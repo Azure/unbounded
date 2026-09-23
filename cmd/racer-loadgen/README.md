@@ -119,8 +119,19 @@ Tune resources and `GOMAXPROCS` alongside object/page concurrency to prevent the
 generator from becoming the bottleneck, and reserve enough node capacity for the
 dataplane. Defaults allow up to 32 concurrent page GETs per process. Watch CPU
 throttling, memory, and network utilization; origin byte generation also consumes
-CPU. The first HEAD for each object hashes its synthetic contents with SHA-256;
-subsequent HEADs reuse the checksum. This cold metadata cost is part of warmup.
+CPU. The first request for each object queues background publication: one worker
+per process hashes synthetic contents with SHA-256 using a 32 KiB scratch buffer.
+Each object is queued at most once, with at most one queue entry per dataset
+object. Concurrent and repeated requests share that work and wait cancelably for
+the published metadata; subsequent HEADs reuse the checksum without reading bytes.
+Request cancellation or the SDK's 30-second response-header timeout does not
+discard hashing progress. A cold request can still time out while its object is
+queued or hashing; later requests can succeed once publication completes.
+This cold metadata cost is part of warmup and can dominate short runs with large
+objects. Startup does not prehash the default 512 GB footprint, and `/healthz`
+reports process health, not checksum readiness. Only requested objects are hashed.
+Shutdown cancels publication, abandons queued work, and joins the worker; checksum
+state is in memory and is lost on restart.
 ETags are strong quoted lowercase content checksums, consistent across replicas.
 Memory is bounded by worker buffers and per-object sampler/checksum state rather
 than footprint bytes. The generator needs no data volume.

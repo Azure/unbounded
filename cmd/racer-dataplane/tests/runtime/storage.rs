@@ -309,7 +309,7 @@ impl Fixture {
                 .shard_count()
         );
         assert_eq!(std::fs::metadata(&self.path).unwrap().len(), capacity);
-        assert!(self.nodes.iter().all(|(app, _)| !app.maintenance));
+        assert!(self.nodes.iter().all(|(app, _)| !app.topology_fence.held()));
     }
 }
 impl Drop for Fixture {
@@ -382,7 +382,7 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
             )
         });
         assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
-        assert!(f.nodes.iter().all(|(app, _)| !app.maintenance));
+        assert!(f.nodes.iter().all(|(app, _)| !app.topology_fence.held()));
         let status = f.updates.status();
         assert_eq!(status["storage"]["phase"], "failed");
         assert_eq!(status["storage"]["appliedBytes"], 64 << 20);
@@ -405,7 +405,7 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
     f.updates.test_storage_policy(5, 256 << 20);
     // Pin a real cache owner so the production fence cannot complete.
     let old_owner = f.nodes[0].0.cache.borrow().use_guard();
-    f.until(|f| f.nodes.iter().all(|(app, _)| app.maintenance));
+    f.until(|f| f.nodes.iter().all(|(app, _)| app.topology_fence.held()));
     f.updates.test_storage_policy(6, 192 << 20);
     drop(old_owner);
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
@@ -430,7 +430,7 @@ fn over_automatic_capacity_limit_reports_bounded_failure_and_keeps_serving() {
     assert!(error.contains("32 MiB..=4 TiB"), "{error}");
     assert!(error.len() < 1024);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
-    assert!(f.nodes.iter().all(|(app, _)| !app.maintenance));
+    assert!(f.nodes.iter().all(|(app, _)| !app.topology_fence.held()));
     f.updates.test_storage_policy(2, 64 << 20);
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
     assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
@@ -456,7 +456,7 @@ fn delayed_worker_ack_prevents_publish_and_partial_resume() {
         app.poll(ring, 128).unwrap();
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(f.nodes.iter().all(|(app, _)| app.maintenance));
+    assert!(f.nodes.iter().all(|(app, _)| app.topology_fence.held()));
     assert_ne!(
         f.updates.storage_policy_status().result,
         Some(StorageResult::Applied)
@@ -476,7 +476,7 @@ fn post_rename_sync_failure_stays_fenced_and_recovers_forward() {
         )
     });
     assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
-    assert!(f.nodes[0].0.maintenance);
+    assert!(f.nodes[0].0.topology_fence.held());
     assert!(StoragePath::lock(&f.path).is_err());
     f.shared().faults.lock().unwrap().sync = false;
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
@@ -491,7 +491,7 @@ fn restart_selects_complete_inode_on_both_sides_of_publish() {
         shared.faults.lock().unwrap().sync = publish;
         let owner = f.nodes[0].0.cache.borrow().use_guard();
         f.updates.test_storage_policy(1, 64 << 20);
-        f.until(|f| f.nodes[0].0.maintenance);
+        f.until(|f| f.nodes[0].0.topology_fence.held());
         drop(owner);
         if publish {
             f.until(|f| {
@@ -620,7 +620,7 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     f.updates.test_storage_policy(1, 20 << 30);
     // Hold a cache owner past the first response to inspect the admission fence.
     let owner = f.nodes[0].0.cache.borrow().use_guard();
-    f.until(|f| f.nodes[0].0.maintenance);
+    f.until(|f| f.nodes[0].0.topology_fence.held());
     let inode = std::fs::metadata(&f.path).unwrap().ino();
     let mut busy = request(&client_ring);
     let mut first_done = false;
@@ -710,12 +710,12 @@ fn retained_old_inode_prevents_a_third_generation_and_shutdown_never_resumes() {
     }
     drop(old);
     let owner = f.nodes[0].0.cache.borrow().use_guard();
-    f.until(|f| f.nodes[0].0.maintenance);
+    f.until(|f| f.nodes[0].0.topology_fence.held());
     f.nodes[0].0.begin_drain();
     drop(owner);
     for _ in 0..30 {
         f.turn();
     }
-    assert!(f.nodes[0].0.maintenance);
+    assert!(f.nodes[0].0.topology_fence.held());
     assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
 }

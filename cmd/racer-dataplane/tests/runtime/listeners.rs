@@ -285,11 +285,11 @@ mod tcp {
                             reply
                                 .send((
                                     owned(&node, a),
-                                    s.handler().current._config.config.revision,
+                                    s.handler().current._config.config_snapshot().revision,
                                     s.handler()
                                         .draining
                                         .iter()
-                                        .map(|g| g._config.config.revision)
+                                        .map(|g| g._config.config_snapshot().revision)
                                         .collect(),
                                     node.peer_server.as_ref().unwrap().connections(),
                                     ring.metrics().values()[0],
@@ -565,11 +565,11 @@ mod overlap {
             .handler()
             .current
             ._config
-            .volumes
+            .volumes()
             .iter()
-            .find(|v| Address::Unix(v.cache_socket) == local_key(address))
+            .find(|v| Address::Unix(v.cache_socket()) == local_key(address))
             .unwrap()
-            .config
+            .config()
             .cache_socket
             .clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -736,7 +736,7 @@ mod overlap {
                     for retired in node.retired.values_mut() {
                         retired.0 = Instant::now();
                     }
-                    node.poll_retired(ring, 64).unwrap();
+                    node.poll_listeners(ring, 64).unwrap();
                     assert!(node.retired.is_empty());
                 }
                 let retired_path = &active.volumes[0].cache_socket;

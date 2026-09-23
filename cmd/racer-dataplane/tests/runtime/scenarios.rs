@@ -38,8 +38,10 @@ impl Cluster {
         let old = self.generation(node);
         let (mut trust, _) = fixture();
         trust.node = [node as u8 + 10; 32];
-        let mut config = old._config.config.clone();
-        config.volumes[0].origin_socket = old._config.config.volumes[0].origin_socket.clone();
+        let mut config = old._config.config_snapshot().clone();
+        config.volumes[0].origin_socket = old._config.config_snapshot().volumes[0]
+            .origin_socket
+            .clone();
         config.revision = 2;
         let topology = config.volumes[0].topology.as_mut().unwrap();
         topology.epoch = 2;
@@ -172,7 +174,11 @@ impl Cluster {
         if peer {
             peer_headers.push((
                 "X-Racer-Volume".into(),
-                self.config(node).volumes[0].config.id.as_bytes().to_vec(),
+                self.config(node).volumes()[0]
+                    .config()
+                    .id
+                    .as_bytes()
+                    .to_vec(),
             ));
         }
         let headers: Vec<_> = peer_headers
@@ -307,9 +313,13 @@ pub(crate) fn activate(
     rails: negotiation::Rails,
 ) -> Volumes {
     let updates = Arc::new(Updates::default());
-    let provider = tls_provider(&config.config.universe, &config.config.node, "test-pod");
+    let provider = tls_provider(
+        &config.config_snapshot().universe,
+        &config.config_snapshot().node,
+        "test-pod",
+    );
     updates.set_credentials(provider);
-    let mut snapshot = config.config.clone();
+    let mut snapshot = config.config_snapshot().clone();
     peer_endpoints(&mut snapshot);
     let trust = crate::control::Trust {
         universe: snapshot.universe.as_slice().try_into().unwrap(),
@@ -350,11 +360,11 @@ fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     volumes.poll(&mut ring, 16).unwrap();
     updates.activated(1, 1);
     assert!(staged.active.get());
-    manager_mut(&staged).trigger(&staged._config.volumes[0].config.peers[0], "/object");
+    manager_mut(&staged).trigger(&staged._config.volumes()[0].config().peers[0], "/object");
     volumes.poll(&mut ring, 16).unwrap();
     let after = manager(&staged).outbound[0].retry.after;
     for _ in 0..5 {
-        manager_mut(&staged).trigger(&staged._config.volumes[0].config.peers[0], "/different");
+        manager_mut(&staged).trigger(&staged._config.volumes()[0].config().peers[0], "/different");
         volumes.poll(&mut ring, 16).unwrap();
     }
     let manager = manager(&staged);
@@ -364,7 +374,7 @@ fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     assert!(manager.live.is_empty());
     drop(manager);
     let (trust, _) = fixture();
-    let mut config = staged._config.config.clone();
+    let mut config = staged._config.config_snapshot().clone();
     config.revision = 2;
     config.fabric.clear();
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
@@ -431,7 +441,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     let old = generation(&volumes, first);
-    assert_eq!(old._config.config.revision, 1);
+    assert_eq!(old._config.config_snapshot().revision, 1);
     old.handlers[0]
         .borrow_mut()
         .cache_mut()
@@ -456,8 +466,8 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert_eq!(volumes.servers.len(), 2);
-    assert!(generation(&volumes, first)._config.peers.is_empty());
-    assert_eq!(old._config.peers.len(), 1);
+    assert!(generation(&volumes, first)._config.peers().is_empty());
+    assert_eq!(old._config.peers().len(), 1);
     for server in volumes.servers.values() {
         for handler in &server.handler().current.handlers {
             handler
@@ -478,8 +488,14 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     config.volumes[1].cache_socket = occupied_path.clone();
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    assert_eq!(updates.decision(3), None);
-    assert_eq!(generation(&volumes, first)._config.config.revision, 2);
+    assert_eq!(updates.decision(3), Decision::Waiting);
+    assert_eq!(
+        generation(&volumes, first)
+            ._config
+            .config_snapshot()
+            .revision,
+        2
+    );
     assert!(volumes.servers.contains_key(&local_key(second)));
     config.revision = 4;
     config.volumes.clear();

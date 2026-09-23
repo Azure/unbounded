@@ -9,6 +9,11 @@ pub(crate) mod failure_tests {
     use client::attempt::{PeerFailure, PeerReason};
     use std::{io, sync::Arc};
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/security/outcome.rs"
+    ));
+
     #[test]
     fn http_metric_classification_preserves_shared_and_remote_evidence() {
         use crate::metrics::{HttpErrorReason as R, HttpPressure as P};

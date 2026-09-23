@@ -88,7 +88,9 @@ func serve(ctx context.Context, c config) error {
 		defer stop()
 	}
 
-	d := newDataset(c)
+	d := newDataset(ctx, c)
+	defer d.Close()
+
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 

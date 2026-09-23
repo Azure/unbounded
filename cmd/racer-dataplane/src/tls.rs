@@ -6,6 +6,9 @@
 //! A session owns its socket. After a WANT result, poll the indicated direction
 //! and retry the operation. Application bytes must never bypass this session.
 
+mod channel;
+pub use channel::TlsChannel;
+
 use foreign_types::ForeignType;
 use openssl::{
     asn1::Asn1Time,

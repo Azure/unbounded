@@ -460,9 +460,9 @@ fn activation_requires_every_worker_and_failure_blocks_activation() {
         .publish(trust.prepare(envelope(snapshot.clone())).unwrap())
         .unwrap();
     updates.staged(1, 0, true);
-    assert_eq!(updates.decision(1), None);
+    assert_eq!(updates.decision(1), Decision::Waiting);
     updates.staged(1, 1, false);
-    assert_eq!(updates.decision(1), None);
+    assert_eq!(updates.decision(1), Decision::Waiting);
     updates.activated(1, 0);
     updates.activated(1, 1);
     assert_epoch(0);
@@ -475,7 +475,7 @@ fn activation_requires_every_worker_and_failure_blocks_activation() {
     assert_epoch(0);
     updates.staged(2, 0, true);
     updates.staged(2, 1, true);
-    assert_eq!(updates.decision(2), Some(true));
+    assert_eq!(updates.decision(2), Decision::Activate);
     updates.activated(2, 0);
     updates.activated(2, 0); // Duplicate acknowledgments cannot finish activation.
     assert_epoch(0);
@@ -491,7 +491,7 @@ fn activation_requires_every_worker_and_failure_blocks_activation() {
     updates
         .publish(trust.prepare(envelope(next.clone())).unwrap())
         .unwrap();
-    assert_eq!(updates.decision(3), None);
+    assert_eq!(updates.decision(3), Decision::Waiting);
     assert_epoch(42);
     updates.staged(3, 0, true);
     updates.staged(3, 1, false);
@@ -628,23 +628,25 @@ pub(crate) fn rdma_fixture() -> (Trust, proto::Snapshot) {
 fn coordinated_receive_barrier_reorder_abort_and_retirement() {
     let (trust, mut snapshot) = fixture();
     let updates = Updates::default();
-    updates.activation.lock().unwrap().workers = 2;
+    for _ in 0..2 {
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+    }
     updates
         .command(trust.prepare(envelope(snapshot.clone())).unwrap(), 1)
         .unwrap();
     updates.staged(1, 0, true);
     updates.staged(1, 1, true);
     assert_eq!(updates.acknowledged_phase(), 1);
-    assert_eq!(updates.decision(1), None);
+    assert_eq!(updates.decision(1), Decision::Waiting);
     // An activation command still cannot bypass the local receive barrier.
     updates.command_phase(1, 3).unwrap();
     updates.received(1, 0);
-    assert_eq!(updates.decision(1), None);
+    assert_eq!(updates.decision(1), Decision::Waiting);
     updates.received(1, 1);
-    assert_eq!(updates.decision(1), Some(true));
+    assert_eq!(updates.decision(1), Decision::Activate);
     assert!(updates.command_phase(1, 5).is_err());
     updates.command_phase(1, 1).unwrap();
-    assert_eq!(updates.decision(1), Some(true));
+    assert_eq!(updates.decision(1), Decision::Activate);
     updates.activated(1, 0);
     assert_eq!(updates.status()["ready"], false);
     updates.activated(1, 1);
@@ -668,9 +670,9 @@ fn coordinated_receive_barrier_reorder_abort_and_retirement() {
     updates
         .command(trust.prepare(envelope(snapshot)).unwrap(), 1)
         .unwrap();
-    assert_eq!(updates.decision(2), Some(false));
+    assert_eq!(updates.decision(2), Decision::Discard);
     updates.command_phase(3, 5).unwrap();
-    assert_eq!(updates.decision(3), Some(false));
+    assert_eq!(updates.decision(3), Decision::Discard);
     assert_eq!(updates.status()["activeRevision"], 1);
 }
 
@@ -678,7 +680,9 @@ fn coordinated_receive_barrier_reorder_abort_and_retirement() {
 fn retired_workers_report_phase_four_only_after_terminal_command() {
     let (trust, snapshot) = fixture();
     let updates = Updates::default();
-    updates.activation.lock().unwrap().workers = 2;
+    for _ in 0..2 {
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+    }
     updates
         .command(trust.prepare(envelope(snapshot)).unwrap(), 3)
         .unwrap();
@@ -688,6 +692,8 @@ fn retired_workers_report_phase_four_only_after_terminal_command() {
     assert!(updates.receive_decision(1));
     for worker in 0..2 {
         updates.received(1, worker);
+    }
+    for worker in 0..2 {
         updates.activated(1, worker);
         updates.retired(1, worker);
     }
@@ -1025,21 +1031,132 @@ fn rdma_capabilities_pin_original_policy_and_do_not_survive_removal_in_new_gener
     );
     assert_eq!(peer.config_snapshot().revision, 1);
 
-    // Public legacy staging fields cannot mint a capability with substituted
-    // endpoints, membership, or policy.
-    let mut staged = trust.prepare(envelope(snapshot)).unwrap();
-    staged.config.peers.clear();
-    staged.config.node = vec![9; 32];
-    staged.peers.clear();
+    // Editing builder input cannot alter a previously validated authority, and
+    // substituted identity must pass validation before it can mint capabilities.
+    let staged = trust.prepare(envelope(snapshot)).unwrap();
+    let mut builder = trust.builder(staged.config_snapshot().clone());
+    builder.snapshot_mut().node = vec![9; 32];
+    assert!(builder.build().is_err());
     let peer = staged.eligible_peer(&id).unwrap();
     assert_eq!(peer.local_node().bytes(), trust.node);
     assert_eq!(peer.config_snapshot().peers.len(), 1);
+    assert_eq!(peer.endpoint().host(), "127.0.0.1:8081");
+    assert!(std::ptr::eq(
+        peer.config_snapshot(),
+        staged.config_snapshot()
+    ));
+    assert!(std::ptr::eq(
+        peer.crypto_snapshot(),
+        staged.crypto_snapshot()
+    ));
+    let mut builder = trust.builder(staged.config_snapshot().clone());
+    builder.snapshot_mut().peers[0].http_address = "127.0.0.1:9091".into();
+    let changed = builder.build().unwrap();
+    assert_eq!(
+        changed.eligible_peer(&id).unwrap().endpoint().host(),
+        "127.0.0.1:9091"
+    );
     assert_eq!(peer.endpoint().host(), "127.0.0.1:8081");
 }
 
 pub(crate) mod activation_tests {
     use super::*;
     use std::sync::{Barrier, TryLockError, mpsc};
+
+    #[test]
+    fn transmit_acknowledgments_cannot_bypass_receive_or_abort() {
+        let (trust, config) = fixture();
+        let updates = Updates::default();
+        for _ in 0..2 {
+            updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        }
+        updates
+            .command(prepare_snapshot(&trust, config.clone()), 1)
+            .unwrap();
+        for worker in 0..2 {
+            updates.staged(1, worker, true);
+        }
+        // Preparation alone never grants coordinated transmit authority.
+        for worker in 0..2 {
+            updates.activated(1, worker);
+        }
+        assert_eq!(updates.status()["activatedWorkers"], 0);
+        assert!(updates.active().is_none());
+        updates.command_phase(1, 3).unwrap();
+        assert!(updates.receive_decision(1));
+        updates.received(1, 0);
+        for worker in 0..2 {
+            updates.activated(1, worker);
+        }
+        assert_eq!(updates.decision(1), Decision::Waiting);
+        assert_eq!(updates.status()["activatedWorkers"], 0);
+        updates.received(1, 1);
+        assert_eq!(updates.decision(1), Decision::Activate);
+        updates.activated(1, 0);
+        assert!(updates.active().is_none());
+        updates.activated(1, 1);
+        assert_eq!(updates.active().unwrap().config_snapshot().revision, 1);
+        assert!(updates.command_phase(1, 5).is_err());
+
+        let aborted = Updates::default();
+        aborted.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        aborted
+            .command(prepare_snapshot(&trust, config), 1)
+            .unwrap();
+        aborted.staged(1, 0, true);
+        aborted.command_phase(1, 5).unwrap();
+        aborted.received(1, 0);
+        aborted.activated(1, 0);
+        aborted.retired(1, 0);
+        assert_eq!(aborted.decision(1), Decision::Discard);
+        assert!(!aborted.receive_decision(1));
+        assert!(aborted.active().is_none());
+        assert_eq!(aborted.status()["retiredWorkers"], 0);
+    }
+
+    #[test]
+    fn command_codes_are_validated_and_monotonic_with_stale_feedback_fenced() {
+        let (trust, mut config) = fixture();
+        let updates = Updates::default();
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        for code in [0, 6, u32::MAX] {
+            assert!(
+                updates
+                    .command(prepare_snapshot(&trust, config.clone()), code)
+                    .is_err()
+            );
+            assert!(updates.latest(0).is_none());
+        }
+        updates
+            .command(prepare_snapshot(&trust, config.clone()), 1)
+            .unwrap();
+        updates.staged(1, 0, false);
+        config.revision = 2;
+        updates
+            .command(prepare_snapshot(&trust, config), 4)
+            .unwrap();
+        let before = updates.status();
+        updates.staged(1, 0, true);
+        updates.received(1, 0);
+        updates.activated(1, 0);
+        updates.retired(1, 0);
+        assert_eq!(updates.status(), before);
+        assert!(!updates.receive_decision(1));
+        assert!(updates.command_phase(1, 2).is_err());
+        for code in [1, 2, 3, 4, 2] {
+            updates.command_phase(2, code).unwrap();
+            assert_eq!(updates.status()["phase"], 4);
+        }
+        updates.staged(2, 0, true);
+        assert!(updates.receive_decision(2));
+        assert_eq!(updates.acknowledged_phase(), 1);
+        updates.received(2, 0);
+        assert_eq!(updates.acknowledged_phase(), 2);
+        updates.activated(2, 0);
+        assert_eq!(updates.acknowledged_phase(), 3);
+        updates.retired(2, 0);
+        assert_eq!(updates.acknowledged_phase(), 4);
+    }
 
     #[test]
     fn b05_exporter_readiness_tracks_required_identity_and_listener() {
@@ -1266,7 +1383,7 @@ pub(crate) mod activation_tests {
             assert_eq!(updates.status()["rejected"], true);
             assert_eq!(updates.status()["preparedWorkers"], 2);
             assert_eq!(updates.acknowledged_phase(), 0);
-            assert_eq!(updates.decision(1), None);
+            assert_eq!(updates.decision(1), Decision::Waiting);
             assert!(!updates.receive_decision(1));
             if phase >= 2 {
                 // A committed command may arrive before staging succeeds. Failure
@@ -1284,16 +1401,16 @@ pub(crate) mod activation_tests {
             updates.staged(1, 2, true);
             assert_eq!(updates.status()["rejected"], false);
             assert_eq!(updates.acknowledged_phase(), 1);
-            assert_eq!(updates.decision(1), None);
+            assert_eq!(updates.decision(1), Decision::Waiting);
             updates.command_phase(1, 2).unwrap();
             assert!(updates.receive_decision(1));
             updates.received(1, 0);
             updates.received(1, 1);
-            assert_eq!(updates.decision(1), None);
+            assert_eq!(updates.decision(1), Decision::Waiting);
             updates.received(1, 2);
             assert_eq!(updates.acknowledged_phase(), 2);
             updates.command_phase(1, 3).unwrap();
-            assert_eq!(updates.decision(1), Some(true));
+            assert_eq!(updates.decision(1), Decision::Activate);
             for worker in 0..3 {
                 updates.activated(1, worker);
             }
@@ -1352,14 +1469,14 @@ pub(crate) mod activation_tests {
                     assert_eq!(updates.status()["activatedWorkers"], 0);
                     updates.staged(revision, order[1], true);
                     if coordinated {
-                        assert_eq!(updates.decision(revision), None);
+                        assert_eq!(updates.decision(revision), Decision::Waiting);
                         updates.command_phase(revision, 3).unwrap();
                         updates.received(revision, order[0]);
                         updates.received(revision, order[0]);
-                        assert_eq!(updates.decision(revision), None);
+                        assert_eq!(updates.decision(revision), Decision::Waiting);
                         updates.received(revision, order[1]);
                     }
-                    assert_eq!(updates.decision(revision), Some(true));
+                    assert_eq!(updates.decision(revision), Decision::Activate);
                     updates.activated(revision, order[0]);
                     updates.activated(revision, order[0]);
                     updates.activated(revision - 1, order[1]);
@@ -1386,10 +1503,7 @@ pub(crate) mod activation_tests {
                         usize::from(revision == 1)
                     );
                     assert_eq!(updates.applied_epoch(), if revision == 1 { 51 } else { 52 });
-                    assert!(Arc::ptr_eq(
-                        updates.active.lock().unwrap().as_ref().unwrap(),
-                        &pinned
-                    ));
+                    assert!(Arc::ptr_eq(updates.active().as_ref().unwrap(), &pinned));
                     if coordinated {
                         assert_eq!(
                             publish(config.clone()).unwrap_err().kind(),
@@ -1429,7 +1543,7 @@ pub(crate) mod activation_tests {
     fn active_snapshot_contender(activate_successor: bool) {
         // Pause BEFORE active publication in both production and mutated code. A real
         // contender observes exclusion without waiting for a timeout: under the fix it
-        // cannot acquire current/activation. With either unlocked-late-swap mutation,
+        // cannot acquire the coordinator. With an unlocked-late-swap mutation,
         // it publishes R+1 (and optionally activates it) before letting R resume.
         let (trust, mut config) = fixture();
         config.epoch = 41;
@@ -1471,12 +1585,8 @@ pub(crate) mod activation_tests {
             }
             // Drop each successful guard immediately; observation holds no locks
             // across the channel or barrier, and never reverses production order.
-            let current_blocked = blocked(publisher_updates.current.try_lock());
-            let activation_blocked = blocked(publisher_updates.activation.try_lock());
-            let active_before = publisher_updates.active.try_lock().unwrap().clone();
-            observed_tx
-                .send((current_blocked, activation_blocked, active_before))
-                .unwrap();
+            let coordinator_blocked = blocked(publisher_updates.coordinator.try_lock());
+            observed_tx.send(coordinator_blocked).unwrap();
             publisher_updates.publish(next).unwrap();
             if activate_successor {
                 publisher_updates.staged(2, 0, true);
@@ -1486,8 +1596,7 @@ pub(crate) mod activation_tests {
             }
             publisher_updates.status()
         });
-        let (current_blocked, activation_blocked, active_before) = observed_rx.recv().unwrap();
-        let excluded = current_blocked || activation_blocked;
+        let excluded = observed_rx.recv().unwrap();
         if excluded {
             // publish cannot finish while R holds these locks. Release R before
             // joining the contender; no sleep or blocking-join deadlock is needed.
@@ -1504,18 +1613,14 @@ pub(crate) mod activation_tests {
         let expected = if activate_successor { 2 } else { 1 };
         let after = updates.status();
         eprintln!(
-            "B07 successor_activated={activate_successor} current_blocked={current_blocked} activation_blocked={activation_blocked}: during={during}; after={after}"
-        );
-        assert!(
-            active_before.is_none(),
-            "hook must precede the first active publication"
+            "B07 successor_activated={activate_successor} coordinator_blocked={excluded}: during={during}; after={after}"
         );
         assert_eq!(
             after["activeRevision"], expected,
             "active must be the last fully acknowledged revision; no premature successor or stale overwrite"
         );
         assert!(
-            current_blocked && activation_blocked,
+            excluded,
             "final acknowledgment must exclude publication until the active swap"
         );
         assert_eq!(
@@ -1532,7 +1637,7 @@ pub(crate) mod activation_tests {
             updates.applied_epoch(),
             if activate_successor { 42 } else { 41 }
         );
-        let active = updates.active.lock().unwrap().clone().unwrap();
+        let active = updates.active().unwrap();
         let pinned = if activate_successor {
             updates.latest(1).unwrap()
         } else {
@@ -2247,14 +2352,16 @@ mod subscriber_tests {
         let file = ConfigFile::new("barrier");
         let (trust, mut config) = fixture();
         let updates = Arc::new(Updates::default());
-        updates.activation.lock().unwrap().workers = 2;
+        for _ in 0..2 {
+            updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        }
         file.write(&json(&config));
         let subscriber =
             Subscriber::start(Source::File(file.path()), Arc::new(trust), updates.clone()).unwrap();
         revision(&updates, 1);
         updates.staged(1, 0, true);
         updates.staged(1, 1, true);
-        assert_eq!(updates.decision(1), Some(true));
+        assert_eq!(updates.decision(1), Decision::Activate);
         updates.activated(1, 0);
         config.revision = 2;
         file.write(&json(&config));
@@ -2268,13 +2375,13 @@ mod subscriber_tests {
         updates.activated(1, 1);
         revision(&updates, 2);
         assert!(updates.subscription_probe.prepares.load(Ordering::SeqCst) > prepares);
-        assert_eq!(updates.decision(2), None);
+        assert_eq!(updates.decision(2), Decision::Waiting);
         updates.staged(2, 0, false);
         quiet(&updates);
-        assert_eq!(updates.decision(2), None);
+        assert_eq!(updates.decision(2), Decision::Waiting);
         updates.staged(2, 0, true);
         updates.staged(2, 1, true);
-        assert_eq!(updates.decision(2), Some(true));
+        assert_eq!(updates.decision(2), Decision::Activate);
         updates.activated(2, 0);
         updates.activated(2, 1);
         quiet(&updates);
@@ -2293,11 +2400,8 @@ mod forward_tests {
         updates
             .command(prepare_snapshot(&trust, config), 2)
             .unwrap();
-        {
-            let mut a = updates.activation.lock().unwrap();
-            a.workers = 1;
-            a.ready.insert(0);
-        }
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        updates.staged(2, 0, true);
         assert!(updates.receive_decision(2));
         updates.received(2, 0);
         let mut rejected = Rejection::default();
@@ -2309,7 +2413,9 @@ mod forward_tests {
         assert!(rejected.check_revision(&updates, 2).is_ok());
         rejected.accepted(2); // terminal status for R2 must retain rejected R3
         assert_eq!(rejected.revision, 3);
-        updates.activation.lock().unwrap().retired.insert(0);
+        updates.command_phase(2, 3).unwrap();
+        updates.activated(2, 0);
+        updates.retired(2, 0);
         let headers = rejected.headers(&updates, "accepted2", "boot");
         assert!(headers.contains(&("X-Racer-Digest", "rejected3".into())));
         assert!(headers.contains(&("X-Racer-Needs-Config", "1".into())));

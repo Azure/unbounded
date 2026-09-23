@@ -46,6 +46,32 @@ fn zc_error_and_cancel_do_not_release_before_notification() {
 }
 
 #[test]
+fn queued_cancellation_retains_storage_and_cannot_cancel_inflight() {
+    let pool = buffers::io_test_pool(1);
+    let mut target = request(
+        Resource::Writable(fill(&pool, 1).into_storage()),
+        abi::READ_FIXED,
+        false,
+    );
+    assert!(!target.cancel_queued());
+    assert!(matches!(target.state, State::InFlight));
+    target.slab_pending = Some(Box::new(SlabPending {
+        sqe: abi::Sqe::default(),
+        io: crate::slab_io::Io::default(),
+        bytes: 1,
+        since: Instant::now(),
+        waited: false,
+    }));
+    assert!(target.cancel_queued());
+    assert!(matches!(target.state, State::Complete(res) if res == -libc::ECANCELED));
+    assert!(target.slab_pending.is_none());
+    assert!(!target.cancel_queued());
+    assert!(pool.stage(Key::new([2; 32])).is_err());
+    drop(target);
+    drop(fill(&pool, 2));
+}
+
+#[test]
 fn zc_without_more_and_invalid_notifications() {
     let pool = buffers::io_test_pool(1);
     let mut send = request(
@@ -556,12 +582,12 @@ fn scheduling_checks(config: Config) {
             arms: arms.clone(),
         });
     }
-    let polls = driver.application.polls;
+    let polls = driver.application().polls;
     for _ in 0..3 {
         driver.turn().unwrap();
     }
     assert_eq!(&*order.borrow(), &[0, 1, 2, 1, 2, 0, 2, 0, 1]);
-    assert_eq!(driver.application.polls, polls + 3);
+    assert_eq!(driver.application().polls, polls + 3);
     assert_eq!(arms.get(), 0, "budget exhaustion must prevent sleeping");
     driver.shutdown().unwrap();
 }
@@ -788,7 +814,7 @@ fn kernel_child() {
     // Generation exhaustion retires a slot; foreign capabilities/tickets
     // cannot address another ring even with numerically equal slot IDs.
     let mut other = Ring::create(buffers::io_test_pool(1), config).unwrap();
-    assert!(other.register_file(fixed.0._file.clone()).is_ok());
+    assert!(other.register_file(fixed.file()).is_ok());
     assert!(other.poll_fd(fixed.into(), Readiness::Readable).is_err());
     assert!(other.take_bytes(&mut pending).is_err());
     let (socket, _peer) = UnixStream::pair().unwrap();

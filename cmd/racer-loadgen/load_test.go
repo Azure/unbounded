@@ -128,7 +128,7 @@ func (w *memoryWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
-	d := newDataset(config{footprint: 3 * (2*racer.PageSize + 137), objectSize: 2*racer.PageSize + 137, ttl: 23 * time.Second})
+	d := datasetForTest(t, config{footprint: 3 * (2*racer.PageSize + 137), objectSize: 2*racer.PageSize + 137, ttl: 23 * time.Second})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	assertMetrics(t, reg, 0, 0, 0)
@@ -221,7 +221,7 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 }
 
 func TestDownloadPartialFailureMetrics(t *testing.T) {
-	d := newDataset(config{footprint: 2*racer.PageSize + 137, objectSize: 2*racer.PageSize + 137})
+	d := datasetForTest(t, config{footprint: 2*racer.PageSize + 137, objectSize: 2*racer.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	origin, _ := racer.NewOrigin(d)
@@ -273,7 +273,7 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 }
 
 func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
-	d := newDataset(config{footprint: racer.PageSize + 137, objectSize: racer.PageSize + 137})
+	d := datasetForTest(t, config{footprint: racer.PageSize + 137, objectSize: racer.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	origin, _ := racer.NewOrigin(d)
@@ -336,7 +336,7 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 		footprint: 8 * racer.PageSize, objectSize: 8 * racer.PageSize,
 		concurrency: workers, pageConcurrency: pages, exponent: 1, seed: 42, timeout: time.Minute,
 	}
-	d := newDataset(c)
+	d := datasetForTest(t, c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	origin, _ := racer.NewOrigin(d)
@@ -416,7 +416,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 	defer server.Close()
 
 	c := config{endpoint: server.URL, footprint: 1, objectSize: 1, concurrency: 3, pageConcurrency: 2, timeout: time.Minute}
-	d := newDataset(c)
+	d := datasetForTest(t, c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -441,7 +441,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 }
 
 func TestOriginRangeResponse(t *testing.T) {
-	d := newDataset(config{footprint: 257, objectSize: 257})
+	d := datasetForTest(t, config{footprint: 257, objectSize: 257})
 	origin, _ := racer.NewOrigin(d)
 
 	for _, tc := range []struct {

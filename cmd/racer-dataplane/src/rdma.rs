@@ -33,82 +33,20 @@ use std::{
 };
 
 const CONTROL: usize = 4096;
+mod connection;
+mod control;
+mod ffi;
+mod framing;
+mod lifecycle;
+mod provider;
+mod retirement;
+mod slot_state;
+mod slots;
+mod source;
 use crate::negotiation::control_wire::{Frame, HEADER};
+use framing::ControlArena;
 /// Maximum opaque RPC metadata (for example, encoded HTTP headers).
 pub const MAX_METADATA: usize = CONTROL - HEADER;
-
-mod ffi {
-    use super::*;
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct Rail {
-        pub name: [c_char; 64],
-        pub gid: [u8; 16],
-        pub max_read: u32,
-        pub lid: u16,
-        pub port: u8,
-        pub gid_index: u8,
-        pub mtu: u8,
-        pub ethernet: u8,
-        pub windows: u8,
-        pub pad: u8,
-    }
-    pub(crate) use crate::negotiation::Endpoint;
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct Wc {
-        pub id: u64,
-        pub status: u32,
-        pub opcode: u32,
-        pub len: u32,
-        pub qpn: u32,
-    }
-    unsafe extern "C" {
-        pub fn racer_discover(out: *mut Rail, capacity: i32) -> i32;
-        pub fn racer_open(
-            name: *const c_char,
-            pool: *mut u8,
-            pool_len: usize,
-            cqe: i32,
-            out: *mut *mut c_void,
-        ) -> i32;
-        pub fn racer_close(d: *mut c_void) -> i32;
-        pub fn racer_fd(d: *mut c_void, asynchronous: i32) -> i32;
-        pub fn racer_notify(d: *mut c_void) -> i32;
-        pub fn racer_event(d: *mut c_void, asynchronous: i32, qpn: *mut u32) -> i32;
-        pub fn racer_poll(d: *mut c_void, out: *mut Wc, capacity: i32) -> i32;
-        pub fn racer_qp(
-            d: *mut c_void,
-            depth: u32,
-            rail: *const Rail,
-            psn: u32,
-            out: *mut Endpoint,
-        ) -> *mut c_void;
-        pub fn racer_init(qp: *mut c_void, port: u8) -> i32;
-        pub fn racer_connect(
-            qp: *mut c_void,
-            rail: *const Rail,
-            peer: *const Endpoint,
-            psn: u32,
-            reads: u8,
-        ) -> i32;
-        pub fn racer_destroy_qp(d: *mut c_void, qp: *mut c_void) -> i32;
-        pub fn racer_destroy_qps(d: *mut c_void, qps: *mut *mut c_void, count: usize) -> i32;
-        pub fn racer_window(d: *mut c_void, key: *mut u32) -> *mut c_void;
-        pub fn racer_free_windows(d: *mut c_void, windows: *mut *mut c_void, count: usize) -> i32;
-        pub fn racer_post(
-            d: *mut c_void,
-            qp: *mut c_void,
-            op: u32,
-            id: u64,
-            address: *mut u8,
-            len: u32,
-            remote: u64,
-            key: u32,
-            mw: *mut c_void,
-        ) -> i32;
-    }
-}
 
 fn error(kind: io::ErrorKind, message: &'static str) -> io::Error {
     io::Error::new(kind, message)
@@ -345,7 +283,7 @@ pub struct Ticket<T> {
     _kind: PhantomData<T>,
 }
 pub enum Grant {}
-pub use crate::http_client::attempt::PeerFailure;
+pub use crate::outcome::PeerFailure;
 pub enum GrantReply {
     Grant(RemoteGrant),
     Failure(PeerFailure),
@@ -512,104 +450,6 @@ pub struct Connection {
     serial: u64,
     cancelled: Rc<Cell<bool>>,
 }
-impl Connecting {
-    pub fn offer(&self) -> &Offer {
-        &self.offer
-    }
-    /// Cancel through a shared reference, including an `Rc` runtime owner.
-    /// A `WouldBlock` result still records cancellation for driver progress.
-    pub fn cancel(&self) -> io::Result<()> {
-        self.transport
-            .disconnect(self.index, self.serial, &self.cancelled)
-    }
-    pub fn close(self) -> io::Result<()> {
-        self.cancel()
-    }
-    pub fn connect(mut self, peer: AuthenticatedOffer, shard: u64) -> io::Result<Connected> {
-        let (peer, binding) = peer.into_parts();
-        let mut owner = self.transport.owner.borrow_mut();
-        let core = owner.core()?;
-        let c = core.connection(self.index, self.serial)?;
-        if core.stopped
-            || c.failed
-            || c.cancelled.get()
-            || c.ready
-            || c.qp.is_null()
-            || crate::environment::now() >= c.deadline
-        {
-            return Err(error(
-                io::ErrorKind::NotConnected,
-                "RDMA handshake expired or closed",
-            ));
-        }
-        if peer.fabric != self.offer.fabric
-            || peer.challenge != self.offer.challenge
-            || peer.nonce == self.offer.nonce
-            || peer.endpoint.ethernet != self.offer.endpoint.ethernet
-            || rails_for_shard(shard, self.offer.rails as usize, peer.rails as usize)
-                != Some((self.offer.rail as usize, peer.rail as usize))
-        {
-            return Err(invalid());
-        }
-        let qp = c.qp;
-        // SAFETY: QP is owned and INIT; endpoint was structurally parsed and authenticated.
-        let result = core.connect_qp(
-            qp,
-            &peer.endpoint,
-            self.offer.endpoint.psn,
-            peer.reads.min(self.offer.reads),
-        );
-        if result != 0 {
-            core.fail(self.index, io::ErrorKind::ConnectionAborted)?;
-            return Err(io::Error::from_raw_os_error(result));
-        }
-        let c = &mut core.connections[self.index];
-        c.peer = peer.nonce;
-        c.binding = Some(binding);
-
-        c.ready = true;
-        self.armed = false;
-        Ok(Connected {
-            transport: self.transport.clone(),
-            index: self.index,
-            serial: self.serial,
-            cancelled: self.cancelled.clone(),
-            armed: true,
-        })
-    }
-    /// Activate only the offer from this channel and install control protection
-    /// before returning a connection usable by the application.
-    pub fn connect_authenticated(
-        self,
-        offer: AuthenticatedOffer,
-        channel: ControlChannel,
-        shard: u64,
-    ) -> io::Result<Connection> {
-        self.connect(offer, shard)?.authenticate_channel(channel)
-    }
-}
-impl Drop for Connecting {
-    fn drop(&mut self) {
-        if self.armed {
-            self.transport
-                .drop_connection(self.index, self.serial, &self.cancelled);
-        }
-    }
-}
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.transport
-            .drop_connection(self.index, self.serial, &self.cancelled);
-    }
-}
-impl Drop for Connected {
-    fn drop(&mut self) {
-        if self.armed {
-            self.transport
-                .drop_connection(self.index, self.serial, &self.cancelled);
-        }
-    }
-}
 
 #[derive(Clone)]
 /// Worker-local submission handle; it cannot cross worker threads.
@@ -758,48 +598,6 @@ struct Slot {
     early: Option<Frame>,
     tracked: bool,
 }
-impl Slot {
-    fn new(now: Instant) -> Self {
-        Self {
-            send_pending: false,
-            send_id: 0,
-            control_tag: 0,
-            descriptor: [0; 32],
-            negative: None,
-            checksum: None,
-            wire_len: 0,
-            phase: Phase::Free,
-            conn: 0,
-            generation: 0,
-            wr: 0,
-            opcode: 0,
-            deadline: now,
-            frame: Frame::default(),
-            fill: None,
-            buffer: None,
-            mw: ptr::null_mut(),
-            key: 0,
-            uses: 0,
-
-            failure: io::ErrorKind::ConnectionAborted,
-            early: None,
-            tracked: false,
-        }
-    }
-}
-// Bounded CPU-only framing storage. No control bytes are registered with the NIC.
-struct ControlArena(Box<[[u8; CONTROL]]>);
-impl ControlArena {
-    fn new(count: usize) -> Self {
-        Self((0..count).map(|_| [0; CONTROL]).collect())
-    }
-    fn bytes(&self, i: usize) -> &[u8; CONTROL] {
-        &self.0[i]
-    }
-    fn bytes_mut(&mut self, i: usize) -> &mut [u8; CONTROL] {
-        &mut self.0[i]
-    }
-}
 struct Core {
     metrics: crate::metrics::Local,
     device: *mut c_void,
@@ -825,31 +623,6 @@ struct Core {
 // owners in a local temporary whose destructor can run before quiescence.
 struct Owner {
     core: Option<Box<Core>>,
-}
-impl Owner {
-    fn core(&mut self) -> io::Result<&mut Core> {
-        self.core
-            .as_deref_mut()
-            .ok_or_else(|| error(io::ErrorKind::NotConnected, "RDMA source closed"))
-    }
-    fn shutdown(&mut self) -> io::Result<()> {
-        if let Some(core) = self.core.as_mut() {
-            core.shutdown()?;
-        }
-        self.core.take();
-        Ok(())
-    }
-}
-impl Drop for Owner {
-    fn drop(&mut self) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown()));
-        if let Some(core) = self.core.take() {
-            std::mem::forget(core);
-        }
-        if let Err(panic) = result {
-            std::mem::forget(panic);
-        }
-    }
 }
 
 impl Transport {
@@ -1059,89 +832,7 @@ impl Transport {
     }
 }
 
-impl Connected {
-    /// Install the exact authenticated TLS channel once.
-    /// Errors retire the QP. Responders activate before sending Ready; initiators
-    /// verify Ready before activation.
-    pub fn authenticate_channel(mut self, channel: ControlChannel) -> io::Result<Connection> {
-        let mut owner = self.transport.owner.borrow_mut();
-        let core = owner.core()?;
-        let c = core.connection(self.index, self.serial)?;
-        if core.stopped
-            || !c.ready
-            || c.failed
-            || c.qp.is_null()
-            || c.cancelled.get()
-            || c.channel.is_some()
-            || c.next_request != 0
-            || c.last_request != 0
-        {
-            return Err(invalid());
-        }
-        channel.matches_transport(c.binding.as_ref().ok_or_else(invalid)?)?;
-        if !channel.healthy() || !channel.admitting() {
-            return Err(error(io::ErrorKind::PermissionDenied, "stale TLS channel"));
-        }
-        core.connections[self.index].channel = Some(channel);
-        self.armed = false;
-        Ok(Connection {
-            transport: self.transport.clone(),
-            index: self.index,
-            serial: self.serial,
-            cancelled: self.cancelled.clone(),
-        })
-    }
-
-    /// Cancel pending activation through a shared runtime owner. A borrow
-    /// conflict records cancellation for progress and returns `WouldBlock`.
-    pub fn cancel(&self) -> io::Result<()> {
-        self.transport
-            .disconnect(self.index, self.serial, &self.cancelled)
-    }
-    pub fn close(self) -> io::Result<()> {
-        self.cancel()
-    }
-}
-
 impl Connection {
-    /// Reserve one bounded control slot after Ready, independent of application
-    /// requests. Both controls use request zero on the authenticated channel.
-    pub(crate) fn begin_confirmation(&self, initiator: bool, deadline: Instant) -> io::Result<()> {
-        let mut owner = self.transport.owner.borrow_mut();
-        let core = owner.core()?;
-        core.ready(self.index, self.serial)?;
-        let c = &mut core.connections[self.index];
-        if c.channel.is_none() || c.confirmation != Confirmation::None {
-            return Err(protocol());
-        }
-        c.deadline = c.deadline.min(deadline);
-        if crate::environment::now() >= c.deadline {
-            return Err(error(io::ErrorKind::TimedOut, "RDMA confirmation expired"));
-        }
-        c.confirmation = if initiator {
-            Confirmation::AwaitAck
-        } else {
-            Confirmation::AwaitConfirm
-        };
-        if initiator {
-            core.confirmation_send(self.index, 5)?;
-        }
-        Ok(())
-    }
-
-    /// ACK receipt can precede local write retirement. Admission waits for both so
-    /// the confirmation arena is retired before application capacity is used.
-    pub(crate) fn is_confirmed(&self) -> bool {
-        self.inspect(|core, c| {
-            c.confirmation == Confirmation::Complete
-                && core.ready(self.index, self.serial).is_ok()
-                && !core
-                    .slots
-                    .iter()
-                    .any(|s| s.conn == self.index && s.phase == Phase::ConfirmSend)
-        })
-    }
-
     fn collect_slot<T>(&self, core: &mut Core, ticket: &mut Ticket<T>) -> io::Result<usize> {
         let i = core.validate(self.index, self.serial, ticket)?;
         if core.renewing {
@@ -1169,72 +860,6 @@ impl Connection {
             return Err(error(e, "RDMA operation failed; use HTTP"));
         }
         Ok(i)
-    }
-    fn inspect(&self, f: impl FnOnce(&Core, &ConnectionState) -> bool) -> bool {
-        self.transport.owner.try_borrow().is_ok_and(|owner| {
-            owner.core.as_ref().is_some_and(|core| {
-                core.connection(self.index, self.serial)
-                    .is_ok_and(|session| f(core, session))
-            })
-        })
-    }
-    /// Local maintenance is recovery-only, not peer failure evidence.
-    pub(crate) fn needs_http_recovery(&self) -> bool {
-        if self.key_draining() {
-            return true;
-        }
-        self.transport
-            .owner
-            .borrow()
-            .core
-            .as_ref()
-            .is_some_and(|core| {
-                core.connection(self.index, self.serial)
-                    .map_or(true, |c| c.local_renewal || (core.renewing && !c.failed))
-            })
-    }
-    pub fn is_authenticated(&self) -> bool {
-        self.inspect(|_, s| s.channel.as_ref().is_some_and(ControlChannel::healthy))
-    }
-    /// True only after a valid authenticated RDMA control was received. HTTP
-    /// Ready does not count. This includes transport confirmation controls.
-    pub fn authenticated_received(&self) -> bool {
-        self.inspect(|_, s| s.authenticated_received)
-    }
-    /// Local transport health, not a peer liveness probe. False after deferred
-    /// cancellation, source shutdown, or failure (also during reentrant polling).
-    pub fn is_healthy(&self) -> bool {
-        !self.cancelled.get()
-            && self.inspect(|core, s| {
-                core.ready(self.index, self.serial).is_ok()
-                    && s.channel.as_ref().is_some_and(ControlChannel::healthy)
-            })
-    }
-
-    pub(crate) fn key_draining(&self) -> bool {
-        self.inspect(|_, s| {
-            s.channel
-                .as_ref()
-                .is_some_and(|channel| !channel.admitting())
-        })
-    }
-
-    /// A replacement may retire this channel only after all original RPCs and
-    /// their terminal controls have relinquished transport ownership.
-    pub(crate) fn is_drained(&self) -> bool {
-        self.key_draining()
-            && self.inspect(|core, _| {
-                !core
-                    .slots
-                    .iter()
-                    .any(|s| s.conn == self.index && s.phase != Phase::Free)
-            })
-    }
-
-    /// Idempotently stop admission/destroy QP; errors retain DMA and cancellation.
-    pub fn disconnect(&self) -> io::Result<()> {
-        self.transport
-            .disconnect(self.index, self.serial, &self.cancelled)
     }
     /// Queue one RPC. `value` must include the complete storage identity,
     /// including version and page offset. `len` is the expected stored length.
@@ -1597,50 +1222,6 @@ impl Connection {
 }
 
 impl Core {
-    fn confirmation_send(&mut self, conn: usize, kind: u8) -> io::Result<()> {
-        let i = self.allocate(conn, Phase::ConfirmSend)?;
-        self.slots[i].frame = Frame {
-            kind,
-            session: self.connections[conn].local,
-            ..Frame::default()
-        };
-        // Share the handshake deadline, including queue pressure. Never create
-        // an unbounded or application-owned confirmation ticket.
-        self.slots[i].deadline = self.connections[conn].deadline;
-        if let Err(e) = self.encode(i, &[]).and_then(|_| self.send_control(i)) {
-            self.release(i);
-            self.fail(conn, io::ErrorKind::ConnectionAborted)?;
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    fn accept_reply(&mut self, i: usize, frame: Frame, ready: Phase) {
-        let s = &mut self.slots[i];
-        if s.phase == Phase::RequestSend {
-            s.early = Some(frame);
-        } else {
-            s.frame = frame;
-            s.phase = ready;
-        }
-    }
-    fn receive_bytes(&mut self, conn: usize, bytes: &[u8]) -> io::Result<()> {
-        self.ready(conn, self.connections[conn].serial)?;
-        if bytes.len() > CONTROL {
-            return Err(protocol());
-        }
-        let frame = Frame::decode(bytes)?;
-        self.received(conn, frame, &bytes[HEADER..])?;
-        self.connections[conn].authenticated_received = true;
-        Ok(())
-    }
-    fn find_slot(&self, conn: usize, request: u64, phases: &[Phase]) -> io::Result<usize> {
-        self.slots
-            .iter()
-            .position(|s| s.conn == conn && s.frame.request == request && phases.contains(&s.phase))
-            .ok_or_else(protocol)
-    }
-
     fn new(pool: &WorkerPool, rail: Rail, config: Config) -> Self {
         let count = config.connections * config.depth * 4;
         let now = crate::environment::now();
@@ -1666,27 +1247,9 @@ impl Core {
             retiring_windows: None,
         }
     }
-    fn create_qp(&mut self, psn: u32, endpoint: &mut ffi::Endpoint) -> *mut c_void {
-        // SAFETY: device/CQ/PD are retained by Owner; caller installs the QP
-        // in that owner before any fallible setup or DMA posting.
-        unsafe {
-            ffi::racer_qp(
-                self.device,
-                (self.config.depth * 4) as u32,
-                &self.rail.raw,
-                psn,
-                endpoint,
-            )
-        }
-    }
-    fn init_qp(&self, qp: *mut c_void) -> i32 {
-        // SAFETY: QP belongs to this core and is newly created.
-        unsafe { ffi::racer_init(qp, self.rail.raw.port) }
-    }
-    fn connect_qp(&self, qp: *mut c_void, peer: &ffi::Endpoint, psn: u32, reads: u8) -> i32 {
-        // SAFETY: caller validated the INIT QP and authenticated peer endpoint.
-        unsafe { ffi::racer_connect(qp, &self.rail.raw, peer, psn, reads) }
-    }
+}
+
+impl Core {
     fn connection(&self, index: usize, serial: u64) -> io::Result<&ConnectionState> {
         self.connections
             .get(index)
@@ -1723,105 +1286,18 @@ impl Core {
         }
         Ok(())
     }
-    fn allocate(&mut self, conn: usize, phase: Phase) -> io::Result<usize> {
-        if self.free.is_empty() && self.slots.iter().any(|s| s.phase == Phase::Free) {
-            self.renewing = true;
-            return Err(error(
-                io::ErrorKind::NotConnected,
-                "RDMA retired capacity requires renewal; use HTTP",
-            ));
-        }
-        let i = self.free.pop().ok_or_else(full)?;
-        let s = &mut self.slots[i];
-        let Some(generation) = s.generation.checked_add(1) else {
-            return Err(full());
-        };
-        s.generation = generation;
-        s.conn = conn;
-        s.phase = phase;
-        s.wr = 0;
-        s.opcode = 0;
-        s.frame = Frame::default();
-        s.checksum = None;
-        s.negative = None;
-        s.descriptor = [0; 32];
-        s.wire_len = 0;
-        s.send_pending = false;
-        s.send_id = 0;
-        s.control_tag = 0;
-        s.early = None;
-        s.tracked = false;
-        s.deadline = crate::environment::now() + self.config.timeout;
-        self.book.slots[i].set((generation, false));
-        Ok(i)
-    }
-    fn ticket<T>(&mut self, i: usize) -> Ticket<T> {
-        self.slots[i].tracked = true;
-        Ticket {
-            book: self.book.clone(),
-            index: i,
-            generation: self.slots[i].generation,
-            active: true,
-            _kind: PhantomData,
-        }
-    }
-    fn validate<T>(&self, conn: usize, serial: u64, ticket: &Ticket<T>) -> io::Result<usize> {
-        self.connection(conn, serial)?;
-        if !ticket.active || !Rc::ptr_eq(&self.book, &ticket.book) {
-            return Err(invalid());
-        }
-        let s = &self.slots[ticket.index];
-        if s.conn != conn || s.generation != ticket.generation || s.phase == Phase::Free {
-            return Err(invalid());
-        }
-        Ok(ticket.index)
-    }
-    fn release(&mut self, i: usize) {
-        let s = &mut self.slots[i];
-        debug_assert_eq!(s.wr, 0);
-        debug_assert_eq!(s.send_id, 0);
-        s.phase = Phase::Free;
-        s.tracked = false;
-        s.early = None;
-        s.send_pending = false;
-        self.book.slots[i].set((s.generation, false));
-        // Never wrap an rkey on a live QP. The entire rail must quiesce before
-        // the provider may recycle any window index (including on another QP).
-        if s.uses == 255 {
-            self.renewing = true;
-        }
-        // After successful QP destruction, a never-bound MW has no exported
-        // capability to retire. Reuse its slot for reconnect without forcing
-        // unrelated confirmed sessions through rail-wide MW renewal. Bound MWs
-        // still require the existing all-QP quiescence/renewal discipline.
-        if s.uses < 255
-            && (!self.connections[s.conn].failed
-                || (s.uses == 0 && self.connections[s.conn].qp.is_null()))
-        {
-            self.free.push(i);
-        }
-        s.buffer.take();
-        s.fill.take();
-    }
+}
+
+impl Core {
     fn encode(&mut self, i: usize, metadata: &[u8]) -> io::Result<()> {
         debug_assert_eq!(self.slots[i].wr, 0);
         debug_assert_eq!(self.slots[i].send_id, 0);
+        let s = &mut self.slots[i];
         if metadata.len() > MAX_METADATA {
             return Err(invalid());
         }
-        let s = &mut self.slots[i];
         s.control_tag = 0;
-        s.frame.metadata = metadata.len() as u16;
-        let mut body = vec![0; HEADER + metadata.len()];
-        s.frame.encode(&mut body);
-        body[HEADER..].copy_from_slice(metadata);
-        let wire = body;
-        if wire.len() > CONTROL {
-            return Err(invalid());
-        }
-        s.wire_len = wire.len();
-        let bytes = self.control.bytes_mut(i);
-        bytes[..wire.len()].copy_from_slice(&wire);
+        s.wire_len = self.control.encode(i, &mut s.frame, metadata)?;
         Ok(())
     }
     fn post(&mut self, i: usize, op: u32) -> io::Result<()> {
@@ -1931,18 +1407,7 @@ impl Core {
         }
         self.slots[i].send_id = 0;
         match self.slots[i].phase {
-            Phase::RequestSend => {
-                if let Some(frame) = self.slots[i].early.take() {
-                    self.slots[i].frame = frame;
-                    self.slots[i].phase = if matches!(frame.kind, 4 | 7) {
-                        Phase::FailureReady
-                    } else {
-                        Phase::GrantReady
-                    };
-                } else {
-                    self.slots[i].phase = Phase::AwaitGrant;
-                }
-            }
+            Phase::RequestSend => self.slots[i].request_sent(),
             Phase::Advertise => {
                 if self.slots[i].early.take().is_some() {
                     self.slots[i].phase = Phase::Invalidate;
@@ -2017,147 +1482,9 @@ impl Core {
         }
         Ok(work)
     }
+}
 
-    fn fail(&mut self, conn: usize, reason: io::ErrorKind) -> io::Result<()> {
-        let c = &mut self.connections[conn];
-        let had_qp = !c.qp.is_null();
-        c.failed = true;
-        c.ready = false;
-        if let Some(channel) = c.channel.as_mut() {
-            channel.close();
-        }
-        if self.retiring_qps.is_some() {
-            return Ok(()); // The batch owns destruction; even fatal events only ACK.
-        }
-        let now = crate::environment::now();
-        if had_qp && c.cleanup_after.is_some_and(|d| now < d) {
-            return Ok(());
-        }
-
-        if !c.qp.is_null() {
-            // ERR alone and local invalidate are NOT quiescence proofs. Successful
-            // provider QP destruction stops both outgoing DMA and incoming READs.
-            // The C job owns ERR + destroy. EAGAIN includes both an outstanding
-            // job and bounded helper admission pressure; neither is quiescence.
-            let result = unsafe { ffi::racer_destroy_qp(self.device, c.qp) };
-            c.cleanup_after = Some(now + Duration::from_millis(100));
-            if result == libc::EAGAIN {
-                c.cleanup_after = Some(now + Duration::from_millis(10));
-                return Ok(());
-            }
-            check(result)?;
-            c.qp = ptr::null_mut();
-        }
-        c.cleanup_after = None;
-        // The MWs remain allocated and are retired (no rkey-index recycling).
-        // No future remote access can use the destroyed QP's type-2B bindings.
-        for i in 0..self.slots.len() {
-            let s = &mut self.slots[i];
-            if s.conn != conn || s.phase == Phase::Free {
-                continue;
-            }
-            if s.phase == Phase::Failed {
-                if self.book.slots[i].get().1 {
-                    self.release(i);
-                }
-                continue;
-            }
-            s.wr = 0;
-            s.send_id = 0;
-            s.send_pending = false;
-            s.failure = reason;
-            s.phase = Phase::Failed;
-            if !s.tracked || self.book.slots[i].get().1 {
-                self.release(i);
-            } else {
-                self.slots[i].buffer.take();
-                self.slots[i].fill.take();
-            }
-        }
-        if had_qp && !self.stopped && self.connections.iter().all(|c| c.qp.is_null()) {
-            self.renewing = true;
-        }
-
-        Ok(())
-    }
-
-    /// Destroy ALL QPs before freeing ANY MW, permitting provider key recycling.
-    /// MR/CQ stay registered; monotonic WR/ticket/session generations fence old CQEs.
-    fn renew_windows(&mut self, now: Instant) {
-        if !self.renewing || self.stopped || self.renew_after.is_some_and(|d| now < d) {
-            return;
-        }
-        self.renew_after = Some(now + Duration::from_millis(100));
-        for c in &mut self.connections {
-            c.local_renewal |= !c.failed;
-        }
-        for c in 0..self.connections.len() {
-            if self.fail(c, io::ErrorKind::ConnectionAborted).is_err() {
-                return; // Keep QPs, windows, control and DMA owners; no new allocation.
-            }
-        }
-        if self.stopped || self.connections.iter().any(|c| !c.qp.is_null()) {
-            return;
-        }
-        // All DMA is quiescent, including forgotten tracked tickets. Retire them
-        // without waiting for application polling, and rebuild admission once.
-        self.free.clear();
-        for s in &mut self.slots {
-            s.phase = Phase::Free;
-            s.tracked = false;
-            s.wr = 0;
-            s.send_id = 0;
-            s.send_pending = false;
-            s.buffer.take();
-            s.fill.take();
-        }
-        // Finish all deallocations before allocating any replacement. On a
-        // partial failure, null handles record progress; retries stay bounded.
-        if self.free_windows().is_err() {
-            return;
-        }
-        for i in 0..self.slots.len() {
-            if self.allocate_window(i).is_err() {
-                return;
-            }
-        }
-        self.free.extend((0..self.slots.len()).rev());
-        self.renewing = false;
-        self.renew_after = None;
-    }
-
-    fn free_windows(&mut self) -> io::Result<()> {
-        if self.retiring_windows.is_none() && self.slots.iter().all(|s| s.mw.is_null()) {
-            return Ok(());
-        }
-
-        let batch = self
-            .retiring_windows
-            .get_or_insert_with(|| self.slots.iter().map(|s| UnsafeCell::new(s.mw)).collect());
-        // SAFETY: all QPs are gone. The fixed table and MW owners remain alive
-        // and inaccessible to Rust until the helper has successfully joined.
-        check(unsafe {
-            ffi::racer_free_windows(self.device, batch.as_ptr().cast_mut().cast(), batch.len())
-        })?;
-        for s in &mut self.slots {
-            s.mw = ptr::null_mut();
-        }
-        self.retiring_windows = None;
-        Ok(())
-    }
-
-    fn allocate_window(&mut self, i: usize) -> io::Result<()> {
-        let s = &mut self.slots[i];
-        debug_assert!(s.mw.is_null());
-
-        s.mw = unsafe { ffi::racer_window(self.device, &mut s.key) };
-        if s.mw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        s.uses = 0;
-        Ok(())
-    }
-
+impl Core {
     fn received(&mut self, conn: usize, frame: Frame, metadata: &[u8]) -> io::Result<()> {
         if frame.session != self.connections[conn].peer {
             return Err(protocol());
@@ -2211,7 +1538,7 @@ impl Core {
                     // existing READs and advertised windows keep their deadlines.
                     let failure = channel.rejection(metadata);
                     self.slots[i].frame.kind =
-                        if failure.reason == crate::http_client::attempt::PeerReason::Unavailable {
+                        if failure.reason == crate::outcome::PeerReason::Unavailable {
                             7
                         } else {
                             4
@@ -2251,7 +1578,7 @@ impl Core {
                 }
                 let failure = PeerFailure::decode(&metadata[32..])?;
                 if frame.kind == 7
-                    && (failure.reason != crate::http_client::attempt::PeerReason::Unavailable
+                    && (failure.reason != crate::outcome::PeerReason::Unavailable
                         || failure.evidence.is_some())
                 {
                     return Err(protocol());
@@ -2518,107 +1845,6 @@ impl Core {
             .filter(|c| !c.qp.is_null())
             .filter_map(|c| c.cleanup_after)
             .min()
-    }
-    fn shutdown(&mut self) -> io::Result<()> {
-        self.stopped = true;
-        // Nonblocking, bounded event drain also services pending QP/CQ destroy.
-        // Even an event-channel error must not prevent reaping completed jobs.
-        let _ = self.events(32);
-        if self.connections.iter().any(|c| !c.qp.is_null()) {
-            let batch = self.retiring_qps.get_or_insert_with(|| {
-                self.connections
-                    .iter()
-                    .map(|c| UnsafeCell::new(c.qp))
-                    .collect()
-            });
-            // SAFETY: stopped admission; fail() cannot touch batch-owned QPs.
-            // C adopts any earlier single-QP job; all owners survive pending
-            // and partial errors. Only successful join releases the table.
-            check(unsafe {
-                ffi::racer_destroy_qps(self.device, batch.as_ptr().cast_mut().cast(), batch.len())
-            })?;
-            for c in &mut self.connections {
-                c.qp = ptr::null_mut();
-                c.cleanup_after = None;
-            }
-            self.retiring_qps = None;
-        }
-        for c in 0..self.connections.len() {
-            self.fail(c, io::ErrorKind::ConnectionAborted)?;
-        }
-        if self.connections.iter().any(|c| !c.qp.is_null()) {
-            return Err(full());
-        }
-        self.free_windows()?;
-
-        // With all QPs gone no new completion-channel events can be generated.
-        if !self.device.is_null() {
-            check(unsafe { ffi::racer_close(self.device) })?;
-            self.device = ptr::null_mut();
-        }
-        Ok(())
-    }
-}
-
-impl uring::CompletionSource for Source {
-    fn poll(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
-        for ticket in &mut self.polls {
-            if let Some(t) = ticket
-                && let Some(c) = ring.take_control(t)?
-            {
-                c.result?;
-                *ticket = None;
-            }
-        }
-        let mut owner = self.transport.owner.borrow_mut();
-        if owner.core.is_none() {
-            return Ok(uring::Work::default());
-        }
-        let core = owner.core()?;
-        let channels = core.poll_channels(ring, budget)?;
-        let mut work = core.progress(budget)?;
-        work.runnable |= channels.runnable;
-        work.deadline = work.deadline.into_iter().chain(channels.deadline).min();
-        Ok(work)
-    }
-    fn arm(&mut self, ring: &mut uring::Ring) -> io::Result<()> {
-        let mut owner = self.transport.owner.borrow_mut();
-        if owner.core.is_none() {
-            return Ok(());
-        }
-        let core = owner.core()?;
-        if core.stopped {
-            return Err(error(io::ErrorKind::NotConnected, "RDMA source stopped"));
-        }
-
-        check(unsafe { ffi::racer_notify(core.device) })?;
-        for i in 0..2 {
-            if self.polls[i].is_none() {
-                self.polls[i] = Some(ring.poll_fd(
-                    self.files.as_ref().unwrap()[i].clone().into(),
-                    uring::Readiness::Readable,
-                )?);
-            }
-        }
-        // uring::Driver rechecks CQ/application state after arming, before wait.
-        Ok(())
-    }
-    fn shutdown(&mut self, ring: &mut uring::Ring) -> io::Result<()> {
-        for ticket in &mut self.polls {
-            if let Some(t) = ticket.take() {
-                drop(ring.cancel(&t)?);
-            }
-        }
-        self.transport.shutdown()
-    }
-}
-impl Drop for Source {
-    fn drop(&mut self) {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transport.shutdown()));
-        if let Err(panic) = result {
-            std::mem::forget(panic);
-        }
     }
 }
 

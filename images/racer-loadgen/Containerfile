@@ -12,7 +12,12 @@ COPY internal/version/ internal/version/
 COPY pkg/racer/ pkg/racer/
 ARG TARGETOS
 ARG TARGETARCH
-RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -mod=readonly -o /racer-loadgen ./cmd/racer-loadgen
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -mod=readonly \
+    -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    -o /racer-loadgen ./cmd/racer-loadgen
 
 FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates \

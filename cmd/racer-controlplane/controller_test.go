@@ -57,7 +57,7 @@ func fakeKube(objects ...client.Object) client.Client {
 	_ = machina.AddToScheme(scheme)
 	_ = racerapi.AddToScheme(scheme)
 
-	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&racerapi.P2PCache{}).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, objectUniverses).Build()
+	return withTypedConfigMapLists(fake.NewClientBuilder(), scheme).WithStatusSubresource(&racerapi.P2PCache{}).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, objectUniverses).Build()
 }
 
 func buildGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches []racerapi.P2PCache) (*generation, *racerapi.P2PCache, error) {

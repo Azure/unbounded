@@ -8,6 +8,8 @@ use crate::{crypto, handlers::Backend, http_client as http, uring};
 use prost::Message;
 #[path = "credentials.rs"]
 pub mod credentials;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
@@ -21,10 +23,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -32,7 +31,9 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.rs"));
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.serde.rs"));
 }
+mod activation;
 mod storage_policy;
+pub use activation::Decision;
 pub use storage_policy::{StoragePolicyStatus, StorageRequest, StorageResult};
 const LIMIT: usize = 64 * 1024 * 1024;
 pub const MAX_SLOTS: u32 = 262144;
@@ -44,7 +45,29 @@ pub struct Trust {
     pub universe: [u8; 32],
     pub node: [u8; 32],
 }
+/// Editable wire input has no serving authority. Building consumes it and runs
+/// the same identity, geometry, endpoint, and resource checks as subscription.
+pub struct PreparedBuilder<'a> {
+    trust: &'a Trust,
+    snapshot: proto::Snapshot,
+}
+impl PreparedBuilder<'_> {
+    pub fn snapshot_mut(&mut self) -> &mut proto::Snapshot {
+        &mut self.snapshot
+    }
+    pub fn build(self) -> io::Result<Prepared> {
+        self.trust.prepare(proto::Configuration {
+            contents: Some(proto::configuration::Contents::Snapshot(self.snapshot)),
+        })
+    }
+}
 impl Trust {
+    pub fn builder(&self, snapshot: proto::Snapshot) -> PreparedBuilder<'_> {
+        PreparedBuilder {
+            trust: self,
+            snapshot,
+        }
+    }
     pub fn from_env() -> io::Result<Self> {
         fn identity(name: &str) -> io::Result<[u8; 32]> {
             let value = std::env::var(name).map_err(invalid)?;
@@ -143,16 +166,7 @@ impl Trust {
                 effective,
             });
         }
-        let mut eligibility = Eligibility::prepare(&config, &crypto, &peers);
-        for volume in &volumes {
-            let policy = Eligibility::prepare(&config, &crypto, &volume.peers);
-            eligibility
-                .volumes
-                .insert(volume.config.id.clone(), policy.peers);
-            eligibility
-                .routing
-                .insert(volume.config.id.clone(), volume.routing.clone());
-        }
+        let eligibility = Eligibility::prepare(&config, &peers, &volumes);
         Ok(Prepared {
             config,
             crypto,
@@ -163,12 +177,29 @@ impl Trust {
     }
 }
 pub struct PreparedVolume {
-    pub routing: Arc<crate::routing::Routing>,
-    pub config: proto::Volume,
-    pub cache_socket: crate::socket::UnixPath,
-    pub backend: Backend,
-    pub peers: BTreeMap<String, http::Endpoint>,
+    routing: Arc<crate::routing::Routing>,
+    config: proto::Volume,
+    cache_socket: crate::socket::UnixPath,
+    backend: Backend,
+    peers: BTreeMap<String, http::Endpoint>,
     effective: BTreeMap<String, (String, String)>,
+}
+impl PreparedVolume {
+    pub fn config(&self) -> &proto::Volume {
+        &self.config
+    }
+    pub fn routing(&self) -> &Arc<crate::routing::Routing> {
+        &self.routing
+    }
+    pub fn cache_socket(&self) -> crate::socket::UnixPath {
+        self.cache_socket
+    }
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+    pub fn peers(&self) -> &BTreeMap<String, http::Endpoint> {
+        &self.peers
+    }
 }
 
 fn effective_peers(
@@ -202,39 +233,48 @@ fn effective_peers(
     }
     Ok(result)
 }
+/// A validated, immutable generation. All serving and capability APIs borrow
+/// the same authoritative inputs. Use `Trust::builder` to edit unvalidated input.
+///
+/// ```compile_fail
+/// use racer_dataplane::control::Prepared;
+/// fn substitute(prepared: &mut Prepared) {
+///     prepared.config_snapshot().peers.clear();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use racer_dataplane::control::Prepared;
+/// fn substitute(prepared: &mut Prepared) {
+///     prepared.volumes()[0].config().peers.clear();
+/// }
+/// ```
 pub struct Prepared {
-    pub config: proto::Snapshot,
-    pub crypto: crypto::Snapshot,
-    pub peers: BTreeMap<String, http::Endpoint>,
-    pub volumes: Vec<PreparedVolume>,
-    // Keep the authorization inputs immutable even though callers
-    // can own/mutate the public staging fields above.
+    config: proto::Snapshot,
+    crypto: crypto::Snapshot,
+    peers: BTreeMap<String, http::Endpoint>,
+    volumes: Vec<PreparedVolume>,
     eligibility: Eligibility,
 }
 
 struct EligibleRecord {
     node: NodeId,
-    pod_uid: String,
-    backend: http::Endpoint,
+    peer_index: usize,
 }
 struct Eligibility {
-    config: proto::Snapshot,
-    crypto: crypto::Snapshot,
     local: NodeId,
     fabric: Option<FabricId>,
     peers: BTreeMap<String, EligibleRecord>,
     volumes: BTreeMap<String, BTreeMap<String, EligibleRecord>>,
-    routing: BTreeMap<String, Arc<crate::routing::Routing>>,
 }
 impl Eligibility {
     fn prepare(
         config: &proto::Snapshot,
-        crypto: &crypto::Snapshot,
         endpoints: &BTreeMap<String, http::Endpoint>,
+        volumes: &[PreparedVolume],
     ) -> Self {
         let local = NodeId::from_bytes(&config.node).expect("validated snapshot node");
         let fabric = FabricId::new(&config.fabric).ok();
-        let mut peers = BTreeMap::new();
         // Case variants are the same node. Ambiguous duplicate node identities
         // remain HTTP-only rather than choosing an endpoint by iteration order.
         let mut counts = BTreeMap::new();
@@ -243,46 +283,45 @@ impl Eligibility {
                 *counts.entry(node).or_insert(0usize) += 1;
             }
         }
-        if let Some(fabric) = &fabric {
-            for peer in &config.peers {
-                let Ok(node) = peer.id.parse::<NodeId>() else {
-                    continue;
-                };
-                let Some(backend) = endpoints.get(&peer.id) else {
-                    continue;
-                };
-                let Some(address) = backend.address().tcp() else {
-                    continue;
-                };
-                if node == local
-                    || counts[&node] != 1
-                    || peer.fabric != fabric.as_str()
-                    || address.port() == 0
-                    || address.ip().is_unspecified()
-                    || address.ip().is_multicast()
-                    || address.ip() == std::net::Ipv4Addr::BROADCAST
-                    || backend.host().len() > MAX_AUTHORITY_LEN
-                {
-                    continue;
+        let records = |endpoints: &BTreeMap<String, http::Endpoint>| {
+            let mut peers = BTreeMap::new();
+            if let Some(fabric) = &fabric {
+                for (peer_index, peer) in config.peers.iter().enumerate() {
+                    let Ok(node) = peer.id.parse::<NodeId>() else {
+                        continue;
+                    };
+                    let Some(backend) = endpoints.get(&peer.id) else {
+                        continue;
+                    };
+                    let Some(address) = backend.address().tcp() else {
+                        continue;
+                    };
+                    if node == local
+                        || counts[&node] != 1
+                        || peer.fabric != fabric.as_str()
+                        || address.port() == 0
+                        || address.ip().is_unspecified()
+                        || address.ip().is_multicast()
+                        || address.ip() == std::net::Ipv4Addr::BROADCAST
+                        || backend.host().len() > MAX_AUTHORITY_LEN
+                    {
+                        continue;
+                    }
+                    peers.insert(peer.id.clone(), EligibleRecord { node, peer_index });
                 }
-                peers.insert(
-                    peer.id.clone(),
-                    EligibleRecord {
-                        node,
-                        pod_uid: peer.pod_uid.clone(),
-                        backend: backend.clone(),
-                    },
-                );
             }
-        }
+            peers
+        };
+        let peers = records(endpoints);
+        let volumes = volumes
+            .iter()
+            .map(|v| (v.config.id.clone(), records(&v.peers)))
+            .collect();
         Self {
-            config: config.clone(),
-            crypto: crypto.clone(),
             local,
             fabric,
             peers,
-            volumes: BTreeMap::new(),
-            routing: BTreeMap::new(),
+            volumes,
         }
     }
 }
@@ -297,9 +336,10 @@ impl Eligibility {
 /// let peer = EligiblePeer {};
 /// ```
 pub struct EligiblePeer<'a> {
-    eligibility: &'a Eligibility,
+    prepared: &'a Prepared,
     id: &'a str,
     record: &'a EligibleRecord,
+    endpoint: &'a http::Endpoint,
 }
 impl<'a> EligiblePeer<'a> {
     /// Configured ID spelling (volume lists use exact strings).
@@ -310,26 +350,53 @@ impl<'a> EligiblePeer<'a> {
         self.record.node
     }
     pub fn pod_uid(&self) -> &str {
-        &self.record.pod_uid
+        &self.prepared.config.peers[self.record.peer_index].pod_uid
     }
     pub fn local_node(&self) -> NodeId {
-        self.eligibility.local
+        self.prepared.local_node()
     }
     pub fn fabric(&self) -> &'a FabricId {
-        self.eligibility.fabric.as_ref().unwrap()
+        self.prepared.fabric().unwrap()
     }
     /// Reuse the numeric endpoint and its canonical IP Host authority.
     pub fn endpoint(&self) -> &'a http::Endpoint {
-        &self.record.backend
+        self.endpoint
     }
     pub fn config_snapshot(&self) -> &'a proto::Snapshot {
-        &self.eligibility.config
+        self.prepared.config_snapshot()
     }
     pub fn crypto_snapshot(&self) -> &'a crypto::Snapshot {
-        &self.eligibility.crypto
+        self.prepared.crypto_snapshot()
     }
 }
 impl Prepared {
+    fn validate_successor(&self, old: &Self) -> io::Result<()> {
+        for volume in &self.volumes {
+            if let Some(previous) = old.volumes.iter().find(|v| v.config.id == volume.config.id) {
+                let a = &previous.routing.geometry;
+                let b = &volume.routing.geometry;
+                if a.slot_count() != b.slot_count()
+                    || b.epoch() < a.epoch()
+                    || (a.epoch() == b.epoch()
+                        && (previous.config.topology != volume.config.topology
+                            || previous.config.origin_socket != volume.config.origin_socket
+                            || previous.config.peers != volume.config.peers
+                            || previous.effective != volume.effective))
+                {
+                    return Err(invalid(
+                        "routing changes require a newer epoch and fixed slot count",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn peers(&self) -> &BTreeMap<String, http::Endpoint> {
+        &self.peers
+    }
+    pub fn volumes(&self) -> &[PreparedVolume] {
+        &self.volumes
+    }
     pub fn peer_identity(&self, id: &str) -> io::Result<crate::tls::PeerIdentity> {
         let peer = self
             .config_snapshot()
@@ -346,7 +413,10 @@ impl Prepared {
         crate::tls::PeerIdentity::new(&universe, &peer.id, &peer.pod_uid)
     }
     pub fn routing_for_volume(&self, volume: &str) -> Option<&Arc<crate::routing::Routing>> {
-        self.eligibility.routing.get(volume)
+        self.volumes
+            .iter()
+            .find(|v| v.config.id == volume)
+            .map(|v| &v.routing)
     }
     pub fn local_node(&self) -> NodeId {
         self.eligibility.local
@@ -357,17 +427,18 @@ impl Prepared {
     }
     /// Original, validated inputs used for eligibility and negotiation.
     pub fn config_snapshot(&self) -> &proto::Snapshot {
-        &self.eligibility.config
+        &self.config
     }
     pub fn crypto_snapshot(&self) -> &crypto::Snapshot {
-        &self.eligibility.crypto
+        &self.crypto
     }
     pub fn eligible_peer(&self, id: &str) -> Option<EligiblePeer<'_>> {
         let (id, record) = self.eligibility.peers.get_key_value(id)?;
         Some(EligiblePeer {
-            eligibility: &self.eligibility,
+            prepared: self,
             id,
             record,
+            endpoint: &self.peers[id],
         })
     }
     /// Lookup an incoming authenticated node claim in configured direct peers.
@@ -380,9 +451,10 @@ impl Prepared {
             .peers
             .iter()
             .map(|(id, record)| EligiblePeer {
-                eligibility: &self.eligibility,
+                prepared: self,
                 id,
                 record,
+                endpoint: &self.peers[id],
             })
     }
     /// Eligible subset in the volume's configured order; unknown volume is empty.
@@ -413,10 +485,12 @@ impl Prepared {
     }
     fn eligible_direct_peer_for_volume(&self, volume: &str, id: &str) -> Option<EligiblePeer<'_>> {
         let (id, record) = self.eligibility.volumes.get(volume)?.get_key_value(id)?;
+        let volume = self.volumes.iter().find(|v| v.config.id == volume)?;
         Some(EligiblePeer {
-            eligibility: &self.eligibility,
+            prepared: self,
             id,
             record,
+            endpoint: &volume.peers[id],
         })
     }
     pub fn eligible_node_for_volume(&self, volume: &str, node: NodeId) -> Option<EligiblePeer<'_>> {
@@ -440,34 +514,14 @@ pub struct Updates {
     boot: Mutex<Option<[u8; 32]>>,
     #[cfg(test)]
     subscription_probe: Arc<tests::Probe>,
-    revision: AtomicU64,
-    applied_epoch: AtomicU64,
-    current: Mutex<Option<Arc<Prepared>>>,
     wakes: Mutex<Vec<Arc<uring::Wake>>>,
-    activation: Mutex<Activation>,
+    coordinator: Mutex<activation::Coordinator>,
     last_error: Mutex<Option<String>>,
     credentials: Mutex<Option<Arc<credentials::Provider>>>,
-    active: Mutex<Option<Arc<Prepared>>>,
     #[cfg(test)]
     before_active_publication: Mutex<Option<Arc<tests::activation_tests::ActivationPause>>>,
     #[cfg(test)]
     before_candidate_replacement: Mutex<Option<Arc<tests::activation_tests::ActivationPause>>>,
-}
-#[derive(Default)]
-struct Activation {
-    revision: u64,
-    epoch: u64,
-    workers: usize,
-    ready: BTreeSet<usize>,
-    activated: BTreeSet<usize>,
-    rejected: bool,
-    failed: BTreeSet<usize>,
-    aborted: bool,
-    phase: u32,
-    received: BTreeSet<usize>,
-    coordinated: bool,
-    retired: BTreeSet<usize>,
-    receive_granted: bool,
 }
 impl Updates {
     pub(crate) fn boot(&self) -> io::Result<[u8; 32]> {
@@ -488,18 +542,16 @@ impl Updates {
         self.wake_all();
     }
     fn forward_eligible(&self, digest: &str, unpublished: bool) -> String {
-        let a = self.activation.lock().unwrap();
-        if !a.receive_granted || (unpublished && a.revision > 0 && a.retired.len() == a.workers) {
+        if self
+            .coordinator
+            .lock()
+            .unwrap()
+            .forward_eligible(unpublished)
+        {
             digest.to_owned()
         } else {
             String::new()
         }
-    }
-
-    fn correction_allowed(a: &Activation, empty: bool, from: u64, to: u64) -> bool {
-        to > from
-            && ((empty || from == a.revision) && !a.receive_granted
-                || (from > a.revision && a.retired.len() == a.workers))
     }
 
     fn forward_command(
@@ -524,54 +576,37 @@ impl Updates {
         {
             return Err(invalid("forward correction binding mismatch"));
         }
-        self.activation.lock().unwrap().coordinated = true;
-        self.publish_forward(next, Some(command.forward_revision))?;
-        self.command_phase(command.revision, command.phase)
+        self.coordinator.lock().unwrap().command(
+            next,
+            command.phase,
+            Some(command.forward_revision),
+            || self.before_replacement(),
+        )?;
+        self.wake_all();
+        Ok(())
     }
 
     /// Last epoch activated by all workers; pending/rejected updates retain it.
     pub fn applied_epoch(&self) -> u64 {
-        self.applied_epoch.load(Ordering::Relaxed)
+        self.coordinator.lock().unwrap().applied_epoch()
     }
     pub fn latest(&self, revision: u64) -> Option<Arc<Prepared>> {
-        if self.revision.load(Ordering::Acquire) == revision {
-            return None;
-        }
-        self.current.lock().unwrap().clone()
+        self.coordinator.lock().unwrap().latest(revision)
+    }
+    pub fn active(&self) -> Option<Arc<Prepared>> {
+        self.coordinator.lock().unwrap().active()
     }
     pub fn status(&self) -> serde_json::Value {
-        let candidate = self.current.lock().unwrap();
-        let activation = self.activation.lock().unwrap();
-        let active = self.active.lock().unwrap();
-        let ready = active.as_ref().is_some_and(|p| {
-            (p.config.idle || !p.config.volumes.is_empty())
-                && candidate.as_ref().is_none_or(|c| {
-                    c.config.volumes.iter().all(|v| {
-                        p.config
-                            .volumes
-                            .iter()
-                            .any(|a| a.id == v.id && a.cache_socket == v.cache_socket)
-                    })
-                })
-        });
-        serde_json::json!({
-            "ready": ready,
-            "activeRevision": active.as_ref().map_or(0, |p| p.config.revision),
-            "candidateRevision": activation.revision,
-            "phase": activation.phase, "receiveReadyWorkers": activation.received.len(),
-            "retiredWorkers": activation.retired.len(),
-            "preparedWorkers": activation.ready.len(), "activatedWorkers": activation.activated.len(),
-            "workers": activation.workers, "rejected": activation.rejected,
-            "volumes": active.as_ref().map(|p| p.config.volumes.iter().map(|v| serde_json::json!({"id":v.id,"epoch":v.topology.as_ref().map_or(0, |t|t.epoch),"ready":true})).collect::<Vec<_>>()).unwrap_or_default(),
-            "storage": self.storage_policy_status().json(),
-            "lastError": *self.last_error.lock().unwrap(),
-            "tls": self.credentials().map(|p| p.status())
-        })
+        let mut status = self.coordinator.lock().unwrap().status();
+        status["storage"] = self.storage_policy_status().json();
+        status["lastError"] = serde_json::json!(*self.last_error.lock().unwrap());
+        status["tls"] = serde_json::json!(self.credentials().map(|p| p.status()));
+        status
     }
 
     pub fn subscribe(&self, wake: Arc<uring::Wake>) {
         self.wakes.lock().unwrap().push(wake);
-        self.activation.lock().unwrap().workers += 1;
+        self.coordinator.lock().unwrap().subscribe();
     }
     fn wake_all(&self) {
         for wake in self.wakes.lock().unwrap().iter() {
@@ -579,258 +614,71 @@ impl Updates {
         }
     }
     pub fn staged(&self, revision: u64, worker: usize, success: bool) {
-        let mut activation = self.activation.lock().unwrap();
-        if activation.revision != revision
-            || activation.aborted
-            || activation.ready.contains(&worker)
-        {
-            return;
-        }
-        if success {
-            activation.ready.insert(worker);
-            activation.failed.remove(&worker);
-        } else {
-            activation.failed.insert(worker);
-        }
-        activation.rejected = !activation.failed.is_empty();
-        drop(activation);
+        self.coordinator
+            .lock()
+            .unwrap()
+            .staged(revision, worker, success);
         self.wake_all();
     }
-    /// None: staging/retrying; Some(false): superseded/aborted; Some(true): ready.
-    pub fn decision(&self, revision: u64) -> Option<bool> {
-        let activation = self.activation.lock().unwrap();
-        if activation.revision != revision || activation.aborted {
-            Some(false)
-        } else if activation.ready.len() == activation.workers
-            && (!activation.coordinated
-                || (activation.phase >= 3 && activation.received.len() == activation.workers))
-        {
-            Some(true)
-        } else {
-            None
-        }
+    pub fn decision(&self, revision: u64) -> Decision {
+        self.coordinator.lock().unwrap().decision(revision)
     }
     pub fn activated(&self, revision: u64, worker: usize) {
-        // Match publish/status lock order: current -> activation -> active.
-        // Pin the candidate until its final acknowledgment and active swap are
-        // complete; a successor must not publish (or activate) between them.
-        let current = self.current.lock().unwrap();
-        let mut activation = self.activation.lock().unwrap();
-        if activation.revision == revision
-            && !activation.rejected
-            && activation.ready.len() == activation.workers
-        {
-            activation.activated.insert(worker);
-            if activation.activated.len() == activation.workers {
+        self.coordinator
+            .lock()
+            .unwrap()
+            .activated(revision, worker, || {
                 #[cfg(test)]
-                {
-                    let pause = self.before_active_publication.lock().unwrap().take();
-                    if let Some(pause) = pause {
-                        pause.wait();
-                    }
+                if let Some(pause) = self.before_active_publication.lock().unwrap().take() {
+                    pause.wait();
                 }
-                *self.active.lock().unwrap() = current.clone();
-                self.applied_epoch
-                    .store(activation.epoch, Ordering::Relaxed);
-            }
-        }
+            });
     }
     pub fn receive_decision(&self, revision: u64) -> bool {
-        let mut a = self.activation.lock().unwrap();
-        let granted = a.revision == revision
-            && a.coordinated
-            && !a.rejected
-            && a.phase >= 2
-            && a.ready.len() == a.workers;
-        a.receive_granted |= granted;
-        granted
+        self.coordinator.lock().unwrap().receive_decision(revision)
     }
     pub fn received(&self, revision: u64, worker: usize) {
-        let mut a = self.activation.lock().unwrap();
-        if a.revision == revision && !a.aborted {
-            a.received.insert(worker);
-        }
-        drop(a);
+        self.coordinator.lock().unwrap().received(revision, worker);
         self.wake_all();
     }
     pub fn retired(&self, revision: u64, worker: usize) {
-        let mut a = self.activation.lock().unwrap();
-        if a.revision == revision && a.activated.contains(&worker) {
-            a.retired.insert(worker);
-        }
+        self.coordinator.lock().unwrap().retired(revision, worker);
     }
     pub(crate) fn command(&self, next: Prepared, phase: u32) -> io::Result<()> {
-        if !(1..=5).contains(&phase) {
-            return Err(invalid("unknown control phase"));
-        }
-        let revision = next.config.revision;
-        // Mark coordinated before exposing a newly published revision to workers.
-        {
-            let mut a = self.activation.lock().unwrap();
-            // A durable newer candidate supersedes a preparation that never
-            // acquired serving authority, even if the Abort response was lost.
-            if a.coordinated && revision > a.revision && a.phase < 2 {
-                a.rejected = true;
-                a.aborted = true;
-            }
-            a.coordinated = true;
-        }
-        self.publish(next)?;
-        self.command_phase(revision, phase)
+        self.coordinator
+            .lock()
+            .unwrap()
+            .command(next, phase, None, || self.before_replacement())?;
+        self.wake_all();
+        Ok(())
     }
     fn command_phase(&self, revision: u64, phase: u32) -> io::Result<()> {
-        if !(1..=5).contains(&phase) {
-            return Err(invalid("unknown control phase"));
-        }
-        let mut a = self.activation.lock().unwrap();
-        if a.revision != revision {
-            return Err(invalid("command revision mismatch"));
-        }
-        if phase == 5 {
-            if a.phase >= 2 {
-                return Err(invalid("cannot abort after receive commitment"));
-            }
-            a.rejected = true;
-            a.aborted = true;
-        } else if a.aborted {
-            return Err(invalid("configuration aborted"));
-        } else {
-            a.phase = a.phase.max(phase);
-        }
-        drop(a);
+        self.coordinator
+            .lock()
+            .unwrap()
+            .command_phase(revision, phase)?;
         self.wake_all();
         Ok(())
     }
     fn acknowledged_phase(&self) -> u32 {
-        let a = self.activation.lock().unwrap();
-        if a.rejected {
-            return 0;
-        }
-        if a.activated.len() == a.workers {
-            return if a.phase >= 4 && a.retired.len() == a.workers {
-                4
-            } else {
-                3
-            };
-        }
-        if a.received.len() == a.workers {
-            return 2;
-        }
-        if a.ready.len() == a.workers {
-            return 1;
-        }
-        0
+        self.coordinator.lock().unwrap().acknowledged_phase()
     }
     pub fn set_lifecycle(&self, lifecycle: Arc<crate::lifecycle::Lifecycle>) {
         assert!(self.lifecycle.set(lifecycle).is_ok());
     }
     pub fn publish(&self, next: Prepared) -> io::Result<()> {
-        self.publish_forward(next, None)
-    }
-    fn publish_forward(&self, next: Prepared, forward: Option<u64>) -> io::Result<()> {
-        let mut current = self.current.lock().unwrap();
-        // A retry must not clear rejection between eligibility and replacement.
-        let mut activation = self.activation.lock().unwrap();
-        let correction = forward.is_some_and(|r| {
-            Self::correction_allowed(&activation, current.is_none(), r, next.config.revision)
-        });
-        if forward.is_some() && !correction {
-            return Err(invalid("forward correction has receive obligation"));
-        }
-        if let Some(old) = current.as_ref() {
-            if next.config.revision < old.config.revision {
-                return Err(invalid("configuration rollback"));
-            }
-            if next.config.revision == old.config.revision {
-                return if next.config == old.config {
-                    Ok(())
-                } else {
-                    Err(invalid("revision reused for different contents"))
-                };
-            }
-            if activation.coordinated
-                && !correction
-                && (!activation.rejected || activation.phase >= 2)
-                && activation.retired.len() != activation.workers
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "previous generation still draining",
-                ));
-            }
-            if !correction
-                && !activation.rejected
-                && activation.activated.len() != activation.workers
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "previous snapshot still activating",
-                ));
-            }
-            #[cfg(test)]
-            if let Some(pause) = self.before_candidate_replacement.lock().unwrap().take() {
-                pause.wait();
-            }
-            for volume in &next.config.volumes {
-                if let Some(previous) = old.config.volumes.iter().find(|v| v.id == volume.id) {
-                    let a = &old
-                        .volumes
-                        .iter()
-                        .find(|v| v.config.id == volume.id)
-                        .unwrap()
-                        .routing
-                        .geometry;
-                    let b = &next
-                        .volumes
-                        .iter()
-                        .find(|v| v.config.id == volume.id)
-                        .unwrap()
-                        .routing
-                        .geometry;
-                    if a.slot_count() != b.slot_count()
-                        || b.epoch() < a.epoch()
-                        || (a.epoch() == b.epoch()
-                            && (previous.topology != volume.topology
-                                || previous.origin_socket != volume.origin_socket
-                                || previous.peers != volume.peers
-                                || old
-                                    .volumes
-                                    .iter()
-                                    .find(|v| v.config.id == volume.id)
-                                    .unwrap()
-                                    .effective
-                                    != next
-                                        .volumes
-                                        .iter()
-                                        .find(|v| v.config.id == volume.id)
-                                        .unwrap()
-                                        .effective))
-                    {
-                        return Err(invalid(
-                            "routing changes require a newer epoch and fixed slot count",
-                        ));
-                    }
-                }
-            }
-        }
-        let revision = next.config.revision;
-        activation.revision = revision;
-        activation.epoch = next.config.epoch;
-        activation.ready.clear();
-        activation.activated.clear();
-        activation.rejected = false;
-        activation.failed.clear();
-        activation.aborted = false;
-        activation.phase = 0;
-        activation.received.clear();
-        activation.retired.clear();
-        activation.receive_granted = false;
-        *current = Some(Arc::new(next));
-        self.revision.store(revision, Ordering::Release);
-        drop(activation);
-        drop(current);
+        self.coordinator
+            .lock()
+            .unwrap()
+            .publish(next, None, || self.before_replacement())?;
         self.wake_all();
         Ok(())
+    }
+    fn before_replacement(&self) {
+        #[cfg(test)]
+        if let Some(pause) = self.before_candidate_replacement.lock().unwrap().take() {
+            pause.wait();
+        }
     }
 }
 #[derive(Clone)]
@@ -905,11 +753,11 @@ struct Rejection {
 }
 impl Rejection {
     fn check_revision(&self, updates: &Updates, revision: u64) -> io::Result<()> {
-        let a = updates.activation.lock().unwrap();
+        let a = updates.coordinator.lock().unwrap();
         // Always permit the accepted candidate's terminal commands, even while
         // a newer unpublished candidate is rejected. Nothing older may change
         // preparation/rejection feedback or invoke preparation again.
-        if revision < a.revision || (revision < self.revision && revision != a.revision) {
+        if revision < a.revision() || (revision < self.revision && revision != a.revision()) {
             return Err(invalid("stale control command revision"));
         }
         Ok(())
@@ -927,9 +775,9 @@ impl Rejection {
         }
     }
     fn headers(&self, updates: &Updates, digest: &str, boot: &str) -> Vec<(&'static str, String)> {
-        let a = updates.activation.lock().unwrap();
-        let pending = a.receive_granted && a.retired.len() != a.workers;
-        let unpublished = !pending && self.revision > a.revision && !self.digest.is_empty();
+        let a = updates.coordinator.lock().unwrap();
+        let pending = a.receive_pending();
+        let unpublished = !pending && self.revision > a.revision() && !self.digest.is_empty();
         drop(a);
         let reported = if unpublished { &self.digest } else { digest };
         let mut headers = vec![

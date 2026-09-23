@@ -4,6 +4,64 @@
 use super::*;
 
 #[test]
+fn early_reply_waits_for_request_send_and_slot_generation_never_wraps() {
+    let now = Instant::now();
+    let mut slot = Slot::new(now);
+    slot.uses = 254;
+    slot.key = 123;
+    assert_eq!(slot.begin(2, Phase::RequestSend, now).unwrap(), 1);
+    slot.frame.request = 42;
+    let reply = Frame {
+        kind: 2,
+        request: 42,
+        key: 99,
+        ..Frame::default()
+    };
+    slot.accept_reply(reply, Phase::GrantReady);
+    assert!(slot.phase == Phase::RequestSend);
+    assert_eq!(
+        slot.frame.key, 0,
+        "TLS still owns the request representation"
+    );
+    slot.request_sent();
+    assert!(slot.phase == Phase::GrantReady);
+    assert_eq!(slot.frame.key, 99);
+    assert_eq!(slot.uses, 254, "a ticket generation cannot renew an rkey");
+    assert_eq!(slot.key, 123);
+
+    slot.generation = u64::MAX;
+    assert!(slot.begin(3, Phase::Incoming, now).is_err());
+    assert_eq!(slot.conn, 2);
+    assert!(slot.phase == Phase::GrantReady);
+    assert_eq!(slot.frame.key, 99);
+}
+
+#[test]
+fn control_arena_preserves_wire_bytes_and_rejects_oversized_metadata() {
+    let mut arena = ControlArena::new(1);
+    let metadata = vec![0x5a; MAX_METADATA];
+    let mut frame = Frame {
+        kind: 1,
+        request: 17,
+        ..Frame::default()
+    };
+    let len = arena.encode(0, &mut frame, &metadata).unwrap();
+    assert_eq!(len, CONTROL);
+    let mut expected = vec![0; len];
+    frame.encode(&mut expected);
+    expected[HEADER..].copy_from_slice(&metadata);
+    assert_eq!(arena.bytes(0).as_slice(), expected);
+    let before = *arena.bytes(0);
+    assert!(
+        arena
+            .encode(0, &mut frame, &vec![0; MAX_METADATA + 1])
+            .is_err()
+    );
+    assert_eq!(*arena.bytes(0), before);
+    assert_eq!(frame.metadata as usize, MAX_METADATA);
+}
+
+#[test]
 fn readiness25_native_blocked_jobs_event_ack_and_context_close() {
     use std::io::Write;
     use std::process::{Command, Stdio};

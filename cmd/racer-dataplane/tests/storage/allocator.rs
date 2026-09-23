@@ -528,15 +528,38 @@ fn kernel_checkpoint_read_and_abandoned_read() {
     };
     a.insert_payload(key(1), buffer(&pool, 1, PAGE_SIZE, 42), None)
         .unwrap();
+    let generation = a.generation();
+    assert_eq!(a.charged, WIDE);
+    let mut barriers = [false; 3];
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !a.is_idle() {
         ring.progress().unwrap();
         let work = a.poll(&mut ring, 32).unwrap();
+        let barrier = match a.pipeline {
+            Some(Pipeline::DataSync(_)) => Some(0),
+            Some(Pipeline::DataSynced(_)) => Some(1),
+            Some(Pipeline::MagicWritten(_)) => Some(2),
+            _ => None,
+        };
+        if let Some(barrier) = barrier {
+            barriers[barrier] = true;
+            assert_eq!(
+                a.generation(),
+                generation,
+                "root published before final sync"
+            );
+            assert_eq!(a.charged, WIDE, "admission released before final sync");
+            assert!(a.checkpoint_permit.is_some());
+        }
         assert!(std::time::Instant::now() < deadline);
         if !work.runnable && !a.is_idle() {
             ring.wait(Some(deadline)).unwrap();
         }
     }
+    assert_eq!(barriers, [true; 3]);
+    assert_eq!(a.generation(), generation + 1);
+    assert_eq!(a.charged, 0);
+    assert!(a.checkpoint_permit.is_none());
     let lease = a.lookup(&key(1), 0).unwrap();
     assert!(lease.buffer().is_none());
     let fill = pool.stage(buffers::Key::new(key(2))).unwrap();

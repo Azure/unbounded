@@ -11,7 +11,7 @@
 //! manager admission checks generation/policy and never reinstalls the session.
 use crate::{
     cache::{Cache, Namespace},
-    control::{Prepared, Updates},
+    control::{Decision, Prepared, Updates},
     handlers::{Handler, Peer},
     http::Progress,
     http_server as http, negotiation,
@@ -31,7 +31,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod generation;
+mod listeners;
 mod storage;
+mod topology;
+use generation::Generation;
 pub use storage::{StorageCoordinator, StorageHandle, StoragePath, validate_startup_memory};
 
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -411,70 +415,6 @@ impl Manager {
     }
 }
 
-struct Generation {
-    volume: String,
-    handlers: Vec<Rc<RefCell<Handler>>>,
-    _config: Arc<Prepared>,
-    manager: Option<RefCell<Manager>>,
-    active: Cell<bool>,
-    drain: Cell<Option<Instant>>,
-    expired: Cell<bool>,
-    identity: [u8; 32],
-}
-impl Generation {
-    fn retire(&self, now: Instant) {
-        self.active.set(false);
-        // Reusing a removed listener must not renew its old generations' leases.
-        if self.drain.get().is_none() {
-            self.drain.set(Some(now + DRAIN_TIMEOUT));
-        }
-        if let Some(manager) = &self.manager {
-            for path in &mut manager.borrow_mut().outbound {
-                path.client = None;
-            }
-        }
-    }
-    fn expire(&self) {
-        self.active.set(false);
-        self.expired.set(true);
-        if let Some(manager) = &self.manager {
-            manager.borrow_mut().clear(&self.handlers);
-        }
-    }
-    fn poll(&self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
-        if self
-            .drain
-            .get()
-            .is_some_and(|d| crate::environment::now() >= d)
-        {
-            self.expire();
-        }
-        if self.expired.get() {
-            return Ok(uring::Work::default());
-        }
-        let mut work = uring::Work {
-            runnable: false,
-            deadline: self.drain.get(),
-        };
-        if let Some(manager) = &self.manager {
-            work.merge(manager.borrow_mut().poll(self, ring, budget));
-        }
-        for handler in &self.handlers {
-            let mut handler = handler.borrow_mut();
-            work.merge(handler.poll_background(ring, budget)?);
-            let negotiations = handler.take_negotiations();
-            if self.active.get()
-                && let Some(manager) = &self.manager
-            {
-                for (id, target) in negotiations {
-                    manager.borrow_mut().trigger(&id, &target);
-                    work.runnable = true;
-                }
-            }
-        }
-        Ok(work)
-    }
-}
 pub struct VolumeHandler {
     local: bool,
     current: Rc<Generation>,
@@ -493,9 +433,9 @@ impl http::Handler for PeerHandler {
                 io::Error::new(io::ErrorKind::PermissionDenied, "peer TLS identity missing")
             })?;
             let config = self.config.as_ref().ok_or_else(unavailable)?;
-            if identity.universe != hex_identity(&config.config.universe)
+            if identity.universe != hex_identity(&config.config_snapshot().universe)
                 || !config
-                    .config
+                    .config_snapshot()
                     .peers
                     .iter()
                     .any(|peer| peer.id == identity.node && peer.pod_uid == identity.pod_uid)
@@ -513,9 +453,9 @@ impl http::Handler for PeerHandler {
                 .map_err(io::Error::other)?
                 .to_owned();
             if !config
-                .volumes
+                .volumes()
                 .iter()
-                .any(|v| v.config.id == volume && v.peers.contains_key(&identity.node))
+                .any(|v| v.config().id == volume && v.peers().contains_key(&identity.node))
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -708,180 +648,6 @@ impl http::Handler for VolumeHandler {
         }
     }
 }
-// Worker-local socket reconciliation, independent of generation authority.
-
-impl Volumes {
-    // Validate the entire candidate before any bind/crypto attachment. A listener
-    // already accepts kernel traffic while merely staged, so rollback after a
-    // conflicting bind would be too late. Exact active/retired paths reuse the
-    // existing server, preserving accepted work and generation deadlines.
-    fn validate_listeners(&self, config: &Prepared) -> io::Result<()> {
-        for (index, volume) in config.volumes.iter().enumerate() {
-            let address = Address::Unix(volume.cache_socket);
-            let conflict = config.volumes[..index]
-                .iter()
-                .map(|v| (Address::Unix(v.cache_socket), "candidate"))
-                // An unarmed stage owns its sockets until abort/supersession.
-                // Preparation only reuses active/retired servers.
-                .chain(
-                    self.staged
-                        .iter()
-                        .flat_map(|s| s.listeners.keys().map(|&a| (a, "staged"))),
-                )
-                .find(|&(other, _)| address == other);
-            if let Some((other, state)) = conflict {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "volume {} listener {address} overlaps {state} listener {other}",
-                        volume.config.id
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    // Move the whole server: outstanding accept, accepted sockets and tasks all
-    // keep their original ring and pinned generations. Never bind a competitor.
-    fn reclaim_listener(&mut self, address: Address) {
-        if let Some((_, server)) = self.retired.remove(&address) {
-            assert!(!self.servers.contains_key(&address));
-            self.servers.insert(address, server);
-        }
-    }
-
-    fn commit(&mut self, staged: Staged) {
-        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
-        if let Some(server) = &mut self.peer_server {
-            server.handler_mut().config = Some(staged.config.clone());
-        }
-        let Staged {
-            generations,
-            mut listeners,
-            ..
-        } = staged;
-        let now = crate::environment::now();
-        // Everything that can fail has completed. No requests are polled between
-        // these mutations. Socket ownership is reconciled by address, not volume ID.
-        let removed: Vec<_> = self
-            .servers
-            .keys()
-            .filter(|a| !generations.contains_key(a))
-            .copied()
-            .collect();
-        for address in removed {
-            let mut server = self.servers.remove(&address).unwrap();
-            server.handler_mut().current.retire(now);
-            // Old peers remain addressable; ordinary ingress is disabled.
-            assert!(
-                self.retired
-                    .insert(address, (now + DRAIN_TIMEOUT, server))
-                    .is_none()
-            );
-        }
-        for (address, current) in generations {
-            self.reclaim_listener(address);
-            current.active.set(true);
-            if let Some(server) = self.servers.get_mut(&address) {
-                let handler = server.handler_mut();
-                handler
-                    .draining
-                    .retain(|g| !Rc::ptr_eq(g, &current) && !g.expired.get());
-                if Rc::ptr_eq(&handler.current, &current) {
-                    continue;
-                }
-                handler.current.retire(now);
-                let old = std::mem::replace(&mut handler.current, current);
-                if !old.expired.get() {
-                    handler.draining.push(old);
-                }
-                if handler.draining.len() > MAX_DRAINING {
-                    handler.draining.remove(0).expire();
-                }
-            } else {
-                self.servers.insert(
-                    address,
-                    http::Server::new(
-                        listeners.remove(&address).unwrap(),
-                        VolumeHandler {
-                            local: true,
-                            current,
-                            draining: Vec::new(),
-                        },
-                        http::Config::default(),
-                    ),
-                );
-            }
-        }
-    }
-
-    fn arm(&mut self, staged: &mut Staged) {
-        if staged.armed {
-            return;
-        }
-        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
-        // Receive authorization follows the coordinated receive barrier, before
-        // ordinary ingress activation. Existing tasks retain their generation.
-        if let Some(server) = &mut self.peer_server {
-            server.handler_mut().config = Some(staged.config.clone());
-        }
-        for (address, candidate) in &staged.generations {
-            self.reclaim_listener(*address);
-            if let Some(server) = self.servers.get_mut(address) {
-                server.handler_mut().draining.push(candidate.clone());
-            } else {
-                self.servers.insert(
-                    *address,
-                    http::Server::new(
-                        staged.listeners.remove(address).unwrap(),
-                        VolumeHandler {
-                            local: true,
-                            current: candidate.clone(),
-                            draining: Vec::new(),
-                        },
-                        http::Config::default(),
-                    ),
-                );
-            }
-        }
-        staged.armed = true;
-        self.updates.received(staged.revision, self.worker);
-    }
-
-    fn poll_retired(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
-        let now = crate::environment::now();
-        let mut work = uring::Work::default();
-        let mut closed = Vec::new();
-        for (address, (deadline, server)) in &mut self.retired {
-            let reserved = self
-                .staged
-                .as_ref()
-                .is_some_and(|stage| stage.generations.contains_key(address));
-            if now >= *deadline && !reserved {
-                server.handler_mut().expire();
-                server.shutdown(ring)?;
-                closed.push(*address);
-            } else {
-                // A ready, unarmed stage reserves the socket, not old authority.
-                // Expire generations at their original deadlines even while the
-                // stage waits. Abort/supersession releases the reservation above.
-                work.merge(server.handler_mut().poll_background(ring, budget)?);
-                work.merge(server.poll(ring, budget)?);
-                if now < *deadline {
-                    work.merge(uring::Work {
-                        runnable: false,
-                        deadline: Some(*deadline),
-                    });
-                }
-            }
-        }
-        for address in closed {
-            self.retired.remove(&address);
-        }
-        Ok(work)
-    }
-}
 impl Volumes {
     /// One immutable process-start catalog. Attempt registration once, only when
     /// useful. SO_REUSEPORT requires the same sparse catalog on every worker.
@@ -949,7 +715,7 @@ impl Volumes {
 
 pub struct Volumes {
     storage: Option<storage::Local>,
-    maintenance: bool,
+    topology_fence: topology::MaintenanceFence,
     receive_authority: Rc<RefCell<Option<Arc<Prepared>>>>,
     peer_server: Option<http::Server<PeerHandler>>,
     credential_revision: u64,
@@ -1025,7 +791,7 @@ impl Volumes {
     ) -> Self {
         Self {
             storage: None,
-            maintenance: false,
+            topology_fence: topology::MaintenanceFence::default(),
             receive_authority: Rc::new(RefCell::new(None)),
             peer_server: None,
             credential_revision: 0,
@@ -1058,121 +824,6 @@ impl Volumes {
         self.peer_ip = ip;
         self
     }
-    fn prepare(&mut self, config: Arc<Prepared>, ring: &mut uring::Ring) -> io::Result<()> {
-        self.validate_listeners(&config)?;
-        self.provision_rdma(&config, ring)?;
-        let crypto = {
-            let (worker, source) = self.crypto.attach_local(ring.pool(), ring.wake_handle())?;
-            let worker = Rc::new(RefCell::new(worker));
-            self.crypto_sources.push((Rc::downgrade(&worker), source));
-            Some(worker)
-        };
-        let mut generations = BTreeMap::new();
-        let mut listeners = BTreeMap::new();
-        for volume in &config.volumes {
-            let address = Address::Unix(volume.cache_socket);
-            if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
-                let path = volume.cache_socket;
-
-                {
-                    crate::socket_listener::SharedUnix::prepare_directory(path)?;
-                }
-                let listener = http::Listener::bind_unix(path)?;
-                listeners.insert(address, listener);
-            }
-            let namespace = Namespace::volume(
-                &config.config.universe,
-                &volume.config.id,
-                volume.config.cache_generation,
-                volume.backend.namespace(),
-            );
-            let mut handler =
-                Handler::shared(self.cache.clone(), volume.backend.clone(), namespace);
-            handler.set_crypto(crypto.clone());
-            handler.set_authentication(crate::http_auth::Policy {
-                universe: config.crypto.universe().bytes(),
-                node: config.local_node().bytes(),
-                peers: volume
-                    .peers
-                    .keys()
-                    .filter_map(|p| {
-                        p.parse::<crate::peer_identity::NodeId>()
-                            .ok()
-                            .map(|n| n.bytes())
-                    })
-                    .collect(),
-            });
-            handler.set_attempt_policy(volume.config.max_candidate_attempts.unwrap_or(3))?;
-            handler.set_routing(
-                volume.routing.clone(),
-                volume
-                    .config
-                    .peers
-                    .iter()
-                    .map(|id| (id.clone(), Peer::from_endpoint(volume.peers[id].clone())))
-                    .collect(),
-            );
-            if let Some(provider) = self.updates.credentials() {
-                let identities = config
-                    .config
-                    .peers
-                    .iter()
-                    .map(|peer| {
-                        Ok((
-                            peer.id.clone(),
-                            crate::tls::PeerIdentity::new(
-                                &hex_identity(&config.config.universe),
-                                &peer.id,
-                                &peer.pod_uid,
-                            )?,
-                        ))
-                    })
-                    .collect::<io::Result<BTreeMap<_, _>>>()?;
-                handler.set_peer_tls(&volume.config.id, provider, &identities);
-            }
-            let handlers = vec![Rc::new(RefCell::new(handler))];
-            let generation = Rc::new(Generation {
-                volume: volume.config.id.clone(),
-                identity: volume.routing.identity,
-                handlers,
-                _config: config.clone(),
-                manager: if let Some(rails) = &self.rails
-                    && config.fabric().is_some()
-                {
-                    Some(RefCell::new(Manager {
-                        context: Rc::new(
-                            negotiation::Context::new(
-                                config.clone(),
-                                &volume.config.id,
-                                self.worker as u64,
-                                ROUTING,
-                            )?
-                            .with_credentials(self.updates.credentials())
-                            .with_authority(self.receive_authority.clone()),
-                        ),
-                        rails: rails.clone(),
-                        outbound: Vec::new(),
-                        inbound: BTreeMap::new(),
-                        live: Vec::new(),
-                    }))
-                } else {
-                    None
-                },
-                active: Cell::new(false),
-                drain: Cell::new(None),
-                expired: Cell::new(false),
-            });
-            generations.insert(Address::Unix(volume.cache_socket), generation);
-        }
-        self.staged = Some(Staged {
-            config: config.clone(),
-            revision: config.config.revision,
-            generations,
-            listeners,
-            armed: false,
-        });
-        Ok(())
-    }
     pub fn poll(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
         self.install_credentials()?;
         let mut work = self.poll_storage(ring)?;
@@ -1182,110 +833,14 @@ impl Volumes {
                 .poll(ring, budget)
                 .map_err(io::Error::other)?,
         );
-        if !self.maintenance {
-            if !self.stopping
-                && let Some(config) = self.updates.latest(self.revision)
-            {
-                self.staged = None;
-                self.revision = config.config.revision;
-                self.preparing = Some((config, Retry::new(crate::environment::now())));
-            }
-            if let Some((config, mut retry)) = self.preparing.take()
-                && self.updates.decision(self.revision) != Some(false)
-            {
-                // Subscription progress (including 304) is independent of this timer.
-                // Preparation is synchronous: retained ready stages never re-ack an
-                // older attempt, and Updates fences superseded/aborted revisions.
-                let now = crate::environment::now();
-                if now >= retry.after {
-                    match self.prepare(config.clone(), ring) {
-                        Ok(()) => self.updates.staged(self.revision, self.worker, true),
-                        Err(error) => {
-                            eprintln!("volume activation failed: {error}");
-                            self.updates.staged(self.revision, self.worker, false);
-                            retry.fail(crate::environment::now());
-                        }
-                    }
-                }
-                if self.staged.is_none() {
-                    work.merge(uring::Work {
-                        runnable: false,
-                        deadline: Some(retry.after),
-                    });
-                    self.preparing = Some((config, retry));
-                }
-            }
-            if let Some(mut staged) = self.staged.take() {
-                if self.updates.receive_decision(staged.revision) {
-                    self.arm(&mut staged);
-                }
-                match self.updates.decision(staged.revision) {
-                    Some(true) => {
-                        self.commit(staged);
-                        self.updates.activated(self.revision, self.worker);
-                    }
-                    Some(false) => {}
-                    None => self.staged = Some(staged),
-                }
-            }
-        }
-        for server in self.servers.values_mut() {
-            work.merge(server.poll(ring, budget)?);
-            work.merge(server.handler_mut().poll_background(ring, budget)?);
-        }
-        work.merge(self.poll_retired(ring, budget)?);
-        if let Some(peer) = &mut self.peer_server {
-            let volumes = &mut peer.handler_mut().volumes;
-            volumes.clear();
-            for server in self
-                .retired
-                .values()
-                .map(|(_, s)| s)
-                .chain(self.servers.values())
-            {
-                let handler = server.handler();
-                for generation in std::iter::once(&handler.current).chain(&handler.draining) {
-                    if generation.expired.get() {
-                        continue;
-                    }
-                    match volumes.entry(generation.volume.clone()) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(VolumeHandler {
-                                local: false,
-                                current: generation.clone(),
-                                draining: Vec::new(),
-                            });
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let target = entry.get_mut();
-                            if generation._config.config.revision
-                                > target.current._config.config.revision
-                            {
-                                let old =
-                                    std::mem::replace(&mut target.current, generation.clone());
-                                target.draining.push(old);
-                            } else {
-                                target.draining.push(generation.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            work.merge(peer.poll(ring, budget)?);
-            work.merge(uring::Work {
-                runnable: false,
-                deadline: Some(crate::environment::now() + Duration::from_secs(1)),
-            });
-        }
-        self.cache.borrow_mut().set_crypto(None);
-        if self.retired.is_empty()
-            && self
-                .servers
-                .values_mut()
-                .all(|s| s.handler_mut().draining.is_empty())
-        {
-            self.updates.retired(self.revision, self.worker);
-        }
+        work.merge(self.poll_topology(ring)?);
+        work.merge(self.poll_listeners(ring, budget)?);
+        work.merge(self.poll_sources(ring, budget)?);
+        work.merge(self.poll_peer_metrics(ring.metrics()));
+        Ok(work)
+    }
+    fn poll_sources(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
+        let mut work = uring::Work::default();
         self.crypto_sources
             .retain(|(worker, _)| worker.strong_count() != 0);
         for (_, source) in &mut self.crypto_sources {
@@ -1304,7 +859,6 @@ impl Volumes {
                 );
             }
         }
-        work.merge(self.poll_peer_metrics(ring.metrics()));
         Ok(work)
     }
     fn poll_peer_metrics(&mut self, metrics: &crate::metrics::Local) -> uring::Work {
@@ -1354,7 +908,6 @@ impl Volumes {
         self.servers.clear();
         self.retired.clear();
         ring.metrics().publish_peers(Vec::new());
-        self.cache.borrow_mut().set_crypto(None);
         self.crypto_sources.clear();
         let mut cache_done = false;
         let mut error = None;

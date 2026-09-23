@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,10 +24,18 @@ import (
 	racer "github.com/Azure/unbounded/pkg/racer"
 )
 
+func datasetForTest(t *testing.T, c config) *dataset {
+	t.Helper()
+	d := newDataset(t.Context(), c)
+	t.Cleanup(d.Close)
+
+	return d
+}
+
 func TestDatasetIdentityAndTargets(t *testing.T) {
 	c := config{footprint: 3 * 257, objectSize: 257, ttl: 17 * time.Second}
 
-	d := newDataset(c)
+	d := datasetForTest(t, c)
 	if got := d.target(2); got != "/loadgen/v1/771/257/2" {
 		t.Fatalf("target = %q", got)
 	}
@@ -40,7 +49,7 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 
 	*m.TTL = 0
 
-	again, err := newDataset(c).Stat(ctx, d.target(2))
+	again, err := datasetForTest(t, c).Stat(ctx, d.target(2))
 	if err != nil || again.ETag != m.ETag || again.TTL == nil || *again.TTL != c.ttl {
 		t.Fatalf("replica metadata = %+v, %v", again, err)
 	}
@@ -84,6 +93,308 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 	}
 }
 
+// Pause after a real chunk has been hashed, independent of CPU speed.
+type pausedChecksumSource struct {
+	io.ReaderAt
+	ctx     context.Context
+	calls   int
+	reads   int
+	release <-chan struct{}
+}
+
+func (s *pausedChecksumSource) ReadAt(p []byte, off int64) (int, error) {
+	s.reads++
+
+	if off > 0 {
+		select {
+		case <-s.release:
+		case <-s.ctx.Done():
+			return 0, s.ctx.Err()
+		}
+	}
+
+	return s.ReaderAt.ReadAt(p, off)
+}
+
+func pausedDatasetForTest(t *testing.T) (*dataset, *pausedChecksumSource, chan struct{}) {
+	t.Helper()
+	d := datasetForTest(t, config{footprint: 65536, objectSize: 65536})
+	release := make(chan struct{})
+
+	t.Cleanup(func() { close(release) })
+
+	source := &pausedChecksumSource{ReaderAt: d.source(d.target(0)), ctx: d.ctx, release: release}
+	d.hash = func(ctx context.Context, _ string) ([32]byte, error) {
+		source.calls++
+		return checksum(ctx, source, d.size)
+	}
+
+	return d, source, release
+}
+
+func statErrorAsync(d *dataset, ctx context.Context, id int) <-chan error {
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := d.Stat(ctx, d.target(id))
+		done <- err
+	}()
+
+	return done
+}
+
+func expectedETag(t *testing.T, d *dataset, target string) string {
+	t.Helper()
+
+	payload := make([]byte, d.size)
+	if _, err := d.source(target).ReadAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	return fmt.Sprintf(`"%x"`, sha256.Sum256(payload))
+}
+
+func TestDatasetChecksumWaiters(t *testing.T) {
+	for _, cancelOwner := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_owner=%t", cancelOwner), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				d, source, release := pausedDatasetForTest(t)
+				target := d.target(0)
+
+				ownerCtx, stopOwner := context.WithCancel(context.Background())
+				defer stopOwner()
+
+				ownerDone := statErrorAsync(d, ownerCtx, 0)
+
+				synctest.Wait()
+
+				canceledCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				deadlineCtx, stopDeadline := context.WithTimeout(context.Background(), time.Second)
+				defer stopDeadline()
+
+				canceledDone := statErrorAsync(d, canceledCtx, 0)
+				deadlineDone := statErrorAsync(d, deadlineCtx, 0)
+
+				liveDone := make(chan racer.Metadata, 1)
+
+				go func() {
+					m, err := d.Stat(context.Background(), target)
+					if err != nil {
+						t.Errorf("live waiter: %v", err)
+					}
+
+					liveDone <- m
+				}()
+
+				synctest.Wait()
+				cancel()
+				time.Sleep(time.Second)
+				synctest.Wait()
+
+				for done, want := range map[<-chan error]error{canceledDone: context.Canceled, deadlineDone: context.DeadlineExceeded} {
+					if err := await(t, done); !errors.Is(err, want) {
+						t.Errorf("waiter error = %v, want %v", err, want)
+					}
+				}
+
+				select {
+				case <-liveDone:
+					t.Fatal("live waiter returned before checksum completion")
+				default:
+				}
+
+				if cancelOwner {
+					stopOwner()
+
+					if err := await(t, ownerDone); !errors.Is(err, context.Canceled) {
+						t.Fatalf("owner error = %v", err)
+					}
+				}
+
+				release <- struct{}{}
+
+				if !cancelOwner {
+					if err := <-ownerDone; err != nil {
+						t.Errorf("owner error = %v", err)
+					}
+				}
+
+				wantETag := expectedETag(t, d, target)
+				if m := <-liveDone; m.Size != d.size || m.ETag != wantETag {
+					t.Fatalf("live waiter metadata = %+v, want ETag %s", m, wantETag)
+				}
+
+				if _, err := d.Stat(context.Background(), target); err != nil {
+					t.Fatal(err)
+				}
+
+				if source.calls != 1 || source.reads != 2 {
+					t.Fatalf("hash calls/reads = %d/%d, want 1/2 without restarting progress", source.calls, source.reads)
+				}
+			})
+		})
+	}
+}
+
+func TestDatasetChecksumOutlivesRequests(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, source, release := pausedDatasetForTest(t)
+		target := d.target(0)
+
+		// Model repeated cold HEAD deadlines while the same partially hashed
+		// object remains in publication, including periods with no waiters.
+		for range 3 {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			done := statErrorAsync(d, ctx, 0)
+
+			synctest.Wait()
+			time.Sleep(30 * time.Second)
+
+			if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("cold HEAD = %v", err)
+			}
+
+			cancel()
+		}
+
+		release <- struct{}{}
+
+		synctest.Wait()
+
+		select {
+		case <-d.checksums[0].done:
+		default:
+			t.Fatal("publication did not finish without waiters")
+		}
+
+		if source.calls != 1 || source.reads != 2 {
+			t.Fatalf("publication without waiters: calls=%d reads=%d", source.calls, source.reads)
+		}
+
+		m, err := d.Stat(context.Background(), target)
+		if err != nil || m.ETag != expectedETag(t, d, target) {
+			t.Fatalf("warm HEAD = %+v, %v", m, err)
+		}
+	})
+}
+
+func TestDatasetPublicationBoundAndShutdown(t *testing.T) {
+	for _, parentCancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parent_cancel=%t", parentCancel), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				d := newDataset(ctx, config{footprint: 16, objectSize: 1})
+				defer d.Close()
+
+				release := make(chan struct{})
+				defer close(release)
+
+				calls := 0
+				exited := false
+				d.hash = func(ctx context.Context, _ string) ([32]byte, error) {
+					calls++
+
+					<-ctx.Done()
+					<-release
+
+					exited = true
+
+					return [32]byte{}, ctx.Err()
+				}
+
+				results := make(chan error, 48)
+
+				for range 3 {
+					for id := range int(d.count) {
+						go func() {
+							_, err := d.Stat(context.Background(), d.target(id))
+							results <- err
+						}()
+					}
+				}
+
+				synctest.Wait()
+
+				if calls != 1 || len(d.jobs) != int(d.count)-1 {
+					t.Fatalf("hash jobs=%d queued=%d; want 1 active and one queued per remaining object", calls, len(d.jobs))
+				}
+
+				if parentCancel {
+					cancel()
+				}
+
+				closed := make(chan struct{})
+
+				go func() {
+					d.Close()
+					close(closed)
+				}()
+
+				synctest.Wait()
+
+				select {
+				case <-closed:
+					t.Fatal("Close returned before publication exited")
+				default:
+				}
+
+				for range 48 {
+					if err := <-results; !errors.Is(err, context.Canceled) {
+						t.Fatalf("shutdown waiter = %v", err)
+					}
+				}
+
+				release <- struct{}{}
+
+				<-closed
+
+				if !exited || calls != 1 {
+					t.Fatalf("shutdown exited=%t calls=%d; queued jobs must not start", exited, calls)
+				}
+
+				for id := range int(d.count) {
+					entry := &d.checksums[id]
+					select {
+					case <-entry.done:
+						if !errors.Is(entry.err, context.Canceled) {
+							t.Fatalf("shutdown published an incomplete checksum: %v", entry.err)
+						}
+					default:
+					}
+
+					if _, err := d.Stat(context.Background(), d.target(id)); !errors.Is(err, context.Canceled) {
+						t.Fatalf("Stat after Close = %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestDatasetPublicationFailure(t *testing.T) {
+	d := datasetForTest(t, config{footprint: 1, objectSize: 1})
+	want := errors.New("checksum source failed")
+	calls := 0
+
+	d.hash = func(context.Context, string) ([32]byte, error) {
+		calls++
+		return [32]byte{}, want
+	}
+	for range 2 {
+		if _, err := d.Stat(context.Background(), d.target(0)); !errors.Is(err, want) {
+			t.Fatalf("publication error = %v", err)
+		}
+	}
+
+	if calls != 1 {
+		t.Fatalf("failed publication calls=%d, want 1", calls)
+	}
+}
+
 func sourceForTest(t *testing.T, d *dataset, id int) racer.Source {
 	t.Helper()
 
@@ -108,7 +419,7 @@ func sourceForTest(t *testing.T, d *dataset, id int) racer.Source {
 
 func TestSyntheticReadAtAlignmentSplitsAndEOF(t *testing.T) {
 	c := config{footprint: 3 * 4099, objectSize: 4099}
-	d := newDataset(c)
+	d := datasetForTest(t, c)
 	s := sourceForTest(t, d, 1)
 
 	whole := make([]byte, d.size)
@@ -130,7 +441,7 @@ func TestSyntheticReadAtAlignmentSplitsAndEOF(t *testing.T) {
 		}
 	}
 	// A separate replica, read in irregular pieces, must reproduce the same object.
-	replica := sourceForTest(t, newDataset(c), 1)
+	replica := sourceForTest(t, datasetForTest(t, c), 1)
 	split := make([]byte, len(whole))
 
 	rng := rand.New(rand.NewSource(29))
@@ -189,7 +500,7 @@ func TestSyntheticReadAtAlignmentSplitsAndEOF(t *testing.T) {
 }
 
 func TestHandlerPreservesRawTargets(t *testing.T) {
-	d := newDataset(config{footprint: 128, objectSize: 64})
+	d := datasetForTest(t, config{footprint: 128, objectSize: 64})
 	reg := prometheus.NewRegistry()
 	newMetrics(reg)
 

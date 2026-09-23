@@ -217,6 +217,59 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
 }
 
 #[test]
+fn storage_fence_preserves_staged_generation_through_receive_and_transmit() {
+    let Some(mut ring) = crate::control::tests::ring() else {
+        return;
+    };
+    let (trust, mut config) = fixture();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "cache");
+    let updates = Arc::new(Updates::default());
+    let mut node = volumes(&ring, &updates, 0);
+    updates
+        .command(prepare_snapshot(&trust, config.clone()), 1)
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    let staged = node
+        .staged
+        .as_ref()
+        .unwrap()
+        .generations
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    node.storage_maintenance(true);
+    updates
+        .command(prepare_snapshot(&trust, config.clone()), 2)
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    assert!(node.servers.is_empty());
+    assert!(!node.staged.as_ref().unwrap().armed);
+    assert_eq!(updates.status()["receiveReadyWorkers"], 0);
+    node.storage_maintenance(false);
+    node.poll(&mut ring, 16).unwrap();
+    assert!(node.staged.as_ref().unwrap().armed);
+    assert!(!staged.active.get());
+    assert_eq!(updates.status()["receiveReadyWorkers"], 1);
+    node.storage_maintenance(true);
+    updates
+        .command(prepare_snapshot(&trust, config), 3)
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    assert!(!staged.active.get());
+    assert!(updates.active().is_none());
+    node.storage_maintenance(false);
+    node.poll(&mut ring, 16).unwrap();
+    assert!(staged.active.get());
+    assert!(Rc::ptr_eq(
+        &node.servers.values().next().unwrap().handler().current,
+        &staged
+    ));
+    assert_eq!(updates.status()["activeRevision"], 1);
+    node.shutdown(&mut ring).unwrap();
+}
+
+#[test]
 fn b04_kernel_failed_bind_same_revision() {
     let Some(mut ring) = crate::control::tests::ring() else {
         return;
@@ -274,7 +327,9 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
         return;
     };
     let updates = Arc::new(Updates::default());
-    let mut node = volumes(&ring, &updates, 0);
+    // This fixture installs TLS after initial activation. Use a distinct local
+    // peer IP so its fixed port does not overlap concurrent listener fixtures.
+    let mut node = volumes(&ring, &updates, 0).with_peer_ip("127.254.0.4".parse().unwrap());
     let (trust, mut config) = fixture();
     let peer = "03".repeat(32);
     config.peers[0].id = peer.clone();
@@ -409,7 +464,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
             .handler()
             .current
             ._config
-            .config
+            .config_snapshot()
             .revision,
         2
     );
