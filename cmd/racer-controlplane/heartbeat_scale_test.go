@@ -70,6 +70,12 @@ type heartbeatScaleFixture struct {
 func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartbeatScaleFixture {
 	tb.Helper()
 
+	return newHeartbeatGeometryFixture(tb, history, phase, 1500)
+}
+
+func newHeartbeatGeometryFixture(tb testing.TB, history bool, phase uint32, slots uint32) *heartbeatScaleFixture {
+	tb.Helper()
+
 	ctx := context.Background()
 
 	const participants = 1500
@@ -95,10 +101,10 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 	}
 
 	g.Revision = 12
-	// Isolate heartbeat scaling at the original 1,500-slot corpus size.
-	// Production fixed geometry is covered by the P2PCache model tests.
-	g.Volume.Slots = participants
-	g.Owners = g.Owners[:participants]
+	// Keep the original small history corpus; production geometry is exercised
+	// separately without manufacturing oversized historical ledgers.
+	g.Volume.Slots = slots
+	g.Owners = g.Owners[:slots]
 	api := &heartbeatAPI{Client: fakeKube()}
 
 	store := stateStore{client: api, namespace: "state"}
@@ -177,13 +183,116 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 		f.requests = append(f.requests, req)
 	}
 
-	if len(s.source.cache) != participants {
+	if slots == participants && len(s.source.cache) != participants {
 		tb.Fatalf("fixture does not have warm snapshots: %d", len(s.source.cache))
 	}
 
 	api.reset()
 
 	return f
+}
+
+// A recipient that already has the configuration must not reconstruct it after
+// payload eviction. Use the actual fixed slot geometry and all 1,500 recipients.
+func TestHeartbeatProductionGeometry(t *testing.T) {
+	f := newHeartbeatGeometryFixture(t, false, 1, defaultSlots)
+
+	var builds atomic.Int64
+
+	f.s.buildSnapshot = func(index *topologyIndex, key recipient) (*entry, error) {
+		builds.Add(1)
+		return buildSnapshotEntry(index, key)
+	}
+
+	cache := make(map[recipient]*entry, len(f.s.source.cache))
+	for key, el := range f.s.source.cache {
+		cache[key] = el.Value.(cachedEntry).entry
+	}
+
+	if len(cache) == 0 || len(cache) >= len(f.requests) || f.s.source.bytes > snapshotCacheBytes {
+		t.Fatalf("fixture did not exercise bounded payload eviction: entries=%d bytes=%d", len(cache), f.s.source.bytes)
+	}
+
+	t.Logf("production geometry: slots=%d recipients=%d retained payloads=%d cache bytes=%d", defaultSlots, len(f.requests), len(cache), f.s.source.bytes)
+	// Barrier correctness is independent of the measured wall-clock sweep.
+	for _, req := range f.requests {
+		f.roll.acks[req.PathValue("node")] = rolloutAck{boot: req.Header.Get("X-Racer-Boot"), phase: 1, seen: time.Now()}
+	}
+
+	delete(f.roll.acks, f.requests[0].PathValue("node"))
+
+	if c := f.call(t, 0); c.Phase != 2 || f.api.gets.Load() != 1 || f.api.updates.Load() != 1 {
+		t.Fatal("config-free acknowledgment failed to persist prepare barrier")
+	}
+
+	f.api.reset()
+
+	start := make(chan struct{})
+	durations := make([]time.Duration, len(f.requests))
+
+	var wg sync.WaitGroup
+	for i := range f.requests {
+		wg.Go(func() {
+			<-start
+
+			now := time.Now()
+			c := f.call(t, i)
+
+			durations[i] = time.Since(now)
+			if c.Configuration != nil || hex.EncodeToString(c.SnapshotDigest) != f.requests[i].Header.Get("X-Racer-Digest") || c.Revision != 12 {
+				t.Errorf("recipient %d received inconsistent config-free command", i)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+
+	late := 0
+
+	for _, d := range durations {
+		if d > 2*time.Second {
+			late++
+		}
+	}
+
+	t.Logf("production heartbeat wave: p50=%s p99=%s max=%s beyond-2s=%d phase=%d", durations[750], durations[1484], durations[1499], late, f.roll.phase)
+	// Structural regression assertion, independent of host speed: config-free
+	// traffic must neither rebuild nor displace serialized payloads.
+	for key, want := range cache {
+		el := f.s.source.cache[key]
+		if el == nil || el.Value.(cachedEntry).entry != want {
+			t.Fatal("config-free heartbeats rebuilt/displaced cached payloads")
+		}
+	}
+
+	if builds.Load() != 0 || len(f.roll.acks) != len(f.requests) {
+		t.Fatalf("config-free wave: builds=%d acknowledgments=%d", builds.Load(), len(f.roll.acks))
+	}
+
+	if f.api.gets.Load()+f.api.creates.Load()+f.api.updates.Load() != 0 {
+		t.Fatal("steady config-free wave touched durable state")
+	}
+	// A real resend after eviction must still carry the exact deterministic
+	// snapshot, while subsequent acknowledgments return to the digest-only path.
+	req := f.requests[0]
+	req.Header.Set("X-Racer-Needs-Config", "1")
+
+	c := f.call(t, 0)
+	raw := configurationSnapshot(t, c.Configuration)
+
+	digest := sha256.Sum256(raw)
+	if builds.Load() != 1 || hex.EncodeToString(digest[:]) != req.Header.Get("X-Racer-Digest") {
+		t.Fatal("evicted configuration resend did not reproduce the exact snapshot")
+	}
+
+	t.Logf("resend: snapshot=%d bytes envelope=%d bytes remote-slot-neighbors=%d", len(raw), proto.Size(c.Configuration), len(c.Configuration.GetSnapshot().Volumes[0].Topology.Neighbors))
+	req.Header.Del("X-Racer-Needs-Config")
+
+	if c := f.call(t, 0); c.Configuration != nil || builds.Load() != 1 {
+		t.Fatal("resend did not return to config-free heartbeats")
+	}
 }
 
 func (f *heartbeatScaleFixture) call(tb testing.TB, i int) *pb.ControlCommand {

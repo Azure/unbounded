@@ -247,6 +247,12 @@ Subsequent requests include worker feedback in `X-Racer-Phase` and
 are always 200 with protobuf `ControlCommand` messages and
 `Content-Type: application/x-protobuf`; configuration is included when needed.
 The `/v3` handler does not use ETags or return 304.
+The controller retains exact per-recipient snapshot digests for each published
+generation independently of its 64 MiB serialized-payload LRU. Matching heartbeats
+do not rebuild evicted payloads. Cold configuration construction uses one builder
+outside the topology lock, rechecking publication and Pod selection before use;
+queued canceled requests do not build. This cache budget is compiled in, not a
+runtime flag or environment setting.
 TLS authentication failures terminate the handshake. After TLS authentication,
 both path identities must be 64 hex characters. Malformed requests return 400;
 unknown universes return 404; invalid credentials or unselected Pod identities

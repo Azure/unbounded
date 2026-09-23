@@ -324,6 +324,9 @@ type topologyIndex struct {
 	byID        map[string]string
 	additional  []*topologyIndex
 	stateDigest string
+	// Exact wire digests outlive serialized-payload eviction. Protected by Server.mu
+	// and scoped to this immutable publication, so replacement drops all digests.
+	snapshotDigests map[[32]byte][32]byte
 }
 
 // publishedDigest must be called under Server.mu on a published index. Candidate

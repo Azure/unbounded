@@ -431,19 +431,23 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	selected, code, err := s.snapshotForControl(req.Context(), key, podUID, req.Header.Get("X-Racer-Digest"), req.Header.Get("X-Racer-Needs-Config") == "1")
+	if err != nil {
+		if code != 0 {
+			fail(err, code)
+		}
+
+		return
+	}
+
+	t = selected.topology
+	entry, digest, revision := selected.payload, selected.digest, t.g.Revision
+
 	r, err := s.rolloutFor(req.Context(), t)
 	if err != nil {
 		fail(err, 503)
 		return
 	}
-
-	entry, err := s.current(key)
-	if err != nil || entry == nil {
-		fail(fmt.Errorf("snapshot unavailable"), 503)
-		return
-	}
-
-	digest := sha256.Sum256(entry.snapshot)
 
 	if old, ok := r.acks[nodeID]; ok && old.boot != hex.EncodeToString(boot) && time.Since(old.seen) < 15*time.Second {
 		fail(fmt.Errorf("another process incarnation is registered"), 409)
@@ -479,6 +483,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		r.acks[nodeID] = rolloutAck{boot: hex.EncodeToString(boot), seen: time.Now()}
 		entry = prior
 		digest = sha256.Sum256(entry.snapshot)
+		revision = entry.revision
 	} else {
 		if req.Header.Get("X-Racer-Digest") == hex.EncodeToString(digest[:]) && phase <= uint64(r.phase) && phase <= 4 {
 			if phase > 0 {
@@ -536,33 +541,34 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	var config *pb.Configuration
-	if req.Header.Get("X-Racer-Digest") != hex.EncodeToString(digest[:]) || req.Header.Get("X-Racer-Needs-Config") == "1" {
-		config = &pb.Configuration{}
-		if err = proto.Unmarshal(entry.body, config); err != nil {
-			fail(err, 500)
-			return
-		}
-	}
-
 	commandPhase := r.phase
 	if prior != nil {
 		commandPhase = priorPhase
 	}
 
-	command := &pb.ControlCommand{Universe: u, Node: n, Incarnation: boot, SnapshotDigest: digest[:], Revision: entry.revision, Phase: commandPhase, Profile: 1, Configuration: config}
+	command := &pb.ControlCommand{Universe: u, Node: n, Incarnation: boot, SnapshotDigest: digest[:], Revision: revision, Phase: commandPhase, Profile: 1}
 	command.ForwardDigest, command.ForwardRevision, command.PodUid = forwardDigest, forwardRevision, podUID
 	command.StoragePolicy = s.storageCommand(req, key, podUID)
+
+	s.mu.Unlock()
+
+	locked = false
+
+	// The command decision and payload are immutable. Decode and serialize large
+	// configurations without delaying independent acknowledgments.
+	if req.Header.Get("X-Racer-Digest") != hex.EncodeToString(digest[:]) || req.Header.Get("X-Racer-Needs-Config") == "1" {
+		command.Configuration = &pb.Configuration{}
+		if err = proto.Unmarshal(entry.body, command.Configuration); err != nil {
+			fail(err, 500)
+			return
+		}
+	}
 
 	body, err := (proto.MarshalOptions{Deterministic: true}).Marshal(command)
 	if err != nil {
 		fail(err, 500)
 		return
 	}
-
-	s.mu.Unlock()
-
-	locked = false
 
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
