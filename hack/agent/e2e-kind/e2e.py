@@ -3060,9 +3060,30 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
                 item["contents"]["source"] = ignition_data_url(json.dumps(cfg))
     doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
 
+    # Stop whatever is running on this disk and discard it. The cloud-init path
+    # reaches a fresh VM through create-vm, but an Ignition host defers its
+    # launch to here, so nothing else has cleared the previous one and the
+    # overlay it still holds open cannot be recreated underneath it.
+    destroy_vm()
     launch_ignition_vm(json.dumps(doc, indent=2))
     _wait_for_ignition_bootstrap()
 
+
+
+def destroy_vm() -> None:
+    """Stop the VM and discard its disk and firmware state.
+
+    The firmware variables are removed along with the disk. They record the boot
+    entries of the disk that is being discarded, so keeping them across a fresh
+    provision leaves the new VM's firmware describing a disk that no longer
+    exists.
+    """
+    _stop_qemu()
+
+    for path in (VM_DIR / f"{VM_NAME}.qcow2", VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"):
+        if path.exists():
+            log(f"Removing {path}")
+            path.unlink()
 
 
 def _wait_for_ignition_bootstrap() -> None:
