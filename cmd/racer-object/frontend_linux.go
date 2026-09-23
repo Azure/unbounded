@@ -162,11 +162,16 @@ func (f *frontend) connection(ctx context.Context, downstream *net.TCPConn) erro
 
 		o, status, code := f.selectObject(req)
 		if status != 0 {
+			slog.Debug("object request rejected", "method", req.Method, "path", req.URL.Path, "code", code)
 			return s3Error(downstream, req.Method == "HEAD", status, code)
 		}
 
 		if !validRange(req.Header) {
 			return s3Error(downstream, req.Method == "HEAD", 400, "InvalidArgument")
+		}
+
+		if req.Header.Get("If-Modified-Since") != "" || req.Header.Get("If-Unmodified-Since") != "" {
+			return s3Error(downstream, req.Method == "HEAD", 501, "NotImplemented")
 		}
 
 		if upstream == nil {
@@ -215,7 +220,10 @@ func (f *frontend) selectObject(r *http.Request) (objectSpec, int, string) {
 		}
 	}
 
-	if r.URL.IsAbs() || !strings.HasPrefix(r.RequestURI, "/") {
+	// Run:ai's native client can send absolute-form targets. The authority is
+	// never dialed: only the configured bucket/key selects a backing object.
+	if r.URL.User != nil || r.URL.Fragment != "" ||
+		r.URL.IsAbs() && r.URL.Scheme != "http" || !r.URL.IsAbs() && !strings.HasPrefix(r.RequestURI, "/") {
 		return objectSpec{}, 400, "InvalidURI"
 	}
 
@@ -287,7 +295,8 @@ func (f *frontend) exchange(dst *net.TCPConn, src *net.UnixConn, p *splicePipe, 
 		return err
 	}
 
-	if len(resp.TransferEncoding) != 0 || resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity" {
+	if resp.Proto != "HTTP/1.1" || len(resp.TransferEncoding) != 0 || len(resp.Header.Values("Content-Encoding")) > 1 ||
+		resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity" {
 		return fmt.Errorf("unexpected upstream encoding")
 	}
 
@@ -312,7 +321,7 @@ func (f *frontend) exchange(dst *net.TCPConn, src *net.UnixConn, p *splicePipe, 
 		return fmt.Errorf("missing upstream length")
 	}
 
-	if resp.Header.Get("ETag") != o.etag {
+	if len(resp.Header.Values("ETag")) != 1 || resp.Header.Get("ETag") != o.etag {
 		return fmt.Errorf("unexpected upstream representation")
 	}
 
@@ -377,6 +386,10 @@ func s3Error(w io.Writer, head bool, status int, code string) error {
 }
 
 func validateResponseRange(req *http.Request, resp *http.Response) error {
+	if len(resp.Header.Values("Content-Range")) > 1 {
+		return fmt.Errorf("duplicate upstream content range")
+	}
+
 	if resp.StatusCode != http.StatusPartialContent {
 		if resp.Header.Get("Content-Range") != "" {
 			return fmt.Errorf("unexpected upstream content range")

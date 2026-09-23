@@ -28,10 +28,11 @@ class UnixBridge(socketserver.BaseRequestHandler):
                     (upstream if source is self.request else self.request).sendall(data)
 
 
-bridge = socketserver.ThreadingTCPServer(("127.0.0.1", 0), UnixBridge)
-bridge.daemon_threads = True
-threading.Thread(target=bridge.serve_forever, daemon=True).start()
-os.environ["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{bridge.server_address[1]}"
+if not os.environ.get("AWS_ENDPOINT_URL"):
+    bridge = socketserver.ThreadingTCPServer(("127.0.0.1", 0), UnixBridge)
+    bridge.daemon_threads = True
+    threading.Thread(target=bridge.serve_forever, daemon=True).start()
+    os.environ["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{bridge.server_address[1]}"
 
 model = torch.nn.Linear(1024, 1024)
 parameters = dict(model.named_parameters())

@@ -89,9 +89,11 @@ Relays and ingress nodes can satisfy later reads from their own cache. See
 Racer first resolves a target into its length, checksum/version, and expiration.
 The target is the exact escaped HTTP path and query: path cleaning, query
 reordering, and decoding would change object identity. Representations require
-a strong quoted ETag containing 64 lowercase hexadecimal checksum characters.
-The origin supplies that whole-object checksum; ranged reads pin the version
-rather than recomputing the entire object hash. See
+a strong quoted ETag containing 64 lowercase hexadecimal representation-ID characters.
+The origin supplies a content checksum or opaque version ID; permanently immutable
+names may use a domain-separated hash of their backing identity. An ID must never
+be reused for changed bytes at the same target, including after deletion/recreation.
+Ranged reads pin this version; independent page CRCs check corruption. See
 [cache.rs:373][object-keys] and [pkg/racer/client.go:121][sdk-client].
 
 Metadata freshness follows the origin's cache policy: `s-maxage` takes precedence

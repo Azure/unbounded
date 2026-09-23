@@ -19,7 +19,9 @@ import (
 // honor ctx. Stat must avoid reading payloads. Open must atomically acquire an
 // immutable snapshot matching the ETag from Stat, or return ErrVersionChanged if
 // that version is unavailable. ETags must be quoted 64-character lowercase hex
-// checksums of the complete representation, computed when publishing the object.
+// representation IDs. A content checksum is suitable, as is a domain-separated
+// hash of a permanently immutable name. Never reuse an ID for changed bytes at
+// the same target, including after deletion and recreation.
 // Use fs.ErrNotExist and fs.ErrPermission for HTTP 404 and 403;
 // ErrVersionChanged produces 412, and other errors produce 500.
 type Store interface {

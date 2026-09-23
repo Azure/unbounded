@@ -70,9 +70,13 @@ repeated keys, and a trailing `?` can identify different cache entries. `Client`
 and `Object` support concurrent calls; objects own no connection and need no Close.
 
 Every representation must carry a strong ETag containing exactly 64 lowercase
-hexadecimal checksum characters inside double quotes, including empty objects.
-Compute the checksum over the complete object (for example SHA-256) at publication.
-`Stat` and `Open` reject weak, missing, arbitrary, and noncanonical validators;
+hexadecimal representation-ID characters inside double quotes, including empty objects.
+A whole-object checksum (for example SHA-256) or an opaque 256-bit version ID is
+valid. Permanently immutable names may use a domain-separated hash of the backing
+object identity. Never reuse an ID for changed bytes at the same target, including
+after deletion/recreation. Page CRCs are independent corruption checks, not proof
+that a name still refers to its original bytes.
+`Stat` and `Open` reject weak, missing, and noncanonical validators;
 the former `AllowUnvalidated` option has been removed. The SDK validates the wire
 encoding and pins versions; it does not recompute whole-object checksums on ranged reads.
 `errors.Is(err, racer.ErrVersionChanged)` identifies HTTP 412 or a

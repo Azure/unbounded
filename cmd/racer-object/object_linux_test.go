@@ -402,3 +402,35 @@ func BenchmarkFrontendSplice(b *testing.B) {
 		}
 	})
 }
+
+// Direct TCP origin uses the same backend and payload as the splice benchmark.
+// Both include fixture and consumer costs; neither measures Azure throughput.
+func BenchmarkDirectOrigin(b *testing.B) {
+	c := testConfig(b)
+	cloud := &memoryCloud{data: bytes.Repeat([]byte{7}, 16<<20)}
+	origin, _ := racer.NewOrigin(newBackend(c, cloud, 16))
+
+	server := httptest.NewServer(origin)
+	defer server.Close()
+
+	b.SetBytes(int64(len(cloud.data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r, err := http.Get(server.URL + c.Objects[0].target)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			n, err := io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+
+			if err != nil || n != int64(len(cloud.data)) {
+				b.Errorf("body %d %v", n, err)
+				return
+			}
+		}
+	})
+}

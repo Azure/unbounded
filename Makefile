@@ -151,6 +151,7 @@ RACER_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_DATAPLANE_CRATE)/target
 RACER_CONTROLPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controlplane:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -773,6 +774,19 @@ racer-controlplane-build: ## Build the Racer control plane without tests
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
 
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object-build: ## Build the Linux splice-only object adapter
+	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
+
+racer-object-test:
+	$(GOTEST) -mod=readonly -race -count=1 ./cmd/racer-object/...
+
+racer-object: racer-object-test racer-object-build
+
+image-racer-object-local:
+	$(CONTAINER_ENGINE) build -f images/racer-object/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_OBJECT_IMAGE) .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
+
 racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, pkg-config, libibverbs-dev, libssl-dev)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane
 	@mkdir -p bin
@@ -782,7 +796,7 @@ racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, pkg-config, l
 RACER_GO_TEST_TIMEOUT ?= 60m
 
 racer-go-test: ## Test Racer Go components with the root module dependencies
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/... ./cmd/racer-object/...
 
 racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
@@ -794,12 +808,13 @@ racer-fmt-check: ## Check Rust formatting, including explicitly included tests
 	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
 
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
-racer-crosslang-test: racer-dataplane-build ## Run SDK and control-plane tests against the real daemon
+racer-crosslang-test: racer-dataplane-build racer-object-build ## Run SDK and control-plane tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
+		RACER_OBJECT_BINARY="$(CURDIR)/bin/racer-object" \
 		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./cmd/racer-controlplane
 
 racer-test: racer-go-test racer-rust-test
-racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build
+racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build racer-object-build
 racer: racer-test racer-build
 racer-controlplane: racer-go-test racer-controlplane-build
 racer-loadgen: racer-go-test racer-loadgen-build

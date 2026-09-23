@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-trixie AS builder
+WORKDIR /src
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/racer-object/ cmd/racer-object/
+COPY internal/version/ internal/version/
+COPY pkg/racer/ pkg/racer/
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+RUN GOOS=linux GOARCH=${TARGETARCH} go build -mod=readonly \
+    -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT}" \
+    -o /racer-object ./cmd/racer-object
+
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+COPY --from=builder /racer-object /racer-object
+COPY LICENSE NOTICE /unbounded/licenses/
+USER 65532:65532
+ENTRYPOINT ["/racer-object"]

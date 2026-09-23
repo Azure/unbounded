@@ -25,7 +25,8 @@ var (
 )
 
 // Metadata describes a representation. ETag is mandatory: a quoted, 64-character
-// lowercase hexadecimal checksum of the complete representation (for example SHA-256).
+// lowercase hexadecimal representation ID. It may be a content checksum or an
+// opaque version identity, but must never identify different bytes at one target.
 type Metadata struct {
 	Size int64
 	ETag string
