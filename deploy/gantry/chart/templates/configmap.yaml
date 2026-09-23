@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- if .Values.gantry.config }}
+    {{- tpl .Values.gantry.config . | nindent 4 }}
+    {{- else }}
+    mirror_listen: "0.0.0.0:5000"
+    mirror_bind_allow_non_loopback: true
+    transfer_listen: "0.0.0.0:5001"
+    chair_listen: "0.0.0.0:5002"
+    metrics_listen: "0.0.0.0:9095"
+    pprof_listen: {{ .Values.gantry.pprofListen | quote }}
+
+    libp2p_listen:
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    libp2p_identity_path: "/var/lib/gantry/libp2p/identity.key"
+
+    chair_namespace: {{ .Release.Namespace | quote }}
+    chair_lease_duration: "60s"
+    chair_renew_period: "20s"
+    chair_rotation_period: "6h"
+    chair_rotation_lead: "5m"
+    chair_startup_jitter: "30s"
+    chair_claim_round_period: "1s"
+    chair_claim_jitter: "750ms"
+    chair_claim_initial_divisor: 2048
+    chair_cluster_size_estimate: 100000
+    chair_capacity_daemonset: gantry
+    chair_seed_percentage: 10
+    chair_seed_count: 50
+    chair_api_timeout: "5s"
+
+    storage_mode: "containerd"
+    containerd_socket: {{ .Values.containerd.socketPath | quote }}
+    containerd_namespace: {{ .Values.containerd.namespace | quote }}
+    containerd_lease_ttl: "60m"
+    containerd_lease_cleanup_interval: "30m"
+
+    upstream_registries:
+      {{- range .Values.gantry.upstreamRegistries }}
+      - name: {{ .name | quote }}
+        endpoint: {{ .endpoint | quote }}
+        {{- with .credentialsPath }}
+        credentials_path: {{ . | quote }}
+        {{- end }}
+        {{- with .namespaceAlias }}
+        ns_alias: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+
+    coord_peer_authz_enforce: false
+    coord_require_chair_assignment: false
+    coord_max_digests_per_request: 256
+    coord_max_concurrent_pulls: 16
+    peer_fetch_timeout: "15m"
+    peer_rediscover_budget: "5m"
+    peer_rediscover_backoff: "1s"
+    transfer_max_concurrent_serves: 10
+    advertise_reconcile_interval: "1m"
+
+    nf5_jitter_base: "3s"
+    nf5_per_node_rate_limit: 2
+    bootstrap_window: "30s"
+    bootstrap_routing_table_pct: 25
+
+    origin_failure_cooldown_initial: "5s"
+    origin_failure_cooldown_max: "5m"
+    origin_failure_cooldown_multiplier: 2
+    origin_failure_honor_window_cap: "30s"
+    origin_failure_classes_trusted_cluster_wide:
+      - "auth"
+      - "not_found"
+      - "rate_limited"
+
+    log_level: "debug"
+    log_format: "json"
+    {{- end }}

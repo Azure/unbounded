@@ -944,13 +944,17 @@ ensure_chair_leases() {
 
 deploy_gantry() {
   export KUBECONFIG
-  local rendered=$DEPLOY_STATE_DIR/gantry-rendered
-  rm -rf "$rendered"
-  GOTOOLCHAIN=auto go run "$repo_root/hack/cmd/render-manifests" \
-    --templates-dir "$repo_root/deploy/gantry" --output-dir "$rendered" \
-    --set "Namespace=$GANTRY_NAMESPACE" --set "Image=$GANTRY_IMAGE" \
-    --set "PprofListen=127.0.0.1:6060"
-  sed -i "s/registry\.example\.com/$GANTRY_ACR_LOGIN_SERVER/g" "$rendered/configmap.yaml"
+  local render_root=$DEPLOY_STATE_DIR/gantry-rendered
+  local rendered=$render_root/gantry/templates
+  rm -rf "$render_root"
+  GOTOOLCHAIN=auto make -C "$repo_root" install-helm
+  "$repo_root/bin/helm" template gantry "$repo_root/deploy/gantry/chart" \
+    --namespace "$GANTRY_NAMESPACE" \
+    --set-string "image.reference=$GANTRY_IMAGE" \
+    --set-string 'gantry.pprofListen=127.0.0.1:6060' \
+    --set-string "gantry.upstreamRegistries[0].name=$GANTRY_ACR_LOGIN_SERVER" \
+    --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER" \
+    --output-dir "$render_root"
 
   kubectl apply -f "$rendered/serviceaccount.yaml"
   kubectl apply -f "$rendered/configmap.yaml"

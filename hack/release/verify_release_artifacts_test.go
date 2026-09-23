@@ -79,17 +79,23 @@ func newRelease(t *testing.T) *release {
 
 	r := &release{t: t, dir: dir}
 
-	// The three signed blobs, each with its bundle.
+	// The signed blobs, each with its bundle.
 	r.write("unbounded-manifests-"+verifyTag+".tar.gz", "tarball")
 	r.write("unbounded-manifests-"+verifyTag+".tar.gz.bundle.json", "{}")
 	r.write("unbounded-operator-"+verifyTag+".yaml", "kind: Deployment")
 	r.write("unbounded-operator-"+verifyTag+".yaml.bundle.json", "{}")
+	r.write("gantry-9.9.9.tgz", "chart")
+	r.write("gantry-9.9.9.tgz.bundle.json", "{}")
 	r.writeBOM(map[string]any{
-		"release":   map[string]any{"tag": verifyTag, "gitCommit": verifyCommit},
-		"artifacts": declaredArtifacts(),
+		"schemaVersion": 2,
+		"release":       map[string]any{"tag": verifyTag, "gitCommit": verifyCommit},
+		"artifacts":     declaredArtifacts(),
 		"images": []any{
 			map[string]any{"reference": "ghcr.io/azure/gantry:" + verifyTag, "digest": "sha256:aa"},
 			map[string]any{"reference": "ghcr.io/azure/machina:" + verifyTag, "digest": "sha256:bb"},
+		},
+		"charts": []any{
+			map[string]any{"reference": "ghcr.io/azure/charts/gantry:9.9.9", "digest": "sha256:cc"},
 		},
 	})
 	r.publishAssets(declaredAssetNames()...)
@@ -97,11 +103,12 @@ func newRelease(t *testing.T) *release {
 	return r
 }
 
-// declaredArtifacts mirrors hack/cmd/release-bom's list: what a release says it
-// shipped, only three of which a deploy ever consumes.
+// declaredArtifacts mirrors the subset of hack/cmd/release-bom's artifact list
+// needed by these verifier fixtures.
 func declaredArtifacts() []any {
 	return []any{
 		map[string]any{"name": "checksums.txt", "signatureBundle": "checksums.txt.bundle.json"},
+		map[string]any{"name": "gantry-9.9.9.tgz", "signatureBundle": "gantry-9.9.9.tgz.bundle.json"},
 		map[string]any{
 			"name":            "unbounded-manifests-" + verifyTag + ".tar.gz",
 			"signatureBundle": "unbounded-manifests-" + verifyTag + ".tar.gz.bundle.json",
@@ -117,6 +124,7 @@ func declaredArtifacts() []any {
 func declaredAssetNames() []string {
 	return []string{
 		"checksums.txt", "checksums.txt.bundle.json",
+		"gantry-9.9.9.tgz", "gantry-9.9.9.tgz.bundle.json",
 		"unbounded-manifests-" + verifyTag + ".tar.gz",
 		"unbounded-manifests-" + verifyTag + ".tar.gz.bundle.json",
 		"unbounded-storage-linux-amd64.tar.gz",
@@ -299,6 +307,67 @@ func TestVerifierAcceptsACompleteRelease(t *testing.T) {
 	// The identity binding is what makes any of this mean anything.
 	requireContains(t, r.cosignCalls(), "release\\.yaml@refs/tags/v9\\.9\\.9$")
 	requireContains(t, r.cosignCalls(), "ghcr.io/azure/gantry@sha256:aa")
+	requireContains(t, r.cosignCalls(), "ghcr.io/azure/charts/gantry@sha256:cc")
+}
+
+func TestVerifierRejectsAnUnverifiableChart(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t)
+	r.failCosignFor("ghcr.io/azure/charts/gantry")
+
+	output, code := r.run(nil)
+
+	if code == 0 {
+		t.Errorf("expected a failure when the chart signature does not verify\n%s", output)
+	}
+}
+
+func TestVerifierRejectsAnUnverifiableChartArchive(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t)
+	r.failCosignFor("gantry-9.9.9.tgz.bundle.json")
+
+	output, code := r.run(nil)
+
+	if code == 0 {
+		t.Errorf("expected a failure when the chart archive signature does not verify\n%s", output)
+	}
+}
+
+func TestVerifierRejectsAMissingChartAsset(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t).withoutAsset("gantry-9.9.9.tgz")
+
+	output, code := r.run(nil)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "gantry-9.9.9.tgz")
+}
+
+func TestVerifierRejectsSchemaTwoWithoutAChart(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t)
+	r.writeBOM(map[string]any{
+		"schemaVersion": 2,
+		"release":       map[string]any{"tag": verifyTag, "gitCommit": verifyCommit},
+		"artifacts":     []any{},
+		"images": []any{
+			map[string]any{"reference": "ghcr.io/azure/gantry:" + verifyTag, "digest": "sha256:aa"},
+		},
+	})
+
+	output, code := r.run(nil)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "expected exactly one")
 }
 
 func TestVerifierRejectsAMissingArtifact(t *testing.T) {
@@ -515,7 +584,7 @@ func TestVerifierSkipsChecksumsWhenNoBinaryIsUsed(t *testing.T) {
 }
 
 // TestVerifierRejectsAReleaseMissingADeclaredArtifact is the regression guard
-// for a draft that lost assets. The deploy consumes three of the six artifacts
+// for a draft that lost assets. The deploy consumes only a subset of artifacts
 // a release declares; nothing looked at the rest, so a release could publish
 // without its storage tarballs, its checksums or unbounded.yaml.
 func TestVerifierRejectsAReleaseMissingADeclaredArtifact(t *testing.T) {

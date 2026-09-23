@@ -49,6 +49,14 @@ func TestBuildBOM(t *testing.T) {
 		t.Fatalf("release image count = %d, want %d", len(bom.Images), len(releaseImageNames))
 	}
 
+	if len(bom.Charts) != 1 {
+		t.Fatalf("release chart count = %d, want 1", len(bom.Charts))
+	}
+
+	if got, want := bom.Charts[0].Reference, "registry.example.com/project/charts/gantry:1.2.3"; got != want {
+		t.Fatalf("chart reference = %q, want %q", got, want)
+	}
+
 	if got, want := bom.Images[0].Reference, "registry.example.com/project/gantry:v1.2.3"; got != want {
 		t.Fatalf("first image reference = %q, want %q", got, want)
 	}
@@ -69,15 +77,24 @@ func TestBuildBOM(t *testing.T) {
 	}
 
 	foundOperatorManifest := false
+	foundGantryChart := false
 
 	for _, artifact := range bom.Artifacts {
 		if artifact.Name == "unbounded-operator-v1.2.3.yaml" && artifact.SignatureBundle == "unbounded-operator-v1.2.3.yaml.bundle.json" {
 			foundOperatorManifest = true
 		}
+
+		if artifact.Name == "gantry-1.2.3.tgz" && artifact.SignatureBundle == "gantry-1.2.3.tgz.bundle.json" {
+			foundGantryChart = true
+		}
 	}
 
 	if !foundOperatorManifest {
 		t.Fatal("signed operator manifest is missing from BOM artifacts")
+	}
+
+	if !foundGantryChart {
+		t.Fatal("signed Gantry chart is missing from BOM artifacts")
 	}
 }
 

@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "image",
+    "namespace",
+    "manager",
+    "nodeSelector",
+    "tolerations",
+    "containerd",
+    "nodeConfig",
+    "registryCredentials",
+    "resources",
+    "gantry"
+  ],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference",
+        "repository",
+        "tag",
+        "digest",
+        "pullPolicy"
+      ],
+      "properties": {
+        "reference": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^(|sha256:[0-9a-f]{64})$"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "create"
+      ],
+      "properties": {
+        "create": {
+          "const": false
+        }
+      }
+    },
+    "manager": {
+      "type": "string",
+      "enum": [
+        "helm"
+      ]
+    },
+    "nodeSelector": {
+      "type": "object",
+      "required": [
+        "kubernetes.io/os"
+      ],
+      "properties": {
+        "kubernetes.io/os": {
+          "const": "linux"
+        }
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "containerd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hostPath",
+        "mountPath",
+        "socketPath",
+        "namespace",
+        "socketGroup"
+      ],
+      "properties": {
+        "hostPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "mountPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "socketPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "socketGroup": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "nodeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "hostPath",
+        "reconcileIntervalSeconds"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hostPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "reconcileIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "registryCredentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "secretName"
+      ],
+      "properties": {
+        "secretName": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "init",
+        "nodeConfig"
+      ],
+      "properties": {
+        "agent": {
+          "type": "object"
+        },
+        "init": {
+          "type": "object"
+        },
+        "nodeConfig": {
+          "type": "object"
+        }
+      }
+    },
+    "gantry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config",
+        "pprofListen",
+        "upstreamRegistries"
+      ],
+      "properties": {
+        "config": {
+          "type": "string"
+        },
+        "pprofListen": {
+          "type": "string"
+        },
+        "upstreamRegistries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "endpoint"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "endpoint": {
+                "type": "string",
+                "pattern": "^https?://"
+              },
+              "credentialsPath": {
+                "type": "string"
+              },
+              "namespaceAlias": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "config": {
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "upstreamRegistries": {
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    }
+  }
+}

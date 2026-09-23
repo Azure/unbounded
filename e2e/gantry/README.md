@@ -78,7 +78,7 @@ prereq CLIs:
 | --- | --- |
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
 | `buildAndLoadImage()` | builds `images/gantry/Containerfile` as `docker.io/library/gantry:e2e`, saves an image archive, then loads the archive into kind |
-| `applyManifests()` | renders `deploy/gantry/*.yaml.tmpl`, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
+| `applyManifests()` | renders `deploy/gantry/chart` with the pinned Helm binary, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |

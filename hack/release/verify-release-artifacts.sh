@@ -41,7 +41,7 @@
 #   4. Every CHECKSUM_FILES entry is listed in checksums.txt, that file carries
 #      the same signed identity, and the bytes on disk match it.
 #   5. The release still carries every artifact the BOM declares, and each
-#      declared signature bundle. A deploy consumes three of the six; the rest
+#      declared signature bundle. A deploy consumes a subset; the rest
 #      are what users download, and nothing else would notice their absence.
 #
 # The expected commit is a parameter, not a 'git rev-parse HEAD': the check is
@@ -101,6 +101,8 @@ for artifact in "${ARCHIVE}" "${OPERATOR_MANIFEST}" "${BOM}"; do
     "${artifact}"
 done
 
+verified_blob_count=3
+
 bom_tag="$(jq -r '.release.tag' "${BOM}")"
 if [[ "$bom_tag" != "$TAG" ]]; then
   echo "::error::release BOM records tag ${bom_tag}, expected ${TAG}"
@@ -111,6 +113,34 @@ bom_commit="$(jq -r '.release.gitCommit' "${BOM}")"
 if [[ "$bom_commit" != "$EXPECTED_COMMIT" ]]; then
   echo "::error::release BOM records commit ${bom_commit}, expected ${EXPECTED_COMMIT}"
   exit 1
+fi
+
+schema_version="$(jq -r '.schemaVersion // 0' "${BOM}")"
+chart_archive_count="$(jq -r '[.artifacts // [] | .[] | select(.name | startswith("gantry-") and endswith(".tgz"))] | length' "${BOM}")"
+if (( schema_version >= 2 && chart_archive_count != 1 )); then
+  echo "::error::release BOM schema ${schema_version} declares ${chart_archive_count} Gantry chart archives; expected exactly one"
+  exit 1
+fi
+
+if (( chart_archive_count > 1 )); then
+  echo "::error::release BOM declares ${chart_archive_count} Gantry chart archives; expected at most one"
+  exit 1
+fi
+
+chart_archive_name="$(jq -r '[.artifacts // [] | .[] | select(.name | startswith("gantry-") and endswith(".tgz")) | .name] | first // empty' "${BOM}")"
+if [[ -n "$chart_archive_name" ]]; then
+  chart_archive="${DIST}/${chart_archive_name}"
+  if [[ ! -f "$chart_archive" || ! -f "${chart_archive}.bundle.json" ]]; then
+    echo "::error::missing Gantry chart archive or signature bundle"
+    exit 1
+  fi
+
+  cosign verify-blob \
+    --bundle "${chart_archive}.bundle.json" \
+    --certificate-identity-regexp "${IDENTITY}" \
+    --certificate-oidc-issuer "${OIDC_ISSUER}" \
+    "${chart_archive}"
+  verified_blob_count=$((verified_blob_count + 1))
 fi
 
 # Captured, not piped: `mapfile < <(jq ...)` reports mapfile's exit status, not
@@ -143,6 +173,21 @@ fi
 # without failing cannot pass either.
 if (( ${#images[@]} != bom_image_count )); then
   echo "::error::release BOM lists ${bom_image_count} images but only ${#images[@]} resolved; refusing to treat it as verified"
+  exit 1
+fi
+
+if ! chart_refs="$(jq -r '.charts // [] | .[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}")"; then
+  echo "::error::could not read the chart list from ${BOM}; refusing to treat it as verified"
+  exit 1
+fi
+
+mapfile -t charts <<<"$chart_refs"
+if (( ${#charts[@]} == 1 )) && [[ -z "${charts[0]}" ]]; then
+  charts=()
+fi
+
+if (( schema_version >= 2 && ${#charts[@]} != 1 )); then
+  echo "::error::release BOM schema ${schema_version} lists ${#charts[@]} charts; expected exactly one"
   exit 1
 fi
 
@@ -195,7 +240,7 @@ else
   echo "Release carries all $(wc -l <<<"$declared") declared artifact(s)"
 fi
 
-for image in "${images[@]}"; do
+for image in "${images[@]}" "${charts[@]}"; do
   cosign verify \
     --certificate-identity-regexp "${IDENTITY}" \
     --certificate-oidc-issuer "${OIDC_ISSUER}" \
@@ -239,4 +284,4 @@ if (( ${#CHECKSUM_TARGETS[@]} > 0 )); then
   ( cd "$DIST" && sha256sum --ignore-missing -c checksums.txt )
 fi
 
-echo "OK: ${#images[@]} image(s), 3 blob(s) and ${#CHECKSUM_TARGETS[@]} checksummed artifact(s) verified against ${TAG}@${EXPECTED_COMMIT}"
+echo "OK: ${#images[@]} image(s), ${#charts[@]} chart(s), ${verified_blob_count} blob(s) and ${#CHECKSUM_TARGETS[@]} checksummed artifact(s) verified against ${TAG}@${EXPECTED_COMMIT}"

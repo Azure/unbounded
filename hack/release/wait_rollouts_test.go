@@ -314,7 +314,7 @@ func workload(selector string, images ...string) string {
 }
 
 // workloadWithInit renders a workload that also declares an init container,
-// matching the shape of deploy/gantry/daemonset.yaml.tmpl.
+// matching the shape of deploy/gantry/chart/templates/daemonset.yaml.
 func workloadWithInit(selector, image, init string) string {
 	return renderWorkload("", selector, []string{image}, []string{init}, nil)
 }

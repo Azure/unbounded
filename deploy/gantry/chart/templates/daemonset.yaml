@@ -1,0 +1,154 @@
+{{- include "gantry.validate" . }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  template:
+    metadata:
+      labels:
+        {{- include "gantry.labels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      {{- if eq .Values.manager "helm" }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      {{- end }}
+    spec:
+      serviceAccountName: gantry
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      priorityClassName: gantry-low
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: chown-hostpaths
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              chown -R 65532:65532 /var/lib/gantry/libp2p
+              chmod 0700 /var/lib/gantry/libp2p
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.resources.init | nindent 12 }}
+          volumeMounts:
+            - name: libp2p
+              mountPath: /var/lib/gantry/libp2p
+      containers:
+        - name: gantry
+          image: {{ include "gantry.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - agent
+            - --config=/etc/gantry/config.yaml
+          env:
+            - name: GANTRY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GANTRY_CHAIR_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: mirror
+              containerPort: 5000
+              hostPort: 5000
+              hostIP: 127.0.0.1
+              protocol: TCP
+            - name: transfer
+              containerPort: 5001
+              protocol: TCP
+            - name: chaircall
+              containerPort: 5002
+              protocol: TCP
+            - name: libp2p-tcp
+              containerPort: 4001
+              protocol: TCP
+            - name: metrics
+              containerPort: 9095
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources.agent | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: {{ .Values.containerd.socketGroup }}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: libp2p
+              mountPath: /var/lib/gantry/libp2p
+            - name: config
+              mountPath: /etc/gantry
+              readOnly: true
+            - name: registry-creds
+              mountPath: /etc/gantry/registry
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: containerd-runtime
+              mountPath: {{ .Values.containerd.mountPath }}
+      volumes:
+        - name: libp2p
+          hostPath:
+            path: /var/lib/gantry/libp2p
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: gantry-config
+        - name: registry-creds
+          secret:
+            secretName: {{ .Values.registryCredentials.secretName }}
+            optional: true
+        - name: tmp
+          emptyDir: {}
+        - name: containerd-runtime
+          hostPath:
+            path: {{ .Values.containerd.hostPath }}
+            type: Directory

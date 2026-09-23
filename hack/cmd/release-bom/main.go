@@ -25,7 +25,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-const bomSchemaVersion = 1
+const bomSchemaVersion = 2
 
 var releaseImageNames = []string{
 	"gantry",
@@ -58,6 +58,7 @@ type releaseBOM struct {
 	Release       releaseInfo          `json:"release"`
 	Artifacts     []releaseArtifact    `json:"artifacts"`
 	Images        []resolvedImage      `json:"images"`
+	Charts        []resolvedImage      `json:"charts"`
 	NodeBootstrap nodeBootstrapProfile `json:"nodeBootstrap"`
 }
 
@@ -179,6 +180,13 @@ func buildBOM(ctx context.Context, opts options, resolve imageResolver) (*releas
 		return nil, fmt.Errorf("resolve sandbox image: %w", err)
 	}
 
+	chartRef := strings.TrimRight(opts.registry, "/") + "/charts/gantry:" + strings.TrimPrefix(opts.tag, "v")
+
+	chart, err := resolve(ctx, "gantry", chartRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Gantry Helm chart: %w", err)
+	}
+
 	return &releaseBOM{
 		SchemaVersion: bomSchemaVersion,
 		Release: releaseInfo{
@@ -187,6 +195,7 @@ func buildBOM(ctx context.Context, opts options, resolve imageResolver) (*releas
 		},
 		Artifacts: releaseArtifacts(opts.tag),
 		Images:    images,
+		Charts:    []resolvedImage{chart},
 		NodeBootstrap: nodeBootstrapProfile{
 			KubernetesVersionSource: "cluster control plane version",
 			ContainerdVersion:       goalstates.ContainerdVersion,
@@ -202,8 +211,11 @@ func buildBOM(ctx context.Context, opts options, resolve imageResolver) (*releas
 }
 
 func releaseArtifacts(tag string) []releaseArtifact {
+	chartVersion := strings.TrimPrefix(tag, "v")
+
 	return []releaseArtifact{
 		{Name: "checksums.txt", Integrity: "cosign-bundle", SignatureBundle: "checksums.txt.bundle.json"},
+		{Name: "gantry-" + chartVersion + ".tgz", Integrity: "cosign-bundle", SignatureBundle: "gantry-" + chartVersion + ".tgz.bundle.json"},
 		{Name: "unbounded-manifests-" + tag + ".tar.gz", Integrity: "cosign-bundle", SignatureBundle: "unbounded-manifests-" + tag + ".tar.gz.bundle.json"},
 		{Name: "unbounded-operator-" + tag + ".yaml", Integrity: "cosign-bundle", SignatureBundle: "unbounded-operator-" + tag + ".yaml.bundle.json"},
 		{Name: "unbounded-storage-linux-amd64.tar.gz", Integrity: "sha256-and-cosign-bundle", SignatureBundle: "unbounded-storage-linux-amd64.tar.gz.bundle.json"},

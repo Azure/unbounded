@@ -1,0 +1,64 @@
+image:
+  reference: ""
+  repository: ghcr.io/azure/gantry
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: false
+
+manager: helm
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - operator: Exists
+
+containerd:
+  hostPath: /run/containerd
+  mountPath: /run/containerd
+  socketPath: /run/containerd/containerd.sock
+  namespace: k8s.io
+  socketGroup: 0
+
+nodeConfig:
+  enabled: true
+  hostPath: /etc/containerd/certs.d
+  reconcileIntervalSeconds: 5
+
+registryCredentials:
+  secretName: gantry-registry-credentials
+
+resources:
+  agent:
+    requests:
+      cpu: 100m
+      memory: 1Gi
+    limits:
+      cpu: "8"
+      memory: 8Gi
+  init:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 32Mi
+  nodeConfig:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      cpu: 50m
+      memory: 16Mi
+
+gantry:
+  config: ""
+  pprofListen: ""
+  upstreamRegistries:
+    - name: registry.example.com
+      endpoint: https://registry.example.com
+      credentialsPath: ""
+      namespaceAlias: ""
