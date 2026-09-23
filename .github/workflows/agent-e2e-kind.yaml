@@ -79,6 +79,10 @@ jobs:
         env:
           # Absent for non-pull_request events, where secrets are available.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          # Presence only. The image needs a federated login, and the entry is
+          # left out entirely until one is configured, rather than added and
+          # failed. GitHub masks the value; nothing here reads it.
+          ACL_CREDENTIAL: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
         run: |
           set -euo pipefail
 
@@ -99,12 +103,15 @@ jobs:
           # boots a 31 GiB sparse overlay through OVMF.
           acl='{"host-base-os":"acl","nspawn-base-os":"azlinux3","timeout":75}'
 
-          if [ -z "${HEAD_REPO}" ] || [ "${HEAD_REPO}" = "${GITHUB_REPOSITORY}" ]; then
-            hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
-          else
+          if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
             echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
-            hosts="$(printf '%s' "${hosts}" | jq -c .)"
+          elif [ -z "${ACL_CREDENTIAL}" ]; then
+            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID is not configured"
+          else
+            hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
           fi
+
+          hosts="$(printf '%s' "${hosts}" | jq -c .)"
 
           printf 'matrix=%s\n' "$(printf '%s' "${hosts}" | jq -c '{include: .}')" >> "${GITHUB_OUTPUT}"
 

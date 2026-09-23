@@ -55,9 +55,17 @@ config URL is appended to the kernel command line by patching a UKI addon on
 the EFI system partition; see `ukiboot.py` for why the boot chain is extended
 rather than replaced.
 
-In CI this entry is skipped on pull requests from forks, because GitHub
-withholds the credentials the image needs from fork-triggered workflows. Every
-other host downloads from a public mirror and runs normally there.
+In CI this entry is skipped unless a federated Azure login is configured, and
+on pull requests from forks, because GitHub withholds secrets from
+fork-triggered workflows. It is left out of the matrix rather than added and
+failed, so it appears on its own once `ACL_IMAGE_CLIENT_ID`,
+`ACL_IMAGE_TENANT_ID` and `ACL_IMAGE_SUBSCRIPTION_ID` exist as repository
+secrets. They have to be repository secrets rather than environment ones: the
+`azure-ci` environment requires a reviewer, which would put a manual approval
+in front of every pull request.
+
+Every other host downloads from a public mirror and runs normally in all of
+these cases.
 
 Cloud-init preparation is fail-fast, with the success marker last. EL10 hosts
 install `kernel-modules-extra-$(uname -r)` and load the netfilter modules required
