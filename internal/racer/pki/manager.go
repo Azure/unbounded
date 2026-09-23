@@ -44,6 +44,11 @@ type Manager struct {
 
 const publicationFence = "racer.unbounded.cloud/pki-fence"
 
+// bootstrapPending exists only until the initial public bundle is durable. A
+// pending Secret can resume publication, but cannot adopt an empty or different
+// tombstone left by a previously initialized trust domain.
+const bootstrapPending = "racer.unbounded.cloud/pki-bootstrap-pending"
+
 // RotationAnnotation requests rotation using a unique, nonempty operator nonce.
 const RotationAnnotation = "racer.unbounded-cloud.io/rotate-ca"
 
@@ -265,11 +270,6 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 			return ErrLostState
 		}
 
-		cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: m.namespace}, Data: map[string]string{}}
-		if err = m.client.Create(ctx, cm); err != nil {
-			return err
-		}
-
 		ca, caErr := makeCA(m.options.Now(), m.options)
 		if caErr != nil {
 			return caErr
@@ -282,7 +282,10 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 			return marshalErr
 		}
 
-		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName, Namespace: m.namespace}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{StateKey: data}}
+		// Create the complete private state first. Create arbitrates concurrent
+		// initializers; an ambiguous result is recovered by reading this Secret
+		// in a new leadership term, never by deleting or replacing it.
+		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName, Namespace: m.namespace, Annotations: map[string]string{bootstrapPending: "v1"}}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{StateKey: data}}
 		if err = m.client.Create(ctx, secret); err != nil {
 			return err
 		}
@@ -319,6 +322,15 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 	if err = m.claimPublication(ctx, token); err != nil {
 		return err
 	}
+	// Do not enable issuance until both objects are durable and initialization
+	// is committed. The Secret CAS also fences a takeover during publication.
+	if _, pending := secret.Annotations[bootstrapPending]; pending {
+		delete(secret.Annotations, bootstrapPending)
+
+		if err = m.client.Update(ctx, secret); err != nil {
+			return err
+		}
+	}
 
 	m.fence = token
 	m.leaderContext = ctx
@@ -336,13 +348,34 @@ func (m *Manager) claimPublication(ctx context.Context, token string) error {
 		return err
 	}
 
-	_, s, err := m.readMetadata(ctx)
+	secret, s, err := m.readMetadata(ctx)
 	if err != nil {
 		return err
 	}
 
 	if s.Fence != token || ctx.Err() != nil {
 		return ErrNotLeader
+	}
+
+	if version, pending := secret.Annotations[bootstrapPending]; pending {
+		if version != "v1" {
+			return ErrLostState
+		}
+
+		// A delayed first initializer may have checked an empty namespace
+		// before another leader initialized and subsequently lost its Secret.
+		// Never overwrite that leader's public trust, even an empty tombstone.
+		// Only our exact bundle proves a prior publication of this pending CA.
+		if missing {
+			if err := m.checkBootstrap(ctx); err != nil {
+				return err
+			}
+		} else {
+			bundle, err := ParseBundle([]byte(cm.Data[BundleKey]))
+			if err != nil || bundle.Digest() != s.bundle().Digest() {
+				return ErrLostState
+			}
+		}
 	}
 
 	if missing {
