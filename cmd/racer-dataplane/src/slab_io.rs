@@ -88,7 +88,7 @@ impl Bucket {
             .tokens
             .saturating_add(elapsed.saturating_mul(self.config.rate as u128))
             .min(self.config.burst as u128 * SECOND);
-        state.updated = now;
+        state.updated = state.updated.max(now);
     }
 }
 
@@ -102,6 +102,14 @@ thread_local! {
     static SETUP: RefCell<Io> = RefCell::default();
 }
 impl Io {
+    #[cfg(test)]
+    pub(crate) fn testing(rate: u64, burst: u64, bytes: bool) -> Self {
+        Self::new(Some(Config {
+            mode: if bytes { Mode::Bytes } else { Mode::Operations },
+            rate,
+            burst,
+        }))
+    }
     pub fn new(config: Option<Config>) -> Self {
         Self {
             bucket: config.map(|config| {

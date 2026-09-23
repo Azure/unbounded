@@ -2490,9 +2490,16 @@ impl Allocator {
             work |= self.changed || self.rotate;
         }
         self.publish_diagnostics(ring.metrics());
-        result.map(|runnable| Work {
-            runnable: runnable || work || self.reads.len() > budget,
-            deadline: None,
+        result.map(|runnable| {
+            // Pending publication and checkpoint-budget contention traditionally
+            // stay runnable. A token wait must instead let the worker park.
+            let deadline = ring
+                .slab_deadline()
+                .filter(|d| *d > crate::environment::now());
+            Work {
+                runnable: work || self.reads.len() > budget || (runnable && deadline.is_none()),
+                deadline,
+            }
         })
     }
 }
