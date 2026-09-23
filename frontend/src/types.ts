@@ -137,7 +137,7 @@ export type NodeStatus = {
   routingTable?: RoutingTable;
   healthCheck?: HealthCheckStatus;
   nodeErrors?: NodeError[];
-  lastPushTime?: string;
+  lastPushTime?: string | null;
   statusSource?: string;
   fetchError?: string;
   bpfEntries?: BpfEntry[];
@@ -261,6 +261,8 @@ export type ClusterSummaryDelta = {
 };
 
 export type NodeSummary = {
+  nodeInfo?: NodeInfo;
+  lastPushTime?: string | null;
   name?: string;
   siteName?: string;
   isGateway?: boolean;
@@ -275,4 +277,23 @@ export type NodeSummary = {
   routeCount?: number;
   routeMismatch?: boolean;
   fetchError?: string;
+  wireGuardOnline?: boolean;
+};
+
+export type NodeDetailSnapshot = {
+  nodeName: string;
+  requestId: string;
+  collectedAt: string;
+  receivedAt: string;
+  expiresAt: string;
+  status: NodeStatus;
+};
+
+export type NodeDetailResult = {
+  state: 'pending' | 'complete' | 'expired' | 'unavailable' | 'retryable';
+  nodeName: string;
+  requestId?: string;
+  deadline?: string;
+  error?: string;
+  details?: NodeDetailSnapshot;
 };

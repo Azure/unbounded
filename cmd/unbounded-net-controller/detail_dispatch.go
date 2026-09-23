@@ -94,6 +94,10 @@ func (m *nodeDetailRequests) startDispatchLocked(request *nodeDetailRequest) {
 		defer m.mu.Unlock()
 
 		request.dispatching = false
+		if request.state != statusv1alpha1.NodeDetailPending {
+			request.cancel()
+		}
+
 		if m.active[request.nodeName] == request && request.retry && m.ctx.Err() == nil && !m.closed {
 			m.startDispatchLocked(request)
 		}
