@@ -21,22 +21,16 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Every update replaces this entire message. Empty lists remove all entries.
 type Snapshot struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Universe []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"` // 32 bytes, pinned by bootstrap configuration
-	Node     []byte                 `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`         // 32 bytes, pinned by bootstrap configuration
-	Revision uint64                 `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
-	Peers    []*Peer                `protobuf:"bytes,4,rep,name=peers,proto3" json:"peers,omitempty"` // only this node's direct connections
-	Volumes  []*Volume              `protobuf:"bytes,5,rep,name=volumes,proto3" json:"volumes,omitempty"`
-	Fabric   string                 `protobuf:"bytes,6,opt,name=fabric,proto3" json:"fabric,omitempty"`
-	// Config generation shared across nodes in a universe; zero means unspecified.
-	// Observability only: revision still orders updates, Topology.epoch orders routing.
-	Epoch uint64 `protobuf:"varint,7,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	// Explicitly authorizes readiness without listeners after worker activation.
-	// Only selected, eligible idle members receive this; empty removal snapshots
-	// leave it false. An idle snapshot must have no volumes or peers.
-	Idle          bool `protobuf:"varint,8,opt,name=idle,proto3" json:"idle,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Universe      []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
+	Node          []byte                 `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
+	Revision      uint64                 `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
+	Peers         []*Peer                `protobuf:"bytes,4,rep,name=peers,proto3" json:"peers,omitempty"`
+	Volumes       []*Volume              `protobuf:"bytes,5,rep,name=volumes,proto3" json:"volumes,omitempty"`
+	Fabric        string                 `protobuf:"bytes,6,opt,name=fabric,proto3" json:"fabric,omitempty"`
+	Epoch         uint64                 `protobuf:"varint,7,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Idle          bool                   `protobuf:"varint,8,opt,name=idle,proto3" json:"idle,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -131,8 +125,8 @@ type Peer struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	Fabric        string                 `protobuf:"bytes,2,opt,name=fabric,proto3" json:"fabric,omitempty"`
-	HttpAddress   string                 `protobuf:"bytes,3,opt,name=http_address,json=httpAddress,proto3" json:"http_address,omitempty"` // IPv4:port or [IPv6]:port
-	PodUid        string                 `protobuf:"bytes,4,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`                // selected Pod identity, verified by peer TLS
+	HttpAddress   string                 `protobuf:"bytes,3,opt,name=http_address,json=httpAddress,proto3" json:"http_address,omitempty"`
+	PodUid        string                 `protobuf:"bytes,4,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -196,21 +190,17 @@ func (x *Peer) GetPodUid() string {
 }
 
 type Volume struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	CacheGeneration uint64                 `protobuf:"varint,5,opt,name=cache_generation,json=cacheGeneration,proto3" json:"cache_generation,omitempty"`
-	// Direct transport peers only. Nonempty lists require topology.
-	Peers    []string  `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
-	Topology *Topology `protobuf:"bytes,7,opt,name=topology,proto3" json:"topology,omitempty"`
-	// Primary plus successors, including suppressed slots; default 3, range 1..8.
-	MaxCandidateAttempts *uint32 `protobuf:"varint,8,opt,name=max_candidate_attempts,json=maxCandidateAttempts,proto3,oneof" json:"max_candidate_attempts,omitempty"`
-	// Required: complete direct membership, including incoming-only peers.
-	// Empty explicitly authorizes none.
-	PeerEndpoints *VolumePeerEndpoints `protobuf:"bytes,9,opt,name=peer_endpoints,json=peerEndpoints,proto3" json:"peer_endpoints,omitempty"`
-	CacheSocket   string               `protobuf:"bytes,10,opt,name=cache_socket,json=cacheSocket,proto3" json:"cache_socket,omitempty"`    // absolute filesystem Unix socket for local ingress
-	OriginSocket  string               `protobuf:"bytes,12,opt,name=origin_socket,json=originSocket,proto3" json:"origin_socket,omitempty"` // absolute filesystem Unix socket for the local origin
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Id                   string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	CacheGeneration      uint64                 `protobuf:"varint,5,opt,name=cache_generation,json=cacheGeneration,proto3" json:"cache_generation,omitempty"`
+	Peers                []string               `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
+	Topology             *Topology              `protobuf:"bytes,7,opt,name=topology,proto3" json:"topology,omitempty"`
+	MaxCandidateAttempts *uint32                `protobuf:"varint,8,opt,name=max_candidate_attempts,json=maxCandidateAttempts,proto3,oneof" json:"max_candidate_attempts,omitempty"`
+	PeerEndpoints        *VolumePeerEndpoints   `protobuf:"bytes,9,opt,name=peer_endpoints,json=peerEndpoints,proto3" json:"peer_endpoints,omitempty"`
+	CacheSocket          string                 `protobuf:"bytes,10,opt,name=cache_socket,json=cacheSocket,proto3" json:"cache_socket,omitempty"`
+	OriginSocket         string                 `protobuf:"bytes,12,opt,name=origin_socket,json=originSocket,proto3" json:"origin_socket,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Volume) Reset() {
@@ -345,8 +335,8 @@ func (x *VolumePeerEndpoints) GetPeers() []*VolumePeerEndpoint {
 
 type VolumePeerEndpoint struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Peer          string                 `protobuf:"bytes,1,opt,name=peer,proto3" json:"peer,omitempty"`                                  // exact identity in Snapshot.peers
-	HttpAddress   string                 `protobuf:"bytes,2,opt,name=http_address,json=httpAddress,proto3" json:"http_address,omitempty"` // empty explicitly inherits the global endpoint
+	Peer          string                 `protobuf:"bytes,1,opt,name=peer,proto3" json:"peer,omitempty"`
+	HttpAddress   string                 `protobuf:"bytes,2,opt,name=http_address,json=httpAddress,proto3" json:"http_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -395,16 +385,13 @@ func (x *VolumePeerEndpoint) GetHttpAddress() string {
 	return ""
 }
 
-// Shared slot geometry/epoch; only local slots and their outgoing neighbors.
-// All nodes in a volume agree on epoch and slot_count. Revision is node-local.
 type Topology struct {
-	state      protoimpl.MessageState `protogen:"open.v1"`
-	Epoch      uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	SlotCount  uint32                 `protobuf:"varint,2,opt,name=slot_count,json=slotCount,proto3" json:"slot_count,omitempty"`
-	LocalSlots []uint32               `protobuf:"varint,3,rep,packed,name=local_slots,json=localSlots,proto3" json:"local_slots,omitempty"`
-	Neighbors  []*SlotPeer            `protobuf:"bytes,4,rep,name=neighbors,proto3" json:"neighbors,omitempty"`
-	// Destination-rooted shortest paths (2); absent defaults to 2.
-	RoutingAlgorithm *uint32 `protobuf:"varint,5,opt,name=routing_algorithm,json=routingAlgorithm,proto3,oneof" json:"routing_algorithm,omitempty"`
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Epoch            uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	SlotCount        uint32                 `protobuf:"varint,2,opt,name=slot_count,json=slotCount,proto3" json:"slot_count,omitempty"`
+	LocalSlots       []uint32               `protobuf:"varint,3,rep,packed,name=local_slots,json=localSlots,proto3" json:"local_slots,omitempty"`
+	Neighbors        []*SlotPeer            `protobuf:"bytes,4,rep,name=neighbors,proto3" json:"neighbors,omitempty"`
+	RoutingAlgorithm *uint32                `protobuf:"varint,5,opt,name=routing_algorithm,json=routingAlgorithm,proto3,oneof" json:"routing_algorithm,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -526,7 +513,6 @@ func (x *SlotPeer) GetPeer() string {
 	return ""
 }
 
-// Embedded in HTTP control commands. Local files use its ProtoJSON form.
 type Configuration struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Contents:
@@ -593,27 +579,22 @@ type Configuration_Snapshot struct {
 
 func (*Configuration_Snapshot) isConfiguration_Contents() {}
 
-// Served over mutual TLS by /v3/{universe}/{node}.
 type ControlCommand struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Universe       []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
-	Node           []byte                 `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
-	Incarnation    []byte                 `protobuf:"bytes,3,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
-	SnapshotDigest []byte                 `protobuf:"bytes,4,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"`
-	Revision       uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"`
-	// 1 prepare, 2 enable receive, 3 activate ingress, 4 retire, 5 abort.
-	Phase         uint32         `protobuf:"varint,6,opt,name=phase,proto3" json:"phase,omitempty"`
-	Configuration *Configuration `protobuf:"bytes,7,opt,name=configuration,proto3" json:"configuration,omitempty"`
-	Profile       uint32         `protobuf:"varint,8,opt,name=profile,proto3" json:"profile,omitempty"` // profile 1: scoped peers, 262144 slots, 64 MiB input
-	// Conditional forward correction, checked atomically against never-receive.
-	ForwardDigest   []byte `protobuf:"bytes,9,opt,name=forward_digest,json=forwardDigest,proto3" json:"forward_digest,omitempty"`
-	ForwardRevision uint64 `protobuf:"varint,10,opt,name=forward_revision,json=forwardRevision,proto3" json:"forward_revision,omitempty"`
-	PodUid          string `protobuf:"bytes,11,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"` // certificate identity, pinned per subscription
-	// Independent of topology revision/phase; may accompany a config-free heartbeat.
-	// Sent only to clients advertising X-Racer-Storage-Policy: 1.
-	StoragePolicy *StoragePolicy `protobuf:"bytes,12,opt,name=storage_policy,json=storagePolicy,proto3" json:"storage_policy,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Universe        []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
+	Node            []byte                 `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
+	Incarnation     []byte                 `protobuf:"bytes,3,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
+	SnapshotDigest  []byte                 `protobuf:"bytes,4,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"`
+	Revision        uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"`
+	Phase           uint32                 `protobuf:"varint,6,opt,name=phase,proto3" json:"phase,omitempty"`
+	Configuration   *Configuration         `protobuf:"bytes,7,opt,name=configuration,proto3" json:"configuration,omitempty"`
+	Profile         uint32                 `protobuf:"varint,8,opt,name=profile,proto3" json:"profile,omitempty"`
+	ForwardDigest   []byte                 `protobuf:"bytes,9,opt,name=forward_digest,json=forwardDigest,proto3" json:"forward_digest,omitempty"`
+	ForwardRevision uint64                 `protobuf:"varint,10,opt,name=forward_revision,json=forwardRevision,proto3" json:"forward_revision,omitempty"`
+	PodUid          string                 `protobuf:"bytes,11,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
+	StoragePolicy   *StoragePolicy         `protobuf:"bytes,12,opt,name=storage_policy,json=storagePolicy,proto3" json:"storage_policy,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ControlCommand) Reset() {
@@ -732,9 +713,9 @@ func (x *ControlCommand) GetStoragePolicy() *StoragePolicy {
 
 type StoragePolicy struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Identity      []byte                 `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`                              // 32-byte durable policy identity for this Kubernetes Node UID
-	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`                               // monotonic within identity; changes only with desired bytes
-	DesiredBytes  uint64                 `protobuf:"varint,3,opt,name=desired_bytes,json=desiredBytes,proto3" json:"desired_bytes,omitempty"` // normalized total disk capacity, not memory or per shard
+	Identity      []byte                 `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`
+	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	DesiredBytes  uint64                 `protobuf:"varint,3,opt,name=desired_bytes,json=desiredBytes,proto3" json:"desired_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -808,7 +789,7 @@ const file_control_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06fabric\x18\x02 \x01(\tR\x06fabric\x12!\n" +
 	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\x12\x17\n" +
-	"\apod_uid\x18\x04 \x01(\tR\x06podUid\"\xcb\x03\n" +
+	"\apod_uid\x18\x04 \x01(\tR\x06podUid\"\xfd\x02\n" +
 	"\x06Volume\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12)\n" +
 	"\x10cache_generation\x18\x05 \x01(\x04R\x0fcacheGeneration\x12\x14\n" +
@@ -819,7 +800,7 @@ const file_control_proto_rawDesc = "" +
 	"\fcache_socket\x18\n" +
 	" \x01(\tR\vcacheSocket\x12#\n" +
 	"\rorigin_socket\x18\f \x01(\tR\foriginSocketB\x19\n" +
-	"\x17_max_candidate_attemptsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\v\x10\fR\x06listenR\x0eorigin_addressR\x0forigin_identityR\vpeer_listen\"Q\n" +
+	"\x17_max_candidate_attempts\"Q\n" +
 	"\x13VolumePeerEndpoints\x12:\n" +
 	"\x05peers\x18\x01 \x03(\v2$.racer.control.v1.VolumePeerEndpointR\x05peers\"K\n" +
 	"\x12VolumePeerEndpoint\x12\x12\n" +
@@ -836,11 +817,11 @@ const file_control_proto_rawDesc = "" +
 	"\x12_routing_algorithm\"2\n" +
 	"\bSlotPeer\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\rR\x04slot\x12\x12\n" +
-	"\x04peer\x18\x02 \x01(\tR\x04peer\"c\n" +
+	"\x04peer\x18\x02 \x01(\tR\x04peer\"U\n" +
 	"\rConfiguration\x128\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x1a.racer.control.v1.SnapshotH\x00R\bsnapshotB\n" +
 	"\n" +
-	"\bcontentsJ\x04\b\x02\x10\x03R\x06signed\"\xd1\x03\n" +
+	"\bcontents\"\xd1\x03\n" +
 	"\x0eControlCommand\x12\x1a\n" +
 	"\buniverse\x18\x01 \x01(\fR\buniverse\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\fR\x04node\x12 \n" +

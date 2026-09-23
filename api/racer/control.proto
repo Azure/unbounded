@@ -3,65 +3,48 @@ package racer.control.v1;
 
 option go_package = "github.com/Azure/unbounded/api/racer;racerconfig";
 
-// Every update replaces this entire message. Empty lists remove all entries.
 message Snapshot {
-  bytes universe = 1; // 32 bytes, pinned by bootstrap configuration
-  bytes node = 2; // 32 bytes, pinned by bootstrap configuration
+  bytes universe = 1;
+  bytes node = 2;
   uint64 revision = 3;
-  repeated Peer peers = 4; // only this node's direct connections
+  repeated Peer peers = 4;
   repeated Volume volumes = 5;
   string fabric = 6;
-  // Config generation shared across nodes in a universe; zero means unspecified.
-  // Observability only: revision still orders updates, Topology.epoch orders routing.
   uint64 epoch = 7;
-  // Explicitly authorizes readiness without listeners after worker activation.
-  // Only selected, eligible idle members receive this; empty removal snapshots
-  // leave it false. An idle snapshot must have no volumes or peers.
   bool idle = 8;
 }
 
 message Peer {
   string id = 1;
   string fabric = 2;
-  string http_address = 3; // IPv4:port or [IPv6]:port
-  string pod_uid = 4; // selected Pod identity, verified by peer TLS
+  string http_address = 3;
+  string pod_uid = 4;
 }
 
 message Volume {
   string id = 1;
-  reserved 2, 3, 4;
-  reserved "listen", "origin_address", "origin_identity";
   uint64 cache_generation = 5;
-  // Direct transport peers only. Nonempty lists require topology.
   repeated string peers = 6;
   Topology topology = 7;
-  // Primary plus successors, including suppressed slots; default 3, range 1..8.
   optional uint32 max_candidate_attempts = 8;
-  // Required: complete direct membership, including incoming-only peers.
-  // Empty explicitly authorizes none.
   VolumePeerEndpoints peer_endpoints = 9;
-  string cache_socket = 10; // absolute filesystem Unix socket for local ingress
-  reserved 11;
-  reserved "peer_listen";
-  string origin_socket = 12; // absolute filesystem Unix socket for the local origin
+  string cache_socket = 10;
+  string origin_socket = 12;
 }
 
 message VolumePeerEndpoints {
   repeated VolumePeerEndpoint peers = 1;
 }
 message VolumePeerEndpoint {
-  string peer = 1; // exact identity in Snapshot.peers
-  string http_address = 2; // empty explicitly inherits the global endpoint
+  string peer = 1;
+  string http_address = 2;
 }
 
-// Shared slot geometry/epoch; only local slots and their outgoing neighbors.
-// All nodes in a volume agree on epoch and slot_count. Revision is node-local.
 message Topology {
   uint64 epoch = 1;
   uint32 slot_count = 2;
   repeated uint32 local_slots = 3;
   repeated SlotPeer neighbors = 4;
-  // Destination-rooted shortest paths (2); absent defaults to 2.
   optional uint32 routing_algorithm = 5;
 }
 message SlotPeer {
@@ -69,36 +52,28 @@ message SlotPeer {
   string peer = 2;
 }
 
-// Embedded in HTTP control commands. Local files use its ProtoJSON form.
 message Configuration {
-  reserved 2;
-  reserved "signed";
   oneof contents {
     Snapshot snapshot = 1;
   }
 }
 
-// Served over mutual TLS by /v3/{universe}/{node}.
 message ControlCommand {
   bytes universe = 1;
   bytes node = 2;
   bytes incarnation = 3;
   bytes snapshot_digest = 4;
   uint64 revision = 5;
-  // 1 prepare, 2 enable receive, 3 activate ingress, 4 retire, 5 abort.
   uint32 phase = 6;
   Configuration configuration = 7;
-  uint32 profile = 8; // profile 1: scoped peers, 262144 slots, 64 MiB input
-  // Conditional forward correction, checked atomically against never-receive.
+  uint32 profile = 8;
   bytes forward_digest = 9;
   uint64 forward_revision = 10;
-  string pod_uid = 11; // certificate identity, pinned per subscription
-  // Independent of topology revision/phase; may accompany a config-free heartbeat.
-  // Sent only to clients advertising X-Racer-Storage-Policy: 1.
+  string pod_uid = 11;
   StoragePolicy storage_policy = 12;
 }
 message StoragePolicy {
-  bytes identity = 1; // 32-byte durable policy identity for this Kubernetes Node UID
-  uint64 version = 2; // monotonic within identity; changes only with desired bytes
-  uint64 desired_bytes = 3; // normalized total disk capacity, not memory or per shard
+  bytes identity = 1;
+  uint64 version = 2;
+  uint64 desired_bytes = 3;
 }
