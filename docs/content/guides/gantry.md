@@ -54,9 +54,11 @@ confirm that every selected node exposes `/run/containerd/containerd.sock` and
 that containerd reads registry host configuration from
 `/etc/containerd/certs.d`.
 
-The chart does not currently modify or restart containerd. Provision the
-`certs.d` setting and Gantry mirror routing through your node-management system.
-The Unbounded agent already manages those settings on operator-managed nodes.
+The chart does not modify or restart containerd. Provision the `certs.d`
+setting through your node-management system. For standalone installations, the
+chart runs a node-config DaemonSet that continuously reconciles the Gantry
+mirror route shown below. The Unbounded agent owns that route instead on
+operator-managed nodes, where the chart's node-config resources are disabled.
 
 The default route written on each node is:
 
@@ -98,9 +100,16 @@ helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
 ```
 
 The chart owns the Gantry ConfigMap, image, RBAC, PriorityClass, chair Leases,
-and DaemonSet. Upgrade those resources through `helm upgrade`, not direct edits.
-Before `helm uninstall`, remove or restore the externally managed containerd
-route so new image pulls cannot target a removed Gantry endpoint.
+agent DaemonSet, and node-config DaemonSet. The node-config process checks its
+`_default/hosts.toml` every five seconds and atomically restores it after drift
+or a node upgrade reset. Upgrade those resources through `helm upgrade`, not
+direct edits. Set `nodeConfig.enabled=false` only when another node-management
+system owns mirror routing.
+
+During graceful disable or uninstall, the node-config pod removes
+`hosts.toml` only when it still matches the chart payload. Nodes unavailable
+during uninstall may retain the file and should be checked before the Gantry
+endpoint is considered fully removed.
 
 ### 3. Configure Upstream Registries
 

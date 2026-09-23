@@ -18,19 +18,19 @@ and examples used by development and benchmark tooling.
 | `chart/templates/serviceaccount.yaml` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + Role + PriorityClass. |
 | `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
+| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's default Gantry mirror route. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
-| `node-config.yaml.tmpl` | `rendered/node-config.yaml` | Standalone node configurator for containerd's default Gantry mirror. |
 
 ## Installation paths
 
 - Operator-managed clusters use the manifests embedded in the
    `unbounded-operator` binary. The operator never runs Helm.
-- Clusters without the operator install the released OCI chart. The initial
-   chart requires containerd to be configured externally to read
-   `/etc/containerd/certs.d`; reversible chart-managed host configuration is not
-   enabled yet.
+- Clusters without the operator install the released OCI chart. The chart
+   continuously reconciles `/etc/containerd/certs.d/_default/hosts.toml` on
+   every selected node. Containerd must already be configured to read
+   `/etc/containerd/certs.d`; the chart does not edit or restart containerd.
 
 The paths are mutually exclusive. `PriorityClass/gantry-low` records the active
 manager, and both installers reject ownership by the other path.
@@ -80,13 +80,14 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
-Legacy development and benchmark workflows can apply
-`rendered/node-config.yaml` to non-agent-managed nodes. The released Helm chart
-does not install that one-way configurator; production standalone installs
-should manage the same host setting through their node-management system until
-the reversible chart lifecycle is available.
+Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
+resident reconciler checks the default `hosts.toml` every five seconds and
+atomically restores the chart-owned payload when the file is missing or
+different, including after a node upgrade resets host configuration. Graceful
+shutdown removes the file only when it still matches the chart payload. Set
+`nodeConfig.enabled=false` when another node-management system owns this file.
 
-For each upstream registry the cluster pulls from, drop a
+Externally managed installations can instead drop a registry-specific
 `hosts.toml` at:
 
 ```

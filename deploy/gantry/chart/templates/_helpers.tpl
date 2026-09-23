@@ -19,11 +19,22 @@
 {{- end -}}
 {{- end }}
 
-{{- define "gantry.labels" -}}
-app.kubernetes.io/name: gantry
+{{- define "gantry.managerLabel" -}}
 {{- if eq .Values.manager "helm" }}
 app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
 {{- else }}
 app.kubernetes.io/managed-by: {{ .Values.manager | quote }}
 {{- end }}
+{{- end }}
+
+{{- define "gantry.labels" -}}
+app.kubernetes.io/name: gantry
+{{ include "gantry.managerLabel" . }}
+{{- end }}
+
+{{- define "gantry.nodeConfigHosts" -}}
+# Managed by the Gantry Helm chart.
+[host."http://127.0.0.1:5000"]
+	capabilities = ["pull", "resolve"]
+	dial_timeout = "200ms"
 {{- end }}

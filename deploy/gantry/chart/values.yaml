@@ -23,6 +23,11 @@ containerd:
   namespace: k8s.io
   socketGroup: 0
 
+nodeConfig:
+  enabled: true
+  hostPath: /etc/containerd/certs.d
+  reconcileIntervalSeconds: 5
+
 registryCredentials:
   secretName: gantry-registry-credentials
 
@@ -41,6 +46,13 @@ resources:
     limits:
       cpu: 100m
       memory: 32Mi
+  nodeConfig:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      cpu: 50m
+      memory: 16Mi
 
 gantry:
   config: ""

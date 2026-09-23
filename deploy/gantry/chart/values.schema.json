@@ -9,6 +9,7 @@
     "nodeSelector",
     "tolerations",
     "containerd",
+    "nodeConfig",
     "registryCredentials",
     "resources",
     "gantry"
@@ -120,6 +121,28 @@
         }
       }
     },
+    "nodeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "hostPath",
+        "reconcileIntervalSeconds"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hostPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "reconcileIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
     "registryCredentials": {
       "type": "object",
       "additionalProperties": false,
@@ -138,13 +161,17 @@
       "additionalProperties": false,
       "required": [
         "agent",
-        "init"
+        "init",
+        "nodeConfig"
       ],
       "properties": {
         "agent": {
           "type": "object"
         },
         "init": {
+          "type": "object"
+        },
+        "nodeConfig": {
           "type": "object"
         }
       }

@@ -8,3 +8,6 @@ namespace:
   create: true
 
 manager: unbounded-operator
+
+nodeConfig:
+  enabled: false

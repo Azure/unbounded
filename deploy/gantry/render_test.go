@@ -5,6 +5,7 @@ package gantry
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -13,7 +14,9 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -265,6 +268,148 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 	}
 }
 
+func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
+	t.Parallel()
+
+	standaloneDir := renderStandaloneTemplates(t)
+	standaloneObjects := renderedObjects(t, standaloneDir)
+	operatorObjects := renderedObjects(t, renderTemplates(t))
+
+	for _, key := range []string{
+		"ConfigMap/unbounded-system/gantry-containerd-hosts",
+		"DaemonSet/unbounded-system/gantry-containerd-config",
+	} {
+		if _, ok := standaloneObjects[key]; !ok {
+			t.Fatalf("standalone profile is missing %s", key)
+		}
+
+		if _, ok := operatorObjects[key]; ok {
+			t.Fatalf("operator profile unexpectedly contains %s", key)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(standaloneDir, "node-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered node config: %v", err)
+	}
+
+	manifest := string(raw)
+	for _, fragment := range []string{
+		"path: /etc/containerd/certs.d",
+		"target_file=\"$target_dir/hosts.toml\"",
+		"while true; do",
+		"if ! cmp -s \"$source_file\" \"$target_file\"; then",
+		"mv \"$temp_file\" \"$target_file\"",
+		"sleep 5",
+		"rm -f \"$target_file\"",
+	} {
+		if !strings.Contains(manifest, fragment) {
+			t.Fatalf("standalone node config is missing %q", fragment)
+		}
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+
+	var hostsConfig, reconcileScript string
+
+	for {
+		var object struct {
+			Kind string            `yaml:"kind"`
+			Data map[string]string `yaml:"data"`
+			Spec struct {
+				Selector struct {
+					MatchLabels map[string]string `yaml:"matchLabels"`
+				} `yaml:"selector"`
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Name    string   `yaml:"name"`
+							Command []string `yaml:"command"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := decoder.Decode(&object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatalf("decode node config: %v", err)
+		}
+
+		switch object.Kind {
+		case "ConfigMap":
+			hostsConfig = object.Data["hosts.toml"]
+		case "DaemonSet":
+			if got := object.Spec.Selector.MatchLabels["app.kubernetes.io/name"]; got != "gantry-containerd-config" {
+				t.Fatalf("node-config selector name = %q, want gantry-containerd-config", got)
+			}
+
+			for _, container := range object.Spec.Template.Spec.Containers {
+				if container.Name == "configure" && len(container.Command) == 3 {
+					reconcileScript = container.Command[2]
+				}
+			}
+		}
+	}
+
+	if hostsConfig == "" || reconcileScript == "" {
+		t.Fatal("rendered node config is missing its payload or reconcile script")
+	}
+
+	hostRoot := t.TempDir()
+	targetDir := filepath.Join(hostRoot, "_default")
+
+	sourceFile := filepath.Join(t.TempDir(), "hosts.toml")
+	if err := os.WriteFile(sourceFile, []byte(hostsConfig), 0o644); err != nil {
+		t.Fatalf("write source hosts config: %v", err)
+	}
+
+	reconcileScript = strings.Replace(reconcileScript, "target_dir=/host-certs/_default", fmt.Sprintf("target_dir=%q", targetDir), 1)
+	reconcileScript = strings.Replace(reconcileScript, "source_file=/config/hosts.toml", fmt.Sprintf("source_file=%q", sourceFile), 1)
+	reconcileScript = strings.Replace(reconcileScript, "sleep 5", "sleep 0.05", 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", reconcileScript)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start node config reconciler: %v", err)
+	}
+
+	defer func() {
+		cancel()
+
+		_ = cmd.Wait()
+	}()
+
+	targetFile := filepath.Join(targetDir, "hosts.toml")
+	waitForFileContent(t, targetFile, hostsConfig)
+
+	if err := os.WriteFile(targetFile, []byte("node upgrade reset\n"), 0o644); err != nil {
+		t.Fatalf("replace managed hosts config: %v", err)
+	}
+
+	waitForFileContent(t, targetFile, hostsConfig)
+}
+
+func waitForFileContent(t *testing.T, path, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(path)
+		if err == nil && string(content) == want {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("%s did not converge to the desired content", path)
+}
+
 func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
 	t.Parallel()
 
@@ -272,6 +417,8 @@ func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
 	standaloneObjects := renderedObjects(t, renderStandaloneTemplates(t))
 
 	delete(operatorObjects, "Namespace//unbounded-system")
+	delete(standaloneObjects, "ConfigMap/unbounded-system/gantry-containerd-hosts")
+	delete(standaloneObjects, "DaemonSet/unbounded-system/gantry-containerd-config")
 
 	if len(operatorObjects) != len(standaloneObjects) {
 		t.Fatalf("shared object counts differ: operator=%d standalone=%d", len(operatorObjects), len(standaloneObjects))
