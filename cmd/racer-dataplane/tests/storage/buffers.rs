@@ -72,12 +72,14 @@ impl WorkerPool {
     pub(crate) fn invariant_snapshot(&self) -> InvariantSnapshot {
         let mut snapshot = InvariantSnapshot::default();
         let mut free = vec![false; self.node.slots.len()];
-        for &index in self.node.free.lock().unwrap().iter() {
+        let state = self.node.free.lock().unwrap();
+        for &index in state.slots.iter().chain(state.grants()) {
             assert!(
                 !std::mem::replace(&mut free[index], true),
                 "duplicate free slot"
             );
         }
+        drop(state);
         for (index, slot) in self.node.slots.iter().enumerate() {
             let refs = slot.refs.0.load(Ordering::Acquire);
             assert_eq!(free[index], refs == 0, "lost or prematurely freed slot");
@@ -147,6 +149,10 @@ impl WorkerPool {
         let snapshot = self.invariant_snapshot();
         assert_eq!(snapshot.flights, 0, "orphan flight");
         assert!(
+            self.node.free.lock().unwrap().is_idle(),
+            "orphan acquisition"
+        );
+        assert!(
             snapshot.refs.iter().all(|refs| *refs == 0),
             "pinned pool slot"
         );
@@ -161,3 +167,7 @@ impl WorkerPool {
 #[cfg(test)]
 #[path = "buffer_lifetimes.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "buffer_acquisition.rs"]
+mod acquisition_tests;

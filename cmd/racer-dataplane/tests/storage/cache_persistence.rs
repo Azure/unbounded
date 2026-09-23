@@ -1322,6 +1322,7 @@ fn kernel_child() {
     single_flight_and_deadlines(&mut ring);
     semantic_fallback(&mut ring);
     peer_retry_reacquisition();
+    buffer_backpressure();
     maintenance(&mut ring);
     disk_singleflight_and_scrub(&mut ring);
     ring.shutdown().unwrap();

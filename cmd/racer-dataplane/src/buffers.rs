@@ -30,6 +30,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
+mod acquisition;
+pub use acquisition::Acquisition;
+use acquisition::Free;
+
 pub const BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -298,7 +302,7 @@ struct Slot {
 struct Node {
     mapping: Arc<Mapping>,
     slots: Box<[Slot]>,
-    free: Mutex<Vec<usize>>,
+    free: Mutex<Free>,
     flights: NetworkFlights,
 }
 impl Node {
@@ -328,7 +332,7 @@ impl Node {
                     info: Padded(Mutex::new(SlotInfo::default())),
                 })
                 .collect(),
-            free: Mutex::new((0..count).rev().collect()),
+            free: Mutex::new(Free::new(count)),
             flights: NetworkFlights {
                 registry: Mutex::new(HashMap::new()),
                 count: Arc::new(AtomicUsize::new(0)),
@@ -344,7 +348,12 @@ impl Node {
         // available under the free-list lock, which synchronizes the next allocation.
         // Acquire observes all other holders' releases before recycling memory.
         if self.slots[index].refs.0.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.free.lock().unwrap().push(index);
+            let wakes = {
+                let mut free = self.free.lock().unwrap();
+                free.slots.push(index);
+                free.dispatch()
+            };
+            acquisition::wake(wakes);
         }
     }
 }
@@ -395,27 +404,31 @@ impl WorkerPool {
             mapping: self.node.mapping.clone(),
         }
     }
-    /// Allocate exclusive transient storage, or apply backpressure if every slot is held.
+    /// Try allocating without waiting. Use `wait_private_fill` for request backpressure.
     pub fn private_fill(&self) -> Result<Fill, Exhausted> {
         self.allocate(None, 0)
     }
-    /// Allocate private staging bound to a complete value identity for transport validation.
+    /// Try allocating private staging without waiting. Use `wait_stage` for requests.
     pub fn stage(&self, key: Key) -> Result<Fill, Exhausted> {
         self.allocate(Some(key), 0)
     }
     /// Keep downstream progress capacity free while a receive depends on peers.
     /// Check and allocation share the NUMA free-list lock across all workers.
+    #[cfg(test)]
     pub(crate) fn stage_reserved(&self, key: Key, reserve: usize) -> Result<Fill, Exhausted> {
         self.allocate(Some(key), reserve)
     }
     fn allocate(&self, value: Option<Key>, reserve: usize) -> Result<Fill, Exhausted> {
         let index = {
             let mut free = self.node.free.lock().unwrap();
-            if free.len() <= reserve {
+            if free.slots.len() <= reserve {
                 return Err(Exhausted);
             }
-            free.pop().unwrap()
+            free.slots.pop().unwrap()
         };
+        Ok(self.fill(index, value))
+    }
+    fn fill(&self, index: usize, value: Option<Key>) -> Fill {
         let slot = &self.node.slots[index];
         debug_assert_eq!(slot.refs.0.load(Ordering::Relaxed), 0);
         *slot.info.0.lock().unwrap() = SlotInfo {
@@ -424,12 +437,12 @@ impl WorkerPool {
             len: None,
         };
         slot.refs.0.store(1, Ordering::Relaxed);
-        Ok(Fill {
+        Fill {
             handle: Some(Handle {
                 node: self.node.clone(),
                 index,
             }),
-        })
+        }
     }
     pub(crate) fn owns_fill(&self, fill: &Fill) -> bool {
         Arc::ptr_eq(&self.node, &fill.handle.as_ref().unwrap().node)

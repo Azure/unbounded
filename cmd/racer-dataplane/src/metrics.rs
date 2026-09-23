@@ -62,8 +62,10 @@ pub(crate) enum ResourceWaitSite {
     UpstreamAdmission,
     PayloadAdmission,
     MaterializeRead,
+    #[allow(dead_code)] // Retired retry site; keep the exported counter at zero.
     MaterializeBuffer,
     ChecksumQueue,
+    #[allow(dead_code)] // Buffer acquisition now waits until the request deadline.
     ReceiveBuffer,
 }
 

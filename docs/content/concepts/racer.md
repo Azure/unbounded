@@ -31,6 +31,12 @@ Cache capacity is rounded up to a 64 MiB boundary, with a minimum of 512 MiB
 per storage shard. The managed agent uses eight page buffers (512 MiB total)
 on one NUMA node and requests 4 GiB of memory.
 
+When all eligible page buffers are in use, requests wait for a buffer release
+until their caller or selected-peer deadline expires. Releases wake eligible
+waiters directly, with reserved capacity for downstream peer requests. Buffer
+pressure does not allocate extra page buffers or consume a timer-based retry
+budget.
+
 ## Built for Performance
 
 Racer is designed for high throughput, low latency, and efficient CPU use:
