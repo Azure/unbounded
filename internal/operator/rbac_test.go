@@ -189,6 +189,17 @@ func TestOperatorClusterRoleAllowsRacerDisruptionBudget(t *testing.T) {
 	}
 }
 
+func TestOperatorCanPatchRacerRoutingAndDelegatePodPermissions(t *testing.T) {
+	cr := loadOperatorClusterRole(t)
+	if !clusterRoleGrants(cr, "", "pods", "patch") {
+		t.Fatal("operator must patch legacy Racer Pod routing")
+	}
+
+	if !clusterRoleGrants(cr, "rbac.authorization.k8s.io", "roles", "escalate") || !clusterRoleGrants(cr, "rbac.authorization.k8s.io", "rolebindings", "bind") {
+		t.Fatal("operator must be able to delegate Racer Pod patch/delete permissions")
+	}
+}
+
 func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 	resources := []struct {
