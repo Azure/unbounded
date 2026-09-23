@@ -13,6 +13,9 @@ mod persistence_parity;
 #[path = "recovery_physical_parity.rs"]
 mod physical_parity;
 
+#[path = "slab_io_setup.rs"]
+mod slab_io_setup;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(std::path::PathBuf);

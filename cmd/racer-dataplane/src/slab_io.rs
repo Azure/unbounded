@@ -194,38 +194,46 @@ impl Io {
     pub(crate) fn blocking<T>(
         &self,
         bytes: usize,
-        f: impl FnOnce() -> io::Result<(T, usize)>,
+        mut f: impl FnMut() -> io::Result<(T, usize)>,
     ) -> io::Result<T> {
-        let start = crate::environment::now();
-        let mut waited = false;
-        let charge = loop {
-            if self.stopped.as_ref().is_some_and(|stop| stop()) {
-                if waited {
-                    self.waited(start);
+        loop {
+            let start = crate::environment::now();
+            let mut waited = false;
+            let charge = loop {
+                if self.stopped.as_ref().is_some_and(|stop| stop()) {
+                    if waited {
+                        self.waited(start);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "slab I/O setup stopped",
+                    ));
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "slab I/O setup stopped",
-                ));
-            }
-            match self.reserve(bytes, crate::environment::now()) {
-                Ok(charge) => break charge,
-                Err(deadline) => {
-                    waited = true;
-                    std::thread::sleep(
-                        deadline
-                            .saturating_duration_since(crate::environment::now())
-                            .min(Duration::from_millis(10)),
-                    );
+                match self.reserve(bytes, crate::environment::now()) {
+                    Ok(charge) => break charge,
+                    Err(deadline) => {
+                        waited = true;
+                        std::thread::sleep(
+                            deadline
+                                .saturating_duration_since(crate::environment::now())
+                                .min(Duration::from_millis(10)),
+                        );
+                    }
                 }
+            };
+            if waited {
+                self.waited(start);
             }
-        };
-        if waited {
-            self.waited(start);
+            let result = f();
+            charge.finish(result.as_ref().map_or(0, |(_, n)| *n));
+            if result
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::Interrupted)
+            {
+                continue;
+            }
+            return result.map(|(value, _)| value);
         }
-        let result = f();
-        charge.finish(result.as_ref().map_or(0, |(_, n)| *n));
-        result.map(|(value, _)| value)
     }
 
     pub(crate) fn render(&self, out: &mut String) {

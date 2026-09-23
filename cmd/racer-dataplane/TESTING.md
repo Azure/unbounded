@@ -61,6 +61,7 @@ cargo test --locked --lib cache::
 cargo test --locked --lib allocator:: -- --test-threads=1
 cargo test --locked --lib sharding::
 cargo test --locked --lib uring::
+cargo test --locked --lib slab_io
 cargo test --locked --lib rdma::
 cargo test --locked --lib crypto::
 cargo test --locked --doc
@@ -88,6 +89,15 @@ acks, RDMA window ownership, and quiescence. Cache tests cover sharing, survivin
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
 
 ## Deterministic campaigns
+
+The `slab_io` filter covers configuration rejection, shared fixed-point token
+refill, burst caps, stale worker clocks, byte refunds, interruptible setup waits,
+and creation/recovery/replacement accounting. Its simulated ring tests cover
+cross-worker sharing, timed parking, bounded admission with control capacity,
+cancellation/shutdown ownership, and short splice input-only charging. The
+`uring::tests::kernel_integration` subprocess additionally exercises limited real
+file reads/writes, timed sync admission, and cancellation before submission.
+Use `RACER_REQUIRE_URING=1` with an external timeout to require kernel coverage.
 
 `allocator::layout::tests` covers automatic planning boundaries, 2 TiB/4 TiB
 sparse files with every allocator opened, exact bitmap backing accounting, and

@@ -137,6 +137,50 @@ CoW versions and container slack; it excludes malloc overhead, external holders,
 pools, transport state and kernel page cache. Its estimates are not allocations
 or a user-configured memory budget. A larger envelope needs additional validation.
 
+### Slab I/O rate limits
+
+Standalone deployments can share disk bandwidth with other workloads by setting
+one startup environment variable:
+
+| Variable | Unit | Example |
+| --- | --- | --- |
+| `RACER_SLAB_IOPS` | Logical slab operations per second | `1000` |
+| `RACER_SLAB_BYTES_PER_SEC` | Data bytes per second | `104857600` (100 MiB/s) |
+| `RACER_SLAB_IO_BURST` | Tokens in the selected mode | `2000` operations or `209715200` bytes |
+
+With neither rate set, slab I/O is unlimited. Set exactly one rate; both rates,
+zero, malformed/overflowing unsigned integers, and a burst without a rate fail
+startup. The optional burst defaults to one second of tokens, with a minimum of
+one operation or 4 MiB. An explicit byte burst must be at least 4 MiB to admit a
+maximum-sized transfer. The bucket starts full and unused credit stops at the
+burst. Settings take effect on process restart.
+
+One process-wide bucket is shared by every worker and all active, replacement,
+and retiring slab inodes. It covers startup initialization/recovery, payload
+reads/writes, checkpoint pages, and slab-to-pipe splice reads. IOPS mode also
+charges slab sync and hole-punch operations. Byte mode charges only transferred
+data bytes: sync and hole-punch have no byte cost. Transfers reserve their
+requested length before submission and return unused byte tokens after short or
+failed completions; IOPS tokens count submissions, including failures/retries.
+
+These limits measure logical file traffic, including page-cache hits, rather
+than physical device IOPS or writeback. They do not charge network I/O, pipe-to-
+socket splice, directory operations, file sizing, xattrs, or memory-resident
+cache hits. Separate dataplane processes have independent buckets.
+
+Workers keep admitted operations in their bounded request tables until tokens
+are available and park until a refill deadline while continuing network,
+heartbeat, and cancellation work. Setup-thread waits are interruptible. Existing
+request/startup/shutdown deadlines still apply; choose limits that allow startup
+recovery and the expected request size to finish within those deadlines. The
+bucket provides an aggregate cap, not a per-worker fairness guarantee.
+
+`/metrics` exposes four fixed counters with prefix `racer_dataplane_slab_io_`:
+`operations_total` (submitted operations), `bytes_total` (completed data bytes),
+`waits_total` (operations that waited for tokens), and `wait_seconds_total`
+(aggregate waiting time). These counters describe limited slab traffic and are
+zero when limits are disabled.
+
 ### Storage generation integration
 
 Execution placement is immutable. Retain a thread-local `WorkerContext::clone`

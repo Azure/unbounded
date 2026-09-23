@@ -124,3 +124,69 @@ fn extreme_rate_saturates_without_overflow() {
         .unwrap()
         .finish(0);
 }
+
+#[test]
+fn stale_worker_timestamp_cannot_create_refill_credit() {
+    let world = crate::simulation::World::new(913);
+    let _scope = world.enter();
+    let io = Io::testing(1, 1, false);
+    let start = crate::environment::now();
+    io.reserve(0, start).ok().unwrap().finish(0);
+    world.advance(Duration::from_secs(1));
+    let now = crate::environment::now();
+    io.reserve(0, now).ok().unwrap().finish(0);
+    assert!(io.reserve(0, start).is_err());
+    assert_eq!(io.reserve(0, now).err(), Some(now + Duration::from_secs(1)));
+}
+
+#[test]
+fn interrupted_syscalls_retry_with_accounting_and_stop_checks() {
+    let io = Io::testing(100, 100, false);
+    let mut attempts = 0;
+    io.blocking(4096, || {
+        attempts += 1;
+        if attempts == 1 {
+            Err(io::ErrorKind::Interrupted.into())
+        } else {
+            Ok(((), 4096))
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    let mut metrics = String::new();
+    io.render(&mut metrics);
+    assert!(metrics.contains("racer_dataplane_slab_io_operations_total 2\n"));
+    assert!(metrics.contains("racer_dataplane_slab_io_bytes_total 4096\n"));
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stopped = Arc::new(AtomicBool::new(false));
+    let check = stopped.clone();
+    let io = io.with_stop(move || check.load(Ordering::Acquire));
+    let error = io
+        .blocking::<()>(0, || {
+            stopped.store(true, Ordering::Release);
+            Err(io::ErrorKind::Interrupted.into())
+        })
+        .unwrap_err();
+    assert_eq!(error.to_string(), "slab I/O setup stopped");
+}
+
+#[test]
+fn synchronous_token_wait_is_interruptible() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let checks = AtomicUsize::new(0);
+    let io = Io::testing(1, 1, false).with_stop(move || checks.fetch_add(1, Ordering::AcqRel) >= 2);
+    io.reserve(0, crate::environment::now())
+        .ok()
+        .unwrap()
+        .finish(0);
+    assert_eq!(
+        io.blocking::<()>(0, || panic!("stopped before I/O"))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    let mut metrics = String::new();
+    io.render(&mut metrics);
+    assert!(metrics.contains("racer_dataplane_slab_io_waits_total 1\n"));
+}
