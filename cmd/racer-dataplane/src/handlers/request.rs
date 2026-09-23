@@ -16,7 +16,7 @@ impl Handler {
         let shared_cache = self.cache.clone();
         let mut cache = shared_cache.borrow_mut();
         let context = cache::Context::new(self.namespace).with_crypto(self.crypto.clone());
-        let deadline = request.deadline();
+        let deadline = request.deadline().min(crate::environment::now() + TIMEOUT);
         let response_deadline = request.response_deadline();
         let mut task = Task {
             _cache_use: (!self.maintenance).then(|| cache.use_guard()),
@@ -63,11 +63,9 @@ impl Handler {
                     None => return Err(invalid("peer request requires mutual TLS").into()),
                 }
                 let bytes = unhex(wire)?;
-                let (cursor, descriptor) = routed_descriptor(&bytes)?;
+                let (_, descriptor) = routed_descriptor(&bytes)?;
                 task.deadline = remote_deadline(&bytes, deadline)?;
-                task.upstream =
-                    self.upstream
-                        .routed(self.route_state(cursor, descriptor.target(), true)?);
+                task.upstream = self.peer_provider(&bytes)?;
                 if self.maintenance {
                     return Err(cache::busy("storage maintenance"));
                 }
@@ -99,9 +97,7 @@ impl Handler {
             }
             Err(_) => task.failure = Some(task.failure.unwrap_or(400)),
         }
-        if task.peer
-            && let Response::Request(request) = &mut task.response
-        {
+        if let Response::Request(request) = &mut task.response {
             request.cap_deadline(task.deadline + RETURN_SLACK);
         }
         task

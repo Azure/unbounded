@@ -161,8 +161,7 @@ impl Peer {
     }
 }
 
-/// Runtime uses this solely to select a retained immutable generation. Full
-/// target/path validation happens before creating any cache fault.
+/// Sender placement hint. Namespace and chain validation precede cache faults.
 pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 32]>> {
     let Some(wire) = text(headers, "x-racer-fault")? else {
         return Ok(None);
@@ -175,6 +174,10 @@ pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 3
 /// Request-local upstream context. Endpoint pools, negotiations and owner health
 /// are shared across a volume; the selected route belongs to this request.
 pub struct Provider {
+    namespace: cache::Namespace,
+    chain: Rc<RefCell<Chain>>,
+    flight: u64,
+    reply_route: Option<([u8; 32], u32)>,
     volume: Option<String>,
     metrics: crate::metrics::Local,
     authentication: Option<crate::http_auth::Policy>,
@@ -187,6 +190,30 @@ pub struct Provider {
     active: Option<Rc<RefCell<RouteState>>>,
     owners: Rc<RefCell<Owners>>,
     negotiations: Rc<RefCell<BTreeMap<String, String>>>,
+}
+struct Chain {
+    hops: u8,
+    work: u8,
+}
+impl Default for Chain {
+    fn default() -> Self {
+        Self {
+            hops: cache::peer_wire::MAX_HOPS,
+            work: cache::peer_wire::MAX_WORK,
+        }
+    }
+}
+impl Chain {
+    fn forward(&mut self) -> io::Result<(u8, u8)> {
+        if self.hops == 0 || self.work == 0 {
+            return Err(io::Error::other("request chain exhausted"));
+        }
+        self.hops -= 1;
+        // Split, never copy, work authority between the child and local recovery.
+        let child = (self.work - 1) / 2;
+        self.work -= child + 1;
+        Ok((self.hops, child))
+    }
 }
 #[derive(Clone)]
 struct RouteState {
@@ -265,8 +292,42 @@ pub struct ReadPhase {
     deadline: Instant,
 }
 impl Provider {
+    fn forward_available(&self) -> cache::Result<()> {
+        let chain = self.chain.borrow();
+        if chain.hops == 0 || chain.work == 0 {
+            return Err(cache::Error::Unavailable);
+        }
+        Ok(())
+    }
+    fn failure(&self, error: &cache::Error) -> PeerFailure {
+        let local = self
+            .active
+            .as_ref()
+            .map(|r| {
+                let r = r.borrow();
+                (
+                    r.cursor.identity,
+                    self.routing.as_ref().unwrap().destination(&r.cursor),
+                )
+            })
+            .unwrap_or(([0; 32], 0));
+        let reply = self.reply_route.unwrap_or(local);
+        let mut failure = peer_failure(error, reply.0, reply.1);
+        failure.identity = reply.0;
+        failure.candidate = reply.1;
+        if reply != local && failure.reason == PeerReason::OwnerUnavailable {
+            // A different placement cannot attest to the sender's owner.
+            failure.reason = PeerReason::Unavailable;
+            failure.evidence = None;
+        }
+        failure
+    }
     fn new(backend: Backend) -> Self {
         Self {
+            namespace: backend.namespace,
+            chain: Rc::new(RefCell::new(Chain::default())),
+            flight: 0,
+            reply_route: None,
             volume: None,
             metrics: crate::metrics::Local::default(),
             authentication: None,
@@ -291,7 +352,10 @@ impl Provider {
     fn budget_wire(&self, request: &UpstreamRequest, end: Instant) -> io::Result<Vec<u8>> {
         // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
         // routed descriptors, budget accounting, or peer request headers.
-        if cache::peer_wire::request_len(request, self.active.is_some(), true)? > MAX_DESCRIPTOR {
+        if cache::peer_wire::request_len(request, self.active.is_some(), true)?
+            + cache::peer_wire::CHAIN_LEN
+            > MAX_DESCRIPTOR
+        {
             return Err(invalid("fault descriptor too large"));
         }
         let bytes = self.wire(request)?;
@@ -304,7 +368,15 @@ impl Provider {
         let remaining = end
             .saturating_duration_since(crate::environment::now())
             .saturating_sub(RETURN_SLACK);
-        cache::peer_wire::with_budget(bytes, remaining)
+        let bytes = cache::peer_wire::with_budget(bytes, remaining)?;
+        let (hops, work) = self.chain.borrow_mut().forward()?;
+        let candidate = self.active.as_ref().map_or(0, |s| {
+            self.routing
+                .as_ref()
+                .unwrap()
+                .destination(&s.borrow().cursor)
+        });
+        cache::peer_wire::with_chain(bytes, *self.namespace.digest(), hops, work, candidate)
     }
     fn wire(&self, request: &UpstreamRequest) -> io::Result<Vec<u8>> {
         let mut bytes = descriptor(request)?;
@@ -408,7 +480,11 @@ impl Upstream for Provider {
             routing: state.cursor.identity,
             version: 5,
             destination: routing.destination(&state.cursor),
-            dependency: routing.dependency(&state.cursor).expect("validated route"),
+            dependency: if state.origin {
+                routing.dependency(&state.cursor).expect("validated route")
+            } else {
+                crate::buffers::NetworkDependency::Independent(self.flight)
+            },
         })
     }
     fn peer_validated(&mut self, retry: &mut Exchange, valid: bool) {
@@ -460,25 +536,12 @@ impl Upstream for Provider {
         self.peer.is_some()
     }
     fn receive_reserve(&self) -> cache::Result<usize> {
-        let (Some(routing), Some(state)) = (&self.routing, &self.active) else {
-            return Ok(usize::from(self.has_peer()));
-        };
-        let state = state.borrow();
-        let crate::buffers::NetworkDependency::Canonical { slot } =
-            routing.dependency(&state.cursor)?;
-        // Normalize co-located slots just as forwarding does. Every remote hop
-        // lowers this rank, so longer peer waits cannot consume owner capacity.
-        let source = routing.geometry.slot(slot).map_err(io::Error::other)?;
-        let owner = routing
-            .geometry
-            .slot(routing.destination(&state.cursor))
-            .map_err(io::Error::other)?;
-        Ok(routing
-            .geometry
-            .distance(source, owner)
-            .map_err(io::Error::other)? as usize)
+        // Independent placements have no common resource rank. Cache admission
+        // parks with bounded resource retries and the original candidate deadline.
+        Ok(0)
     }
     fn peer_failed(&mut self, error: cache::Error) -> cache::Result<bool> {
+        self.forward_available()?;
         let Some(state) = self.active.clone() else {
             return Ok(false);
         };
@@ -543,14 +606,21 @@ impl Upstream for Provider {
             // The candidate's downstream budget also serves same-peer HTTP
             // recovery. RDMA's shorter speculative grant/read cap is local;
             // it must not turn a healthy slow relay into final-owner evidence.
-            let wire = self.budget_wire(&request, self.service_end(deadline))?;
-            let mut attempt = self.attempt(hex(blake3::hash(&wire).as_bytes()))?;
+            self.forward_available()?;
+            let mut attempt = None;
             let (key, len) = match &request {
                 UpstreamRequest::PeerMetadata(m) => (m.key(), m.len()),
                 UpstreamRequest::PeerPage(p) => (*p.key(), p.len()),
                 _ => unreachable!(),
             };
             let peer = self.peer.as_ref().ok_or(cache::Error::Unavailable)?.clone();
+            let rdma_wire = if peer.borrow().rdma.is_some() {
+                let wire = self.budget_wire(&request, self.service_end(deadline))?;
+                attempt = self.attempt(hex(blake3::hash(&wire).as_bytes()))?;
+                Some(wire)
+            } else {
+                None
+            };
             let peer = peer.borrow_mut();
             if peer.http.breaker.active() + peer.breaker.active() >= peer.http.limit {
                 return Err(cache::busy("direct peer exchange limit"));
@@ -573,7 +643,7 @@ impl Upstream for Provider {
             if let Some(connection) = &peer.rdma
                 && let Ok(permit) = peer.breaker.try_acquire()
             {
-                match connection.request(key, len, &wire) {
+                match connection.request(key, len, rdma_wire.as_ref().unwrap()) {
                     Ok(ticket) => {
                         self.metrics
                             .upstream(crate::metrics::Upstream::PeerRdma, metric_kind(&request));
@@ -861,6 +931,28 @@ pub struct Handler {
     peer_cursor: usize,
 }
 impl Handler {
+    fn peer_provider(&self, bytes: &[u8]) -> cache::Result<Provider> {
+        let (cursor, descriptor) = routed_descriptor(bytes)?;
+        let chain = cache::peer_wire::chain(bytes)?;
+        if (self.upstream.routing.is_some() || self.upstream.has_peer()) && chain.is_none() {
+            return Err(invalid("missing bounded request chain").into());
+        }
+        if chain.is_some_and(|(namespace, _, _, _)| namespace != *self.namespace.digest()) {
+            return Err(invalid("foreign cache namespace").into());
+        }
+        let reply = cursor
+            .as_ref()
+            .zip(chain)
+            .map(|(c, (_, _, _, candidate))| (c.identity, candidate));
+        let mut provider =
+            self.upstream
+                .routed(self.route_state(cursor, descriptor.target(), true)?);
+        provider.reply_route = reply;
+        if let Some((_, hops, work, _)) = chain {
+            provider.chain = Rc::new(RefCell::new(Chain { hops, work }));
+        }
+        Ok(provider)
+    }
     pub fn set_authentication(&mut self, policy: crate::http_auth::Policy) {
         self.upstream.authentication = Some(policy);
     }
@@ -907,7 +999,7 @@ impl Handler {
         };
         let origin = !peer;
         let mut cursor = match cursor {
-            Some(cursor) if peer => cursor,
+            Some(cursor) if peer => routing.receive(cursor, target)?,
             None if !peer => routing.start(target),
             _ => return Err(invalid("missing topology cursor")),
         };
@@ -961,6 +1053,7 @@ impl Handler {
             namespace,
             upstream: Provider {
                 metrics,
+                namespace,
                 ..Provider::new(backend)
             },
             incoming: VecDeque::new(),
@@ -1140,8 +1233,8 @@ impl Handler {
                 self.upstream
                     .metrics
                     .request(crate::metrics::Traffic::PeerRdma);
-                if let Ok((cursor, descriptor)) = routed_descriptor(&request.metadata)
-                    && let Ok(route) = self.route_state(cursor, descriptor.target(), true)
+                if let Ok((_, descriptor)) = routed_descriptor(&request.metadata)
+                    && let Ok(upstream) = self.peer_provider(&request.metadata)
                     && let Ok(deadline) =
                         remote_deadline(&request.metadata, crate::environment::now() + TIMEOUT)
                 {
@@ -1162,23 +1255,11 @@ impl Handler {
                                 connection,
                                 request,
                                 fault,
-                                upstream: self.upstream.routed(route),
+                                upstream,
                             });
                         }
                         Err(error) => {
-                            let (identity, candidate) = route.as_ref().map_or(([0; 32], 0), |r| {
-                                let r = r.borrow();
-                                (
-                                    r.cursor.identity,
-                                    self.upstream
-                                        .routing
-                                        .as_ref()
-                                        .unwrap()
-                                        .destination(&r.cursor),
-                                )
-                            });
-                            let _ = connection
-                                .respond_error(request, peer_failure(&error, identity, candidate));
+                            let _ = connection.respond_error(request, upstream.failure(&error));
                         }
                     }
                 } else {
@@ -1227,21 +1308,7 @@ impl Handler {
                     });
                 }
                 Err(error) => {
-                    let (identity, candidate) =
-                        upstream.active.as_ref().map_or(([0; 32], 0), |r| {
-                            let r = r.borrow();
-                            (
-                                r.cursor.identity,
-                                self.upstream
-                                    .routing
-                                    .as_ref()
-                                    .unwrap()
-                                    .destination(&r.cursor),
-                            )
-                        });
-
-                    let _ = connection
-                        .respond_error(request, peer_failure(&error, identity, candidate));
+                    let _ = connection.respond_error(request, upstream.failure(&error));
                     work.runnable = true;
                 }
             }
@@ -1376,7 +1443,7 @@ impl Task {
                 let fault = cache.page(
                     self.metadata.as_ref().unwrap(),
                     self.next,
-                    self.response_deadline.get(),
+                    self.response_deadline.get().min(self.deadline),
                 )?;
                 let offset = self.next;
                 self.next += fault.len() as u64;
@@ -1520,21 +1587,17 @@ impl Handler {
                 task.position = 0;
                 task.end = 0;
                 task.next = 0;
-                let owner = owner_failure(&error).map(|s| s.to_string());
-                let failure = if task.peer {
-                    task.upstream.active.as_ref().map(|route| {
-                        let route = route.borrow();
-                        hex(&peer_failure(
-                            &error,
-                            route.cursor.identity,
-                            self.upstream
-                                .routing
-                                .as_ref()
-                                .unwrap()
-                                .destination(&route.cursor),
-                        )
-                        .encode())
+                let owner = owner_failure(&error)
+                    .filter(|_| {
+                        !task.peer
+                            || task.upstream.failure(&error).reason == PeerReason::OwnerUnavailable
                     })
+                    .map(|s| s.to_string());
+                let failure = if task.peer {
+                    task.upstream
+                        .active
+                        .as_ref()
+                        .map(|_| hex(&task.upstream.failure(&error).encode()))
                 } else {
                     None
                 };

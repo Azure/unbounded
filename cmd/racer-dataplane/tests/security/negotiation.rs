@@ -46,7 +46,7 @@ pub(crate) mod tests {
             .unwrap();
         Rc::new(Context::new(Arc::new(prepared), "v1", shard, routing).unwrap())
     }
-    pub(super) fn offer(
+    pub(crate) fn offer(
         nonce: u8,
         challenge: [u8; 16],
         rail: u32,
@@ -173,6 +173,40 @@ pub(crate) mod tests {
         assert!(
             a.authorize(Some(&identity), NodeId::from_bytes(&[9; 32]).unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn mixed_placement_negotiates_but_namespace_and_protocol_remain_exact() {
+        let a = context(2, 7, b"route");
+        let b = context_with(3, 7, b"route", |c| {
+            c.volumes[0].topology.as_mut().unwrap().epoch = 2
+        });
+        let offer = offer(1, [2; 16], 0, 1, "fabric");
+        let frame = b.frame(true, &offer);
+        assert!(a.validate(&frame, b.prepared.local_node()).is_ok());
+        for changed in [
+            context_with(3, 7, b"route", |c| c.volumes[0].cache_generation += 1),
+            context_with(3, 7, b"route", |c| c.universe = vec![9; 32]),
+            context(3, 7, b"other-protocol"),
+            context(3, 8, b"route"),
+        ] {
+            assert!(
+                a.validate(&changed.frame(true, &offer), changed.prepared.local_node())
+                    .is_err()
+            );
+        }
+        assert!(a.current_placement());
+        let next = context_with(2, 7, b"route", |c| {
+            c.volumes[0].topology.as_mut().unwrap().epoch = 2
+        });
+        *a.authority.borrow_mut() = Some(next.prepared.clone());
+        assert!(!a.current_placement());
+        let node = b.prepared.local_node();
+        let identity = a.prepared.peer_identity(&node.to_string()).unwrap();
+        assert!(
+            a.authorize(Some(&identity), node).is_ok(),
+            "membership is independent of placement/session admission"
         );
     }
 

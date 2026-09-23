@@ -67,6 +67,31 @@ fn maximum_descriptor_http_bounds() {
 }
 
 #[test]
+fn bounded_chain_rejects_truncation_nesting_and_oversized_hops() {
+    let bytes = with_budget(b"RF05\0/object".to_vec(), Duration::from_secs(1)).unwrap();
+    let mut wire = with_chain(bytes, [7; 32], 0, 0, 42).unwrap();
+    assert_eq!(chain(&wire).unwrap(), Some(([7; 32], 0, 0, 42)));
+    assert_eq!(routed_descriptor(&wire).unwrap().1.target(), "/object");
+    for n in 4..CHAIN_LEN + 14 {
+        assert!(chain(&wire[..n]).is_err());
+    }
+    wire[36] = MAX_HOPS + 1;
+    assert!(routed_descriptor(&wire).is_err());
+    wire[36] = MAX_HOPS;
+    assert!(with_chain(wire.clone(), [7; 32], 1, 1, 42).is_err());
+    wire.resize(MAX_DESCRIPTOR, b'x');
+    assert!(routed_descriptor(&wire).is_ok());
+    wire.push(b'x');
+    assert!(routed_descriptor(&wire).is_err());
+    assert!(client_fits(
+        MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN
+    ));
+    assert!(!client_fits(
+        MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN + 1
+    ));
+}
+
+#[test]
 fn exact_descriptor_boundaries() {
     use super::{MetadataRequest, Namespace, Object, Record};
     let (_, config) = crate::control::tests::fixture();

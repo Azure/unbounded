@@ -126,7 +126,7 @@ impl Cluster {
             updates.subscribe(cluster.rings[node].wake_handle());
             updates.publish(prepared).unwrap();
             let crypto = Arc::new(crate::crypto::Pool::test_pool(cluster.rings[node].pool()));
-            let worker = usize::from(node == 1 || node == 7);
+            let worker = 0;
             let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
                 .with_peer_ip(cluster.addresses[node].ip());
             volumes.poll(&mut cluster.rings[node], 64).unwrap();
@@ -326,8 +326,13 @@ pub(crate) fn activate(
         node: snapshot.node.as_slice().try_into().unwrap(),
     };
     let config = prepare_snapshot(&trust, snapshot);
-    updates.subscribe(ring.wake_handle());
+    for _ in 0..=worker {
+        updates.subscribe(ring.wake_handle());
+    }
     updates.publish(config).unwrap();
+    for other in 0..worker {
+        updates.staged(1, other, true);
+    }
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
 
     let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
@@ -335,6 +340,9 @@ pub(crate) fn activate(
         .with_rdma(Some(rails));
 
     volumes.poll(ring, 32).unwrap();
+    for other in 0..worker {
+        volumes.updates.activated(1, other);
+    }
     volumes
 }
 

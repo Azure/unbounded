@@ -7,6 +7,9 @@ use crate::tls::{ExpectedPeer, PeerIdentity, TlsContext, TlsProgress, TlsSession
 use cache::adapter_fixture::page_request;
 use http::cache_responses::accept;
 
+#[path = "mixed_version.rs"]
+mod mixed_version;
+
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {

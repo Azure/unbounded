@@ -156,6 +156,7 @@ impl Fixture {
     pub fn provider(&self, workers: usize) -> Arc<Provider> {
         let identity = PeerIdentity::new(&"01".repeat(32), &"02".repeat(32), "test-pod").unwrap();
         Arc::new(Provider {
+            proof_wake: Default::default(),
             state: Mutex::new(State {
                 current: Arc::new(Snapshot {
                     revision: 1,
@@ -725,4 +726,84 @@ fn proof_requires_installed_context_and_fresh_mutual_tls() {
     prove(&settings, &provider).unwrap();
     server.join().unwrap();
     assert!(provider.state.lock().unwrap().connections.is_empty());
+}
+#[test]
+fn proof_refresh_is_jittered_within_security_lifetime() {
+    let mut random = 1234;
+    let mut delays = std::collections::BTreeSet::new();
+    for _ in 0..100 {
+        let delay = super::proof_refresh_delay(&mut random);
+        assert!(delay >= Duration::from_secs(180));
+        assert!(delay <= Duration::from_secs(240));
+        assert!(delay + Duration::from_secs(10) < Duration::from_secs(300));
+        delays.insert(delay);
+    }
+    assert!(delays.len() > 20);
+}
+
+#[test]
+fn manager_proves_installation_and_drain_immediately_then_holds_refresh() {
+    let fixture = Fixture::new();
+    let scratch = Scratch::new();
+    std::fs::write(scratch.0.join("bundle.json"), fixture.bundle(1)).unwrap();
+    let (enroll, enrollment) = enroll_server(&fixture, vec![(copy_fixture(&fixture), 1, None)]);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut settings = scratch.settings(enroll);
+    settings.proof = url::Url::parse(&format!(
+        "https://{}/v3/proof",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let context = fixture.context("spiffe://racer/controlplane", Some("localhost"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let proofs = std::thread::spawn(move || {
+        while !stopping.load(Ordering::Acquire) {
+            let (socket, _) = match listener.accept() {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            let mut stream = server(socket, &context);
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            tx.send(String::from_utf8(request).unwrap()).unwrap();
+        }
+    });
+    let updates = Arc::new(super::super::Updates::default());
+    let manager = Manager::start_with_settings(1, &updates, settings).unwrap();
+    enrollment.join().unwrap();
+    let provider = updates.credentials().unwrap();
+    provider.installed(0, 1, 2);
+    assert!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .contains("X-Racer-Old-Connections: 2\r\n")
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    // A completed drain must wake a sleeping manager, not wait for periodic proof.
+    // Invalid projection cannot suppress proof of the still-installed last-good trust.
+    std::fs::write(scratch.0.join("bundle.json"), b"invalid projection").unwrap();
+    provider.installed(0, 1, 0);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(600))
+            .unwrap()
+            .contains("X-Racer-Old-Connections: 0\r\n")
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    drop(manager);
+    stop.store(true, Ordering::Release);
+    proofs.join().unwrap();
 }

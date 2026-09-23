@@ -598,10 +598,11 @@ impl http::Handler for VolumeHandler {
             return self.negotiation(request);
         }
         let generation = match crate::handlers::routing_identity(request.headers()) {
-            Ok(Some(identity)) if !self.local => std::iter::once(&self.current)
-                .chain(&self.draining)
-                .find(|g| !g.expired.get() && g.identity == identity)
-                .cloned(),
+            // Handler checks the immutable RF06 namespace before rebasing the
+            // sender's placement hint onto current local routing.
+            Ok(Some(_)) if !self.local => {
+                (!self.current.expired.get()).then(|| self.current.clone())
+            }
             Ok(None) if self.local && !negotiation::is_negotiation(request.headers()) => {
                 self.current.active.get().then(|| self.current.clone())
             }
@@ -745,7 +746,6 @@ struct Staged {
     revision: u64,
     generations: BTreeMap<Address, Rc<Generation>>,
     listeners: BTreeMap<Address, http::Listener>,
-    armed: bool,
 }
 impl Volumes {
     fn install_credentials(&mut self) -> io::Result<()> {

@@ -58,6 +58,22 @@ message Configuration {
   }
 }
 
+// Full independently applicable desired state on /v4/config. Cursor acknowledges
+// receipt, not successful local preparation or application.
+message DesiredState {
+  bytes universe = 1;
+  bytes node = 2;
+  bytes incarnation = 3;
+  bytes snapshot_digest = 4;
+  uint64 revision = 5;
+  Configuration configuration = 6;
+  uint32 profile = 7;
+  string pod_uid = 8;
+  StoragePolicy storage_policy = 9;
+  string cursor = 10;
+}
+
+// Legacy Go reference protocol. Never sent on /v4/config.
 message ControlCommand {
   bytes universe = 1;
   bytes node = 2;

@@ -84,7 +84,7 @@ impl Fixture {
         Self { request, key, kind }
     }
     pub fn descriptor(&self, deadline: Instant) -> io::Result<Vec<u8>> {
-        // Benchmark fidelity: RF05/RF03/RF04 are real codecs, including a routed
+        // Benchmark fidelity: RF06/RF05/RF03/RF04 are real codecs, including a routed
         // cursor and the same bounded remaining budget used by peer requests.
         let mut bytes = b"RF03".to_vec();
         bytes.extend(
@@ -99,11 +99,18 @@ impl Fixture {
             .encode(),
         );
         bytes.extend(wire::descriptor(&self.request)?);
-        wire::with_budget(
+        let bytes = wire::with_budget(
             bytes,
             deadline
                 .saturating_duration_since(Instant::now())
                 .saturating_sub(Duration::from_millis(10)),
+        )?;
+        wire::with_chain(
+            bytes,
+            [0; 32],
+            wire::MAX_HOPS - 1,
+            (wire::MAX_WORK - 1) / 2,
+            1,
         )
     }
     pub fn fields(&self, deadline: Instant) -> io::Result<Vec<(&'static str, String)>> {

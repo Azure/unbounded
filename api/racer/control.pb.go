@@ -579,6 +579,125 @@ type Configuration_Snapshot struct {
 
 func (*Configuration_Snapshot) isConfiguration_Contents() {}
 
+// Full independently applicable desired state on /v4/config. Cursor acknowledges
+// receipt, not successful local preparation or application.
+type DesiredState struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Universe       []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
+	Node           []byte                 `protobuf:"bytes,2,opt,name=node,proto3" json:"node,omitempty"`
+	Incarnation    []byte                 `protobuf:"bytes,3,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
+	SnapshotDigest []byte                 `protobuf:"bytes,4,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"`
+	Revision       uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"`
+	Configuration  *Configuration         `protobuf:"bytes,6,opt,name=configuration,proto3" json:"configuration,omitempty"`
+	Profile        uint32                 `protobuf:"varint,7,opt,name=profile,proto3" json:"profile,omitempty"`
+	PodUid         string                 `protobuf:"bytes,8,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
+	StoragePolicy  *StoragePolicy         `protobuf:"bytes,9,opt,name=storage_policy,json=storagePolicy,proto3" json:"storage_policy,omitempty"`
+	Cursor         string                 `protobuf:"bytes,10,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DesiredState) Reset() {
+	*x = DesiredState{}
+	mi := &file_control_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DesiredState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DesiredState) ProtoMessage() {}
+
+func (x *DesiredState) ProtoReflect() protoreflect.Message {
+	mi := &file_control_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DesiredState.ProtoReflect.Descriptor instead.
+func (*DesiredState) Descriptor() ([]byte, []int) {
+	return file_control_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *DesiredState) GetUniverse() []byte {
+	if x != nil {
+		return x.Universe
+	}
+	return nil
+}
+
+func (x *DesiredState) GetNode() []byte {
+	if x != nil {
+		return x.Node
+	}
+	return nil
+}
+
+func (x *DesiredState) GetIncarnation() []byte {
+	if x != nil {
+		return x.Incarnation
+	}
+	return nil
+}
+
+func (x *DesiredState) GetSnapshotDigest() []byte {
+	if x != nil {
+		return x.SnapshotDigest
+	}
+	return nil
+}
+
+func (x *DesiredState) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
+}
+
+func (x *DesiredState) GetConfiguration() *Configuration {
+	if x != nil {
+		return x.Configuration
+	}
+	return nil
+}
+
+func (x *DesiredState) GetProfile() uint32 {
+	if x != nil {
+		return x.Profile
+	}
+	return 0
+}
+
+func (x *DesiredState) GetPodUid() string {
+	if x != nil {
+		return x.PodUid
+	}
+	return ""
+}
+
+func (x *DesiredState) GetStoragePolicy() *StoragePolicy {
+	if x != nil {
+		return x.StoragePolicy
+	}
+	return nil
+}
+
+func (x *DesiredState) GetCursor() string {
+	if x != nil {
+		return x.Cursor
+	}
+	return ""
+}
+
+// Legacy Go reference protocol. Never sent on /v4/config.
 type ControlCommand struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Universe        []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
@@ -599,7 +718,7 @@ type ControlCommand struct {
 
 func (x *ControlCommand) Reset() {
 	*x = ControlCommand{}
-	mi := &file_control_proto_msgTypes[8]
+	mi := &file_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -611,7 +730,7 @@ func (x *ControlCommand) String() string {
 func (*ControlCommand) ProtoMessage() {}
 
 func (x *ControlCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[8]
+	mi := &file_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -624,7 +743,7 @@ func (x *ControlCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlCommand.ProtoReflect.Descriptor instead.
 func (*ControlCommand) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{8}
+	return file_control_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ControlCommand) GetUniverse() []byte {
@@ -722,7 +841,7 @@ type StoragePolicy struct {
 
 func (x *StoragePolicy) Reset() {
 	*x = StoragePolicy{}
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -734,7 +853,7 @@ func (x *StoragePolicy) String() string {
 func (*StoragePolicy) ProtoMessage() {}
 
 func (x *StoragePolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -747,7 +866,7 @@ func (x *StoragePolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoragePolicy.ProtoReflect.Descriptor instead.
 func (*StoragePolicy) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{9}
+	return file_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *StoragePolicy) GetIdentity() []byte {
@@ -821,7 +940,19 @@ const file_control_proto_rawDesc = "" +
 	"\rConfiguration\x128\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x1a.racer.control.v1.SnapshotH\x00R\bsnapshotB\n" +
 	"\n" +
-	"\bcontents\"\xd1\x03\n" +
+	"\bcontents\"\xff\x02\n" +
+	"\fDesiredState\x12\x1a\n" +
+	"\buniverse\x18\x01 \x01(\fR\buniverse\x12\x12\n" +
+	"\x04node\x18\x02 \x01(\fR\x04node\x12 \n" +
+	"\vincarnation\x18\x03 \x01(\fR\vincarnation\x12'\n" +
+	"\x0fsnapshot_digest\x18\x04 \x01(\fR\x0esnapshotDigest\x12\x1a\n" +
+	"\brevision\x18\x05 \x01(\x04R\brevision\x12E\n" +
+	"\rconfiguration\x18\x06 \x01(\v2\x1f.racer.control.v1.ConfigurationR\rconfiguration\x12\x18\n" +
+	"\aprofile\x18\a \x01(\rR\aprofile\x12\x17\n" +
+	"\apod_uid\x18\b \x01(\tR\x06podUid\x12F\n" +
+	"\x0estorage_policy\x18\t \x01(\v2\x1f.racer.control.v1.StoragePolicyR\rstoragePolicy\x12\x16\n" +
+	"\x06cursor\x18\n" +
+	" \x01(\tR\x06cursor\"\xd1\x03\n" +
 	"\x0eControlCommand\x12\x1a\n" +
 	"\buniverse\x18\x01 \x01(\fR\buniverse\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\fR\x04node\x12 \n" +
@@ -853,7 +984,7 @@ func file_control_proto_rawDescGZIP() []byte {
 	return file_control_proto_rawDescData
 }
 
-var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_control_proto_goTypes = []any{
 	(*Snapshot)(nil),            // 0: racer.control.v1.Snapshot
 	(*Peer)(nil),                // 1: racer.control.v1.Peer
@@ -863,24 +994,27 @@ var file_control_proto_goTypes = []any{
 	(*Topology)(nil),            // 5: racer.control.v1.Topology
 	(*SlotPeer)(nil),            // 6: racer.control.v1.SlotPeer
 	(*Configuration)(nil),       // 7: racer.control.v1.Configuration
-	(*ControlCommand)(nil),      // 8: racer.control.v1.ControlCommand
-	(*StoragePolicy)(nil),       // 9: racer.control.v1.StoragePolicy
+	(*DesiredState)(nil),        // 8: racer.control.v1.DesiredState
+	(*ControlCommand)(nil),      // 9: racer.control.v1.ControlCommand
+	(*StoragePolicy)(nil),       // 10: racer.control.v1.StoragePolicy
 }
 var file_control_proto_depIdxs = []int32{
-	1, // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
-	2, // 1: racer.control.v1.Snapshot.volumes:type_name -> racer.control.v1.Volume
-	5, // 2: racer.control.v1.Volume.topology:type_name -> racer.control.v1.Topology
-	3, // 3: racer.control.v1.Volume.peer_endpoints:type_name -> racer.control.v1.VolumePeerEndpoints
-	4, // 4: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
-	6, // 5: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
-	0, // 6: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
-	7, // 7: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
-	9, // 8: racer.control.v1.ControlCommand.storage_policy:type_name -> racer.control.v1.StoragePolicy
-	9, // [9:9] is the sub-list for method output_type
-	9, // [9:9] is the sub-list for method input_type
-	9, // [9:9] is the sub-list for extension type_name
-	9, // [9:9] is the sub-list for extension extendee
-	0, // [0:9] is the sub-list for field type_name
+	1,  // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
+	2,  // 1: racer.control.v1.Snapshot.volumes:type_name -> racer.control.v1.Volume
+	5,  // 2: racer.control.v1.Volume.topology:type_name -> racer.control.v1.Topology
+	3,  // 3: racer.control.v1.Volume.peer_endpoints:type_name -> racer.control.v1.VolumePeerEndpoints
+	4,  // 4: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
+	6,  // 5: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
+	0,  // 6: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
+	7,  // 7: racer.control.v1.DesiredState.configuration:type_name -> racer.control.v1.Configuration
+	10, // 8: racer.control.v1.DesiredState.storage_policy:type_name -> racer.control.v1.StoragePolicy
+	7,  // 9: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
+	10, // 10: racer.control.v1.ControlCommand.storage_policy:type_name -> racer.control.v1.StoragePolicy
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_control_proto_init() }
@@ -899,7 +1033,7 @@ func file_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_proto_rawDesc), len(file_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

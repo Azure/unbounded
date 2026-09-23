@@ -804,7 +804,11 @@ pub struct NetworkFlightKey {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NetworkDependency {
-    Canonical { slot: u32 },
+    Canonical {
+        slot: u32,
+    },
+    /// Relayed work must never join a flight waiting on its own request chain.
+    Independent(u64),
 }
 /// Bounded coordination storage, with no completed-value directory ownership.
 struct NetworkFlights {

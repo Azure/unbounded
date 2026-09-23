@@ -53,15 +53,18 @@ impl Provider {
 
     pub(super) fn service_end(&self, deadline: Instant) -> Instant {
         let now = crate::environment::now();
-        let window = self.active.as_ref().map_or(COOLDOWN, |s| {
-            Duration::from_secs(4 + 2 * u64::from(3 - s.borrow().cursor.position.min(3)))
-        });
+        let window = self.active.as_ref().map_or(COOLDOWN, |_| MAX_CANDIDATE);
         (now + window).min(deadline.checked_sub(RETURN_SLACK).unwrap_or(now).max(now))
     }
 
     /// Create an independently routed request over the shared endpoint registry.
     pub(super) fn routed(&self, state: Option<Rc<RefCell<RouteState>>>) -> Self {
+        static NEXT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut request = Self {
+            namespace: self.namespace,
+            chain: Rc::new(RefCell::new(Chain::default())),
+            flight: NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            reply_route: None,
             volume: self.volume.clone(),
             metrics: self.metrics.clone(),
             authentication: self.authentication.clone(),
@@ -80,11 +83,14 @@ impl Provider {
     }
 
     pub(super) fn fork(&self) -> Self {
-        self.routed(
+        let mut fork = self.routed(
             self.active
                 .as_ref()
                 .map(|s| Rc::new(RefCell::new(s.borrow().clone()))),
-        )
+        );
+        fork.chain = self.chain.clone();
+        fork.reply_route = self.reply_route;
+        fork
     }
 
     pub(super) fn select_peer(&mut self) {

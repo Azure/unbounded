@@ -389,7 +389,7 @@ impl ControlChannel {
                 .membership
                 .as_ref()
                 .is_none_or(|(context, identity, node)| {
-                    context.authorize(Some(identity), *node).is_ok()
+                    context.authorize(Some(identity), *node).is_ok() && context.current_placement()
                 })
     }
     pub(crate) fn rejection(&self, metadata: &[u8]) -> rdma::PeerFailure {
@@ -404,10 +404,11 @@ impl ControlChannel {
             Ok((Some(cursor), descriptor)) => {
                 if let Some((context, _, _)) = &self.membership
                     && let Some(routing) = context.prepared.routing_for_volume(&context.volume_id)
-                    && routing.validate(&cursor, descriptor.target()).is_ok()
+                    && routing.receive(cursor.clone(), descriptor.target()).is_ok()
+                    && let Ok(Some((_, _, _, candidate))) = crate::cache::peer_wire::chain(metadata)
                 {
                     failure.identity = cursor.identity;
-                    failure.candidate = routing.destination(&cursor);
+                    failure.candidate = candidate;
                 } else {
                     failure.reason = PeerReason::Protocol;
                 }
@@ -598,10 +599,20 @@ impl Context {
         hash.update(&(volume.len() as u64).to_be_bytes());
         hash.update(volume.as_bytes());
         hash.update(&config.cache_generation.to_be_bytes());
-        let topology = prepared
-            .routing_for_volume(volume)
+        let prepared_volume = prepared
+            .volumes()
+            .iter()
+            .find(|v| v.config().id == volume)
             .ok_or_else(|| invalid("unknown routing volume"))?;
-        let route = [routing, topology.identity.as_slice()].concat();
+        let namespace = crate::cache::Namespace::volume(
+            &prepared.config_snapshot().universe,
+            volume,
+            config.cache_generation,
+            prepared_volume.backend().namespace(),
+        );
+        // Session compatibility binds immutable data identity and protocol,
+        // never independently converging placement revisions.
+        let route = [routing, namespace.digest().as_slice()].concat();
         Ok(Self {
             authority: Rc::new(RefCell::new(Some(prepared.clone()))),
             prepared,
@@ -662,6 +673,17 @@ impl Context {
             ));
         }
         Ok(())
+    }
+    fn current_placement(&self) -> bool {
+        // A retained session can complete accepted work, but a new RPC must not
+        // enter its retired handler. Its bounded Retry sends the caller through
+        // current HTTP dispatch until a new RDMA session is negotiated.
+        let authority = self.authority.borrow();
+        authority
+            .as_ref()
+            .and_then(|p| p.routing_for_volume(&self.volume_id))
+            .zip(self.prepared.routing_for_volume(&self.volume_id))
+            .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
     }
     fn validate(&self, frame: &Frame, remote: NodeId) -> io::Result<()> {
         if frame.node != remote

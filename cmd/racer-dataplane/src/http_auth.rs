@@ -9,6 +9,8 @@ use std::{collections::BTreeSet, io};
 pub struct Policy {
     pub universe: [u8; 32],
     pub node: [u8; 32],
+    /// Namespace members, including nonadjacent processes. Outbound adjacency
+    /// is selected independently by Routing; runtime checks the exact pod UID.
     pub peers: BTreeSet<[u8; 32]>,
 }
 impl Policy {

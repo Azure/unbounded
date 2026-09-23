@@ -100,7 +100,7 @@ mod management_tests {
                         .publish(prepare_snapshot(&trust, config.clone()))
                         .unwrap();
                     let candidate = updates.latest(0).unwrap();
-                    check_http(&exporter, &updates, false);
+                    check_http(&exporter, &updates, !initial);
                     node.poll(&mut ring, 16).unwrap();
                     let status = updates.status();
                     eprintln!(
@@ -128,7 +128,7 @@ mod management_tests {
                         assert!(old.active.get());
                         assert!(Rc::ptr_eq(old, &node.servers[&a.into()].handler().current));
                     }
-                    check_http(&exporter, &updates, false);
+                    check_http(&exporter, &updates, !initial);
                     let (code, metrics) = get(&exporter, "/metrics");
                     assert_eq!(code, 200);
                     assert!(metrics.contains(&format!(
@@ -160,7 +160,55 @@ pub(super) fn address() -> SocketAddr {
 }
 
 #[test]
-fn coordinated_candidate_is_receive_addressable_before_ingress() {
+fn desired_state_keeps_working_listener_after_failure_and_converges_independently() {
+    let Some(mut ring) = crate::control::tests::ring() else {
+        return;
+    };
+    let updates = Arc::new(Updates::default());
+    let mut node = volumes(&ring, &updates, 0);
+    let (trust, mut config) = fixture();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "desired-cache");
+    let original = Address::unix(&config.volumes[0].cache_socket).unwrap();
+    updates
+        .apply_desired(prepare_snapshot(&trust, config.clone()))
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    let working = node.servers[&original].handler().current.clone();
+    assert_eq!(updates.active().unwrap().config_snapshot().revision, 1);
+    let blocked = crate::control::tests::test_socket(address(), "desired-blocked");
+    let blocker = std::os::unix::net::UnixListener::bind(&blocked).unwrap();
+    config.revision = 3;
+    config.volumes[0].cache_socket = blocked;
+    updates
+        .apply_desired(prepare_snapshot(&trust, config.clone()))
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    assert_eq!(updates.active().unwrap().config_snapshot().revision, 1);
+    assert!(Rc::ptr_eq(
+        &working,
+        &node.servers[&original].handler().current
+    ));
+    assert!(working.active.get());
+    assert_eq!(updates.status()["ready"], true);
+    config.revision = 20;
+    config.volumes[0].cache_socket =
+        crate::control::tests::test_socket(address(), "desired-recovered");
+    updates
+        .apply_desired(prepare_snapshot(&trust, config))
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    assert_eq!(updates.active().unwrap().config_snapshot().revision, 20);
+    assert_eq!(updates.status()["localState"], "applied");
+    assert!(
+        !node.retired.is_empty(),
+        "old work drains after independent commit"
+    );
+    drop(blocker);
+    node.shutdown(&mut ring).unwrap();
+}
+
+#[test]
+fn independently_prepared_generation_has_no_serving_authority_until_commit() {
     let Some(mut ring) = crate::control::tests::ring() else {
         return;
     };
@@ -171,22 +219,23 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     let updates = Arc::new(Updates::default());
     let mut volumes = volumes(&ring, &updates, 0);
     let prepare = |s| prepare_snapshot(&trust, s);
-    updates.command(prepare(config.clone()), 1).unwrap();
+    // A second worker delays the local commit, without any remote phase.
+    updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+    updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert!(volumes.servers.is_empty());
     assert!(!updates.status()["ready"].as_bool().unwrap());
-    updates.command(prepare(config.clone()), 2).unwrap();
-    volumes.poll(&mut ring, 16).unwrap();
-    let candidate = volumes.servers[&address.into()].handler().current.clone();
+    let candidate = volumes.staged.as_ref().unwrap().generations[&address].clone();
     assert!(!candidate.active.get());
     assert!(!updates.status()["ready"].as_bool().unwrap());
-    updates.command(prepare(config.clone()), 4).unwrap();
+    updates.staged(1, 1, true);
     volumes.poll(&mut ring, 16).unwrap();
     assert!(candidate.active.get());
+    updates.activated(1, 1);
     assert!(updates.status()["ready"].as_bool().unwrap());
     config.revision = 2;
     config.volumes[0].topology.as_mut().unwrap().epoch = 2;
-    updates.command(prepare(config.clone()), 1).unwrap();
+    updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert!(
         volumes.servers[&address.into()]
@@ -194,16 +243,13 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
             .draining
             .is_empty()
     );
-    updates.command(prepare(config.clone()), 2).unwrap();
-    volumes.poll(&mut ring, 16).unwrap();
     let handler = volumes.servers[&address.into()].handler();
     assert!(Rc::ptr_eq(&handler.current, &candidate));
     assert!(handler.current.active.get());
-    assert_eq!(handler.draining.len(), 1);
-    assert!(!handler.draining[0].active.get());
-    assert_ne!(handler.current.identity, handler.draining[0].identity);
-    updates.command(prepare(config), 3).unwrap();
+    assert!(handler.draining.is_empty());
+    updates.staged(2, 1, true);
     volumes.poll(&mut ring, 16).unwrap();
+    updates.activated(2, 1);
     assert!(!candidate.active.get());
     assert!(
         volumes.servers[&address.into()]
@@ -217,7 +263,7 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
 }
 
 #[test]
-fn storage_fence_preserves_staged_generation_through_receive_and_transmit() {
+fn storage_fence_preserves_preparation_until_local_commit() {
     let Some(mut ring) = crate::control::tests::ring() else {
         return;
     };
@@ -225,9 +271,8 @@ fn storage_fence_preserves_staged_generation_through_receive_and_transmit() {
     config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "cache");
     let updates = Arc::new(Updates::default());
     let mut node = volumes(&ring, &updates, 0);
-    updates
-        .command(prepare_snapshot(&trust, config.clone()), 1)
-        .unwrap();
+    updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+    updates.publish(prepare_snapshot(&trust, config)).unwrap();
     node.poll(&mut ring, 16).unwrap();
     let staged = node
         .staged
@@ -239,27 +284,14 @@ fn storage_fence_preserves_staged_generation_through_receive_and_transmit() {
         .unwrap()
         .clone();
     node.storage_maintenance(true);
-    updates
-        .command(prepare_snapshot(&trust, config.clone()), 2)
-        .unwrap();
+    updates.staged(1, 1, true);
     node.poll(&mut ring, 16).unwrap();
     assert!(node.servers.is_empty());
-    assert!(!node.staged.as_ref().unwrap().armed);
-    assert_eq!(updates.status()["receiveReadyWorkers"], 0);
-    node.storage_maintenance(false);
-    node.poll(&mut ring, 16).unwrap();
-    assert!(node.staged.as_ref().unwrap().armed);
-    assert!(!staged.active.get());
-    assert_eq!(updates.status()["receiveReadyWorkers"], 1);
-    node.storage_maintenance(true);
-    updates
-        .command(prepare_snapshot(&trust, config), 3)
-        .unwrap();
-    node.poll(&mut ring, 16).unwrap();
     assert!(!staged.active.get());
     assert!(updates.active().is_none());
     node.storage_maintenance(false);
     node.poll(&mut ring, 16).unwrap();
+    updates.activated(1, 1);
     assert!(staged.active.get());
     assert!(Rc::ptr_eq(
         &node.servers.values().next().unwrap().handler().current,
@@ -317,6 +349,47 @@ fn b04_kernel_failed_bind_same_revision() {
 }
 
 #[test]
+fn superseded_local_preparation_never_commits_or_leaks_listener_authority() {
+    let Some(mut ring) = crate::control::tests::ring() else {
+        return;
+    };
+    let updates = Arc::new(Updates::default());
+    let mut node = volumes(&ring, &updates, 0);
+    updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+    let (trust, mut config) = fixture();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "stale-stage");
+    updates
+        .publish(prepare_snapshot(&trust, config.clone()))
+        .unwrap();
+    node.poll(&mut ring, 16).unwrap();
+    let stale = node
+        .staged
+        .as_ref()
+        .unwrap()
+        .generations
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(!stale.active.get());
+    config.revision = 9;
+    updates.publish(prepare_snapshot(&trust, config)).unwrap();
+    // Simulate completion of work that started before desired replacement.
+    updates.staged(1, 1, true);
+    updates.activated(1, 1);
+    node.poll(&mut ring, 16).unwrap();
+    assert!(node.servers.is_empty());
+    assert_eq!(node.staged.as_ref().unwrap().revision, 9);
+    updates.staged(9, 1, true);
+    node.poll(&mut ring, 16).unwrap();
+    updates.activated(9, 1);
+    assert!(!stale.active.get());
+    assert_eq!(updates.active().unwrap().config_snapshot().revision, 9);
+    assert_eq!(node.servers.len(), 1);
+    node.shutdown(&mut ring).unwrap();
+}
+
+#[test]
 fn b04_subscription_304_does_not_gate_runtime_retry() {
     use crate::control::{Source, Subscriber, proto};
     use prost::Message;
@@ -360,7 +433,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let source = Source::parse(&format!(
-        "https://{}/configuration",
+        "https://{}/v4/config",
         listener.local_addr().unwrap()
     ))
     .unwrap();
@@ -394,9 +467,14 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
-                socket.read_exact(&mut byte).unwrap();
+                if socket.read_exact(&mut byte).is_err() {
+                    break;
+                }
                 request.push(byte[0]);
                 assert!(request.len() < 16384);
+            }
+            if !request.ends_with(b"\r\n\r\n") {
+                continue;
             }
             if first {
                 first = false;
@@ -406,7 +484,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                     .lines()
                     .find_map(|line| line.strip_prefix("X-Racer-Boot: "))
                     .unwrap();
-                let body = proto::ControlCommand {
+                let body = proto::DesiredState {
                     universe: command_config.universe.clone(),
                     node: command_config.node.clone(),
                     revision: 2,
@@ -415,7 +493,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                         .map(|i| u8::from_str_radix(&boot[i..i + 2], 16).unwrap())
                         .collect(),
                     profile: 1,
-                    phase: 3,
+                    cursor: "revision-2".into(),
                     pod_uid: "test-pod".into(),
                     snapshot_digest: sha2::Sha256::digest(command_config.encode_to_vec()).to_vec(),
                     configuration: Some(proto::Configuration::decode(body.as_slice()).unwrap()),

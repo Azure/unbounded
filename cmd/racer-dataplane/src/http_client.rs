@@ -1689,6 +1689,8 @@ mod retry {
     use super::*;
 
     impl<B: Writable> GetExchange<B> {
+        // Production peer retries must return to Provider to spend chain budget.
+        #[cfg(test)]
         pub(crate) fn retry_idle_peer(
             mut self,
             origin: &Origin,
@@ -1702,6 +1704,7 @@ mod retry {
             self
         }
     }
+    #[cfg(test)]
     impl SmallExchange {
         pub(crate) fn retry_idle_peer(
             mut self,
@@ -1720,6 +1723,7 @@ mod retry {
     }
 
     impl<B: Writable> Exchange<B> {
+        #[cfg(test)]
         fn enable_peer_retry(&mut self, origin: &Origin, metrics: &crate::metrics::Local) {
             if let Some(tls) = &origin.tls {
                 self.enable_idle_retry(metrics);

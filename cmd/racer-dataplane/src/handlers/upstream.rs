@@ -292,6 +292,7 @@ impl Provider {
         deadline: Instant,
         inherited: Option<Attempt>,
     ) -> cache::Result<Exchange> {
+        self.forward_available()?;
         let kind = metric_kind(&request);
         let service_end = self.service_end(deadline);
         let bytes = self.budget_wire(&request, service_end)?;
@@ -401,7 +402,6 @@ impl Provider {
                 Some(destination) => HttpGet::Payload(
                     connection
                         .get(request_wire, destination, service_end.min(deadline))?
-                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),
@@ -412,7 +412,6 @@ impl Provider {
                             cache::METADATA_SIZE,
                             service_end.min(deadline),
                         )?
-                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),

@@ -105,35 +105,6 @@ impl Volumes {
             }
         }
     }
-    pub(super) fn arm(&mut self, staged: &mut Staged) {
-        if staged.armed {
-            return;
-        }
-        // Receive authority precedes ordinary ingress activation. Existing tasks
-        // retain their generation and the old transmit generation remains active.
-        self.receive_authority(&staged.config);
-        for (address, candidate) in &staged.generations {
-            self.reclaim_listener(*address);
-            if let Some(server) = self.servers.get_mut(address) {
-                server.handler_mut().draining.push(candidate.clone());
-            } else {
-                self.servers.insert(
-                    *address,
-                    http::Server::new(
-                        staged.listeners.remove(address).unwrap(),
-                        VolumeHandler {
-                            local: true,
-                            current: candidate.clone(),
-                            draining: Vec::new(),
-                        },
-                        http::Config::default(),
-                    ),
-                );
-            }
-        }
-        staged.armed = true;
-        self.updates.received(staged.revision, self.worker);
-    }
     fn poll_retired(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
         let now = crate::environment::now();
         let mut work = uring::Work::default();
