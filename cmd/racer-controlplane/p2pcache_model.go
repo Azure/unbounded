@@ -13,27 +13,17 @@ import (
 	"github.com/Azure/unbounded/internal/racer"
 )
 
-// All caches in a Site share the same managed process inventory. Peer ports
-// remain allocated after withdrawal so a returning cache cannot collide with a
-// draining listener. Local sockets are derived separately from the cache name.
-func buildCacheGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches []racerapi.P2PCache, reserved reservedPorts, root string) (*generation, error) {
+// All caches in a Site share the same managed process inventory and peer TLS
+// endpoint. Local sockets follow cache names; cache identity follows the UID.
+func buildCacheGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches []racerapi.P2PCache, root string) (*generation, error) {
 	if name == "" {
 		return nil, fmt.Errorf("universe must not be empty")
-	}
-
-	ports := map[string]int32{}
-	used := map[int32]bool{}
-
-	if previous != nil {
-		for id, port := range previous.Ports {
-			ports[id], used[port] = port, true
-		}
 	}
 
 	caches = append([]racerapi.P2PCache(nil), caches...)
 	sort.Slice(caches, func(i, j int) bool { return caches[i].Name < caches[j].Name })
 
-	g, err := buildInventory(name, previous, nodes, pods, ports)
+	g, err := buildInventory(name, previous, nodes, pods)
 	if err != nil {
 		return nil, err
 	}
@@ -57,8 +47,6 @@ func buildCacheGeneration(name string, previous *generation, nodes []corev1.Node
 		}
 	}
 
-	nextPort := int32(10000)
-
 	for _, cache := range caches {
 		if cache.UID == "" || cache.Spec.CacheGeneration < 0 || cache.Spec.MaxCandidateAttempts < 1 || cache.Spec.MaxCandidateAttempts > 8 {
 			return nil, fmt.Errorf("P2PCache %s has invalid identity or configuration", cache.Name)
@@ -71,28 +59,7 @@ func buildCacheGeneration(name string, previous *generation, nodes []corev1.Node
 
 		id := string(cache.UID)
 		delete(g.Withdrawn, id)
-		// The socket and peer-port lifetime follows the name. Cache identity follows
-		// the UID, ensuring recreation cannot reuse cached bytes from an old object.
-		port := ports[cache.Name]
-		if port == 0 {
-			for nextPort <= 29999 && (used[nextPort] || reserved.contains(nextPort)) {
-				nextPort++
-			}
-
-			if nextPort > 29999 {
-				return nil, fmt.Errorf("peer listener port range exhausted")
-			}
-
-			port = nextPort
-			ports[cache.Name], used[port] = port, true
-		}
-
-		if reserved.contains(port) {
-			return nil, fmt.Errorf("historical peer listener port %d for %s is reserved for management", port, cache.Name)
-		}
-
-		g.Ports[cache.Name] = port
-		v := &volumeSpec{ID: id, Name: cache.Name, ResourceGeneration: cache.Generation, CacheSocket: local, OriginSocket: origin, Port: port, Slots: racer.SlotCount, Cache: uint64(cache.Spec.CacheGeneration), Algorithm: 2, Attempts: uint32(cache.Spec.MaxCandidateAttempts)}
+		v := &volumeSpec{ID: id, Name: cache.Name, ResourceGeneration: cache.Generation, CacheSocket: local, OriginSocket: origin, Slots: racer.SlotCount, Cache: uint64(cache.Spec.CacheGeneration), Algorithm: 2, Attempts: uint32(cache.Spec.MaxCandidateAttempts)}
 
 		var priorOwners []string
 

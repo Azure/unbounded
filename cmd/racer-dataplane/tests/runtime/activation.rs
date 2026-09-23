@@ -15,11 +15,10 @@ fn peer_metrics_follow_active_generation_and_idle_transport_changes() {
     registry.register(0, ring.metrics());
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
-    let address: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+    let address = Address::unix(&config.volumes[0].cache_socket).unwrap();
     // A second volume exercises independent breakers to the same peer.
     let mut second = config.volumes[0].clone();
     second.id = "v2".into();
-    second.peer_listen = "127.0.0.1:8090".into();
     second.cache_socket = "/dev/racer/v2/cache".into();
     second.origin_socket = "/dev/racer/v2/origin".into();
     config.volumes.push(second);
@@ -263,7 +262,6 @@ mod namespace_tests {
             let updates = Arc::new(Updates::default());
             let mut node = volumes(&ring, &updates, 0);
             let (mut trust, mut config) = fixture();
-            trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
             config.peers.clear();
             let volume = &mut config.volumes[0];
             volume.origin_socket = "/dev/racer/v1/origin".into();
@@ -380,7 +378,7 @@ mod management_tests {
     use super::*;
 
     #[test]
-    fn b06_dst_management_rejection_preserves_desired_listener_visibility() {
+    fn b06_dst_socket_rejection_preserves_desired_listener_visibility() {
         let world = World::new(461);
         let _scope = world.enter();
         let mut ring = crate::conformance::ring(8, Default::default());
@@ -388,7 +386,7 @@ mod management_tests {
         let mut node = volumes(&ring, &updates, 0);
         let (trust, mut config) = fixture();
         config.epoch = 101;
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
@@ -399,11 +397,12 @@ mod management_tests {
         config.epoch = 102;
         let mut b = config.volumes[0].clone();
         b.id = "B".into();
-        b.peer_listen = "127.0.0.1:9090".into();
         b.cache_socket = "/dev/racer/b/cache".into();
         b.origin_socket = "/dev/racer/b/origin".into();
+        let blocker = world
+            .listen_address(Address::unix(&b.cache_socket).unwrap())
+            .unwrap();
         config.volumes.push(b);
-        // No simulated blocker: this must be policy rejection, not EADDRINUSE.
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
@@ -414,7 +413,7 @@ mod management_tests {
         eprintln!("B06 DST after staging: {status}");
         assert_eq!(
             status["rejected"], true,
-            "B06 must reject management before binding"
+            "B06 must reject an occupied local socket"
         );
         assert_eq!(status["ready"], false, "B05 required B remains visible");
         assert_eq!(status["candidateRevision"], 2);
@@ -426,14 +425,15 @@ mod management_tests {
         assert_eq!(updates.applied_epoch(), 101);
         assert!(Arc::ptr_eq(&candidate, &updates.latest(1).unwrap()));
         assert!(Rc::ptr_eq(&old, &node.servers[&a.into()].handler().current));
-        assert_eq!(node.servers.len(), 2);
-        // Staging retries cannot turn a permanent management conflict into activation.
+        assert_eq!(node.servers.len(), 1);
+        // Staging retries cannot activate while another owner holds the socket.
         world.advance(Duration::from_millis(250));
         node.poll(&mut ring, 16).unwrap();
         assert_eq!(updates.status()["rejected"], true);
         assert_eq!(updates.status()["ready"], false);
         let unused = world.listen("127.0.0.1:9090".parse().unwrap()).unwrap();
         drop(unused);
+        drop(blocker);
         node.shutdown(&mut ring).unwrap();
         drop((old, node, ring));
         world.assert_clean();
@@ -487,19 +487,12 @@ mod management_tests {
     }
 
     #[test]
-    fn b06_real_exporter_socket_default_custom_and_family_reservations() {
+    fn b06_real_exporter_socket_default_custom_and_family_independence() {
         // Fixed default verifies deployment behavior; :0 verifies the actual assigned
         // Exporter.address(), not the requested port or a hard-coded 9090 check.
         for management in ["0.0.0.0:9090", "127.0.0.1:0", "[::1]:0", "[::]:0"] {
             for initial in [false, true] {
-                for host in [
-                    "127.0.0.1",
-                    "0.0.0.0",
-                    "127.0.0.2",
-                    "[::1]",
-                    "[::]",
-                    "[::ffff:127.0.0.1]",
-                ] {
+                for occupied_tcp in [false, true] {
                     let updates = Arc::new(Updates::default());
                     let registry = Arc::new(crate::metrics::Registry::new(1, updates.clone()));
                     let exporter =
@@ -508,11 +501,12 @@ mod management_tests {
                     let Some(mut ring) = crate::control::tests::ring() else {
                         return;
                     };
-                    let mut node = volumes(&ring, &updates, 0).with_management(exporter.address());
+                    let mut node = volumes(&ring, &updates, 0);
                     let (trust, mut config) = fixture();
                     let a = address();
-                    config.volumes[0].peer_listen = a.to_string();
+                    let _tcp = occupied_tcp.then(|| std::net::TcpListener::bind(a).unwrap());
                     config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
+                    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
                     config.epoch = 111;
                     if !initial {
                         updates
@@ -528,9 +522,10 @@ mod management_tests {
                         .map(|s| s.handler().current.clone());
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
-                    b.peer_listen = format!("{host}:{}", exporter.address().port());
-                    b.cache_socket = crate::control::tests::test_socket(a, "cache-b");
-                    b.origin_socket = crate::control::tests::test_socket(a, "origin-b");
+                    let unique = address();
+                    b.cache_socket = crate::control::tests::test_socket(unique, "cache-b");
+                    b.origin_socket = crate::control::tests::test_socket(unique, "origin-b");
+                    let blocker = std::os::unix::net::UnixListener::bind(&b.cache_socket).unwrap();
                     config.volumes.push(b);
                     config.epoch = 112;
                     updates
@@ -543,7 +538,7 @@ mod management_tests {
                     eprintln!(
                         "B06 real management={} B={} initial={initial}: {status}",
                         exporter.address(),
-                        config.volumes[1].peer_listen
+                        config.volumes[1].cache_socket
                     );
                     assert_eq!(status["rejected"], true);
                     assert_eq!(status["activeRevision"], if initial { 0 } else { 1 });
@@ -560,7 +555,7 @@ mod management_tests {
                     );
                     assert!(Arc::ptr_eq(&candidate, &updates.latest(0).unwrap()));
                     assert!(node.staged.is_none());
-                    assert_eq!(node.servers.len(), 2 * usize::from(!initial));
+                    assert_eq!(node.servers.len(), usize::from(!initial));
                     if let Some(old) = &old {
                         assert!(old.active.get());
                         assert!(Rc::ptr_eq(old, &node.servers[&a.into()].handler().current));
@@ -572,15 +567,15 @@ mod management_tests {
                         "racer_dataplane_config_epoch {}\n",
                         if initial { 0 } else { 111 }
                     )));
-                    // A distinct data port stages/activates normally, while management
-                    // continues serving status. Supersession clears the failed retry.
+                    // Releasing the local socket permits activation while management
+                    // and the unrelated TCP owner remain live.
                     config.revision += 1;
-                    config.volumes[1].peer_listen = address().to_string();
+                    drop(blocker);
                     updates.publish(prepare_snapshot(&trust, config)).unwrap();
                     node.poll(&mut ring, 16).unwrap();
                     check_http(&exporter, &updates, true);
                     assert_eq!(updates.applied_epoch(), 112);
-                    assert_eq!(node.servers.len(), 4);
+                    assert_eq!(node.servers.len(), 2);
                     assert!(node.preparing.is_none());
                     node.shutdown(&mut ring).unwrap();
                 }
@@ -602,6 +597,8 @@ mod coordination_tests {
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         assert_eq!(updates.status()["ready"], false);
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
@@ -624,7 +621,7 @@ mod coordination_tests {
                     assert_eq!(status["ready"], revision != 4, "{status}");
                     assert_eq!(updates.applied_epoch(), revision);
                     for worker in &workers {
-                        assert_eq!(worker.node.servers.len(), 2 * usize::from(revision == 2));
+                        assert_eq!(worker.node.servers.len(), usize::from(revision == 2));
                     }
                     if complete_at.get_or_insert_with(Instant::now).elapsed()
                         >= Duration::from_millis(600)
@@ -632,7 +629,7 @@ mod coordination_tests {
                         let Source::Http { address, host, .. } = &source else {
                             unreachable!()
                         };
-                        let mut socket = std::net::TcpStream::connect(address).unwrap();
+                        let mut socket = credentials.connect(*address).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -672,6 +669,8 @@ mod coordination_tests {
         let survivor = std::env::var("RACER_FORWARD_MODE").unwrap() == "survivor";
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         // Permanent worker-local bind failure, retained through successful correction.
         let blockers: Vec<_> = workers
@@ -679,7 +678,9 @@ mod coordination_tests {
             .filter(|_| !backend && !survivor)
             .map(|w| {
                 let _scope = w.world.enter();
-                w.world.listen("0.0.0.0:10000".parse().unwrap()).unwrap()
+                w.world
+                    .listen_address(Address::unix("/dev/racer/volume/cache").unwrap())
+                    .unwrap()
             })
             .collect();
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
@@ -707,7 +708,7 @@ mod coordination_tests {
                 let Source::Http { address, host, .. } = &source else {
                     unreachable!()
                 };
-                let mut socket = std::net::TcpStream::connect(address).unwrap();
+                let mut socket = credentials.connect(*address).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -821,6 +822,7 @@ mod coordination_tests {
     fn production_catchup_child() {
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let subscriber =
             Subscriber::start(Source::from_env().unwrap(), trust, updates.clone()).unwrap();
@@ -874,14 +876,15 @@ mod coordination_tests {
     }
 
     #[test]
-    #[ignore = "launched by Go TestB14ProductionCoordination with signed HTTP controller"]
+    #[ignore = "launched by Go TestB14ProductionCoordination with mTLS controller"]
     fn production_coordination_child() {
         use std::io::{Read, Write};
         let mode = std::env::var("RACER_COORDINATION_MODE").unwrap();
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
-        assert!(trust.keys.requires_verification());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
         let heartbeat = mode == "heartbeat";
@@ -905,7 +908,6 @@ mod coordination_tests {
             let status = updates.status();
             if negative && !released && status["lastError"].is_string() {
                 let expected = match mode.as_str() {
-                    "signature" => "signature verification failed",
                     "universe" | "node" | "boot" => "control command identity/profile mismatch",
                     "revision" => "candidate revision mismatch",
                     "digest" => "candidate digest mismatch",
@@ -930,7 +932,7 @@ mod coordination_tests {
                 let Source::Http { address, host, .. } = &source else {
                     unreachable!()
                 };
-                let mut socket = std::net::TcpStream::connect(address).unwrap();
+                let mut socket = credentials.connect(*address).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -953,7 +955,7 @@ mod coordination_tests {
                 assert_eq!(status["activatedWorkers"], 2);
                 assert_eq!(updates.applied_epoch(), 1);
                 for worker in &workers {
-                    assert_eq!(worker.node.servers.len(), 2);
+                    assert_eq!(worker.node.servers.len(), 1);
                     assert!(
                         worker
                             .node
@@ -1001,17 +1003,21 @@ mod coordination_tests {
 }
 
 mod forward_multi_tests {
-    //! Concurrent recipients driven by the Go signed control server. Test endpoints
+    //! Concurrent recipients driven by the Go mTLS control server. Test endpoints
     //! schedule faults only; every protocol acknowledgment comes from Volumes.
     use super::*;
     use crate::control::{Source, Subscriber, Trust};
 
-    fn schedule(source: &Source, path: &str) -> bool {
+    fn schedule(
+        source: &Source,
+        credentials: &Arc<crate::control::credentials::Provider>,
+        path: &str,
+    ) -> bool {
         use std::io::{Read, Write};
         let Source::Http { address, host, .. } = source else {
             unreachable!()
         };
-        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut stream = credentials.connect(*address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1033,13 +1039,17 @@ mod forward_multi_tests {
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let blockers: Vec<_> = workers
             .iter()
             .filter(|_| role == "failed")
             .map(|w| {
                 let _scope = w.world.enter();
-                w.world.listen("0.0.0.0:10000".parse().unwrap()).unwrap()
+                w.world
+                    .listen_address(Address::unix("/dev/racer/bad/cache").unwrap())
+                    .unwrap()
             })
             .collect();
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
@@ -1065,7 +1075,7 @@ mod forward_multi_tests {
                     assert_eq!(s["receiveReadyWorkers"], 0);
                     if s["rejected"] == true && !failure_reported {
                         assert!(workers.iter().all(|w| w.node.preparing.is_some()));
-                        assert!(schedule(&source, "/multi/failed"));
+                        assert!(schedule(&source, &credentials, "/multi/failed"));
                         failure_reported = true;
                     }
                 } else if s["phase"] == trap
@@ -1075,7 +1085,7 @@ mod forward_multi_tests {
                     observed_old = true;
                     assert_eq!(s["activeRevision"], if trap == 2 { 0 } else { 1 });
                     for w in &workers {
-                        assert_eq!(w.node.servers.len(), 4);
+                        assert_eq!(w.node.servers.len(), 2);
                         assert!(
                             w.node.servers.values().all(|server| server
                                 .handler()
@@ -1085,7 +1095,7 @@ mod forward_multi_tests {
                                 == (trap >= 3))
                         );
                     }
-                    if role == "initial" && schedule(&source, "/multi/checkpoint") {
+                    if role == "initial" && schedule(&source, &credentials, "/multi/checkpoint") {
                         break;
                     }
                 }
@@ -1105,7 +1115,7 @@ mod forward_multi_tests {
                 assert_eq!(updates.applied_epoch(), 2);
                 assert!(role != "failed" || failure_reported);
                 for w in &workers {
-                    assert_eq!(w.node.servers.len(), 2);
+                    assert_eq!(w.node.servers.len(), 1);
                     assert!(
                         w.node
                             .servers
@@ -1276,11 +1286,9 @@ mod storage_workers {
     #[test]
     fn b17_actual_worker_group_survives_storage_pressure_and_poison() {
         let updates = Arc::new(Updates::default());
-        let (mut trust, mut config) = fixture();
-        trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
+        let (trust, mut config) = fixture();
         config.peers.clear();
         let volume = &mut config.volumes[0];
-        volume.peer_listen = "127.0.0.1:18080".into();
         volume.origin_socket = "/dev/racer/v1/origin".into();
         volume.peers.clear();
         let topology = volume.topology.as_mut().unwrap();
@@ -1288,7 +1296,6 @@ mod storage_workers {
         topology.neighbors.clear();
         let mut b = volume.clone();
         b.id = "unrelated".into();
-        b.peer_listen = "127.0.0.1:18081".into();
         b.cache_socket = "/dev/racer/unrelated/cache".into();
         b.origin_socket = "/dev/racer/unrelated/origin".into();
         config.volumes.push(b);
@@ -1388,8 +1395,8 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     };
     let (trust, mut config) = fixture();
     let address = address();
-    config.volumes[0].peer_listen = address.to_string();
     config.volumes[0].cache_socket = crate::control::tests::test_socket(address, "cache");
+    let address = Address::unix(&config.volumes[0].cache_socket).unwrap();
     let updates = Arc::new(Updates::default());
     let mut volumes = volumes(&ring, &updates, 0);
     let prepare = |s| prepare_snapshot(&trust, s);
@@ -1564,13 +1571,13 @@ fn lifecycle_drain_fences_later_configuration_activation() {
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
-    let address: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+    let address = Address::unix(&config.volumes[0].cache_socket).unwrap();
     let generation = node.servers[&address.into()].handler().current.clone();
     node.begin_drain();
     assert!(!generation.active.get());
     assert!(node.drained());
     config.revision = 2;
-    config.volumes[0].peer_listen = "127.0.0.1:18082".into();
+    config.volumes[0].cache_socket = "/dev/racer/moved/cache".into();
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
     for _ in 0..4 {
         node.poll(&mut ring, 16).unwrap();
@@ -1627,8 +1634,8 @@ fn generated_activation_retry_and_supersession() {
         let updates = Arc::new(Updates::default());
         let mut workers: Vec<_> = (0..count).map(|i| Worker::new(&updates, i)).collect();
         let (trust, mut config) = fixture();
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
-        let b: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
+        let b = Address::unix("/dev/racer/extra/cache").unwrap();
         if !initial {
             updates
                 .publish(prepare_snapshot(&trust, config.clone()))
@@ -1650,13 +1657,12 @@ fn generated_activation_retry_and_supersession() {
             .collect();
         let mut extra = config.volumes[0].clone();
         extra.id = "B".into();
-        extra.peer_listen = b.to_string();
         extra.cache_socket = "/dev/racer/extra/cache".into();
         extra.origin_socket = "/dev/racer/extra/origin".into();
         config.volumes.push(extra);
         config.epoch = 42;
         let failed = random.index(count);
-        let blocker = workers[failed].world.listen(b).unwrap();
+        let blocker = workers[failed].world.listen_address(b).unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
@@ -1688,7 +1694,7 @@ fn generated_activation_retry_and_supersession() {
                 }
                 retained[i] = Some(stage.clone());
                 updates.staged(config.revision, i, false); // duplicate cannot revoke success
-                assert!(workers[i].world.listen(b).is_err());
+                assert!(workers[i].world.listen_address(b).is_err());
             }
             let status = updates.status();
             assert_eq!(
@@ -1698,7 +1704,7 @@ fn generated_activation_retry_and_supersession() {
             assert_eq!(status["activeRevision"], u64::from(!initial));
             assert_eq!(status["ready"], false);
             for (w, old) in workers.iter().zip(&old) {
-                assert_eq!(w.node.servers.len(), 2 * usize::from(!initial));
+                assert_eq!(w.node.servers.len(), usize::from(!initial));
                 if let Some(old) = old {
                     assert!(old.active.get());
                     assert!(Rc::ptr_eq(
@@ -1763,7 +1769,7 @@ fn generated_activation_retry_and_supersession() {
         for (i, w) in workers.iter().enumerate() {
             assert!(w.node.staged.is_none() && w.node.preparing.is_none());
             if supersede {
-                drop(w.world.listen(b).unwrap());
+                drop(w.world.listen_address(b).unwrap());
             } else {
                 let current = &w.node.servers[&b.into()].handler().current;
                 assert!(Arc::ptr_eq(&candidate, &current._config));
@@ -1784,7 +1790,7 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     let updates = Arc::new(Updates::default());
     let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
     let (trust, mut config) = fixture();
-    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
     config.epoch = 71;
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
@@ -1796,11 +1802,10 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
         .iter()
         .map(|w| w.node.servers[&a.into()].handler().current.clone())
         .collect();
-    let b: SocketAddr = "127.0.0.1:18083".parse().unwrap();
-    let c: SocketAddr = "127.0.0.1:18084".parse().unwrap();
+    let b = Address::unix("/dev/racer/extra/cache").unwrap();
+    let c = Address::unix("/dev/racer/moved/cache").unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.peer_listen = b.to_string();
     extra.cache_socket = "/dev/racer/extra/cache".into();
     extra.origin_socket = "/dev/racer/extra/origin".into();
     config.volumes.push(extra);
@@ -1809,7 +1814,7 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
-    let blocker = workers[1].world.listen(b).unwrap();
+    let blocker = workers[1].world.listen_address(b).unwrap();
     workers[0].poll();
     workers[1].poll();
     assert_eq!(updates.status()["preparedWorkers"], 1);
@@ -1824,10 +1829,13 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
         let candidate = w.node.preparing.take().unwrap().0;
         w.node.prepare(candidate, &mut w.ring).unwrap();
     }
-    let blockers: Vec<_> = workers.iter().map(|w| w.world.listen(c).unwrap()).collect();
+    let blockers: Vec<_> = workers
+        .iter()
+        .map(|w| w.world.listen_address(c).unwrap())
+        .collect();
     config.revision = 3;
     config.epoch = 73;
-    config.volumes[1].peer_listen = c.to_string();
+    config.volumes[1].cache_socket = c.to_string();
     let next = prepare_snapshot(&trust, config);
     let pause = updates.pause_candidate_replacement();
     let publishing = updates.clone();
@@ -1909,12 +1917,12 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
             "B04 publication gap committed R behind last-good status"
         );
         assert!(old.active.get());
-        assert_eq!(w.node.servers.len(), 2);
+        assert_eq!(w.node.servers.len(), 1);
         assert!(w.node.staged.is_none());
         assert_eq!(w.node.preparing.as_ref().unwrap().0.config.revision, 3);
-        drop(w.world.listen(b).unwrap()); // superseded stage released its listener
-        assert!(w.world.listen(a).is_err()); // last-good listener still owned
-        assert!(w.world.listen(c).is_err()); // external blocker still owns C
+        drop(w.world.listen_address(b).unwrap()); // superseded stage released its listener
+        assert!(w.world.listen_address(a).is_err()); // last-good listener still owned
+        assert!(w.world.listen_address(c).is_err()); // external blocker still owns C
     }
     assert_eq!(decision, Some(false));
     assert!(
@@ -1933,9 +1941,9 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
         let updates = Arc::new(Updates::default());
         let mut worker = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
         config.epoch = 81;
-        let blocker = worker.world.listen(a).unwrap();
+        let blocker = worker.world.listen_address(a).unwrap();
         let candidate = prepare_snapshot(&trust, config.clone());
         if coordinated {
             updates.command(candidate, 1).unwrap();
@@ -1995,7 +2003,7 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
                 &worker.node.servers[&a.into()].handler().current
             ));
             assert!(!generation.active.get());
-            assert!(worker.world.listen(a).is_err());
+            assert!(worker.world.listen_address(a).is_err());
             assert_eq!(updates.status()["receiveReadyWorkers"], 1);
             assert_eq!(updates.decision(1), None);
             updates
@@ -2050,8 +2058,8 @@ fn b04_coordinated_retry_phases_and_terminal_abort() {
         let mut worker = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
         config.epoch = 61;
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
-        let blocker = worker.world.listen(a).unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
+        let blocker = worker.world.listen_address(a).unwrap();
         updates
             .command(prepare_snapshot(&trust, config.clone()), 1)
             .unwrap();
@@ -2084,7 +2092,7 @@ fn b04_coordinated_retry_phases_and_terminal_abort() {
             );
             worker.world.advance(Duration::from_secs(120));
             worker.poll();
-            drop(worker.world.listen(a).unwrap());
+            drop(worker.world.listen_address(a).unwrap());
             config.revision = 2;
             updates
                 .command(prepare_snapshot(&trust, config.clone()), 1)
@@ -2136,8 +2144,8 @@ fn b04_retry_backoff_is_bounded_and_abort_drops_successful_stage() {
     let updates = Arc::new(Updates::default());
     let mut worker = Worker::new(&updates, 0);
     let (trust, config) = fixture();
-    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
-    let blocker = worker.world.listen(a).unwrap();
+    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
+    let blocker = worker.world.listen_address(a).unwrap();
     updates
         .command(prepare_snapshot(&trust, config.clone()), 1)
         .unwrap();
@@ -2153,14 +2161,14 @@ fn b04_retry_backoff_is_bounded_and_abort_drops_successful_stage() {
     drop(blocker);
     worker.poll();
     assert!(worker.node.staged.is_some());
-    assert!(worker.world.listen(a).is_err());
+    assert!(worker.world.listen_address(a).is_err());
     updates
         .command(prepare_snapshot(&trust, config), 5)
         .unwrap();
     worker.poll();
     assert!(worker.node.staged.is_none());
     assert!(worker.node.preparing.is_none());
-    drop(worker.world.listen(a).unwrap());
+    drop(worker.world.listen_address(a).unwrap());
     worker.finish();
 }
 
@@ -2173,18 +2181,18 @@ fn b04_kernel_failed_bind_same_revision() {
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
     let a = address();
-    config.volumes[0].peer_listen = a.to_string();
     config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
+    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
     let old = node.servers[&a.into()].handler().current.clone();
-    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let b = blocker.local_addr().unwrap();
+    let b = address();
+    let path = crate::control::tests::test_socket(b, "cache");
+    let blocker = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.peer_listen = b.to_string();
     extra.cache_socket = crate::control::tests::test_socket(b, "cache");
     extra.origin_socket = crate::control::tests::test_socket(b, "origin");
     config.volumes.push(extra);
@@ -2205,9 +2213,9 @@ fn b04_kernel_failed_bind_same_revision() {
                 .unwrap();
         }
     }
-    assert_eq!(node.servers.len(), 4);
+    assert_eq!(node.servers.len(), 2);
     assert!(!old.active.get());
-    std::net::TcpStream::connect(b).unwrap();
+    std::os::unix::net::UnixStream::connect(path).unwrap();
     node.shutdown(&mut ring).unwrap();
 }
 
@@ -2224,46 +2232,42 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let updates = Arc::new(Updates::default());
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
+    let peer = "03".repeat(32);
+    config.peers[0].id = peer.clone();
+    config.volumes[0].peers = vec![peer.clone()];
+    config.volumes[0].peer_endpoints.as_mut().unwrap().peers[0].peer = peer.clone();
+    config.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = peer;
     let a = address();
-    config.volumes[0].peer_listen = a.to_string();
     config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
-    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let b = blocker.local_addr().unwrap();
+    let b = address();
+    let path = crate::control::tests::test_socket(b, "cache");
+    let blocker = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.peer_listen = b.to_string();
     extra.cache_socket = crate::control::tests::test_socket(b, "cache");
     extra.origin_socket = crate::control::tests::test_socket(b, "origin");
+    let b = Address::unix(&extra.cache_socket).unwrap();
     config.volumes.push(extra);
     config.revision = 2;
-    let snapshot = config.encode_to_vec();
     let command_config = config.clone();
-    let command_keys = trust.keys.clone();
-    let signature = trust
-        .keys
-        .sign(b"racer/config/v2", &[&snapshot])
-        .unwrap()
-        .to_vec();
     let body = proto::Configuration {
-        contents: Some(proto::configuration::Contents::Signed(
-            proto::SignedSnapshot {
-                snapshot,
-                signature,
-            },
-        )),
+        contents: Some(proto::configuration::Contents::Snapshot(config)),
     }
     .encode_to_vec();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let source = Source::parse(&format!(
-        "http://{}/configuration",
+        "https://{}/configuration",
         listener.local_addr().unwrap()
     ))
     .unwrap();
+    let tls = crate::control::credentials::tests::Fixture::new();
+    updates.set_credentials(tls.provider(1));
+    let context = tls.context("spiffe://racer/controlplane", Some("localhost"));
     let done = Arc::new(AtomicBool::new(false));
     let not_modified = Arc::new(AtomicUsize::new(0));
     let stop = done.clone();
@@ -2273,7 +2277,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
         let mut first = true;
         while !stop.load(Ordering::Acquire) {
             assert!(Instant::now() < end, "subscription fixture watchdog");
-            let (mut socket, _) = match listener.accept() {
+            let (socket, _) = match listener.accept() {
                 Ok(socket) => socket,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -2281,6 +2285,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                 }
                 Err(e) => panic!("{e}"),
             };
+            let mut socket = crate::control::credentials::tests::server(socket, &context);
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -2302,7 +2307,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                     .lines()
                     .find_map(|line| line.strip_prefix("X-Racer-Boot: "))
                     .unwrap();
-                let command = proto::ControlCommand {
+                let body = proto::ControlCommand {
                     universe: command_config.universe.clone(),
                     node: command_config.node.clone(),
                     revision: 2,
@@ -2316,14 +2321,6 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                     snapshot_digest: sha2::Sha256::digest(command_config.encode_to_vec()).to_vec(),
                     configuration: Some(proto::Configuration::decode(body.as_slice()).unwrap()),
                     ..Default::default()
-                }
-                .encode_to_vec();
-                let body = proto::SignedControlCommand {
-                    signature: command_keys
-                        .sign(b"racer/control/v1", &[&command])
-                        .unwrap()
-                        .to_vec(),
-                    command,
                 }
                 .encode_to_vec();
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"R2\"\r\nConnection: close\r\n\r\n", body.len()).unwrap();
@@ -2340,23 +2337,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
             }
         }
     });
-    let keys =
-        std::env::temp_dir().join(format!("runtime-subscription-keys-{}", std::process::id()));
-    std::fs::create_dir_all(&keys).unwrap();
-    std::fs::write(keys.join("token"), "test-token").unwrap();
-    std::fs::write(
-        keys.join("bundle.json"),
-        crate::signing::bundle_tests::bundle(1, 7, &[7], false),
-    )
-    .unwrap();
-    let subscriber = Subscriber::start_with_paths(
-        source,
-        Arc::new(trust),
-        updates.clone(),
-        Some(keys.join("token")),
-        Some(keys.clone()),
-    )
-    .unwrap();
+    let subscriber = Subscriber::start(source, Arc::new(trust), updates.clone()).unwrap();
     let end = Instant::now() + Duration::from_secs(5);
     let mut blocker = Some(blocker);
     while updates.status()["activeRevision"] != 2 {
@@ -2391,7 +2372,6 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     drop(subscriber);
     done.store(true, Ordering::Release);
     server.join().unwrap();
-    std::fs::remove_dir_all(keys).unwrap();
     node.shutdown(&mut ring).unwrap();
 }
 
@@ -2430,32 +2410,6 @@ mod rdma_startup {
         );
         let (trust, config) = crate::control::tests::rdma_fixture();
         let prepared = crate::control::tests::prepare_snapshot(&trust, config.clone());
-        for keys in [
-            crate::signing::Keys::new(None, vec![]).unwrap(),
-            crate::signing::Keys::new(Some([7; 32]), vec![]).unwrap(),
-            crate::signing::Keys::new(
-                None,
-                vec![
-                    ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-                        .verifying_key()
-                        .to_bytes(),
-                ],
-            )
-            .unwrap(),
-        ] {
-            let trust = crate::control::Trust {
-                universe: trust.universe,
-                node: trust.node,
-                keys,
-            };
-            let unauthenticated = crate::control::tests::prepare_snapshot(&trust, config.clone());
-            volumes
-                .provision_rdma_with(&unauthenticated, &ring, |_, _| {
-                    panic!("mutual auth required before registration")
-                })
-                .unwrap();
-            assert!(volumes.rdma_startup.is_some());
-        }
         let mut http = config;
         http.fabric.clear();
         let http = crate::control::tests::prepare_snapshot(&trust, http);

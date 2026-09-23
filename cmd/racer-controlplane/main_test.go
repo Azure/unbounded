@@ -46,7 +46,7 @@ func TestCLI(t *testing.T) {
 		{name: "long-flag", args: []string{"--version"}},
 		{name: "explicit-true", args: []string{"-version=true"}},
 		{name: "before-bootstrap", args: []string{"-bootstrap-node=node", "--version"}},
-		{name: "before-validation", args: []string{"-reserved-management-ports=invalid", "--version"}},
+		{name: "before-validation", args: []string{"-socket-root=relative", "--version"}},
 		{name: "explicit-false", args: []string{"-version=false", "-token-review-qps=invalid"}, wantError: true, wantStderr: "invalid value"},
 		{name: "unknown-flag", args: []string{"--version", "-unknown"}, wantError: true, wantStderr: "flag provided but not defined"},
 		{name: "invalid-boolean", args: []string{"--version=invalid"}, wantError: true, wantStderr: "invalid boolean value"},

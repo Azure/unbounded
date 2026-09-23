@@ -49,6 +49,7 @@ into the application at the same path. Mount the directory rather than either
 socket inode so a restarted server's socket replacement remains visible. The
 cache socket is created by Racer, and the local origin process creates `origin`.
 Run the origin on every participating node, serving the same logical dataset.
+Peer mTLS uses a separate network listener; local Unix HTTP remains plaintext.
 
 ### Metadata and random access
 
@@ -224,7 +225,7 @@ RACER_DATAPLANE_BINARY=/absolute/path/to/racer-dataplane \
     GOTOOLCHAIN=go1.26.6 go test -race -run TestDataplaneInterop -v ./pkg/racer
 ```
 
-The opt-in test starts an isolated single-node daemon with signing keys and an SDK origin,
+The opt-in test starts an isolated single-node daemon with HTTPS enrollment, mTLS credentials, and an SDK origin,
 verifies HEAD causes no page reads, checks multi-page cold downloads and warm
 cache reuse, and reads across a page boundary. A shared conformance suite runs
 against both Unix sockets, covering raw targets, full and ranged reads, empty objects,

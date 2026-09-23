@@ -1,9 +1,11 @@
 # Racer - High-level architecture
 
-**Status:** Architecture of the HTTP-cache implementation.
-**Scope:** Racer at revision `cc0a20cd2f38518dab6e3f4d07518d86cbbe4281`
-on `feat/racer-operator-integration`. Source links below are pinned to the
-reviewed revision of the HTTP-cache implementation.
+**Status:** Architecture of the HTTP-cache implementation with mTLS and CA rotation.
+**Scope:** Cache/routing references retain the reviewed baseline at
+`cc0a20cd2f38518dab6e3f4d07518d86cbbe4281`. Trust, transport, and deployment
+references describe the mTLS implementation at
+`10f7d259` on `feat/racer-mtls`. Runtime-resize references track the merged
+implementation. The cutover requires matching binaries.
 
 This is a historical, revision-pinned description. The P2PCache/Unix-socket
 implementation supersedes its annotated-Service configuration and local TCP
@@ -23,8 +25,8 @@ The architecture separates three responsibilities:
 
 - **Kubernetes integration** installs workloads and translates Site membership
   and volume Services into cache topology.
-- **The control plane** durably records topology and coordinates signed
-  configuration changes across participating processes.
+- **The control plane** durably records topology, coordinates configuration
+  changes over mTLS, and manages certificate issuance and CA rotation.
 - **The dataplane** serves reads, routes misses, coalesces compatible in-flight
   fetches, and manages local storage and transport resources.
 
@@ -34,11 +36,11 @@ flowchart LR
     Operator --> CP[Racer control plane]
     Operator --> DP[Per-Site dataplane DaemonSet]
     Kube[Nodes, Pods, volume and origin Services] --> CP
-    CP --> State[(ConfigMaps and signing Secrets)]
-    CP -. signed configuration .-> DP
+    CP --> State[(ConfigMaps and CA Secret)]
+    CP -. mTLS configuration .-> DP
     App[Application] -->|HTTP GET / HEAD| Service[Volume Service]
     Service --> Local[Local dataplane]
-    Local -->|miss| Peer[Peer dataplanes]
+    Local -->|mTLS miss| Peer[Peer dataplanes]
     Peer -->|owner miss| Origin[HTTP origin Service]
     Local --> Slab[(Local slab file)]
 ```
@@ -53,8 +55,8 @@ addresses directly. See [controller.go:446][service-output] and
 
 | Component | Responsibility |
 | --- | --- |
-| `internal/operator/components/racer` | Shared control-plane installation, per-Site DaemonSets, bootstrap, key projections, and host cache mounts. |
-| `cmd/racer-controlplane` | Kubernetes reconciliation, slot placement, listener allocation, durable generations, and authenticated configuration delivery. |
+| `internal/operator/components/racer` | Shared control-plane installation, per-Site DaemonSets, bootstrap, public trust projection, enrollment tokens, and host cache mounts. |
+| `cmd/racer-controlplane` | Kubernetes reconciliation, slot placement, listener allocation, durable generations, mTLS configuration delivery, and CA issuance/rotation. |
 | `cmd/racer-dataplane` | Linux Rust daemon implementing the HTTP cache, peer routing, io_uring execution, persistent storage, and optional RDMA. |
 | `api/racer/control.proto` | Shared configuration and coordinated-control wire schema, with Go and Rust bindings. |
 | `pkg/racer` | Go client for version-pinned parallel reads and an origin handler backed by an application-provided store. |
@@ -220,7 +222,7 @@ layout records size, shard count, and I/O-worker placement; incompatible
 formats or execution placement are rejected instead of automatically reformatted. See
 [cache.rs:263][namespace] and [allocator.rs:162][layout].
 
-Runtime-resize update: independent signed per-Node storage policies now replace
+Runtime-resize update: independent per-Node storage policies delivered over mTLS replace
 size and shard layout through a fresh-inode cache flush. Execution placement,
 workers, pools, and RDMA registrations stay fixed. The all-worker fence/install
 transaction publishes by rename and directory sync, then retires old ownership
@@ -230,6 +232,10 @@ Site/Node quantities normalize independently of topology. See the current
 [runtime coordinator](../cmd/racer-dataplane/src/runtime/storage.rs),
 [layout planner](../cmd/racer-dataplane/src/allocator/layout.rs), and
 [storage policy controller](../cmd/racer-controlplane/storage_policy.go).
+Policy admission follows TLS and command identity validation
+(`cmd/racer-dataplane/src/control.rs:1051-1061`); identity/version validation and
+runtime feedback remain independent of topology
+(`cmd/racer-dataplane/src/control/storage_policy.rs:121-204`).
 
 ## 6. Control plane and reconfiguration
 
@@ -244,11 +250,14 @@ Only the elected leader serves subscriptions. Durable topology lives in
 immutable, hash-verified ConfigMap chunks referenced by a resource-version
 compare-and-swap commit pointer. This keeps partially written generations from
 becoming authoritative and preserves revisions, ownership, and port reservations
-across controller restarts. See [main.go:275][leader] and [state.go:39][state].
+across controller restarts. See [tls_server.go:225-283][leader] and [state.go:39][state].
 
-Dataplanes subscribe to `/v2/<universe>/<node>`. Pod-bound service-account tokens
-identify the selected Pod; a process boot nonce distinguishes incarnations.
-Signed commands bind those identities to a revision and exact snapshot digest.
+Dataplanes subscribe to `GET /v3/<universe>/<node>` over mTLS on port 8443.
+An enrolled leaf identifies the universe, node, and selected Pod; a process boot
+nonce distinguishes incarnations. Raw protobuf `ControlCommand` messages bind
+those identities to a revision and exact snapshot digest. Pod-bound tokens are
+used for certificate enrollment and renewal, not subscription authentication.
+See [tls_server.go:133-164][control-tls] and [control.proto:78-93][mtls-schema].
 The normal rollout has four phases:
 
 | Phase | Meaning |
@@ -271,25 +280,99 @@ participant has disappeared. See [runtime.rs:516][generations] and
 
 ## 7. Transports and trust boundaries
 
-Client reads and origin fetches use HTTP. Peer metadata uses small HTTP exchanges;
-peer payload can use HTTP or optional RDMA READ. RDMA sessions are negotiated
-for configured direct peers, and the cache/routing model remains the same for
-both transports. Runtime RDMA is disabled by default. See
-[handlers.rs:785][upstream] and [main.rs:159][runtime-startup].
+Client reads and origin fetches use ordinary HTTP. Peer metadata and HTTP payload
+exchanges use a dedicated TLS 1.3 mutual-authentication listener on port 9443.
+Optional RDMA READ retains authenticated session negotiation, but its payload is
+not TLS-encrypted. The cache/routing model is shared by both peer transports;
+runtime RDMA is disabled by default. Peer mTLS does not authenticate clients at
+volume ingress. See [runtime.rs][mtls-runtime], [http_auth.rs:15-24][peer-auth],
+and [main.rs][runtime-startup].
 
-Peer HTTP requests and responses carry detached signatures bound to request
-semantics and identities. Receivers check configured peer membership, timestamps,
-and a process-wide replay ledger. These checks authenticate protocol exchanges;
-plaintext HTTP and RDMA payloads are not encrypted by those signatures. Control
-subscription tokens also travel over the configured HTTP transport. See
-[http_auth.rs:377][peer-auth] and [rollout.go:328][rollout].
+### Per-process credentials
 
-The managed deployment projects separate configuration-verification and
-peer-signing bundles. Configuration authority and peer data exchange are separate
-roles. The ordinary client-facing object API is also distinct from authenticated
-peer RPCs; deployments must provide the network and client-access boundary
-appropriate for their datasets. See [resources.go:180][deployment] and
-[handlers.rs:125][response].
+Each dataplane generates a local private key and sends a CSR to
+`POST /v3/enroll` on port 8444 over server-authenticated HTTPS. The request uses a
+Pod-bound bearer token for audience `racer-control`, a 64-hex `X-Racer-Boot` nonce,
+and JSON fields `csr`, `pod_namespace`, and `pod_name`. The response contains
+`certificate` (PEM leaf plus issuing root), `generation`, and `issuer` (root DER
+SHA-256). The server derives identity from TokenReview, live Kubernetes ownership
+and Site membership, and committed topology, not CSR identity claims.
+
+Node leaves carry
+`spiffe://racer/universe/<universe>/node/<node>/pod/<podUID>`. Peer authorization
+checks universe, direct membership, and the selected Pod UID for the addressed
+routing generation. Node IDs survive Pod replacement, but keys are not shared
+across nodes or processes. PKI participants are identified by Pod UID and boot
+nonce. Controller replicas also generate local keys; the leader validates their
+Pod/ReplicaSet/Deployment ownership and issues leaves through Pod-owned
+`racer-replica-<podUID>` ConfigMaps. Controller leaves identify
+`spiffe://racer/controlplane` and the Service DNS name.
+
+Sources: [enrollment.go:77-214][enrollment], [pki/types.go:55-74][pki-types],
+[replica_tls.go][replica-tls], and [runtime.rs][mtls-runtime].
+
+### Durable CA rotation
+
+The fenced leader persists CA private state in Secret `racer-ca` (`state.json`)
+and publishes public trust in ConfigMap `racer-trust` (`bundle.json`). Immutable
+participant ConfigMap shards are referenced by the Secret's commit. The public
+bundle carries version, generation, active root DER digest, and PEM roots.
+Existing trust/topology prevents silent CA regeneration if private state is lost.
+
+Rotation is independent of topology rollout and advances the public generation
+at each transition:
+
+1. **Stable:** one root issues production leaves.
+2. **Overlap:** persist and publish both roots, still issuing production leaves
+   from the old root. All retained controller/dataplane processes acknowledge the
+   exact bundle and prove next-root trust through a fresh TLS handshake.
+3. **Switched:** issue new-root production leaves while retaining both roots.
+   Retirement requires fresh proofs, old-connection draining, and the old issuer's
+   latest leaf expiry plus clock skew.
+4. **Stable again:** remove the old root and publish single-root trust.
+
+Dataplanes prove installed trust through empty-body `POST /v3/proof` on 8446 over
+a fresh mTLS connection (204 on success). It carries boot, trust generation/digest,
+verified issuer, and old-connection-count headers. In overlap the server presents
+a next-root leaf while the client can still present an old-root leaf. The leader
+also probes every replica's `GET /v3/replica-proof` on 8445 over fresh
+server-authenticated TLS pinned to that replica's key and boot. Claims in headers
+or ConfigMaps alone do not satisfy the TLS proof barrier. Leader takeover requires
+fresh evidence. Lost readiness, labels, or network contact does not retire a
+participant; authoritative Pod absence or proven container replacement does.
+
+The binary defaults to a 30-day CA interval, 24-hour leaves, and five-minute
+retirement clock skew. Operators request rotation with a unique nonempty
+`racer.unbounded-cloud.io/rotate-ca` annotation on `racer-trust`, never by editing
+or deleting private state. The [control-plane guide][control-guide] provides the
+command and observation procedure. Retained unavailable participants can block
+progress, and a switched two-root bundle is expected until old leaves expire.
+
+Sources: [pki/manager.go:535-651][ca-rotation], [pki/types.go][pki-types],
+[participants.go][pki-participants], [main.go:42-54][control-defaults],
+[trust_proof.go][trust-proof], and [replica_tls.go][replica-tls].
+
+### Hot reload and TLS I/O
+
+The managed deployment projects only public trust as a directory without
+`subPath`. A dataplane credential loop runs independently of control polling,
+installs overlap roots, and renews leaves when needed. Every worker must install
+the context before trust is acknowledged. Invalid bundles, rollback, and
+same-generation divergence retain the last valid context and report an error;
+certificate validity is still enforced. Controllers reload both production and
+proof contexts, including on standbys. New connections use the installed context
+while old contexts drain.
+
+Native dataplane builds require OpenSSL 3 headers/libraries and `pkg-config` as
+well as `cc`, `ar`, and libibverbs headers. OpenSSL uses native socket BIOs; kTLS
+eligibility requires **OpenSSL >= 3.5 and Linux >= 6.14** for TLS 1.3 rekeying.
+OpenSSL 3.0 and older kernels use encrypted software TLS for the entire connection.
+TX/RX offload is measured independently and is not guaranteed by version checks.
+TLS file sends use `SSL_sendfile` only with TX offload, otherwise buffered encrypted
+writes. Plaintext application ingress retains its file/splice path.
+
+Sources: [credentials.rs:378-517][credentials], [tls_native.c:39-65][ktls],
+[http_server.rs][tls-file-send], and [resources.go:199-270][deployment].
 
 ## 8. Deployment and architectural tradeoffs
 
@@ -298,8 +381,11 @@ DaemonSet. The managed profile sets the locked-memory limit, starts the daemon, 
 `/var/lib/racer` for the slab. Linux io_uring, suitable physical-core placement,
 NUMA allocation, locked memory, and the supported filesystem geometry are runtime
 prerequisites. Management exposes startup, readiness, liveness, and metrics
-endpoints separately from volume listeners. See [resources.go:180][deployment]
-and the [dataplane README:68][runtime-guide].
+endpoints on HTTP port 9090 separately from volume listeners. Controller HTTP
+health and leader readiness use 8081. The controller Service exposes subscription
+8443, enrollment 8444, and trust proof 8446; replica proof 8445 is accessed directly
+on controller Pods. See [resources.go:112-146][deployment] and the
+[dataplane README][runtime-guide].
 
 The main tradeoffs follow from the read path:
 
@@ -316,7 +402,7 @@ The main tradeoffs follow from the read path:
   transitions. Existing serving generations can survive a control partition;
   membership changes cannot simply treat silence as removal.
 - **Persistent cache over disposable process state:** warm data can survive
-  restart, at the cost of a fixed slab layout and recovery machinery. The origin
+  restart, at the cost of persisted layout and recovery machinery. The origin
   remains responsible for authoritative data durability.
 
 ## 9. Verification and further reading
@@ -336,13 +422,26 @@ The [dataplane testing guide][testing-guide] describes deterministic simulation,
 real-kernel ownership checks, and opt-in hardware/stress coverage. The
 [control-plane README][control-guide] covers Service configuration and rollout
 operations; the [SDK README][sdk-guide] covers client and origin contracts.
-These operational references belong to the same pinned implementation revision.
+These operational references track the current repository documentation.
+
+For the mTLS implementation, `TestTrustProofRequiresFreshPendingRootTLS` checks
+that an old-root client can prove next-root trust and rejects wrong digest, boot,
+and self-reported issuer. `TestProductionCARotationTraffic` launches two real Rust
+daemons with fake Kubernetes/TokenReview and short-lived leaves, asserting
+continuous SDK reads through overlap, issuer switch, full retirement, and renewal.
+It requires `RACER_DATAPLANE_BINARY`; coordination children require
+`RACER_COORDINATION_TEST_BIN`. `make racer-crosslang-test` sets both. A skipped
+campaign is not passing coverage. The live Kubernetes deployment test separately
+checks overlap/switch and that production leaves prevent early retirement.
+See [trust_proof_test.go:149-162][proof-test],
+[rotation_harness_test.go:519-596][rotation-test], and
+[e2e/racer/deployment_test.go:288-342][live-rotation-test].
 
 [service-output]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/controller.go#L446-L477
 [snapshots]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/topology.go#L410-L539
 [site-identity]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/internal/racer/site.go#L19-L89
 [volume-model]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/model.go#L51-L174
-[schema]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/api/racer/control.proto#L7-L96
+[schema]: https://github.com/Azure/unbounded/blob/10f7d259/api/racer/control.proto#L7-L93
 [placement]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/topology.go#L107-L294
 [cache-lookup]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/cache.rs#L1454-L2036
 [object-keys]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/cache.rs#L313-L443
@@ -364,20 +463,36 @@ These operational references belong to the same pinned implementation revision.
 [namespace]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/cache.rs#L263-L303
 [layout]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/allocator.rs#L162-L311
 [membership]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/model.go#L205-L371
-[leader]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/main.go#L275-L304
+[leader]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/tls_server.go#L225-L283
 [state]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/state.go#L39-L159
 [rollout]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/rollout.go#L328-L553
 [activation]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/runtime.rs#L893-L1055
 [generations]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/runtime.rs#L516-L713
 [rollout-recovery]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/rollout.go#L54-L322
-[runtime-startup]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/main.rs#L159-L218
-[peer-auth]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/src/http_auth.rs#L377-L510
-[deployment]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/internal/operator/components/racer/resources.go#L180-L247
-[runtime-guide]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/README.md#L68-L85
+[runtime-startup]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/main.rs
+[peer-auth]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/http_auth.rs#L15-L24
+[deployment]: https://github.com/Azure/unbounded/blob/10f7d259/internal/operator/components/racer/resources.go#L112-L270
+[runtime-guide]: ../cmd/racer-dataplane/README.md
 [topology-test]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/tests/control/topology.rs#L91-L181
 [routing-test]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/tests/control/routing.rs#L51-L124
 [flight-test]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/tests/storage/cache_persistence.rs#L1614-L1677
 [activation-test]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/tests/runtime/activation.rs#L1274-L1316
-[testing-guide]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-dataplane/TESTING.md
-[control-guide]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/cmd/racer-controlplane/README.md
-[sdk-guide]: https://github.com/Azure/unbounded/blob/cc0a20cd2f38518dab6e3f4d07518d86cbbe4281/pkg/racer/README.md
+[testing-guide]: ../cmd/racer-dataplane/TESTING.md
+[control-guide]: ../cmd/racer-controlplane/README.md
+[sdk-guide]: ../pkg/racer/README.md
+[control-tls]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/tls_server.go#L133-L164
+[mtls-schema]: https://github.com/Azure/unbounded/blob/10f7d259/api/racer/control.proto#L78-L93
+[enrollment]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/enrollment.go#L77-L214
+[pki-types]: https://github.com/Azure/unbounded/blob/10f7d259/internal/racer/pki/types.go
+[replica-tls]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/replica_tls.go
+[ca-rotation]: https://github.com/Azure/unbounded/blob/10f7d259/internal/racer/pki/manager.go#L535-L651
+[pki-participants]: https://github.com/Azure/unbounded/blob/10f7d259/internal/racer/pki/participants.go
+[control-defaults]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/main.go#L42-L54
+[trust-proof]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/trust_proof.go
+[credentials]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/credentials.rs#L378-L517
+[ktls]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/tls_native.c#L39-L65
+[tls-file-send]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/http_server.rs
+[mtls-runtime]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-dataplane/src/runtime.rs
+[proof-test]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/trust_proof_test.go#L149-L162
+[rotation-test]: https://github.com/Azure/unbounded/blob/10f7d259/cmd/racer-controlplane/rotation_harness_test.go#L519-L596
+[live-rotation-test]: https://github.com/Azure/unbounded/blob/10f7d259/e2e/racer/deployment_test.go#L288-L342

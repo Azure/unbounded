@@ -11,6 +11,18 @@ fn run(command: &mut Command) {
 }
 
 fn main() {
+    let openssl = pkg_config::Config::new()
+        .atleast_version("3.0.0")
+        .probe("openssl")
+        .expect("OpenSSL 3 development headers and libraries are required");
+    println!("cargo:rerun-if-changed=src/tls_native.c");
+    cc::Build::new()
+        .file("src/tls_native.c")
+        .includes(openssl.include_paths)
+        .flag_if_supported("-std=c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .compile("racer_tls");
     // Match internal/version's unstamped Go defaults. Track each input so a
     // cached Cargo build cannot retain metadata from a previous release.
     for (name, default) in [

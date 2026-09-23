@@ -257,7 +257,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := setupController(ctx, manager, server, "state", nil, racer.SocketRoot); err != nil {
+	if err := setupController(ctx, manager, server, "state", racer.SocketRoot); err != nil {
 		t.Fatal(err)
 	}
 

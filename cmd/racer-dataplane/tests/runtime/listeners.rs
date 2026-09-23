@@ -37,26 +37,76 @@ mod tcp {
         s
     }
 
-    fn request(a: SocketAddr, peer: Option<&str>) -> (u16, Vec<u8>) {
-        if peer.is_none() {
+    struct PeerStream(crate::tls::TlsSession);
+    impl PeerStream {
+        fn drive<T>(
+            &mut self,
+            mut operation: impl FnMut(
+                &mut crate::tls::TlsSession,
+            ) -> io::Result<crate::tls::TlsProgress<T>>,
+        ) -> io::Result<T> {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                match operation(&mut self.0)? {
+                    crate::tls::TlsProgress::Complete(value) => return Ok(value),
+                    crate::tls::TlsProgress::Eof => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    crate::tls::TlsProgress::WantRead | crate::tls::TlsProgress::WantWrite => {
+                        if Instant::now() >= end {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        thread::sleep(Duration::from_micros(100));
+                    }
+                }
+            }
+        }
+    }
+    impl Read for PeerStream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.drive(|s| match s.read(bytes)? {
+                crate::tls::TlsProgress::Eof => Ok(crate::tls::TlsProgress::Complete(0)),
+                other => Ok(other),
+            })
+        }
+    }
+    impl Write for PeerStream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.drive(|s| s.write(bytes))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    trait Stream: Read + Write {}
+    impl Stream for TcpStream {}
+    impl Stream for std::os::unix::net::UnixStream {}
+    impl Stream for PeerStream {}
+
+    fn request(a: SocketAddr, peer: Option<(&str, &crate::tls::TlsContext)>) -> (u16, Vec<u8>) {
+        let mut s: Box<dyn Stream> = if let Some((_, context)) = peer {
+            let socket = connect(super::super::tests::peer_address(a));
+            socket.set_nonblocking(true).unwrap();
+            let mut stream = PeerStream(
+                crate::tls::TlsSession::client(
+                    context,
+                    socket.into(),
+                    crate::tls::ExpectedPeer::Identity(local_identity()),
+                )
+                .unwrap(),
+            );
+            stream.drive(|s| s.handshake()).unwrap();
+            Box::new(stream)
+        } else {
             let path = crate::control::tests::test_socket(a, "cache");
-            let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+            let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            write!(
-                socket,
-                "HEAD /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            let h = headers(&mut socket);
-            return (
-                h.split_whitespace().nth(1).unwrap().parse().unwrap(),
-                Vec::new(),
-            );
-        }
-        let mut s = connect(a);
-        if let Some(wire) = peer {
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            Box::new(socket)
+        };
+        if let Some((wire, _)) = peer {
             write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\n").unwrap();
             for (name, value) in peer_headers(wire) {
                 write!(s, "{name}: {value}\r\n").unwrap();
@@ -73,7 +123,16 @@ mod tcp {
         let code = h.split_whitespace().nth(1).unwrap().parse().unwrap();
         let mut body = Vec::new();
         if peer.is_some() {
-            s.read_to_end(&mut body).unwrap();
+            let length: usize = h
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            body.resize(length, 0);
+            s.read_exact(&mut body).unwrap();
         }
         (code, body)
     }
@@ -81,19 +140,35 @@ mod tcp {
     // The actual kernel listener inode set catches competing SO_REUSEPORT sockets,
     // independently of runtime map counts and probabilistic connection selection.
     fn listener_inodes(a: SocketAddr) -> std::collections::BTreeSet<String> {
+        let std::net::IpAddr::V4(ip) = a.ip() else {
+            panic!("IPv4 listener observer requires an IPv4 endpoint");
+        };
+        // /proc/net/tcp is network-namespace-wide, not process-local. Match the
+        // full endpoint and owned socket inodes so other tests/daemons using
+        // 9443 cannot inflate the exact SO_REUSEPORT worker count.
+        let endpoint = format!("{:08X}:{:04X}", u32::from_ne_bytes(ip.octets()), a.port());
+        let owned: std::collections::BTreeSet<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter_map(|path| {
+                path.to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')
+                    .map(str::to_owned)
+            })
+            .collect();
         std::fs::read_to_string("/proc/net/tcp")
             .unwrap()
             .lines()
             .skip(1)
             .filter_map(|line| {
                 let f: Vec<_> = line.split_whitespace().collect();
-                (f[3] == "0A" && f[1].ends_with(&format!(":{:04X}", a.port())))
-                    .then(|| f[9].to_owned())
+                (f[3] == "0A" && f[1] == endpoint && owned.contains(f[9])).then(|| f[9].to_owned())
             })
             .collect()
     }
 
-    fn unix_listener_inodes(path: &str) -> std::collections::BTreeSet<String> {
+    pub(super) fn unix_listener_inodes(path: &str) -> std::collections::BTreeSet<String> {
         std::fs::read_to_string("/proc/net/unix")
             .unwrap()
             .lines()
@@ -113,7 +188,7 @@ mod tcp {
 
     #[test]
     fn b08_kernel_two_workers_fresh_connections_and_held_old_peer() {
-        let a = address();
+        let a = super::super::tests::address();
         let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let (trust, mut config) = peer_fixture(a, reservation.local_addr().unwrap());
         let origin_path = config.volumes[0].origin_socket.clone();
@@ -160,6 +235,30 @@ mod tcp {
             std::fs::remove_file(origin_path).unwrap();
         });
         let updates = Arc::new(Updates::default());
+        let authority = crate::tls::tests::Authority::new();
+        let exporter = crate::metrics::Exporter::start(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(crate::metrics::Registry::new(2, updates.clone())),
+        )
+        .unwrap();
+        assert_ne!(
+            exporter.address().ip(),
+            a.ip(),
+            "regression requires distinct management and peer bind IPs"
+        );
+        let probe_management = || {
+            let mut socket = connect(exporter.address());
+            socket
+                .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            assert!(headers(&mut socket).starts_with("HTTP/1.1 200"));
+        };
+        probe_management();
+        let peer_context = authority.context(&remote_identity(), true);
+        updates.set_credentials(crate::control::credentials::Provider::for_test(
+            local_identity(),
+            Arc::new(authority.context(&local_identity(), true)),
+        ));
         let (ready_tx, ready_rx) = mpsc::channel();
         let mut workers = Vec::new();
         for id in 0..2 {
@@ -168,7 +267,7 @@ mod tcp {
             let (tx, rx) = mpsc::channel();
             let join = thread::spawn(move || {
                 let mut ring = crate::control::tests::ring().expect("real io_uring required");
-                let mut node = volumes(&ring, &updates, id);
+                let mut node = volumes(&ring, &updates, id).with_peer_ip(a.ip());
                 node.cache.borrow_mut().set_metrics(ring.metrics().clone());
                 ready.send(()).unwrap();
                 let end = Instant::now() + Duration::from_secs(20);
@@ -181,8 +280,8 @@ mod tcp {
                         Ok(Command::Inspect(reply)) => {
                             let s = node
                                 .servers
-                                .get(&a.into())
-                                .or_else(|| node.retired.get(&a.into()).map(|(_, s)| s))
+                                .get(&local_key(a))
+                                .or_else(|| node.retired.get(&local_key(a)).map(|(_, s)| s))
                                 .unwrap();
                             reply
                                 .send((
@@ -193,7 +292,7 @@ mod tcp {
                                         .iter()
                                         .map(|g| g._config.config.revision)
                                         .collect(),
-                                    s.connections(),
+                                    node.peer_server.as_ref().unwrap().connections(),
                                     ring.metrics().values()[0],
                                 ))
                                 .unwrap();
@@ -226,8 +325,17 @@ mod tcp {
             }
         };
         activate(config.clone());
-        let original = listener_inodes(a);
+        assert!(listener_inodes(a).is_empty(), "cache must not bind TCP");
+        let peer_address = super::super::tests::peer_address(a);
+        let unrelated_address = super::super::tests::peer_address(super::super::tests::address());
+        let unrelated = TcpListener::bind(unrelated_address).unwrap();
+        assert_eq!(unrelated.local_addr().unwrap().port(), peer_address.port());
+        assert_ne!(unrelated_address.ip(), peer_address.ip());
+        let unrelated_inodes = listener_inodes(unrelated_address);
+        assert_eq!(unrelated_inodes.len(), 1);
+        let original = listener_inodes(peer_address);
         assert_eq!(original.len(), 2);
+        assert!(original.is_disjoint(&unrelated_inodes));
         let cache_path = config.volumes[0].cache_socket.clone();
         let unix_original = unix_listener_inodes(&cache_path);
         assert_eq!(
@@ -237,7 +345,8 @@ mod tcp {
         );
         let old_config = config.clone();
         let held_wire = peer_wire(&config, "/held");
-        let held = thread::spawn(move || request(a, Some(&held_wire)));
+        let held_context = peer_context.clone();
+        let held = thread::spawn(move || request(a, Some((&held_wire, &held_context))));
         held_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         // Old peer is blocked in an actual backend HEAD, with its accepted task live.
         config.revision = 2;
@@ -247,14 +356,14 @@ mod tcp {
         let volume = config.volumes.pop().unwrap();
         config.revision = 3;
         activate(config.clone());
-        assert_eq!(listener_inodes(a), original);
+        assert_eq!(listener_inodes(peer_address), original);
         assert_eq!(request(a, None).0, 409);
         config.revision = 4;
         config.volumes.push(volume);
         config.volumes[0].topology.as_mut().unwrap().epoch = 4;
         activate(config.clone());
         assert_eq!(
-            listener_inodes(a),
+            listener_inodes(peer_address),
             original,
             "B08 created competing retired+new reuseport listeners"
         );
@@ -284,7 +393,7 @@ mod tcp {
         for c in [&old_config, &prior_config, &config] {
             for n in 0..16 {
                 let wire = peer_wire(c, &format!("/peer-{}-{n}", c.revision));
-                let (status, body) = request(a, Some(&wire));
+                let (status, body) = request(a, Some((&wire, &peer_context)));
                 assert_eq!(status, 200);
                 assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
             }
@@ -302,7 +411,7 @@ mod tcp {
             volume.topology.as_mut().unwrap().epoch = config.revision;
             config.volumes.push(volume);
             activate(config.clone());
-            assert_eq!(listener_inodes(a), original);
+            assert_eq!(listener_inodes(peer_address), original);
             assert_eq!(unix_listener_inodes(&cache_path), unix_original);
             for _ in 0..128 {
                 assert_eq!(request(a, None).0, 200);
@@ -310,7 +419,7 @@ mod tcp {
             }
         }
         eprintln!(
-            "B08 TCP: 2 I/O threads, {successes} fresh ingress 200, 48 old/current peer 200, held old peer completed, same two kernel listener inodes across four readds"
+            "B08 UDS/TLS: 2 I/O threads, {successes} fresh ingress 200, 48 old/current peer 200, held old peer completed, stable local and TLS listener inodes across four readds"
         );
         for (id, (tx, _)) in workers.iter().enumerate() {
             let (reply, rx) = mpsc::channel();
@@ -347,14 +456,18 @@ mod tcp {
         stop.store(true, Ordering::Release);
         origin.join().unwrap();
         assert!(listener_inodes(a).is_empty());
+        assert!(listener_inodes(peer_address).is_empty());
+        assert_eq!(listener_inodes(unrelated_address), unrelated_inodes);
         assert!(unix_listener_inodes(&cache_path).is_empty());
         assert!(!std::path::Path::new(&cache_path).exists());
+        // Worker/listener retirement must not disturb the independent exporter.
+        probe_management();
     }
 }
 
 mod overlap {
     use super::*;
-    use std::net::{IpAddr, TcpStream};
+    use std::net::TcpStream;
 
     const PAIRS: &[(&str, &str, bool)] = &[
         ("0.0.0.0", "127.0.0.1", true),
@@ -376,44 +489,42 @@ mod overlap {
     }
 
     #[test]
-    fn audit20_production_snapshot_overlap_and_negative_controls() {
-        for &(a, b, overlap) in PAIRS {
-            for (a, b) in [(a, b), (b, a)] {
-                for port in [18080, 18081] {
-                    let (trust, mut config) =
-                        local_fixture(addr(a, 18080), addr("127.0.0.1", 19000));
-                    let mut extra = config.volumes[0].clone();
-                    extra.id = "B".into();
-                    extra.peer_listen = addr(b, port).to_string();
-                    extra.cache_socket = "/dev/racer/b/cache".into();
-                    extra.origin_socket = "/dev/racer/b/origin".into();
-                    config.volumes.push(extra);
-                    crate::control::tests::scope_peers(&mut config);
-                    let result = trust.prepare(crate::control::proto::Configuration {
-                        contents: Some(crate::control::proto::configuration::Contents::Snapshot(
-                            config,
-                        )),
-                    });
-                    assert_eq!(
-                        result.is_err(),
-                        overlap && port == 18080,
-                        "{a} -> {b}:{port}"
-                    );
-                    if let Err(e) = result {
-                        assert!(e.to_string().contains("overlaps candidate"));
-                    }
-                }
+    fn audit20_production_snapshot_socket_duplicates_and_negative_controls() {
+        for collision in [
+            "none",
+            "cache-cache",
+            "cache-origin",
+            "origin-cache",
+            "origin-origin",
+        ] {
+            let (trust, mut config) = fixture();
+            let mut extra = config.volumes[0].clone();
+            extra.id = "B".into();
+            extra.cache_socket = "/dev/racer/b/cache".into();
+            extra.origin_socket = "/dev/racer/b/origin".into();
+            match collision {
+                "cache-cache" => extra.cache_socket = config.volumes[0].cache_socket.clone(),
+                "cache-origin" => extra.cache_socket = config.volumes[0].origin_socket.clone(),
+                "origin-cache" => extra.origin_socket = config.volumes[0].cache_socket.clone(),
+                "origin-origin" => extra.origin_socket = config.volumes[0].origin_socket.clone(),
+                _ => {}
+            }
+            config.volumes.push(extra);
+            crate::control::tests::scope_peers(&mut config);
+            let result = trust.prepare(crate::control::proto::Configuration {
+                contents: Some(crate::control::proto::configuration::Contents::Snapshot(
+                    config,
+                )),
+            });
+            assert_eq!(result.is_err(), collision != "none", "{collision}");
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("duplicate cache or origin socket")
+                );
             }
         }
-        // Kernel aliases are not exact socket reuse keys, even within IPv6.
-        let a: SocketAddr = "[fe80::1%1]:18080".parse().unwrap();
-        let b: SocketAddr = "[fe80::1%2]:18080".parse().unwrap();
-        assert!(crate::listener_policy::overlaps(a, b));
-        let mut b = a;
-        if let SocketAddr::V6(b) = &mut b {
-            b.set_flowinfo(1);
-        }
-        assert!(crate::listener_policy::overlaps(a, b));
     }
 
     #[test]
@@ -421,7 +532,7 @@ mod overlap {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = local_fixture(addr("127.0.0.1", 18080), addr("127.0.0.1", 19000));
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+        let a = addr("127.0.0.1", 18080);
         {
             let _scope = w.world.enter();
             w.node
@@ -433,7 +544,9 @@ mod overlap {
             let sources = w.node.crypto_sources.len();
             for ip in ["0.0.0.0", "127.0.0.1", "::", "::ffff:127.0.0.1"] {
                 let mut next = config.clone();
-                next.volumes[0].peer_listen = addr(ip, 18080).to_string();
+                // Peer address-family edits must not bypass a staged UDS owner.
+                next.peers = fixture().1.peers;
+                next.peers[0].http_address = addr(ip, 9443).to_string();
                 let error = w
                     .node
                     .prepare(Arc::new(prepare_snapshot(&trust, next)), &mut w.ring)
@@ -448,7 +561,6 @@ mod overlap {
             let mut candidate = prepare_snapshot(&trust, config.clone());
             let mut extra = config.clone();
             extra.volumes[0].id = "B".into();
-            extra.volumes[0].peer_listen = "0.0.0.0:18080".into();
             candidate
                 .volumes
                 .push(prepare_snapshot(&trust, extra).volumes.remove(0));
@@ -458,7 +570,7 @@ mod overlap {
                 .unwrap_err();
             assert!(error.to_string().contains("candidate listener"));
             assert!(w.node.staged.is_none());
-            let unused = w.world.listen(a).unwrap();
+            let unused = w.world.listen_address(local_key(a)).unwrap();
             drop(unused);
         }
         updates
@@ -473,7 +585,9 @@ mod overlap {
         w.poll();
         config.revision = 3;
         config.volumes.push(volume);
-        config.volumes[0].peer_listen = "0.0.0.0:18080".into();
+        let replacement = local_key(addr("127.0.0.1", 18081));
+        config.volumes[0].cache_socket = replacement.to_string();
+        let blocker = w.world.listen_address(replacement).unwrap();
         updates.publish(prepare_snapshot(&trust, config)).unwrap();
         w.poll();
         assert_eq!(updates.status()["rejected"], true);
@@ -482,6 +596,7 @@ mod overlap {
         w.poll(); // prepare still sees the socket; then retirement closes it
         assert!(w.node.retired.is_empty());
         quiesce(&mut w);
+        drop(blocker);
         w.world.advance(Duration::from_secs(1));
         w.poll();
         assert_eq!(updates.status()["activeRevision"], 3);
@@ -521,7 +636,7 @@ mod overlap {
             .servers
             .iter()
             .chain(node.retired.iter().map(|(key, (_, server))| (key, server)))
-            .find(|(key, _)| key.overlaps(address.into()))
+            .find(|(key, _)| **key == local_key(address))
             .unwrap()
             .1;
         let path = server
@@ -530,7 +645,7 @@ mod overlap {
             ._config
             .volumes
             .iter()
-            .find(|v| crate::socket::Address::Tcp(v.address).overlaps(address.into()))
+            .find(|v| Address::Unix(v.cache_socket) == local_key(address))
             .unwrap()
             .config
             .cache_socket
@@ -538,15 +653,9 @@ mod overlap {
         let (tx, rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
             let timeout = Duration::from_secs(3);
-            let mut peer = TcpStream::connect_timeout(&address, timeout).unwrap();
-            peer.set_read_timeout(Some(timeout)).unwrap();
-            peer.write_all(b"HEAD /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut rejected = String::new();
-            peer.read_to_string(&mut rejected).unwrap();
             assert!(
-                rejected.starts_with("HTTP/1.1 409"),
-                "unsigned TCP ingress: {rejected}"
+                TcpStream::connect_timeout(&address, timeout).is_err(),
+                "cache unexpectedly exposes TCP ingress"
             );
             let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
             socket.set_read_timeout(Some(timeout)).unwrap();
@@ -580,22 +689,11 @@ mod overlap {
     }
 
     fn destination(a: SocketAddr) -> SocketAddr {
-        if a.ip().is_unspecified() {
-            SocketAddr::new(
-                if a.is_ipv4() {
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                } else {
-                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                },
-                a.port(),
-            )
-        } else {
-            a
-        }
+        a
     }
 
     #[test]
-    fn audit20_kernel_two_workers_overlap_transitions_and_multivolume() {
+    fn audit20_kernel_two_workers_socket_transitions_and_multivolume() {
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
@@ -605,17 +703,16 @@ mod overlap {
             crate::conformance::origin(0, stop.clone(), Arc::new(Mutex::new(Vec::new())));
         let (extra_backend, extra_origin) =
             crate::conformance::origin(1, stop.clone(), Arc::new(Mutex::new(Vec::new())));
-        // Real dual-stack and mapped IPv6 sockets are mandatory on this Linux test.
+        // Local UDS ownership is independent of the addresses used for peer TCP.
         for &(left, right, _) in &PAIRS[..6] {
             for (left, right) in [(left, right), (right, left)] {
                 let port = address().port();
                 let a = addr(left, port);
-                let b = addr(right, port);
+                let b = addr(right, address().port());
                 let other = address();
                 let (trust, mut config) = local_fixture(a, backend);
                 let mut extra = config.volumes[0].clone();
                 extra.id = "unrelated".into();
-                extra.peer_listen = other.to_string();
                 extra.cache_socket = crate::control::tests::test_socket(other, "cache");
                 extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
                 config.volumes.push(extra);
@@ -633,17 +730,17 @@ mod overlap {
                 poll(&mut workers);
                 poll(&mut workers);
                 assert_eq!(updates.status()["ready"], true);
-                let original = inodes(port);
-                assert_eq!(original.len(), 2);
+                let original = tcp::unix_listener_inodes(&config.volumes[0].cache_socket);
+                assert_eq!(original.len(), 1);
+                assert!(inodes(port).is_empty());
                 assert_eq!(head(&mut workers, destination(a)), 200);
-                // A dual-stack wildcard still serves actual IPv4 traffic.
-                if left == "::" {
-                    assert_eq!(head(&mut workers, addr("127.0.0.1", port)), 200);
-                }
                 let active = config.clone();
                 config.revision = 2;
                 config.epoch = 102;
-                config.volumes[0].peer_listen = b.to_string();
+                config.volumes[0].cache_socket = local_key(b).to_string();
+                let blocker =
+                    std::os::unix::net::UnixListener::bind(&config.volumes[0].cache_socket)
+                        .unwrap();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
@@ -651,7 +748,11 @@ mod overlap {
                 assert_eq!(updates.status()["rejected"], true, "{a} -> {b}");
                 assert_eq!(updates.status()["ready"], false);
                 assert_eq!(updates.applied_epoch(), 101);
-                assert_eq!(inodes(port), original, "staging diverted kernel traffic");
+                assert_eq!(
+                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    original,
+                    "staging diverted kernel traffic"
+                );
                 for _ in 0..8 {
                     assert_eq!(head(&mut workers, destination(a)), 200);
                     assert_eq!(head(&mut workers, other), 200);
@@ -668,7 +769,7 @@ mod overlap {
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(head(&mut workers, destination(a)), 409);
                 let mut moved = active.volumes[0].clone();
-                moved.peer_listen = b.to_string();
+                moved.cache_socket = local_key(b).to_string();
                 config.volumes.insert(0, moved);
                 config.revision = 4;
                 updates
@@ -678,18 +779,25 @@ mod overlap {
                 assert_eq!(updates.status()["rejected"], true);
                 assert_eq!(updates.status()["ready"], false);
                 assert_eq!(updates.status()["activeRevision"], 3);
-                assert_eq!(inodes(port), original, "retired socket shadowed candidate");
+                assert_eq!(
+                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    original,
+                    "retired socket shadowed candidate"
+                );
                 assert_eq!(head(&mut workers, other), 200);
-                // Exact-address reuse reclaims both original sockets.
+                // Exact-path reuse reclaims both workers' shared listener handles.
                 config.revision = 5;
-                config.volumes[0].peer_listen = a.to_string();
+                config.volumes[0].cache_socket = local_key(a).to_string();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
                 poll(&mut workers);
                 poll(&mut workers);
                 assert_eq!(updates.status()["ready"], true);
-                assert_eq!(inodes(port), original);
+                assert_eq!(
+                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    original
+                );
                 for _ in 0..8 {
                     assert_eq!(head(&mut workers, destination(a)), 200);
                 }
@@ -709,11 +817,30 @@ mod overlap {
                     node.poll_retired(ring, 64).unwrap();
                     assert!(node.retired.is_empty());
                 }
+                let retired_path = &active.volumes[0].cache_socket;
                 assert!(
-                    inodes(port).is_empty(),
-                    "pending ACCEPT kept endpoint listening"
+                    !std::path::Path::new(retired_path).exists(),
+                    "retirement must unlink the shared filesystem endpoint"
                 );
-                moved.peer_listen = b.to_string();
+                assert!(
+                    std::os::unix::net::UnixStream::connect(retired_path).is_err(),
+                    "pending ACCEPT kept endpoint reachable"
+                );
+                // /proc/net/unix can retain the shutdown socket inode until the
+                // pending ACCEPT drops its descriptor. It must then disappear too.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !tcp::unix_listener_inodes(retired_path).is_empty() {
+                    for (_, ring) in &mut workers {
+                        ring.progress().unwrap();
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "retired ACCEPT descriptor leaked"
+                    );
+                    std::thread::yield_now();
+                }
+                moved.cache_socket = local_key(b).to_string();
+                drop(blocker);
                 config.volumes.insert(0, moved);
                 config.revision = 7;
                 updates.publish(prepare_snapshot(&trust, config)).unwrap();
@@ -721,8 +848,10 @@ mod overlap {
                 poll(&mut workers);
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(updates.status()["activeRevision"], 7);
-                assert_eq!(inodes(port).len(), 2);
-                assert!(inodes(port).is_disjoint(&original));
+                let replacement = tcp::unix_listener_inodes(&local_key(b).to_string());
+                assert_eq!(replacement.len(), 1);
+                assert!(replacement.is_disjoint(&original));
+                assert!(inodes(port).is_empty());
                 assert_eq!(head(&mut workers, destination(b)), 200);
                 assert_eq!(head(&mut workers, other), 200);
                 for (node, ring) in &mut workers {
@@ -738,7 +867,7 @@ mod overlap {
     }
 
     #[test]
-    fn audit20_kernel_disjoint_same_port_listeners_serve_each_volume() {
+    fn audit20_kernel_disjoint_sockets_serve_each_volume() {
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
@@ -753,12 +882,11 @@ mod overlap {
                 continue;
             }
             let a = addr(left, address().port());
-            let b = addr(right, a.port());
+            let b = addr(right, address().port());
             let (trust, mut config) = local_fixture(a, backend);
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();
-            extra.peer_listen = b.to_string();
-            extra.cache_socket = crate::control::tests::test_socket(b, "cache-b");
+            extra.cache_socket = crate::control::tests::test_socket(b, "cache");
             extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
             config.volumes.push(extra);
             let updates = Arc::new(Updates::default());
@@ -767,7 +895,15 @@ mod overlap {
             updates.publish(prepare_snapshot(&trust, config)).unwrap();
             poll(&mut workers);
             assert_eq!(updates.status()["ready"], true, "{a}, {b}");
-            assert_eq!(inodes(a.port()).len(), 2);
+            assert!(inodes(a.port()).is_empty());
+            assert_eq!(
+                tcp::unix_listener_inodes(&local_key(a).to_string()).len(),
+                1
+            );
+            assert_eq!(
+                tcp::unix_listener_inodes(&local_key(b).to_string()).len(),
+                1
+            );
             assert_eq!(head(&mut workers, destination(a)), 200);
             assert_eq!(head(&mut workers, destination(b)), 200);
             for (node, ring) in &mut workers {
@@ -787,7 +923,6 @@ fn local_fixture(
     let (trust, mut config) = fixture();
     config.peers.clear();
     let v = &mut config.volumes[0];
-    v.peer_listen = a.to_string();
     v.cache_socket = crate::control::tests::test_socket(a, "cache");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers.clear();
@@ -805,7 +940,6 @@ fn peer_fixture(
     let peer = "03".repeat(32);
     config.peers[0].id = peer.clone();
     let v = &mut config.volumes[0];
-    v.peer_listen = a.to_string();
     v.cache_socket = crate::control::tests::test_socket(a, "cache");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers = vec![peer.clone()];
@@ -830,31 +964,45 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
 }
 
 fn peer_headers(wire: &str) -> Vec<(String, String)> {
-    let (trust, _) = fixture();
-    let policy = crate::http_auth::Policy {
-        keys: trust.keys,
-        universe: trust.universe,
-        node: [3; 32],
-        peers: [trust.node].into(),
-    };
-    let mut headers = vec![("X-Racer-Fault".into(), wire.as_bytes().to_vec())];
-    policy
-        .request(trust.node, "GET", "/", &mut headers)
-        .unwrap();
-    headers
-        .into_iter()
-        .map(|(k, v)| (k, String::from_utf8(v).unwrap()))
-        .collect()
+    let (_, config) = fixture();
+    vec![
+        ("X-Racer-Fault".into(), wire.into()),
+        ("X-Racer-Volume".into(), config.volumes[0].id.clone()),
+    ]
 }
 
-fn owned(node: &Volumes, address: SocketAddr) -> usize {
-    usize::from(node.servers.contains_key(&address.into()))
-        + usize::from(node.retired.contains_key(&address.into()))
+fn local_identity() -> crate::tls::PeerIdentity {
+    let (trust, _) = fixture();
+    crate::tls::PeerIdentity::new(
+        &crate::cache::peer_wire::hex(&trust.universe),
+        &crate::cache::peer_wire::hex(&trust.node),
+        "test-pod",
+    )
+    .unwrap()
+}
+
+fn remote_identity() -> crate::tls::PeerIdentity {
+    let mut identity = local_identity();
+    identity.node = "03".repeat(32);
+    identity
+}
+
+fn owned(node: &Volumes, address: impl Into<Address>) -> usize {
+    let address = match address.into() {
+        Address::Tcp(a) => local_key(a),
+        unix => unix,
+    };
+    usize::from(node.servers.contains_key(&address))
+        + usize::from(node.retired.contains_key(&address))
         + usize::from(
             node.staged
                 .as_ref()
-                .is_some_and(|s| s.listeners.contains_key(&address.into())),
+                .is_some_and(|s| s.listeners.contains_key(&address)),
         )
+}
+
+fn local_key(address: SocketAddr) -> Address {
+    Address::unix(&crate::control::tests::test_socket(address, "cache")).unwrap()
 }
 
 fn quiesce(w: &mut Worker) {
@@ -872,7 +1020,7 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
@@ -891,12 +1039,11 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         config.volumes[0].topology.as_mut().unwrap().epoch = 3;
         let mut extra = config.volumes[0].clone();
         extra.id = "B".into();
-        let b: SocketAddr = "127.0.0.1:18089".parse().unwrap();
-        extra.peer_listen = b.to_string();
+        let b = Address::unix("/dev/racer/extra/cache").unwrap();
         extra.cache_socket = "/dev/racer/extra/cache".into();
         extra.origin_socket = "/dev/racer/extra/origin".into();
         config.volumes.push(extra);
-        let blocker = w.world.listen(b).unwrap();
+        let blocker = w.world.listen_address(b).unwrap();
         // Publish first, then coordinate the same candidate before any worker
         // observes it. Switching modes on the previous draining revision is
         // deliberately rejected by Updates::command.
@@ -955,7 +1102,7 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         assert_eq!(old.drain.get(), Some(deadline));
         assert!(!candidate.expired.get());
         assert_eq!(owned(&w.node, a), 1);
-        assert!(w.world.listen(a).is_err());
+        assert!(w.world.listen_address(a).is_err());
         for _ in 0..8 {
             let work = w.poll();
             assert!(
@@ -982,8 +1129,8 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
                 w.poll();
                 assert_eq!(owned(&w.node, a), 0);
                 quiesce(&mut w);
-                drop(w.world.listen(a).unwrap());
-                drop(w.world.listen(b).unwrap());
+                drop(w.world.listen_address(a).unwrap());
+                drop(w.world.listen_address(b).unwrap());
             }
             _ => {
                 config.revision = 4;
@@ -994,8 +1141,8 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
                 w.poll();
                 assert_eq!(owned(&w.node, a), 0);
                 quiesce(&mut w);
-                drop(w.world.listen(a).unwrap());
-                drop(w.world.listen(b).unwrap());
+                drop(w.world.listen_address(a).unwrap());
+                drop(w.world.listen_address(b).unwrap());
             }
         }
         drop((old, candidate));
@@ -1010,7 +1157,7 @@ fn generated_listener_churn_preserves_ownership_and_deadlines() {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+        let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
@@ -1056,7 +1203,7 @@ fn generated_listener_churn_preserves_ownership_and_deadlines() {
             let handler = w.node.servers[&a.into()].handler();
             assert!(handler.current.active.get());
             assert_eq!(handler.draining.len(), generations.len().min(MAX_DRAINING));
-            assert!(w.world.listen(a).is_err());
+            assert!(w.world.listen_address(a).is_err());
             for (i, (g, deadline)) in generations.iter().enumerate() {
                 assert_eq!(g.drain.get(), Some(*deadline));
                 assert_eq!(g.expired.get(), i + MAX_DRAINING < generations.len());
@@ -1074,7 +1221,7 @@ fn generated_listener_churn_preserves_ownership_and_deadlines() {
         assert_eq!(owned(&w.node, a), 0);
         assert!(generations.iter().all(|(g, _)| g.expired.get()));
         quiesce(&mut w);
-        drop(w.world.listen(a).unwrap());
+        drop(w.world.listen_address(a).unwrap());
         drop(generations);
         w.finish();
     }
@@ -1085,7 +1232,7 @@ fn b08_dst_two_worker_unarmed_readd_survives_expiry_then_direct_commit() {
     let updates = Arc::new(Updates::default());
     let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
     let (trust, mut config) = fixture();
-    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -1152,6 +1299,12 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
         let a = "127.0.0.1:18080".parse().unwrap();
         let backend = "127.0.0.1:18082".parse().unwrap();
         let (trust, mut config) = peer_fixture(a, backend);
+        updates.set_credentials(super::tests::tls_provider(
+            &trust.universe,
+            &trust.node,
+            "test-pod",
+        ));
+        node = node.with_peer_ip(a.ip());
         let mut origin = http::Server::new(
             http::Listener::bind_unix(
                 crate::socket::UnixPath::new(&crate::control::tests::test_socket(
@@ -1170,7 +1323,7 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         node.poll(&mut ring, 32).unwrap();
-        let old = node.servers[&a.into()].handler().current.clone();
+        let old = node.servers[&local_key(a)].handler().current.clone();
         let wire = peer_wire(&config, "/held");
         let headers = peer_headers(&wire);
         let headers: Vec<_> = headers
@@ -1178,14 +1331,19 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let fill = ring.pool().stage(Key::new([201; 32])).unwrap();
-        let mut held = client::Connection::new(a, "localhost")
-            .unwrap()
-            .get(
-                client::Request::new("/", &headers).unwrap(),
-                fill,
-                world.now() + Duration::from_secs(10),
-            )
-            .unwrap();
+        let mut held = client::Connection::new_simulated_peer(
+            super::tests::peer_address(a),
+            "localhost",
+            remote_identity(),
+            local_identity(),
+        )
+        .unwrap()
+        .get(
+            client::Request::new("/", &headers).unwrap(),
+            fill,
+            world.now() + Duration::from_secs(10),
+        )
+        .unwrap();
         // Stop backend service only after the real old peer task starts a fault.
         for _ in 0..300 {
             ring.progress().unwrap();
@@ -1196,7 +1354,8 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             ));
             world.advance(Duration::from_millis(1));
             world.run_tasks();
-            if Rc::strong_count(&old) >= 3 && node.servers[&a.into()].connections() == 1 {
+            if Rc::strong_count(&old) >= 3 && node.peer_server.as_ref().unwrap().connections() == 1
+            {
                 break;
             }
         }
@@ -1226,9 +1385,9 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .command(prepare_snapshot(&trust, config.clone()), 2)
             .unwrap();
         node.poll(&mut ring, 32).unwrap();
-        assert_eq!(node.servers[&a.into()].connections(), 1);
-        assert!(!node.servers[&a.into()].handler().current.active.get());
-        let candidate = node.staged.as_ref().unwrap().generations[&a.into()].clone();
+        assert_eq!(node.peer_server.as_ref().unwrap().connections(), 1);
+        assert!(!node.servers[&local_key(a)].handler().current.active.get());
+        let candidate = node.staged.as_ref().unwrap().generations[&local_key(a)].clone();
         assert!(!candidate.active.get());
         // Fresh TCP peers for both identities work during receive-only arm;
         // ordinary ingress still rejects until the activation barrier.
@@ -1246,7 +1405,17 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let mut request = client::Connection::new(a, "localhost")
+            let connection = if headers.is_empty() {
+                client::Connection::new_address(local_key(a), "localhost")
+            } else {
+                client::Connection::new_simulated_peer(
+                    super::tests::peer_address(a),
+                    "localhost",
+                    remote_identity(),
+                    local_identity(),
+                )
+            };
+            let mut request = connection
                 .unwrap()
                 .get(
                     client::Request::new("/", &headers).unwrap(),

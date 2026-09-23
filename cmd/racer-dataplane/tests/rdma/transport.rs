@@ -3,6 +3,42 @@
 
 use super::*;
 
+impl Core {
+    pub(super) fn test_control_completed(&mut self, wc: ffi::Wc) -> io::Result<()> {
+        let i = wc.id as u32 as usize;
+        if self
+            .slots
+            .get(i)
+            .is_none_or(|s| s.send_id != wc.id || wc.id == 0)
+        {
+            return Ok(());
+        }
+        let conn = self.slots[i].conn;
+        if self.connections[conn].failed {
+            return Ok(());
+        }
+        if wc.status != 0 {
+            return self.fail(conn, io::ErrorKind::ConnectionAborted);
+        }
+        let result = if wc.opcode == 2 {
+            let bytes = self.control.bytes(i)[..wc.len as usize].to_vec();
+            self.slots[i].send_id = 0;
+            self.release(i);
+            self.receive_bytes(conn, &bytes)
+        } else {
+            self.sent(conn, wc.id)
+        };
+        let sim = self.simulation.as_mut().unwrap();
+        sim.effected.remove(&wc.id);
+        sim.queued.remove(&wc.id);
+        sim.receives.remove(&wc.id);
+        if result.is_err() {
+            self.fail(conn, io::ErrorKind::ConnectionAborted)?;
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn readiness25_native_blocked_jobs_event_ack_and_context_close() {
     use std::io::Write;
@@ -161,6 +197,9 @@ static void capacity(size_t qps, size_t windows, int delayed) {
 
 int main(void) {
     alarm(15); /* A synchronous-wait regression fails rather than hanging CI. */
+    /* Removed control opcodes reject before touching any device or QP. */
+    assert(racer_post(NULL, NULL, 1, 1, NULL, 0, 0, 0, NULL) == EINVAL);
+    assert(racer_post(NULL, NULL, 2, 1, NULL, 0, 0, 0, NULL) == EINVAL);
     struct ibv_context ctx = {0};
     struct racer_device devices[33] = {0};
     uint32_t partial_qpn;
@@ -390,7 +429,7 @@ pub(crate) fn transport_config(
         qpn: 7,
         ..ffi::Endpoint::default()
     };
-    let mut session = Session::new(
+    let mut session = ConnectionState::new(
         std::ptr::dangling_mut::<u8>().cast(),
         1,
         [1; 16],
@@ -399,6 +438,21 @@ pub(crate) fn transport_config(
     );
     session.peer = [2; 16];
     session.ready = true;
+    let local = Offer {
+        version: 2,
+        fabric: "test".into(),
+        nonce: session.local,
+        challenge: [7; 16],
+        endpoint,
+        rail: 0,
+        rails: 1,
+        reads: 1,
+    };
+    let mut peer = local.clone();
+    peer.nonce = session.peer;
+    let ((offer, channel), _) = crate::negotiation::test_channels(&local, &peer);
+    session.binding = Some(offer.into_parts().1);
+    session.channel = Some(channel);
     core.connections.push(session);
     let transport = Transport {
         owner: Rc::new(RefCell::new(Owner {
@@ -432,14 +486,20 @@ pub(super) fn wc(core: &Core, i: usize) -> ffi::Wc {
 }
 pub(super) fn complete(t: &Transport, i: usize) {
     let now = crate::environment::now();
-    with(t, |c| c.completed(wc(c, i), now).unwrap());
+    with(t, |c| {
+        if c.slots[i].send_id != 0 {
+            c.sent(c.slots[i].conn, c.slots[i].send_id).unwrap();
+        } else {
+            c.completed(wc(c, i), now).unwrap();
+        }
+    });
 }
 
 pub(super) fn wire(t: &Transport, i: usize) -> Vec<u8> {
     with(t, |c| wire_bytes(c, i))
 }
 pub(super) fn wire_bytes(c: &Core, i: usize) -> Vec<u8> {
-    (unsafe { c.control.bytes(i) })[..c.slots[i].wire_len].to_vec()
+    c.control.bytes(i)[..c.slots[i].wire_len].to_vec()
 }
 pub(super) fn deliver(t: &Transport, bytes: &[u8]) {
     with(t, |c| c.receive_bytes(0, bytes).unwrap());
@@ -579,7 +639,8 @@ impl Transport {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, s)| {
-                        (s.wr != 0 && s.opcode == 1).then(|| (s.wr, tests::wire_bytes(c, i)))
+                        (s.send_id != 0 && s.phase != Phase::ControlReceive)
+                            .then(|| (s.send_id, tests::wire_bytes(c, i)))
                     })
                     .collect(),
                 qps: c.connections.iter().filter(|s| !s.qp.is_null()).count(),
@@ -589,13 +650,19 @@ impl Transport {
                 pending: c
                     .slots
                     .iter()
-                    .filter_map(|s| s.send_pending.then_some(s.signed))
+                    .filter_map(|s| s.send_pending.then_some(false))
                     .collect(),
             }
         })
     }
     pub(crate) fn test_inject(&self, bytes: &[u8]) -> io::Result<()> {
-        tests::with(self, |c| c.receive_bytes(0, bytes))
+        tests::with(self, |c| {
+            let result = c.receive_bytes(0, bytes);
+            if result.is_err() {
+                c.fail(0, io::ErrorKind::ConnectionAborted)?;
+            }
+            result
+        })
     }
     pub(crate) fn test_borrow(&self, f: impl FnOnce()) {
         let _owner = self.owner.borrow_mut();
@@ -672,8 +739,12 @@ impl TestQp {
         let mut posts = core
             .slots
             .iter()
-            .filter(|s| s.conn == self.index && s.wr != 0 && s.opcode != 2)
-            .map(|s| self.post_token(core, s.wr))
+            .filter(|s| {
+                s.conn == self.index
+                    && (s.wr != 0 || s.send_id != 0)
+                    && s.phase != Phase::ControlReceive
+            })
+            .map(|s| self.post_token(core, s.wr.max(s.send_id)))
             .collect::<Vec<_>>();
         posts.sort_by_key(|p| p.id);
         posts
@@ -699,7 +770,15 @@ impl TestQp {
         let s = &c.slots[id as u32 as usize];
         TestPost {
             id,
-            opcode: s.opcode,
+            opcode: if s.send_id != 0 {
+                if s.phase == Phase::ControlReceive {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                s.opcode
+            },
             kind: s.frame.kind,
             value: s.frame.value,
             owner: c.simulation.as_ref().unwrap().id,
@@ -733,16 +812,17 @@ impl TestQp {
         };
         let sim = core.simulation.as_ref().unwrap();
         if s.conn != self.index
-            || s.wr != post.id
-            || s.opcode != post.opcode
+            || s.wr.max(s.send_id) != post.id
+            || self.post_token(core, post.id).opcode != post.opcode
             || sim.effected.contains(&post.id)
             || sim.queued.contains(&post.id)
             || core.slots.iter().any(|s| {
                 s.conn == self.index
-                    && s.opcode != 2
-                    && s.wr != 0
-                    && s.wr < post.id
-                    && !sim.effected.contains(&s.wr)
+                    && s.phase != Phase::ControlReceive
+                    && (s.send_id != 0) == (post.opcode == 1)
+                    && s.wr.max(s.send_id) != 0
+                    && s.wr.max(s.send_id) < post.id
+                    && !sim.effected.contains(&s.wr.max(s.send_id))
             })
         {
             return Ok(false);
@@ -752,38 +832,31 @@ impl TestQp {
             1 => {
                 let mut remote_owner = peer.transport.owner.borrow_mut();
                 let remote = remote_owner.core()?;
-                let receive = remote
+                if remote
                     .slots
                     .iter()
-                    .enumerate()
-                    .filter(|(_, s)| {
-                        s.conn == peer.index
-                            && s.opcode == 2
-                            && s.wr != 0
-                            && !remote.simulation.as_ref().unwrap().effected.contains(&s.wr)
-                            && !remote.simulation.as_ref().unwrap().queued.contains(&s.wr)
-                    })
-                    .min_by_key(|(_, s)| s.wr)
-                    .map(|(i, _)| i);
-                let Some(receive) = receive else {
+                    .filter(|s| s.conn == peer.index && s.phase == Phase::ControlReceive)
+                    .count()
+                    >= remote.config.depth * 2
+                {
                     return Ok(false);
-                };
-                let bytes = unsafe { core.control.bytes(i) };
+                }
+                let receive = remote.allocate(peer.index, Phase::ControlReceive)?;
+                remote.wr += 1;
+                remote.slots[receive].send_id = (remote.wr << 32) | receive as u64;
+                let bytes = core.control.bytes(i);
                 let len = core.slots[i].wire_len;
                 if len > CONTROL {
                     return Err(protocol());
                 }
-                // Both transport owners are borrowed through the synchronous copy.
-                // No pointer escapes this effect; WRs keep arenas pinned until CQE
-                // processing or successful QP destruction. Distinct transports own
-                // distinct control arenas, so the ranges cannot overlap.
-                unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), remote.control.pointer(receive), len);
-                }
+                // Model a framed TLS read independently from verbs DMA effects.
+                remote.control.bytes_mut(receive)[..len].copy_from_slice(&bytes[..len]);
                 if let Some(world) = crate::simulation::current() {
                     world.trace_bytes(&bytes[..len]);
                 }
                 let mut wc = tests::wc(remote, receive);
+                wc.id = remote.slots[receive].send_id;
+                wc.opcode = 2;
                 wc.len = len as u32;
                 let sim = remote.simulation.as_mut().unwrap();
                 sim.effected.insert(wc.id);
@@ -869,11 +942,11 @@ impl TestQp {
             return Ok(false);
         }
         let i = post.id as u32 as usize;
-        if core
-            .slots
-            .get(i)
-            .is_none_or(|s| s.wr != post.id || s.conn != self.index || s.opcode != post.opcode)
-        {
+        if core.slots.get(i).is_none_or(|s| {
+            s.wr.max(s.send_id) != post.id
+                || s.conn != self.index
+                || self.post_token(core, post.id).opcode != post.opcode
+        }) {
             return Ok(false);
         }
         let mut wc = core
@@ -885,14 +958,17 @@ impl TestQp {
             .copied()
             .unwrap_or_else(|| tests::wc(core, i));
         wc.status = status;
+        wc.id = post.id;
+        wc.opcode = post.opcode;
         let sim = core.simulation.as_mut().unwrap();
         if (status == 0 && !sim.effected.contains(&post.id))
             || core.slots.iter().any(|s| {
                 s.conn == self.index
-                    && (s.opcode == 2) == (post.opcode == 2)
-                    && s.wr != 0
-                    && s.wr < post.id
-                    && !sim.queued.contains(&s.wr)
+                    && (s.phase == Phase::ControlReceive) == (post.opcode == 2)
+                    && (s.send_id != 0) == matches!(post.opcode, 1 | 2)
+                    && s.wr.max(s.send_id) != 0
+                    && s.wr.max(s.send_id) < post.id
+                    && !sim.queued.contains(&s.wr.max(s.send_id))
             })
             || !sim.queued.insert(post.id)
         {
@@ -969,7 +1045,7 @@ impl Connection {
         tests::with(&self.transport, |core| {
             let frame =
                 crate::negotiation::control_wire::test_grant(core.slots[ticket.index].frame);
-            core.received(0, frame, 15).unwrap();
+            core.received(0, frame, &[0; 8]).unwrap();
         })
     }
 
@@ -1126,7 +1202,7 @@ impl TestObservation {
     fn retained_sends(&self, after: &Self) {
         for (id, bytes) in &self.sends {
             if let Some((_, current)) = after.sends.iter().find(|(wr, _)| wr == id) {
-                assert_eq!(bytes, current, "NIC-owned SEND mutated before retirement");
+                assert_eq!(bytes, current, "queued TLS frame mutated before retirement");
             }
         }
     }
@@ -1134,7 +1210,6 @@ impl TestObservation {
 
 pub(crate) mod rdma_ownership_corpus {
     use super::*;
-    use crate::crypto::auth;
     type Event = (TestQp, TestPost);
     type Reading = Ticket<rdma::Read>;
     fn assert_shutdown(t: &Transport) {
@@ -1169,14 +1244,14 @@ pub(crate) mod rdma_ownership_corpus {
         assert!(pool.stage(Key::new([key; 32])).is_err());
     }
     #[test]
-    fn authenticated_controls_reject_malformed_negative_tamper_replay_and_downgrade() {
-        // Negative semantic attacks are signed by the genuine session. The
-        // remaining cases corrupt each control kind after signing or replay it.
+    fn tls_controls_reject_malformed_correlation_replay_and_foreign_sessions() {
+        // TLS authenticates bytes; the core still rejects malformed semantics,
+        // wrong request descriptors, duplicate replies and foreign sessions.
         for kind in 1..=4 {
-            for attack in 0..25 {
+            for attack in [0, 1, 2, 3, 4, 5, 6, 7, 8, 21, 23, 24] {
                 if (kind == 1 && attack < 8)
                     || (kind == 2 && matches!(attack, 5..=7))
-                    || (kind != 4 && attack == 25)
+                    || (kind == 1 && attack == 24)
                 {
                     continue;
                 }
@@ -1186,13 +1261,8 @@ pub(crate) mod rdma_ownership_corpus {
                 let (sender, _) = p.side(kind % 2 == 0);
                 let (receiver, connection) = p.side(kind % 2 != 0);
                 let mut wire = sender.test_observe().sends[0].1.clone();
-                if (8..21).contains(&attack) {
-                    let offsets = [0, 8, 16, 24, 40, 48, 80, 84, 92, 100, 104, 128];
-                    let offset = offsets.get(attack - 8).copied().unwrap_or(wire.len() - 1);
-                    wire[offset] ^= 1;
-                }
-                if attack == 22 {
-                    wire = wire[16..wire.len() - 96].to_vec();
+                if attack == 8 {
+                    wire[0] ^= 1;
                 }
                 if attack == 23 || attack == 24 {
                     let foreign = Pair::new(1);
@@ -1201,7 +1271,7 @@ pub(crate) mod rdma_ownership_corpus {
                     } else {
                         p.side(kind % 2 == 0)
                     };
-                    t.test_inject(&wire).unwrap();
+                    assert!(t.test_inject(&wire).is_err());
                     assert!(!c.is_healthy());
                     assert!(connection.is_healthy());
                     continue;
@@ -1233,6 +1303,54 @@ pub(crate) mod rdma_ownership_corpus {
         }
     }
     #[test]
+    fn rotation_retry_requires_bound_descriptor_and_no_peer_evidence() {
+        use crate::http_client::attempt::{Cause, PeerEvidence, PeerReason};
+        for attack in 0..9 {
+            let p = Pair::new(1);
+            let mut ticket = p.request(4);
+            p.pump(false, 1);
+            failure_reply(&p.bc);
+            let mut wire = p.b.test_observe().sends[0].1.clone();
+            wire[4] = if attack == 8 { 4 } else { 7 };
+            let mut failure = negative();
+            failure.reason = PeerReason::Unavailable;
+            if attack == 1 {
+                failure.reason = PeerReason::OwnerUnavailable;
+            }
+            if attack == 2 {
+                failure.evidence = Some(PeerEvidence {
+                    endpoint: "127.0.0.1:9443".parse().unwrap(),
+                    transport: crate::http_client::attempt::Transport::Rdma,
+                    phase: crate::http_client::attempt::Phase::Grant,
+                    cause: Cause::Connection,
+                    initiated: true,
+                });
+            }
+            wire[HEADER + 32..].copy_from_slice(&failure.encode());
+            match attack {
+                3 => wire[HEADER] ^= 1,
+                4 => wire[8] ^= 1,
+                5 => wire[31] ^= 1,
+                6 => wire[32] ^= 1,
+                7 => wire[67] ^= 1,
+                _ => (),
+            }
+            if matches!(attack, 0 | 8) {
+                p.a.test_inject(&wire).unwrap();
+                let reply = p.ac.take_reply(&mut ticket).unwrap().unwrap();
+                let actual = match (attack, reply) {
+                    (0, GrantReply::Retry(actual)) | (8, GrantReply::Failure(actual)) => actual,
+                    _ => panic!("retry must remain distinct from ordinary unavailable"),
+                };
+                assert_eq!(actual, failure);
+                assert!(p.ac.is_healthy());
+            } else {
+                assert!(p.a.test_inject(&wire).is_err(), "attack {attack}");
+                assert!(!p.ac.is_healthy());
+            }
+        }
+    }
+    #[test]
     fn dropped_read_releases_storage_after_shutdown_quiescence() {
         let p = Pair::new(1);
         let ticket = p.read();
@@ -1241,6 +1359,101 @@ pub(crate) mod rdma_ownership_corpus {
         drop(ticket);
         p.a.shutdown().unwrap();
         drop(fill(&p.ap, [8; 32]));
+    }
+
+    #[test]
+    fn tls_confirmation_waits_for_write_retirement_without_verbs_controls() {
+        let p = Pair::new(1);
+        let deadline = crate::environment::now() + Duration::from_secs(5);
+        p.bc.begin_confirmation(false, deadline).unwrap();
+        p.ac.begin_confirmation(true, deadline).unwrap();
+        assert!(!p.ac.is_confirmed() && !p.bc.is_confirmed());
+        let confirm = p.effect(false, 1);
+        assert!(!p.bc.is_confirmed());
+        let ack = p.effect(true, 1);
+        assert!(!p.ac.is_confirmed());
+        p.finish(confirm);
+        p.finish(ack);
+        assert!(p.ac.is_confirmed() && p.bc.is_confirmed());
+        for t in [&p.a, &p.b] {
+            with(t, |c| {
+                assert!(
+                    c.simulation
+                        .as_ref()
+                        .unwrap()
+                        .posts
+                        .iter()
+                        .all(|(_, op)| matches!(op, 3..=5))
+                );
+                assert!(c.slots.iter().all(|s| s.wr == 0 && s.send_id == 0));
+            });
+        }
+        p.read_all(p.read());
+    }
+
+    #[test]
+    fn tls_channel_loss_retains_read_and_advertised_dma_until_qp_quiescence() {
+        let p = Pair::new(1);
+        let read = p.read();
+        for t in [&p.a, &p.b] {
+            t.test_block_destroy(true);
+            with(t, |c| c.connections[0].channel.as_mut().unwrap().close());
+        }
+        assert!(!p.ac.is_healthy() && !p.bc.is_healthy());
+        for t in [&p.a, &p.b] {
+            with(t, |c| c.fail(0, io::ErrorKind::ConnectionAborted).unwrap());
+            assert_eq!(t.test_invariants().2, 1);
+            assert!(t.shutdown().is_err());
+        }
+        drop(read);
+        assert_blocked(&p.ap, 9);
+        assert!(p.bp.stage(Key::new([8; 32])).is_err());
+        for t in [&p.a, &p.b] {
+            t.test_block_destroy(false);
+            with(t, |c| c.connections[0].cleanup_after = None);
+            t.shutdown().unwrap();
+        }
+        drop(fill(&p.ap, [8; 32]));
+        drop(fill(&p.bp, [8; 32]));
+    }
+
+    #[test]
+    fn tls_backpressure_is_bounded_and_preserves_fifo_across_reused_slots() {
+        let p = Pair::new(2);
+        let _one = p.request(4);
+        let _two = p.ac.request([8; 32], 4, b"second").unwrap();
+        p.pump(false, 1);
+        p.pump(false, 1);
+        p.b.test_faults(1, false, false, false);
+        failure_reply(&p.bc);
+        failure_reply(&p.bc);
+        for _ in 0..16 {
+            let work = p.b.test_progress(1).unwrap();
+            assert!(
+                !work.runnable,
+                "TLS readiness, not queue pressure, wakes the source"
+            );
+            assert_eq!(p.b.test_observe().pending.len(), 2);
+            assert_eq!(p.b.test_invariants().2, 0);
+        }
+        p.b.test_faults(0, false, false, false);
+        p.progress();
+        let sends = p.b.test_observe().sends;
+        assert_eq!(sends.len(), 2);
+        let mut requests = sends
+            .iter()
+            .map(|(id, bytes)| (*id, Frame::decode(bytes).unwrap().request))
+            .collect::<Vec<_>>();
+        requests.sort();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(_, request)| *request)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        p.pump(true, 1);
+        p.pump(true, 1);
     }
     #[test]
     fn terminal_send_and_advertised_owner_corpus() {
@@ -1291,17 +1504,6 @@ pub(crate) mod rdma_ownership_corpus {
         let o = t.test_observe();
         assert_eq!((o.qps, o.wrs), (0, 0));
     }
-    fn session_pair(a: &Offer, b: &Offer) -> (auth::Session, auth::Session, crypto::Snapshot) {
-        let snapshot = crypto::tests::trust(7).1;
-        let peers = auth::PeerContext::new([1; 32], [2; 32]).unwrap();
-        let duration = Duration::from_secs(30);
-        let (i, hello) =
-            auth::Initiator::start(snapshot.clone(), peers.clone(), Some(a), duration).unwrap();
-        let (r, reply) =
-            auth::Responder::accept(snapshot.clone(), peers, hello, Some(b), duration).unwrap();
-        let (i, finish) = i.finish(reply).unwrap();
-        (i, r.finish(finish).unwrap(), snapshot)
-    }
     #[test]
     fn renewal_and_negative_reuse_corpus() {
         let mut p = Pair::new(1);
@@ -1333,8 +1535,8 @@ pub(crate) mod rdma_ownership_corpus {
             p.ac.disconnect().unwrap();
             p.bc.disconnect().unwrap();
             (p.ac, p.bc) = Pair::connect(&p.a, &p.b);
-            assert_eq!(p.a.test_invariants(), (8, 6, 0));
-            assert_eq!(p.b.test_invariants(), (8, 6, 0));
+            assert_eq!(p.a.test_invariants(), (8, 8, 0));
+            assert_eq!(p.b.test_invariants(), (8, 8, 0));
             for t in [&p.a, &p.b] {
                 let o = t.test_observe();
                 assert_eq!(o.allocated, 8 * (epoch + 2));
@@ -1416,26 +1618,27 @@ pub(crate) mod rdma_ownership_corpus {
             let b = test_transport(&pool);
             let challenge = [if case == 0 { 8 } else { 7 }; 16];
             let bb = b.prepare(challenge, 0, 1).unwrap();
-            let (mut sa, mut sb, snapshot) = session_pair(aa.offer(), bb.offer());
+            let ((oa, sa), (_, mut sb)) = crate::negotiation::test_channels(aa.offer(), bb.offer());
             if case >= 10 {
-                let (mut other, _, _) = session_pair(aa.offer(), bb.offer());
-                other.take_offer(&snapshot).unwrap();
-                sb.take_offer(&snapshot).unwrap();
-                let connected = aa
-                    .connect(sa.take_offer(&snapshot).unwrap().unwrap(), 0)
-                    .unwrap();
+                let ((_, other), _) = crate::negotiation::test_channels(aa.offer(), bb.offer());
+                let connected = aa.connect(oa, 0).unwrap();
                 match case {
                     12 => connected.cancel().unwrap(),
                     13 => a.shutdown().unwrap(),
-                    14 => a.test_inject(b"bad").unwrap(),
+                    14 => {
+                        assert!(a.test_inject(b"bad").is_err());
+                    }
                     _ => (),
                 }
                 let session = match case {
                     10 => other,
-                    11 => sb,
+                    11 => {
+                        sb.close();
+                        sb
+                    }
                     _ => sa,
                 };
-                assert!(connected.authenticate_session(session, snapshot).is_err());
+                assert!(connected.authenticate_channel(session).is_err());
                 if case != 13 {
                     a.test_progress(32).unwrap();
                     retired(&a);
@@ -1449,7 +1652,7 @@ pub(crate) mod rdma_ownership_corpus {
                     3 => aa.cancel().unwrap(),
                     _ => (),
                 }
-                assert!(aa.connect_authenticated(sa, snapshot, 0).is_err());
+                assert!(aa.connect_authenticated(oa, sa, 0).is_err());
                 assert_eq!(a.test_observe().qps, 0);
             } else {
                 match case {
@@ -1476,12 +1679,10 @@ pub(crate) mod rdma_ownership_corpus {
                                 drop(aa);
                             });
                         } else {
-                            let connected = aa
-                                .connect(sa.take_offer(&snapshot).unwrap().unwrap(), 0)
-                                .unwrap();
+                            let connected = aa.connect(oa, 0).unwrap();
                             a.test_borrow(|| drop(connected));
                         }
-                        assert_eq!(a.test_observe().wrs, 8);
+                        assert_eq!(a.test_observe().wrs, 0);
                         assert_eq!(a.test_progress(32).is_err(), fail);
                         if fail {
                             assert!(a.shutdown().is_err());
@@ -1515,8 +1716,8 @@ pub(crate) mod rdma_ownership_corpus {
         let old = a.prepare_for_fabric("old", [7; 16], 0, 1).unwrap();
         let new = a.prepare_for_fabric("new", [7; 16], 0, 1).unwrap();
         assert_eq!((old.offer().fabric(), new.offer().fabric()), ("old", "new"));
-        let (sa, _, snapshot) = session_pair(old.offer(), new.offer());
-        assert!(old.connect_authenticated(sa, snapshot, 0).is_err());
+        let ((offer, channel), _) = crate::negotiation::test_channels(old.offer(), new.offer());
+        assert!(old.connect_authenticated(offer, channel, 0).is_err());
         drop(new);
         assert_eq!(a.prepare([7; 16], 0, 1).unwrap().offer().fabric(), "test");
         for fabric in ["".to_string(), "x".repeat(65536)] {
@@ -1535,7 +1736,7 @@ pub(crate) mod rdma_ownership_corpus {
         bp: WorkerPool,
         a: Transport,
         b: Transport,
-        ac: Connection,
+        pub(crate) ac: Connection,
         pub(crate) bc: Connection,
     }
     impl Pair {
@@ -1623,14 +1824,10 @@ pub(crate) mod rdma_ownership_corpus {
         fn connect(a: &Transport, b: &Transport) -> (Connection, Connection) {
             let aa = a.prepare([7; 16], 0, 1).unwrap();
             let bb = b.prepare([7; 16], 0, 1).unwrap();
-            let (mut sa, mut sb, snapshot) = session_pair(aa.offer(), bb.offer());
-            let ready = sb
-                .sign(&snapshot, auth::Control::new(0, b"Ready".to_vec()).unwrap())
-                .unwrap();
-            sa.verify(&snapshot, ready).unwrap();
+            let ((oa, sa), (ob, sb)) = crate::negotiation::test_channels(aa.offer(), bb.offer());
             (
-                aa.connect_authenticated(sa, snapshot.clone(), 0).unwrap(),
-                bb.connect_authenticated(sb, snapshot, 0).unwrap(),
+                aa.connect_authenticated(oa, sa, 0).unwrap(),
+                bb.connect_authenticated(ob, sb, 0).unwrap(),
             )
         }
         fn qps(&self) -> (TestQp, TestQp) {
@@ -1742,6 +1939,150 @@ pub(crate) mod rdma_ownership_corpus {
             (grant, reply)
         }
     }
+    #[test]
+    fn tls_rotation_stale_rpc_preserves_slow_read_ownership_and_deadlines() {
+        let Some(mut ring) = crate::control::tests::ring() else {
+            return;
+        };
+        for (offload, revoke) in [(false, false), (true, false), (false, true), (true, true)] {
+            let ap = buffers::io_test_pool(1);
+            let bp = buffers::io_test_pool(1);
+            let a = test_transport_config(&ap, 2, 4);
+            let b = test_transport_config(&bp, 2, 4);
+            let aa = a.prepare([7; 16], 0, 1).unwrap();
+            let bb = b.prepare([7; 16], 0, 1).unwrap();
+            let ((oa, sa), (ob, sb)) =
+                crate::negotiation::tests::tls_channels(aa.offer(), bb.offer(), &mut ring, offload);
+            let pair = Pair {
+                ac: aa.connect_authenticated(oa, sa, 0).unwrap(),
+                bc: bb.connect_authenticated(ob, sb, 0).unwrap(),
+                ap,
+                bp,
+                a,
+                b,
+            };
+            let end = crate::environment::now() + Duration::from_secs(5);
+            let drive = |ring: &mut uring::Ring| {
+                assert!(
+                    crate::environment::now() < end,
+                    "TLS rotation controls stalled"
+                );
+                ring.progress().unwrap();
+                for t in [&pair.a, &pair.b] {
+                    with(t, |c| c.poll_channels(ring, 8).unwrap());
+                    t.test_progress(32).unwrap();
+                }
+            };
+            let mut request = pair.request(4);
+            let incoming = loop {
+                drive(&mut ring);
+                if let Some(r) = pair.bc.next_request().unwrap() {
+                    break r;
+                }
+            };
+            pair.bc.respond(incoming, pair.source(4)).unwrap();
+            pair.pump(true, 4);
+            let grant = loop {
+                drive(&mut ring);
+                if let Some(g) = pair.ac.take_grant(&mut request).unwrap() {
+                    break g;
+                }
+            };
+            let mut read = pair.ac.read(grant, pair.fill()).unwrap();
+            let dma = pair.effect(false, 3); // DMA effect, deliberately delayed READ CQE.
+            let deadlines = [&pair.a, &pair.b].map(|t| {
+                with(t, |c| {
+                    c.slots
+                        .iter()
+                        .filter(|s| s.owns_dma())
+                        .map(|s| s.deadline)
+                        .collect::<Vec<_>>()
+                })
+            });
+            assert_eq!(pair.a.test_invariants().2, 1);
+            assert_eq!(pair.b.test_invariants().2, 1);
+            let (descriptor, identity, candidate) = with(&pair.b, |c| {
+                let channel = c.connections[pair.bc.index].channel.as_mut().unwrap();
+                if revoke {
+                    channel.test_revoke();
+                } else {
+                    channel.test_rotate();
+                }
+                channel.test_descriptor()
+            });
+            assert!(pair.bc.key_draining());
+            assert!(!pair.bc.is_drained());
+            assert!(
+                !pair.ac.key_draining(),
+                "peer has not observed local rotation"
+            );
+            let mut stale = pair.ac.request([8; 32], 4, &descriptor).unwrap();
+            let failure = loop {
+                drive(&mut ring);
+                assert!(pair.ac.is_healthy() && pair.bc.is_healthy());
+                assert!(pair.ac.take_read(&mut read).unwrap().is_none());
+                if let Some(reply) = pair.ac.take_reply(&mut stale).unwrap() {
+                    let GrantReply::Retry(failure) = reply else {
+                        panic!("draining peer granted new DMA")
+                    };
+                    break failure;
+                }
+            };
+            assert_eq!(failure.identity, identity);
+            assert_eq!(failure.candidate, candidate);
+            assert_eq!(
+                failure.reason,
+                crate::http_client::attempt::PeerReason::Unavailable
+            );
+            assert_eq!(failure.evidence, None);
+            assert!(pair.bc.next_request().unwrap().is_none());
+            for (t, expected) in [&pair.a, &pair.b].into_iter().zip(deadlines) {
+                assert_eq!(
+                    t.test_invariants().2,
+                    1,
+                    "DMA released before READ retirement"
+                );
+                assert_eq!(
+                    with(t, |c| c
+                        .slots
+                        .iter()
+                        .filter(|s| s.owns_dma())
+                        .map(|s| s.deadline)
+                        .collect::<Vec<_>>()),
+                    expected
+                );
+            }
+            pair.finish(dma);
+            let bytes = loop {
+                drive(&mut ring);
+                if let Some(bytes) = pair.ac.take_read(&mut read).unwrap() {
+                    break bytes;
+                }
+            };
+            assert_eq!(bytes.as_slice(), &[42; 4]);
+            drop(bytes);
+            loop {
+                drive(&mut ring);
+                if pair.qps().1.posts().iter().any(|p| p.opcode == 5) {
+                    break;
+                }
+            }
+            assert_eq!(
+                pair.b.test_invariants().2,
+                1,
+                "source retained until invalidate CQE"
+            );
+            pair.pump(true, 5);
+            assert_eq!(pair.a.test_invariants().2, 0);
+            assert_eq!(pair.b.test_invariants().2, 0);
+            assert!(pair.ac.is_healthy() && pair.bc.is_healthy());
+            assert!(pair.bc.is_drained());
+            pair.a.shutdown().unwrap();
+            pair.b.shutdown().unwrap();
+        }
+        ring.shutdown().unwrap();
+    }
+
     #[test]
     fn readiness25_delayed_destroy_retains_both_dma_owners_and_bounds_admission() {
         use crate::simulation::World;
@@ -2044,13 +2385,17 @@ pub(crate) mod rdma_ownership_corpus {
         {
             let (_a, aa) = pending(&pool);
             let (_b, bb) = pending(&pool);
-            let (sa, sb, snapshot) = session_pair(aa.offer(), bb.offer());
-            let ac = aa.connect_authenticated(sa, snapshot.clone(), 0).unwrap();
-            let bc = bb.connect_authenticated(sb, snapshot, 0).unwrap();
+            let ((oa, sa), (ob, sb)) = crate::negotiation::test_channels(aa.offer(), bb.offer());
+            let ac = aa.connect_authenticated(oa, sa, 0).unwrap();
+            let bc = bb.connect_authenticated(ob, sb, 0).unwrap();
             assert!(ac.is_authenticated());
             assert!(bc.is_authenticated());
             let ticket = ac.request([9; 32], 4, b"descriptor").unwrap();
-            ac.test_pump(&bc, false);
+            let (aq, bq) = (ac.test_endpoint().1, bc.test_endpoint().1);
+            let send = aq.posts()[0];
+            assert!(aq.effect(&bq, send, false).unwrap());
+            assert!(bq.complete(bq.receives()[0], 0).unwrap());
+            bc.transport.test_progress(32).unwrap();
             assert_eq!(
                 bc.respond_error(bc.next_request().unwrap().unwrap(), negative())
                     .is_ok(),
@@ -2071,7 +2416,7 @@ pub(crate) mod rdma_ownership_corpus {
             p.b.test_faults(0, false, false, false);
             let mut pending = p.b.test_observe().pending;
             pending.sort();
-            assert_eq!(pending, [false, true]);
+            assert_eq!(pending, [false, false]);
             if expire {
                 p.b.test_expire();
                 p.progress();
@@ -2171,17 +2516,36 @@ pub(crate) mod rdma_ownership_corpus {
             depth: 2,
             ..Config::default()
         };
-        let (a, _a_source) = Transport::new(&a_pool, rail.clone(), config.clone()).unwrap();
-        let (b, _b_source) = Transport::new(&b_pool, rail, config).unwrap();
-        let p = Pair::from_transports(a_pool, b_pool, a, b);
+        let (a, mut a_source) = Transport::new(&a_pool, rail.clone(), config.clone()).unwrap();
+        let (b, mut b_source) = Transport::new(&b_pool, rail, config).unwrap();
+        let mut a_ring =
+            uring::Ring::http_test_ring(a_pool.clone(), uring::Config::default()).unwrap();
+        let mut b_ring =
+            uring::Ring::http_test_ring(b_pool.clone(), uring::Config::default()).unwrap();
+        let aa = a.prepare([7; 16], 0, 1).unwrap();
+        let bb = b.prepare([7; 16], 0, 1).unwrap();
+        let ((oa, sa), (ob, sb)) =
+            crate::negotiation::tests::tls_channels(aa.offer(), bb.offer(), &mut a_ring, false);
+        let ac = aa.connect_authenticated(oa, sa, 0).unwrap();
+        let bc = bb.connect_authenticated(ob, sb, 0).unwrap();
+        let p = Pair {
+            ap: a_pool,
+            bp: b_pool,
+            a,
+            b,
+            ac,
+            bc,
+        };
         let source = p.source(BUFFER_SIZE);
         let mut request = p.request(BUFFER_SIZE);
         let until = Instant::now() + Duration::from_secs(5);
         let (mut read, mut served) = (None, false);
         loop {
             assert!(Instant::now() < until, "loopback timed out");
-            p.a.test_progress(32).unwrap();
-            p.b.test_progress(32).unwrap();
+            a_ring.progress().unwrap();
+            b_ring.progress().unwrap();
+            uring::CompletionSource::poll(&mut a_source, &mut a_ring, 32).unwrap();
+            uring::CompletionSource::poll(&mut b_source, &mut b_ring, 32).unwrap();
             if !served && let Some(r) = p.bc.next_request().unwrap() {
                 assert_request(&r, BUFFER_SIZE);
                 p.bc.respond(r, source.clone()).unwrap();

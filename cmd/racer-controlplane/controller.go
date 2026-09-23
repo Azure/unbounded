@@ -43,12 +43,11 @@ type reconciler struct {
 	pointers     map[string]*corev1.ConfigMap
 	minInterval  time.Duration
 	lastAttempt  map[string]time.Time
-	reserved     reservedPorts
 	podNamespace string
 	socketRoot   string
 }
 
-func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, reserved reservedPorts, socketRoot string) error {
+func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, socketRoot string) error {
 	for _, object := range []client.Object{&corev1.Node{}} {
 		if err := manager.GetFieldIndexer().IndexField(ctx, object, universeIndex, objectUniverses); err != nil {
 			return err
@@ -57,7 +56,6 @@ func setupController(ctx context.Context, manager ctrl.Manager, server *Server, 
 
 	r := &reconciler{client: manager.GetClient(), store: stateStore{client: manager.GetClient(), namespace: namespace}, server: server, loaded: map[string]*generation{}, pointers: map[string]*corev1.ConfigMap{}}
 	r.minInterval = 2 * time.Second
-	r.reserved = reserved
 	r.podNamespace = namespace
 	r.socketRoot = socketRoot
 	r.lastAttempt = map[string]time.Time{}
@@ -180,6 +178,14 @@ func (r *reconciler) podRequests(ctx context.Context, o client.Object) []reconci
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+	if r.server.pkiReady != nil {
+		select {
+		case <-r.server.pkiReady:
+		default:
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+	}
+
 	name := request.Name
 	if name == "" {
 		return ctrl.Result{}, nil
@@ -242,7 +248,7 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		root = racer.SocketRoot
 	}
 
-	next, err := buildCacheGeneration(name, previous, nodes.Items, pods.Items, caches, r.reserved, root)
+	next, err := buildCacheGeneration(name, previous, nodes.Items, pods.Items, caches, root)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

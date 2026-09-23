@@ -1944,7 +1944,13 @@ impl Cache {
                     return Ok(Step::File(file));
                 }
                 fault.state = Loading::Publishing(lease);
-                return Ok(Step::Pending(runnable()));
+                return Ok(Step::Pending(match ring.slab_deadline() {
+                    Some(deadline) => Work {
+                        runnable: false,
+                        deadline: Some(deadline),
+                    },
+                    None => runnable(),
+                }));
             }
             Loading::File(file) => {
                 if file.info().kind != Kind::Payload || file.info().len != fault.len() {

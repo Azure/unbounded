@@ -20,21 +20,21 @@ import (
 	"github.com/Azure/unbounded/internal/racer"
 )
 
-func TestB06ConfiguredPortsValidation(t *testing.T) {
-	for _, text := range []string{"", "0", "65536", "-1", "+9090", "9090,", ",9090", "9090,9090", "9090, 10000", "metrics", "9090-9091"} {
-		if _, err := parseReservedPorts(text); err == nil {
-			t.Errorf("accepted invalid ports %q", text)
+func TestB06ConfiguredSocketRootValidation(t *testing.T) {
+	for _, text := range []string{"", "relative", "9090", "/bad\x00root"} {
+		if _, _, err := racer.CacheSockets(text, "cache"); err == nil {
+			t.Errorf("accepted invalid socket root %q", text)
 		}
 	}
 
-	for _, text := range []string{"9090", "10000,10001", "1,65535"} {
-		ports, err := parseReservedPorts(text)
+	for _, text := range []string{"/dev/racer", "/run/cache", "/run/9443"} {
+		cache, origin, err := racer.CacheSockets(text, "cache")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if !ports.contains(9090) {
-			t.Fatal("default management reservation lost")
+		if cache != filepath.Join(text, "cache", "cache") || origin != filepath.Join(text, "cache", "origin") {
+			t.Fatal("socket paths do not follow deployment root")
 		}
 	}
 }

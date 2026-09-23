@@ -18,7 +18,7 @@ documentation remain beside the implementation in `src/`.
 | `tests/storage/` | Allocator geometry/pressure, checkpoint recovery, buffer ownership, cache flights and persistence, peer/HTTP metadata |
 | `tests/execution/` | Worker placement, pools, sharding, lifecycle and io_uring ownership |
 | `tests/http/` | Client framing/reuse, server streaming/files, deadlines, scheduling/pressure, handlers, breaker and owner health |
-| `tests/security/` | Crypto ownership, handshake/negotiation, HTTP authentication/replay and signing rotation |
+| `tests/security/` | Checksum ownership, TLS identities/trust/record I/O, negotiation and peer authorization |
 | `tests/control/` | Configuration activation/subscription, routing and topology proofs |
 | `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
 | `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
@@ -61,10 +61,16 @@ cargo test --locked --lib cache::
 cargo test --locked --lib allocator:: -- --test-threads=1
 cargo test --locked --lib sharding::
 cargo test --locked --lib uring::
+cargo test --locked --lib slab_io
 cargo test --locked --lib rdma::
 cargo test --locked --lib crypto::
 cargo test --locked --doc
 ```
+
+`http_server::tests::tls_transport::encrypted_http_kernel_integration` also
+checks limited TLS file responses and exact charged byte counts. Set
+`RACER_REQUIRE_KTLS=1` on an eligible host to require actual kTLS coverage;
+otherwise the encrypted software-TLS path remains covered.
 
 Build identity/CLI tests run for the daemon without kernel or runtime
 configuration prerequisites:
@@ -88,6 +94,15 @@ acks, RDMA window ownership, and quiescence. Cache tests cover sharing, survivin
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
 
 ## Deterministic campaigns
+
+The `slab_io` filter covers configuration rejection, shared fixed-point token
+refill, burst caps, stale worker clocks, byte refunds, interruptible setup waits,
+and creation/recovery/replacement accounting. Its simulated ring tests cover
+cross-worker sharing, timed parking, bounded admission with control capacity,
+cancellation/shutdown ownership, and short splice input-only charging. The
+`uring::tests::kernel_integration` subprocess additionally exercises limited real
+file reads/writes, timed sync admission, and cancellation before submission.
+Use `RACER_REQUIRE_URING=1` with an external timeout to require kernel coverage.
 
 `allocator::layout::tests` covers automatic planning boundaries, 2 TiB/4 TiB
 sparse files with every allocator opened, exact bitmap backing accounting, and
@@ -113,7 +128,11 @@ prepared, renamed, and directory-synced restart boundaries. These test process
 crashes, not power-cut filesystem behavior. Cache DST tests additionally cover
 delayed scrub/read completion ownership and shared-NUMA consumer deadlines;
 the cluster DST harness checks admitted RDMA work drains and the same registered
-transport resumes. Native RDMA resize and full-device multi-TiB load remain
+transport resumes. The TLS peer maintenance fixture checks that admitted pages
+drain, new cold pages receive empty 503 responses without origin execution, and
+service resumes with the peer listener present and credential revision unchanged
+(`tests/runtime/actors.rs:1115-1170`). It uses modeled TLS identities, not native
+TLS record I/O. Native RDMA resize and full-device multi-TiB load remain
 separate hardware validation.
 
 `runtime::storage::memory_tests` covers clean file-cache credit, unreclaimable
@@ -126,16 +145,18 @@ The daemon startup and sharding suites also cover a recorded 64 GiB/2,048-shard
 layout with one worker, unchanged inode, and complete generation authorization,
 while new automatic planning retains its ceilings.
 
-`cmd/racer-controlplane/TestStorageRuntimeSignedResizeRestart` complements these
-fault fixtures with the actual daemon executable and Go signed-policy server.
+`cmd/racer-controlplane/TestStorageRuntimeTLSResizeRestart` complements these
+fault fixtures with the actual daemon executable and Go mTLS subscription server.
 It applies 64MiB -> 20GiB -> 96MiB, verifies fresh inodes and shard changes without
 changing the boot or topology, waits for `/status` and the controller's Node
 annotation to agree, rejects a 5TiB runtime request without losing the old cache,
 and checks invalid/equivalent input. It restarts controller and daemon, first with
 control unavailable and an invalid creation-size environment, then requires fresh
 policy acknowledgment with the same durable policy and published inode. Kubernetes
-and TokenReview are simulated; filesystem, io_uring, signed HTTP and the process
-are real. The separate envtest suites exercise Kubernetes validation and CAS.
+is fake and certificates are fixture-issued; filesystem, io_uring, TLS and the
+process are real. This test does not exercise production enrollment or CA rotation
+(`../racer-controlplane/storage_runtime_test.go:31-110`). The separate envtest suites
+exercise Kubernetes validation and CAS.
 
 From the repository root on a capable Linux host:
 
@@ -178,6 +199,18 @@ the same failure. Dedicated replay tests also check successful schedules.
 
 ## Shared cluster harness and verification
 
+Peer authentication in DST models socket-bound universe/node/Pod identities,
+current membership, and monotonic RDMA control-channel expiry. The wall-step HTTP
+actor rejects a replaced Pod before cache admission, retries the same descriptor
+on a fresh connection after membership restoration, and lets admitted work finish
+within its original deadline (`tests/runtime/actors.rs:894-1078`). Shared-worker
+contracts check common TLS identity, distinct entropy, listener selection and
+incarnation fencing (`tests/support/simulation_contracts.rs:1036-1134`). These
+models do not validate X.509 lifetimes, certificate chains or encrypted records.
+Native TLS fixtures cover those separately, including expired-certificate rejection
+(`tests/security/tls.rs:369`) and real-handshake membership removal
+(`tests/security/http_auth.rs:472`). See the [DST authentication boundary](../../dst/README.md#tls-membership-and-monotonic-channel-expiry).
+
 `runtime::dst::Cluster` runs both generated campaigns and targeted scenarios
 through the production driver, readiness scheduler, and RDMA sources. Boot,
 restart, SQ effects/CQ delivery, resource checks, and teardown are shared.
@@ -192,9 +225,9 @@ The retained scenario families cover:
 | Family | Properties |
 | --- | --- |
 | `conformance::` | Aligned two-page range reads and cache reuse; canonical relay convergence and shared failures |
-| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, signed admission, shared-NUMA worker takeover, strict replay |
+| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, peer admission, shared-NUMA worker takeover, strict replay |
 | `http_auth::attribution::` | Candidate bounds, final-hop evidence, owner/probe recovery, backend pressure, cancellation phases, RDMA renewal and healthy-session reuse |
-| `control::tests::dst_` | Signed controller updates/key overlap and routing-algorithm rollover with fresh RDMA reads |
+| `control::tests::dst_` | Controller updates and routing-algorithm rollover with fresh RDMA reads |
 
 ```sh
 timeout --signal=KILL 90s cargo test --locked --lib runtime::tests::dst:: -- --test-threads=2

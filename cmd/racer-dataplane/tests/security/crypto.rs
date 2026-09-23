@@ -4,7 +4,7 @@
 mod regression_tests {
     use super::*;
     use buffers::Key;
-    use std::sync::atomic::AtomicUsize;
+    use std::{sync::atomic::AtomicUsize, time::Instant};
 
     fn wait(mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -427,15 +427,7 @@ mod regression_tests {
 pub(crate) mod tests {
     use super::*;
     use buffers::Key;
-    pub(crate) fn trust(generation: u64) -> (crate::signing::Keys, Snapshot) {
-        let seed = [generation as u8; 32];
-        let public = ed25519_dalek::SigningKey::from_bytes(&seed)
-            .verifying_key()
-            .to_bytes();
-        let keys = crate::signing::Keys::new(Some(seed), vec![public]).unwrap();
-        let snapshot = Snapshot::signed(UniverseId([8; 32]), keys.clone());
-        (keys, snapshot)
-    }
+    use std::time::Instant;
     fn fill(pool: &buffers::WorkerPool, id: u8, len: usize) -> Fill {
         let mut fill = pool.stage(Key::new([id; 32])).unwrap();
         fill.as_mut_slice()[..len].fill(42);
@@ -450,109 +442,6 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
-    }
-    fn sessions(snapshot: &Snapshot) -> (auth::Session, auth::Session) {
-        let expected = auth::PeerContext::new([1; 32], [2; 32]).unwrap();
-        let (initiator, hello) = auth::Initiator::start(
-            snapshot.clone(),
-            expected.clone(),
-            None,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let (responder, reply) = auth::Responder::accept(
-            snapshot.clone(),
-            expected,
-            hello,
-            None,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let (a, finish) = initiator.finish(reply).unwrap();
-        (a, responder.finish(finish).unwrap())
-    }
-    #[test]
-    fn handshake_and_bidirectional_controls_use_distinct_private_keys() {
-        let snapshot = |local, remote| {
-            let public = ed25519_dalek::SigningKey::from_bytes(&[remote; 32])
-                .verifying_key()
-                .to_bytes();
-            Snapshot::signed(
-                UniverseId::new([8; 32]),
-                crate::signing::Keys::new(Some([local; 32]), vec![public]).unwrap(),
-            )
-        };
-        let a_keys = snapshot(1, 2);
-        let b_keys = snapshot(2, 1);
-        let context = auth::PeerContext::new([1; 32], [2; 32]).unwrap();
-        let (initiator, hello) = auth::Initiator::start(
-            a_keys.clone(),
-            context.clone(),
-            None,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let (responder, reply) =
-            auth::Responder::accept(b_keys.clone(), context, hello, None, Duration::from_secs(1))
-                .unwrap();
-        let (mut a, finish) = initiator.finish(reply).unwrap();
-        let mut b = responder.finish(finish).unwrap();
-        let request = a
-            .sign(&a_keys, auth::Control::new(1, b"request".to_vec()).unwrap())
-            .unwrap();
-        assert_eq!(b.verify(&b_keys, request).unwrap().body(), b"request");
-        let response = b
-            .sign(&b_keys, auth::Control::new(1, b"reply".to_vec()).unwrap())
-            .unwrap();
-        assert_eq!(a.verify(&a_keys, response).unwrap().body(), b"reply");
-    }
-    #[test]
-    fn handshake_and_control_reject_tamper_replay_reflection_and_key_change() {
-        let (_, snapshot) = trust(1);
-        let (mut a, mut b) = sessions(&snapshot);
-        let signed = a
-            .sign(
-                &snapshot,
-                auth::Control::new(17, b"rkey,descriptor,length".to_vec()).unwrap(),
-            )
-            .unwrap();
-        let original = signed.encode().to_vec();
-        let mut tampered = original.clone();
-        tampered[8] ^= 1;
-        assert!(
-            b.verify(&snapshot, auth::SignedControl::decode(&tampered).unwrap())
-                .is_err()
-        );
-        assert!(
-            a.verify(&snapshot, auth::SignedControl::decode(&original).unwrap())
-                .is_err()
-        );
-        let verified = b.verify(&snapshot, signed).unwrap();
-        assert_eq!(verified.request_id(), 17);
-        assert_eq!(verified.body(), b"rkey,descriptor,length");
-        assert!(
-            b.verify(&snapshot, auth::SignedControl::decode(&original).unwrap())
-                .is_err()
-        );
-        let (_, mut another) = sessions(&snapshot);
-        assert!(
-            another
-                .verify(&snapshot, auth::SignedControl::decode(&original).unwrap())
-                .is_err()
-        );
-        let (_, updated) = trust(2);
-        assert!(
-            a.sign(&updated, auth::Control::new(1, vec![]).unwrap())
-                .is_err()
-        );
-        let expected = auth::PeerContext::new([1; 32], [2; 32]).unwrap();
-        let (initiator, hello) =
-            auth::Initiator::start(snapshot.clone(), expected, None, Duration::from_secs(1))
-                .unwrap();
-        let wrong = auth::PeerContext::new([2; 32], [1; 32]).unwrap();
-        let (_, reply) =
-            auth::Responder::accept(snapshot, wrong, hello, None, Duration::from_secs(1)).unwrap();
-        assert!(initiator.finish(reply).is_err());
     }
     #[test]
     fn offload_full_payload_atomic_checksum_and_backpressure() {

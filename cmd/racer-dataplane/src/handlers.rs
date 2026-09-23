@@ -300,11 +300,14 @@ impl Peer {
 
 #[cfg(test)]
 pub(crate) fn simulation_target(wire: &str) -> String {
-    routed_descriptor(&unhex(wire).unwrap())
-        .unwrap()
-        .1
-        .target()
-        .to_owned()
+    unhex(wire)
+        .ok()
+        .and_then(|bytes| {
+            routed_descriptor(&bytes)
+                .ok()
+                .map(|(_, d)| d.target().to_owned())
+        })
+        .unwrap_or_default()
 }
 /// Runtime uses this solely to select a retained immutable generation. Full
 /// target/path validation happens before creating any cache fault.
@@ -319,6 +322,7 @@ pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 3
 
 /// Concrete worker-local upstream provider used by the handler's affine tasks.
 pub struct Provider {
+    volume: Option<String>,
     metrics: crate::metrics::Local,
     authentication: Option<crate::http_auth::Policy>,
     max_attempts: u32,
@@ -417,7 +421,6 @@ pub enum Exchange {
         UpstreamRequest,
         crate::breaker::Permit,
         Option<Attempt>,
-        Option<crate::http_auth::Pending>,
     ),
     Grant {
         attempt: Option<Attempt>,
@@ -454,6 +457,7 @@ pub enum Exchange {
 impl Provider {
     fn new(backend: Backend) -> Self {
         Self {
+            volume: None,
             metrics: crate::metrics::Local::default(),
             authentication: None,
             max_attempts: 3,
@@ -609,21 +613,13 @@ impl Provider {
         let bytes = self.budget_wire(&request, service_end)?;
         let wire = hex(&bytes);
         let mut headers = vec![("X-Racer-Fault".to_owned(), wire.as_bytes().to_vec())];
+        if let Some(volume) = &self.volume {
+            headers.push(("X-Racer-Volume".into(), volume.as_bytes().to_vec()));
+        }
         let mut nonce = [0; 16];
         crate::environment::random(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
         let context = format!("{}{}", hex(blake3::hash(&bytes).as_bytes()), hex(&nonce));
         headers.push(("X-Racer-Attempt".to_owned(), context.as_bytes().to_vec()));
-        let policy = self
-            .authentication
-            .as_ref()
-            .ok_or_else(|| invalid("missing peer authentication policy"))?;
-        let peer = self
-            .selected
-            .as_ref()
-            .ok_or_else(|| invalid("missing peer identity"))?
-            .parse::<crate::peer_identity::NodeId>()?
-            .bytes();
-        let authentication = Some(policy.request(peer, "GET", "/", &mut headers)?);
         let mut attempt = if let Some(mut inherited) = inherited {
             inherited.route.context = context.clone();
             Some(inherited)
@@ -751,6 +747,7 @@ impl Provider {
                 Some(destination) => HttpGet::Payload(
                     connection
                         .get(request_wire, destination, service_end.min(deadline))?
+                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),
@@ -761,17 +758,12 @@ impl Provider {
                             cache::METADATA_SIZE,
                             service_end.min(deadline),
                         )?
+                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),
             };
-            Ok(Exchange::Get(
-                get,
-                request,
-                permit.take().unwrap(),
-                attempt,
-                authentication,
-            ))
+            Ok(Exchange::Get(get, request, permit.take().unwrap(), attempt))
         })();
         if let Err(error) = &result {
             HttpOrigin::error(permit.take().unwrap(), error, true);
@@ -1100,7 +1092,6 @@ impl Upstream for Provider {
                     request,
                     permit.take().unwrap(),
                     None,
-                    None,
                 ))
             }
             _ => unreachable!(),
@@ -1163,7 +1154,7 @@ impl Upstream for Provider {
                 }
                 result
             }
-            Exchange::Get(mut exchange, request, permit, mut attempt, mut authentication) => {
+            Exchange::Get(mut exchange, request, permit, mut attempt) => {
                 let mut permit = Some(permit);
                 let peer = matches!(
                     request,
@@ -1185,30 +1176,10 @@ impl Upstream for Provider {
                     }
                 })? {
                     Progress::Pending(work) => pending(
-                        Exchange::Get(
-                            exchange,
-                            request,
-                            permit.take().unwrap(),
-                            attempt.take(),
-                            authentication.take(),
-                        ),
+                        Exchange::Get(exchange, request, permit.take().unwrap(), attempt.take()),
                         work,
                     ),
                     Progress::Ready(mut response) => {
-                        if peer {
-                            if let Some(authentication) = &authentication {
-                                authentication.verify(
-                                    &self.authentication.as_ref().unwrap().keys,
-                                    response.status(),
-                                    response
-                                        .content_length()
-                                        .ok_or_else(|| invalid("missing peer length"))?,
-                                    response.headers(),
-                                )?;
-                            } else {
-                                return Err(invalid("missing peer authentication context").into());
-                            }
-                        }
                         if peer && response.status() != 200 {
                             if text(response.headers(), "x-racer-failure")?.is_some() {
                                 let a = attempt
@@ -1371,7 +1342,12 @@ impl Upstream for Provider {
                         deadline: Some(deadline),
                     },
                 ),
-                Ok(Some(rdma::GrantReply::Failure(failure))) => {
+                Ok(Some(reply @ (rdma::GrantReply::Failure(_) | rdma::GrantReply::Retry(_)))) => {
+                    let (failure, retry) = match reply {
+                        rdma::GrantReply::Failure(failure) => (failure, false),
+                        rdma::GrantReply::Retry(failure) => (failure, true),
+                        _ => unreachable!(),
+                    };
                     let valid = attempt.as_ref().map_or(
                         failure.identity == [0; 32]
                             && failure.candidate == 0
@@ -1384,6 +1360,18 @@ impl Upstream for Provider {
                     if !valid {
                         let _ = connection.disconnect();
                         return Ok(self.rdma_failed(request, permit, attempt, &connection));
+                    }
+                    if retry {
+                        // The authenticated, descriptor-bound rotation response is
+                        // not owner failure. Cache recovery retains the original
+                        // candidate deadline and reacquires private storage.
+                        drop((permit, ticket, destination));
+                        if let Some(peer) = &mut self.peer {
+                            peer.http.retire_idle();
+                        }
+                        return Ok(ExchangeProgress::RetryPeer {
+                            exchange: Exchange::RecoverHttp(request, attempt),
+                        });
                     }
                     permit.success();
                     self.reported(failure, &mut attempt)?;
@@ -1507,6 +1495,24 @@ impl Handler {
     pub fn set_authentication(&mut self, policy: crate::http_auth::Policy) {
         self.upstream.authentication = Some(policy);
     }
+    pub(crate) fn set_peer_tls(
+        &mut self,
+        volume: &str,
+        provider: Arc<crate::control::credentials::Provider>,
+        identities: &BTreeMap<String, crate::tls::PeerIdentity>,
+    ) {
+        self.upstream.volume = Some(volume.to_owned());
+        if let (Some(id), Some(peer)) = (&self.upstream.selected, &mut self.upstream.peer)
+            && let Some(identity) = identities.get(id)
+        {
+            peer.http.set_tls(provider.clone(), identity.clone());
+        }
+        for (id, peer) in &mut self.upstream.peers {
+            if let Some(identity) = identities.get(id) {
+                peer.http.set_tls(provider.clone(), identity.clone());
+            }
+        }
+    }
     pub(crate) fn reject(&mut self, request: http::Request, status: u16) -> Task {
         let mut task = <Self as http::Handler>::start(self, request);
         task.fault = None;
@@ -1609,7 +1615,6 @@ impl Handler {
     pub(crate) fn test_authentication(&mut self, node: u8, peers: &[u8], selected: Option<u8>) {
         let (trust, _) = crate::control::tests::fixture();
         self.set_authentication(crate::http_auth::Policy {
-            keys: trust.keys,
             universe: trust.universe,
             node: [node; 32],
             peers: peers.iter().map(|peer| [*peer; 32]).collect(),
@@ -1773,6 +1778,14 @@ impl Handler {
     }
     /// Bounded round-robin disk and inbound RDMA service, even with no HTTP tasks.
     pub fn poll_background(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
+        for peer in self
+            .upstream
+            .peers
+            .values_mut()
+            .chain(self.upstream.peer.iter_mut())
+        {
+            peer.http.maintain();
+        }
         let mut cache = self.cache.borrow_mut();
         cache.set_namespace(self.namespace);
         cache.set_crypto(self.crypto.clone());
@@ -1962,7 +1975,6 @@ pub struct Task {
     // Includes streaming gaps with resolved metadata but no current Fault.
     // Rejected maintenance requests never acquire a cache-use guard.
     _cache_use: Option<Rc<()>>,
-    authentication: Option<(crate::http_auth::Incoming, crate::signing::Keys)>,
     route: Option<Rc<RefCell<RouteState>>>,
     response: Response,
     metadata: Option<Metadata>,
@@ -1987,16 +1999,7 @@ impl Task {
         else {
             return Err(invalid("response already started"));
         };
-        let signature = self
-            .authentication
-            .as_ref()
-            .map(|(incoming, keys)| incoming.response(keys, status, len, headers))
-            .transpose()?;
-        let mut headers = headers.to_vec();
-        if let Some(signature) = &signature {
-            headers.push(("X-Racer-Signature", signature.as_bytes()));
-        }
-        let head = http::ResponseHead::new(status, Some(len), &headers)?;
+        let head = http::ResponseHead::new(status, Some(len), headers)?;
         self.response = match request {
             http::Request::Get(request) => Response::Headers(request.respond(head)?),
             http::Request::Head(request) => Response::Head(request.respond(head)?),
@@ -2101,7 +2104,6 @@ impl http::Handler for Handler {
         let response_deadline = request.response_deadline();
         let mut task = Task {
             _cache_use: (!self.maintenance).then(|| cache.use_guard()),
-            authentication: None,
             route: None,
             response: Response::Request(request),
             metadata: None,
@@ -2140,20 +2142,14 @@ impl http::Handler for Handler {
                     .authentication
                     .as_ref()
                     .ok_or_else(|| invalid("missing peer authentication policy"))?;
-                let incoming = policy.receive("GET", request.target(), request.headers())?;
-                task.authentication = Some((incoming, policy.keys.clone()));
+                match request.peer_identity() {
+                    Some(identity) => policy.authorize(identity)?,
+                    None => return Err(invalid("peer request requires mutual TLS").into()),
+                }
                 let bytes = unhex(wire)?;
                 let (cursor, descriptor) = routed_descriptor(&bytes)?;
                 task.deadline = remote_deadline(&bytes, deadline)?;
                 task.route = self.route_state(cursor, descriptor.target(), true)?;
-                if let Some((incoming, _)) = &task.authentication {
-                    if let Err(error) = incoming.accept_once() {
-                        if error.kind() == io::ErrorKind::WouldBlock {
-                            return Ok(Initial::Rejected(error.into()));
-                        }
-                        return Err(error.into());
-                    }
-                }
                 if self.maintenance {
                     return Err(cache::busy("storage maintenance"));
                 }

@@ -307,6 +307,7 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/metrics.rs"));
 
 /// Fixed worker slots. Registration happens once, inside the pinned factory.
 pub struct Registry {
+    slab_io: crate::slab_io::Io,
     lifecycle: Option<Arc<crate::lifecycle::Lifecycle>>,
     workers: Vec<OnceLock<Arc<Snapshot>>>,
     updates: Arc<crate::control::Updates>,
@@ -314,6 +315,7 @@ pub struct Registry {
 impl Registry {
     pub fn new(workers: usize, updates: Arc<crate::control::Updates>) -> Self {
         Self {
+            slab_io: crate::slab_io::Io::default(),
             lifecycle: None,
             workers: (0..workers).map(|_| OnceLock::new()).collect(),
             updates,
@@ -321,6 +323,10 @@ impl Registry {
     }
     pub fn with_lifecycle(mut self, lifecycle: Arc<crate::lifecycle::Lifecycle>) -> Self {
         self.lifecycle = Some(lifecycle);
+        self
+    }
+    pub fn with_slab_io(mut self, io: crate::slab_io::Io) -> Self {
+        self.slab_io = io;
         self
     }
     fn status(&self) -> serde_json::Value {
@@ -352,6 +358,7 @@ impl Registry {
             }
         }
         let mut out = String::with_capacity(4096);
+        self.slab_io.render(&mut out);
         let storage = self.updates.storage_policy_status();
         for (name, help, value) in [
             (
@@ -430,7 +437,51 @@ impl Registry {
             }
         }
         writeln!(out, "# HELP racer_dataplane_disk_cache_evictions_total Payload items evicted to make room for new cache fills, counted when removed even if the fill later fails. Excludes metadata, replacement, invalidation and corruption cleanup.\n# TYPE racer_dataplane_disk_cache_evictions_total counter\nracer_dataplane_disk_cache_evictions_total {}", totals[DISK_CACHE_EVICTIONS]).unwrap();
-        crate::http_auth::replay::render(&mut out);
+        let tls = crate::tls::global_counters();
+        for (name, help, value) in [
+            (
+                "tls_handshakes_total",
+                "Completed authenticated TLS handshakes.",
+                tls.handshakes,
+            ),
+            (
+                "tls_ktls_tx_connections_total",
+                "Connections with confirmed kernel TLS transmit offload.",
+                tls.ktls_tx_connections,
+            ),
+            (
+                "tls_ktls_rx_connections_total",
+                "Connections with confirmed kernel TLS receive offload.",
+                tls.ktls_rx_connections,
+            ),
+            (
+                "tls_encrypted_fallback_connections_total",
+                "Connections using encrypted userspace transmit records.",
+                tls.encrypted_fallback_connections,
+            ),
+            (
+                "tls_tx_bytes_total",
+                "Plaintext bytes encrypted by TLS for transmission.",
+                tls.tx_bytes,
+            ),
+            (
+                "tls_rx_bytes_total",
+                "Authenticated plaintext bytes received through TLS.",
+                tls.rx_bytes,
+            ),
+            (
+                "tls_sendfile_bytes_total",
+                "File bytes sent with confirmed kernel TLS offload.",
+                tls.sendfile_bytes,
+            ),
+            (
+                "tls_fallback_sendfile_bytes_total",
+                "File bytes sent using bounded encrypted userspace fallback.",
+                tls.fallback_sendfile_bytes,
+            ),
+        ] {
+            writeln!(out, "# HELP racer_dataplane_{name} {help}\n# TYPE racer_dataplane_{name} counter\nracer_dataplane_{name} {value}").unwrap();
+        }
         writeln!(out, "# HELP racer_dataplane_allocator_payload_rejections_total Rejected insert_payload attempts by local capacity check; retries count again. Excludes invalid input and quarantined allocators; filesystem_headroom includes failed filesystem capacity queries.\n# TYPE racer_dataplane_allocator_payload_rejections_total counter").unwrap();
         for (index, reason) in ["pending_limit", "filesystem_headroom", "extent_unavailable"]
             .iter()

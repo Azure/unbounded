@@ -274,7 +274,7 @@ func TestSiteDepartureDeliversV2RemovalUntilDeletion(t *testing.T) {
 			}
 
 			var snapshot pb.Snapshot
-			if err := proto.Unmarshal(command.Configuration.GetSigned().Snapshot, &snapshot); err != nil {
+			if err := proto.Unmarshal(configurationSnapshot(t, command.Configuration), &snapshot); err != nil {
 				t.Fatal(err)
 			}
 
@@ -283,7 +283,7 @@ func TestSiteDepartureDeliversV2RemovalUntilDeletion(t *testing.T) {
 			}
 
 			// A controller restart must recover the historical authorization.
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			r = newTestReconciler(f.api)
 
 			r.server = f.s

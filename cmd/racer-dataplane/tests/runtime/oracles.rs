@@ -102,7 +102,12 @@ impl Placement {
         let workers = local.keys().map(|&node| (node, node)).collect();
         let endpoints = local
             .keys()
-            .map(|&node| (format!("127.0.0.1:{}", 10000 + node).parse().unwrap(), node))
+            .map(|&node| {
+                (
+                    SocketAddr::from(([127, 65, (node >> 8) as u8, (node + 1) as u8], 9443)),
+                    node,
+                )
+            })
             .collect();
         Self {
             slots,
@@ -501,13 +506,13 @@ fn independent_scope_rejects_wrong_routes_transports_origins_and_missing_witness
             "route",
             "source=4 owner=3 attempt=0 position=0 origin=true",
         ),
-        event(4, "transport-http", "endpoint=127.0.0.1:10000"),
+        event(4, "transport-http", "endpoint=127.65.0.1:9443"),
         event(
             0,
             "route",
             "source=4 owner=3 attempt=0 position=1 origin=false",
         ),
-        event(4, "transport-rdma", "endpoint=127.0.0.1:10000"),
+        event(4, "transport-rdma", "endpoint=127.65.0.1:9443"),
     ];
     let hits = vec![(0, target.clone())];
     let check = |events: &[Event], hits: &[(usize, String)], attempts: &[u32]| {
@@ -528,7 +533,7 @@ fn independent_scope_rejects_wrong_routes_transports_origins_and_missing_witness
     }
     for index in [1, 3] {
         let mut bad = events.clone();
-        bad[index].detail = "endpoint=127.0.0.1:10004".into();
+        bad[index].detail = "endpoint=127.65.0.5:9443".into();
         rejects(&bad, &hits, &[0]);
     }
     rejects(&events, &[(4, target.clone())], &[0]);

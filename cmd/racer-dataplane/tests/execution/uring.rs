@@ -5,6 +5,8 @@ use super::*;
 
 #[path = "../storage/http_io_pressure.rs"]
 mod http_io_pressure;
+#[path = "../storage/slab_io_ring.rs"]
+mod slab_io_ring;
 use crate::buffers::{self, Key};
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -15,6 +17,8 @@ fn fill(pool: &WorkerPool, key: u8) -> Fill {
 }
 fn request(resource: Resource, opcode: u8, abandoned: bool) -> Request {
     Request {
+        slab_pending: None,
+        slab_charge: None,
         metric_traffic: None,
         _keepalive: None,
         resource,
@@ -830,7 +834,8 @@ fn kernel_child() {
     let name = std::ffi::CString::new("racer-uring-test").unwrap();
     let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     assert!(raw >= 0);
-    let disk = File::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    let disk = File::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        .with_slab_io(crate::slab_io::Io::testing(20, 1, false));
     let mut write = ring
         .write(
             disk.clone().into(),
@@ -856,6 +861,7 @@ fn kernel_child() {
             true
         })
     });
+    slab_io_ring::kernel_wait_and_cancel(&mut ring);
 
     // Dropped tickets retain storage until the target CQE, not cancel ack.
     let mut pending = ring

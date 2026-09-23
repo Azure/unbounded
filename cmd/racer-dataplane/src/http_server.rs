@@ -208,6 +208,9 @@ impl Control {
 /// Worker-local listener. One outstanding accept; dropping cancels it even under
 /// SQ pressure. Bind the same volume address on each worker using SO_REUSEPORT.
 pub struct Listener {
+    tls_expiry: u64,
+    tls_revision: u64,
+    tls: Option<(crate::tls::TlsContext, crate::tls::ExpectedPeer)>,
     file: File,
     address: crate::socket::Address,
     shared: Option<std::sync::Arc<crate::socket_listener::SharedUnix>>,
@@ -235,6 +238,9 @@ impl Listener {
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {
             return Ok(Self {
+                tls: None,
+                tls_revision: 0,
+                tls_expiry: u64::MAX,
                 file: File::simulated(world.listen(address)?),
                 address: address.into(),
                 shared: None,
@@ -311,6 +317,9 @@ impl Listener {
         let listener = TcpListener::from(fd);
         let address = listener.local_addr()?;
         Ok(Self {
+            tls: None,
+            tls_revision: 0,
+            tls_expiry: u64::MAX,
             file: File::new(listener.into()),
             address: address.into(),
             shared: None,
@@ -331,6 +340,9 @@ impl Listener {
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {
             return Ok(Self {
+                tls: None,
+                tls_revision: 0,
+                tls_expiry: u64::MAX,
                 file: File::simulated(world.listen_address(crate::socket::Address::Unix(path))?),
                 address: crate::socket::Address::Unix(path),
                 shared: None,
@@ -343,6 +355,9 @@ impl Listener {
         }
         let shared = crate::socket_listener::SharedUnix::bind(path)?;
         Ok(Self {
+            tls: None,
+            tls_revision: 0,
+            tls_expiry: u64::MAX,
             file: File::new(shared.descriptor()?),
             address: crate::socket::Address::Unix(path),
             shared: Some(shared),
@@ -352,6 +367,23 @@ impl Listener {
             pressure_failures: 0,
             accepted: None,
         })
+    }
+    pub fn set_tls(&mut self, context: crate::tls::TlsContext, expected: crate::tls::ExpectedPeer) {
+        self.tls = Some((context, expected));
+    }
+    #[cfg(test)]
+    fn set_simulated_tls(&mut self, identity: crate::tls::PeerIdentity) {
+        let world = crate::simulation::current().unwrap();
+        world.tls_listener(self.file.simulation_id().unwrap(), identity);
+        world.tls_credentials(
+            self.file.simulation_id().unwrap(),
+            self.tls_revision,
+            self.tls_expiry,
+        );
+        self.tls = None;
+    }
+    pub(crate) fn set_tls_revision(&mut self, revision: u64) {
+        self.tls_revision = revision;
     }
 
     pub fn poll_accept(
@@ -379,9 +411,37 @@ impl Listener {
                     self.retry_at = Some(after);
                     return Ok(pending(false, Some(after)));
                 };
+                let file = self.accepted.take().unwrap();
+                let mut tls = self
+                    .tls
+                    .as_ref()
+                    .map(|(context, expected)| {
+                        crate::http_client::TlsChannel::new(
+                            file.clone(),
+                            context,
+                            expected.clone(),
+                            true,
+                        )
+                    })
+                    .transpose()?;
+                if self.tls_revision != 0 {
+                    if let Some(tls) = &mut tls {
+                        tls.set_revision(self.tls_revision);
+                        tls.set_expiry(self.tls_expiry);
+                    }
+                }
                 return Ok(Progress::Ready(Connection {
+                    #[cfg(test)]
+                    simulated_tls: crate::simulation::current().and_then(|world| {
+                        file.simulation_id().and_then(|fd| world.tls_session(fd))
+                    }),
+                    #[cfg(test)]
+                    simulated_identity: crate::simulation::current()
+                        .and_then(|world| file.simulation_id().and_then(|fd| world.tls_peer(fd))),
+                    tls,
+                    transferred: false,
                     control: Rc::new(Control {
-                        file: self.accepted.take().unwrap(),
+                        file,
                         closed: Cell::new(false),
                         unix: matches!(self.address, crate::socket::Address::Unix(_)),
                     }),
@@ -450,6 +510,12 @@ impl Listener {
 /// Affine idle connection. Its two scratch allocations are reused across requests.
 #[must_use]
 pub struct Connection {
+    #[cfg(test)]
+    simulated_tls: Option<crate::tls::SimulatedSession>,
+    #[cfg(test)]
+    simulated_identity: Option<crate::tls::PeerIdentity>,
+    tls: Option<crate::http_client::TlsChannel>,
+    transferred: bool,
     // The registration also retains this lease for ring-owned IO after drop.
     admission: Rc<crate::uring::Inbound>,
     control: Rc<Control>,
@@ -461,10 +527,34 @@ pub struct Connection {
 }
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.control.close();
+        if !self.transferred {
+            self.control.close();
+        }
     }
 }
 impl Connection {
+    #[cfg(test)]
+    pub(crate) fn simulated_tls(&self) -> crate::tls::SimulatedSession {
+        self.simulated_tls.unwrap()
+    }
+    pub fn peer_identity(&self) -> Option<&crate::tls::PeerIdentity> {
+        #[cfg(test)]
+        if self.simulated_identity.is_some() {
+            return self.simulated_identity.as_ref();
+        }
+        self.tls.as_ref().and_then(|tls| tls.peer_identity())
+    }
+    pub fn into_tls_channel(mut self) -> io::Result<crate::http_client::TlsChannel> {
+        if self.used != 0 {
+            return Err(protocol("unconsumed HTTP bytes at TLS channel takeover"));
+        }
+        let tls = self
+            .tls
+            .take()
+            .ok_or_else(|| invalid("connection is not TLS"))?;
+        self.transferred = true;
+        Ok(tls)
+    }
     pub fn connection_id(&self) -> ConnectionId {
         ConnectionId(self.control.clone())
     }
@@ -634,6 +724,20 @@ impl ReceivingRequest {
             .as_mut()
             .ok_or_else(|| invalid("receive already finished"))?;
         c.check(ring, self.deadline)?;
+        #[cfg(test)]
+        if c.simulated_tls
+            .is_some_and(|tls| tls.admission.expired(u64::MAX))
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        if let Some(tls) = &mut c.tls {
+            if tls.expired() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if let Progress::Pending(work) = tls.handshake(ring, self.deadline)? {
+                return Ok(Progress::Pending(work));
+            }
+        }
         if let Some(after) = self.retry_at {
             if crate::environment::now() < after {
                 return Ok(pending(false, Some(after.min(self.deadline))));
@@ -713,6 +817,22 @@ impl ReceivingRequest {
                     }
                 }
             }
+            if let Some(tls) = &mut c.tls {
+                match tls.poll_read(
+                    ring,
+                    &mut c.input.as_mut().unwrap()[c.used..],
+                    self.deadline,
+                )? {
+                    Progress::Pending(work) => return Ok(Progress::Pending(work)),
+                    Progress::Ready(n) => {
+                        c.used += transfer(n, SCRATCH_SIZE - c.used)?;
+                        if let Some(timeout) = self.first_byte_timeout.take() {
+                            self.deadline = crate::environment::now() + timeout;
+                        }
+                        continue;
+                    }
+                }
+            }
             let bytes = c.input.take().unwrap();
             match ring.recv_bytes_range(
                 c.fixed.as_ref().unwrap().clone().into(),
@@ -775,6 +895,12 @@ pub enum Request {
     Head(HeadRequest),
 }
 impl Request {
+    pub fn peer_identity(&self) -> Option<&crate::tls::PeerIdentity> {
+        match self {
+            Self::Get(r) => r.0.connection.peer_identity(),
+            Self::Head(r) => r.0.connection.peer_identity(),
+        }
+    }
     pub(crate) fn set_metric_traffic(&mut self, traffic: crate::metrics::Traffic) {
         match self {
             Self::Get(r) => r.0.metric_traffic = Some(traffic),
@@ -1098,6 +1224,20 @@ impl HeaderSend {
             if self.sent == r.header_len {
                 return Ok(Progress::Ready(self.response.take().unwrap()));
             }
+            if let Some(tls) = &mut r.connection.tls {
+                match tls.poll_write(
+                    ring,
+                    &r.connection.output.as_ref().unwrap()[self.sent..r.header_len],
+                    r.deadline.get(),
+                )? {
+                    Progress::Pending(work) => return Ok(Progress::Pending(work)),
+                    Progress::Ready(n) => {
+                        self.sent += transfer(n, r.header_len - self.sent)?;
+                        r.deadline.sent()?;
+                        continue;
+                    }
+                }
+            }
             if let Some(t) = &mut self.ticket {
                 let Some(c) = ring.take_bytes(t)? else {
                     return Ok(pending(false, Some(r.deadline.get())));
@@ -1185,6 +1325,9 @@ impl BodyWriter {
             });
         }
         Ok(SendingBody {
+            tls_read: None,
+            tls_bytes: None,
+            tls_file: None,
             response: Some(self.0),
             chunk: Some(chunk),
             ticket: None,
@@ -1198,6 +1341,10 @@ impl BodyWriter {
 /// Sends a chunk, handles short transfers, and drains notifications as needed.
 #[must_use]
 pub struct SendingBody {
+    tls_read: Option<Ticket<Bytes>>,
+    tls_bytes: Option<(Box<[u8]>, std::ops::Range<usize>)>,
+    // Retain the same descriptor across OpenSSL WANT retries.
+    tls_file: Option<File>,
     small: Option<Ticket<Bytes>>,
     buffered: Option<Ticket<crate::uring::Write>>,
     response: Option<Response>,
@@ -1233,6 +1380,9 @@ impl SendingBody {
             self.file_owner.take();
             self.small.take();
             self.buffered.take();
+            self.tls_read.take();
+            self.tls_bytes.take();
+            self.tls_file.take();
         }
         result
     }
@@ -1307,6 +1457,86 @@ impl SendingBody {
                 return Ok(pending(false, Some(r.deadline.get())));
             }
             let chunk = self.chunk.as_ref().unwrap();
+            if let Some(tls) = &mut r.connection.tls {
+                let progress = match &chunk.buffer {
+                    crate::cache::CachedValue::Metadata(record) => tls.poll_write(
+                        ring,
+                        &record.to_bytes()[chunk.range.clone()],
+                        r.deadline.get(),
+                    )?,
+                    crate::cache::CachedValue::Buffer(buffer) => tls.poll_write(
+                        ring,
+                        &buffer.as_slice()[chunk.range.clone()],
+                        r.deadline.get(),
+                    )?,
+                    crate::cache::CachedValue::File(value) => {
+                        if self.tls_file.is_none() {
+                            let mut source = crate::allocator::FileSource::new(value)?;
+                            self.tls_file = Some(source.descriptor(value)?);
+                        }
+                        if !tls.ktls_tx() {
+                            if let Some(ticket) = &mut self.tls_read {
+                                let Some(done) = ring.take_bytes(ticket)? else {
+                                    return Ok(pending(false, Some(r.deadline.get())));
+                                };
+                                let len = transfer(done.result?, chunk.range.len().min(64 * 1024))?;
+                                self.tls_read = None;
+                                self.tls_bytes = Some((done.resource, 0..len));
+                            }
+                            if self.tls_bytes.is_none() {
+                                match ring.read_bytes(
+                                    self.tls_file.as_ref().unwrap().clone().into(),
+                                    vec![0; chunk.range.len().min(64 * 1024)].into_boxed_slice(),
+                                    value.offset() + chunk.range.start as u64,
+                                ) {
+                                    Ok(ticket) => {
+                                        ring.retain(&ticket, Rc::new(value.clone()));
+                                        self.tls_read = Some(ticket.cancel_on_drop());
+                                        return Ok(pending(false, Some(r.deadline.get())));
+                                    }
+                                    Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {
+                                        return Ok(pending(true, Some(r.deadline.get())));
+                                    }
+                                    Err(e) => return Err(e.error),
+                                }
+                            }
+                            let (bytes, range) = self.tls_bytes.as_mut().unwrap();
+                            let progress =
+                                tls.poll_write(ring, &bytes[range.clone()], r.deadline.get())?;
+                            if let Progress::Ready(n) = progress {
+                                tls.record_fallback_sendfile_bytes(n);
+                                range.start += n;
+                                if range.start == range.end {
+                                    self.tls_bytes = None;
+                                }
+                            }
+                            progress
+                        } else {
+                            tls.poll_sendfile(
+                                ring,
+                                self.tls_file.as_ref().unwrap(),
+                                value.offset() + chunk.range.start as u64,
+                                chunk.range.len(),
+                                r.deadline.get(),
+                            )?
+                        }
+                    }
+                };
+                match progress {
+                    Progress::Pending(work) => return Ok(Progress::Pending(work)),
+                    Progress::Ready(n) => {
+                        let chunk = self.chunk.as_mut().unwrap();
+                        let n = transfer(n, chunk.range.len())?;
+                        chunk.range.start += n;
+                        r.remaining -= n as u64;
+                        r.deadline.sent()?;
+                        if chunk.range.is_empty() {
+                            self.chunk = None;
+                        }
+                        continue;
+                    }
+                }
+            }
             if let crate::cache::CachedValue::Metadata(record) = &chunk.buffer {
                 match ring.send_bytes_range(
                     r.connection.fixed.as_ref().unwrap().clone().into(),
@@ -1482,6 +1712,10 @@ pub struct Completed {
     identity: Rc<()>,
 }
 impl Completed {
+    /// Transfer the socket while retaining this request's completion identity.
+    pub fn take_connection(&mut self) -> Option<Connection> {
+        self.connection.take()
+    }
     pub fn recycle(self) -> Option<Connection> {
         self.connection
     }
@@ -1529,6 +1763,7 @@ impl Default for Config {
 }
 
 struct Slot<T> {
+    tls_retire: Option<Instant>,
     control: Rc<Control>,
     receiving: Option<ReceivingRequest>,
     task: Option<T>,
@@ -1552,6 +1787,7 @@ impl<T> Slot<T> {
             receiving.first_byte_timeout = Some(config.request_timeout);
         }
         Ok(Self {
+            tls_retire: None,
             control,
             receiving: Some(receiving),
             task: None,
@@ -1585,6 +1821,10 @@ pub struct Server<H: Handler> {
     work: Work,
 }
 impl<H: Handler> Server<H> {
+    #[cfg(test)]
+    pub(crate) fn install_simulated_tls(&mut self, identity: crate::tls::PeerIdentity) {
+        self.listener.as_mut().unwrap().set_simulated_tls(identity);
+    }
     pub fn new(listener: Listener, handler: H, config: Config) -> Self {
         Self {
             listener: Some(listener),
@@ -1600,6 +1840,28 @@ impl<H: Handler> Server<H> {
     }
     pub fn handler(&self) -> &H {
         &self.handler
+    }
+    pub(crate) fn install_tls(
+        &mut self,
+        context: crate::tls::TlsContext,
+        expected: crate::tls::ExpectedPeer,
+        revision: u64,
+        expiry: u64,
+    ) {
+        if let Some(listener) = &mut self.listener {
+            if listener.tls_revision != revision {
+                let retire = crate::environment::now() + Duration::from_secs(30);
+                for slot in &mut self.slots {
+                    // Bound old-context admission even when the remote peer has
+                    // not renewed its own leaf. Later rotations cannot extend it.
+                    slot.tls_retire.get_or_insert(retire);
+                }
+                self.sweep_left = 0;
+            }
+            listener.set_tls(context, expected);
+            listener.set_tls_revision(revision);
+            listener.tls_expiry = expiry;
+        }
     }
     pub fn handler_mut(&mut self) -> &mut H {
         &mut self.handler
@@ -1676,11 +1938,22 @@ impl<H: Handler> Server<H> {
                 match result {
                     Ok(SlotProgress::Pending(w)) => {
                         merge(&mut self.work, w);
+                        if slot.task.is_none() {
+                            merge(
+                                &mut self.work,
+                                Work {
+                                    runnable: false,
+                                    deadline: slot.tls_retire,
+                                },
+                            );
+                        }
                         self.slots.push_back(slot);
                     }
                     Ok(SlotProgress::Complete(c)) => {
                         if let Some(connection) = c.recycle().filter(|_| self.listener.is_some()) {
-                            self.slots.push_back(Slot::new(connection, &self.config)?);
+                            let mut next = Slot::new(connection, &self.config)?;
+                            next.tls_retire = slot.tls_retire;
+                            self.slots.push_back(next);
                         }
                         // Revisit admission/newly recycled work before sleeping.
                         self.work.runnable = true;
@@ -1710,6 +1983,12 @@ impl<H: Handler> Server<H> {
                 .map_or(slot.deadline, Deadline::get),
         )?;
         if let Some(receiving) = &mut slot.receiving {
+            if slot
+                .tls_retire
+                .is_some_and(|at| crate::environment::now() >= at)
+            {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
             let progress = receiving.poll(ring, 1)?;
             slot.deadline = receiving.deadline;
             match progress {
@@ -1895,6 +2174,10 @@ fn split_byte(bytes: &[u8], byte: u8) -> Option<(&[u8], &[u8])> {
 
 #[cfg(test)]
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/http/server.rs"));
+
+#[cfg(test)]
+#[path = "../tests/http/simulated_tls.rs"]
+mod simulated_tls_tests;
 
 #[cfg(test)]
 include!(concat!(

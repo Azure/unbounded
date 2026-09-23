@@ -29,5 +29,5 @@ LABEL org.opencontainers.image.licenses="Apache-2.0" \
 COPY --from=builder /src/bin/racer-controlplane /racer-controlplane
 RUN ln -s /racer-controlplane /usr/local/bin/racer-controlplane
 COPY LICENSE NOTICE /unbounded/licenses/
-EXPOSE 8080 8081
+EXPOSE 8081 8443 8444 8445 8446
 ENTRYPOINT ["/racer-controlplane"]

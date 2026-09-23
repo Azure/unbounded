@@ -453,8 +453,9 @@ func TestTokenReviewConfiguration(t *testing.T) {
 }
 
 // Count actual TokenReview HTTP POSTs through the real client and its 20/30
-// limiter. Heartbeat time is deterministic; rollout signing/barriers are real.
-func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
+// limiter. TLS-authenticated heartbeats must never reach that API, even when
+// bearer credentials change or the selected Pod is replaced.
+func TestPhase4TLSAvoidsTokenReviewAndChecksSelection(t *testing.T) {
 	var (
 		posts               atomic.Int32
 		apiFailure, invalid atomic.Bool
@@ -524,7 +525,7 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &Server{controlStore: store, reviewClient: reviewer, signer: testSigner(t, 7)}
+	s := &Server{controlStore: store, reviewClient: reviewer}
 	if err := s.install(index); err != nil {
 		t.Fatal(err)
 	}
@@ -538,10 +539,11 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 	call := func(phase uint32, want int) {
 		t.Helper()
 
-		req := httptest.NewRequest("GET", "/v2/"+identity("universe", "default")+"/"+node, nil)
+		req := httptest.NewRequest("GET", "/v3/"+identity("universe", "default")+"/"+node, nil)
 		req.SetPathValue("universe", identity("universe", "default"))
 		req.SetPathValue("node", node)
 		req.Header.Set("Authorization", "Bearer "+token)
+		controlTLS(req, "pod-uid")
 		req.Header.Set("X-Racer-Boot", strings.Repeat("ab", 32))
 		req.Header.Set("X-Racer-Profile", "1")
 		req.Header.Set("X-Racer-Phase", fmt.Sprint(phase))
@@ -555,16 +557,9 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 		}
 
 		if want == 200 {
-			var (
-				signed  pb.SignedControlCommand
-				command pb.ControlCommand
-			)
+			var command pb.ControlCommand
 
-			if err := proto.Unmarshal(w.Body.Bytes(), &signed); err != nil {
-				t.Fatal(err)
-			}
-
-			if err := proto.Unmarshal(signed.Command, &command); err != nil {
+			if err := proto.Unmarshal(w.Body.Bytes(), &command); err != nil {
 				t.Fatal(err)
 			}
 
@@ -585,14 +580,14 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 		now = now.Add(250 * time.Millisecond)
 	}
 
-	if posts.Load() != 4 {
-		t.Fatalf("84 heartbeats over 20s made %d POSTs, want 4", posts.Load())
+	if posts.Load() != 0 {
+		t.Fatalf("84 mTLS heartbeats made %d TokenReview POSTs, want 0", posts.Load())
 	}
 
 	if ack := s.rollouts["default"].acks[node]; ack.phase != 4 || time.Since(ack.seen) >= 15*time.Second {
 		t.Fatal("phase heartbeat lost")
 	}
-	// Warm the entry at the new time, then commit a replacement Pod selection.
+	// Refresh the heartbeat, then commit a replacement Pod selection.
 	call(4, 200)
 
 	oldPosts := posts.Load()
@@ -613,20 +608,20 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 	call(4, 403)
 
 	if posts.Load() != oldPosts {
-		t.Fatal("selection check did not use cached identity")
+		t.Fatal("selection check did not use TLS identity")
 	}
-	// New credential and review failures are not confused with selection denial.
+	// Bearer credential changes and review failures cannot affect TLS selection.
 	token = testCredential(now.Add(time.Hour), "rotated")
 
 	apiFailure.Store(true)
-	call(4, 503)
-	call(4, 503)
+	call(4, 403)
+	call(4, 403)
 	apiFailure.Store(false)
 	invalid.Store(true)
 	call(4, 403)
 	call(4, 403)
 
-	if posts.Load() != oldPosts+4 {
-		t.Fatal("failure or invalid result cached")
+	if posts.Load() != oldPosts {
+		t.Fatal("mTLS heartbeat consulted TokenReview")
 	}
 }

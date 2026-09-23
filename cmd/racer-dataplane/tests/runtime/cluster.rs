@@ -26,6 +26,14 @@ const POOL_SLOTS: usize = 48;
 const RDMA_QPS: usize = 32;
 const RDMA_DEPTH: usize = 2;
 const RING_SLOTS: u32 = 256;
+
+fn cache_address(node: usize) -> Address {
+    Address::unix(&crate::control::tests::test_socket(
+        address(node, false),
+        "cache",
+    ))
+    .unwrap()
+}
 #[path = "actors.rs"]
 mod actors;
 #[path = "oracles.rs"]
@@ -1332,7 +1340,7 @@ fn coordinated_retirement_under_continuous_http_load() {
         for (node, machine) in cluster.machines.iter_mut().enumerate() {
             let volumes = &machine.driver.application().volumes;
             old.push(
-                volumes.servers[&address(node, false).into()]
+                volumes.servers[&cache_address(node)]
                     .handler()
                     .current
                     .clone(),
@@ -1529,6 +1537,10 @@ enum PhasePolicy {
     #[default]
     Fixed,
     Permuted,
+}
+
+pub(crate) fn simulated_peer_address(node: usize) -> SocketAddr {
+    SocketAddr::from(([127, 65, (node >> 8) as u8, (node + 1) as u8], 9443))
 }
 
 pub(crate) struct Cluster {
@@ -1766,7 +1778,6 @@ impl Cluster {
             let trust = crate::control::Trust {
                 node: identity(node),
                 universe: base_trust.universe,
-                keys: base_trust.keys.clone(),
             };
             config.node = trust.node.to_vec();
             config.fabric = "invariant-dst".into();
@@ -1779,12 +1790,12 @@ impl Cluster {
             for &peer in neighbors.union(&incoming[node]).filter(|n| **n != node) {
                 config.peers.push(proto::Peer {
                     id: id(peer),
+                    pod_uid: format!("pod-{peer}"),
                     http_address: address(peer, false).to_string(),
                     fabric: config.fabric.clone(),
                 });
             }
             let volume = &mut config.volumes[0];
-            volume.peer_listen = address(node, false).to_string();
             volume.cache_socket = crate::control::tests::test_socket(address(node, false), "cache");
             volume.origin_socket =
                 crate::control::tests::test_socket(address(node, true), "origin");
@@ -1888,7 +1899,7 @@ impl Cluster {
         for (n, m) in s.machines.iter_mut().enumerate() {
             let v = &m.driver.application_mut().volumes;
             assert_eq!(
-                v.servers[&address(n, false).into()]
+                v.servers[&cache_address(n)]
                     .handler()
                     .current
                     ._config
@@ -1919,7 +1930,7 @@ impl Cluster {
     }
     fn boot_machine_with_disk_size(
         node: usize,
-        config: proto::Snapshot,
+        mut config: proto::Snapshot,
         disk: Disk,
         format: bool,
         rdma: bool,
@@ -1955,6 +1966,44 @@ impl Cluster {
         let (mut trust, _) = fixture();
         trust.node = config.node.as_slice().try_into().unwrap();
         let updates = Arc::new(Updates::default());
+        crate::control::tests::scope_peers(&mut config);
+        for peer in &mut config.peers {
+            let id: NodeId = peer.id.parse().unwrap();
+            let remote = if scenario.is_some() {
+                (id.bytes()[0] - 10) as usize
+            } else {
+                u64::from_le_bytes(id.bytes()[..8].try_into().unwrap()) as usize
+            };
+            peer.http_address = simulated_peer_address(remote).to_string();
+        }
+        for volume in &mut config.volumes {
+            if let Some(endpoints) = &mut volume.peer_endpoints {
+                for endpoint in &mut endpoints.peers {
+                    if endpoint.http_address.is_empty() {
+                        continue;
+                    }
+                    let id: NodeId = endpoint.peer.parse().unwrap();
+                    let remote = if scenario.is_some() {
+                        (id.bytes()[0] - 10) as usize
+                    } else {
+                        u64::from_le_bytes(id.bytes()[..8].try_into().unwrap()) as usize
+                    };
+                    endpoint.http_address = simulated_peer_address(remote).to_string();
+                }
+            }
+        }
+        updates.set_credentials(super::tests::tls_provider(
+            &config.universe,
+            &config.node,
+            &format!(
+                "pod-{}",
+                if scenario.is_some() {
+                    (config.node[0] - 10) as usize
+                } else {
+                    u64::from_le_bytes(config.node[..8].try_into().unwrap()) as usize
+                }
+            ),
+        ));
         updates.subscribe(ring.wake_handle());
         updates
             .publish(if scenario.is_some() {
@@ -1985,7 +2034,8 @@ impl Cluster {
             updates,
             crypto,
             if scenario.is_some() { node } else { 0 },
-        );
+        )
+        .with_peer_ip(simulated_peer_address(node).ip());
         if !transports.is_empty() {
             volumes = volumes.with_rdma(Some(
                 negotiation::Rails::new(
@@ -2153,8 +2203,7 @@ impl Cluster {
             Action::Reload(node) | Action::Topology(node) => {
                 let _scope = self.world.scoped_node(Some(node));
                 let machine = &mut self.machines[node];
-                let old = machine.driver.application().volumes.servers
-                    [&address(node, false).into()]
+                let old = machine.driver.application().volumes.servers[&cache_address(node)]
                     .handler()
                     .current
                     .clone();
@@ -2178,7 +2227,7 @@ impl Cluster {
                 for _ in 0..100 {
                     self.turn();
                     if self.machines[node].driver.application().volumes.servers
-                        [&address(node, false).into()]
+                        [&cache_address(node)]
                         .handler()
                         .current
                         ._config
@@ -2190,7 +2239,7 @@ impl Cluster {
                     }
                 }
                 let current = self.machines[node].driver.application().volumes.servers
-                    [&address(node, false).into()]
+                    [&cache_address(node)]
                     .handler()
                     .current
                     .clone();
@@ -2268,7 +2317,7 @@ impl Cluster {
                 self.fault_targets.insert(target.clone());
                 let gate = self.world.gate(Gate::new(
                     source,
-                    address(destination, false),
+                    simulated_peer_address(destination),
                     &target,
                     self.gate_phase,
                     errno,
@@ -2564,7 +2613,7 @@ impl Cluster {
                         break;
                     }
                     if let Some(close) =
-                        negotiation::gate(post, Some((*node, address(*peer_node, false))))
+                        negotiation::gate(post, Some((*node, simulated_peer_address(*peer_node))))
                     {
                         if close {
                             qp.disconnect().unwrap();
@@ -2697,7 +2746,9 @@ impl Cluster {
                     .http_exchanges
                     .entry((
                         event.node.unwrap(),
-                        endpoint.port() as usize - 10000,
+                        (0..self.machines.len())
+                            .find(|&n| simulated_peer_address(n) == endpoint)
+                            .expect("known peer exchange endpoint"),
                         event.kind == "http-payload-exchange",
                     ))
                     .or_default() += 1;
@@ -2725,7 +2776,9 @@ impl Cluster {
                     .unwrap()
                     .parse()
                     .unwrap();
-                let destination = endpoint.port() as usize - 10000;
+                let destination = (0..self.machines.len())
+                    .find(|&n| simulated_peer_address(n) == endpoint)
+                    .expect("known peer endpoint");
                 let count = self.machines.len();
                 let mut degree = 1;
                 while degree * degree * degree < count {
@@ -2940,7 +2993,7 @@ impl Cluster {
             let _scope = self.world.scoped_node(Some(source));
             let driver = &mut self.machines[source].driver;
             let app = driver.application_mut();
-            let generation = &app.volumes.servers[&address(source, false).into()]
+            let generation = &app.volumes.servers[&cache_address(source)]
                 .handler()
                 .current;
             let peer = NodeId::from_bytes(&identity(destination))
@@ -2963,7 +3016,7 @@ impl Cluster {
                     .into_iter()
                     .all(|(node, peer, outbound)| {
                         let generation = &self.machines[node].driver.application().volumes.servers
-                            [&address(node, false).into()]
+                            [&cache_address(node)]
                             .handler()
                             .current;
                         generation

@@ -203,12 +203,16 @@ impl Manager {
         {
             return Err(unavailable());
         }
-        let context = Rc::new(negotiation::Context::new(
-            self.context.prepared().clone(),
-            self.context.volume_id(),
-            hint.shard,
-            ROUTING,
-        )?);
+        let context = Rc::new(
+            negotiation::Context::new(
+                self.context.prepared().clone(),
+                self.context.volume_id(),
+                hint.shard,
+                ROUTING,
+            )?
+            .with_credentials(self.context.credentials())
+            .with_authority(self.context.authority()),
+        );
         let server = negotiation::Server::new(context, self.rails.clone(), 1, NEGOTIATION_TIMEOUT)?;
         let server = Rc::new(RefCell::new(match replacement {
             Some(old) => server.replacing(old),
@@ -231,17 +235,25 @@ impl Manager {
     ) -> io::Result<()> {
         // An old Finish may complete on its original TCP, but cannot install a
         // stale session, even into a newer handler with the same peer identity.
-        if !generation.active.get()
+        if generation.expired.get()
+            || generation.drain.get().is_some()
             || !Arc::ptr_eq(established.context.prepared(), &generation._config)
         {
             return Err(unavailable());
         }
-        if self.live.len() >= 2 * MAX_PATHS
-            || self.live.iter().any(|p| {
+        let predecessors: Vec<_> = self
+            .live
+            .iter()
+            .filter(|p| {
                 p.outbound.is_none() == outbound.is_none()
                     && p.peer == established.peer
                     && p.context.shard() == established.context.shard()
             })
+            .collect();
+        // One draining predecessor may coexist with its authenticated replacement.
+        if self.live.len() >= 4 * MAX_PATHS
+            || predecessors.len() >= 2
+            || predecessors.iter().any(|p| !p.connection.key_draining())
         {
             return Err(unavailable());
         }
@@ -277,17 +289,30 @@ impl Manager {
         let mut work = uring::Work::default();
         let mut i = 0;
         while i < self.live.len() {
+            let replaced = self.live[i].connection.is_drained()
+                && self.live.iter().enumerate().any(|(other, replacement)| {
+                    other != i
+                        && replacement.peer == self.live[i].peer
+                        && replacement.outbound == self.live[i].outbound
+                        && replacement.context.shard() == self.live[i].context.shard()
+                        && replacement.connection.is_healthy()
+                        && replacement.connection.is_confirmed()
+                        && !replacement.connection.key_draining()
+                });
             let live = &mut self.live[i];
             if live.connection.is_confirmed() {
                 live.confirmation = None;
             }
-            if !live.connection.is_healthy() || live.confirmation.is_some_and(|d| now >= d) {
+            if replaced
+                || !live.connection.is_healthy()
+                || live.confirmation.is_some_and(|d| now >= d)
+            {
                 let live = self.live.swap_remove(i);
                 let _ = live.connection.disconnect();
                 generation.handlers[live.handler]
                     .borrow_mut()
                     .remove_connection(&live.connection);
-                if let Some(i) = live.outbound {
+                if let Some(i) = live.outbound.filter(|_| !replaced) {
                     self.outbound[i].retry.fail(now);
                 }
             } else {
@@ -303,7 +328,11 @@ impl Manager {
                 self.outbound[i].client = None;
                 continue;
             }
-            if self.live.iter().any(|p| p.outbound == Some(i)) {
+            if self
+                .live
+                .iter()
+                .any(|p| p.outbound == Some(i) && !p.connection.key_draining())
+            {
                 continue;
             }
             let path = &mut self.outbound[i];
@@ -335,7 +364,11 @@ impl Manager {
                     }
                 }
             }
-            if self.outbound[i].client.is_none() && !self.live.iter().any(|p| p.outbound == Some(i))
+            if self.outbound[i].client.is_none()
+                && !self
+                    .live
+                    .iter()
+                    .any(|p| p.outbound == Some(i) && !p.connection.key_draining())
             {
                 work.merge(uring::Work {
                     runnable: false,
@@ -379,6 +412,7 @@ impl Manager {
 }
 
 struct Generation {
+    volume: String,
     handlers: Vec<Rc<RefCell<Handler>>>,
     _config: Arc<Prepared>,
     manager: Option<RefCell<Manager>>,
@@ -446,6 +480,89 @@ pub struct VolumeHandler {
     current: Rc<Generation>,
     draining: Vec<Rc<Generation>>,
 }
+struct PeerHandler {
+    config: Option<Arc<Prepared>>,
+    volumes: BTreeMap<String, VolumeHandler>,
+}
+struct PeerTask(io::Result<(String, Task)>);
+impl http::Handler for PeerHandler {
+    type Task = PeerTask;
+    fn start(&mut self, request: http::Request) -> PeerTask {
+        PeerTask((|| {
+            let identity = request.peer_identity().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::PermissionDenied, "peer TLS identity missing")
+            })?;
+            let config = self.config.as_ref().ok_or_else(unavailable)?;
+            if identity.universe != hex_identity(&config.config.universe)
+                || !config
+                    .config
+                    .peers
+                    .iter()
+                    .any(|peer| peer.id == identity.node && peer.pod_uid == identity.pod_uid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer no longer in current topology",
+                ));
+            }
+            let volume = request
+                .headers()
+                .get("x-racer-volume")
+                .ok_or_else(unavailable)?;
+            let volume = std::str::from_utf8(volume)
+                .map_err(io::Error::other)?
+                .to_owned();
+            if !config
+                .volumes
+                .iter()
+                .any(|v| v.config.id == volume && v.peers.contains_key(&identity.node))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer removed from volume topology",
+                ));
+            }
+            let handler = self.volumes.get_mut(&volume).ok_or_else(unavailable)?;
+            if !negotiation::is_negotiation(request.headers())
+                && matches!(
+                    crate::handlers::routing_identity(request.headers()),
+                    Ok(None)
+                )
+            {
+                let data = handler.current.handlers[0].clone();
+                let task = data.borrow_mut().reject(request, 409);
+                return Ok((
+                    volume,
+                    Task {
+                        generation: handler.current.clone(),
+                        kind: TaskKind::Data(data, task),
+                    },
+                ));
+            }
+            Ok((volume, handler.start(request)))
+        })())
+    }
+    fn poll(
+        &mut self,
+        task: &mut PeerTask,
+        ring: &mut uring::Ring,
+        budget: usize,
+    ) -> io::Result<Progress<http::Completed>> {
+        let (_, task) = task
+            .0
+            .as_mut()
+            .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+        VolumeHandler {
+            local: false,
+            current: task.generation.clone(),
+            draining: Vec::new(),
+        }
+        .poll(task, ring, budget)
+    }
+}
+fn hex_identity(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 pub struct Task {
     generation: Rc<Generation>,
     kind: TaskKind,
@@ -482,7 +599,7 @@ impl VolumeHandler {
             }
             let server = match server {
                 Some(server) => server,
-                None if self.current.active.get() && !hint.is_finish => self
+                None if !self.current.expired.get() && !hint.is_finish => self
                     .current
                     .manager
                     .as_ref()
@@ -504,13 +621,12 @@ impl VolumeHandler {
         ring: &mut uring::Ring,
         budget: usize,
     ) -> io::Result<uring::Work> {
-        // The TCP peer server owns background polling for the shared generation.
+        // The local listener owns background polling for generations shared with
+        // the dedicated TLS peer dispatcher, including retired listeners.
         let mut work = uring::Work::default();
-        if !self.local {
-            work.merge(self.current.poll(ring, budget)?);
-            for generation in &self.draining {
-                work.merge(generation.poll(ring, budget)?);
-            }
+        work.merge(self.current.poll(ring, budget)?);
+        for generation in &self.draining {
+            work.merge(generation.poll(ring, budget)?);
         }
         self.draining.retain(|g| !g.expired.get());
         Ok(work)
@@ -526,6 +642,18 @@ impl VolumeHandler {
 impl http::Handler for VolumeHandler {
     type Task = Task;
     fn start(&mut self, request: http::Request) -> Task {
+        // Ordinary ingress never admits peer protocol without authenticated TLS.
+        if request.peer_identity().is_none()
+            && (request.headers().get("x-racer-fault").is_some()
+                || negotiation::is_negotiation(request.headers()))
+        {
+            let handler = self.current.handlers[0].clone();
+            let task = handler.borrow_mut().reject(request, 403);
+            return Task {
+                generation: self.current.clone(),
+                kind: TaskKind::Data(handler, task),
+            };
+        }
         if !self.local && negotiation::is_negotiation(request.headers()) {
             return self.negotiation(request);
         }
@@ -602,52 +730,30 @@ impl http::Handler for VolumeHandler {
 impl Volumes {
     // Validate the entire candidate before any bind/crypto attachment. A listener
     // already accepts kernel traffic while merely staged, so rollback after a
-    // conflicting bind would be too late. Only exact active/retired keys permit
-    // socket reuse; aliases of those keys are not reusable socket identities.
+    // conflicting bind would be too late. Exact active/retired paths reuse the
+    // existing server, preserving accepted work and generation deadlines.
     fn validate_listeners(&self, config: &Prepared) -> io::Result<()> {
         for (index, volume) in config.volumes.iter().enumerate() {
-            for address in [
-                Address::Tcp(volume.address),
-                Address::Unix(volume.cache_socket),
-            ] {
-                let conflict = config.volumes[..index]
-                    .iter()
-                    .flat_map(|v| {
-                        [
-                            (Address::Tcp(v.address), "candidate"),
-                            (Address::Unix(v.cache_socket), "candidate"),
-                        ]
-                    })
-                    .chain(
-                        self.servers
-                            .keys()
-                            .filter(|&&a| a != address)
-                            .map(|&a| (a, "active")),
-                    )
-                    .chain(
-                        self.retired
-                            .keys()
-                            .filter(|&&a| a != address)
-                            .map(|&a| (a, "retired")),
-                    )
-                    // An unarmed stage owns its sockets until abort/supersession.
-                    // It cannot be overwritten by another preparation, even at an
-                    // exact key: prepare only reuses active/retired servers.
-                    .chain(
-                        self.staged
-                            .iter()
-                            .flat_map(|s| s.listeners.keys().map(|&a| (a, "staged"))),
-                    )
-                    .find(|&(other, _)| address.overlaps(other));
-                if let Some((other, state)) = conflict {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!(
-                            "volume {} listener {address} overlaps {state} listener {other}",
-                            volume.config.id
-                        ),
-                    ));
-                }
+            let address = Address::Unix(volume.cache_socket);
+            let conflict = config.volumes[..index]
+                .iter()
+                .map(|v| (Address::Unix(v.cache_socket), "candidate"))
+                // An unarmed stage owns its sockets until abort/supersession.
+                // Preparation only reuses active/retired servers.
+                .chain(
+                    self.staged
+                        .iter()
+                        .flat_map(|s| s.listeners.keys().map(|&a| (a, "staged"))),
+                )
+                .find(|&(other, _)| address == other);
+            if let Some((other, state)) = conflict {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "volume {} listener {address} overlaps {state} listener {other}",
+                        volume.config.id
+                    ),
+                ));
             }
         }
         Ok(())
@@ -663,6 +769,10 @@ impl Volumes {
     }
 
     fn commit(&mut self, staged: Staged) {
+        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
+        if let Some(server) = &mut self.peer_server {
+            server.handler_mut().config = Some(staged.config.clone());
+        }
         let Staged {
             generations,
             mut listeners,
@@ -712,7 +822,7 @@ impl Volumes {
                     http::Server::new(
                         listeners.remove(&address).unwrap(),
                         VolumeHandler {
-                            local: matches!(address, Address::Unix(_)),
+                            local: true,
                             current,
                             draining: Vec::new(),
                         },
@@ -727,6 +837,12 @@ impl Volumes {
         if staged.armed {
             return;
         }
+        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
+        // Receive authorization follows the coordinated receive barrier, before
+        // ordinary ingress activation. Existing tasks retain their generation.
+        if let Some(server) = &mut self.peer_server {
+            server.handler_mut().config = Some(staged.config.clone());
+        }
         for (address, candidate) in &staged.generations {
             self.reclaim_listener(*address);
             if let Some(server) = self.servers.get_mut(address) {
@@ -737,7 +853,7 @@ impl Volumes {
                     http::Server::new(
                         staged.listeners.remove(address).unwrap(),
                         VolumeHandler {
-                            local: matches!(address, Address::Unix(_)),
+                            local: true,
                             current: candidate.clone(),
                             draining: Vec::new(),
                         },
@@ -783,26 +899,6 @@ impl Volumes {
         Ok(work)
     }
 }
-// Process-local listener reservation, checked at worker staging so rejected
-// desired listeners remain visible to aggregate readiness.
-
-fn validate_management(config: &Prepared, management: SocketAddr) -> io::Result<()> {
-    // Deliberately conservative across interfaces and address families. Do not
-    // depend on wildcard/dual-stack bind behavior or SO_REUSEPORT selection.
-    for volume in &config.volumes {
-        if volume.address.port() == management.port() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!(
-                    "volume {} listener {} conflicts with management {management} (reserved port)",
-                    volume.config.id, volume.address
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl Volumes {
     /// One immutable process-start catalog. Attempt registration once, only when
     /// useful. SO_REUSEPORT requires the same sparse catalog on every worker.
@@ -830,7 +926,7 @@ impl Volumes {
     ) -> io::Result<()> {
         if !rdma::StartupPolicy::eligible(
             config.fabric().is_some(),
-            config.crypto_snapshot().signatures().can_authenticate(),
+            self.updates.credentials().is_some() || cfg!(test),
         ) {
             return Ok(());
         }
@@ -871,8 +967,11 @@ impl Volumes {
 pub struct Volumes {
     storage: Option<storage::Local>,
     maintenance: bool,
+    receive_authority: Rc<RefCell<Option<Arc<Prepared>>>>,
+    peer_server: Option<http::Server<PeerHandler>>,
+    credential_revision: u64,
     stopping: bool,
-    management: SocketAddr,
+    peer_ip: std::net::IpAddr,
     worker: usize,
     rails: Option<negotiation::Rails>,
     rdma_startup: Option<(rdma::StartupPolicy, Vec<Option<rdma::Rail>>)>,
@@ -893,12 +992,54 @@ pub struct Volumes {
     peer_metrics_deadline: Option<Instant>,
 }
 struct Staged {
+    config: Arc<Prepared>,
     revision: u64,
     generations: BTreeMap<Address, Rc<Generation>>,
     listeners: BTreeMap<Address, http::Listener>,
     armed: bool,
 }
 impl Volumes {
+    fn install_credentials(&mut self) -> io::Result<()> {
+        let Some(provider) = self.updates.credentials() else {
+            return Ok(());
+        };
+        let snapshot = provider.current();
+        if self.credential_revision != snapshot.revision {
+            let expected = crate::tls::ExpectedPeer::Universe(provider.identity().universe.clone());
+            if self.peer_server.is_none() {
+                let address = SocketAddr::new(self.peer_ip, 9443);
+                let listener = http::Listener::bind(address, NonZeroU32::new(1024).unwrap())?;
+                self.peer_server = Some(http::Server::new(
+                    listener,
+                    PeerHandler {
+                        config: None,
+                        volumes: BTreeMap::new(),
+                    },
+                    http::Config::default(),
+                ));
+            }
+            self.peer_server.as_mut().unwrap().install_tls(
+                (*snapshot.context).clone(),
+                expected,
+                snapshot.revision,
+                snapshot.expires_unix,
+            );
+            #[cfg(test)]
+            if crate::simulation::current().is_some() {
+                self.peer_server
+                    .as_mut()
+                    .unwrap()
+                    .install_simulated_tls(provider.identity().clone());
+            }
+            self.credential_revision = snapshot.revision;
+        }
+        provider.installed(
+            self.worker,
+            self.credential_revision,
+            crate::http_client::TlsChannel::old_connections(self.credential_revision),
+        );
+        Ok(())
+    }
     pub fn new(
         cache: Cache,
         updates: Arc<Updates>,
@@ -908,9 +1049,12 @@ impl Volumes {
         Self {
             storage: None,
             maintenance: false,
+            receive_authority: Rc::new(RefCell::new(None)),
+            peer_server: None,
+            credential_revision: 0,
             stopping: false,
             worker,
-            management: SocketAddr::from(([0, 0, 0, 0], 9090)),
+            peer_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
             rails: None,
             rdma_startup: None,
             rdma_sources: Vec::new(),
@@ -931,13 +1075,13 @@ impl Volumes {
         self.rails = rails;
         self
     }
-    /// Set before polling, using the process Exporter's actual bound address.
-    pub fn with_management(mut self, address: SocketAddr) -> Self {
-        self.management = address;
+    /// Set before polling to the primary Pod IP. Independent of management;
+    /// authenticated peer traffic always listens on port 9443.
+    pub fn with_peer_ip(mut self, ip: std::net::IpAddr) -> Self {
+        self.peer_ip = ip;
         self
     }
     fn prepare(&mut self, config: Arc<Prepared>, ring: &mut uring::Ring) -> io::Result<()> {
-        validate_management(&config, self.management)?;
         self.validate_listeners(&config)?;
         self.provision_rdma(&config, ring)?;
         let crypto = {
@@ -949,28 +1093,18 @@ impl Volumes {
         let mut generations = BTreeMap::new();
         let mut listeners = BTreeMap::new();
         for volume in &config.volumes {
-            for address in [
-                Address::Tcp(volume.address),
-                Address::Unix(volume.cache_socket),
-            ] {
-                if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
-                    let listener = match address {
-                        Address::Tcp(address) => {
-                            http::Listener::bind(address, NonZeroU32::new(1024).unwrap())?
-                        }
-                        Address::Unix(path) => {
-                            #[cfg(test)]
-                            let simulated = crate::simulation::current().is_some();
-                            #[cfg(not(test))]
-                            let simulated = false;
-                            if !simulated {
-                                crate::socket_listener::SharedUnix::prepare_directory(path)?;
-                            }
-                            http::Listener::bind_unix(path)?
-                        }
-                    };
-                    listeners.insert(address, listener);
+            let address = Address::Unix(volume.cache_socket);
+            if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
+                let path = volume.cache_socket;
+                #[cfg(test)]
+                let simulated = crate::simulation::current().is_some();
+                #[cfg(not(test))]
+                let simulated = false;
+                if !simulated {
+                    crate::socket_listener::SharedUnix::prepare_directory(path)?;
                 }
+                let listener = http::Listener::bind_unix(path)?;
+                listeners.insert(address, listener);
             }
             let namespace = Namespace::volume(
                 &config.config.universe,
@@ -982,7 +1116,6 @@ impl Volumes {
                 Handler::shared(self.cache.clone(), volume.backend.clone(), namespace);
             handler.set_crypto(crypto.clone());
             handler.set_authentication(crate::http_auth::Policy {
-                keys: config.crypto.signatures().clone(),
                 universe: config.crypto.universe().bytes(),
                 node: config.local_node().bytes(),
                 peers: volume
@@ -1005,22 +1138,44 @@ impl Volumes {
                     .map(|id| (id.clone(), Peer::from_endpoint(volume.peers[id].clone())))
                     .collect(),
             );
+            if let Some(provider) = self.updates.credentials() {
+                let identities = config
+                    .config
+                    .peers
+                    .iter()
+                    .map(|peer| {
+                        Ok((
+                            peer.id.clone(),
+                            crate::tls::PeerIdentity::new(
+                                &hex_identity(&config.config.universe),
+                                &peer.id,
+                                &peer.pod_uid,
+                            )?,
+                        ))
+                    })
+                    .collect::<io::Result<BTreeMap<_, _>>>()?;
+                handler.set_peer_tls(&volume.config.id, provider, &identities);
+            }
             let handlers = vec![Rc::new(RefCell::new(handler))];
             let generation = Rc::new(Generation {
+                volume: volume.config.id.clone(),
                 identity: volume.routing.identity,
                 handlers,
                 _config: config.clone(),
                 manager: if let Some(rails) = &self.rails
                     && config.fabric().is_some()
-                    && config.crypto_snapshot().signatures().can_authenticate()
                 {
                     Some(RefCell::new(Manager {
-                        context: Rc::new(negotiation::Context::new(
-                            config.clone(),
-                            &volume.config.id,
-                            self.worker as u64,
-                            ROUTING,
-                        )?),
+                        context: Rc::new(
+                            negotiation::Context::new(
+                                config.clone(),
+                                &volume.config.id,
+                                self.worker as u64,
+                                ROUTING,
+                            )?
+                            .with_credentials(self.updates.credentials())
+                            .with_authority(self.receive_authority.clone()),
+                        ),
                         rails: rails.clone(),
                         outbound: Vec::new(),
                         inbound: BTreeMap::new(),
@@ -1033,10 +1188,10 @@ impl Volumes {
                 drain: Cell::new(None),
                 expired: Cell::new(false),
             });
-            generations.insert(Address::Tcp(volume.address), generation.clone());
             generations.insert(Address::Unix(volume.cache_socket), generation);
         }
         self.staged = Some(Staged {
+            config: config.clone(),
             revision: config.config.revision,
             generations,
             listeners,
@@ -1045,6 +1200,7 @@ impl Volumes {
         Ok(())
     }
     pub fn poll(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
+        self.install_credentials()?;
         let mut work = self.poll_storage(ring)?;
         work.merge(
             self.cache
@@ -1104,6 +1260,49 @@ impl Volumes {
             work.merge(server.handler_mut().poll_background(ring, budget)?);
         }
         work.merge(self.poll_retired(ring, budget)?);
+        if let Some(peer) = &mut self.peer_server {
+            let volumes = &mut peer.handler_mut().volumes;
+            volumes.clear();
+            for server in self
+                .retired
+                .values()
+                .map(|(_, s)| s)
+                .chain(self.servers.values())
+            {
+                let handler = server.handler();
+                for generation in std::iter::once(&handler.current).chain(&handler.draining) {
+                    if generation.expired.get() {
+                        continue;
+                    }
+                    match volumes.entry(generation.volume.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(VolumeHandler {
+                                local: false,
+                                current: generation.clone(),
+                                draining: Vec::new(),
+                            });
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let target = entry.get_mut();
+                            if generation._config.config.revision
+                                > target.current._config.config.revision
+                            {
+                                let old =
+                                    std::mem::replace(&mut target.current, generation.clone());
+                                target.draining.push(old);
+                            } else {
+                                target.draining.push(generation.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            work.merge(peer.poll(ring, budget)?);
+            work.merge(uring::Work {
+                runnable: false,
+                deadline: Some(crate::environment::now() + Duration::from_secs(1)),
+            });
+        }
         self.cache.borrow_mut().set_crypto(None);
         if self.retired.is_empty()
             && self
@@ -1138,22 +1337,15 @@ impl Volumes {
         let now = crate::environment::now();
         if self.peer_metrics_deadline.is_none_or(|at| now >= at) {
             let mut peers = Vec::new();
-            for (address, server) in &self.servers {
-                let Address::Tcp(address) = address else {
-                    continue;
-                };
+            for server in self.servers.values() {
                 let generation = &server.handler().current;
                 if !generation.active.get() || generation.expired.get() {
                     continue;
                 }
-                let volume = generation
-                    ._config
-                    .volumes
-                    .iter()
-                    .find(|volume| volume.address == *address)
-                    .unwrap();
                 for handler in &generation.handlers {
-                    handler.borrow().peer_metrics(&volume.config.id, &mut peers);
+                    handler
+                        .borrow()
+                        .peer_metrics(&generation.volume, &mut peers);
                 }
             }
             metrics.publish_peers(peers);
@@ -1170,6 +1362,9 @@ impl Volumes {
     fn shutdown_until(&mut self, ring: &mut uring::Ring, deadline: Instant) -> io::Result<()> {
         if let Some(storage) = &self.storage {
             storage.stop();
+        }
+        if let Some(mut peer) = self.peer_server.take() {
+            peer.shutdown(ring)?;
         }
         self.stopping = true;
         self.staged = None;
@@ -1254,6 +1449,9 @@ impl Volumes {
         if let Some(storage) = &self.storage {
             storage.stop();
         }
+        if let Some(peer) = &mut self.peer_server {
+            peer.begin_drain();
+        }
         self.stopping = true;
         self.staged = None;
         self.preparing = None;
@@ -1273,10 +1471,14 @@ impl Volumes {
         }
     }
     pub fn drained(&self) -> bool {
-        self.servers
-            .values()
-            .chain(self.retired.values().map(|(_, s)| s))
-            .all(|s| s.connections() == 0)
+        self.peer_server
+            .as_ref()
+            .is_none_or(|s| s.connections() == 0)
+            && self
+                .servers
+                .values()
+                .chain(self.retired.values().map(|(_, s)| s))
+                .all(|s| s.connections() == 0)
     }
 }
 

@@ -11,15 +11,15 @@ pub mod http_auth;
 pub mod http_client;
 pub mod http_server;
 pub mod lifecycle;
-mod listener_policy;
 pub mod metadata;
 pub mod metrics;
 pub mod negotiation;
 pub mod rdma;
 pub mod runtime;
-pub mod signing;
+pub mod slab_io;
 pub mod socket;
 mod socket_listener;
+pub mod tls;
 pub mod uring;
 pub mod workers;
 

@@ -236,6 +236,46 @@ mod management_address_tests {
     }
 
     #[test]
+    fn peer_binding_follows_pod_ip_independently_of_management_override() {
+        for (metrics, pod, expected_peer) in [
+            ("127.0.0.1:9090", Some("127.0.0.2"), "127.0.0.2:9443"),
+            ("127.0.0.1:9090", Some("fd00::42"), "[fd00::42]:9443"),
+            ("[::1]:9090", Some("10.20.30.40"), "10.20.30.40:9443"),
+            ("127.0.0.1:9090", None, "0.0.0.0:9443"),
+        ] {
+            let lookup = |name: &str| match name {
+                "RACER_METRICS_ADDR" => Ok(metrics.to_owned()),
+                "RACER_POD_IP" => pod.map(str::to_owned).ok_or(env::VarError::NotPresent),
+                _ => panic!("unexpected setting {name}"),
+            };
+            assert_eq!(
+                management_address(lookup).unwrap(),
+                metrics.parse().unwrap()
+            );
+            assert_eq!(
+                peer_address(lookup).unwrap(),
+                expected_peer.parse().unwrap()
+            );
+        }
+        // A management override cannot conceal an invalid advertised Pod address.
+        for bad in ["", "localhost", "127.0.0.2:9443", "[::1]"] {
+            let error = peer_address(|name| {
+                assert_eq!(name, "RACER_POD_IP");
+                Ok(bad.into())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        let error = peer_address(|_| {
+            Err(env::VarError::NotUnicode(std::ffi::OsString::from_vec(
+                vec![0xff],
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn invalid_selected_configuration_fails_instead_of_falling_back() {
         for bad in ["", "localhost", "[::1]", "127.0.0.1:9090", "not-an-ip"] {
             let error = configured(None, Some(bad)).unwrap_err();
@@ -354,7 +394,9 @@ mod startup_layout_tests {
         let Ok(expected) = env::var("RACER_LAYOUT_EXPECT_ERROR") else {
             return;
         };
-        let error = main_with_args(std::iter::empty()).unwrap_err().to_string();
+        let error = main_with_args(std::iter::empty::<std::ffi::OsString>())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&expected), "expected {expected}: {error}");
     }
 
@@ -373,17 +415,6 @@ mod startup_layout_tests {
         let path =
             env::temp_dir().join(format!("racer-startup-layout-{}.slab", std::process::id()));
         assert!(!path.exists());
-        let keys = env::temp_dir().join(format!("racer-startup-keys-{}", std::process::id()));
-        std::fs::create_dir(&keys).unwrap();
-        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let public: String = key
-            .verifying_key()
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let active = public.clone();
-        std::fs::write(keys.join("bundle.json"), serde_json::json!({"version":1,"generation":1,"seed":"01".repeat(32),"active":active,"public":[public]}).to_string()).unwrap();
         let size = 32u64 * 32 * 1024 * 1024;
         let run = |size: &str, shards: Option<&str>, expected: &str| {
             let mut command = Command::new(env::current_exe().unwrap());
@@ -394,7 +425,6 @@ mod startup_layout_tests {
                     "--test-threads=2",
                 ])
                 .env_clear()
-                .env("RACER_PEER_KEYS_DIR", &keys)
                 .env("RACER_LAYOUT_EXPECT_ERROR", expected)
                 .env("RACER_CONTROL_PLANE_URL", "/unused-bootstrap.json")
                 .env("RACER_UNIVERSE", "01".repeat(32))
@@ -542,6 +572,5 @@ mod startup_layout_tests {
         let mut lock = path.as_os_str().to_owned();
         lock.push(".lock");
         std::fs::remove_file(lock).unwrap();
-        std::fs::remove_dir_all(&keys).unwrap();
     }
 }

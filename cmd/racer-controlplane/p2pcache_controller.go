@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"time"
@@ -129,7 +130,20 @@ func (r *cacheStatusReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 
 	before := cache.DeepCopy()
 
-	cache.Status = r.status(&cache, sites.Items, nodes.Items, pods.Items, time.Now())
+	// Use the durable client rather than the informer cache: every committed
+	// universe must be accounted for, including deleted Sites and universes
+	// not yet restored after restart or an ambiguous commit.
+	store := r.server.controlStore
+	if store.client == nil {
+		store.client = r.client
+	}
+
+	var pointers corev1.ConfigMapList
+	if err := store.client.List(ctx, &pointers, client.InNamespace(store.namespace), client.MatchingLabels{stateLabel: "commit"}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	cache.Status = r.status(&cache, sites.Items, nodes.Items, pods.Items, time.Now(), pointers.Items...)
 	if !reflect.DeepEqual(before.Status, cache.Status) {
 		if err := r.client.Status().Patch(ctx, &cache, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
@@ -139,7 +153,7 @@ func (r *cacheStatusReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
-func (r *cacheStatusReconciler) status(cache *racerapi.P2PCache, sites []machina.Site, nodes []corev1.Node, pods []corev1.Pod, now time.Time) racerapi.P2PCacheStatus {
+func (r *cacheStatusReconciler) status(cache *racerapi.P2PCache, sites []machina.Site, nodes []corev1.Node, pods []corev1.Pod, now time.Time, pointers ...corev1.ConfigMap) racerapi.P2PCacheStatus {
 	status := *cache.Status.DeepCopy()
 	status.ObservedGeneration = cache.Generation
 	status.Participants = racerapi.P2PCacheParticipants{}
@@ -204,6 +218,27 @@ func (r *cacheStatusReconciler) status(cache *racerapi.P2PCache, sites []machina
 	defer r.server.mu.Unlock()
 
 	converged := true
+
+	for _, pointer := range pointers {
+		var m manifest
+		if json.Unmarshal([]byte(pointer.Data["manifest"]), &m) != nil || m.Universe == "" || pointer.Name != stateName(m.Universe) || r.server.source == nil {
+			converged = false
+			continue
+		}
+
+		t := r.server.source.topologies[identityBytes("universe", m.Universe)]
+
+		roll := r.server.rollouts[m.Universe]
+		if t == nil || roll == nil || roll.invalid || roll.revision != t.g.Revision {
+			converged = false
+			continue
+		}
+
+		digest, err := t.publishedDigest()
+		if err != nil || digest != m.Digest {
+			converged = false
+		}
+	}
 
 	for _, node := range nodes {
 		universe := racer.NodeUniverse(&node)
@@ -279,8 +314,18 @@ func (r *cacheStatusReconciler) status(cache *racerapi.P2PCache, sites []machina
 				}
 
 				forwards, err := roll.forwardHistory(t.g.Universe)
-				if err != nil || len(forwards) != 0 {
+				if err != nil {
 					converged = false
+				}
+
+				for _, forward := range forwards {
+					// Wildcards remain durable recovery evidence after a boot has
+					// retired. Only a fresh acknowledgment of the current revision
+					// proves that retained participant has completed withdrawal.
+					ack := roll.acks[forward.snapshotRef().Node]
+					if forward.Boot != "" || ack.boot == "" || ack.phase != 4 || ack.seen.After(now) || now.Sub(ack.seen) >= storageFreshness {
+						converged = false
+					}
 				}
 			}
 		}

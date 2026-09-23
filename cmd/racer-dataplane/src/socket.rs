@@ -66,13 +66,6 @@ impl From<SocketAddr> for Address {
 }
 
 impl Address {
-    pub(crate) fn overlaps(self, other: Self) -> bool {
-        match (self, other) {
-            (Self::Tcp(a), Self::Tcp(b)) => crate::listener_policy::overlaps(a, b),
-            (Self::Unix(a), Self::Unix(b)) => a == b,
-            _ => false,
-        }
-    }
     pub fn unix(path: &str) -> io::Result<Self> {
         UnixPath::new(path).map(Self::Unix)
     }

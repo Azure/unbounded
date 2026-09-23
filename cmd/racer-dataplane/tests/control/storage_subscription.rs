@@ -1,28 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Uses the production HTTP Subscriber with the owning module's signed fixture.
+// Uses the production mTLS Subscriber with the owning module's TLS fixture.
 #[test]
-fn independent_signed_storage_subscription() {
-    fn encode(trust: &Trust, command: &proto::ControlCommand) -> Vec<u8> {
-        let command = command.encode_to_vec();
-        proto::SignedControlCommand {
-            signature: trust
-                .keys
-                .sign(b"racer/control/v1", &[&command])
-                .unwrap()
-                .to_vec(),
-            command,
-        }
-        .encode_to_vec()
+fn independent_mtls_storage_subscription() {
+    fn encode(_trust: &Trust, command: &proto::ControlCommand) -> Vec<u8> {
+        command.encode_to_vec()
     }
     let server = Server::new();
     let (subscriber, updates, trust, config) = server.start();
     let (mut socket, request, _) = server.next();
     assert!(request.contains("X-Racer-Storage-Policy: 1\r\n"));
-    let signed =
-        proto::SignedControlCommand::decode(signed(&trust, config.clone()).as_slice()).unwrap();
-    let mut command = proto::ControlCommand::decode(signed.command.as_slice()).unwrap();
+    let mut command =
+        proto::ControlCommand::decode(signed(&trust, config.clone()).as_slice()).unwrap();
     // Invalid storage leaves valid topology fully usable.
     command.storage_policy = Some(proto::StoragePolicy {
         identity: vec![5; 32],
@@ -53,7 +43,7 @@ fn independent_signed_storage_subscription() {
     assert_eq!(updates.desired_storage().unwrap().version, 2);
     assert_eq!(updates.storage_policy_status().applied_bytes, 1 << 30);
     assert_eq!(updates.latest(0).unwrap().config.revision, 1);
-    // Every signed identity binding is checked before the storage mailbox.
+    // Every identity binding and malformed frame is checked before the storage mailbox.
     for field in 0..6 {
         let mut bad = command.clone();
         bad.revision = 1;
@@ -68,9 +58,7 @@ fn independent_signed_storage_subscription() {
         }
         let mut body = encode(&trust, &bad);
         if field == 5 {
-            let mut signed = proto::SignedControlCommand::decode(body.as_slice()).unwrap();
-            signed.signature[0] ^= 1;
-            body = signed.encode_to_vec();
+            body = vec![0xff];
         }
         reply(&mut socket, &body, "\"bad\"");
         (socket, _, _) = server.next();

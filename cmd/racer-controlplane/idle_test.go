@@ -7,16 +7,13 @@ import (
 	"context"
 	"encoding/hex"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/proto"
-	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -56,7 +53,6 @@ func TestIdleSiteAuthenticatedLifecycle(t *testing.T) {
 	n, p, svc := idleFixtures()
 	kube := tokenClient{fakeKube(n, p)}
 	r := newTestReconciler(kube)
-	r.server.signer = testSigner(t, 7)
 	f := &coordinationFixture{s: r.server, api: &rolloutAPI{Client: kube}, node: identity("node", string(n.UID))}
 	activate := func(idle bool, volumes int) {
 		t.Helper()
@@ -75,7 +71,7 @@ func TestIdleSiteAuthenticatedLifecycle(t *testing.T) {
 			}
 
 			var snapshot pb.Snapshot
-			if err := proto.Unmarshal(command.Configuration.GetSigned().Snapshot, &snapshot); err != nil {
+			if err := proto.Unmarshal(configurationSnapshot(t, command.Configuration), &snapshot); err != nil {
 				t.Fatal(err)
 			}
 
@@ -105,7 +101,6 @@ func TestIdleSiteAuthenticatedLifecycle(t *testing.T) {
 	// Restart recovers durable idle authorization without advancing the revision.
 	revision := r.loaded["default"].Revision
 	r = newTestReconciler(kube)
-	r.server.signer = testSigner(t, 7)
 	f.s = r.server
 
 	activate(true, 0)
@@ -130,17 +125,8 @@ func TestIdleSiteAuthenticatedLifecycle(t *testing.T) {
 	}
 
 	f.call(t, 0, 403)
-	// TokenReview authenticates the new Pod, then the same signed barriers apply.
-	r.server.credentials = credentialCache{}
-	r.server.reviewClient = &reviewTestClient{review: func(ctx context.Context, review *authenticationv1.TokenReview) error {
-		if err := validReview(ctx, review); err != nil {
-			return err
-		}
-
-		review.Status.User.Extra["authentication.kubernetes.io/pod-uid"] = authenticationv1.ExtraValue{string(p.UID)}
-
-		return nil
-	}}
+	// The certificate authenticates the new Pod, then the same barriers apply.
+	f.podUID = string(p.UID)
 
 	activate(true, 0)
 }
@@ -214,8 +200,8 @@ func TestIdleSiteSelectionFailsClosed(t *testing.T) {
 	}
 }
 
-// Real signed HTTP delivery and production Rust Subscriber/Volumes workers;
-// Kubernetes discovery/persistence and TokenReview use the existing fake API.
+// Real mutual-TLS delivery and production Rust Subscriber/Volumes workers;
+// Kubernetes discovery/persistence use the existing fake API.
 func TestProductionIdleSiteLifecycle(t *testing.T) {
 	bin := os.Getenv("RACER_COORDINATION_TEST_BIN")
 	if bin == "" {
@@ -226,7 +212,6 @@ func TestProductionIdleSiteLifecycle(t *testing.T) {
 	n, p, svc := idleFixtures()
 	kube := tokenClient{fakeKube(n, p)}
 	r := newTestReconciler(kube)
-	r.server.signer = testSigner(t, 7)
 	index := reconcileIdle(t, r)
 	node := index.g.Nodes[n.Name].ID
 
@@ -236,7 +221,7 @@ func TestProductionIdleSiteLifecycle(t *testing.T) {
 	)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -285,24 +270,10 @@ func TestProductionIdleSiteLifecycle(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	server := httptest.NewServer(mux)
+	server, pki := coordinationServer(t, mux)
 	defer server.Close()
 
-	dir := t.TempDir()
-
-	keys := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(keys, "controller.pub"), r.server.signer.key[32:], 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	token := filepath.Join(dir, "token")
-	if err := os.WriteFile(token, []byte("pod-token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	dir := pki.directory(t, node, string(p.UID))
 
 	childCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
@@ -310,10 +281,10 @@ func TestProductionIdleSiteLifecycle(t *testing.T) {
 	cmd := exec.CommandContext(childCtx, bin, "coordination_tests::production_idle_site_child", "--ignored", "--nocapture", "--test-threads=1")
 
 	cmd.Env = append(os.Environ(),
-		"RACER_PEER_KEYS_DIR="+coordinationPeerKey(t, dir, keys),
-		"RACER_CONTROL_PLANE_URL="+server.URL+"/v2/"+identity("universe", "default")+"/"+node,
+		"RACER_TLS_DIR="+dir,
+		"RACER_CONTROL_PLANE_URL="+server.URL+"/v3/"+identity("universe", "default")+"/"+node,
 		"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+node,
-		"RACER_CONFIG_KEYS_DIR="+keys, "RACER_CONTROL_TOKEN_FILE="+token)
+		"RACER_POD_UID="+string(p.UID))
 	output, err := cmd.CombinedOutput()
 	t.Logf("Rust idle lifecycle: %s", output)
 

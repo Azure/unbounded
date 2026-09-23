@@ -10,7 +10,7 @@ use racer_dataplane::{
     cache::CachedValue,
     http_client as client, http_server as server,
     socket::Address,
-    uring, workers,
+    tls, uring, workers,
 };
 use std::{
     env, io,
@@ -39,6 +39,10 @@ struct Options {
     duration: Duration,
     body: String,
     slab_dir: std::path::PathBuf,
+    tls_trust_dir: Option<std::path::PathBuf>,
+    tls_cert: Option<std::path::PathBuf>,
+    tls_key: Option<std::path::PathBuf>,
+    tls_peer: Option<String>,
 }
 impl Options {
     fn parse() -> io::Result<Option<Self>> {
@@ -46,7 +50,7 @@ impl Options {
         let mode = args.next().unwrap_or_default();
         if mode.is_empty() || mode == "--help" {
             println!(
-                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nUse taskset to select workers (one per allowed physical core). Payload: 4 MiB; default body: file. Unix parent directories must exist."
+                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nTCP modes: --tls-trust-dir DIR --tls-cert PEM --tls-key PEM --tls-peer SPIFFE_URI enables mutual TLS and automatic kTLS. All four TLS options are required together.\nUse taskset to select workers (one per allowed physical core). Payload: 4 MiB; default body: file. Unix parent directories must exist."
             );
             return Ok(None);
         }
@@ -63,10 +67,18 @@ impl Options {
             duration: Duration::from_secs(30),
             body: "file".into(),
             slab_dir: env::temp_dir(),
+            tls_trust_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_peer: None,
         };
         while let Some(flag) = args.next() {
             let value = args.next().ok_or_else(|| invalid("missing option value"))?;
             match flag.as_str() {
+                "--tls-trust-dir" => options.tls_trust_dir = Some(value.into()),
+                "--tls-cert" => options.tls_cert = Some(value.into()),
+                "--tls-key" => options.tls_key = Some(value.into()),
+                "--tls-peer" => options.tls_peer = Some(value),
                 "--body" if server && matches!(value.as_str(), "file" | "buffer") => {
                     options.body = value
                 }
@@ -114,7 +126,31 @@ impl Options {
         {
             return Err(invalid("port must be nonzero"));
         }
+        let tls_options = [
+            options.tls_trust_dir.is_some(),
+            options.tls_cert.is_some(),
+            options.tls_key.is_some(),
+            options.tls_peer.is_some(),
+        ];
+        if tls_options.iter().any(|enabled| *enabled) && !tls_options.iter().all(|enabled| *enabled)
+        {
+            return Err(invalid("all four TLS options are required together"));
+        }
         Ok(Some(options))
+    }
+
+    fn tls(&self) -> io::Result<Option<(tls::TlsContext, tls::ExpectedPeer)>> {
+        let Some(dir) = &self.tls_trust_dir else {
+            return Ok(None);
+        };
+        let bundle = tls::TrustBundle::load(dir, None)?;
+        let certificate = std::fs::read(self.tls_cert.as_ref().unwrap())?;
+        let key = std::fs::read(self.tls_key.as_ref().unwrap())?;
+        let expected = tls::PeerIdentity::parse(self.tls_peer.as_ref().unwrap())?;
+        Ok(Some((
+            tls::TlsContext::new(&bundle, &certificate, &key)?,
+            tls::ExpectedPeer::Identity(expected),
+        )))
     }
 }
 
@@ -402,6 +438,7 @@ fn main() -> io::Result<()> {
         return Err(invalid("build with --release"));
     }
     install_signals()?;
+    let tls = options.tls()?;
     // An upper bound if SMT siblings are allowed; the production planner selects
     // just one CPU per physical core. taskset makes this bound exact in our runs.
     let allowed = thread::available_parallelism()?.get();
@@ -478,12 +515,18 @@ fn main() -> io::Result<()> {
                 } else {
                     CachedValue::Buffer(payload)
                 };
-                let listener = match options.address {
+                let mut listener = match options.address {
                     Address::Tcp(address) => {
                         server::Listener::bind(address, NonZeroU32::new(1024).unwrap())?
                     }
                     Address::Unix(path) => server::Listener::bind_unix(path)?,
                 };
+                if let Some((context, expected)) = &tls {
+                    if options.address.tcp().is_none() {
+                        return Err(invalid("TLS benchmark requires TCP"));
+                    }
+                    listener.set_tls(context.clone(), expected.clone());
+                }
                 App::Server(server::Server::new(
                     listener,
                     Handler {
@@ -499,7 +542,20 @@ fn main() -> io::Result<()> {
                     fill.as_mut_slice().fill(0);
                     slots.push(Slot {
                         idle: Some((
-                            client::Connection::new_address(options.address, "localhost")?,
+                            match &tls {
+                                Some((context, expected)) => client::Connection::new_tls(
+                                    options
+                                        .address
+                                        .tcp()
+                                        .ok_or_else(|| invalid("TLS benchmark requires TCP"))?,
+                                    &options.address.to_string(),
+                                    context,
+                                    expected.clone(),
+                                )?,
+                                None => {
+                                    client::Connection::new_address(options.address, "localhost")?
+                                }
+                            },
                             fill,
                         )),
                         exchange: None,
@@ -563,6 +619,8 @@ fn main() -> io::Result<()> {
         .join()
         .map_err(|_| io::Error::other("monitor panicked"))?;
     result?;
+    let offload = tls::global_counters();
+    eprintln!("TLS {offload:?}");
     if options.server {
         eprintln!("server stopped cleanly");
         return Ok(());

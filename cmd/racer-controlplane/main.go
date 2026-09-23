@@ -5,11 +5,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -17,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -29,7 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/version"
@@ -42,35 +41,25 @@ func main() {
 	}
 
 	showVersion := flag.Bool("version", false, "print version and exit")
-	listen := flag.String("listen", ":8080", "HTTP listen address")
+	listen := flag.String("listen", ":8443", "mTLS control listen address")
+	enrollListen := flag.String("enroll-listen", ":8444", "server-authenticated HTTPS enrollment listen address")
 	namespace := flag.String("state-namespace", "racer-system", "namespace for durable state and leader election")
 	probes := flag.String("health-listen", ":8081", "health probe listen address")
 	bootstrap := flag.String("bootstrap-node", "", "print shell bootstrap identities for this Kubernetes Node and exit")
 	bootstrapUniverse := flag.String("bootstrap-universe", "", "required mapped Site universe from the Pod universe label")
 	bootstrapService := flag.String("bootstrap-service", "racer-controlplane", "controller Service name for bootstrap")
 	bootstrapNamespace := flag.String("bootstrap-namespace", "racer-system", "controller Service namespace for bootstrap")
-	bootstrapPort := flag.String("bootstrap-port", "8080", "controller Service port name or number")
-	keyDir := flag.String("generate-key", "", "write a raw Ed25519 seed and public key into a new directory and exit")
-	management := flag.String("reserved-management-ports", "9090", "comma-separated dataplane management ports; 9090 is always reserved")
 	socketRoot := flag.String("socket-root", racer.SocketRoot, "deployment-wide absolute directory for local cache and origin sockets")
+	bootstrapPort := flag.String("bootstrap-port", "8443", "controller Service port name or number")
 	reviewQPS := flag.Float64("token-review-qps", 20, "TokenReview API requests per second on credential cache misses")
 	reviewBurst := flag.Int("token-review-burst", 30, "TokenReview API request burst on credential cache misses")
-	rotationInterval := flag.Duration("signing-rotation-interval", 24*time.Hour, "time between signing key activations")
-	propagationDelay := flag.Duration("signing-propagation-delay", 10*time.Minute, "minimum signing trust propagation delay")
+	rotationInterval := flag.Duration("ca-rotation-interval", 30*24*time.Hour, "time between CA rotations")
 	logging := zap.Options{}
 	logging.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(version.String())
-		return
-	}
-
-	if *keyDir != "" {
-		if err := generateKey(*keyDir); err != nil {
-			log.Fatal(err)
-		}
-
 		return
 	}
 
@@ -84,16 +73,11 @@ func main() {
 		return
 	}
 
-	reserved, err := parseReservedPorts(*management)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	if _, _, err := racer.CacheSockets(*socketRoot, strings.Repeat("a", 63)); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := run(*listen, *namespace, *probes, *socketRoot, reserved, *reviewQPS, *reviewBurst, rotationPolicy{*rotationInterval, *propagationDelay}); err != nil {
+	if err := run(*listen, *enrollListen, *namespace, *probes, *socketRoot, *reviewQPS, *reviewBurst, *rotationInterval); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -164,9 +148,9 @@ func validateBootstrapNode(node *corev1.Node, expectedUniverse string) error {
 	return racer.ValidateBootstrapNode(node, expectedUniverse)
 }
 
-func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, reviewQPS float64, reviewBurst int, policy rotationPolicy) error {
-	if err := policy.validate(); err != nil {
-		return err
+func run(listen, enrollListen, namespace, probes, socketRoot string, reviewQPS float64, reviewBurst int, rotationInterval time.Duration) error {
+	if rotationInterval <= 0 {
+		return fmt.Errorf("ca-rotation-interval must be positive")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -175,10 +159,6 @@ func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, r
 	config := new(Server)
 
 	scheme := runtime.NewScheme()
-	if err := machinav1alpha3.AddToScheme(scheme); err != nil {
-		return err
-	}
-
 	if err := racerv1alpha1.AddToScheme(scheme); err != nil {
 		return err
 	}
@@ -188,6 +168,14 @@ func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, r
 	}
 
 	if err := corev1.AddToScheme(scheme); err != nil {
+		return err
+	}
+
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		return err
+	}
+
+	if err := machina.AddToScheme(scheme); err != nil {
 		return err
 	}
 
@@ -212,62 +200,13 @@ func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, r
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Pod{}:       {Label: labels.SelectorFromSet(labels.Set{dataplaneLabel: "true"})},
 			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{namespace: {}}, Label: labels.SelectorFromSet(labels.Set{stateLabel: "commit"})},
-			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{namespace: {}}},
 		}},
 	})
 	if err != nil {
 		return err
 	}
-	// The manager cache and leader election have not started. Provision through
-	// a direct client so every replica can initialize without waiting for either.
-	var signingClient client.Client
-	if managedSigningEnabled() {
-		signingClient, err = client.New(kube, client.Options{Scheme: scheme})
-		if err != nil {
-			return err
-		}
-	}
 
-	signingCtx, cancelSigning := context.WithTimeout(ctx, 30*time.Second)
-	key, err := signerFromEnv(signingCtx, signingClient, namespace)
-
-	cancelSigning()
-
-	if err != nil {
-		return err
-	}
-
-	config.signer = key
-
-	var refreshSigning func(context.Context) error
-
-	if managedSigningEnabled() {
-		observer := &signingSecretReconciler{client: manager.GetClient(), server: config, namespace: namespace}
-
-		refreshSigning = func(ctx context.Context) error {
-			for _, name := range []string{configSigningSecret, peerSigningSecret} {
-				var secret corev1.Secret
-				if err := signingClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &secret); err != nil {
-					return err
-				}
-
-				if err := observer.observe(&secret); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		}
-		if err := refreshSigning(ctx); err != nil {
-			return err
-		}
-
-		if err := setupSigningController(manager, observer, signingClient, policy); err != nil {
-			return err
-		}
-	}
-
-	if err := setupController(ctx, manager, config, namespace, reserved, socketRoot); err != nil {
+	if err := setupController(ctx, manager, config, namespace, socketRoot); err != nil {
 		return err
 	}
 
@@ -279,58 +218,9 @@ func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, r
 		return err
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v2/{universe}/{node}", config.control)
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-
-	server := &http.Server{
-		Addr:              listen,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      70 * time.Second,
-		IdleTimeout:       90 * time.Second,
-	}
-	if err := manager.Add(&subscriptionServer{server: server, refreshSigning: refreshSigning}); err != nil {
+	if err := setupTLSControl(manager, config, listen, enrollListen, namespace, rotationInterval); err != nil {
 		return err
 	}
 
 	return manager.Start(ctx)
-}
-
-// Standbys do not listen on the subscription port and therefore fail the
-// Kubernetes readiness probe. Only the fenced leader serves configurations.
-type subscriptionServer struct {
-	server         *http.Server
-	refreshSigning func(context.Context) error
-}
-
-func (*subscriptionServer) NeedLeaderElection() bool { return true }
-func (s *subscriptionServer) Start(ctx context.Context) error {
-	if s.refreshSigning != nil {
-		if err := s.refreshSigning(ctx); err != nil {
-			return err
-		}
-	}
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if err := s.server.Close(); err != nil {
-				log.Printf("close subscription server: %v", err)
-			}
-		case <-done:
-		}
-	}()
-
-	log.Printf("control plane leader listening on %s", s.server.Addr)
-
-	err := s.server.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-
-	return err
 }

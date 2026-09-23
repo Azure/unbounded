@@ -27,11 +27,11 @@ import (
 
 func testGeneration(p uint32, n int) *generation {
 	names := make([]string, n)
-	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "cache-uid", Name: "volume", Slots: p, Port: 10000, CacheSocket: "/dev/racer/volume/cache", OriginSocket: "/dev/racer/volume/origin", Algorithm: 2, Attempts: 3}}
+	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "cache-uid", Name: "volume", Slots: p, CacheSocket: "/dev/racer/volume/cache", OriginSocket: "/dev/racer/volume/origin", Algorithm: 2, Attempts: 3}}
 
 	for i := range names {
 		names[i] = fmt.Sprintf("node-%06d", i)
-		g.Nodes[names[i]] = member{ID: identity("node", names[i]), IP: fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255)}
+		g.Nodes[names[i]] = member{ID: identity("node", names[i]), IP: fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255), PodUID: "pod-" + names[i]}
 	}
 
 	var err error
@@ -42,6 +42,42 @@ func testGeneration(p uint32, n int) *generation {
 	}
 
 	return g
+}
+
+func TestPeerTLSIdentityAndEndpoint(t *testing.T) {
+	for _, ip := range []string{"10.1.2.3", "2001:db8::1"} {
+		t.Run(ip, func(t *testing.T) {
+			g := testGeneration(8, 2)
+			remote := g.Nodes["node-000001"]
+			remote.IP = ip
+			g.Nodes["node-000001"] = remote
+
+			index, err := indexGeneration(g)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			snapshot := index.snapshot(g.Nodes["node-000000"].ID)
+			if len(snapshot.Peers) != 1 {
+				t.Fatalf("peers: %v", snapshot.Peers)
+			}
+
+			peer := snapshot.Peers[0]
+			if peer.PodUid != remote.PodUID || peer.HttpAddress != net.JoinHostPort(ip, "9443") {
+				t.Fatalf("peer TLS identity/address: %v", peer)
+			}
+
+			for _, volume := range snapshot.Volumes {
+				if volume.CacheSocket != "/dev/racer/volume/cache" {
+					t.Fatalf("client listener: %s", volume.CacheSocket)
+				}
+
+				if len(volume.PeerEndpoints.Peers) != 1 || volume.PeerEndpoints.Peers[0].HttpAddress != peer.HttpAddress {
+					t.Fatalf("peer endpoint: %v", volume.PeerEndpoints)
+				}
+			}
+		})
+	}
 }
 
 // Placement diversity, deterministic churn and minimum pair movement.
@@ -401,7 +437,8 @@ func TestB02CapacityAndAdmission(t *testing.T) {
 		for i := 0; i < 4; i++ {
 			v := *g.Volume
 			v.ID = fmt.Sprintf("v%d", i)
-			v.Port += int32(i + 1)
+			v.CacheSocket = fmt.Sprintf("/dev/racer/v%d/cache", i)
+			v.OriginSocket = fmt.Sprintf("/dev/racer/v%d/origin", i)
 			g.Additional = append(g.Additional, volumeState{&v, g.Owners})
 		}
 
@@ -449,7 +486,6 @@ func TestB02ProductionSnapshots(t *testing.T) {
 			g := testGeneration(p, n)
 			g.Volume.OriginSocket = "/dev/racer/volume/origin"
 
-			g.Volume.Port = 18881
 			for name, node := range g.Nodes {
 				node.IP = "127.0.0.2"
 				if name != "node-000000" {
@@ -515,7 +551,6 @@ func TestB02ProductionSnapshots(t *testing.T) {
 					name := fmt.Sprintf("node-%06d", i)
 					snap := idx.snapshot(g.Nodes[name].ID)
 
-					snap.Volumes[0].PeerListen = net.JoinHostPort(g.Nodes[name].IP, "18881")
 					if root := os.Getenv("B02_SOCKET_ROOT"); root != "" {
 						snap.Volumes[0].CacheSocket = filepath.Join(root, fmt.Sprintf("cache-%d", i))
 						snap.Volumes[0].OriginSocket = filepath.Join(root, fmt.Sprintf("origin-%d", i))

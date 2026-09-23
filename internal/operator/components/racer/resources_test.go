@@ -37,22 +37,27 @@ func envValues(c corev1.Container) map[string]string {
 }
 
 // Shipping contracts are checked against the operator's resource constructors.
-func TestShippingSigning(t *testing.T) {
+func TestShippingMTLS(t *testing.T) {
 	const ns = "custom-system"
 
 	d := controlDeployment(ns, component.Config{})
 
 	pod := d.Spec.Template.Spec
-	if len(pod.Containers) != 1 || len(pod.Volumes) != 0 || len(pod.Containers[0].VolumeMounts) != 0 || pod.ServiceAccountName != controlPlaneName {
-		t.Fatal("controller must bootstrap managed signing keys without mounts")
+	if len(pod.Containers) != 1 || pod.ServiceAccountName != controlPlaneName {
+		t.Fatal("missing controlplane container or service account")
 	}
 
-	for _, c := range []corev1.Container{pod.Containers[0], dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec.Containers[0]} {
-		for _, key := range []string{"RACER_ALLOW_UNSIGNED", "RACER_SIGNING_KEY", "RACER_VERIFY_KEYS_DIR", "RACER_CONFIG_VERIFY_KEYS_DIR"} {
+	dataplane := dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec
+	for _, p := range []corev1.PodSpec{pod, dataplane} {
+		c := p.Containers[0]
+		for _, key := range []string{"RACER_ALLOW_UNSIGNED", "RACER_SIGNING_KEY", "RACER_VERIFY_KEYS_DIR", "RACER_CONFIG_VERIFY_KEYS_DIR", "RACER_PEER_KEYS_DIR", "RACER_CONFIG_KEYS_DIR"} {
 			if _, exists := envValues(c)[key]; exists {
-				t.Fatalf("unexpected signing escape hatch %s", key)
+				t.Fatalf("unexpected legacy signing setting %s", key)
 			}
 		}
+
+		assertPodIdentityEnv(t, c)
+		assertTrustBundleMount(t, p, p.ServiceAccountName == controlPlaneName)
 	}
 
 	verbs := map[string]bool{}
@@ -82,16 +87,16 @@ func TestShippingSigning(t *testing.T) {
 			}
 
 			for _, verb := range rule.Verbs {
-				if !slices.Contains([]string{"get", "update", "create", "list", "watch"}, verb) {
+				if !slices.Contains([]string{"get", "update", "create"}, verb) {
 					t.Fatalf("unnecessary Secret verb %s", verb)
 				}
 
 				if verb == "get" || verb == "update" {
-					if !reflect.DeepEqual(rule.ResourceNames, []string{"racer-config-signing", "racer-peer-signing"}) {
-						t.Fatal("unrestricted signing Secret read/update")
+					if !reflect.DeepEqual(rule.ResourceNames, []string{"racer-ca"}) {
+						t.Fatal("CA Secret read/update must be name-restricted")
 					}
 				} else if len(rule.ResourceNames) != 0 {
-					t.Fatal("startup/cache Secret verbs must be namespace-wide")
+					t.Fatal("Secret create must be namespace-wide")
 				}
 
 				verbs[verb] = true
@@ -99,34 +104,24 @@ func TestShippingSigning(t *testing.T) {
 		}
 	}
 
-	if len(verbs) != 5 || !foundBinding {
-		t.Fatal("missing managed signing RBAC")
+	if len(verbs) != 3 || !foundBinding {
+		t.Fatal("missing managed CA RBAC")
 	}
 
-	p := dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec
+	p := dataplane
 	if len(p.Containers) != 1 {
 		t.Fatal("expected one dataplane container")
 	}
 
 	c := p.Containers[0]
 
-	for setting, secret := range map[string]string{"RACER_PEER_KEYS_DIR": "racer-peer-signing", "RACER_CONFIG_KEYS_DIR": "racer-config-signing"} {
-		found := false
-
-		for _, mount := range c.VolumeMounts {
-			if mount.MountPath != envValues(c)[setting] || !mount.ReadOnly || mount.SubPath != "" || mount.SubPathExpr != "" {
-				continue
-			}
-
-			for _, v := range p.Volumes {
-				if v.Name == mount.Name && v.Secret != nil {
-					found = v.Secret.SecretName == secret && reflect.DeepEqual(v.Secret.Items, []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}})
-				}
-			}
-		}
-
-		if !found {
-			t.Fatalf("%s lacks read-only rotating bundle-only mount", setting)
+	for key, want := range map[string]string{
+		"RACER_ENROLL_URL":          "https://racer-controlplane.custom-system.svc:8444/v3/enroll",
+		"RACER_CONTROL_SERVER_NAME": "racer-controlplane.custom-system.svc",
+		"RACER_CONTROL_TOKEN_FILE":  "/var/run/racer-control/token",
+	} {
+		if envValues(c)[key] != want {
+			t.Fatalf("%s = %q, want %q", key, envValues(c)[key], want)
 		}
 	}
 
@@ -147,6 +142,176 @@ func TestShippingSigning(t *testing.T) {
 
 	if !tokenFound {
 		t.Fatal("missing audience-bound control token")
+	}
+
+	tokenMounted := false
+
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == "control-token" && mount.MountPath+"/token" == envValues(c)["RACER_CONTROL_TOKEN_FILE"] && mount.ReadOnly {
+			tokenMounted = true
+		}
+	}
+
+	if !tokenMounted {
+		t.Fatal("control token file is not mounted")
+	}
+}
+
+func assertPodIdentityEnv(t *testing.T, c corev1.Container) {
+	t.Helper()
+
+	for name, field := range map[string]string{"RACER_POD_NAME": "metadata.name", "RACER_POD_NAMESPACE": "metadata.namespace", "RACER_POD_UID": "metadata.uid"} {
+		count := 0
+
+		for _, env := range c.Env {
+			if env.Name != name {
+				continue
+			}
+
+			count++
+
+			if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.APIVersion != "v1" || env.ValueFrom.FieldRef.FieldPath != field {
+				t.Fatalf("%s must use downward API %s", name, field)
+			}
+		}
+
+		if count != 1 {
+			t.Fatalf("expected one %s, got %d", name, count)
+		}
+	}
+}
+
+func TestEnrollmentVerificationRBAC(t *testing.T) {
+	const namespace = "custom-system"
+
+	objects := sharedResources(namespace)
+	allowed := func(account, group, resource, verb, name, ns string) bool {
+		for _, obj := range objects {
+			var (
+				rules []rbacv1.PolicyRule
+				ref   rbacv1.RoleRef
+			)
+
+			switch role := obj.(type) {
+			case *rbacv1.ClusterRole:
+				rules = role.Rules
+				ref = rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}
+			case *rbacv1.Role:
+				if role.Namespace != ns {
+					continue
+				}
+
+				rules = role.Rules
+				ref = rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: role.Name}
+			default:
+				continue
+			}
+
+			bound := false
+
+			for _, binding := range objects {
+				var subjects []rbacv1.Subject
+
+				switch b := binding.(type) {
+				case *rbacv1.ClusterRoleBinding:
+					if b.RoleRef == ref {
+						subjects = b.Subjects
+					}
+				case *rbacv1.RoleBinding:
+					if b.RoleRef == ref && b.Namespace == ns {
+						subjects = b.Subjects
+					}
+				}
+
+				bound = bound || slices.Contains(subjects, rbacv1.Subject{Kind: "ServiceAccount", Name: account, Namespace: namespace})
+			}
+
+			for _, rule := range rules {
+				if bound && slices.Contains(rule.APIGroups, group) && slices.Contains(rule.Resources, resource) && slices.Contains(rule.Verbs, verb) && (len(rule.ResourceNames) == 0 || slices.Contains(rule.ResourceNames, name)) {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	for _, tc := range []struct {
+		group, resource, name, namespace string
+		verbs                            []string
+	}{
+		{"authentication.k8s.io", "tokenreviews", "", "", []string{"create"}},
+		{"", "pods", "actual-pod", namespace, []string{"get", "list", "watch"}},
+		{"", "nodes", "actual-node", "", []string{"get", "list", "watch"}},
+		{unboundedv1alpha3.GroupVersion.Group, "sites", "rack-a", "", []string{"get", "list", "watch"}},
+		{"apps", "daemonsets", "racer-rack-a", namespace, []string{"get"}},
+		{"apps", "replicasets", "racer-controlplane-revision", namespace, []string{"get"}},
+		{"apps", "deployments", controlPlaneName, namespace, []string{"get"}},
+		{"", "secrets", "racer-ca", namespace, []string{"get", "update", "create"}},
+		{"", "configmaps", "racer-trust", namespace, []string{"get", "list", "watch", "create", "update", "delete"}},
+		{"coordination.k8s.io", "leases", "racer-controlplane", namespace, []string{"get", "list", "watch", "create", "update", "patch"}},
+	} {
+		for _, verb := range tc.verbs {
+			if !allowed(controlPlaneName, tc.group, tc.resource, verb, tc.name, tc.namespace) {
+				t.Errorf("controlplane cannot %s %s/%s %s in %q", verb, tc.group, tc.resource, tc.name, tc.namespace)
+			}
+		}
+	}
+
+	for _, account := range []string{controlPlaneName, dataplaneName} {
+		for _, ns := range []string{namespace, "other-namespace"} {
+			for _, name := range []string{"racer-ca", "other-secret", "racer-config-signing", "racer-peer-signing"} {
+				for _, verb := range []string{"get", "update", "list", "watch", "delete", "patch"} {
+					want := account == controlPlaneName && ns == namespace && name == "racer-ca" && (verb == "get" || verb == "update")
+					if got := allowed(account, "", "secrets", verb, name, ns); got != want {
+						t.Errorf("%s %s Secret %s/%s = %v, want %v", account, verb, ns, name, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func assertTrustBundleMount(t *testing.T, pod corev1.PodSpec, optional bool) {
+	t.Helper()
+
+	c := pod.Containers[0]
+	if envValues(c)["RACER_TLS_TRUST_DIR"] != "/var/run/racer-trust" {
+		t.Fatal("missing trust directory setting")
+	}
+
+	found := false
+
+	for _, volume := range pod.Volumes {
+		if volume.Secret != nil {
+			t.Fatal("private or legacy Secret mounted in workload")
+		}
+
+		if volume.Projected != nil {
+			for _, source := range volume.Projected.Sources {
+				if source.Secret != nil {
+					t.Fatal("private or legacy Secret projected into workload")
+				}
+			}
+		}
+
+		if volume.ConfigMap == nil || volume.ConfigMap.Name != "racer-trust" {
+			continue
+		}
+
+		if !reflect.DeepEqual(volume.ConfigMap.Items, []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}}) || ptr.Deref(volume.ConfigMap.Optional, false) != optional {
+			t.Fatal("trust projection must contain only bundle.json with bootstrap-safe optionality")
+		}
+
+		for _, mount := range c.VolumeMounts {
+			if mount.Name == volume.Name && mount.MountPath == "/var/run/racer-trust" && mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+				found = true
+			}
+		}
+	}
+
+	if !found {
+		t.Fatal("missing read-only rotating public trust mount")
 	}
 }
 
@@ -245,7 +410,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		". /bootstrap/identity",
 		"chgrp 65532 /dev/racer",
 		"chmod 2770 /dev/racer",
-		`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
 		"exec /usr/local/bin/racer-dataplane",
 	}, "\n")
 	if command != wantCommand || strings.Join(c.Command, " ") != "/bin/sh -ec" {
@@ -508,13 +673,29 @@ func TestControlPlaneDefaultsAndNamespaceImages(t *testing.T) {
 	}
 
 	c := d.Spec.Template.Spec.Containers[0]
-	if c.Image != "example.test/team/racer-controlplane:v123" || !slices.Contains(c.Args, "-state-namespace=custom") || !slices.Contains(c.Args, "-reserved-management-ports=9090") || c.ReadinessProbe.HTTPGet.Path != "/readyz" || c.ReadinessProbe.HTTPGet.Port.StrVal != "subscription" || c.LivenessProbe.HTTPGet.Path != "/healthz" || c.LivenessProbe.HTTPGet.Port.StrVal != "health" {
+	if c.Image != "example.test/team/racer-controlplane:v123" || !slices.Contains(c.Args, "-state-namespace=custom") || slices.Contains(c.Args, "-reserved-management-ports=9090,9443") || c.ReadinessProbe.HTTPGet.Path != "/readyz" || c.ReadinessProbe.HTTPGet.Port.StrVal != "health" || c.LivenessProbe.HTTPGet.Path != "/healthz" || c.LivenessProbe.HTTPGet.Port.StrVal != "health" {
 		t.Fatal("controlplane image/flags/probes drift")
 	}
 
 	svc := controlService("custom")
-	if !reflect.DeepEqual(svc.Spec.Selector, d.Spec.Template.Labels) || svc.Spec.Ports[0].Port != 8080 || svc.Spec.Ports[0].TargetPort.StrVal != "subscription" || svc.Spec.PublishNotReadyAddresses {
+	if !reflect.DeepEqual(svc.Spec.Selector, d.Spec.Template.Labels) || svc.Spec.PublishNotReadyAddresses {
 		t.Fatal("Service must select serving leader only")
+	}
+
+	if len(svc.Spec.Ports) != 3 || len(c.Ports) != 5 {
+		t.Fatal("expected TLS subscription/enrollment/trust proof Service ports and container-only health/replica proof ports")
+	}
+
+	for name, port := range map[string]int32{"subscription": 8443, "enrollment": 8444, "replica-proof": 8445, "trust-proof": 8446, "health": 8081} {
+		if !slices.Contains(c.Ports, corev1.ContainerPort{Name: name, ContainerPort: port, Protocol: corev1.ProtocolTCP}) {
+			t.Fatalf("missing container port %s:%d", name, port)
+		}
+
+		if name != "health" && name != "replica-proof" && !slices.ContainsFunc(svc.Spec.Ports, func(p corev1.ServicePort) bool {
+			return p.Name == name && p.Port == port && p.TargetPort.StrVal == name && p.Protocol == corev1.ProtocolTCP
+		}) {
+			t.Fatalf("missing Service port %s:%d", name, port)
+		}
 	}
 
 	ds := dataplaneDaemonSet("custom", cfg, testSite("rack-a"))

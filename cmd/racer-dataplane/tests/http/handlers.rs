@@ -3,9 +3,10 @@
 
 use super::*;
 use crate::http_auth::failure_tests::SEMANTICS;
+use crate::tls::{ExpectedPeer, PeerIdentity, TlsContext, TlsProgress, TlsSession};
 use cache::adapter_fixture::page_request;
 use cache::peer_wire::decode_descriptor;
-use http::cache_responses::{accept, request};
+use http::cache_responses::accept;
 
 #[test]
 fn receive_reservation_tracks_candidate_and_colocated_route_rank() {
@@ -70,7 +71,6 @@ fn receive_reservation_tracks_candidate_and_colocated_route_rank() {
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {
-        keys: trust.keys,
         universe: trust.universe,
         node: [node; 32],
         peers: [[peer; 32]].into(),
@@ -78,35 +78,148 @@ fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
 }
 
 fn authenticate_provider(provider: &mut Provider) {
+    // The deterministic transport explicitly models authenticated peer channels.
+    assert!(crate::simulation::current().is_some());
     provider.authentication = Some(peer_policy(2, 3));
     provider.selected = Some(hex(&[3; 32]));
 }
 
 fn peer_response(request: &str, len: usize, checksum: u64, etag: &str) -> String {
-    let policy = peer_policy(3, 2);
-    let wire = request
-        .split_once("\r\n")
-        .unwrap()
-        .1
-        .strip_suffix("\r\n")
-        .unwrap();
-    let incoming =
-        cache::http_metadata::headers(wire, |headers| policy.receive("GET", "/", headers).unwrap());
-    let checksum = format!("{checksum:016x}");
-    let signature = incoming
-        .response(
-            &policy.keys,
-            200,
-            len as u64,
-            &[
-                ("X-Racer-Crc64", checksum.as_bytes()),
-                ("ETag", etag.as_bytes()),
-            ],
-        )
-        .unwrap();
+    assert!(request.contains("\r\nX-Racer-Volume: test-volume\r\n"));
+    assert!(!request.to_ascii_lowercase().contains("x-racer-signature:"));
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nETag: {etag}\r\nX-Racer-Crc64: {checksum}\r\nX-Racer-Signature: {signature}\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nETag: {etag}\r\nX-Racer-Crc64: {checksum:016x}\r\nConnection: close\r\n\r\n"
     )
+}
+
+fn peer_identity(node: u8) -> PeerIdentity {
+    PeerIdentity::new(
+        &hex(&peer_policy(node, 0).universe),
+        &hex(&[node; 32]),
+        "handler-pod",
+    )
+    .unwrap()
+}
+
+struct PeerTls {
+    client: TlsContext,
+    server: TlsContext,
+}
+
+impl PeerTls {
+    fn new() -> Self {
+        let ca = crate::tls::tests::Authority::new();
+        Self {
+            client: ca.context(&peer_identity(2), false),
+            server: ca.context(&peer_identity(3), false),
+        }
+    }
+
+    fn configure(&self, provider: &mut Provider) {
+        provider.authentication = Some(peer_policy(2, 3));
+        provider.selected = Some(hex(&[3; 32]));
+        provider.volume = Some("test-volume".into());
+        provider.peer.as_mut().unwrap().http.set_tls(
+            crate::control::credentials::Provider::for_test(peer_identity(2), self.client.clone()),
+            peer_identity(3),
+        );
+    }
+
+    fn accept(&self, listener: &TcpListener) -> PeerStream {
+        let socket = accept(listener);
+        socket.set_nonblocking(true).unwrap();
+        PeerStream::new(
+            TlsSession::server(
+                &self.server,
+                socket.into(),
+                ExpectedPeer::Identity(peer_identity(2)),
+            )
+            .unwrap(),
+            peer_identity(2),
+        )
+    }
+
+    fn connect(&self, address: std::net::SocketAddr) -> PeerStream {
+        let socket = std::net::TcpStream::connect(address).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        PeerStream::new(
+            TlsSession::client(
+                &self.client,
+                socket.into(),
+                ExpectedPeer::Identity(peer_identity(3)),
+            )
+            .unwrap(),
+            peer_identity(3),
+        )
+    }
+}
+
+// The fixture's blocking facade still drives the native nonblocking TLS session;
+// every handshake/read/write is bounded independently of the io_uring worker.
+struct PeerStream {
+    session: TlsSession,
+    end: Instant,
+}
+
+impl PeerStream {
+    fn new(session: TlsSession, expected: PeerIdentity) -> Self {
+        let mut stream = Self {
+            session,
+            end: deadline(),
+        };
+        assert_eq!(stream.progress(TlsSession::handshake).unwrap(), Some(()));
+        assert_eq!(stream.session.peer_identity(), Some(&expected));
+        stream
+    }
+
+    fn progress<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut TlsSession) -> io::Result<TlsProgress<T>>,
+    ) -> io::Result<Option<T>> {
+        loop {
+            if Instant::now() >= self.end {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match operation(&mut self.session)? {
+                TlsProgress::Complete(value) => return Ok(Some(value)),
+                TlsProgress::Eof => return Ok(None),
+                TlsProgress::WantRead | TlsProgress::WantWrite => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+            }
+        }
+    }
+}
+
+impl std::io::Read for PeerStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        Ok(self.progress(|session| session.read(bytes))?.unwrap_or(0))
+    }
+}
+
+impl std::io::Write for PeerStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.progress(|session| session.write(bytes))?
+            .ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request(stream: &mut (impl std::io::Read + ?Sized)) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+        assert!(
+            bytes.len() <= 16 * 1024,
+            "HTTP fixture header budget exceeded"
+        );
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 #[test]
@@ -526,6 +639,7 @@ fn simulated_handler(target: &str) -> (allocator::Slab, Ring, Handler, cache::Pa
     authenticate_provider(&mut handler.upstream);
     let page = page_request(&mut handler.cache.borrow_mut(), &mut ring, target);
     handler.set_peer(Peer::new("127.0.0.1:2", Some(rdma::test_connection(ring.pool()))).unwrap());
+    PeerTls::new().configure(&mut handler.upstream);
     (slab, ring, handler, page)
 }
 
@@ -959,9 +1073,10 @@ fn rdma_http_backend_chain(ring: &mut Ring) {
         backend: 0,
         completed_bytes: None,
     };
-    authenticate_provider(&mut upstream.provider);
+    let tls = PeerTls::new();
+    tls.configure(&mut upstream.provider);
     let peer_thread = thread::spawn(move || {
-        let mut stream = accept(&peer);
+        let mut stream = tls.accept(&peer);
         assert!(request(&mut stream).starts_with("GET / HTTP/1.1\r\n"));
         stream
             .write_all(
@@ -1020,9 +1135,10 @@ fn metadata_http_with_rdma_available_and_pinned_payloads(ring: &mut Ring) {
             backend: 0,
             completed_bytes: None,
         };
-        authenticate_provider(&mut upstream.provider);
+        let tls = PeerTls::new();
+        tls.configure(&mut upstream.provider);
         let server = thread::spawn(move || {
-            let mut stream = accept(&peer);
+            let mut stream = tls.accept(&peer);
             let request = request(&mut stream);
             {
                 assert!(request.starts_with("GET / HTTP/1.1\r\n"));
@@ -1100,6 +1216,9 @@ fn metadata_http_with_rdma_available_and_pinned_payloads(ring: &mut Ring) {
 
 fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
     use std::io::Read;
+    trait HttpStream: Read + std::io::Write {}
+    impl HttpStream for std::net::TcpStream {}
+    impl HttpStream for PeerStream {}
     let origin = TcpListener::bind("127.0.0.1:0").unwrap();
     let backend = Backend::new(&origin.local_addr().unwrap().to_string(), "test-origin").unwrap();
     let origin_thread = thread::spawn(move || {
@@ -1107,13 +1226,25 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
         assert!(request(&mut socket).starts_with("HEAD /pinned HTTP/1.1\r\n"));
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", crate::conformance::etag(b"1234567")).unwrap();
     });
-    let mut handler = Handler::new(cache(&backend, 1), backend);
-    handler.upstream.authentication = Some(peer_policy(3, 2));
-    let listener = http::Listener::bind(
+    let mut handler = Handler::new(cache(&backend, 1), backend.clone());
+    let client_handler =
+        Handler::shared(handler.cache.clone(), backend.clone(), backend.namespace());
+    let client_listener = http::Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
         std::num::NonZeroU32::new(16).unwrap(),
     )
     .unwrap();
+    let client_address = client_listener.local_addr().unwrap();
+    let mut client_server =
+        http::Server::new(client_listener, client_handler, http::Config::default());
+    handler.upstream.authentication = Some(peer_policy(3, 2));
+    let tls = PeerTls::new();
+    let mut listener = http::Listener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        std::num::NonZeroU32::new(16).unwrap(),
+    )
+    .unwrap();
+    listener.set_tls(tls.server.clone(), ExpectedPeer::Identity(peer_identity(2)));
     let address = listener.local_addr().unwrap();
     let mut server = http::Server::new(listener, handler, http::Config::default());
     let mut pinned = Vec::new();
@@ -1122,19 +1253,22 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
     }
     let client = thread::spawn(move || {
         for peer in [false, false, true, true] {
-            let mut socket = std::net::TcpStream::connect(address).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            let mut socket: Box<dyn HttpStream> = if peer {
+                Box::new(tls.connect(address))
+            } else {
+                let socket = std::net::TcpStream::connect(client_address).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                Box::new(socket)
+            };
             let mut fields = Vec::new();
             if peer {
                 fields.push((
                     "X-Racer-Fault".to_owned(),
                     hex(b"RF04\x88\x13\0\0RF05\0/pinned").into_bytes(),
                 ));
-                peer_policy(2, 3)
-                    .request([3; 32], "GET", "/", &mut fields)
-                    .unwrap();
+                fields.push(("X-Racer-Volume".to_owned(), b"test-volume".to_vec()));
             }
             write!(
                 socket,
@@ -1171,6 +1305,7 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
         assert!(Instant::now() < end);
         ring.progress().unwrap();
         server.handler_mut().poll_background(ring, 16).unwrap();
+        client_server.poll(ring, 16).unwrap();
         server.poll(ring, 16).unwrap();
         thread::yield_now();
     }
@@ -1178,6 +1313,8 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
     origin_thread.join().unwrap();
     assert!(ring.pool().private_fill().is_err());
     drop(pinned);
+    client_server.shutdown(ring).unwrap();
+    client_server.handler_mut().shutdown(ring).unwrap();
     server.shutdown(ring).unwrap();
     server.handler_mut().shutdown(ring).unwrap();
 }
@@ -1185,7 +1322,6 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
 fn rdma_completion_and_http_fallback(ring: &mut Ring) {
     let backend = Backend::new("127.0.0.1:1", "test-origin").unwrap();
     let mut handler = Handler::new(cache(&backend, 1), backend);
-    authenticate_provider(&mut handler.upstream);
     let page = page_request(&mut handler.cache.borrow_mut(), ring, "//rdma%2f?x=1&x=2");
     let wire = descriptor(&UpstreamRequest::PeerPage(page.clone())).unwrap();
     let decoded = handler
@@ -1198,6 +1334,8 @@ fn rdma_completion_and_http_fallback(ring: &mut Ring) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = listener.local_addr().unwrap().to_string();
     handler.set_peer(Peer::new(&url, Some(rdma::test_connection(ring.pool()))).unwrap());
+    let tls = PeerTls::new();
+    tls.configure(&mut handler.upstream);
     assert_eq!(handler.connections.len(), 1);
     let (authority, dest) = destination(ring, *page.key());
     let exchange = handler
@@ -1262,7 +1400,7 @@ fn rdma_completion_and_http_fallback(ring: &mut Ring) {
     drop(authority);
     let (authority, dest) = destination(ring, *page.key());
     let server = thread::spawn(move || {
-        let mut stream = accept(&listener);
+        let mut stream = tls.accept(&listener);
         let request = request(&mut stream);
         assert!(request.starts_with("GET / HTTP/1.1\r\n"));
         let encoded = request
@@ -1315,6 +1453,139 @@ fn rdma_completion_and_http_fallback(ring: &mut Ring) {
     drop(fill);
     server.join().unwrap();
     handler.shutdown(ring).unwrap();
+}
+
+#[test]
+fn dst_rotation_retry_preserves_request_owner_and_candidate_budget() {
+    use crate::negotiation::control_wire::{Frame, HEADER};
+
+    for (kind, wrong_candidate) in [(7, false), (4, false), (7, true)] {
+        let world = crate::simulation::World::new(164);
+        let _scope = world.enter();
+        let (slab, mut ring, mut handler, page) = simulated_handler("/rotation-retry");
+        let local = rdma::test_transport(ring.pool());
+        let remote = rdma::test_transport(ring.pool());
+        let a = local.prepare([7; 16], 0, 1).unwrap();
+        let b = remote.prepare([7; 16], 0, 1).unwrap();
+        let remote_session = b.offer().nonce;
+        let ((offer_a, channel_a), (offer_b, channel_b)) =
+            crate::negotiation::test_channels(a.offer(), b.offer());
+        let ac = Rc::new(a.connect_authenticated(offer_a, channel_a, 0).unwrap());
+        let bc = b.connect_authenticated(offer_b, channel_b, 0).unwrap();
+        handler.upstream.peer.as_mut().unwrap().rdma = Some(ac.clone());
+        let candidate_end = world.now() + Duration::from_secs(3);
+        let (authority, dest) = destination(&ring, *page.key());
+        let mut exchange = handler
+            .upstream
+            .start(
+                UpstreamRequest::PeerPage(page.clone()),
+                dest,
+                candidate_end,
+                &mut ring,
+            )
+            .unwrap();
+        let Exchange::Grant {
+            attempt,
+            connection,
+            ..
+        } = &mut exchange
+        else {
+            panic!("expected RDMA request")
+        };
+        let identity = [0; 32];
+        *attempt = Some(Attempt {
+            route: AttemptRoute {
+                cursor: crate::routing::Cursor::decode(&[0; crate::routing::Cursor::LEN]).unwrap(),
+                candidate: 3,
+                endpoint: "127.0.0.1:2".parse().unwrap(),
+                final_hop: true,
+                context: String::new(),
+            },
+            owner: Some(handler.upstream.owners.acquire(identity, 3).unwrap()),
+        });
+        let (transport, qp) = connection.test_endpoint();
+        let post = qp.posts().into_iter().find(|post| post.kind == 1).unwrap();
+        let observation = transport.test_observe();
+        let wire = &observation
+            .sends
+            .iter()
+            .find(|(id, _)| *id == post.id)
+            .unwrap()
+            .1;
+        let mut frame = Frame::decode(wire).unwrap();
+        let mut metadata = blake3::hash(&wire[HEADER..]).as_bytes().to_vec();
+        metadata.extend(
+            PeerFailure {
+                identity,
+                candidate: if wrong_candidate { 4 } else { 3 },
+                reason: PeerReason::Unavailable,
+                evidence: None,
+            }
+            .encode(),
+        );
+        frame.kind = kind;
+        frame.session = remote_session;
+        frame.metadata = metadata.len() as u16;
+        let mut reply = vec![0; HEADER];
+        frame.encode(&mut reply);
+        reply.extend(metadata);
+        ac.test_pump(&bc, false);
+        transport.test_inject(&reply).unwrap();
+        let result = handler.upstream.poll(exchange, &mut ring);
+        if kind == 4 {
+            assert!(
+                result.is_err(),
+                "ordinary Unavailable must retain its failure semantics"
+            );
+        } else {
+            let ExchangeProgress::RetryPeer { exchange } = result.unwrap() else {
+                panic!("expected HTTP recovery")
+            };
+            let Exchange::RecoverHttp(UpstreamRequest::PeerPage(saved), Some(attempt)) = &exchange
+            else {
+                panic!("lost request or owner permit")
+            };
+            assert_eq!(saved.key(), page.key());
+            assert_eq!(attempt.route.candidate, 3);
+            assert!(attempt.owner.is_some());
+            assert!(handler.upstream.owners.evidence(identity, 3).is_none());
+            assert_eq!(ac.is_healthy(), !wrong_candidate);
+            if !wrong_candidate {
+                assert!(
+                    handler
+                        .upstream
+                        .peer
+                        .as_ref()
+                        .unwrap()
+                        .breaker
+                        .try_acquire()
+                        .is_ok()
+                );
+            }
+            drop(authority);
+            // Recovery must consume the remaining original candidate budget,
+            // never mint another deadline after rotation.
+            world.advance(Duration::from_secs(3));
+            let (authority, destination) = destination(&ring, *page.key());
+            assert!(
+                handler
+                    .upstream
+                    .resume_peer(exchange, destination, candidate_end, &mut ring)
+                    .is_err()
+            );
+            drop(authority);
+            handler.shutdown(&mut ring).unwrap();
+            drop((handler, ring, slab, transport, qp, ac, bc, local, remote));
+            world.run_tasks();
+            world.assert_clean();
+            continue;
+        }
+        drop(authority);
+        handler.shutdown(&mut ring).unwrap();
+        drop((handler, ring, slab, transport, qp, ac, bc, local, remote));
+        world.run_tasks();
+        world.assert_clean();
+    }
 }
 
 #[test]

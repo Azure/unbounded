@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -34,7 +33,7 @@ func TestP2PCacheGenerationIdentityAndWithdrawal(t *testing.T) {
 	build := func(previous *generation, caches ...racerapi.P2PCache) *generation {
 		t.Helper()
 
-		g, err := buildCacheGeneration("default", previous, []corev1.Node{*node}, []corev1.Pod{*pod}, caches, nil, racer.SocketRoot)
+		g, err := buildCacheGeneration("default", previous, []corev1.Node{*node}, []corev1.Pod{*pod}, caches, racer.SocketRoot)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,7 +54,7 @@ func TestP2PCacheGenerationIdentityAndWithdrawal(t *testing.T) {
 	cache.UID = "replacement-uid"
 
 	replacement := build(empty, *cache)
-	if replacement.Volume.ID == first.Volume.ID || replacement.Volume.Port != first.Volume.Port || replacement.Volume.CacheSocket != first.Volume.CacheSocket {
+	if replacement.Volume.ID == first.Volume.ID || replacement.Volume.CacheSocket != first.Volume.CacheSocket {
 		t.Fatal("recreation did not separate identity from endpoint lifetime")
 	}
 }
@@ -68,7 +67,7 @@ func TestP2PCacheStatusMissingParticipantsAndFreshness(t *testing.T) {
 	cache := cacheFixture()
 	site := machina.Site{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: machina.SiteSpec{Components: machina.SiteComponents{Racer: &machina.RacerComponentSpec{SiteComponentSpec: machina.SiteComponentSpec{Enabled: ptr.To(true)}}}}}
 
-	g, err := buildCacheGeneration("default", nil, []corev1.Node{*node}, []corev1.Pod{*pod}, []racerapi.P2PCache{*cache}, nil, racer.SocketRoot)
+	g, err := buildCacheGeneration("default", nil, []corev1.Node{*node}, []corev1.Pod{*pod}, []racerapi.P2PCache{*cache}, racer.SocketRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +127,123 @@ func TestP2PCacheStatusMissingParticipantsAndFreshness(t *testing.T) {
 	}
 }
 
+func TestP2PCacheStatusDurablePublishedGeneration(t *testing.T) {
+	ctx := context.Background()
+	node, pod, cache := fixtures()
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	extra := cache.DeepCopy()
+	extra.Name, extra.UID = "z-extra", "extra-uid"
+	kube := fakeKube(node, pod, cache, extra)
+
+	topology := newTestReconciler(kube)
+	if _, err := topology.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "default"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile indexes before incrementing the candidate revision, then commits
+	// and publishes it. Exercise that path rather than synthesizing an index.
+	index := topology.server.source.topologies[identityBytes("universe", "default")]
+
+	roll, err := topology.server.rolloutFor(ctx, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for phase := uint32(2); phase <= 4; phase++ {
+		if err := topology.server.persistPhase(ctx, "default", roll, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	statusController := &cacheStatusReconciler{client: kube, server: topology.server}
+	check := func(t *testing.T, ready bool) {
+		t.Helper()
+
+		roll.acks[index.g.Nodes[node.Name].ID] = rolloutAck{boot: "boot", phase: 4, healthy: true, seen: time.Now()}
+
+		if _, err := statusController.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cache)}); err != nil {
+			t.Fatal(err)
+		}
+
+		var actual racerapi.P2PCache
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(cache), &actual); err != nil {
+			t.Fatal(err)
+		}
+
+		wantParticipants := int32(1)
+		if roll.invalid {
+			wantParticipants = 0
+		}
+
+		if actual.Status.Participants.Desired != 1 || actual.Status.Participants.Ready != wantParticipants || meta.IsStatusConditionTrue(actual.Status.Conditions, racerapi.ConditionReady) != ready {
+			t.Fatalf("want Ready=%v with %d ready participants: %+v", ready, wantParticipants, actual.Status)
+		}
+	}
+	check(t, true)
+	check(t, true) // Reuse the published digest on subsequent status reconciliations.
+
+	if roll.pointer.Name != stateName("default")+"-rollout" || roll.pointer.Data["manifest"] != "" {
+		t.Fatal("fixture must use the production rollout object, not the commit pointer")
+	}
+
+	// A metadata-only commit-pointer update changes its RV, not publication identity.
+	_, pointer, err := topology.store.load(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pointer.Annotations = map[string]string{"review": "metadata-only"}
+	if err := kube.Update(ctx, pointer); err != nil {
+		t.Fatal(err)
+	}
+
+	check(t, true)
+
+	for _, test := range []struct {
+		name string
+		edit func(*generation)
+	}{
+		{"primary payload at same revision", func(g *generation) { g.Volume.OriginSocket = "/dev/racer/changed/origin" }},
+		{"additional payload at same revision", func(g *generation) { g.Additional[0].Volume.Cache++ }},
+		{"withdrawal at same revision", func(g *generation) { g.Withdrawn = map[string]bool{"other-cache": true} }},
+		{"new revision", func(g *generation) { g.Revision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate, pointer, err := topology.store.load(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			test.edit(candidate)
+
+			if err := topology.store.commit(ctx, candidate, pointer); err != nil {
+				t.Fatal(err)
+			}
+
+			check(t, false)
+
+			_, pointer, err = topology.store.load(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := topology.store.commit(ctx, index.g, pointer); err != nil {
+				t.Fatal(err)
+			}
+
+			check(t, true)
+		})
+	}
+
+	roll.invalid = true
+
+	check(t, false)
+
+	roll.invalid = false
+
+	check(t, true)
+}
+
 func TestP2PCacheMultiSiteWithdrawal(t *testing.T) {
 	cache := cacheFixture()
 	server := &Server{rollouts: map[string]*rollout{}}
@@ -152,7 +268,7 @@ func TestP2PCacheMultiSiteWithdrawal(t *testing.T) {
 
 		nodes, pods = append(nodes, *node), append(pods, *pod)
 
-		g, err := buildCacheGeneration(name, nil, []corev1.Node{*node}, []corev1.Pod{*pod}, []racerapi.P2PCache{*cache}, nil, racer.SocketRoot)
+		g, err := buildCacheGeneration(name, nil, []corev1.Node{*node}, []corev1.Pod{*pod}, []racerapi.P2PCache{*cache}, racer.SocketRoot)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +302,75 @@ func TestP2PCacheMultiSiteWithdrawal(t *testing.T) {
 	key := identityBytes("universe", "west")
 	previous := server.source.topologies[key].g
 
-	withdrawn, err := buildCacheGeneration("west", previous, nodes, pods[1:], nil, nil, racer.SocketRoot)
+	t.Run("durable inventory survives missing publications", func(t *testing.T) {
+		objects := []client.Object{cache.DeepCopy()}
+		for i := range sites {
+			objects = append(objects, sites[i].DeepCopy(), nodes[i].DeepCopy(), pods[i].DeepCopy())
+		}
+
+		kube := fakeKube(objects...)
+
+		store := stateStore{client: kube, namespace: "state"}
+		for _, topology := range server.source.topologies {
+			if err := store.commit(context.Background(), topology.g, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		fresh := &Server{controlStore: store, rollouts: map[string]*rollout{}}
+
+		east, _, err := store.load(context.Background(), "east")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		index, err := indexGeneration(east)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := fresh.install(index); err != nil {
+			t.Fatal(err)
+		}
+
+		eastRoll, err := fresh.rolloutFor(context.Background(), index)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := fresh.persistPhase(context.Background(), "east", eastRoll, 4); err != nil {
+			t.Fatal(err)
+		}
+
+		eastRoll.acks = server.rollouts["east"].acks
+		statusController := &cacheStatusReconciler{client: kube, server: fresh}
+		check := func() {
+			t.Helper()
+
+			if _, err := statusController.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: cache.Name}}); err != nil {
+				t.Fatal(err)
+			}
+
+			var actual racerapi.P2PCache
+			if err := kube.Get(context.Background(), types.NamespacedName{Name: cache.Name}, &actual); err != nil {
+				t.Fatal(err)
+			}
+
+			if actual.Status.Participants.Ready != 1 || meta.IsStatusConditionTrue(actual.Status.Conditions, racerapi.ConditionReady) {
+				t.Fatalf("unloaded west falsely converged: %+v", actual.Status)
+			}
+		}
+		check()
+
+		if err := fresh.install(server.source.topologies[key]); err != nil {
+			t.Fatal(err)
+		}
+		// An ambiguous commit unpublishes west without removing its durable pointer.
+		delete(fresh.source.topologies, key)
+		check()
+	})
+
+	withdrawn, err := buildCacheGeneration("west", previous, nodes, pods[1:], nil, racer.SocketRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,15 +400,61 @@ func TestP2PCacheMultiSiteWithdrawal(t *testing.T) {
 	if !meta.IsStatusConditionTrue(status.Conditions, racerapi.ConditionReady) {
 		t.Fatalf("retired withdrawal not converged: %+v", status)
 	}
+
+	prior, err := indexGeneration(previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := marshalSnapshot(prior.snapshot(previous.Nodes["west"].ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wildcard := forwardDecision{Snapshot: data, PodUID: previous.Nodes["west"].PodUID}
+	bound := wildcard
+	bound.Boot = identity("boot", "west")
+	setHistory := func(entries ...forwardDecision) {
+		t.Helper()
+
+		raw, err := encodeForwards(entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		roll.pointer = &corev1.ConfigMap{Data: map[string]string{"forwards": raw}}
+		if _, err := roll.forwardHistory("west"); err != nil {
+			t.Fatal("invalid test forward history", err)
+		}
+	}
+	setHistory(wildcard, bound)
+
+	status = r.status(cache, sites, nodes, pods, now)
+	if meta.IsStatusConditionTrue(status.Conditions, racerapi.ConditionReady) {
+		t.Fatal("bound retirement obligation ignored")
+	}
+
+	setHistory(wildcard)
+
+	status = r.status(cache, sites, nodes, pods, now)
+	if !meta.IsStatusConditionTrue(status.Conditions, racerapi.ConditionReady) {
+		t.Fatal("retained wildcard prevented completed withdrawal")
+	}
+
+	roll.acks = map[string]rolloutAck{}
+
+	status = r.status(cache, sites, nodes, pods, now)
+	if meta.IsStatusConditionTrue(status.Conditions, racerapi.ConditionReady) {
+		t.Fatal("controller restart must require fresh withdrawal acknowledgment")
+	}
 }
 
-func TestP2PCachePeerPortHistoryAndReservations(t *testing.T) {
+func TestP2PCacheSocketIdentityAndValidation(t *testing.T) {
 	a, b := cacheFixture(), cacheFixture()
 	a.Name, a.UID = "a", "a-uid"
 	b.Name, b.UID = "b", "b-uid"
-	reserved := reservedPorts{10000: true}
 	build := func(previous *generation, caches ...racerapi.P2PCache) (*generation, error) {
-		return buildCacheGeneration("default", previous, nil, nil, caches, reserved, racer.SocketRoot)
+		return buildCacheGeneration("default", previous, nil, nil, caches, racer.SocketRoot)
 	}
 
 	first, err := build(nil, *b, *a)
@@ -237,8 +467,8 @@ func TestP2PCachePeerPortHistoryAndReservations(t *testing.T) {
 		t.Fatal("allocation depends on list order", err)
 	}
 
-	if first.Ports["a"] != 10001 || first.Ports["b"] != 10002 {
-		t.Fatal(first.Ports)
+	if first.Volume.CacheSocket != "/dev/racer/a/cache" || first.Additional[0].Volume.CacheSocket != "/dev/racer/b/cache" {
+		t.Fatal("cache socket paths are not derived from sorted names")
 	}
 
 	withdrawn, err := build(first)
@@ -249,23 +479,13 @@ func TestP2PCachePeerPortHistoryAndReservations(t *testing.T) {
 	a.UID = "recreated"
 
 	returned, err := build(withdrawn, *a)
-	if err != nil || returned.Volume.Port != 10001 {
-		t.Fatal("lost historical reservation", err)
+	if err != nil || returned.Volume.CacheSocket != first.Volume.CacheSocket || returned.Volume.ID == first.Volume.ID {
+		t.Fatal("recreation lost socket identity or reused cache UID", err)
 	}
 
-	reserved[10001] = true
-
+	a.Name = "invalid/name"
 	if _, err := build(returned, *a); err == nil {
-		t.Fatal("management reservation collision accepted")
-	}
-
-	full := &generation{Ports: map[string]int32{}}
-	for port := int32(10000); port <= 29999; port++ {
-		full.Ports[fmt.Sprint(port)] = port
-	}
-
-	if _, err := build(full, *a); err == nil {
-		t.Fatal("exhausted peer range accepted")
+		t.Fatal("invalid socket name accepted")
 	}
 }
 

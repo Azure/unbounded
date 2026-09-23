@@ -14,16 +14,20 @@ CRDs. A `unbounded-cloud.io/v1alpha3` Site with `components.racer.enabled: true`
 causes the operator to create the shared control plane and per-Site DaemonSet.
 No standalone Racer installation manifests are applied.
 
-The suite preserves the upstream checks for:
+The suite checks:
 
-- Successful bootstrap, signed `/v2` configuration and coordinated activation;
-  removed legacy endpoint rejection and unauthenticated `/v2` rejection.
+- Successful bootstrap, mTLS `/v3` configuration and coordinated activation;
+  unauthenticated control requests rejected at the TLS boundary.
 - Site-selected P2PCaches, activation status, Unix cache and origin sockets,
   and functioning dataplanes with deliberately unusable DNS.
 - HEAD, GET, ranges, missing objects, exact raw request targets, cache hits,
   single-owner origin fetches, and authenticated peer forwarding.
-- Two staged signing-key rotations with continuous traffic and leader failure;
-  signing Secret persistence through leader replacement and controller restart.
+- CA overlap and issuer switch, requested through the `racer-trust` rotation
+  annotation, with traffic during polling and leader failure; renewed contexts
+  installed on every worker without dataplane restarts. Production 24-hour leaves
+  keep the old root trusted, and the test asserts it has not retired early.
+- CA Secret identity and authority persistence through leader replacement and
+  controller restart.
 - Local origin process replacement without invalidating warm cache, cache-generation
   changes, independent volume addition/removal, and dataplane replacement with
   stable bootstrap identity.
@@ -33,6 +37,16 @@ Sites, assert isolated active caches and participant status, disable the second
 Site, and return the Node to the first Site. Membership uses
 `unbounded-cloud.io/site` and `racer.unbounded-cloud.io/exclude=true`; no Node
 universe or deployment-profile opt-in is installed.
+
+Full old-root retirement is covered separately by
+`cmd/racer-controlplane`'s `TestProductionCARotationTraffic`. It uses two real
+Rust daemons, production enrollment/proof handlers, fake Kubernetes/TokenReview,
+short-lived leaves, and continuous Go SDK reads through retirement and renewal.
+Set `RACER_DATAPLANE_BINARY` to the production daemon's absolute path, or use
+`make racer-crosslang-test`, which also sets `RACER_COORDINATION_TEST_BIN` for the
+Rust lib-test coordination children. Use workspace-local ext4 `TMPDIR` and the
+dataplane's core, io_uring, and locked-memory prerequisites. The campaign skips
+without the binary variable; it does not establish live Kubernetes coverage.
 
 `TestVLLMS3` uses independent CPU vLLM clients on the two worker networks. It
 loads actual safetensors into parameters, verifies exact tensors and inference,
@@ -62,12 +76,17 @@ the real net workloads are embedded even on a fresh checkout.
   cgroup v2, 4 KiB pages, ext4 scratch storage, NUMA memory binding, at least two
   distinct physical cores in the participating NUMA node, and permission to
   raise memlock to 256 MiB. Each worker dataplane and its bootstrap retain
-   requests/limits of 3 CPUs and 4 GiB. Allow capacity for Kubernetes and fixtures.
+  requests/limits of 3 CPUs and 4 GiB. Allow capacity for Kubernetes and fixtures.
 - Enough disk for root-context image builds and kind images. The vLLM CPU image
   is large. Allow space for each worker's 128 MiB test slab.
 - Enough host inotify instances for three additional kind nodes. Exhaustion can
   prevent systemd from booting before an API server exists.
 - Registry access for the base images and Python dependencies, or cached layers.
+
+Native dataplane builds require
+`build-essential libibverbs-dev libssl-dev pkg-config`. OpenSSL 3.0 supports
+encrypted software TLS. kTLS eligibility requires OpenSSL >= 3.5 and
+Linux >= 6.14; these e2e assertions do not require or prove offload.
 
 The main dataplane remains **Unconfined**, drops capabilities except
 `SYS_RESOURCE`, and sets memlock before starting `/usr/local/bin/racer-dataplane`.
@@ -76,9 +95,9 @@ Bootstrap uses the existing
 shipping `/racer-*` binaries. No custom seccomp profile is installed or mounted.
 
 Workload overrides select local images, reduce control-plane CPU/memory requests,
-shorten signing propagation to two minutes, disable dataplane DNS, and select
-a smaller slab on an additional ext4 hostPath. The operator's original volume
-is preserved because overrides protect declared volume identities. Optional
+disable dataplane DNS, and select a smaller slab on an additional ext4 hostPath.
+The operator's original volume is preserved because overrides protect declared
+volume identities. Optional
 Site components are explicitly disabled. Since net is an unconditional cluster
 singleton, its Deployment is scaled to zero and its DaemonSet gets an unmatched
 node selector through overrides, preserving kind's CNI.
@@ -155,10 +174,10 @@ before cluster creation. CI execution itself must still be verified after push.
   Build `images/racer-loadgen/Containerfile` from the root, make the image
   available on nodes, and tune workload size before applying.
 
-## Historical validation status (2026-09-21, before P2PCache/UDS)
+## Historical validation status (2026-09-21, before P2PCache/UDS and mTLS)
 
 The results below describe the earlier Service-based revision. They do not
-establish live Kubernetes coverage of the P2PCache/UDS implementation.
+establish live Kubernetes coverage of the P2PCache/UDS and mTLS implementation.
 
 - E2E-tagged compilation, fixture contract, operator fixture-plan check, and
   scoped Go lint passed using `GOTOOLCHAIN=go1.26.6`.

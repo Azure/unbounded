@@ -761,7 +761,7 @@ e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract)$$' ./e2e/racer/...
 
-e2e-racer: ## Run real-operator deployment, signed protocol, and Site membership e2e
+e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
 
 e2e-racer-vllm: ## Opt-in vLLM CPU/S3 end-to-end suite (requires large external images)
@@ -773,7 +773,7 @@ racer-controlplane-build: ## Build the Racer control plane without tests
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
 
-racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, libibverbs-dev)
+racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, pkg-config, libibverbs-dev, libssl-dev)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane
 	@mkdir -p bin
 	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane bin/

@@ -157,12 +157,13 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 
 func TestNoOpWritesDriftAndControllerOwnedState(t *testing.T) {
 	writes := 0
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-config-signing", Namespace: "custom"}, Data: map[string][]byte{"private": []byte("keep")}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-ca", Namespace: "custom"}, Data: map[string][]byte{"private": []byte("keep")}}
 	state := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "racer-state", Namespace: "custom"}, Data: map[string]string{"manifest": "keep"}}
+	trust := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "racer-trust", Namespace: "custom"}, Data: map[string]string{"bundle.json": "keep"}}
 	env := testEnv(t, interceptor.Funcs{Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 		writes++
 		return c.Apply(ctx, obj, opts...)
-	}}, secret, state)
+	}}, secret, state, trust)
 	site := testSite("rack-a")
 	first := combinedPlan(t, env, site)
 
@@ -236,6 +237,7 @@ func TestNoOpWritesDriftAndControllerOwnedState(t *testing.T) {
 	var (
 		gotSecret corev1.Secret
 		gotState  corev1.ConfigMap
+		gotTrust  corev1.ConfigMap
 	)
 
 	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(secret), &gotSecret); err != nil {
@@ -248,6 +250,14 @@ func TestNoOpWritesDriftAndControllerOwnedState(t *testing.T) {
 
 	if !reflect.DeepEqual(gotSecret.Data, secret.Data) || !reflect.DeepEqual(gotState.Data, state.Data) || len(gotSecret.OwnerReferences) != 0 || len(gotState.OwnerReferences) != 0 {
 		t.Fatal("operator changed controller-owned durable state")
+	}
+
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(trust), &gotTrust); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(gotTrust.Data, trust.Data) || len(gotTrust.OwnerReferences) != 0 {
+		t.Fatal("operator changed controller-owned public trust")
 	}
 }
 

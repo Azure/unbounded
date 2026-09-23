@@ -99,32 +99,8 @@ func podAvailable(p *corev1.Pod) bool {
 	return p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning && ip != nil && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsLoopback() && !ip.Equal(net.IPv4bcast)
 }
 
-// Reservations are deployment policy, not allocation history. Always retain the
-// default during rolling changes; nil also reserves 9090.
-type reservedPorts map[int32]bool
-
-func (ports reservedPorts) contains(port int32) bool { return port == 9090 || ports[port] }
-
-func parseReservedPorts(text string) (reservedPorts, error) {
-	ports := reservedPorts{}
-
-	for _, field := range strings.Split(text, ",") {
-		port, err := strconv.ParseUint(field, 10, 16)
-		if err != nil || port == 0 || ports[int32(port)] {
-			return nil, fmt.Errorf("reserved-management-ports must be distinct comma-separated ports in 1..65535")
-		}
-
-		ports[int32(port)] = true
-	}
-
-	return ports, nil
-}
-
-func buildInventory(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, ports map[string]int32) (*generation, error) {
-	g := &generation{Format: generationFormat, Universe: name, Nodes: map[string]member{}, SlotHistory: map[string]uint32{}, Ports: map[string]int32{}}
-	for id, port := range ports {
-		g.Ports[id] = port
-	}
+func buildInventory(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod) (*generation, error) {
+	g := &generation{Format: generationFormat, Universe: name, Nodes: map[string]member{}, SlotHistory: map[string]uint32{}}
 
 	if previous != nil {
 		podKeys := map[string]types.NamespacedName{}

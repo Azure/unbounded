@@ -80,7 +80,7 @@ func roleBinding(name, namespace, account string) *rbacv1.RoleBinding {
 }
 
 // sharedResources contains only operator-owned installation resources. The Racer
-// controller owns runtime ConfigMaps, leader Leases and signing Secrets; emitting
+// controller owns runtime ConfigMaps, leader Leases and the CA Secret; emitting
 // any of those here would replace durable state or rotate identities on upgrade.
 func sharedResources(namespace string) []client.Object {
 	return []client.Object{
@@ -99,8 +99,9 @@ func sharedResources(namespace string) []client.Object {
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 			rbacv1.PolicyRule{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
-			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"racer-config-signing", "racer-peer-signing"}, Verbs: []string{"get", "update"}},
-			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create", "list", "watch"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"racer-ca"}, Verbs: []string{"get", "update"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create"}},
+			rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "replicasets", "deployments"}, Verbs: []string{"get"}},
 		),
 		roleBinding(stateRoleName, namespace, controlPlaneName),
 		serviceAccount(dataplaneName, namespace),
@@ -115,7 +116,11 @@ func sharedResources(namespace string) []client.Object {
 func controlService(namespace string) *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: metadata(controlPlaneName, namespace, controlPlaneName),
-		Spec: corev1.ServiceSpec{Selector: map[string]string{componentLabel: controlPlaneName}, Ports: []corev1.ServicePort{{Port: 8080, TargetPort: intstr.FromString("subscription"), Protocol: corev1.ProtocolTCP}}},
+		Spec: corev1.ServiceSpec{Selector: map[string]string{componentLabel: controlPlaneName}, Ports: []corev1.ServicePort{
+			{Name: "subscription", Port: 8443, TargetPort: intstr.FromString("subscription"), Protocol: corev1.ProtocolTCP},
+			{Name: "enrollment", Port: 8444, TargetPort: intstr.FromString("enrollment"), Protocol: corev1.ProtocolTCP},
+			{Name: "trust-proof", Port: 8446, TargetPort: intstr.FromString("trust-proof"), Protocol: corev1.ProtocolTCP},
+		}},
 	}
 }
 
@@ -133,12 +138,16 @@ func controlDeployment(namespace string, cfg component.Config) *appsv1.Deploymen
 				ServiceAccountName: controlPlaneName,
 				Containers: []corev1.Container{{
 					Name: "controller", Image: cfg.Image(controlPlaneName),
-					Args:           []string{"-state-namespace=" + namespace, "-reserved-management-ports=9090"},
-					Ports:          []corev1.ContainerPort{{Name: "subscription", ContainerPort: 8080, Protocol: corev1.ProtocolTCP}, {Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP}},
-					ReadinessProbe: httpProbe("/readyz", intstr.FromString("subscription")),
+					Args:           []string{"-state-namespace=" + namespace},
+					Env:            append(podIdentityEnv(), corev1.EnvVar{Name: "RACER_TLS_TRUST_DIR", Value: "/var/run/racer-trust"}),
+					Ports:          []corev1.ContainerPort{{Name: "subscription", ContainerPort: 8443, Protocol: corev1.ProtocolTCP}, {Name: "enrollment", ContainerPort: 8444, Protocol: corev1.ProtocolTCP}, {Name: "replica-proof", ContainerPort: 8445, Protocol: corev1.ProtocolTCP}, {Name: "trust-proof", ContainerPort: 8446, Protocol: corev1.ProtocolTCP}, {Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP}},
+					ReadinessProbe: httpProbe("/readyz", intstr.FromString("health")),
 					LivenessProbe:  httpProbe("/healthz", intstr.FromString("health")),
 					Resources:      corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("512Mi")}},
+					VolumeMounts:   []corev1.VolumeMount{trustMount()},
 				}},
+				// The controller creates the trust bundle on the first startup.
+				Volumes: []corev1.Volume{trustVolume(true)},
 			}},
 		},
 	}
@@ -150,6 +159,14 @@ func httpProbe(path string, port intstr.IntOrString) *corev1.Probe {
 
 func fieldEnv(name, field string) corev1.EnvVar {
 	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: field}}}
+}
+
+func podIdentityEnv() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		fieldEnv("RACER_POD_NAME", "metadata.name"),
+		fieldEnv("RACER_POD_NAMESPACE", "metadata.namespace"),
+		fieldEnv("RACER_POD_UID", "metadata.uid"),
+	}
 }
 
 func securityContext(bootstrap bool) *corev1.SecurityContext {
@@ -201,17 +218,18 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
 			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
-			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},
 		SecurityContext: securityContext(false), Resources: dataplaneResources(false),
-		Env: []corev1.EnvVar{
+		Env: append(podIdentityEnv(), []corev1.EnvVar{
 			{Name: "RACER_CONTROL_TOKEN_FILE", Value: "/var/run/racer-control/token"},
-			{Name: "RACER_PEER_KEYS_DIR", Value: "/var/run/racer-peer-signing"},
-			{Name: "RACER_CONFIG_KEYS_DIR", Value: "/var/run/racer-config-verify"},
+			{Name: "RACER_TLS_TRUST_DIR", Value: "/var/run/racer-trust"},
+			{Name: "RACER_ENROLL_URL", Value: "https://racer-controlplane." + namespace + ".svc:8444/v3/enroll"},
+			{Name: "RACER_CONTROL_SERVER_NAME", Value: "racer-controlplane." + namespace + ".svc"},
 			fieldEnv("RACER_POD_IP", "status.podIP"),
 			{Name: "RACER_SLAB_PATH", Value: "/cache/cache.slab"},
-			// Creation defaults only. Signed storage policy owns subsequent capacity;
+			// Creation defaults only. TLS-authenticated storage policy owns subsequent capacity;
 			// persisted geometry wins on restart. Keep the execution cap at one even
 			// when automatic runtime storage planning creates hundreds of shards.
 			{Name: "RACER_SLAB_SIZE", Value: "10737418240"},
@@ -223,12 +241,11 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			{Name: "RACER_STALL_SECONDS", Value: "5"},
 			{Name: "RACER_DRAIN_SECONDS", Value: "20"},
 			{Name: "RACER_QUIESCE_SECONDS", Value: "5"},
-		},
+		}...),
 		StartupProbe: httpProbe("/startupz", intstr.FromInt32(9090)), ReadinessProbe: httpProbe("/readyz", intstr.FromInt32(9090)), LivenessProbe: httpProbe("/livez", intstr.FromInt32(9090)),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "control-token", MountPath: "/var/run/racer-control", ReadOnly: true},
-			{Name: "peer-signing", MountPath: "/var/run/racer-peer-signing", ReadOnly: true},
-			{Name: "config-verify", MountPath: "/var/run/racer-config-verify", ReadOnly: true},
+			trustMount(),
 			{Name: "bootstrap", MountPath: "/bootstrap", ReadOnly: true},
 			{Name: "cache", MountPath: "/cache"},
 			{Name: "sockets", MountPath: racermeta.SocketRoot},
@@ -254,7 +271,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 				InitContainers: []corev1.Container{bootstrap}, Containers: []corev1.Container{main},
 				Volumes: []corev1.Volume{
 					{Name: "control-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", Audience: "racer-control", ExpirationSeconds: ptr.To(int64(3600))}}}}}},
-					bundleVolume("peer-signing", "racer-peer-signing"), bundleVolume("config-verify", "racer-config-signing"),
+					trustVolume(false),
 					{Name: "bootstrap", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					{Name: "cache", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/racer", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}},
 					{Name: "sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}},
@@ -264,6 +281,10 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 	}
 }
 
-func bundleVolume(name, secret string) corev1.Volume {
-	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secret, Items: []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}}}}}
+func trustMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: "trust", MountPath: "/var/run/racer-trust", ReadOnly: true}
+}
+
+func trustVolume(optional bool) corev1.Volume {
+	return corev1.Volume{Name: "trust", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "racer-trust"}, Items: []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}}, Optional: ptr.To(optional)}}}
 }

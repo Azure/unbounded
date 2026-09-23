@@ -324,7 +324,7 @@ func (s *Server) rolloutBusy(ctx context.Context, t *topologyIndex) (bool, error
 
 // Authenticated control delivery and acknowledgment collection.
 
-// Pod-bound service-account tokens identify the selected process's Pod. A boot
+// Verified client certificates identify the selected process's Pod. A boot
 // nonce binds commands and acknowledgments to this subscription incarnation.
 func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	fail := func(err error, code int) { http.Error(w, err.Error(), code) }
@@ -347,25 +347,9 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	token, bearer := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
-	if !bearer {
-		fail(errInvalidCredential, 403)
-		return
-	}
-
-	kube := s.reviewClient
-	if kube == nil {
-		kube = s.controlStore.client
-	}
-
-	podUID, err := s.credentials.authenticate(req.Context(), kube, token, controlAudience)
+	podUID, err := authenticateControl(req)
 	if err != nil {
-		code := http.StatusServiceUnavailable
-		if err == errInvalidCredential {
-			code = http.StatusForbidden
-		}
-
-		fail(err, code)
+		fail(err, http.StatusForbidden)
 
 		return
 	}
@@ -376,9 +360,9 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if s.signer == nil || s.source == nil {
+	if s.source == nil {
 		s.mu.Unlock()
-		fail(fmt.Errorf("signed controller unavailable"), 503)
+		fail(fmt.Errorf("controller unavailable"), 503)
 
 		return
 	}
@@ -401,11 +385,18 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 
 	nodeID := hex.EncodeToString(n)
 	name, ok := t.byID[nodeID]
-	// Authorization is deliberately outside the credential cache: every heartbeat
-	// checks the current committed selection, including phase 4 and cache hits.
+	// Every heartbeat checks current committed selection, including phase 4 and
+	// established TLS connections retained across topology updates.
 	if !ok || t.g.Nodes[name].PodUID != podUID {
 		fail(fmt.Errorf("pod is not selected for node"), 403)
 		return
+	}
+
+	if s.trustHeartbeat != nil {
+		if err := s.trustHeartbeat(req, podUID); err != nil {
+			fail(err, http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	r, err := s.rolloutFor(req.Context(), t)
@@ -531,17 +522,12 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	command.ForwardDigest, command.ForwardRevision, command.PodUid = forwardDigest, forwardRevision, podUID
 	command.StoragePolicy = s.storageCommand(req, key, podUID)
 
-	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(command)
+	body, err := (proto.MarshalOptions{Deterministic: true}).Marshal(command)
 	if err != nil {
 		fail(err, 500)
 		return
 	}
 
-	body, err := proto.Marshal(&pb.SignedControlCommand{Command: raw, Signature: s.signer.signDomain("racer/control/v1", raw)})
-	if err != nil {
-		fail(err, 500)
-		return
-	}
 	s.mu.Unlock()
 
 	locked = false
@@ -853,7 +839,7 @@ func (s *Server) catchup(ctx context.Context, r *rollout, universe, node, pod, b
 				return nil, 0, fmt.Errorf("removal decision is not terminal")
 			}
 
-			e, err := newEntry(d.Snapshot, snap.Revision, s.signer)
+			e, err := newEntry(d.Snapshot, snap.Revision)
 
 			return e, d.Phase, err
 		}
@@ -1273,7 +1259,7 @@ func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, b
 			return nil, nil, 0, err
 		}
 
-		e, err := newEntry(data, ref.Revision, s.signer)
+		e, err := newEntry(data, ref.Revision)
 
 		return e, nil, 0, err
 	}

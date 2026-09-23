@@ -15,6 +15,6 @@
     {"selector": "runtime::dst::fullpage_seeded_latency_stress", "status": "required", "supersedes": "ignored shared-producer 503; restored by 4f7f9c60"},
     {"selector": "negotiation::tests::confirmation_queue_pressure_loss_and_replay_are_bounded", "status": "required"},
     {"selector": "negotiation::tests::abandoned_initiator_after_ack_replaces_at_full_capacity_and_reconnects", "status": "required"},
-    {"selector": "negotiation::tests::replacement_hello_bad_finish_replay_and_wrong_tcp_never_evict", "status": "required"}
+    {"selector": "negotiation::tests::replacement_tls_identity_binding_and_membership_never_evict", "status": "required"}
   ]
 }

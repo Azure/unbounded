@@ -61,7 +61,7 @@ func fakeKube(objects ...client.Object) client.Client {
 }
 
 func buildGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches []racerapi.P2PCache) (*generation, *racerapi.P2PCache, error) {
-	g, err := buildCacheGeneration(name, previous, nodes, pods, caches, nil, racer.SocketRoot)
+	g, err := buildCacheGeneration(name, previous, nodes, pods, caches, racer.SocketRoot)
 	return g, nil, err
 }
 
@@ -232,7 +232,7 @@ func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 	}
 
 	snapshot := index.snapshot(multi.Nodes[n.Name].ID)
-	if len(snapshot.Volumes) != 2 || snapshot.Volumes[0].PeerListen == snapshot.Volumes[1].PeerListen || snapshot.Volumes[0].CacheSocket == snapshot.Volumes[1].CacheSocket || snapshot.Volumes[0].PeerEndpoints == nil || snapshot.Volumes[1].PeerEndpoints == nil {
+	if len(snapshot.Volumes) != 2 || snapshot.Volumes[0].CacheSocket == snapshot.Volumes[1].CacheSocket || snapshot.Volumes[0].PeerEndpoints == nil || snapshot.Volumes[1].PeerEndpoints == nil {
 		t.Fatal("missing isolated volume listeners/policies")
 	}
 }
@@ -257,7 +257,6 @@ func TestDurableStateChunksConflictAndCorruption(t *testing.T) {
 	c := fakeKube()
 	store := stateStore{client: c, namespace: "state"}
 	g := testGeneration(8000, 8000)
-	g.Ports = map[string]int32{"ns/volume": 10000}
 
 	g.SlotHistory = map[string]uint32{"ns/volume": 8000}
 	if err := store.commit(ctx, g, nil); err != nil {
@@ -314,7 +313,7 @@ func TestDurableStateChunksConflictAndCorruption(t *testing.T) {
 // Historical Pod authority, deletion proofs and durable history collection.
 
 // These controller tests use synthetic worker acknowledgments, but exercise
-// real admission, durable topology/history, and the signed HTTP authorization path.
+// real admission, durable topology/history, and the TLS authorization path.
 func historicalReconcile(t *testing.T, r *reconciler) *topologyIndex {
 	t.Helper()
 
@@ -539,7 +538,7 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 				t.Fatal("exclusion did not advance")
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			r = newTestReconciler(f.api)
 			r.server = f.s
 			f.index = historicalReconcile(t, r)
@@ -634,7 +633,7 @@ func TestHistoricalPodDeletionCommitSafety(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			if err := f.s.install(f.index); err != nil {
 				t.Fatal(err)
 			}
@@ -694,7 +693,7 @@ func TestHistoricalDeletedPodForwardGC(t *testing.T) {
 			}
 			// Crash between topology commit and ledger GC, then inject ambiguous
 			// history writes. No proposal can collect these references beforehand.
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			if err := f.s.install(f.index); err != nil {
 				t.Fatal(err)
 			}

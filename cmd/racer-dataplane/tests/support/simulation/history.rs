@@ -38,14 +38,13 @@ pub(crate) enum Transition {
         fault: usize,
         authenticated: bool,
     },
-    HttpAuthenticationExpired {
+    HttpTlsMembershipRejected {
         target: String,
         offset: i64,
-        status: u16,
     },
     HttpAuthenticationRecovered {
         target: String,
-        same_nonce: bool,
+        same_descriptor: bool,
     },
     HttpAuthenticatedFlightCompleted {
         target: String,
@@ -58,10 +57,10 @@ pub(crate) enum Transition {
         offset: i64,
         accepted: bool,
     },
-    AuthenticationReplayRetained {
+    AuthenticationMembershipRetained {
         offset: i64,
     },
-    AuthenticationNonceExpired {
+    AuthenticationChannelExpired {
         elapsed: u64,
     },
     OracleCapability {

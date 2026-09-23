@@ -217,7 +217,7 @@ impl Default for Config {
 
 /// Shared local ownership of an ordinary descriptor; cloning makes no syscall.
 #[derive(Clone)]
-pub struct File(Rc<FileHandle>);
+pub struct File(Rc<FileHandle>, crate::slab_io::Io);
 enum FileHandle {
     Os(OwnedFd),
     #[cfg(test)]
@@ -248,11 +248,21 @@ impl File {
         })
     }
     pub fn new(fd: OwnedFd) -> Self {
-        Self(Rc::new(FileHandle::Os(fd)))
+        Self(Rc::new(FileHandle::Os(fd)), crate::slab_io::Io::default())
+    }
+    pub(crate) fn with_slab_io(mut self, io: crate::slab_io::Io) -> Self {
+        self.1 = io;
+        self
+    }
+    pub(crate) fn slab_io(&self) -> &crate::slab_io::Io {
+        &self.1
     }
     #[cfg(test)]
     pub(crate) fn simulated(handle: crate::simulation::Handle) -> Self {
-        Self(Rc::new(FileHandle::Sim(handle)))
+        Self(
+            Rc::new(FileHandle::Sim(handle)),
+            crate::slab_io::Io::default(),
+        )
     }
     #[cfg(test)]
     pub(crate) fn simulation_id(&self) -> Option<i32> {
@@ -516,6 +526,8 @@ enum State {
     Complete(i32),
 }
 struct Request {
+    slab_pending: Option<Box<SlabPending>>,
+    slab_charge: Option<crate::slab_io::Charge>,
     metric_traffic: Option<crate::metrics::Traffic>,
     // Optional application ownership, retained even when its ticket is abandoned.
     _keepalive: Option<Rc<dyn std::any::Any>>,
@@ -524,6 +536,13 @@ struct Request {
     opcode: u8,
     state: State,
     abandoned: bool,
+}
+struct SlabPending {
+    sqe: abi::Sqe,
+    io: crate::slab_io::Io,
+    bytes: usize,
+    since: Instant,
+    waited: bool,
 }
 impl Request {
     // Apply a completion without accessing the kernel. Returns true only on
@@ -553,8 +572,21 @@ impl Request {
             self.resource =
                 Resource::Accepted(Some(File::new(unsafe { OwnedFd::from_raw_fd(res) })));
         }
+        if let Some(charge) = self.slab_charge.take() {
+            charge.finish(res.max(0) as usize);
+        }
         self.state = State::Complete(res);
         Ok(true)
+    }
+    fn cancel_queued(&mut self) -> bool {
+        let Some(pending) = self.slab_pending.take() else {
+            return false;
+        };
+        if pending.waited {
+            pending.io.waited(pending.since);
+        }
+        self.state = State::Complete(-libc::ECANCELED);
+        true
     }
 }
 struct Slot {
@@ -662,6 +694,8 @@ impl std::task::Wake for Wake {
 /// send::<Ring>();
 /// ```
 pub struct Ring {
+    slab_queue: VecDeque<u64>,
+    slab_deadline: Option<Instant>,
     inbound: Rc<std::cell::Cell<usize>>,
     metrics: crate::metrics::Local,
     // Take-and-forget guard: Rust must never automatically drop live requests
@@ -759,6 +793,8 @@ impl Ring {
             config,
             stopping: false,
             completion_epoch: 0,
+            slab_queue: VecDeque::new(),
+            slab_deadline: None,
         })
     }
 
@@ -942,25 +978,46 @@ impl Ring {
 
     fn enqueue<O: Operation>(
         &mut self,
-        mut sqe: abi::Sqe,
+        sqe: abi::Sqe,
         resource: Resource,
         fd: Option<Descriptor>,
     ) -> Result<Ticket<O>, (io::Error, Resource)> {
-        let reserve = if matches!(sqe.opcode, abi::ACCEPT | abi::RECV | abi::CONNECT) {
-            self.config
-                .progress_reserve
-                .min(self.config.entries / 4)
-                .min(self.config.requests / 4) as usize
+        let io = if matches!(
+            sqe.opcode,
+            abi::READ_FIXED | abi::WRITE_FIXED | 22 | 23 | 3 | 17
+        ) {
+            fd.as_ref().map(|fd| match fd {
+                Descriptor::File(file) => file.1.clone(),
+                Descriptor::Fixed(file) => file.0._file.1.clone(),
+            })
         } else {
-            0
+            None
         };
+        self.enqueue_slab(sqe, resource, fd, io)
+    }
+
+    fn enqueue_slab<O: Operation>(
+        &mut self,
+        mut sqe: abi::Sqe,
+        resource: Resource,
+        fd: Option<Descriptor>,
+        io: Option<crate::slab_io::Io>,
+    ) -> Result<Ticket<O>, (io::Error, Resource)> {
+        let io = io.filter(|io| io.limited());
+        let reserve =
+            if io.is_some() || matches!(sqe.opcode, abi::ACCEPT | abi::RECV | abi::CONNECT) {
+                self.config
+                    .progress_reserve
+                    .min(self.config.entries / 4)
+                    .min(self.config.requests / 4) as usize
+            } else {
+                0
+            };
         let error = if self.stopping {
             Some(io::Error::new(io::ErrorKind::BrokenPipe, "ring stopping"))
-        } else if self
-            .core
-            .as_ref()
-            .is_none_or(|c| c.free.len() <= reserve || c.raw.space() <= 1 + reserve as u32)
-        {
+        } else if self.core.as_ref().is_none_or(|c| {
+            c.free.len() <= reserve || (io.is_none() && c.raw.space() <= 1 + reserve as u32)
+        }) {
             Some(io::Error::from(io::ErrorKind::WouldBlock))
         } else {
             None
@@ -975,7 +1032,23 @@ impl Ring {
         slot.generation += 1;
         let id = (u64::from(slot.generation) << 32) | u64::from(index);
         sqe.user_data = id;
+        let slab_pending = io.map(|io| {
+            Box::new(SlabPending {
+                bytes: if matches!(sqe.opcode, 3 | 17) {
+                    0
+                } else {
+                    sqe.len as usize
+                },
+                sqe,
+                io,
+                since: crate::environment::now(),
+                waited: false,
+            })
+        });
+        let queued = slab_pending.is_some();
         slot.request = Some(Request {
+            slab_pending,
+            slab_charge: None,
             metric_traffic: None,
             _keepalive: None,
             resource,
@@ -984,7 +1057,12 @@ impl Ring {
             state: State::InFlight,
             abandoned: false,
         });
-        core.raw.push(sqe);
+        if queued {
+            self.slab_queue.push_back(id);
+            self.slab_deadline = Some(crate::environment::now());
+        } else {
+            core.raw.push(sqe);
+        }
         Ok(Ticket {
             id,
             book: self.book.clone(),
@@ -1168,6 +1246,40 @@ impl Ring {
         let len = bytes.len();
         self.recv_bytes_range(fd, bytes, 0..len)
     }
+    /// Buffered file read with owned storage retained through terminal completion.
+    pub(crate) fn read_bytes(
+        &mut self,
+        fd: Descriptor,
+        bytes: Box<[u8]>,
+        offset: u64,
+    ) -> Result<Ticket<Bytes>, Rejected<Box<[u8]>>> {
+        if bytes.is_empty() || bytes.len() > BUFFER_SIZE || offset > i64::MAX as u64 {
+            return Err(Rejected {
+                error: invalid("invalid buffered read range"),
+                resource: bytes,
+            });
+        }
+        let mut sqe = abi::Sqe {
+            opcode: 22,
+            off: offset,
+            addr: bytes.as_ptr() as u64,
+            len: bytes.len() as u32,
+            ..Default::default()
+        };
+        if let Err(error) = self.descriptor(&fd, &mut sqe) {
+            return Err(Rejected {
+                error,
+                resource: bytes,
+            });
+        }
+        self.enqueue(sqe, Resource::Bytes(bytes), Some(fd))
+            .map_err(|(error, resource)| {
+                let Resource::Bytes(resource) = resource else {
+                    unreachable!()
+                };
+                Rejected { error, resource }
+            })
+    }
     pub fn send_bytes(
         &mut self,
         fd: Descriptor,
@@ -1350,18 +1462,23 @@ impl Ring {
         offset: Option<FileOffset>,
         len: usize,
     ) -> io::Result<Ticket<Splice>> {
+        let input = input(&owner);
+        let io = input.1.clone();
+        if io.limited() && len > BUFFER_SIZE {
+            return Err(invalid("slab splice exceeds maximum operation size"));
+        }
         let mut sqe = abi::Sqe {
             opcode: 30,
             off: u64::MAX,
             addr: offset.map_or(u64::MAX, |offset| offset.0),
             len: u32::try_from(len).map_err(|_| invalid("splice length"))?,
-            file_index: input(&owner).raw_id() as u32,
+            file_index: input.raw_id() as u32,
             op_flags: libc::SPLICE_F_NONBLOCK,
             ..Default::default()
         };
         self.descriptor(&output, &mut sqe)?;
         let ticket = self
-            .enqueue(sqe, Resource::None, Some(output))
+            .enqueue_slab(sqe, Resource::None, Some(output), Some(io))
             .map_err(|(e, _)| e)?;
         self.retain(&ticket, owner);
         Ok(ticket)
@@ -1463,7 +1580,20 @@ impl Ring {
     }
 
     pub fn cancel<O: Operation>(&mut self, ticket: &Ticket<O>) -> io::Result<Ticket<Cancel>> {
-        self.request(ticket)?;
+        if self.request(ticket)?.slab_pending.is_some() {
+            // A NOP supplies the ordinary cancellation acknowledgment. The target
+            // never reached the kernel and retains resources until collection.
+            let ack = self
+                .enqueue(abi::Sqe::default(), Resource::None, None)
+                .map_err(|(e, _)| e)?;
+            self.core.as_mut().unwrap().slots[ticket.id as u32 as usize]
+                .request
+                .as_mut()
+                .unwrap()
+                .cancel_queued();
+            self.slab_queue.retain(|id| *id != ticket.id);
+            return Ok(ack);
+        }
         self.enqueue(
             abi::Sqe {
                 opcode: abi::CANCEL,
@@ -1529,6 +1659,7 @@ impl Ring {
             world.run_tasks();
         }
         self.abandoned();
+        let slab_runnable = self.submit_slab();
         let core = self.core.as_mut().ok_or_else(|| invalid("ring closed"))?;
         #[cfg(test)]
         if self.stopping
@@ -1572,12 +1703,74 @@ impl Ring {
         let woke = core.wake.fd.is_none() && core.wake.pending.swap(false, Ordering::AcqRel);
         #[cfg(not(test))]
         let woke = false;
-        Ok(woke
+        Ok(slab_runnable
+            || woke
             || count != 0
             || core.raw.ready()
             || core.raw.needs_enter()
             || !core.unused_fixed.borrow().is_empty()
             || !self.book.abandoned.borrow().is_empty())
+    }
+
+    fn submit_slab(&mut self) -> bool {
+        self.slab_deadline = None;
+        let Some(core) = &mut self.core else {
+            return false;
+        };
+        let now = crate::environment::now();
+        for _ in 0..self.config.completion_budget {
+            let Some(&id) = self.slab_queue.front() else {
+                return false;
+            };
+            let slot = &mut core.slots[id as u32 as usize];
+            let Some(request) = slot
+                .request
+                .as_mut()
+                .filter(|_| slot.generation == (id >> 32) as u32)
+            else {
+                self.slab_queue.pop_front();
+                continue;
+            };
+            if self.stopping {
+                request.cancel_queued();
+            }
+            let Some(pending) = &mut request.slab_pending else {
+                self.slab_queue.pop_front();
+                if request.abandoned {
+                    drop(core.release(id as u32 as usize));
+                }
+                continue;
+            };
+            if core.raw.space() <= 1 {
+                self.slab_deadline = Some(now);
+                return true;
+            }
+            match pending.io.reserve(pending.bytes, now) {
+                Ok(charge) => {
+                    if pending.waited {
+                        pending.io.waited(pending.since);
+                    }
+                    core.raw.push(pending.sqe);
+                    request.slab_charge = Some(charge);
+                    request.slab_pending = None;
+                    self.slab_queue.pop_front();
+                }
+                Err(deadline) => {
+                    pending.waited = true;
+                    self.slab_deadline = Some(deadline);
+                    return false;
+                }
+            }
+        }
+        if !self.slab_queue.is_empty() {
+            self.slab_deadline = Some(now);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn slab_deadline(&self) -> Option<Instant> {
+        self.slab_deadline
     }
 
     fn abandoned(&mut self) {
@@ -1613,6 +1806,11 @@ impl Ring {
                 continue;
             }
             if let Some(request) = &mut slot.request {
+                if cancel {
+                    if request.cancel_queued() {
+                        self.slab_queue.retain(|queued| *queued != id);
+                    }
+                }
                 if cancel
                     && !matches!(request.state, State::Complete(_))
                     && !core.raw.discard_unsubmitted(id)
@@ -1644,6 +1842,10 @@ impl Ring {
     /// Returns on software wakes, timeout or interruption, including empty wakes.
     pub fn wait(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.abandoned();
+        if self.submit_slab() {
+            return Ok(());
+        }
+        let deadline = deadline.into_iter().chain(self.slab_deadline).min();
         let core = self.core.as_mut().ok_or_else(|| invalid("ring closed"))?;
         if self.stopping {
             return Err(invalid("ring stopping"));
@@ -2071,6 +2273,10 @@ impl<A: Application> Driver<A> {
             work.merge(self.sources[index].poll(&mut self.ring, self.budget)?);
         }
         work.merge(self.application.poll(&mut self.ring, self.budget)?);
+        work.merge(Work {
+            runnable: false,
+            deadline: self.ring.slab_deadline(),
+        });
         work.merge(self.ring.metrics.poll(&mut self.metrics_deadline));
         if let Some((life, worker)) = &self.lifecycle {
             life.progress(*worker);

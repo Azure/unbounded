@@ -13,8 +13,16 @@ fn session(generation: &Generation) -> Rc<rdma::Connection> {
     manager(generation).live[0].connection.clone()
 }
 fn generation(volumes: &Volumes, address: SocketAddr) -> Rc<Generation> {
-    volumes.servers[&address.into()].handler().current.clone()
+    volumes.servers[&local_key(address)]
+        .handler()
+        .current
+        .clone()
 }
+fn local_key(address: SocketAddr) -> Address {
+    Address::unix(&crate::control::tests::test_socket(address, "cache")).unwrap()
+}
+pub(crate) use super::dst::simulated_peer_address;
+
 pub(crate) mod dst {
     use crate::runtime::dst::oracles::{Placement, RouteOutcome, RouteScope};
 
@@ -48,7 +56,7 @@ pub(crate) mod dst {
         );
     }
 
-    // Co-located slots use production cache flights, signed HTTP and negotiated RDMA.
+    // Co-located slots use production cache flights, mTLS HTTP and negotiated RDMA.
     fn b03_cluster(world: World, rdma: bool) -> Cluster {
         let mut s = Cluster::with_connections(world, rdma, true);
         for n in 0..8 {
@@ -61,11 +69,18 @@ pub(crate) mod dst {
                 .to_string();
             let c = &mut s.machines[n].config;
             c.peers = vec![proto::Peer {
+                pod_uid: format!("pod-{remote}"),
                 id: id.clone(),
-                http_address: format!("127.0.0.1:{}", 10000 + remote),
+                http_address: crate::runtime::dst::simulated_peer_address(remote).to_string(),
                 fabric: "dst".into(),
             }];
             let v = &mut c.volumes[0];
+            v.peer_endpoints = Some(proto::VolumePeerEndpoints {
+                peers: vec![proto::VolumePeerEndpoint {
+                    peer: id.clone(),
+                    http_address: String::new(),
+                }],
+            });
             v.peers = vec![id.clone()];
             v.topology = Some(proto::Topology {
                 epoch: 1,
@@ -107,7 +122,7 @@ pub(crate) mod dst {
                 assert_eq!(a.normalized_position(&next).unwrap(), 2);
                 assert!(a.next(&next).unwrap().is_none());
                 let sessions = s.warm_transport(rdma, &[(4, 0)]);
-                // Validate a real signed exchange / negotiated READ before stopping A.
+                // Validate an authenticated exchange / negotiated READ before stopping A.
                 let warm = s.target(3, "b03-live");
                 let warm_scope = route_scope(&s, &warm);
                 assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
@@ -187,7 +202,7 @@ pub(crate) mod dst {
     }
 
     #[test]
-    fn b03_healthy_signed_peer_after_server_idle_close() {
+    fn b03_healthy_tls_peer_after_server_idle_close() {
         for head_first in [true, false] {
             let run = |replay: Option<Vec<crate::simulation::Choice>>| {
                 let world = World::new(502);
@@ -355,7 +370,7 @@ pub(crate) mod dst {
     #[ignore = "requires B02_EXPORT from Go production placement"]
     fn b02_go_interleaved_stopped_restart_strict_replay() {
         let dir = std::path::PathBuf::from(std::env::var("B02_EXPORT").unwrap());
-        for p in [8, 131072] {
+        for p in [8, 262144] {
             for layout in ["fresh", "migrated"] {
                 let run = |replay: Option<Vec<crate::simulation::Choice>>| {
                     let world = World::new(502);
@@ -808,29 +823,15 @@ pub(crate) mod dst {
         assert_eq!(run(Some(choices.clone())), (digest, choices));
     }
     #[test]
-    fn replay_http_signed_busy_duplicate_and_invalid_context_never_execute() {
-        use crate::{
-            cache::peer_wire::hex,
-            http_auth::{Policy, failure},
-            http_client::attempt::PeerReason,
-        };
+    fn tls_identity_rejection_and_invalid_context_never_execute() {
+        use crate::cache::peer_wire::hex;
         let world = World::new(714);
         let _scope = world.enter();
         let mut s = Cluster::with_algorithm(world.clone(), false, true, Some(2));
-        world.node(Some(1));
-        world.configure_replay(crate::http_auth::replay::Config {
-            capacity: 1,
-            shards: 1,
-        });
-        world.node(None);
         let (trust, _) = fixture();
-        let policy = Policy {
-            keys: trust.keys,
-            universe: trust.universe,
-            node: [10; 32],
-            peers: [[11; 32]].into(),
-        };
-        let target = s.target(3, "replay-pressure");
+        let identity =
+            crate::tls::PeerIdentity::new(&hex(&trust.universe), &hex(&[10; 32]), "pod-0").unwrap();
+        let target = s.target(3, "tls-rejection");
         let routing = &s.prepared(0).volumes[0].routing;
         let mut cursor = routing.start(&target);
         cursor.position += 1; // 0 -> 1 -> 3
@@ -840,77 +841,74 @@ pub(crate) mod dst {
         wire.extend(cursor.encode());
         wire.extend(b"RF05\0");
         wire.extend(target.as_bytes());
-        let context = "a".repeat(96);
-        let mut headers = vec![
+        let headers = vec![
             ("X-Racer-Fault".into(), hex(&wire).into_bytes()),
-            ("X-Racer-Attempt".into(), context.as_bytes().to_vec()),
+            ("X-Racer-Attempt".into(), "a".repeat(96).into_bytes()),
+            (
+                "X-Racer-Volume".into(),
+                s.prepared(1).volumes[0].config.id.as_bytes().to_vec(),
+            ),
         ];
-        let pending = policy.request([11; 32], "GET", "/", &mut headers).unwrap();
-        // Fill with a different nonce; Busy cannot admit a cache fault or backend IO.
-        world.node(Some(1));
-        world.accept_nonce([99; 32]).unwrap();
-        world.node(None);
-        let exchange =
-            |s: &mut Cluster, headers: &[(String, Vec<u8>)], expected: u16, signed: bool| {
-                let refs: Vec<_> = headers
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
-                    .collect();
-                let fill = s.ring(0).pool().private_fill().unwrap();
-                let end = world.now() + Duration::from_secs(5);
-                let mut request =
-                    client::Connection::new("127.0.0.1:10001".parse().unwrap(), "localhost")
-                        .unwrap()
-                        .get(client::Request::new("/", &refs).unwrap(), fill, end)
-                        .unwrap();
-                let response = s.response(0, end, |ring| request.poll(ring, 32));
-                assert_eq!(response.status(), expected);
-                assert_eq!(response.content_length(), Some(0));
-                if signed {
-                    pending
-                        .verify(&policy.keys, expected, 0, response.headers())
-                        .unwrap();
-                } else {
-                    assert!(response.headers().get("x-racer-signature").is_none());
-                }
-                if expected == 503 {
-                    let route = failure::AttemptRoute {
-                        cursor: cursor.clone(),
-                        candidate: routing.destination(&cursor),
-                        endpoint: "127.0.0.1:10001".parse().unwrap(),
-                        final_hop: false,
-                        context: context.clone(),
-                    };
-                    let report =
-                        failure::validate_peer_report(response.headers(), Some(0), 503, &route)
-                            .unwrap();
-                    assert_eq!(report.reason, PeerReason::Busy);
-                    assert!(
-                        response
-                            .headers()
-                            .get("x-racer-owner-unavailable")
-                            .is_none()
-                    );
-                }
-                assert!(
-                    s.hits.borrow().is_empty(),
-                    "rejected request executed at origin"
-                );
-                assert_eq!(
-                    s.cache(1).metrics().values()[6..20],
-                    [0; 14],
-                    "rejected request reached cache"
-                );
-            };
-        exchange(&mut s, &headers, 503, true);
-        let mut bad = headers.clone();
-        bad.iter_mut()
-            .find(|(n, _)| n == "X-Racer-Signature")
+        let exchange = |s: &mut Cluster,
+                        headers: &[(String, Vec<u8>)],
+                        identity: crate::tls::PeerIdentity,
+                        expected: Option<u16>| {
+            let refs: Vec<_> = headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
+                .collect();
+            let fill = s.ring(0).pool().private_fill().unwrap();
+            let end = world.now() + Duration::from_secs(5);
+            let mut request = client::Connection::new_simulated_peer(
+                crate::runtime::dst::simulated_peer_address(1),
+                "localhost",
+                identity,
+                crate::tls::PeerIdentity::new(&hex(&trust.universe), &hex(&[11; 32]), "pod-1")
+                    .unwrap(),
+            )
             .unwrap()
-            .1[0] ^= 1;
-        exchange(&mut s, &bad, 400, false);
-        // A valid signature over invalid routing context must not turn into Busy.
-        let mut bad = headers[..2].to_vec();
+            .get(client::Request::new("/", &refs).unwrap(), fill, end)
+            .unwrap();
+            loop {
+                s.turn();
+                match request.poll(s.ring(0), 32) {
+                    Ok(Progress::Ready(response)) => {
+                        assert_eq!(Some(response.status()), expected);
+                        assert_eq!(response.content_length(), Some(0));
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(expected.is_none(), "expected HTTP rejection");
+                        assert_ne!(error.kind(), io::ErrorKind::TimedOut, "rejection stalled");
+                        break;
+                    }
+                    Ok(Progress::Pending(_)) => assert!(world.now() < end, "rejection stalled"),
+                }
+            }
+            assert!(
+                s.hits.borrow().is_empty(),
+                "rejected request executed at origin"
+            );
+            assert_eq!(
+                s.cache(1).metrics().values()[6..20],
+                [0; 14],
+                "rejected request reached cache"
+            );
+        };
+        let mut wrong = identity.clone();
+        wrong.pod_uid = "replaced-pod".into();
+        exchange(&mut s, &headers, wrong, None);
+        let mut wrong = identity.clone();
+        wrong.node = hex(&[99; 32]);
+        exchange(&mut s, &headers, wrong, None);
+        let mut wrong = identity.clone();
+        wrong.universe = hex(&[99; 32]);
+        exchange(&mut s, &headers, wrong, None);
+        let mut bad = headers.clone();
+        bad[0].1 = b"not-hex".to_vec();
+        exchange(&mut s, &bad, identity.clone(), Some(409));
+        // Authenticated transport cannot authorize an invalid routing cursor.
+        let mut bad = headers.clone();
         let mut wrong_cursor = cursor.clone();
         wrong_cursor.position = 0;
         let mut wrong_wire = b"RF04".to_vec();
@@ -920,63 +918,10 @@ pub(crate) mod dst {
         wrong_wire.extend(b"RF05\0");
         wrong_wire.extend(target.as_bytes());
         bad[0].1 = hex(&wrong_wire).into_bytes();
-        let bad_pending = policy.request([11; 32], "GET", "/", &mut bad).unwrap();
-        let refs: Vec<_> = bad
-            .iter()
-            .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
-            .collect();
-        let fill = s.ring(0).pool().private_fill().unwrap();
-        let end = world.now() + Duration::from_secs(5);
-        let mut request = client::Connection::new("127.0.0.1:10001".parse().unwrap(), "localhost")
-            .unwrap()
-            .get(client::Request::new("/", &refs).unwrap(), fill, end)
-            .unwrap();
-        let response = s.response(0, end, |ring| request.poll(ring, 32));
-        assert_eq!(response.status(), 400);
-        bad_pending
-            .verify(&policy.keys, 400, 0, response.headers())
-            .unwrap();
-        drop((request, response));
-        // After expiry, explicitly admit the captured nonce to represent its first
-        // execution on another worker/volume, then replay the exact signed request.
-        world.advance(Duration::from_secs(121));
-        let mut fresh = headers[..2].to_vec();
-        let fresh_pending = policy.request([11; 32], "GET", "/", &mut fresh).unwrap();
-        let text = fresh
-            .iter()
-            .map(|(n, v)| format!("{n}: {}\r\n", std::str::from_utf8(v).unwrap()))
-            .collect::<String>();
-        let receiver = Policy {
-            node: [11; 32],
-            peers: [[10; 32]].into(),
-            ..policy.clone()
-        };
-        let incoming =
-            crate::cache::http_metadata::headers(&text, |h| receiver.receive("GET", "/", h))
-                .unwrap();
-        world.node(Some(1));
-        incoming.accept_once().unwrap();
-        world.node(None);
-        // This duplicate returns 400 rather than conflating replay with capacity.
-        // Use the matching pending context for signature verification below.
-        let refs: Vec<_> = fresh
-            .iter()
-            .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
-            .collect();
-        let fill = s.ring(0).pool().private_fill().unwrap();
-        let end = world.now() + Duration::from_secs(5);
-        let mut request = client::Connection::new("127.0.0.1:10001".parse().unwrap(), "localhost")
-            .unwrap()
-            .get(client::Request::new("/", &refs).unwrap(), fill, end)
-            .unwrap();
-        let response = s.response(0, end, |ring| request.poll(ring, 32));
-        assert_eq!(response.status(), 400);
-        fresh_pending
-            .verify(&policy.keys, 400, 0, response.headers())
-            .unwrap();
-        assert!(s.hits.borrow().is_empty());
-        assert_eq!(s.cache(1).metrics().values()[6..20], [0; 14]);
-        drop((request, response));
+        exchange(&mut s, &bad, identity.clone(), Some(400));
+        let mut bad = headers.clone();
+        bad[2].1 = b"missing-volume".to_vec();
+        exchange(&mut s, &bad, identity, None);
         clean_repro(s, &world);
     }
     use super::*;
@@ -1040,7 +985,8 @@ pub(crate) mod dst {
             self.machines[n].driver.ring_mut()
         }
         pub(crate) fn handler(&self, n: usize) -> std::cell::RefMut<'_, Handler> {
-            self.machines[n].driver.application().volumes.servers[&self.address(n).into()]
+            self.machines[n].driver.application().volumes.servers
+                [&Address::unix(&self.machines[n].config.volumes[0].cache_socket).unwrap()]
                 .handler()
                 .current
                 .handlers[0]
@@ -1063,8 +1009,13 @@ pub(crate) mod dst {
             errno: Option<i32>,
             persistent: bool,
         ) -> usize {
-            let gate =
-                crate::simulation::Gate::new(edge.0, self.address(edge.1), target, phase, errno);
+            let gate = crate::simulation::Gate::new(
+                edge.0,
+                crate::runtime::dst::simulated_peer_address(edge.1),
+                target,
+                phase,
+                errno,
+            );
             self.world
                 .gate(if persistent { gate.persistent() } else { gate })
         }
@@ -1240,12 +1191,6 @@ pub(crate) mod dst {
             self.reboot(n, format, None);
             self.turn();
         }
-        fn address(&self, n: usize) -> SocketAddr {
-            self.machines[n].config.volumes[0]
-                .peer_listen
-                .parse()
-                .unwrap()
-        }
         pub(crate) fn local_address(&self, n: usize) -> crate::socket::Address {
             self.world.node(Some(n));
             crate::socket::Address::unix(&self.machines[n].config.volumes[0].cache_socket).unwrap()
@@ -1257,7 +1202,7 @@ pub(crate) mod dst {
                     .application()
                     .volumes
                     .servers
-                    .get(&self.address(n).into())?
+                    .get(&Address::unix(&m.config.volumes[0].cache_socket).unwrap())?
                     .handler()
                     .current
                     .clone(),
@@ -1608,7 +1553,6 @@ pub(crate) mod dst {
             // so each caller selects its worker, with identical routing/ValueIds.
             let mut config = s.machines[0].config.clone();
             let address: SocketAddr = "127.0.0.1:12000".parse().unwrap();
-            config.volumes[0].peer_listen = address.to_string();
             config.volumes[0].cache_socket = crate::control::tests::test_socket(address, "cache");
             let _worker = world.scoped_node(Some(8));
             let ring = uring::Ring::http_test_ring(
@@ -1820,7 +1764,7 @@ pub(crate) mod dst {
             if mode != "mixed" {
                 assert_transport(&events, &target, from, to, mode == "rdma");
             } else {
-                let endpoint = format!("127.0.0.1:{}", 10000 + to);
+                let endpoint = crate::runtime::dst::simulated_peer_address(to).to_string();
                 assert!(events.iter().any(|e| e.target == target
                     && e.node == Some(from)
                     && matches!(e.kind, "rdma-deliver" | "transport-http")
@@ -1860,6 +1804,7 @@ pub(crate) struct Cluster {
     rings: Vec<uring::Ring>,
     nodes: Vec<Option<Volumes>>,
     addresses: Vec<SocketAddr>,
+    credentials: Vec<Arc<crate::control::credentials::Provider>>,
     pub(crate) hits: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     backends: Vec<std::thread::JoinHandle<()>>,
@@ -1897,7 +1842,7 @@ impl Cluster {
         );
     }
     pub(crate) fn expire_previous(&mut self, node: usize) {
-        let server = &self.nodes[node].as_ref().unwrap().servers[&self.addresses[node].into()];
+        let server = &self.nodes[node].as_ref().unwrap().servers[&self.local_address(node)];
         for old in &server.handler().draining {
             old.drain.set(Some(Instant::now()));
         }
@@ -1925,17 +1870,21 @@ impl Cluster {
         drop(ring()?);
         let new_ring = || crate::conformance::ring(32, uring::Config::default());
         let first = new_ring();
-        let reservations: Vec<_> = (0..8).map(|_| crate::conformance::reserve()).collect();
+        let reservations: Vec<_> = (0..8)
+            .map(|_| std::net::TcpListener::bind(address()).unwrap())
+            .collect();
         let addresses: Vec<_> = reservations
             .iter()
             .map(|l| l.local_addr().unwrap())
             .collect();
+        drop(reservations);
         let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut cluster = Self {
             rings: vec![first],
             nodes: vec![],
             addresses,
+            credentials: vec![],
             hits,
             stop,
             backends: vec![],
@@ -1949,20 +1898,25 @@ impl Cluster {
             cluster.backends.push(task);
             let (mut trust, _) = fixture();
             trust.node = [node as u8 + 10; 32];
-            let config = cluster_config(
+            let mut config = cluster_config(
                 node,
                 &cluster.addresses,
                 backend,
                 algorithm,
                 "topology-test",
             );
+            peer_endpoints(&mut config);
             let prepared = crate::control::tests::prepare_cluster_snapshot(&trust, config);
             let updates = Arc::new(Updates::default());
+            let provider = tls_provider(&trust.universe, &trust.node, &format!("pod-{node}"));
+            updates.set_credentials(provider.clone());
+            cluster.credentials.push(provider);
             updates.subscribe(cluster.rings[node].wake_handle());
             updates.publish(prepared).unwrap();
             let crypto = Arc::new(crate::crypto::Pool::test_pool(cluster.rings[node].pool()));
             let worker = usize::from(node == 1 || node == 7);
-            let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker);
+            let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
+                .with_peer_ip(cluster.addresses[node].ip());
             // The simulated transport supports one connection per rail. Separate
             // inbound/outbound rails at intermediates; production rails multiplex.
             if rdma_enabled {
@@ -1980,7 +1934,6 @@ impl Cluster {
             volumes.poll(&mut cluster.rings[node], 64).unwrap();
             cluster.nodes.push(Some(volumes));
         }
-        drop(reservations);
         Some(cluster)
     }
     fn turn(&mut self) {
@@ -2017,39 +1970,35 @@ impl Cluster {
             *blake3::hash(format!("response {node} {target} {headers:?}").as_bytes()).as_bytes();
         let fill = self.rings[node].pool().stage(Key::new(key)).unwrap();
         let end = Instant::now() + Duration::from_secs(15);
-        let mut signed_headers: Vec<_> = headers
+        let mut peer_headers: Vec<_> = headers
             .iter()
             .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
             .collect();
-        if headers
+        let peer = headers
             .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case("x-racer-fault"))
-        {
-            let (trust, _) = fixture();
-            let policy = crate::http_auth::Policy {
-                keys: trust.keys,
-                universe: trust.universe,
-                node: [10; 32],
-                peers: Default::default(),
-            };
-            policy
-                .request([(10 + node) as u8; 32], "GET", target, &mut signed_headers)
-                .unwrap();
+            .any(|(n, _)| n.eq_ignore_ascii_case("x-racer-fault"));
+        if peer {
+            peer_headers.push((
+                "X-Racer-Volume".into(),
+                self.config(node).volumes[0].config.id.as_bytes().to_vec(),
+            ));
         }
-        let headers: Vec<_> = signed_headers
+        let headers: Vec<_> = peer_headers
             .iter()
             .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
             .collect();
-        let endpoint = if headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("x-racer-fault"))
-        {
-            self.addresses[node].into()
+        let connection = if peer {
+            client::Connection::new_tls(
+                peer_address(self.addresses[node]),
+                "localhost",
+                &self.credentials[0].current().context,
+                crate::tls::ExpectedPeer::Identity(self.credentials[node].identity().clone()),
+            )
         } else {
-            self.local_address(node)
-        };
-        let mut request = client::Connection::new_address(endpoint, "localhost")
-            .unwrap()
+            client::Connection::new_address(self.local_address(node), "localhost")
+        }
+        .unwrap();
+        let mut request = connection
             .get(client::Request::new(target, &headers).unwrap(), fill, end)
             .unwrap();
         loop {
@@ -2236,24 +2185,83 @@ use crate::control::{
     proto,
     tests::{cluster_config, fixture, prepare_snapshot, ring, runtime_pair as prepared},
 };
-fn address() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
+pub(super) fn address() -> SocketAddr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(n < 65536);
+    std::net::TcpListener::bind(SocketAddr::from(([127, 64, (n >> 8) as u8, n as u8], 0)))
         .unwrap()
         .local_addr()
         .unwrap()
 }
+
+pub(super) fn peer_address(mut address: SocketAddr) -> SocketAddr {
+    address.set_port(9443);
+    address
+}
+
+fn peer_endpoints(config: &mut proto::Snapshot) {
+    for peer in &mut config.peers {
+        peer.http_address = peer_address(peer.http_address.parse().unwrap()).to_string();
+    }
+    for volume in &mut config.volumes {
+        if let Some(endpoints) = &mut volume.peer_endpoints {
+            for endpoint in &mut endpoints.peers {
+                if !endpoint.http_address.is_empty() {
+                    endpoint.http_address =
+                        peer_address(endpoint.http_address.parse().unwrap()).to_string();
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn tls_provider(
+    universe: &[u8],
+    node: &[u8],
+    pod_uid: &str,
+) -> Arc<crate::control::credentials::Provider> {
+    thread_local! {
+        static AUTHORITY: crate::tls::tests::Authority = crate::tls::tests::Authority::new();
+    }
+    let identity = crate::tls::PeerIdentity::new(
+        &crate::cache::peer_wire::hex(universe),
+        &crate::cache::peer_wire::hex(node),
+        pod_uid,
+    )
+    .unwrap();
+    AUTHORITY.with(|authority| {
+        let context = authority.context(&identity, true);
+        crate::control::credentials::Provider::for_test(identity, Arc::new(context))
+    })
+}
 pub(crate) fn activate(
     ring: &mut uring::Ring,
     config: Prepared,
+    address: SocketAddr,
     worker: usize,
     rails: negotiation::Rails,
 ) -> Volumes {
     let updates = Arc::new(Updates::default());
+    let provider = tls_provider(&config.config.universe, &config.config.node, "test-pod");
+    updates.set_credentials(provider);
+    let mut snapshot = config.config.clone();
+    peer_endpoints(&mut snapshot);
+    let trust = crate::control::Trust {
+        universe: snapshot.universe.as_slice().try_into().unwrap(),
+        node: snapshot.node.as_slice().try_into().unwrap(),
+    };
+    let config = prepare_snapshot(&trust, snapshot);
     updates.subscribe(ring.wake_handle());
     updates.publish(config).unwrap();
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
-    let mut volumes =
-        Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker).with_rdma(Some(rails));
+    let sources = rails.test_sources();
+    let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
+        .with_peer_ip(address.ip())
+        .with_rdma(Some(rails));
+    for (index, source) in sources {
+        volumes.rdma_sources.push((index, RdmaSource::new(source)));
+    }
     volumes.poll(ring, 32).unwrap();
     volumes
 }
@@ -2326,8 +2334,8 @@ fn automatic_cross_worker_handshake_confirmation_reconnect_and_drain() {
     let b_rails =
         negotiation::Rails::new(vec![None, None, Some(rdma::test_transport(ring.pool()))], 3)
             .unwrap();
-    let mut a = activate(&mut ring, prepared(2, aa, ba, true), 5, a_rails);
-    let mut b = activate(&mut ring, prepared(3, ba, aa, false), 9, b_rails);
+    let mut a = activate(&mut ring, prepared(2, aa, ba, true), aa, 5, a_rails);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, false), ba, 9, b_rails);
     let ag = generation(&a, aa);
     let bg = generation(&b, ba);
     // Metadata is HTTP-only; a payload fault triggers RDMA negotiation. Trigger
@@ -2414,8 +2422,8 @@ fn stale_inbound_replacement_preserves_reverse_session_at_two_qp_capacity() {
     let bt = rdma::test_transport_config(ring.pool(), 2, 1);
     let ar = negotiation::Rails::new(vec![Some(at.clone())], 1).unwrap();
     let br = negotiation::Rails::new(vec![Some(bt.clone())], 1).unwrap();
-    let mut a = activate(&mut ring, prepared(2, aa, ba, true), 0, ar);
-    let mut b = activate(&mut ring, prepared(3, ba, aa, true), 0, br);
+    let mut a = activate(&mut ring, prepared(2, aa, ba, true), aa, 0, ar);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, true), ba, 0, br);
     warm(&a, aa);
     warm(&b, ba);
     let ag = generation(&a, aa);
@@ -2470,7 +2478,12 @@ fn stale_inbound_replacement_preserves_reverse_session_at_two_qp_capacity() {
         }
         assert!(
             Instant::now() < end,
-            "authenticated replacement did not reconnect promptly"
+            "authenticated replacement did not reconnect promptly: stale healthy={}, live=({}, {}), QPs=({}, {})",
+            stale.is_healthy(),
+            manager(&ag).live.len(),
+            manager(&bg).live.len(),
+            at.test_observe().qps,
+            bt.test_observe().qps,
         );
     }
     assert!(!stale.is_healthy());
@@ -2481,19 +2494,82 @@ fn stale_inbound_replacement_preserves_reverse_session_at_two_qp_capacity() {
 }
 
 #[test]
+fn credential_rotation_replaces_confirmed_rdma_before_retiring_old_channel() {
+    let Some(mut ring) = ring() else { return };
+    let aa = address();
+    let ba = address();
+    let at = rdma::test_transport_config(ring.pool(), 4, 1);
+    let bt = rdma::test_transport_config(ring.pool(), 4, 1);
+    let ar = negotiation::Rails::new(vec![Some(at.clone())], 1).unwrap();
+    let br = negotiation::Rails::new(vec![Some(bt.clone())], 1).unwrap();
+    let mut a = activate(&mut ring, prepared(2, aa, ba, true), aa, 0, ar);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, true), ba, 0, br);
+    warm(&a, aa);
+    handshake(&mut ring, &mut a, &mut b, aa, ba);
+    let ag = generation(&a, aa);
+    let bg = generation(&b, ba);
+    let old_a = session(&ag);
+    let old_b = session(&bg);
+    let provider_a = a.updates.credentials().unwrap();
+    let provider_b = b.updates.credentials().unwrap();
+    let root = crate::tls::tests::Authority::new();
+    provider_a.rotate_for_test(root.context(provider_a.identity(), false));
+    provider_b.rotate_for_test(root.context(provider_b.identity(), false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut replacement_seen = false;
+    loop {
+        ring.progress().unwrap();
+        a.poll(&mut ring, 64).unwrap();
+        b.poll(&mut ring, 64).unwrap();
+        confirm(&a, aa);
+        confirm(&b, ba);
+        let fresh = |g: &Generation, old: &Rc<rdma::Connection>| {
+            manager(g).live.iter().any(|live| {
+                !Rc::ptr_eq(&live.connection, old)
+                    && live.connection.is_confirmed()
+                    && live.connection.is_healthy()
+            })
+        };
+        if fresh(&ag, &old_a) && fresh(&bg, &old_b) {
+            replacement_seen = true;
+        }
+        if !old_a.is_healthy() || !old_b.is_healthy() {
+            assert!(
+                replacement_seen,
+                "old channel retired before fresh channel confirmation"
+            );
+        }
+        assert_eq!(a.updates.status()["ready"], true);
+        assert_eq!(b.updates.status()["ready"], true);
+        if replacement_seen && !old_a.is_healthy() && !old_b.is_healthy() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "credential rotation did not converge"
+        );
+    }
+    a.shutdown(&mut ring).unwrap();
+    b.shutdown(&mut ring).unwrap();
+}
+
+#[test]
 fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     let Some(mut ring) = ring() else { return };
     let addr = address();
     let updates = Arc::new(Updates::default());
+    let (trust, _) = fixture();
+    updates.set_credentials(tls_provider(&trust.universe, &trust.node, "test-pod"));
     updates.subscribe(ring.wake_handle());
     updates.subscribe(ring.wake_handle());
     updates.publish(prepared(2, addr, address(), true)).unwrap();
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
     let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates.clone(), crypto, 0)
+        .with_peer_ip(addr.ip())
         .with_rdma(Some(negotiation::Rails::new(vec![None; 3], 3).unwrap()));
     volumes.poll(&mut ring, 16).unwrap();
     assert!(volumes.servers.is_empty());
-    let staged = volumes.staged.as_ref().unwrap().generations[&addr.into()].clone();
+    let staged = volumes.staged.as_ref().unwrap().generations[&local_key(addr)].clone();
     assert!(!staged.active.get());
     updates.staged(1, 1, true);
     volumes.poll(&mut ring, 16).unwrap();
@@ -2518,7 +2594,7 @@ fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     config.fabric.clear();
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let disabled = volumes.staged.as_ref().unwrap().generations[&addr.into()].clone();
+    let disabled = volumes.staged.as_ref().unwrap().generations[&local_key(addr)].clone();
     assert!(disabled.manager.is_none());
     assert!(!disabled.active.get());
     assert!(staged.active.get());
@@ -2535,6 +2611,7 @@ fn inbound_membership_shard_cardinality_and_expiry() {
     let mut volumes = activate(
         &mut ring,
         prepared(3, addr, address(), false),
+        addr,
         9,
         negotiation::Rails::new(vec![None], 1).unwrap(),
     );
@@ -2568,10 +2645,21 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     let aa = address();
     let ba = address();
     let rails = negotiation::Rails::new(vec![Some(rdma::test_transport(ring.pool()))], 1).unwrap();
-    let mut b = activate(&mut ring, prepared(3, ba, aa, false), 7, rails);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, false), ba, 7, rails);
     let old = generation(&b, ba);
+    let mut client_config = prepared(2, aa, ba, true).config.clone();
+    peer_endpoints(&mut client_config);
+    let (trust, _) = fixture();
+    let provider = tls_provider(&trust.universe, &[2; 32], "test-pod");
     let context = Rc::new(
-        negotiation::Context::new(Arc::new(prepared(2, aa, ba, true)), "v1", 3, ROUTING).unwrap(),
+        negotiation::Context::new(
+            Arc::new(prepare_snapshot(&trust, client_config)),
+            "v1",
+            3,
+            ROUTING,
+        )
+        .unwrap()
+        .with_credentials(Some(provider)),
     );
     let rails = negotiation::Rails::new(vec![Some(rdma::test_transport(ring.pool()))], 1).unwrap();
     let id = NodeId::from_bytes(&[3; 32]).unwrap().to_string();
@@ -2583,7 +2671,7 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
         NEGOTIATION_TIMEOUT,
     )
     .unwrap();
-    // Stop client polling at AwaitReply so no Finish can be sent yet.
+    // Stop client polling before it takes over the offer connection and confirms.
     assert!(matches!(
         client.poll(&mut ring, 64).unwrap(),
         Progress::Pending(_)
@@ -2591,7 +2679,7 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         ring.progress().unwrap();
-        // Advance TCP connect/send until responder holds a replied Hello.
+        // Advance TLS connect/send until the responder holds an authenticated offer.
         if manager(&old)
             .inbound
             .values()
@@ -2606,17 +2694,24 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
         b.poll(&mut ring, 64).unwrap();
         assert!(Instant::now() < deadline);
     }
-    // Poll responder until reply is sent and ownership is in has_pending.
-    for _ in 0..100 {
-        ring.progress().unwrap();
-        b.poll(&mut ring, 64).unwrap();
-    }
     let pinned = manager(&old).inbound.values().next().unwrap().clone();
     assert_eq!(pinned.borrow().reserved(), 1);
+    // Finish the response through the dispatcher without admitting the session.
+    // The retained TLS channel now owns confirmation instead of a second HTTP
+    // Finish request, so keep its original Established context across reload.
+    let inbound = loop {
+        ring.progress().unwrap();
+        b.peer_server.as_mut().unwrap().poll(&mut ring, 64).unwrap();
+        if let Some(established) = pinned.borrow_mut().take_completed(Instant::now()) {
+            break established;
+        }
+        assert!(Instant::now() < deadline);
+    };
     let mut next = prepared(3, ba, aa, false);
     // Prepared's immutable eligibility snapshot must also carry revision 2.
     let (trust, _) = fixture();
     let mut config = next.config.clone();
+    peer_endpoints(&mut config);
     config.revision = 2;
     let mut trust = trust;
     trust.node = [3; 32];
@@ -2626,21 +2721,12 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     let current = generation(&b, ba);
     assert!(!old.active.get() && current.active.get());
     assert!(!Rc::ptr_eq(&old, &current));
-    // Drive the real HTTP dispatcher, but defer Manager::poll so its stale
-    // admission rejection cannot destroy the QP before we observe Ready and
-    // complete confirmation. The server still selects the pinned continuation
-    // through VolumeHandler::negotiation exactly as it does in production.
-    let mut inbound = None;
+    // Complete confirmation on the original TLS connection after reload.
+    // Defer Manager::poll so stale admission cannot destroy the QP before the
+    // original peers finish their authenticated control exchange.
     let outbound = loop {
         ring.progress().unwrap();
-        b.servers
-            .get_mut(&ba.into())
-            .unwrap()
-            .poll(&mut ring, 64)
-            .unwrap();
-        if inbound.is_none() {
-            inbound = pinned.borrow_mut().take_completed(Instant::now());
-        }
+        b.peer_server.as_mut().unwrap().poll(&mut ring, 64).unwrap();
         negotiation::test_confirmations(&rails);
         negotiation::test_confirmations(&manager(&old).rails);
         match client.poll(&mut ring, 64).unwrap() {
@@ -2648,13 +2734,12 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
             Progress::Pending(_) => assert!(Instant::now() < deadline),
         }
     };
-    let inbound = inbound.expect("original pinned server must complete Finish/Ready");
     assert!(Arc::ptr_eq(inbound.context.prepared(), &old._config));
     assert!(!Arc::ptr_eq(inbound.context.prepared(), &current._config));
     assert_eq!(inbound.context.shard(), 3);
     assert_eq!(pinned.borrow().reserved(), 0);
     assert!(inbound.connection.is_confirmed());
-    // Established proves the client verified both original Ready and ConfirmAck;
+    // Established proves the client verified the original offer and ConfirmAck;
     // a timeout, wrong-server dispatch, or failed proof cannot satisfy this test.
     assert!(outbound.connection.is_confirmed());
     assert!(manager_mut(&old).admit(inbound, None, &old).is_err());
@@ -2668,7 +2753,6 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let Some(mut ring) = ring() else { return };
     let (trust, mut config) = fixture();
     let first = address();
-    config.volumes[0].peer_listen = first.to_string();
     config.volumes[0].cache_socket = crate::control::tests::test_socket(first, "cache");
     let updates = Arc::new(Updates::default());
     updates.subscribe(ring.wake_handle());
@@ -2679,7 +2763,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let prepare = |s| prepare_snapshot(&trust, s);
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let old = volumes.servers[&first.into()].handler().current.clone();
+    let old = generation(&volumes, first);
     assert_eq!(old._config.config.revision, 1);
     old.handlers[0]
         .borrow_mut()
@@ -2699,19 +2783,15 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let second = address();
     let mut extra = config.volumes[0].clone();
     extra.id = "second".into();
-    extra.peer_listen = second.to_string();
     extra.cache_socket = crate::control::tests::test_socket(second, "cache");
     extra.origin_socket = crate::control::tests::test_socket(second, "origin");
     config.volumes.push(extra);
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    assert_eq!(volumes.servers.len(), 4);
+    assert_eq!(volumes.servers.len(), 2);
     assert!(generation(&volumes, first)._config.peers.is_empty());
     assert_eq!(old._config.peers.len(), 1);
-    for (address, server) in &volumes.servers {
-        if address.tcp().is_some() {
-            continue;
-        }
+    for server in volumes.servers.values() {
         for handler in &server.handler().current.handlers {
             handler
                 .borrow_mut()
@@ -2725,14 +2805,15 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
         3,
         "old and both new volume handlers retain worker counters"
     );
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied_path = crate::control::tests::test_socket(address(), "cache");
+    let occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
     config.revision = 3;
-    config.volumes[1].peer_listen = occupied.local_addr().unwrap().to_string();
+    config.volumes[1].cache_socket = occupied_path.clone();
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert_eq!(updates.decision(3), None);
     assert_eq!(generation(&volumes, first)._config.config.revision, 2);
-    assert!(volumes.servers.contains_key(&second.into()));
+    assert!(volumes.servers.contains_key(&local_key(second)));
     config.revision = 4;
     config.volumes.clear();
     updates.publish(prepare(config)).unwrap();
@@ -2742,4 +2823,6 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     volumes.shutdown(&mut ring).unwrap();
     drop(volumes);
     Arc::try_unwrap(crypto).ok().unwrap().shutdown().unwrap();
+    drop(occupied);
+    std::fs::remove_file(occupied_path).unwrap();
 }

@@ -220,7 +220,6 @@ mod placement_tests {
         Trust {
             universe: s.universe.clone().try_into().unwrap(),
             node: s.node.clone().try_into().unwrap(),
-            keys: crate::signing::Keys::new(None, vec![]).unwrap(),
         }
     }
 
@@ -275,11 +274,19 @@ mod placement_tests {
                         (1..3).any(|i| r.local.contains(&primary)
                             != r.local.contains(&((primary + i) % p)))
                     );
-                    if p == 131072 && !r.local.contains(&primary) {
+                    if !r.local.contains(&primary) {
                         cursor.owner = primary;
-                        assert!(r.last_hop(&cursor));
+                        // A remote physical owner does not imply a sparse proof
+                        // for every destination, particularly at cube geometry.
+                        let (next_peer, _) = r.next(&cursor).unwrap().unwrap();
+                        assert_eq!(s.peers.len(), 1);
+                        assert_eq!(next_peer, s.peers[0].id);
+                        assert_eq!(r.last_hop(&cursor), r.neighbors.contains_key(&primary));
                         cursor.attempt = 1;
-                        assert!(r.next(&cursor).unwrap().is_none());
+                        assert_eq!(
+                            r.next(&cursor).unwrap().is_none(),
+                            r.local.contains(&((primary + 1) % p))
+                        );
                         cursor.attempt = 0;
                     }
                 }
@@ -335,7 +342,9 @@ mod placement_tests {
             let c = r.start(&target);
             if !local {
                 assert!(r.last_hop(&c));
-                assert!((1..3).any(|i| r.local.contains(&((c.owner + i) % 131072))));
+                assert!(
+                    (1..3).any(|i| r.local.contains(&((c.owner + i) % r.geometry.slot_count())))
+                );
             }
             println!("B03_TARGET {label} {target}");
         }
@@ -346,13 +355,12 @@ mod placement_tests {
         for i in 0..9 {
             let mut v = s.volumes[0].clone();
             v.id = format!("v{i}");
-            v.peer_listen = format!("127.0.0.1:{}", 20000 + i);
             v.cache_socket = format!("/dev/racer/v{i}/cache");
             v.origin_socket = format!("/dev/racer/v{i}/origin");
             v.peers.clear();
             v.peer_endpoints = Some(Default::default());
             let t = v.topology.as_mut().unwrap();
-            t.local_slots = (0..131072).collect();
+            t.local_slots = (0..t.slot_count).collect();
             t.neighbors.clear();
             large.volumes.push(v);
         }

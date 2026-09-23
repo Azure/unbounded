@@ -175,7 +175,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers jq
+          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq
       - name: Set up Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt
@@ -246,6 +246,7 @@ jobs:
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
           timeout --signal=KILL 15m go test -mod=readonly -race -count=1 -timeout=14m -v ./cmd/racer-controlplane
       - name: Test SDK against the real dataplane
         run: |

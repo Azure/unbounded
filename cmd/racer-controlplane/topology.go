@@ -6,10 +6,10 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 
 	pb "github.com/Azure/unbounded/api/racer"
 	"github.com/Azure/unbounded/internal/racer"
@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultSlots     uint32 = racer.SlotCount
-	generationFormat int    = 3
+	generationFormat int    = 4
 )
 
 func identity(domain, value string) string {
@@ -46,7 +46,6 @@ type volumeSpec struct {
 	ResourceGeneration int64  `json:"resourceGeneration,omitempty"`
 	CacheSocket        string `json:"cacheSocket,omitempty"`
 	OriginSocket       string `json:"originSocket,omitempty"`
-	Port               int32  `json:"port"`
 	Slots              uint32 `json:"slots"`
 	Cache              uint64 `json:"cache"`
 	Algorithm          uint32 `json:"algorithm"`
@@ -76,7 +75,6 @@ type generation struct {
 	Volume      *volumeSpec       `json:"volume,omitempty"`
 	Owners      []string          `json:"owners,omitempty"`
 	SlotHistory map[string]uint32 `json:"slotHistory"`
-	Ports       map[string]int32  `json:"ports"`
 	Withdrawn   map[string]bool   `json:"withdrawn,omitempty"`
 	// Keep the primary volume fields readable by existing persisted generations.
 	Additional []volumeState `json:"additional,omitempty"`
@@ -321,10 +319,29 @@ func diversify(owners []string) error {
 // Recipient indexing, admission budgets and wire snapshots.
 
 type topologyIndex struct {
-	g          *generation
-	local      map[string][]uint32
-	byID       map[string]string
-	additional []*topologyIndex
+	g           *generation
+	local       map[string][]uint32
+	byID        map[string]string
+	additional  []*topologyIndex
+	stateDigest string
+}
+
+// publishedDigest must be called under Server.mu on a published index. Candidate
+// indexing precedes the final revision increment in Reconcile, so computing the
+// digest in indexGeneration would cache the wrong commit identity. Published
+// generations are immutable; cache the exact stateStore.commit JSON digest once.
+func (t *topologyIndex) publishedDigest() (string, error) {
+	if t.stateDigest == "" {
+		data, err := json.Marshal(t.g)
+		if err != nil {
+			return "", err
+		}
+
+		digest := sha256.Sum256(data)
+		t.stateDigest = hex.EncodeToString(digest[:])
+	}
+
+	return t.stateDigest, nil
 }
 
 func indexGeneration(g *generation) (*topologyIndex, error) {
@@ -514,7 +531,7 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	neighbors, outgoing, direct := t.connections(name)
 	for peer := range direct {
 		remote := t.g.Nodes[peer]
-		s.Peers = append(s.Peers, &pb.Peer{Id: remote.ID, HttpAddress: net.JoinHostPort(remote.IP, strconv.Itoa(int(v.Port))), Fabric: remote.Fabric})
+		s.Peers = append(s.Peers, &pb.Peer{Id: remote.ID, HttpAddress: net.JoinHostPort(remote.IP, "9443"), Fabric: remote.Fabric, PodUid: remote.PodUID})
 	}
 
 	sort.Slice(s.Peers, func(i, j int) bool { return s.Peers[i].Id < s.Peers[j].Id })
@@ -526,13 +543,8 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 
 	sort.Strings(peers)
 
-	listen := "0.0.0.0"
-	if net.ParseIP(node.IP).To4() == nil {
-		listen = "::"
-	}
-
 	s.Volumes = []*pb.Volume{{
-		Id: v.ID, PeerListen: net.JoinHostPort(listen, strconv.Itoa(int(v.Port))), CacheSocket: v.CacheSocket, OriginSocket: v.OriginSocket, CacheGeneration: v.Cache,
+		Id: v.ID, CacheSocket: v.CacheSocket, OriginSocket: v.OriginSocket, CacheGeneration: v.Cache,
 		Peers: peers, Topology: &pb.Topology{Epoch: t.g.Revision, SlotCount: v.Slots, LocalSlots: t.local[name], Neighbors: neighbors, RoutingAlgorithm: &v.Algorithm}, MaxCandidateAttempts: &v.Attempts,
 	}}
 	{
