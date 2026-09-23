@@ -928,6 +928,9 @@ deploy_gantry() {
     --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER" \
     --wait \
     --timeout 45m
+
+  kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
+  kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=45m
 }
 
 provision_operator() {
