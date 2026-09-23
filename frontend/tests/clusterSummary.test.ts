@@ -93,11 +93,26 @@ test('resource online counts retain interface semantics independently of CNI hea
 });
 
 test('summary deltas reject stale sequence and remove nodes without losing resources', () => {
-  const initial = toClusterSummary({ seq: 4, sites: [{ name: 'site' }], nodeSummaries: [{ name: 'old' }] });
+  const initial = toClusterSummary({
+    seq: 4,
+    sites: [{ name: 'site' }],
+    gatewayPools: [{ name: 'pool' }],
+    warnings: ['warning'],
+    nodeSummaries: [{ name: 'old' }],
+  });
   assert.equal(mergeSummary(initial, { seq: 4, removedNodes: ['old'] }), initial);
-  const next = mergeSummary(initial, { seq: 5, removedNodes: ['old'], nodeSummaries: [{ name: 'new' }] });
+  const next = mergeSummary(initial, {
+    seq: 5,
+    sites: [],
+    gatewayPools: [],
+    warnings: [],
+    removedNodes: ['old'],
+    nodeSummaries: [{ name: 'new' }],
+  });
   assert.deepEqual(next.nodeSummaries, toClusterSummary({ nodeSummaries: [{ name: 'new' }] }).nodeSummaries);
-  assert.deepEqual(next.sites, initial.sites);
+  assert.deepEqual(next.sites, []);
+  assert.deepEqual(next.gatewayPools, []);
+  assert.deepEqual(next.warnings, []);
 });
 
 test('legacy partial updates keep counts and CNI facts without retaining full base', () => {

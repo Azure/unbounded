@@ -238,8 +238,8 @@ export type ClusterSummaryDelta = {
   nodeCount?: number;
   siteCount?: number;
   azureTenantId?: string;
-  leaderInfo?: LeaderInfo;
-  buildInfo?: BuildInfo;
+  leaderInfo?: LeaderInfo | null;
+  buildInfo?: BuildInfo | null;
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
