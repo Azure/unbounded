@@ -9,18 +9,21 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type config struct {
-	showVersion                    bool
-	endpoint, originSocket, listen string
-	footprint, objectSize, seed    int64
-	exponent                       float64
-	concurrency, pageConcurrency   int
-	timeout, ttl, duration         time.Duration
+	mode, role, registryListen, registryURL, registryNamespace, gantryEndpoint string
+	layersPerImage, layerConcurrency                                           int
+	showVersion                                                                bool
+	endpoint, originSocket, listen                                             string
+	footprint, objectSize, seed                                                int64
+	exponent                                                                   float64
+	concurrency, pageConcurrency                                               int
+	timeout, ttl, duration                                                     time.Duration
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -32,6 +35,14 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
 	f.BoolVar(&c.showVersion, "version", false, "print version and exit")
+	f.StringVar(&c.mode, "mode", "racer", "workload: racer or container-image")
+	f.StringVar(&c.role, "role", "", "container-image role: registry or load")
+	f.StringVar(&c.registryListen, "registry-listen", ":8081", "fake registry TCP listen address")
+	f.StringVar(&c.registryURL, "registry-url", "", "fake registry HTTP(S) URL for catalog discovery")
+	f.StringVar(&c.registryNamespace, "registry-namespace", "", "Gantry upstream registry name (ns query parameter)")
+	f.StringVar(&c.gantryEndpoint, "gantry-endpoint", "http://127.0.0.1:5000", "Gantry mirror HTTP(S) URL")
+	f.IntVar(&c.layersPerImage, "layers-per-image", 4, "unique layers per synthetic image; object-size is layer size")
+	f.IntVar(&c.layerConcurrency, "layer-concurrency", 3, "parallel layer downloads per image")
 	f.StringVar(&c.endpoint, "endpoint", "/dev/racer/loadgen/cache", "local Racer cache Unix socket")
 	f.StringVar(&c.originSocket, "origin-socket", "/dev/racer/loadgen/origin", "local origin Unix socket")
 	f.StringVar(&c.listen, "listen", ":8080", "management TCP address for /metrics and /healthz")
@@ -47,9 +58,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 		return err
 	})
-	f.IntVar(&c.concurrency, "concurrency", 4, "simultaneous full-object downloads")
+	f.IntVar(&c.concurrency, "concurrency", 4, "simultaneous object downloads or image pulls")
 	f.IntVar(&c.pageConcurrency, "page-concurrency", 8, "parallel page requests per object")
-	f.DurationVar(&c.timeout, "timeout", 5*time.Minute, "deadline for each full-object download")
+	f.DurationVar(&c.timeout, "timeout", 5*time.Minute, "deadline for each object download, image pull, or catalog request")
 	f.DurationVar(&c.ttl, "ttl", time.Hour, "origin metadata TTL")
 	f.DurationVar(&c.duration, "duration", 0, "run duration (0 runs until interrupted)")
 
@@ -94,7 +105,56 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return c, fmt.Errorf("timeout must be positive; ttl and duration must be nonnegative")
 	}
 
-	return c, nil
+	return c, c.validateMode()
+}
+
+func (c config) validateMode() error {
+	switch c.mode {
+	case "racer":
+		if c.role != "" {
+			return fmt.Errorf("role is only supported in container-image mode")
+		}
+	case "container-image":
+		if c.role != "registry" && c.role != "load" {
+			return fmt.Errorf("container-image mode requires -role=registry or -role=load")
+		}
+
+		if c.layersPerImage < 1 || c.layersPerImage > 1024 || c.layerConcurrency < 1 {
+			return fmt.Errorf("layers-per-image must be 1..1024 and layer-concurrency must be positive")
+		}
+
+		if c.role == "registry" {
+			layers := c.footprint / c.objectSize
+			if layers%int64(c.layersPerImage) != 0 || layers/int64(c.layersPerImage) > 100_000 {
+				return fmt.Errorf("layer count must be divisible by layers-per-image and produce at most 100000 images")
+			}
+		} else {
+			if err := validateHTTPURL(c.registryURL); err != nil {
+				return fmt.Errorf("registry-url: %w", err)
+			}
+
+			if err := validateHTTPURL(c.gantryEndpoint); err != nil {
+				return fmt.Errorf("gantry-endpoint: %w", err)
+			}
+
+			if c.registryNamespace == "" || strings.ContainsAny(c.registryNamespace, "/?#@ \t\r\n") {
+				return fmt.Errorf("registry-namespace must be a registry name, optionally with a port")
+			}
+		}
+	default:
+		return fmt.Errorf("unknown mode %q", c.mode)
+	}
+
+	return nil
+}
+
+func validateHTTPURL(value string) error {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("expected an HTTP(S) origin URL without credentials, path, query, or fragment")
+	}
+
+	return nil
 }
 
 func parseSize(s string) (int64, error) {

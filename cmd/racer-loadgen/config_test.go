@@ -18,6 +18,7 @@ func TestConfigDefaults(t *testing.T) {
 	}
 
 	want := config{
+		mode: "racer", registryListen: ":8081", gantryEndpoint: "http://127.0.0.1:5000", layersPerImage: 4, layerConcurrency: 3,
 		endpoint: "/dev/racer/loadgen/cache", originSocket: "/dev/racer/loadgen/origin", listen: ":8080",
 		footprint: 512_000_000_000, objectSize: 1_000_000_000, seed: 42, exponent: 1,
 		concurrency: 4, pageConcurrency: 8, timeout: 5 * time.Minute, ttl: time.Hour,

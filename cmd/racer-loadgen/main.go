@@ -70,6 +70,9 @@ func managementHandler(reg *prometheus.Registry) http.Handler {
 }
 
 func serve(ctx context.Context, c config) error {
+	if c.mode == "container-image" {
+		return serveImages(ctx, c)
+	}
 	// Validate the endpoint before opening a listener.
 	client, err := racer.NewClient(c.endpoint, racer.ClientOptions{Concurrency: c.pageConcurrency})
 	if err != nil {
