@@ -108,8 +108,15 @@ func setupCacheStatusController(manager ctrl.Manager, server *Server, socketRoot
 }
 
 func (r *cacheStatusReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+	// Read the patch baseline directly: another event can requeue this cache
+	// before the informer observes our previous status write.
+	store := r.server.controlStore
+	if store.client == nil {
+		store.client = r.client
+	}
+
 	var cache racerapi.P2PCache
-	if err := r.client.Get(ctx, request.NamespacedName, &cache); err != nil {
+	if err := store.client.Get(ctx, request.NamespacedName, &cache); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -133,17 +140,12 @@ func (r *cacheStatusReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	// Use the durable client rather than the informer cache: every committed
 	// universe must be accounted for, including deleted Sites and universes
 	// not yet restored after restart or an ambiguous commit.
-	store := r.server.controlStore
-	if store.client == nil {
-		store.client = r.client
-	}
-
 	var pointers corev1.ConfigMapList
 	if err := store.client.List(ctx, &pointers, client.InNamespace(store.namespace), client.MatchingLabels{stateLabel: "commit"}); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	cache.Status = r.status(&cache, sites.Items, nodes.Items, pods.Items, time.Now(), pointers.Items...)
+	cache.Status = r.status(&cache, sites.Items, nodes.Items, pods.Items, time.Time{}, pointers.Items...)
 	if !reflect.DeepEqual(before.Status, cache.Status) {
 		if err := r.client.Status().Patch(ctx, &cache, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
@@ -216,6 +218,13 @@ func (r *cacheStatusReconciler) status(cache *racerapi.P2PCache, sites []machina
 
 	r.server.mu.Lock()
 	defer r.server.mu.Unlock()
+
+	// Sample time with the acknowledgment snapshot, after waiting for heartbeat
+	// writers. Sampling before the lock misclassifies intervening heartbeats as
+	// future timestamps. Tests may supply an explicit observation time.
+	if now.IsZero() {
+		now = time.Now()
+	}
 
 	converged := true
 

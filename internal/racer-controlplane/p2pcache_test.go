@@ -6,10 +6,13 @@ package controlplane
 import (
 	"context"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -105,6 +108,11 @@ func TestP2PCacheStatusMissingParticipantsAndFreshness(t *testing.T) {
 	status = r.status(cache, []machina.Site{site}, []corev1.Node{*node}, []corev1.Pod{*pod}, now.Add(storageFreshness))
 	if status.Participants.Ready != 0 {
 		t.Fatal("stale activation remained ready")
+	}
+
+	status = r.status(cache, []machina.Site{site}, []corev1.Node{*node}, []corev1.Pod{*pod}, now.Add(-time.Nanosecond))
+	if status.Participants.Ready != 0 {
+		t.Fatal("future activation counted as ready")
 	}
 
 	ack := roll.acks[g.Nodes[node.Name].ID]
@@ -546,5 +554,236 @@ func TestP2PCacheStatusPatchAndEmptySelections(t *testing.T) {
 	status := r.status(cache, nil, nil, nil, time.Now())
 	if meta.IsStatusConditionTrue(status.Conditions, racerapi.ConditionAccepted) {
 		t.Fatal("invalid selector accepted without Sites")
+	}
+}
+
+type staleCacheStatusClient struct {
+	client.Client
+	cache *racerapi.P2PCache
+}
+
+func (c *staleCacheStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if cache, ok := obj.(*racerapi.P2PCache); ok {
+		c.cache.DeepCopyInto(cache)
+		return nil
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestP2PCacheStatusInformerLag(t *testing.T) {
+	ctx := context.Background()
+	cache := cacheFixture()
+	kube := fakeKube(cache)
+
+	key := client.ObjectKeyFromObject(cache)
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := &staleCacheStatusClient{Client: kube, cache: cache.DeepCopy()}
+	server := &Server{controlStore: stateStore{client: kube, namespace: "state"}}
+	r := &cacheStatusReconciler{client: stale, server: server}
+
+	request := ctrl.Request{NamespacedName: key}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	version := cache.ResourceVersion
+	if version == stale.cache.ResourceVersion {
+		t.Fatal("fixture did not leave the informer behind the status write")
+	}
+
+	// The same writer must observe its last patch even before the informer does.
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatalf("status conflicted with its own prior write: %v", err)
+	}
+
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.ResourceVersion != version {
+		t.Fatal("unchanged status was rewritten while the informer lagged")
+	}
+
+	cache.Spec.SiteSelector.MatchLabels = map[string]string{"absent": "true"}
+
+	cache.Generation++
+	if err := kube.Update(ctx, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.Status.ObservedGeneration != cache.Generation || meta.FindStatusCondition(cache.Status.Conditions, racerapi.ConditionReady).Reason != "NoMatchingSites" {
+		t.Fatalf("status used the stale informer spec: %+v", cache.Status)
+	}
+
+	if err := kube.Delete(ctx, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatalf("deleted cache retained by informer: %v", err)
+	}
+}
+
+type concurrentCacheEditClient struct {
+	client.Client
+	edit func() error
+}
+
+func (c *concurrentCacheEditClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if c.edit != nil {
+		edit := c.edit
+
+		c.edit = nil
+		if err := edit(); err != nil {
+			return err
+		}
+	}
+
+	return c.Client.List(ctx, list, opts...)
+}
+
+func TestP2PCacheStatusConcurrentSpecEdit(t *testing.T) {
+	ctx := context.Background()
+	cache := cacheFixture()
+	kube := fakeKube(cache)
+	key := client.ObjectKeyFromObject(cache)
+	cached := &concurrentCacheEditClient{Client: kube, edit: func() error {
+		if err := kube.Get(ctx, key, cache); err != nil {
+			return err
+		}
+
+		cache.Spec.SiteSelector.MatchLabels = map[string]string{"absent": "true"}
+		cache.Generation++
+
+		return kube.Update(ctx, cache)
+	}}
+	r := &cacheStatusReconciler{client: cached, server: &Server{controlStore: stateStore{client: kube, namespace: "state"}}}
+
+	request := ctrl.Request{NamespacedName: key}
+	if _, err := r.Reconcile(ctx, request); !apierrors.IsConflict(err) {
+		t.Fatalf("concurrent spec edit must reject old status, got %v", err)
+	}
+
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.Status.ObservedGeneration != 0 || len(cache.Status.Conditions) != 0 {
+		t.Fatalf("published status for a superseded spec: %+v", cache.Status)
+	}
+
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(ctx, key, cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.Status.ObservedGeneration != cache.Generation || meta.FindStatusCondition(cache.Status.Conditions, racerapi.ConditionReady).Reason != "NoMatchingSites" {
+		t.Fatalf("retry did not recompute for the current spec: %+v", cache.Status)
+	}
+}
+
+func TestP2PCacheStatusHeartbeatDuringLockWait(t *testing.T) {
+	ctx := context.Background()
+	node, pod, cache := fixtures()
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	kube := fakeKube(node, pod, cache)
+
+	topology := newTestReconciler(kube)
+	if _, err := topology.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "default"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := topology.server
+	index := server.source.topologies[identityBytes("universe", "default")]
+
+	roll, err := server.rolloutFor(ctx, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := server.persistPhase(ctx, "default", roll, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &cacheStatusReconciler{client: kube, server: server}
+	server.mu.Lock()
+	locked := true
+
+	defer func() {
+		if locked {
+			server.mu.Unlock()
+		}
+	}()
+
+	finished := make(chan error, 1)
+
+	go func() {
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cache)})
+		finished <- err
+	}()
+
+	// Wait for the real reconciliation to block on the heartbeat writer lock.
+	// A sleep alone would not guarantee that its observation had started.
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		stack := make([]byte, 1<<20)
+		n := runtime.Stack(stack, true)
+		waiting := false
+
+		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
+			if strings.Contains(goroutine, "(*cacheStatusReconciler).status") && strings.Contains(goroutine, "sync.(*Mutex).Lock") {
+				waiting = true
+				break
+			}
+		}
+
+		if waiting {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("status reconciliation did not wait for the heartbeat lock")
+		}
+
+		runtime.Gosched()
+	}
+
+	// Simulate the healthy phase-4 heartbeat completing before status acquires
+	// the lock. Its receive timestamp is newer than reconciliation's start.
+	roll.acks[index.g.Nodes[node.Name].ID] = rolloutAck{boot: "boot", phase: 4, healthy: true, seen: time.Now()}
+	server.mu.Unlock()
+
+	locked = false
+
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(cache), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.Status.Participants.Ready != 1 || !meta.IsStatusConditionTrue(cache.Status.Conditions, racerapi.ConditionReady) {
+		t.Fatalf("fresh heartbeat received during lock wait was excluded: %+v", cache.Status)
 	}
 }
