@@ -59,3 +59,23 @@ func TestInstallNSpawnLifecycleHelper(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("new-agent"), data)
 }
+
+// TestEnsureNSpawnLifecycleHelperInstallsAtTheGivenTarget covers the task
+// wrapper rather than the copy beneath it.
+//
+// The copy already had tests, but they call installNSpawnLifecycleHelper
+// directly and so say nothing about where the task decides to put the file.
+// That decision is the whole of this task's behavior, and a regression to a
+// fixed path would install the helper somewhere the generated hook units do
+// not name.
+func TestEnsureNSpawnLifecycleHelperInstallsAtTheGivenTarget(t *testing.T) {
+	t.Parallel()
+
+	target := filepath.Join(t.TempDir(), "bin", "unbounded-agent-nspawn-lifecycle")
+	require.NoError(t, EnsureNSpawnLifecycleHelper(target).Do(t.Context()))
+
+	info, err := os.Stat(target)
+	require.NoError(t, err, "helper must be installed at the requested target")
+	require.True(t, info.Mode().IsRegular())
+	require.NotZero(t, info.Mode().Perm()&0o111, "helper must be executable")
+}

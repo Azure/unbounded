@@ -484,3 +484,43 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	// The writable mount must not appear as a BindReadOnly entry.
 	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
 }
+
+// TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper writes the generated
+// units from a goal state and checks they invoke the helper it resolved.
+//
+// These units are the only callers of the helper. If they name the default
+// while the helper is installed under a prefix, nothing fails until systemd
+// starts the machine and the hook cannot exec, which surfaces as a machine that
+// will not start rather than as an installation error.
+//
+// This goes through writeNSpawnConfigs rather than rendering the templates from
+// hand-built data, because the defect being guarded against is the population
+// step reverting to the constant. A test that supplies its own template data
+// passes either way.
+func TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper(t *testing.T) {
+	t.Parallel()
+
+	const helper = "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle"
+
+	dir := t.TempDir()
+	goalState := &goalstates.RootFS{
+		MachineDir:             filepath.Join(dir, "machines", "kube1"),
+		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+		ConfigRegenerationFile: filepath.Join(dir, "config-regeneration.service"),
+		NSpawnLifecycleBinary:  helper,
+	}
+
+	require.NoError(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState))
+
+	for _, path := range []string{goalState.ServiceOverrideFile, goalState.ConfigRegenerationFile} {
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+
+		rendered := string(content)
+		require.Contains(t, rendered, helper,
+			"%s must invoke the helper the goal state resolved", filepath.Base(path))
+		require.NotContains(t, rendered, goalstates.NSpawnLifecycleBinaryPath+" nspawn-lifecycle",
+			"%s must not fall back to the default prefix", filepath.Base(path))
+	}
+}

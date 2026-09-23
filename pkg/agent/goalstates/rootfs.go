@@ -13,14 +13,21 @@ type RootFS struct {
 	NSpawnConfigFile       string // e.g. /etc/systemd/nspawn/node.nspawn
 	ServiceOverrideFile    string // e.g. /etc/systemd/system/systemd-nspawn@node.service.d/override.conf
 	ConfigRegenerationFile string // host systemd pre-start unit
-	HostArch               string
-	HostKernel             string // running kernel version from uname -r, e.g. "6.8.0-45-generic"
-	Hostname               string // host hostname, written into the rootfs so the nspawn container inherits it
-	ContainerdVersion      string
-	RunCVersion            string
-	CNIPluginVersion       string
-	KubernetesVersion      string
-	LocalDNS               LocalDNS
+
+	// NSpawnLifecycleBinary is the rollback-stable helper the generated nspawn
+	// hook units invoke. It is resolved from the installation prefix here so
+	// that the unit and the file it names cannot be resolved from different
+	// prefixes: the hooks are written once and must keep working across an
+	// agent upgrade.
+	NSpawnLifecycleBinary string
+	HostArch              string
+	HostKernel            string // running kernel version from uname -r, e.g. "6.8.0-45-generic"
+	Hostname              string // host hostname, written into the rootfs so the nspawn container inherits it
+	ContainerdVersion     string
+	RunCVersion           string
+	CNIPluginVersion      string
+	KubernetesVersion     string
+	LocalDNS              LocalDNS
 
 	// Downloads optionally overrides the download sources for binaries
 	// the agent installs into the nspawn rootfs (kubelet, containerd,
