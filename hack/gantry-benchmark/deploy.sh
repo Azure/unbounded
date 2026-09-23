@@ -688,12 +688,9 @@ private_dns_ip() {
   exit 1
 }
 
-install_node_configuration() {
+install_private_dns_guard() {
   export KUBECONFIG
   kubectl create namespace "$GANTRY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-  kubectl apply -f "$repo_root/hack/gantry-benchmark/manifests/containerd.yaml"
-  kubectl -n "$GANTRY_NAMESPACE" rollout status \
-    daemonset/gantry-benchmark-containerd-config --timeout=45m
 
   local baseline_login_ip baseline_data_ip gantry_login_ip gantry_data_ip
   baseline_login_ip=$(private_dns_ip "$BASELINE_ACR_NAME")
@@ -855,8 +852,6 @@ replace_private_pull_tls_nodes() {
     return 1
   }
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
-    daemonset/gantry-benchmark-containerd-config --timeout=30m
-  kubectl -n "$GANTRY_NAMESPACE" rollout status \
     daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
 
@@ -921,48 +916,18 @@ PROBE
   kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-baseline-acr-pull-probe --wait=true
 }
 
-chair_leases_exist() {
-  kubectl -n "$GANTRY_NAMESPACE" get leases -l gantry.io/chair=true -o json | jq -e '
-    ([range(0; 64) | if . < 10 then "gantry-chair-0\(.)" else "gantry-chair-\(.)" end] | sort) as $expected |
-    ([.items[].metadata.name] | sort) == $expected
-  ' >/dev/null
-}
-
-ensure_chair_leases() {
-  local manifest=$1
-
-  if chair_leases_exist; then
-    return
-  fi
-
-  if ! kubectl create -f "$manifest"; then
-    log "chair Lease creation raced with another writer; verifying fixed set"
-  fi
-
-  chair_leases_exist
-}
-
 deploy_gantry() {
   export KUBECONFIG
-  local render_root=$DEPLOY_STATE_DIR/gantry-rendered
-  local rendered=$render_root/gantry/templates
-  rm -rf "$render_root"
   GOTOOLCHAIN=auto make -C "$repo_root" install-helm
-  "$repo_root/bin/helm" template gantry "$repo_root/deploy/gantry/chart" \
+  "$repo_root/bin/helm" upgrade --install gantry "$repo_root/deploy/gantry/chart" \
     --namespace "$GANTRY_NAMESPACE" \
+    --create-namespace \
     --set-string "image.reference=$GANTRY_IMAGE" \
     --set-string 'gantry.pprofListen=127.0.0.1:6060' \
     --set-string "gantry.upstreamRegistries[0].name=$GANTRY_ACR_LOGIN_SERVER" \
     --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER" \
-    --output-dir "$render_root"
-
-  kubectl apply -f "$rendered/serviceaccount.yaml"
-  kubectl apply -f "$rendered/configmap.yaml"
-  ensure_chair_leases "$rendered/rendezvous-leases.yaml"
-  kubectl apply -f "$rendered/node-config.yaml"
-  kubectl apply -f "$rendered/daemonset.yaml"
-  kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
-  kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=45m
+    --wait \
+    --timeout 45m
 }
 
 provision_operator() {
@@ -1057,7 +1022,7 @@ ensure_role "$kubelet_object_id" AcrPull \
   "$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query id -o tsv)"
 
 wait_for_nodes
-install_node_configuration
+install_private_dns_guard
 install_monitoring
 
 set_acrs_private
@@ -1077,7 +1042,7 @@ assert_equal "Gantry ACR public access" \
 
 kubectl -n "$MONITORING_NAMESPACE" get endpoints "$PROMETHEUS_SERVICE" -o json | \
   jq -e '.subsets | any(.addresses | length > 0)' >/dev/null
-for daemonset in gantry-benchmark-containerd-config gantry-acr-private-dns-guard gantry-containerd-config gantry; do
+for daemonset in gantry-acr-private-dns-guard gantry-containerd-config gantry; do
   namespace=$GANTRY_NAMESPACE
   desired=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.desiredNumberScheduled}')
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')

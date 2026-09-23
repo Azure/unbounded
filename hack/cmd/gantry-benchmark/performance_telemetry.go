@@ -43,12 +43,16 @@ type containerdJournalEvent struct {
 }
 
 type phasePerformanceTelemetry struct {
-	Window                  telemetryWindow          `json:"window"`
-	ObserverPodNodes        map[string]string        `json:"observer_pod_nodes"`
-	Prometheus              []prometheusRangeCapture `json:"prometheus"`
-	ContainerdJournal       string                   `json:"containerd_journal"`
-	ContainerdJournalEvents []containerdJournalEvent `json:"containerd_journal_events"`
-	Complete                bool                     `json:"complete"`
+	Window                            telemetryWindow          `json:"window"`
+	ObserverPodNodes                  map[string]string        `json:"observer_pod_nodes"`
+	Prometheus                        []prometheusRangeCapture `json:"prometheus"`
+	ContainerdJournal                 string                   `json:"containerd_journal"`
+	ContainerdJournalEvents           []containerdJournalEvent `json:"containerd_journal_events"`
+	ContainerdJournalPodsObserved     int                      `json:"containerd_journal_pods_observed"`
+	ContainerdJournalPodsExpected     int                      `json:"containerd_journal_pods_expected"`
+	ContainerdJournalCoverageComplete bool                     `json:"containerd_journal_coverage_complete"`
+	ContainerdUnpackTelemetry         bool                     `json:"containerd_unpack_telemetry"`
+	Complete                          bool                     `json:"complete"`
 }
 
 var journalFieldPattern = regexp.MustCompile(`(?:^|[[:space:]])([a-zA-Z_]+)="?([^"[:space:]]+)"?`)
@@ -138,14 +142,19 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 	if err != nil {
 		return phasePerformanceTelemetry{}, err
 	}
+	journalPodsObserved, unpackTelemetry := summarizeContainerdJournal(journalEvents)
 
 	return phasePerformanceTelemetry{
-		Window:                  window,
-		ObserverPodNodes:        observerPods,
-		Prometheus:              captures,
-		ContainerdJournal:       journal,
-		ContainerdJournalEvents: journalEvents,
-		Complete:                true,
+		Window:                            window,
+		ObserverPodNodes:                  observerPods,
+		Prometheus:                        captures,
+		ContainerdJournal:                 journal,
+		ContainerdJournalEvents:           journalEvents,
+		ContainerdJournalPodsObserved:     journalPodsObserved,
+		ContainerdJournalPodsExpected:     len(observerPods),
+		ContainerdJournalCoverageComplete: journalPodsObserved == len(observerPods),
+		ContainerdUnpackTelemetry:         unpackTelemetry,
+		Complete:                          true,
 	}, nil
 }
 
@@ -188,7 +197,6 @@ func parseContainerdJournal(
 	window telemetryWindow,
 ) ([]containerdJournalEvent, error) {
 	events := []containerdJournalEvent{}
-	observedPods := map[string]struct{}{}
 
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
@@ -258,18 +266,22 @@ func parseContainerdJournal(
 		}
 
 		events = append(events, event)
-		observedPods[observerPod] = struct{}{}
-	}
-
-	if len(observedPods) != len(observerPodNodes) {
-		return nil, fmt.Errorf(
-			"containerd journal has phase events from %d/%d observer pods",
-			len(observedPods),
-			len(observerPodNodes),
-		)
 	}
 
 	return events, nil
+}
+
+func summarizeContainerdJournal(events []containerdJournalEvent) (int, bool) {
+	observedPods := map[string]struct{}{}
+	unpackTelemetry := false
+	for _, event := range events {
+		observedPods[event.ObserverPod] = struct{}{}
+		if event.Type == "layer_unpacked" || event.Type == "image_unpacked" {
+			unpackTelemetry = true
+		}
+	}
+
+	return len(observedPods), unpackTelemetry
 }
 
 func classifyContainerdJournalEvent(message string) string {

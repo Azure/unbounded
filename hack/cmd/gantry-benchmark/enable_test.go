@@ -98,8 +98,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")
 	}
 
-	if !strings.Contains(string(rendered), `systemctl show --property MainPID --value containerd`) {
-		t.Fatalf("rendered manifest does not validate the running containerd debug configuration")
+	if !strings.Contains(string(rendered), `journalctl -f -n 0 -u containerd`) ||
+		strings.Contains(string(rendered), `containerd debug logging is required`) {
+		t.Fatalf("rendered manifest does not support stock containerd journal collection")
 	}
 
 	if !strings.Contains(string(rendered), `- port: ctr-metrics`) || strings.Contains(string(rendered), `- port: containerd-metrics`) {
@@ -289,30 +290,23 @@ func renderedContainerScript(t *testing.T, rendered []byte, objectName, containe
 	return ""
 }
 
-func TestContainerdBenchmarkManifest(t *testing.T) {
+func TestDeployDoesNotInstallContainerdBenchmarkConfig(t *testing.T) {
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		t.Fatalf("findRepoRoot: %v", err)
 	}
 
-	manifest, err := os.ReadFile(filepath.Join(repoRoot, "hack/gantry-benchmark/manifests/containerd.yaml"))
+	deployScript, err := os.ReadFile(filepath.Join(repoRoot, "hack/gantry-benchmark/deploy.sh"))
 	if err != nil {
-		t.Fatalf("read containerd manifest: %v", err)
+		t.Fatalf("read deploy script: %v", err)
 	}
 
-	wantKinds := []string{"ConfigMap", "DaemonSet"}
-	if kinds := decodeManifestKinds(t, manifest); !slices.Equal(kinds, wantKinds) {
-		t.Fatalf("manifest kinds = %v, want %v", kinds, wantKinds)
-	}
-
-	for _, setting := range []string{
-		`level = "debug"`,
-		`image_pull_progress_timeout = "15m"`,
-		`max_concurrent_downloads = 6`,
-		`systemd-run`,
+	for _, removed := range []string{
+		"manifests/containerd.yaml",
+		"gantry-benchmark-containerd-config",
 	} {
-		if !bytes.Contains(manifest, []byte(setting)) {
-			t.Fatalf("containerd manifest is missing %q", setting)
+		if bytes.Contains(deployScript, []byte(removed)) {
+			t.Fatalf("deploy script still installs benchmark containerd configuration %q", removed)
 		}
 	}
 }

@@ -18,11 +18,10 @@ make -C hack/gantry-benchmark deploy-status
 The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
-images, containerd settings, deterministic node-side ACR routing, bounded
-Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
-preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
-the same invocation should start the benchmark after every deployment gate
-passes.
+images, deterministic node-side ACR routing, bounded Prometheus discovery,
+Gantry, and the private operator VM. It leaves the stack preflight-ready by
+default; set `START_BENCHMARK=true` in `deploy.env` only when the same invocation
+should start the benchmark after every deployment gate passes.
 
 The deployment config contains names and topology only. Credentials remain in
 Azure managed identities and short-lived ACR tokens.
@@ -41,17 +40,17 @@ for diagnosis or manual operation after full-stack deployment succeeds.
 When invoking the benchmark tool directly, it expects:
 
 - Exactly `BENCHMARK_NODE_COUNT` Ready, schedulable `linux/amd64` nodes.
-- A Ready `gantry-system/gantry` DaemonSet on every benchmark node.
+- A Helm release named `gantry` with a Ready `gantry-system/gantry` DaemonSet
+  on every benchmark node.
 - A dedicated Gantry ACR listed exactly once in Gantry's
   `upstream_registries` configuration, plus a different baseline ACR.
 - kube-prometheus-stack, the Prometheus Operator CRDs, kube-state-metrics, and
   a Grafana dashboard sidecar. The workflow installs benchmark-owned
   PodMonitors for Gantry and, in proxy mode, the proxy.
 - Containerd configured to read `/etc/containerd/certs.d`.
-- Containerd metrics listening on `0.0.0.0:10257` and debug logging enabled.
-  The managed node template in this repository configures both. Preflight
-  refuses to run without a containerd scrape from every target node, and the
-  node-observer DaemonSet fails if effective containerd log level is not debug.
+- Containerd metrics listening on `0.0.0.0:10257`. Preflight refuses to run
+  without a containerd scrape from every target node. Debug logging is optional;
+  stock logging omits per-layer and image-unpack journal telemetry.
 - A private operator VM in the AKS VNet. The VM runs every benchmark command,
   builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
@@ -114,9 +113,9 @@ Preflight validates the audit path end to end by creating a unique ConfigMap
 and requiring its create event to appear in `AKSAuditAdmin`. Merely being able
 to query an empty table is not sufficient.
 
-The workload is a Kubernetes Job with 300 completions and 300-way
-parallelism. Required hostname anti-affinity uses the run ID and phase, so the
-workflow proves that exactly one pull pod ran on each of 300 distinct nodes.
+The workload is a Kubernetes Job with `BENCHMARK_NODE_COUNT` completions and
+the same parallelism. Required hostname anti-affinity uses the run ID and phase,
+so the workflow proves that exactly one pull pod ran on each target node.
 Each pull container remains Running for 15 seconds after image startup so
 `AKSAuditAdmin` reliably captures a running status transition. The startup
 metric ends at that transition; the hold is not included in startup latency.
@@ -148,12 +147,12 @@ range-query envelopes at 10-second resolution for:
 
 The same artifact includes the observer-pod-to-node map, raw filtered
 containerd journal, and phase-bounded structured events for `PullImage`,
-successful pull completion, no-progress cancellation, `layer unpacked`, and
-`image unpacked`. Capture fails unless every observer pod has an event in the
-phase window. Containerd's
-`layer unpacked` duration spans fetch, apply, and snapshot commit; it is not a
-pure filesystem-write duration. Host disk metrics provide the independent
-filesystem pressure signal during that span.
+successful pull completion, and no-progress cancellation. When containerd
+debug logging is enabled, it also includes `layer unpacked` and `image unpacked`
+events. The artifact records journal pod coverage and whether unpack telemetry
+was available. Containerd's `layer unpacked` duration spans fetch, apply, and
+snapshot commit; it is not a pure filesystem-write duration. Host disk metrics
+remain the independent filesystem signal when unpack events are unavailable.
 
 Phase JSON also includes:
 

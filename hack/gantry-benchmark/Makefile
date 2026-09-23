@@ -74,8 +74,9 @@ operator-vm-check:
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
-	! grep -Fq 'kubectl apply -f "$$rendered/rendezvous-leases.yaml"' deploy.sh
-	grep -Fq 'ensure_chair_leases "$$rendered/rendezvous-leases.yaml"' deploy.sh
+	grep -Fq '"$$repo_root/bin/helm" upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
+	! grep -Fq '"$$repo_root/bin/helm" template gantry' deploy.sh
+	! grep -Fq 'ensure_chair_leases' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"

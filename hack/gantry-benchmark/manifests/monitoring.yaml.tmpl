@@ -133,13 +133,6 @@ spec:
               mkdir -p "${textfile}"
               rm -f "${textfile}"/*.tmp
 
-              containerd_pid="$(chroot /host systemctl show --property MainPID --value containerd)"
-              containerd_bin="$(chroot /host readlink -f "/proc/${containerd_pid}/exe")"
-              if [ -z "${containerd_bin}" ] || ! chroot /host "${containerd_bin}" config dump 2>/dev/null | grep -Eq "^[[:space:]]*level = ['\"]debug['\"]$"; then
-                echo "containerd debug logging is required for unpack timing capture" >&2
-                exit 1
-              fi
-
               chroot /host journalctl -f -n 0 -u containerd -o cat | while IFS= read -r line; do
                 case "${line}" in
                   *PullImage*gantry-benchmark-pull*)
