@@ -24,6 +24,11 @@ type dataset struct {
 	size, count int64
 	ttl         time.Duration
 	checksums   []datasetChecksum
+	ctx         context.Context
+	cancel      context.CancelFunc
+	jobs        chan int64
+	stopped     chan struct{}
+	hash        func(context.Context, string) ([32]byte, error)
 }
 
 type datasetChecksum struct {
@@ -31,13 +36,52 @@ type datasetChecksum struct {
 	done  chan struct{}
 	ready bool
 	sum   [32]byte
+	err   error
 }
 
-func newDataset(c config) *dataset {
-	return &dataset{
+func newDataset(ctx context.Context, c config) *dataset {
+	ctx, cancel := context.WithCancel(ctx)
+	d := &dataset{
 		prefix: fmt.Sprintf("/loadgen/v1/%d/%d/", c.footprint, c.objectSize),
 		size:   c.objectSize, count: c.footprint / c.objectSize, ttl: c.ttl,
 		checksums: make([]datasetChecksum, c.footprint/c.objectSize),
+		ctx:       ctx, cancel: cancel,
+		jobs: make(chan int64, c.footprint/c.objectSize), stopped: make(chan struct{}),
+	}
+
+	d.hash = d.checksum
+	go d.publish()
+
+	return d
+}
+
+// Close cancels publication and joins the single worker, including on setup failure.
+func (d *dataset) Close() {
+	d.cancel()
+	<-d.stopped
+}
+
+func (d *dataset) publish() {
+	defer close(d.stopped)
+
+	for {
+		var id int64
+		select {
+		case <-d.ctx.Done():
+			return
+		case id = <-d.jobs:
+		}
+
+		if d.ctx.Err() != nil {
+			return
+		}
+
+		sum, err := d.hash(d.ctx, d.target(int(id)))
+		entry := &d.checksums[id]
+		entry.mu.Lock()
+		entry.sum, entry.err, entry.ready = sum, err, err == nil
+		close(entry.done)
+		entry.mu.Unlock()
 	}
 }
 
@@ -58,58 +102,52 @@ func (d *dataset) Stat(ctx context.Context, target string) (racer.Metadata, erro
 	ttl := d.ttl
 	entry := &d.checksums[id]
 	entry.mu.Lock()
+	if entry.done == nil && d.ctx.Err() == nil {
+		// Each object is queued at most once, so the dataset-sized queue cannot
+		// block. Requests never own publication or spawn hashing goroutines.
+		entry.done = make(chan struct{})
+
+		d.jobs <- id
+	}
+
+	done := entry.done
+	entry.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+	case <-d.ctx.Done():
+	case <-done:
+	}
+
+	if err := ctx.Err(); err != nil {
+		return racer.Metadata{}, err
+	}
+
+	if err := d.ctx.Err(); err != nil {
+		return racer.Metadata{}, err
+	}
+
+	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return racer.Metadata{}, err
-		}
-
-		if entry.ready {
-			return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
-		}
-
-		if done := entry.done; done != nil {
-			entry.mu.Unlock()
-
-			select {
-			case <-ctx.Done():
-			case <-done:
-			}
-
-			entry.mu.Lock()
-
-			continue
-		}
-
-		// Only the owner computes; waiters can cancel without waiting for it.
-		entry.done = make(chan struct{})
-		entry.mu.Unlock()
-
-		sum, err := d.checksum(ctx, target)
-
-		entry.mu.Lock()
-		if err == nil {
-			entry.sum, entry.ready = sum, true
-		}
-
-		close(entry.done)
-		entry.done = nil
-
-		if err != nil {
-			return racer.Metadata{}, err
-		}
+	if entry.err != nil {
+		return racer.Metadata{}, entry.err
 	}
+
+	return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
 }
 
 func (d *dataset) checksum(ctx context.Context, target string) ([32]byte, error) {
+	return checksum(ctx, d.source(target), d.size)
+}
+
+func checksum(ctx context.Context, source io.ReaderAt, size int64) ([32]byte, error) {
 	// Hash the actual synthetic bytes once per object, using bounded scratch.
 	// The target hash seeds the generator; it is not a content checksum.
-	source := d.source(target)
 	h := sha256.New()
 	buf := make([]byte, 32*1024)
 
-	for off := int64(0); off < d.size; {
+	for off := int64(0); off < size; {
 		if err := ctx.Err(); err != nil {
 			return [32]byte{}, err
 		}
