@@ -215,3 +215,43 @@ fn wake_callback_can_reenter_and_panic_without_losing_a_grant() {
     drop(ready(&mut wait, Waker::noop()));
     pool.assert_recovered();
 }
+
+#[test]
+#[ignore = "opt-in buffer acquisition microbenchmark; run with --release --ignored --nocapture"]
+fn acquisition_throughput() {
+    use std::hint::black_box;
+    let pool = io_test_pool(1);
+    let iterations = 1_000_000;
+    let end = Instant::now() + Duration::from_secs(120);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        drop(black_box(pool.private_fill().unwrap()));
+    }
+    let immediate = start.elapsed();
+    let start = Instant::now();
+    for _ in 0..iterations {
+        drop(black_box(ready(
+            &mut pool.wait_private_fill(end),
+            Waker::noop(),
+        )));
+    }
+    let uncontended = start.elapsed();
+    let (count, waker) = counter();
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let held = pool.private_fill().unwrap();
+        let mut wait = pool.wait_private_fill(end);
+        assert!(wait.poll(&waker).is_pending());
+        drop(held);
+        drop(black_box(ready(&mut wait, &waker)));
+    }
+    let handoff = start.elapsed();
+    assert_eq!(count.0.load(Ordering::Relaxed), iterations);
+    eprintln!(
+        "buffer ns/op: immediate={:.1} uncontended={:.1} contended-handoff={:.1}; exactly one wake per handoff",
+        immediate.as_nanos() as f64 / iterations as f64,
+        uncontended.as_nanos() as f64 / iterations as f64,
+        handoff.as_nanos() as f64 / iterations as f64
+    );
+    pool.assert_recovered();
+}

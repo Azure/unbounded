@@ -103,7 +103,12 @@ impl Acquisition {
     /// A successful acquisition is exclusive even before the worker claims it.
     pub fn poll(&mut self, waker: &Waker) -> Poll<io::Result<Fill>> {
         assert!(!self.done, "completed buffer acquisition");
+        let waker = waker.clone();
+        let mut free = self.pool.node.free.lock().unwrap();
+        // Serialize expiry with dispatch: a release can retire an expired waiter
+        // while this worker is waiting for the lock.
         if crate::environment::now() >= self.deadline {
+            drop(free);
             self.cancel();
             self.done = true;
             return Poll::Ready(Err(io::Error::new(
@@ -111,7 +116,6 @@ impl Acquisition {
                 "buffer acquisition deadline",
             )));
         }
-        let mut free = self.pool.node.free.lock().unwrap();
         let index = if let Some(id) = self.id {
             if let Some(index) = free.granted.remove(&id) {
                 self.id = None;
@@ -123,8 +127,8 @@ impl Acquisition {
                     .unwrap()
                     .get_mut(&id)
                     .unwrap();
-                if !waiter.waker.will_wake(waker) {
-                    let old = std::mem::replace(&mut waiter.waker, waker.clone());
+                if !waiter.waker.will_wake(&waker) {
+                    let old = std::mem::replace(&mut waiter.waker, waker);
                     drop(free);
                     drop(old);
                 }
@@ -139,7 +143,7 @@ impl Acquisition {
                 id,
                 Waiter {
                     deadline: self.deadline,
-                    waker: waker.clone(),
+                    waker,
                 },
             );
             self.id = Some(id);

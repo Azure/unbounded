@@ -724,4 +724,8 @@ pub(crate) mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/storage/cache_persistence.rs"
     ));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/storage/cache_backpressure.rs"
+    ));
 }
