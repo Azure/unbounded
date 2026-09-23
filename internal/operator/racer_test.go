@@ -10,7 +10,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,7 +46,7 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 			return c.Apply(ctx, obj, opts...)
 		},
 	}).Build()
-	r := &SiteReconciler{Client: c, Scheme: scheme, Namespace: "custom", Config: Config{ImageRegistry: "example.test/team", ImageTag: "v1"}, Registry: &component.Registry{Cluster: []component.ClusterComponent{racer.NewControlPlane()}, Site: []component.SiteComponent{racer.NewDataplane()}}}
+	r := &SiteReconciler{Client: c, Scheme: scheme, Namespace: "custom", Config: Config{ImageRegistry: "example.test/team", ImageTag: "v1"}, Registry: &component.Registry{Cluster: []component.ClusterComponent{racer.NewControlPlane(), racer.NewDataplane()}}}
 	run := func(name string) {
 		t.Helper()
 
@@ -82,7 +81,7 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 	// reconciliation must not write deployment intent or trigger a Pod rollout.
 	var before appsv1.DaemonSet
 
-	key := client.ObjectKey{Namespace: "custom", Name: racer.SiteDaemonSetName(sites[0].Name)}
+	key := client.ObjectKey{Namespace: "custom", Name: "racer-dataplane"}
 	if err := c.Get(t.Context(), key, &before); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +115,7 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 			t.Fatalf("capacity %q changed managed deployment: %d SSA writes", capacity, writes)
 		}
 	}
-	// A singleton override event must reach both per-Site DaemonSets.
+	// A singleton override event must reach the shared DaemonSet.
 	cm := overridesConfigMap(map[string]string{"racer.yaml": `apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
 - component: racer-dataplane
@@ -139,15 +138,13 @@ overrides:
 
 	run(component.SingletonRequestName)
 
-	for _, s := range sites {
-		var ds appsv1.DaemonSet
-		if err := c.Get(t.Context(), client.ObjectKey{Namespace: "custom", Name: racer.SiteDaemonSetName(s.Name)}, &ds); err != nil {
-			t.Fatal(err)
-		}
+	var ds appsv1.DaemonSet
+	if err := c.Get(t.Context(), key, &ds); err != nil {
+		t.Fatal(err)
+	}
 
-		if ds.Spec.Template.Spec.Containers[0].Image != "example.test/pinned:v2" {
-			t.Fatal("singleton event failed to fan out overrides")
-		}
+	if ds.Spec.Template.Spec.Containers[0].Image != "example.test/pinned:v2" {
+		t.Fatal("singleton event failed to fan out overrides")
 	}
 
 	var disabled unboundedv1alpha3.Site
@@ -162,8 +159,8 @@ overrides:
 
 	run(disabled.Name)
 
-	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "custom", Name: racer.SiteDaemonSetName(disabled.Name)}, &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("disabled dataplane survived: %v", err)
+	if err := c.Get(t.Context(), key, &appsv1.DaemonSet{}); err != nil {
+		t.Fatalf("Site opt-out lost retained dataplane: %v", err)
 	}
 
 	for _, s := range sites {

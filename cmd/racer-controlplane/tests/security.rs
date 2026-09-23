@@ -144,6 +144,33 @@ async fn manager(store: &Store, token: &str) -> CaManager<Store> {
     .unwrap()
 }
 
+#[tokio::test]
+async fn durable_admission_prevents_rebinding_a_live_pod() {
+    let store = Store::default();
+    let manager = manager(&store, "term").await;
+    let original = node("worker");
+    manager.admit(original.clone()).await.unwrap();
+    for changed_node in [false, true] {
+        let mut next = original.clone();
+        next.boot_id = "e".repeat(64);
+        if changed_node {
+            next.node = "f".repeat(64);
+        } else {
+            next.universe = "f".repeat(64);
+        }
+        assert!(manager.admit(next).await.is_err());
+    }
+    let mut same_identity = original.clone();
+    same_identity.boot_id = "e".repeat(64);
+    manager.admit(same_identity).await.unwrap();
+    // A replacement Pod is a distinct participant and may join the new Site.
+    let mut replacement = original;
+    replacement.pod_uid = "replacement".into();
+    replacement.universe = "f".repeat(64);
+    manager.admit(replacement).await.unwrap();
+    assert_eq!(manager.state().await.unwrap().members().count(), 3);
+}
+
 async fn issue(
     manager: &CaManager<Store>,
     identity: Identity,
@@ -1087,31 +1114,31 @@ fn enrollment_requires_bound_audience_and_actual_ownership() {
             uid: "site".into(),
             ..Default::default()
         },
-        racer_enabled: true,
     };
     let node = ObjectMetadata {
         name: "worker".into(),
         uid: "node".into(),
-        labels: [("unbounded-cloud.io/site".into(), "edge".into())].into(),
+        labels: [
+            ("unbounded-cloud.io/site".into(), "edge".into()),
+            ("kubernetes.io/os".into(), "linux".into()),
+        ]
+        .into(),
         ..Default::default()
     };
     let daemon = WorkloadData {
         metadata: ObjectMetadata {
             namespace: "system".into(),
-            name: "daemon".into(),
+            name: "racer-dataplane".into(),
             uid: "ds".into(),
             labels: [(format!("{prefix}component"), "racer-dataplane".into())].into(),
-            owners: vec![OwnerReference {
-                api_version: "unbounded-cloud.io/v1alpha3".into(),
-                kind: "Site".into(),
-                name: "edge".into(),
-                uid: "site".into(),
-                controller: false,
-            }],
             ..Default::default()
         },
         template_service_account: "racer-dataplane".into(),
-        template_labels: [(format!("{prefix}universe"), "edge".into())].into(),
+        template_labels: [
+            (format!("{prefix}component"), "racer-dataplane".into()),
+            (format!("{prefix}dataplane"), "true".into()),
+        ]
+        .into(),
     };
     let pod = PodData {
         metadata: ObjectMetadata {
@@ -1120,13 +1147,13 @@ fn enrollment_requires_bound_audience_and_actual_ownership() {
             uid: "pod".into(),
             labels: [
                 (format!("{prefix}dataplane"), "true".into()),
-                (format!("{prefix}universe"), "edge".into()),
+                (format!("{prefix}component"), "racer-dataplane".into()),
             ]
             .into(),
             owners: vec![OwnerReference {
                 api_version: "apps/v1".into(),
                 kind: "DaemonSet".into(),
-                name: "daemon".into(),
+                name: "racer-dataplane".into(),
                 uid: "ds".into(),
                 controller: true,
             }],
@@ -1161,7 +1188,7 @@ fn enrollment_requires_bound_audience_and_actual_ownership() {
     assert!(authorize_enrollment(&data).is_err());
     data.review = &review;
     let mut disabled = site.clone();
-    disabled.racer_enabled = false;
+    disabled.metadata.deleting = true;
     data.site = &disabled;
     assert!(authorize_enrollment(&data).is_err());
     let mut canonical = node.clone();

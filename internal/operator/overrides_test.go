@@ -650,15 +650,15 @@ func planWithApplied(hashes map[string]string) *component.Plan {
 // workload, so fan-out can be observed reaching it.
 type perSiteDataplane struct{}
 
-func (perSiteDataplane) Name() string                         { return "racer-dataplane" }
-func (perSiteDataplane) ConditionType() string                { return "RacerDataplaneReady" }
+func (perSiteDataplane) Name() string                         { return "metalman" }
+func (perSiteDataplane) ConditionType() string                { return "MetalmanReady" }
 func (perSiteDataplane) Enabled(*unboundedv1alpha3.Site) bool { return true }
 
 func (c perSiteDataplane) Plan(_ context.Context, _ *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	workload := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
-		"kind":       "DaemonSet",
-		"metadata":   map[string]any{"name": "racer-" + site.Name, "namespace": component.DefaultNamespace},
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "metalman-" + site.Name, "namespace": component.DefaultNamespace},
 		"spec": map[string]any{
 			"selector": map[string]any{"matchLabels": map[string]any{"app": "racer-dataplane"}},
 			"template": map[string]any{
@@ -692,8 +692,8 @@ func (perSiteDataplane) CleanupPlan(context.Context, *component.Env, *unboundedv
 // fan-out does its job.
 //
 // The overrides ConfigMap watch enqueues only the singleton request. Without
-// the Site-less pass reconciling every Site, an override targeting Racer or
-// metalman would sit in the ConfigMap and never take effect.
+// the Site-less pass reconciling every Site, an override targeting metalman
+// would sit in the ConfigMap and never take effect.
 func TestOverridesReachPerSiteComponentsViaFanOut(t *testing.T) {
 	scheme := newReconcilerTestScheme(t)
 
@@ -705,8 +705,8 @@ func TestOverridesReachPerSiteComponentsViaFanOut(t *testing.T) {
 		WithObjects(alpha, bravo, overridesConfigMap(map[string]string{
 			"overrides.yaml": `apiVersion: ` + override.APIVersion + `
 overrides:
-  - component: racer-dataplane
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     sites: [bravo]
     extraArgs:
       run: ["--only-bravo"]
@@ -727,14 +727,22 @@ overrides:
 	}
 
 	// bravo received the override.
-	got := appliedDaemonSet(t, cl, "racer-bravo")
+	got := &appsv1.Deployment{}
+	if err := cl.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: "metalman-bravo"}, got); err != nil {
+		t.Fatal(err)
+	}
+
 	if args := got.Spec.Template.Spec.Containers[0].Args; len(args) != 2 || args[1] != "--only-bravo" {
 		t.Fatalf("bravo args = %v, want the override appended", args)
 	}
 
 	// alpha was reconciled by the same pass but not selected, so it keeps the
 	// operator's arguments untouched.
-	untouched := appliedDaemonSet(t, cl, "racer-alpha")
+	untouched := &appsv1.Deployment{}
+	if err := cl.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: "metalman-alpha"}, untouched); err != nil {
+		t.Fatal(err)
+	}
+
 	if args := untouched.Spec.Template.Spec.Containers[0].Args; len(args) != 1 {
 		t.Fatalf("alpha args = %v, want the operator's only", args)
 	}

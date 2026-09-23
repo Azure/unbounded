@@ -45,9 +45,5 @@ func CacheSelectsSite(cache *racerapi.P2PCache, site *machina.Site) (bool, error
 		return false, err
 	}
 
-	return cache.DeletionTimestamp == nil && SiteEnabled(site) && selector.Matches(labels.Set(site.Labels)), nil
-}
-
-func SiteEnabled(site *machina.Site) bool {
-	return site != nil && site.DeletionTimestamp == nil && site.Spec.Components.Racer != nil && machina.ComponentEnabled(&site.Spec.Components.Racer.SiteComponentSpec)
+	return cache.DeletionTimestamp == nil && site != nil && site.DeletionTimestamp == nil && selector.Matches(labels.Set(site.Labels)), nil
 }

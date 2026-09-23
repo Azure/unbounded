@@ -132,13 +132,13 @@ func TestGantryControlFixture(t *testing.T) {
 		{"csr-signature", "gantry-e2e", "node0", string(token), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: badSignature})), 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, _ := json.Marshal(map[string]string{"csr": tc.csr, "pod_namespace": tc.namespace, "pod_name": tc.pod})
+			body, _ := json.Marshal(map[string]string{"csr": tc.csr, "pod_namespace": tc.namespace, "pod_name": tc.pod, "expected_universe": strings.Repeat("01", 32), "expected_node": gantryNode(0)})
 			request(client, "POST", env["RACER_ENROLL_URL"], "Bearer "+tc.token, boot, body, tc.status)
 		})
 	}
 
 	for i := range 2 {
-		body, _ := json.Marshal(map[string]string{"csr": csrPEM, "pod_namespace": "gantry-e2e", "pod_name": fmt.Sprintf("node%d", i)})
+		body, _ := json.Marshal(map[string]string{"csr": csrPEM, "pod_namespace": "gantry-e2e", "pod_name": fmt.Sprintf("node%d", i), "expected_universe": strings.Repeat("01", 32), "expected_node": gantryNode(i)})
 		data := request(client, "POST", env["RACER_ENROLL_URL"], "Bearer "+string(token), boot, body, 200)
 
 		var issued struct {

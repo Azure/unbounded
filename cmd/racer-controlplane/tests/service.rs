@@ -359,8 +359,8 @@ impl Fixture {
         self.put(&format!("{prefix}/services/racer-controlplane"), json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"racer-controlplane","namespace":"system","uid":"service"},"spec":{"clusterIP":"10.0.0.1","clusterIPs":["10.0.0.1"],"selector":{"racer.unbounded-cloud.io/serving-leader":"true"},"ports":[{"name":"control","port":8443}]}}));
         self.put("/apis/unbounded-cloud.io/v1alpha3/sites/edge", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"edge","uid":"site"},"spec":{"components":{"racer":{"enabled":true}}}}));
         self.put("/api/v1/nodes/worker", json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"worker","uid":"node","labels":{"unbounded-cloud.io/site":"edge","kubernetes.io/os":"linux"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}));
-        self.put("/apis/apps/v1/namespaces/system/daemonsets/dataplane", json!({"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"name":"dataplane","namespace":"system","uid":"ds","labels":{"racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","name":"edge","uid":"site"}]},"spec":{"selector":{"matchLabels":{"app":"worker"}},"template":{"metadata":{"labels":{"racer.unbounded-cloud.io/universe":"edge"}},"spec":{"serviceAccountName":"racer-dataplane","containers":[{"name":"dataplane","image":"test"}]}}}}));
-        self.put(&format!("{prefix}/pods/worker"), json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker","namespace":"system","uid":"worker-pod","creationTimestamp":"2026-01-01T00:00:00Z","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/universe":"edge"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"dataplane","uid":"ds","controller":true}]},"spec":{"nodeName":"worker","serviceAccountName":"racer-dataplane","containers":[{"name":"dataplane","image":"test"}]},"status":{"phase":"Running","podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}));
+        self.put("/apis/apps/v1/namespaces/system/daemonsets/racer-dataplane", json!({"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"name":"racer-dataplane","namespace":"system","uid":"ds","labels":{"racer.unbounded-cloud.io/component":"racer-dataplane"}},"spec":{"selector":{"matchLabels":{"app":"worker"}},"template":{"metadata":{"labels":{"racer.unbounded-cloud.io/component":"racer-dataplane","racer.unbounded-cloud.io/dataplane":"true"}},"spec":{"serviceAccountName":"racer-dataplane","containers":[{"name":"dataplane","image":"test"}]}}}}));
+        self.put(&format!("{prefix}/pods/worker"), json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker","namespace":"system","uid":"worker-pod","creationTimestamp":"2026-01-01T00:00:00Z","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds","controller":true}]},"spec":{"nodeName":"worker","serviceAccountName":"racer-dataplane","containers":[{"name":"dataplane","image":"test"}]},"status":{"phase":"Running","podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}));
     }
 }
 
@@ -557,6 +557,20 @@ async fn actual_kube_store_cas_uncertain_write_and_takeover() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Result<()> {
+    service_replacement_scenario("boot").await
+}
+
+#[tokio::test]
+async fn runnable_service_replaces_enrolled_pod_after_site_change() -> Result<()> {
+    service_replacement_scenario("site").await
+}
+
+#[tokio::test]
+async fn runnable_service_replaces_enrolled_pod_after_node_recreation() -> Result<()> {
+    service_replacement_scenario("node").await
+}
+
+async fn service_replacement_scenario(change: &str) -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("racer_controlplane=debug,kube=warn")
         .with_test_writer()
@@ -621,7 +635,7 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
     fixture.put(worker_path, worker);
     let key = generate_local_key()?;
     let body = serde_json::to_string(
-        &json!({"csr":String::from_utf8(key.csr_pem.clone())?,"pod_namespace":"system","pod_name":"worker"}),
+        &json!({"csr":String::from_utf8(key.csr_pem.clone())?,"pod_namespace":"system","pod_name":"worker", "expected_universe":racer_identity("universe", "edge"), "expected_node":racer_identity("node", "node")}),
     )?;
     use base64::Engine;
     let token = format!(
@@ -634,6 +648,30 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
         "POST /v3/enroll HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {boot}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    // A stale init identity must not receive a leaf for the Node's new identity.
+    // Only an authenticated live singleton Pod can trigger guarded replacement.
+    let stale = enrollment.replace(&racer_identity("universe", "edge"), &"0".repeat(64));
+    let unauthorized = stale.replace(&token, "invalid-token");
+    let denied = request(
+        &options.enroll_listen,
+        &unauthorized,
+        Some(tls_config(&bundle, None)),
+    )
+    .await?;
+    assert!(!denied.starts_with(b"HTTP/1.1 200"));
+    let worker = fixture.get(worker_path).unwrap();
+    let denied = request(
+        &options.enroll_listen,
+        &stale,
+        Some(tls_config(&bundle, None)),
+    )
+    .await?;
+    assert!(!denied.starts_with(b"HTTP/1.1 200"));
+    assert!(
+        fixture.get(worker_path).is_none(),
+        "stale bootstrap Pod must be replaced before first admission"
+    );
+    fixture.put(worker_path, worker);
     let response = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let response = request(
@@ -668,7 +706,7 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
     assert!(renewed.starts_with(b"HTTP/1.1 200"));
     assert_eq!(
         fixture.objects.lock().unwrap().reviews,
-        1,
+        2,
         "successful Pod TokenReview should be cached"
     );
     let response: Value = serde_json::from_slice(&response[start..])?;
@@ -780,18 +818,29 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
     // A second boot of the same Pod cannot identify which process is dead.
     // The service replaces the managed Pod, then retires only after UID absence.
     let second_boot = "b".repeat(64);
-    let second_enrollment = enrollment.replace(&boot, &second_boot);
-    let admitted = request(
-        &options.enroll_listen,
-        &second_enrollment,
-        Some(tls_config(&switched, None)),
-    )
-    .await?;
-    ensure!(
-        admitted.starts_with(b"HTTP/1.1 200"),
-        "second boot enrollment failed: {}",
-        String::from_utf8_lossy(&admitted)
-    );
+    if change == "boot" {
+        let second_enrollment = enrollment.replace(&boot, &second_boot);
+        let admitted = request(
+            &options.enroll_listen,
+            &second_enrollment,
+            Some(tls_config(&switched, None)),
+        )
+        .await?;
+        ensure!(
+            admitted.starts_with(b"HTTP/1.1 200"),
+            "second boot enrollment failed: {}",
+            String::from_utf8_lossy(&admitted)
+        );
+    } else {
+        let mut node = fixture.get("/api/v1/nodes/worker").unwrap();
+        if change == "site" {
+            fixture.put("/apis/unbounded-cloud.io/v1alpha3/sites/other", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"other","uid":"other-site"},"spec":{"components":{"racer":{"enabled":false}}}}));
+            node["metadata"]["labels"]["unbounded-cloud.io/site"] = json!("other");
+        } else {
+            node["metadata"]["uid"] = json!("replacement-node");
+        }
+        fixture.put("/api/v1/nodes/worker", node);
+    }
     tokio::time::timeout(Duration::from_secs(20), async {
         while fixture
             .get("/api/v1/namespaces/system/pods/worker")

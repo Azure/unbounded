@@ -125,3 +125,21 @@ func RequiredNodeAffinity(site string) *corev1.NodeAffinity {
 
 	return &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: selector}
 }
+
+// EligibleNodeAffinity selects nonempty canonical Site membership, falling back
+// to the deprecated label only when the canonical label is absent.
+func EligibleNodeAffinity() *corev1.NodeAffinity {
+	return &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+		{MatchExpressions: []corev1.NodeSelectorRequirement{
+			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpExists},
+			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
+			{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
+		}},
+		{MatchExpressions: []corev1.NodeSelectorRequirement{
+			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
+			{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpExists},
+			{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
+			{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
+		}},
+	}}}
+}

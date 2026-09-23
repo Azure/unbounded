@@ -15,7 +15,7 @@ func TestRacerKindsAndScope(t *testing.T) {
 		{"racer-controlplane", "DaemonSet", nil, false},
 		{"racer-controlplane", "Deployment", []string{"rack-a"}, false},
 		{"racer-dataplane", "DaemonSet", nil, true},
-		{"racer-dataplane", "DaemonSet", []string{"rack-a"}, true},
+		{"racer-dataplane", "DaemonSet", []string{"rack-a"}, false},
 		{"racer-dataplane", "Deployment", nil, false},
 	} {
 		entry := SourcedEntry{Entry: Entry{Component: tc.component, Kind: tc.kind, Sites: tc.sites, Patch: map[string]any{"spec": map[string]any{"minReadySeconds": int64(1)}}}}

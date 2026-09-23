@@ -59,7 +59,7 @@ func componentContainerNames(t *testing.T, componentName, kind string) map[strin
 	}
 
 	if componentName == "racer-dataplane" {
-		plan, _, err := racer.NewDataplane().Plan(t.Context(), &component.Env{Namespace: component.DefaultNamespace}, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "example"}})
+		plan, _, err := racer.NewDataplane().Plan(t.Context(), &component.Env{Namespace: component.DefaultNamespace}, []unboundedv1alpha3.Site{{ObjectMeta: metav1.ObjectMeta{Name: "example"}}})
 		if err != nil {
 			t.Fatal(err)
 		}

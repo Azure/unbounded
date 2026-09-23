@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer installs the shared Racer control plane and opt-in Site dataplanes.
+// Package racer installs the retained cluster-wide Racer control plane and dataplane.
 package racer
 
 import (
@@ -12,7 +12,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,42 +29,44 @@ type (
 )
 
 func NewControlPlane() component.ClusterComponent { return ControlPlane{} }
-func NewDataplane() component.SiteComponent       { return Dataplane{} }
+func NewDataplane() component.ClusterComponent    { return Dataplane{} }
 func (ControlPlane) Name() string                 { return controlPlaneName }
 func (ControlPlane) ConditionType() string        { return "RacerControlPlaneReady" }
 func (Dataplane) Name() string                    { return dataplaneName }
 func (Dataplane) ConditionType() string           { return "RacerDataplaneReady" }
 
-func (Dataplane) Enabled(site *unboundedv1alpha3.Site) bool {
-	return site.Spec.Components.Racer != nil && unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Racer.SiteComponentSpec)
+func EnabledFor(site *unboundedv1alpha3.Site) bool {
+	return site != nil && (site.Spec.Components.Racer == nil || site.Spec.Components.Racer.Enabled == nil || *site.Spec.Components.Racer.Enabled)
 }
 
-// Plan retains and repairs an installed singleton after the last Site is disabled
-// or deleted. The shared ServiceAccount is the installation marker; the Deployment
-// also recognizes installations whose account was removed. Legacy routing hints
-// are migrated before narrowing the Service; no all-replicas-ready gate is used.
-func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	enabled := false
-
+// WantedOrRetained is the shared installation decision for both Racer components
+// and Gantry's optional Racer backend. Site votes do not restrict participation.
+func WantedOrRetained(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (bool, error) {
 	for i := range sites {
-		if (Dataplane{}).Enabled(&sites[i]) {
-			enabled = true
-			break
+		if EnabledFor(&sites[i]) {
+			return true, nil
 		}
 	}
 
-	if !enabled {
-		for _, obj := range []client.Object{serviceAccount(controlPlaneName, env.Namespace), controlDeployment(env.Namespace, env.Config)} {
-			err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj)
-			if err == nil {
-				enabled = true
-				break
-			}
-
-			if !apierrors.IsNotFound(err) {
-				return nil, component.Result{}, fmt.Errorf("check retained Racer installation: %w", err)
-			}
+	for _, obj := range []client.Object{serviceAccount(controlPlaneName, env.Namespace), controlDeployment(env.Namespace, env.Config), dataplaneDaemonSet(env.Namespace, env.Config)} {
+		err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+		if err == nil {
+			return true, nil
 		}
+
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("check retained Racer installation: %w", err)
+		}
+	}
+
+	return false, nil
+}
+
+// Plan retains and repairs the shared installation after all Sites opt out or disappear.
+func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	enabled, err := WantedOrRetained(ctx, env, sites)
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
 	plan := component.NewPlan()
@@ -95,37 +96,26 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboun
 	return plan, component.Reconciled(), nil
 }
 
-func (Dataplane) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (Dataplane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
+
+	enabled, err := WantedOrRetained(ctx, env, sites)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if !enabled {
+		return plan, component.Disabled("no Site enables Racer and no retained installation exists"), nil
+	}
 
 	var dependencies []component.ObjectRef
 	for _, obj := range sharedResources(env.Namespace) {
 		dependencies = append(dependencies, component.RefOf(component.ToUnstructured(obj)))
 	}
 
-	plan.Add(component.Operation{Kind: component.OpApply, Object: resourceObject(dataplaneDaemonSet(env.Namespace, env.Config, site)), Component: dataplaneName, Site: site.Name, Overridable: true, DependsOn: dependencies})
+	plan.Add(component.Operation{Kind: component.OpApply, Object: resourceObject(dataplaneDaemonSet(env.Namespace, env.Config)), Component: dataplaneName, Overridable: true, DependsOn: dependencies})
 
 	return plan, component.Reconciled(), nil
-}
-
-// CleanupPlan uses the cache before planning a delete, so Sites that never opted
-// in and repeated disabled passes generate no delete traffic. Site deletion uses
-// the DaemonSet's controller owner reference; host slab data is never removed.
-func (Dataplane) CleanupPlan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	plan := component.NewPlan()
-	ds := &appsv1.DaemonSet{}
-
-	err := env.Client.Get(ctx, client.ObjectKey{Namespace: env.Namespace, Name: SiteDaemonSetName(site.Name)}, ds)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return nil, component.Result{}, fmt.Errorf("read disabled Racer dataplane: %w", err)
-	}
-
-	if err == nil && ds.DeletionTimestamp.IsZero() {
-		ds.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
-		plan.Add(component.DeleteOperation(ds, dataplaneName, site.Name))
-	}
-
-	return plan, component.Disabled("Racer is disabled for this Site"), nil
 }
 
 // SetupWatches maps every shared installation dependency to the singleton request.
@@ -164,9 +154,9 @@ func (ControlPlane) SetupWatches(b *builder.Builder, env *component.Env) {
 }
 
 func (Dataplane) SetupWatches(b *builder.Builder, env *component.Env) {
-	// Use the singleton fanout rather than deriving Site names from the safe
-	// resource name. This also repairs a deleted or corrupted owner reference.
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(managedPredicate(env.InNamespaceWithPrefix(dataplaneDaemonSetPrefix))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(managedPredicate(func(obj client.Object) bool {
+		return obj.GetNamespace() == env.Namespace && obj.GetName() == dataplaneName
+	})))
 }
 
 func managedPredicate(match func(client.Object) bool) predicate.Predicate {

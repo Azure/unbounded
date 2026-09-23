@@ -125,9 +125,11 @@ type SiteComponents struct {
 	// +optional
 	Metalman *MetalmanComponentSpec `json:"metalman,omitempty"`
 
-	// Racer enables the per-Site Racer dataplane and shared control plane.
-	// It defaults to disabled; set racer.enabled to true to opt in.
+	// Racer votes to install the cluster-wide Racer control plane and dataplane.
+	// It defaults to enabled. Explicit false opts out of initial installation;
+	// an installed Racer is retained, and all live Sites remain cache universes.
 	// +optional
+	// +kubebuilder:default={enabled: true}
 	Racer *RacerComponentSpec `json:"racer,omitempty"`
 
 	// Gantry configures the gantry peer-to-peer OCI distribution agent for this

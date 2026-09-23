@@ -81,8 +81,8 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			site := testSite(tc.site)
 
-			desired := dataplaneDaemonSet(namespace, component.Config{}, site)
-			if err := kube.Create(ctx, desired); err != nil {
+			desired := dataplaneDaemonSet(namespace, component.Config{})
+			if err := kube.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
 				t.Fatalf("admit Site workload: %v", err)
 			}
 
@@ -94,12 +94,12 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 			universe := racermeta.UniverseForSite(site.Name)
 
 			pod := actual.Spec.Template.Spec
-			if actual.Spec.Selector.MatchLabels[racermeta.UniverseKey] != universe || actual.Spec.Template.Labels[racermeta.UniverseKey] != universe || envValues(pod.InitContainers[0])["POD_UNIVERSE"] != universe {
+			if actual.Spec.Selector.MatchLabels[racermeta.UniverseKey] != "" || actual.Spec.Template.Labels[racermeta.UniverseKey] != "" || envValues(pod.InitContainers[0])["POD_UNIVERSE"] != "" {
 				t.Fatal("API round-trip changed selector/Pod/bootstrap identity")
 			}
 
-			if !reflect.DeepEqual(actual.OwnerReferences, []metav1.OwnerReference{component.SiteOwnerReference(site)}) || !reflect.DeepEqual(pod.Affinity, desired.Spec.Template.Spec.Affinity) {
-				t.Fatal("API round-trip changed Site ownership or required affinity")
+			if len(actual.OwnerReferences) != 0 || !reflect.DeepEqual(pod.Affinity, desired.Spec.Template.Spec.Affinity) {
+				t.Fatal("API round-trip changed singleton ownership or required affinity")
 			}
 
 			if tc.name == "long-site" {
@@ -117,8 +117,8 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 							t.Fatal(err)
 						}
 
-						if matchesNode(t, pod, admitted) {
-							t.Fatalf("long Site workload matched %s=%q", key, value)
+						if matchesNode(t, pod, admitted) != (value != "") {
+							t.Fatalf("singleton eligibility disagrees for %s=%q", key, value)
 						}
 					}
 				}
@@ -127,12 +127,11 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 	}
 
 	var ds appsv1.DaemonSet
-	if err := kube.Get(ctx, client.ObjectKey{Namespace: namespace, Name: SiteDaemonSetName("rack-a")}, &ds); err != nil {
+	if err := kube.Get(ctx, client.ObjectKey{Namespace: namespace, Name: dataplaneName}, &ds); err != nil {
 		t.Fatal(err)
 	}
 
 	pod := ds.Spec.Template.Spec
-	universe := envValues(pod.InitContainers[0])["POD_UNIVERSE"]
 	check := func(t *testing.T, node *corev1.Node, want bool) {
 		t.Helper()
 
@@ -145,7 +144,7 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 			t.Fatalf("persisted Node affinity match=%v, want %v", got, want)
 		}
 
-		if err := racermeta.ValidateBootstrapNode(&persisted, universe); (err == nil) != want {
+		if err := racermeta.ValidateBootstrapNode(&persisted, racermeta.NodeUniverse(&persisted)); (err == nil) != want {
 			t.Fatalf("persisted Node bootstrap validation=%v, want admitted=%v", err, want)
 		}
 	}
@@ -174,7 +173,7 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			check(t, node, false)
+			check(t, node, node.Labels[racermeta.ExcludeLabelKey] != "true")
 
 			node.Labels[racermeta.SiteLabelKey] = "rack-a"
 
@@ -196,7 +195,8 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 	}
 
 	t.Run("invalid-affinity", func(t *testing.T) {
-		invalid := dataplaneDaemonSet(namespace, component.Config{}, testSite("invalid-affinity"))
+		invalid := dataplaneDaemonSet(namespace, component.Config{})
+		invalid.Name = "invalid-affinity"
 
 		invalid.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Operator = "Invalid"
 		if err := kube.Create(ctx, invalid, client.DryRunAll); !apierrors.IsInvalid(err) {
@@ -205,7 +205,8 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 	})
 
 	t.Run("selector-identity-mismatch", func(t *testing.T) {
-		invalid := dataplaneDaemonSet(namespace, component.Config{}, testSite("invalid-selector"))
+		invalid := dataplaneDaemonSet(namespace, component.Config{})
+		invalid.Name = "invalid-selector"
 
 		invalid.Spec.Template.Labels = map[string]string{racermeta.DataplaneLabelKey: "true", racermeta.UniverseKey: "foreign"}
 		if err := kube.Create(ctx, invalid, client.DryRunAll); !apierrors.IsInvalid(err) {

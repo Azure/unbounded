@@ -511,6 +511,8 @@ func (f *gantryFixture) control(nodes int) [][]string {
 			CSR       string `json:"csr"`
 			Namespace string `json:"pod_namespace"`
 			Pod       string `json:"pod_name"`
+			Universe  string `json:"expected_universe"`
+			Node      string `json:"expected_node"`
 		}
 		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Namespace != "gantry-e2e" || r.Header.Get("Authorization") != "Bearer "+tokenValue {
 			http.Error(w, "denied", http.StatusForbidden)
@@ -518,7 +520,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		}
 
 		i, err := strconv.Atoi(strings.TrimPrefix(request.Pod, "node"))
-		if err != nil || i < 0 || i >= nodes || request.Pod != fmt.Sprintf("node%d", i) {
+		if err != nil || i < 0 || i >= nodes || request.Pod != fmt.Sprintf("node%d", i) || request.Universe != strings.Repeat("01", 32) || request.Node != gantryNode(i) {
 			http.Error(w, "invalid node", http.StatusForbidden)
 			return
 		}

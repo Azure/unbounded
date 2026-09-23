@@ -436,6 +436,8 @@ fn enroll_server_with_authorities(
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["pod_namespace"], "test-namespace");
             assert_eq!(body["pod_name"], "test-name");
+            assert_eq!(body["expected_universe"], "01".repeat(32));
+            assert_eq!(body["expected_node"], "02".repeat(32));
             let csr =
                 openssl::x509::X509Req::from_pem(body["csr"].as_str().unwrap().as_bytes()).unwrap();
             let public = csr.public_key().unwrap();
