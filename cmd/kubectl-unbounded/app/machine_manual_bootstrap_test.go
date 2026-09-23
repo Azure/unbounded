@@ -1380,9 +1380,13 @@ func TestIgnitionBootstrapUnitRunsOnEveryBoot(t *testing.T) {
 	require.NotContains(t, unit, "ConditionPathExists=!",
 		"a completion marker would be a second source of truth beside the ownership record")
 
-	// The one condition that stays guards against running a binary Ignition
-	// failed to place, which would otherwise fail confusingly every boot.
-	require.Contains(t, unit, "ConditionPathExists=/opt/unbounded/bin/unbounded-agent")
+	// The one check that stays guards against running a binary Ignition failed
+	// to place. It asserts rather than conditions: a failed condition leaves the
+	// unit inactive and unremarkable, so a host that never bootstrapped would
+	// look no different from one that had nothing to do.
+	require.Contains(t, unit, "AssertPathExists=/opt/unbounded/bin/unbounded-agent")
+	require.NotContains(t, unit, "ConditionPathExists=/opt/unbounded/bin/unbounded-agent",
+		"a missing agent binary must fail visibly rather than skip silently")
 
 	require.Contains(t, unit, "WantedBy=multi-user.target", "the unit has to be started on every boot for this to work")
 }
@@ -1402,6 +1406,13 @@ func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
 
 	require.Contains(t, unit, "Restart=on-failure", "DNS may not answer yet on the first attempt")
 	require.Contains(t, unit, "StartLimitIntervalSec=0", "bootstrap gets no second chance if systemd gives up on it")
+
+	// Retrying forever is the point, but retrying every ten seconds forever is
+	// not: with no start limit to stop it, an unreachable network would spawn
+	// the agent thousands of times a day and bury the reason in the journal.
+	require.Contains(t, unit, "RestartSteps=10")
+	require.Contains(t, unit, "RestartMaxDelaySec=300")
+	require.Contains(t, unit, "RestartSec=10s", "the first retry stays prompt")
 	require.Contains(t, unit, "Type=oneshot")
 	require.Contains(t, unit, "After=network-online.target nss-lookup.target systemd-sysext.service")
 

@@ -1005,7 +1005,13 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// the agent itself. Ordering after systemd-sysext keeps any extension
 	// merged before the agent runs.
 	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
-	b.WriteString("ConditionPathExists=" + binary + "\n")
+	// Assert rather than Condition. A failed condition is not an error: systemd
+	// marks the unit inactive and moves on, so a host whose binary Ignition
+	// never placed sits there looking healthy and never bootstraps. A failed
+	// assertion puts the unit in the failed state, where `systemctl status` and
+	// any watchdog can see it. Neither one starts the service, so this changes
+	// only whether the reason is visible.
+	b.WriteString("AssertPathExists=" + binary + "\n")
 	// Retry indefinitely rather than giving up after systemd's default start
 	// limit. Bootstrap has no later opportunity to run, so a burst of early
 	// failures must not permanently disable it.
@@ -1021,6 +1027,16 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// 255 that Type=oneshot honors Restart=.
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("RestartSec=10s\n")
+	// Back off towards a five minute ceiling instead of retrying every ten
+	// seconds forever. With no start limit to stop it, a host that cannot reach
+	// the network would otherwise spawn the agent several thousand times a day,
+	// and the journal that would explain why scrolls away.
+	//
+	// These need systemd 254. Older versions log an unknown key and carry on
+	// with the fixed RestartSec above, which is the behavior this replaces, so
+	// nothing is lost where they are not understood.
+	b.WriteString("RestartSteps=10\n")
+	b.WriteString("RestartMaxDelaySec=300\n")
 	// `unbounded-agent start` has no --config flag and reads this variable.
 	b.WriteString("Environment=UNBOUNDED_AGENT_CONFIG_FILE=" + ignitionAgentConfigPath + "\n")
 
