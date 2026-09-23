@@ -593,11 +593,21 @@ func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDo
 // installEnv returns the KEY=VALUE pairs that should be exported before the
 // embedded install script runs. Only non-empty overrides are included.
 func (h *manualBootstrapHandler) installEnv() []string {
-	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
+	env := provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
 		Version: h.agentVersion,
 		BaseURL: h.agentBaseURL,
 		URL:     h.agentURL,
 	})
+
+	// The prefix is added here rather than in AgentInstallEnv because it comes
+	// from the agent config, not the agent spec. The Machine CR has no prefix
+	// field, so the controller-driven paths that share AgentInstallEnv have
+	// none to pass and correctly keep the default.
+	if prefix := strings.TrimSpace(h.hostPrefix); prefix != "" {
+		env = append(env, "AGENT_PREFIX="+provision.ShellSingleQuote(prefix))
+	}
+
+	return env
 }
 
 // machineNameDisplay returns the value rendered into the comment header of the

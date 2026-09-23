@@ -98,10 +98,16 @@ chmod 0755 "${AGENT_BIN}"
 # so it is left untouched and admission still runs from the staged executable
 # above. A dangling link resolves to nothing and is replaced, because install
 # would otherwise write through it to a stale location.
-AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
+#
+# AGENT_PREFIX matches the agent's own installation prefix. Staging the binary
+# under a fixed /usr/local would put it somewhere the agent does not look, and
+# on a host that mounts /usr read-only the install would fail outright before
+# the agent ever runs.
+AGENT_PREFIX="${AGENT_PREFIX:-/usr/local}"
+AGENT_BIN_TARGET="${AGENT_PREFIX}/bin/unbounded-agent"
 if [ ! -x "${AGENT_BIN_TARGET}" ]; then
     rm -f "${AGENT_BIN_TARGET}"
-    install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
+    install -D -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
 fi
 
 _START_ARGS=""

@@ -890,6 +890,32 @@ func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
 			handler: manualBootstrapHandler{agentVersion: "v'1"},
 			want:    []string{`AGENT_VERSION='v'\''1'`},
 		},
+		// The install script stages the agent binary before the agent runs, so
+		// it has to be told the prefix. Left to a fixed /usr/local it writes
+		// where the agent does not look, and on a host that mounts /usr
+		// read-only it fails before the agent gets a chance to run at all.
+		{
+			name:    "host prefix is exported",
+			handler: manualBootstrapHandler{hostPrefix: "/opt/unbounded"},
+			want:    []string{"AGENT_PREFIX='/opt/unbounded'"},
+		},
+		// Nothing is exported without a prefix, so the script's own default
+		// stays the single definition of the historical path.
+		{
+			name:    "unset prefix exports nothing",
+			handler: manualBootstrapHandler{},
+			want:    nil,
+		},
+		{
+			name:    "whitespace is not a prefix",
+			handler: manualBootstrapHandler{hostPrefix: "   "},
+			want:    nil,
+		},
+		{
+			name:    "prefix is quoted with the rest",
+			handler: manualBootstrapHandler{agentVersion: "v0.0.10", hostPrefix: "/opt/it's"},
+			want:    []string{"AGENT_VERSION='v0.0.10'", `AGENT_PREFIX='/opt/it'\''s'`},
+		},
 	}
 
 	for _, tt := range tests {
