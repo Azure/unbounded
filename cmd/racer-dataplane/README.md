@@ -90,6 +90,20 @@ protobuf over authenticated TLS; local files use the same snapshot validation
 boundary. Application-level detached signatures and signing-key bundles are no
 longer part of the protocol.
 
+`Trust::prepare` and `Trust::builder(...).build()` produce an immutable `Prepared`
+generation. The builder edits unvalidated wire input; read-only accessors and
+peer capabilities share the validated configuration, crypto snapshot, and
+endpoints. `Updates` delegates candidate replacement, receive/transmit barriers,
+and final active publication to `control::activation` under one coordinator lock.
+Worker decisions are `Waiting`, `Discard`, or `Activate`; protocol phase codes
+remain numeric on the wire. A receive command prohibits abort, while the separate
+worker receive-grant latch fences forward corrections.
+
+Worker polling delegates preparation/barriers to `runtime::topology`, socket
+reconciliation and dispatch polling to `runtime::listeners`, and generation
+leases to `runtime::generation`. The storage transaction remains independent and
+holds an explicit topology maintenance fence during cache replacement.
+
 The daemon requires at least four buffers per NUMA node: canonical routes can
 have three peer hops, requiring three downstream progress slots plus one receive
 slot. The minimum applies before topology subscription because later

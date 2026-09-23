@@ -205,7 +205,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
             )),
         })
         .unwrap();
-    let routing = prepared.volumes[0].routing.clone();
+    let routing = prepared.volumes()[0].routing().clone();
     let target = (0..)
         .map(|n| format!("/health-{n}"))
         .find(|t| routing.start(t).owner == 1)
@@ -214,11 +214,11 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         peers: Rc::new(RefCell::new(BTreeMap::from([(
             "p1".into(),
             Rc::new(RefCell::new(Peer::from_endpoint(
-                prepared.peers["p1"].clone(),
+                prepared.peers()["p1"].clone(),
             ))),
         )]))),
         routing: Some(routing.clone()),
-        ..Provider::new(prepared.volumes[0].backend.clone())
+        ..Provider::new(prepared.volumes()[0].backend().clone())
     };
     let state = Rc::new(RefCell::new(RouteState {
         cursor: routing.start(&target),
@@ -461,18 +461,18 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
             )),
         })
         .unwrap();
-    let routing = prepared.volumes[0].routing.clone();
+    let routing = prepared.volumes()[0].routing().clone();
     let target = (0..)
         .map(|n| format!("/interleaved-{n}"))
         .find(|t| routing.start(t).owner == 1)
         .unwrap();
     let peer = Rc::new(RefCell::new(Peer::from_endpoint(
-        prepared.peers["p1"].clone(),
+        prepared.peers()["p1"].clone(),
     )));
     let provider = Provider {
         routing: Some(routing.clone()),
         peers: Rc::new(RefCell::new(BTreeMap::from([("p1".into(), peer.clone())]))),
-        ..Provider::new(prepared.volumes[0].backend.clone())
+        ..Provider::new(prepared.volumes()[0].backend().clone())
     };
     let state = || {
         Some(Rc::new(RefCell::new(RouteState {

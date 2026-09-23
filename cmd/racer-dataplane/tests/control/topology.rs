@@ -233,7 +233,7 @@ mod placement_tests {
             let s = snapshot(&dir.join(&file));
             let started = std::time::Instant::now();
             let prepared = trust(&s).prepare(envelope(s.clone())).unwrap();
-            let r = &prepared.volumes[0].routing;
+            let r = prepared.volumes()[0].routing();
             let p = r.geometry.slot_count();
             let v = &s.volumes[0];
             let t = v.topology.as_ref().unwrap();

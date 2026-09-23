@@ -438,7 +438,7 @@ mod endpoint_tests {
                     node: s.node.clone().try_into().unwrap(),
                 };
                 let prepared = trust.prepare(envelope(s.clone())).unwrap();
-                assert_eq!(prepared.volumes[0].backend.host(), "localhost");
+                assert_eq!(prepared.volumes()[0].backend().host(), "localhost");
                 assert_last_good(&trust, s);
                 println!("B12 Go P2PCache snapshot prepared: {name}");
             }
