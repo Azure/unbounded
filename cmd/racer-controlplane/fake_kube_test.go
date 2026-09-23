@@ -35,6 +35,13 @@ func withTypedConfigMapLists(builder *fake.ClientBuilder, scheme *runtime.Scheme
 
 func typedConfigMapLists(tracker kubetesting.ObjectTracker) interceptor.Funcs {
 	return interceptor.Funcs{List: func(ctx context.Context, underlying client.WithWatch, obj client.ObjectList, opts ...client.ListOption) error {
+		if list, ok := obj.(*metav1.PartialObjectMetadataList); ok && list.GroupVersionKind() == corev1.SchemeGroupVersion.WithKind("ConfigMapList") {
+			options := (&client.ListOptions{}).ApplyOptions(opts)
+			if options.FieldSelector == nil && options.Raw == nil && options.UnsafeDisableDeepCopy == nil && !options.DisableReadYourWritesConsistency {
+				return listConfigMapMetadata(tracker, list, options)
+			}
+		}
+
 		list, ok := obj.(*corev1.ConfigMapList)
 		if !ok || !list.GroupVersionKind().Empty() {
 			return underlying.List(ctx, obj, opts...)
@@ -79,6 +86,35 @@ func typedConfigMapLists(tracker kubetesting.ObjectTracker) interceptor.Funcs {
 	}}
 }
 
+func listConfigMapMetadata(tracker kubetesting.ObjectTracker, list *metav1.PartialObjectMetadataList, options *client.ListOptions) error {
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+
+	stored, err := tracker.List(corev1.SchemeGroupVersion.WithResource("configmaps"), gvk, options.Namespace)
+	if err != nil {
+		return err
+	}
+
+	// Match the pinned fake: Limit and Continue are ignored, ListMeta is reset,
+	// and item GVK is explicit. Real GC pagination is tested by gcPagesAPI.
+	// Tracker.List owns these copies; project metadata without JSON/base64 of
+	// chunk payloads, and without keeping a second store that can miss writes.
+	result := stored.(*corev1.ConfigMapList)
+
+	items := make([]metav1.PartialObjectMetadata, 0, len(result.Items))
+	for _, item := range result.Items {
+		if options.LabelSelector != nil && !options.LabelSelector.Matches(labels.Set(item.Labels)) {
+			continue
+		}
+
+		item.ManagedFields = nil
+		items = append(items, metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}, ObjectMeta: item.ObjectMeta})
+	}
+
+	*list = metav1.PartialObjectMetadataList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMapList"}, Items: items}
+
+	return nil
+}
+
 func TestTypedConfigMapListEquivalence(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -112,6 +148,7 @@ func TestTypedConfigMapListEquivalence(t *testing.T) {
 		{name: "all-namespaces"},
 		{name: "namespace", opts: []client.ListOption{client.InNamespace("state")}},
 		{name: "gc-owner", opts: []client.ListOption{client.InNamespace("state"), client.MatchingLabels{stateOwnerLabel: "owner"}}},
+		{name: "gc-page", opts: []client.ListOption{client.InNamespace("state"), client.MatchingLabels{stateOwnerLabel: "owner"}, client.Limit(100), client.Continue("")}},
 		{name: "set-selector", opts: []client.ListOption{client.MatchingLabelsSelector{Selector: selector}}},
 		{name: "no-label-match", opts: []client.ListOption{client.MatchingLabels{"missing": "value"}}},
 		{name: "no-namespace-match", opts: []client.ListOption{client.InNamespace("missing")}},
@@ -140,6 +177,23 @@ func TestTypedConfigMapListEquivalence(t *testing.T) {
 
 			if got.Continue != "" {
 				t.Fatal("retained stale list metadata")
+			}
+		})
+		t.Run("metadata/"+tc.name, func(t *testing.T) {
+			want := configMapMetadataList()
+			got := configMapMetadataList()
+			remaining := int64(12)
+			got.ListMeta = metav1.ListMeta{ResourceVersion: "stale", Continue: "stale", RemainingItemCount: &remaining}
+			got.Items = []metav1.PartialObjectMetadata{{ObjectMeta: metav1.ObjectMeta{Name: "stale"}}}
+			wantErr := stock.List(t.Context(), want, tc.opts...)
+
+			gotErr := fast.List(t.Context(), got, tc.opts...)
+			if (wantErr == nil) != (gotErr == nil) || wantErr != nil && wantErr.Error() != gotErr.Error() {
+				t.Fatalf("errors differ: stock=%v metadata=%v", wantErr, gotErr)
+			}
+
+			if wantErr == nil && !reflect.DeepEqual(want, got) {
+				t.Fatalf("metadata lists differ: stock=%+v fast=%+v", want, got)
 			}
 		})
 	}
@@ -202,6 +256,61 @@ func TestTypedConfigMapListEquivalence(t *testing.T) {
 	}
 }
 
+func configMapMetadataList() *metav1.PartialObjectMetadataList {
+	return &metav1.PartialObjectMetadataList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMapList"}}
+}
+
+func TestConfigMapMetadataListMutationAndWrites(t *testing.T) {
+	object := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "state", Name: "chunk", Labels: map[string]string{"owner": "first"}, Annotations: map[string]string{"note": "original"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "pointer", UID: "pointer-uid"}}}, BinaryData: map[string][]byte{"state": {1, 2, 3}}}
+	kube := fakeKube(object)
+	list := configMapMetadataList()
+
+	options := []client.ListOption{client.InNamespace("state"), client.MatchingLabels{"owner": "first"}, client.Limit(100), client.Continue("")}
+	if err := kube.List(t.Context(), list, options...); err != nil || len(list.Items) != 1 {
+		t.Fatalf("initial list: %+v %v", list, err)
+	}
+
+	original := list.DeepCopy()
+	list.Items[0].Labels["owner"] = "mutated"
+	list.Items[0].Annotations["note"] = "mutated"
+
+	list.Items[0].OwnerReferences[0].Name = "mutated"
+	if err := kube.List(t.Context(), list, options...); err != nil || !reflect.DeepEqual(original, list) {
+		t.Fatalf("list mutation changed tracker: %+v %v", list, err)
+	}
+
+	updated := &corev1.ConfigMap{}
+	if err := kube.Get(t.Context(), client.ObjectKeyFromObject(object), updated); err != nil {
+		t.Fatal(err)
+	}
+
+	updated.Labels["owner"] = "second"
+	if err := kube.Update(t.Context(), updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.List(t.Context(), list, options...); err != nil || len(list.Items) != 0 {
+		t.Fatalf("list retained old labels after update: %+v %v", list, err)
+	}
+
+	if err := kube.List(t.Context(), list, client.InNamespace("state")); err != nil || len(list.Items) != 1 || list.Items[0].ResourceVersion != updated.ResourceVersion {
+		t.Fatalf("list did not observe update: %+v %v", list, err)
+	}
+
+	stale := &corev1.ConfigMap{ObjectMeta: original.Items[0].ObjectMeta}
+	if err := kube.Update(t.Context(), stale); !apierrors.IsConflict(err) {
+		t.Fatalf("metadata bypassed CAS: %v", err)
+	}
+
+	if err := kube.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: list.Items[0].ObjectMeta}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.List(t.Context(), list, client.InNamespace("state")); err != nil || len(list.Items) != 0 {
+		t.Fatalf("metadata-based delete not visible: %+v %v", list, err)
+	}
+}
+
 type configMapListTracker struct {
 	kubetesting.ObjectTracker
 	list *corev1.ConfigMapList
@@ -230,9 +339,22 @@ func TestTypedConfigMapListMetadataAndFailure(t *testing.T) {
 		t.Fatal("list metadata aliases tracker")
 	}
 
+	metadata := configMapMetadataList()
+	if err := typedConfigMapLists(tracker).List(t.Context(), nil, metadata, client.Limit(100), client.Continue("next")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(metadata.ListMeta, metav1.ListMeta{}) {
+		t.Fatalf("metadata projection retained tracker pagination unlike pinned fake: %+v", metadata.ListMeta)
+	}
+
 	tracker.err = errors.New("tracker unavailable")
 	if err := typedConfigMapLists(tracker).List(t.Context(), nil, &got); !errors.Is(err, tracker.err) {
 		t.Fatalf("lost tracker error: %v", err)
+	}
+
+	if err := typedConfigMapLists(tracker).List(t.Context(), nil, metadata); !errors.Is(err, tracker.err) {
+		t.Fatalf("lost metadata tracker error: %v", err)
 	}
 }
 
@@ -256,6 +378,13 @@ func TestTypedConfigMapListFallback(t *testing.T) {
 		{name: "continue", opts: []client.ListOption{client.Continue("next")}},
 		{name: "unsafe-deep-copy", opts: []client.ListOption{&client.ListOptions{UnsafeDisableDeepCopy: &disable}}},
 		{name: "read-consistency", opts: []client.ListOption{&client.ListOptions{DisableReadYourWritesConsistency: true}}},
+		{name: "metadata-no-gvk", list: &metav1.PartialObjectMetadataList{}},
+		{name: "metadata-other-gvk", list: &metav1.PartialObjectMetadataList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}}},
+		{name: "metadata-other-version", list: &metav1.PartialObjectMetadataList{TypeMeta: metav1.TypeMeta{APIVersion: "other/v1", Kind: "ConfigMapList"}}},
+		{name: "metadata-field-selector", list: configMapMetadataList(), opts: []client.ListOption{client.MatchingFields{"metadata.name": "chunk"}}},
+		{name: "metadata-raw", list: configMapMetadataList(), opts: []client.ListOption{&client.ListOptions{Raw: &metav1.ListOptions{}}}},
+		{name: "metadata-unsafe-deep-copy", list: configMapMetadataList(), opts: []client.ListOption{&client.ListOptions{UnsafeDisableDeepCopy: &disable}}},
+		{name: "metadata-read-consistency", list: configMapMetadataList(), opts: []client.ListOption{&client.ListOptions{DisableReadYourWritesConsistency: true}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.list == nil {
@@ -329,10 +458,10 @@ func BenchmarkConfigMapChunkList(b *testing.B) {
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "state", Name: "unrelated"}, BinaryData: map[string][]byte{"state": bytes.Repeat([]byte{2}, 6*1024*1024)}},
 	}
 
-	for _, name := range []string{"stock", "typed"} {
+	for _, name := range []string{"stock", "typed", "stock-metadata", "typed-metadata"} {
 		b.Run(name, func(b *testing.B) {
 			builder := fake.NewClientBuilder().WithScheme(scheme)
-			if name == "typed" {
+			if name == "typed" || name == "typed-metadata" {
 				builder = withTypedConfigMapLists(builder, scheme)
 			}
 
@@ -342,6 +471,19 @@ func BenchmarkConfigMapChunkList(b *testing.B) {
 			b.ResetTimer()
 
 			for b.Loop() {
+				if name == "stock-metadata" || name == "typed-metadata" {
+					list := configMapMetadataList()
+					if err := kube.List(b.Context(), list, client.InNamespace("state"), client.MatchingLabels{stateOwnerLabel: "owner"}, client.Limit(100), client.Continue("")); err != nil {
+						b.Fatal(err)
+					}
+
+					if len(list.Items) != 1 || list.Items[0].Name != "owned" || list.Continue != "" {
+						b.Fatal("incorrect metadata projection")
+					}
+
+					continue
+				}
+
 				var list corev1.ConfigMapList
 				if err := kube.List(b.Context(), &list, client.InNamespace("state"), client.MatchingLabels{stateOwnerLabel: "owner"}); err != nil {
 					b.Fatal(err)
