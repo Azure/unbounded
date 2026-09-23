@@ -9,7 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,9 +20,9 @@ import (
 type ClientOptions struct {
 	// Concurrency bounds active page requests per operation; zero means 8.
 	Concurrency int
-	// HTTPClient supplies transport, timeouts and authentication. It is copied,
-	// with redirects disabled. Its Transport remains shared and caller-owned.
-	HTTPClient *http.Client
+	// Timeout bounds an entire HTTP request, including reading its body. Zero
+	// leaves the deadline to the operation's context.
+	Timeout time.Duration
 	// Header supplies application headers, copied at construction. Protocol-owned
 	// headers (Range, validators, encoding and framing) cannot be overridden.
 	Header http.Header
@@ -37,13 +37,15 @@ type Client struct {
 	owned    *http.Transport
 }
 
-// NewClient connects to a volume or origin endpoint such as http://cache:8080. An endpoint
-// has no path prefix; targets are exact, already-escaped path/query strings.
+// NewClient connects to an absolute filesystem Unix socket, such as
+// /dev/racer/dataset/cache. Targets are exact, already-escaped path/query strings.
 func NewClient(endpoint string, options ClientOptions) (*Client, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
-		u.User != nil || (u.Path != "" && u.Path != "/") || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(endpoint, "#") {
-		return nil, fmt.Errorf("racer: invalid volume endpoint %q", endpoint)
+	if !filepath.IsAbs(endpoint) || len(endpoint) > 107 || strings.ContainsRune(endpoint, 0) {
+		return nil, fmt.Errorf("racer: invalid Unix socket path %q", endpoint)
+	}
+
+	if options.Timeout < 0 {
+		return nil, fmt.Errorf("racer: timeout must be nonnegative")
 	}
 
 	workers := options.Concurrency
@@ -67,30 +69,25 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 		}
 	}
 
-	c := &Client{endpoint: u.Scheme + "://" + u.Host, header: h, workers: workers}
-
-	if options.HTTPClient != nil {
-		cloned := *options.HTTPClient
-		c.http = &cloned
-	} else {
-		// A dedicated pool avoids net/http's default two idle connections per host.
-		c.owned = &http.Transport{
-			Proxy:        http.ProxyFromEnvironment,
-			DialContext:  (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			MaxIdleConns: workers, MaxIdleConnsPerHost: workers,
-			IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true,
-		}
-		c.http = &http.Client{Transport: c.owned}
+	c := &Client{endpoint: "http://localhost", header: h, workers: workers}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	// This pool always dials the configured local socket, never an HTTP proxy.
+	c.owned = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", endpoint)
+		},
+		MaxIdleConns: workers, MaxIdleConnsPerHost: workers,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true,
 	}
+	c.http = &http.Client{Transport: c.owned, Timeout: options.Timeout}
 
 	c.http.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	return c, nil
 }
 
-// CloseIdleConnections releases this client's owned pool. Custom transports are
-// caller-owned and are not closed. Active transfers are unaffected.
+// CloseIdleConnections releases this client's pool. Active transfers are unaffected.
 func (c *Client) CloseIdleConnections() {
 	if c.owned != nil {
 		c.owned.CloseIdleConnections()

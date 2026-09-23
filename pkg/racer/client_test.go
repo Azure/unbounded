@@ -11,8 +11,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,13 +35,43 @@ func (b sliceWriter) WriteAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+func socketDirectory(t testing.TB) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", "racer-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	return dir
+}
+
+func unixTestServer(t testing.TB, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	s := httptest.NewUnstartedServer(handler)
+	_ = s.Listener.Close()
+
+	listener, err := net.Listen("unix", filepath.Join(socketDirectory(t), "origin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.Listener = listener
+	s.Start()
+	t.Cleanup(s.Close)
+
+	return s
+}
+
 func newTestClient(t testing.TB, handler http.Handler, options ClientOptions) *Client {
 	t.Helper()
 
-	s := httptest.NewServer(handler)
-	t.Cleanup(s.Close)
+	s := unixTestServer(t, handler)
 
-	c, err := NewClient(s.URL, options)
+	c, err := NewClient(s.Listener.Addr().String(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +343,7 @@ func TestValidatorPolicyEmptyAndStatuses(t *testing.T) {
 }
 
 func TestClientValidationAndRedirect(t *testing.T) {
-	for _, endpoint := range []string{"", "ftp://host", "http://host/prefix", "http://host/user/..", "http://host/%2f", "http://user@host", "http://host?", "http://host/#"} {
+	for _, endpoint := range []string{"", "relative", "@abstract", "/nul\x00socket", "/" + strings.Repeat("a", 107), "ftp://host", "http://host/prefix", "http://host/user/..", "http://host/%2f", "http://user@host", "http://host?", "http://host/#"} {
 		if _, err := NewClient(endpoint, ClientOptions{}); err == nil {
 			t.Errorf("accepted %q", endpoint)
 		}
@@ -330,7 +363,7 @@ func TestClientValidationAndRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := NewClient("http://localhost", ClientOptions{Header: http.Header{"rAnGe": {"bytes=0-1"}}}); err == nil {
+	if _, err := NewClient("/dev/racer/test/cache", ClientOptions{Header: http.Header{"rAnGe": {"bytes=0-1"}}}); err == nil {
 		t.Fatal("accepted reserved header")
 	}
 }
@@ -368,7 +401,12 @@ func TestReadAtPartialCountWithOutOfOrderCompletion(t *testing.T) {
 	// page's successful prefix contributes to ReaderAt's count.
 	done := make(chan struct{})
 
-	cl, err := NewClient("http://cache", ClientOptions{Concurrency: 2, HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	cl, err := NewClient("/dev/racer/test/cache", ClientOptions{Concurrency: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		h := http.Header{"Etag": {checksumTag(append(payload(int(PageSize)), []byte("xyz")...))}}
 
 		resp := &http.Response{StatusCode: 200, Header: h, ContentLength: PageSize + 3, Body: io.NopCloser(strings.NewReader(""))}
@@ -394,10 +432,7 @@ func TestReadAtPartialCountWithOutOfOrderCompletion(t *testing.T) {
 		}
 
 		return resp, nil
-	})}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -427,15 +462,17 @@ func TestProtocolFramingAndCanceledContext(t *testing.T) {
 		{"invalid-etag", func(r *http.Response) { r.Header.Set("ETag", "unquoted") }, ErrProtocol},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := NewClient("http://cache", ClientOptions{HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			c, err := NewClient("/dev/racer/test/cache", ClientOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 				r := &http.Response{StatusCode: 200, ContentLength: 3, Header: http.Header{"Etag": {checksumTag([]byte("abc"))}}, Body: io.NopCloser(strings.NewReader(""))}
 				tc.mutate(r)
 
 				return r, nil
-			})}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			})
 
 			_, err = c.Stat(context.Background(), "/x")
 			if !errors.Is(err, tc.want) {

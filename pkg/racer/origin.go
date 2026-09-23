@@ -37,8 +37,9 @@ type Source interface {
 	io.Closer
 }
 
-// Origin implements the same object HEAD/GET contract as a Racer volume listener.
-// Mount it directly on an http.Server to preserve raw targets without path cleaning.
+// Origin implements the same object HEAD/GET contract as a Racer cache listener.
+// Serve it directly with http.Server.Serve on a filesystem Unix listener to
+// preserve raw targets without path cleaning.
 // Configure server timeouts and admission limits for your deployment.
 type Origin struct{ store Store }
 

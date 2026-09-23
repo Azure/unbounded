@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,23 +70,27 @@ func conformanceBody(target string) []byte {
 func TestOriginConformance(t *testing.T) {
 	o, _ := NewOrigin(conformanceStore{})
 
-	s := httptest.NewServer(o)
-	defer s.Close()
+	s := unixTestServer(t, o)
 
-	runReadConformance(t, s.URL)
+	runReadConformance(t, s.Listener.Addr().String())
 }
 
 // The same assertions run against the origin and the real dataplane. Expected
 // bytes/ranges are explicit and do not use the implementation's range parser.
 func runReadConformance(t *testing.T, endpoint string) {
-	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	sdk, err := NewClient(endpoint, ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := sdk.http
 	defer client.CloseIdleConnections()
 
 	for _, target := range []string{"/object", "//a%2fb?b=2&a=1&a=3", "/a%2Fb", "/a/b", "/a/../b", "/object?", "/metadata", "/page", "/empty"} {
 		t.Run(target, func(t *testing.T) {
 			want := conformanceBody(target)
 			for _, method := range []string{"HEAD", "GET"} {
-				r, _ := http.NewRequest(method, endpoint+target, nil)
+				r, _ := http.NewRequest(method, "http://localhost"+target, nil)
 				r.Header.Set("X-Racer-Target", "/wrong")
 
 				resp, err := client.Do(r)
@@ -175,7 +178,7 @@ func runReadConformance(t *testing.T, endpoint string) {
 		{"missing", "GET", "/missing", nil, 404, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, _ := http.NewRequest(tc.method, endpoint+tc.target, nil)
+			r, _ := http.NewRequest(tc.method, "http://localhost"+tc.target, nil)
 			if tc.headers != nil {
 				r.Header = tc.headers
 				for name, values := range r.Header {
@@ -217,7 +220,7 @@ func runReadConformance(t *testing.T, endpoint string) {
 		t.Fatalf("changed snapshot: %v", err)
 	}
 	// Absolute form must discard authority, preserving the raw path/query.
-	conn, err := net.Dial("tcp", strings.TrimPrefix(endpoint, "http://"))
+	conn, err := net.Dial("unix", endpoint)
 	if err != nil {
 		t.Fatal(err)
 	}

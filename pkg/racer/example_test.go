@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"time"
 
 	racer "github.com/Azure/unbounded/pkg/racer"
@@ -72,12 +74,22 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 		log.Fatal(err)
 	}
 
-	server := &http.Server{Addr: ":8081", Handler: origin, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Fatal(server.ListenAndServe())
+	listener, err := net.Listen("unix", "/dev/racer/dataset/origin")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+
+	if err := os.Chmod("/dev/racer/dataset/origin", 0o660); err != nil {
+		log.Fatal(err)
+	}
+
+	server := &http.Server{Handler: origin, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
+	log.Fatal(server.Serve(listener))
 }
 
 func ExampleClient_Open() { //nolint:testableexamples // Requires an external cache serving application data.
-	client, err := racer.NewClient("http://cache:8080", racer.ClientOptions{Concurrency: 8})
+	client, err := racer.NewClient("/dev/racer/dataset/cache", racer.ClientOptions{Concurrency: 8})
 	if err != nil {
 		log.Fatal(err)
 	}

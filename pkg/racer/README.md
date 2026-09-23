@@ -10,7 +10,7 @@ module and uses the toolchain and dependency versions declared in `go.mod`.
 ```go
 import racer "github.com/Azure/unbounded/pkg/racer"
 
-client, err := racer.NewClient("http://cache:8080", racer.ClientOptions{
+client, err := racer.NewClient("/dev/racer/dataset/cache", racer.ClientOptions{
     Concurrency: 8, // also the default
 })
 if err != nil { return err }
@@ -37,12 +37,18 @@ encoded responses, and truncated bodies fail the operation. There is no automati
 retry with newer metadata that could combine versions.
 
 Reuse the client: its dedicated HTTP/1.1 connection pool retains enough idle
-connections for the configured parallelism. `HTTPClient` permits custom
-transports, credentials, TLS termination, and request timeouts; the client is
-copied, its transport stays caller-owned, and redirects are disabled. Racer's
-native listener uses plain HTTP. `Header` is copied and can hold authentication
-headers; protocol-owned headers cannot be overridden. Dynamic authentication can
-be implemented with a custom `http.RoundTripper`.
+connections for the configured parallelism. Every connection uses the configured
+filesystem Unix socket; proxy environment variables are ignored and redirects
+are disabled. `Timeout` optionally bounds each HTTP request, including its body.
+`Header` is copied; protocol-owned headers cannot be overridden. HTTP uses
+`Host: localhost`, independently of the socket path. TCP URLs and abstract Unix
+sockets are not accepted.
+
+For a `P2PCache` named `dataset`, mount the host directory `/dev/racer/dataset`
+into the application at the same path. Mount the directory rather than either
+socket inode so a restarted server's socket replacement remains visible. The
+cache socket is created by Racer, and the local origin process creates `origin`.
+Run the origin on every participating node, serving the same logical dataset.
 
 ### Metadata and random access
 
@@ -133,14 +139,23 @@ can implement a no-op `Close`.
 ```go
 origin, err := racer.NewOrigin(store)
 if err != nil { return err }
+listener, err := net.Listen("unix", "/dev/racer/dataset/origin")
+if err != nil { return err }
+defer listener.Close()
+if err := os.Chmod("/dev/racer/dataset/origin", 0o660); err != nil { return err }
 server := &http.Server{
-    Addr:              ":8081",
     Handler:           origin,
     ReadHeaderTimeout: 5 * time.Second,
     IdleTimeout:       90 * time.Second,
 }
-return server.ListenAndServe()
+return server.Serve(listener)
 ```
+
+Provision the parent directory with a shared group and mode `2770`; the origin
+process and Racer must belong to that group. Socket mode `0660` supports non-root
+applications. The embedding application owns startup and shutdown, including
+exclusive ownership and stale-socket recovery after an unclean exit. Never
+blindly unlink a path that could belong to a running server.
 
 See [example_test.go](example_test.go) for a complete immutable memory-store
 implementation. Store methods must support concurrent calls and respect context
@@ -149,7 +164,7 @@ cancellation. Errors matching `fs.ErrNotExist`, `fs.ErrPermission`, or
 exposing backend details.
 
 The handler and Racer volume listeners share an object-read API. Clients can
-switch between them by changing only the base URL:
+switch between them by changing only the Unix socket path:
 
 | Request | Response |
 | --- | --- |
@@ -169,7 +184,7 @@ are ordinary object names; `X-Racer-Target` has no routing effect.
 
 This is a breaking replacement of the old two-endpoint origin API: deploy the
 origin and dataplane changes together. Racer sends HEAD and aligned page GETs to
-the actual target, with the configured backend Host and `Accept-Encoding: identity`.
+the actual target, with `Host: localhost` and `Accept-Encoding: identity`.
 There is no legacy fallback on errors.
 
 Clients may omit `If-Match`. Conditional headers retain standard HTTP syntax:
@@ -212,7 +227,7 @@ RACER_DATAPLANE_BINARY=/absolute/path/to/racer-dataplane \
 The opt-in test starts an isolated single-node daemon with signing keys and an SDK origin,
 verifies HEAD causes no page reads, checks multi-page cold downloads and warm
 cache reuse, and reads across a page boundary. A shared conformance suite runs
-against both base URLs, covering raw targets, full and ranged reads, empty objects,
+against both Unix sockets, covering raw targets, full and ranged reads, empty objects,
 conditions, SDK operations and version changes. It fails on daemon startup errors
 when the binary is explicitly configured. The regular suite exercises wire
 validation, concurrent page dispatch, cancellation, validators, EOF, source

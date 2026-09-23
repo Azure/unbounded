@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +32,7 @@ func TestDataplaneInterop(t *testing.T) {
 	store := &memoryStore{data: data, meta: Metadata{Size: int64(len(data)), ETag: checksumTag(data), TTL: durationPointer(time.Hour)}}
 	origin, _ := NewOrigin(conformanceStore{sdk: store})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept-Encoding") != "identity" || len(r.Header.Values("X-Racer-Target")) != 0 {
 			// Direct conformance deliberately supplies a conflicting legacy header.
 			// Only the SDK object's requests exclusively originate at the dataplane.
@@ -74,6 +73,7 @@ func TestDataplaneInterop(t *testing.T) {
 	metrics.Close()
 
 	dir := t.TempDir()
+	cacheSocket := filepath.Join(socketDirectory(t), "cache")
 
 	public, private, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -94,7 +94,7 @@ func TestDataplaneInterop(t *testing.T) {
 		"node":     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
 		"revision": "1", "epoch": "1",
 		"volumes": []any{map[string]any{
-			"id": "sdk", "listen": address, "originAddress": server.Listener.Addr().String(), "originIdentity": "sdk/origin:80", "cacheGeneration": "1",
+			"id": "sdk", "peerListen": address, "cacheSocket": cacheSocket, "originSocket": server.Listener.Addr().String(), "cacheGeneration": "1",
 			"peerEndpoints": map[string]any{}, "topology": map[string]any{"epoch": "1", "slotCount": 1, "localSlots": []int{0}},
 		}},
 	}}
@@ -162,7 +162,7 @@ func TestDataplaneInterop(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 
 	for {
-		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		conn, err := net.DialTimeout("unix", cacheSocket, 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			break
@@ -183,7 +183,7 @@ func TestDataplaneInterop(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	c, err := NewClient("http://"+address, ClientOptions{Concurrency: 3})
+	c, err := NewClient(cacheSocket, ClientOptions{Concurrency: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,8 +224,8 @@ func TestDataplaneInterop(t *testing.T) {
 	}
 
 	t.Logf("verified HEAD + 3 cold pages + warm reuse + cross-page ReadAt (%d bytes)", len(data))
-	t.Run("direct", func(t *testing.T) { runReadConformance(t, server.URL) })
-	t.Run("cached", func(t *testing.T) { runReadConformance(t, "http://"+address) })
+	t.Run("direct", func(t *testing.T) { runReadConformance(t, server.Listener.Addr().String()) })
+	t.Run("cached", func(t *testing.T) { runReadConformance(t, cacheSocket) })
 
 	for _, target := range []string{"/encoded", "/duplicate-encoding", "/identity"} {
 		want := 502
@@ -236,9 +236,9 @@ func TestDataplaneInterop(t *testing.T) {
 		deadline := time.Now().Add(10 * time.Second)
 
 		for {
-			r, _ := http.NewRequestWithContext(ctx, "HEAD", "http://"+address+target, nil)
+			r, _ := http.NewRequestWithContext(ctx, "HEAD", "http://localhost"+target, nil)
 
-			resp, err := http.DefaultClient.Do(r)
+			resp, err := c.http.Do(r)
 			if err != nil {
 				t.Fatal(err)
 			}
