@@ -93,6 +93,36 @@ test('selection cancellation and superseded refresh reject stale async payloads'
   assert.equal(f.store.read('node').snapshot.requestId, 'new');
 });
 
+test('node removal or identity replacement invalidates cached details without loading', async () => {
+  const f = fixture();
+  const original = {
+    name: 'node',
+    nodeInfo: { providerId: 'provider://old', internalIPs: ['192.0.2.1'], wireGuard: { publicKey: 'old' } },
+  };
+  f.store.syncNodes([original]);
+  f.store.load('node');
+  f.calls[0].resolve(f.complete());
+  await tick();
+
+  f.store.syncNodes([{ ...original, siteName: 'new-site' }]);
+  assert.equal(f.store.read('node').state, 'loaded');
+  assert.equal(f.calls.length, 1);
+
+  f.store.syncNodes([{
+    name: 'node',
+    nodeInfo: { providerId: 'provider://new', internalIPs: ['192.0.2.2'], wireGuard: { publicKey: 'new' } },
+  }]);
+  assert.equal(f.store.read('node').state, 'not-loaded');
+  assert.equal(f.calls.length, 1);
+
+  f.store.load('node');
+  f.calls[1].resolve(f.complete('replacement'));
+  await tick();
+  f.store.syncNodes([]);
+  assert.equal(f.store.read('node').state, 'not-loaded');
+  assert.equal(f.calls.length, 2);
+});
+
 test('pending polling honors original deadline, aborts in-flight GET, rejects late replies', async () => {
   const f = fixture();
   f.store.load('node');

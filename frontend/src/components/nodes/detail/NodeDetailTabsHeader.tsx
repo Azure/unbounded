@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 type NodeDetailTabsHeaderProps = {
+  detailsLoaded?: boolean;
   detailTab: 'peerings' | 'routes' | 'bpf';
   routesValidationSummary: { total: number; mismatch: number };
   bpfEntryCount: number;
@@ -10,6 +11,7 @@ type NodeDetailTabsHeaderProps = {
 };
 
 function NodeDetailTabsHeader({
+  detailsLoaded = true,
   detailTab,
   routesValidationSummary,
   bpfEntryCount,
@@ -30,7 +32,7 @@ function NodeDetailTabsHeader({
           onClick={() => onDetailTabChange('routes')}
         >
           Routes
-          {routesValidationSummary.mismatch > 0 && (
+          {detailsLoaded && routesValidationSummary.mismatch > 0 && (
             <span
               className="tab-warning-icon route-presence route-presence-warning"
               title={`${routesValidationSummary.mismatch} mismatched route next hop(s)`}
@@ -39,7 +41,7 @@ function NodeDetailTabsHeader({
             </span>
           )}
         </button>
-        {bpfEntryCount > 0 && (
+        {(!detailsLoaded || bpfEntryCount > 0) && (
           <button
             className={`tab-button ${detailTab === 'bpf' ? 'active' : ''}`}
             onClick={() => onDetailTabChange('bpf')}
@@ -49,7 +51,7 @@ function NodeDetailTabsHeader({
         )}
       </div>
       <div className="detail-tabs-controls">
-        {detailTab !== 'peerings' && detailTab !== 'bpf' && (
+        {detailsLoaded && detailTab !== 'peerings' && detailTab !== 'bpf' && (
           <>
             {(() => {
               const summary = routesValidationSummary;

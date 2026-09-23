@@ -4,8 +4,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { pollNodeDetails, requestNodeDetails } from '../api';
 import { NodeDetails } from '../state/nodeDetails';
+import type { NodeSummary } from '../types';
 
-export default function useNodeDetails(selectedNodeName: string | null) {
+export default function useNodeDetails(selectedNodeName: string | null, nodeSummaries: NodeSummary[]) {
   const [, setVersion] = useState(0);
   const storeRef = useRef<NodeDetails | null>(null);
   if (!storeRef.current) {
@@ -16,6 +17,7 @@ export default function useNodeDetails(selectedNodeName: string | null) {
   }
   const store = storeRef.current;
   useEffect(() => () => store.dispose(), [store]);
+  useEffect(() => store.syncNodes(nodeSummaries), [store, nodeSummaries]);
   // Selection only cancels obsolete waiters. It never initiates collection.
   useEffect(() => () => {
     if (selectedNodeName) store.cancel(selectedNodeName);
