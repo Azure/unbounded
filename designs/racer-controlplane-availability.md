@@ -32,11 +32,23 @@ degraded operation. They cannot guarantee separation when capacity is constraine
 
 ## Limitations and validation
 
-The first upgrade from an older binary has a routing compatibility gap: the
-operator installs the new Service selector before an old leader can publish the
-new hint. Requests resume after a new replica becomes leader. Avoid claiming a
-zero-downtime upgrade across this boundary. Subsequent upgrades can also have an
-election and endpoint-propagation gap when the leader is replaced.
+Before narrowing an existing legacy Service, the operator probes each managed
+replica's live `/readyz?verbose` contract. Only the old `leader-tls` check permits
+an operator-installed routing hint. Both old leaders and old standbys receive
+the hint: their old readiness contract still selects only the elected leader,
+including a leadership change during migration. Generic readiness and image tags
+are never leadership evidence. Unknown or unreachable processes block migration
+without changing the old Service. Pod patches are optimistic and are dependencies
+of the Service apply; failures retain the old selector and block the Deployment
+update. New warm replicas remain unready until the Service has leader-only
+selection, and clear inherited hints before startup. Leader replacement can still
+have an election and endpoint-propagation gap.
+
+Shutdown removes a hint only when the routing boot annotation belongs to the
+exiting process. Each predecessor-sweep patch uses a Pod snapshot read before a
+durable fence check. A new leader changes all candidate resource versions before
+publishing, so an in-flight predecessor sweep conflicts instead of removing the
+new route. There are no retries that reuse old leadership with freshly read Pods.
 
 Tests exercise readiness, certificate expiry, missing proof and failed production
 listeners, request gating on followers and cancellation, stale hint cleanup,

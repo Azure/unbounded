@@ -42,6 +42,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "replicationcontrollers", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
+  # Preserve old leader routing before narrowing the Racer Service selector.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
   # Read-only, and only ever read: a component that registers admission
   # webhooks or an aggregated API points them at a Service, and a registration
   # whose backend is not serving is worse than none. Endpoints answer whether

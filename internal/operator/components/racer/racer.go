@@ -42,8 +42,8 @@ func (Dataplane) Enabled(site *unboundedv1alpha3.Site) bool {
 
 // Plan retains and repairs an installed singleton after the last Site is disabled
 // or deleted. The shared ServiceAccount is the installation marker; the Deployment
-// also recognizes installations whose account was removed. No runtime state is
-// read or written, and no all-replicas-ready rollout gate or polling is needed.
+// also recognizes installations whose account was removed. Legacy routing hints
+// are migrated before narrowing the Service; no all-replicas-ready gate is used.
 func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	enabled := false
 
@@ -73,10 +73,19 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboun
 		return plan, component.Disabled("no Site enables Racer and no retained installation exists"), nil
 	}
 
+	routes, err := planRoutingMigration(ctx, env, plan)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
 	var dependencies []component.ObjectRef
 
 	for _, obj := range sharedResources(env.Namespace) {
 		op := component.Operation{Kind: component.OpApply, Object: resourceObject(obj), Component: controlPlaneName}
+		if op.Ref().GVK.Kind == "Service" {
+			op.DependsOn = routes
+		}
+
 		plan.Add(op)
 		dependencies = append(dependencies, op.Ref())
 	}

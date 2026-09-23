@@ -18,7 +18,10 @@ import (
 	"github.com/Azure/unbounded/internal/racer"
 )
 
-const servingLeaderLabel = racer.MetadataPrefix + "serving-leader"
+const (
+	servingLeaderLabel    = racer.MetadataPrefix + "serving-leader"
+	routingBootAnnotation = racer.MetadataPrefix + "routing-boot"
+)
 
 func (s *tlsControl) serving() bool {
 	return s.ready.Load() && s.leaderContext.Err() == nil
@@ -40,7 +43,40 @@ func (s *tlsControl) replicaReady(req *http.Request) error {
 		return errors.New("TLS listeners are not serving")
 	}
 
-	return s.replica.Ready(req)
+	if err := s.replica.Ready(req); err != nil {
+		return err
+	}
+	// During migration the old Service selects every Ready Pod. A warm
+	// standby must not enter that Service before leader-only selection exists.
+	ctx := context.Background()
+	if req != nil {
+		ctx = req.Context()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	var service corev1.Service
+	if err := s.kube.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: replicaComponent}, &service); err != nil {
+		return err
+	}
+
+	if service.Spec.Selector[servingLeaderLabel] != "true" {
+		return errors.New("waiting for leader-only Service routing")
+	}
+	// A legacy probe can race a same-Pod process restart before kubelet reports
+	// it. Even if that migration patch wins CAS, never let its hint expose a
+	// warm follower. The next leader sweep repairs the obsolete hint.
+	var pod corev1.Pod
+	if err := s.kube.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: s.replica.podName}, &pod); err != nil {
+		return err
+	}
+
+	if pod.UID != s.replica.podUID || (pod.Labels[servingLeaderLabel] == "true" && (!s.serving() || pod.Annotations[routingBootAnnotation] != s.boot)) {
+		return errors.New("replica has a stale leader routing hint")
+	}
+
+	return nil
 }
 
 // Labels are routing hints, never authorization. Clear the previous process's
@@ -63,12 +99,16 @@ func (s *tlsControl) setServingLabel(ctx context.Context, pod *corev1.Pod, servi
 		pod.Annotations = map[string]string{}
 	}
 
-	pod.Annotations[racer.MetadataPrefix+"routing-boot"] = s.boot
+	pod.Annotations[routingBootAnnotation] = s.boot
 
 	return s.kube.Patch(ctx, pod, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (s *tlsControl) clearLocalServingLabel(ctx context.Context) error {
+	return s.clearLocalRoute(ctx, false)
+}
+
+func (s *tlsControl) clearLocalRoute(ctx context.Context, ownedOnly bool) error {
 	var pod corev1.Pod
 	if err := s.kube.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: s.replica.podName}, &pod); err != nil {
 		return err
@@ -76,6 +116,10 @@ func (s *tlsControl) clearLocalServingLabel(ctx context.Context) error {
 
 	if pod.UID != s.replica.podUID {
 		return errors.New("local control-plane Pod UID changed")
+	}
+
+	if ownedOnly && pod.Annotations[routingBootAnnotation] != s.boot {
+		return nil
 	}
 
 	return s.setServingLabel(ctx, &pod, false)
@@ -95,6 +139,12 @@ func (s *tlsControl) publishServingLeader(ctx context.Context) error {
 	}
 
 	for i := range pods.Items {
+		// The snapshot predates this fence check. A successor's sweep or
+		// publication changes the resource version, so delayed patches conflict.
+		if err := s.manager.Publish(ctx); err != nil {
+			return err
+		}
+
 		if err := s.setServingLabel(ctx, &pods.Items[i], false); err != nil {
 			return err
 		}
@@ -146,7 +196,7 @@ func (t *controlTransport) Start(ctx context.Context) error {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
 
-		if err := s.clearLocalServingLabel(cleanup); err != nil {
+		if err := s.clearLocalRoute(cleanup, true); err != nil {
 			log.Printf("clear serving leader route: %v", err)
 		}
 	}()

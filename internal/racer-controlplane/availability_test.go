@@ -6,6 +6,7 @@ package controlplane
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,13 +15,17 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
 func TestWarmStandbyReadinessAndLeaderRequestGate(t *testing.T) {
 	_, _, _, replica := replicaFixture(t)
 
-	s := &tlsControl{replica: replica}
+	s := &tlsControl{replica: replica, kube: replica.kube, namespace: replica.namespace}
 	if s.replicaReady(nil) == nil {
 		t.Fatal("unstarted replica ready")
 	}
@@ -39,8 +44,42 @@ func TestWarmStandbyReadinessAndLeaderRequestGate(t *testing.T) {
 
 	replica.proofServing.Store(true)
 
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: replica.namespace, Name: replicaComponent}}
+	if err := replica.kube.Create(t.Context(), service); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.replicaReady(nil) == nil {
+		t.Fatal("warm standby ready before selector migration")
+	}
+
+	service.Spec.Selector = map[string]string{servingLeaderLabel: "true"}
+	if err := replica.kube.Update(t.Context(), service); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.replicaReady(nil); err != nil {
 		t.Fatal("warm standby must be ready", err)
+	}
+
+	var pod corev1.Pod
+	if err := replica.kube.Get(t.Context(), client.ObjectKey{Namespace: replica.namespace, Name: replica.podName}, &pod); err != nil {
+		t.Fatal(err)
+	}
+
+	pod.Labels[servingLeaderLabel] = "true"
+	if err := replica.kube.Update(t.Context(), &pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.replicaReady(nil) == nil {
+		t.Fatal("racing legacy migration exposed restarted warm standby")
+	}
+
+	delete(pod.Labels, servingLeaderLabel)
+
+	if err := replica.kube.Update(t.Context(), &pod); err != nil {
+		t.Fatal(err)
 	}
 
 	called := false
@@ -76,6 +115,90 @@ func TestWarmStandbyReadinessAndLeaderRequestGate(t *testing.T) {
 
 	if s.replicaReady(nil) == nil {
 		t.Fatal("expired standby remained ready")
+	}
+}
+
+func TestOldBootCleanupDoesNotRemoveNewBootRoute(t *testing.T) {
+	kube, pod, _, replica := replicaFixture(t)
+
+	old := &tlsControl{kube: kube, namespace: pod.Namespace, replica: replica, boot: "old"}
+	if err := old.clearLocalServingLabel(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(t.Context(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+
+	next := &tlsControl{kube: kube, boot: "new"}
+	if err := next.setServingLabel(t.Context(), pod, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := old.clearLocalRoute(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kube.Get(t.Context(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if pod.Labels[servingLeaderLabel] != "true" || pod.Annotations[routingBootAnnotation] != "new" {
+		t.Fatal("old boot cleanup removed successor route")
+	}
+}
+
+func TestDelayedLeaderSweepCannotClearSuccessorRoute(t *testing.T) {
+	kube, pod, ca, replica := replicaFixture(t)
+	replicaBootstrap(t, replica)
+
+	nextCA, err := pki.New(kube, pod.Namespace, pki.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next := &tlsControl{kube: kube, namespace: pod.Namespace, replica: replica, manager: nextCA, boot: "new", leaderContext: t.Context()}
+	next.ready.Store(true)
+
+	old := &tlsControl{kube: kube, namespace: pod.Namespace, replica: replica, manager: ca, boot: "old", leaderContext: t.Context()}
+	old.ready.Store(true)
+
+	watch, ok := kube.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client lacks Watch")
+	}
+
+	delayed := false
+
+	old.kube = interceptor.NewClient(watch, interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, object client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if !delayed {
+			delayed = true
+
+			if err := nextCA.AcquireLeadership(ctx, "new"); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := next.publishServingLeader(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		return c.Patch(ctx, object, patch, opts...)
+	}})
+	if err := old.publishServingLeader(t.Context()); !apierrors.IsConflict(err) {
+		t.Fatalf("delayed predecessor sweep must conflict: %v", err)
+	}
+
+	if err := kube.Get(t.Context(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if pod.Labels[servingLeaderLabel] != "true" || pod.Annotations[routingBootAnnotation] != "new" {
+		t.Fatal("delayed sweep removed successor route")
+	}
+
+	if err := old.publishServingLeader(t.Context()); !errors.Is(err, pki.ErrNotLeader) {
+		t.Fatalf("stale leader must fail before touching current Pod versions: %v", err)
 	}
 }
 
