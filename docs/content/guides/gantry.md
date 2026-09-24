@@ -208,8 +208,7 @@ The peer/chair/advertiser signals in this table apply to the direct backend.
 ## Optional Racer Backend
 
 Using Racer as Gantry's backend is opt-in. Operator-managed Gantry uses direct
-distribution unless a valid user-managed P2PCache selects Racer through its
-`unbounded-cloud.io/gantry-backing: "true"` annotation. Building
+distribution unless a valid user-managed ClusterCache named `gantry` exists. Building
 Gantry does not require building Racer; Racer mode additionally requires the
 version-matched Racer control-plane and Linux dataplane deployment described in
 the [Racer documentation](../../concepts/racer/).
@@ -224,41 +223,39 @@ the [Racer documentation](../../concepts/racer/).
    Unassigned nodes, including control-plane nodes, must be accounted for.
    Custom `NoSchedule`/`NoExecute` taints unsupported by the managed Racer
    DaemonSet invalidate the selection.
-3. Create a dedicated, user-managed, cluster-scoped cache. Save this as
+3. Create a dedicated, user-managed, cluster-scoped cache named `gantry`. Save this as
    `gantry-cache.yaml` and run `kubectl apply -f gantry-cache.yaml`:
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: P2PCache
+kind: ClusterCache
 metadata:
   name: gantry
-  annotations:
-    unbounded-cloud.io/gantry-backing: "true"
 spec:
   siteSelector: {}
   cacheGeneration: 1
   maxCandidateAttempts: 3
 ```
 
-Any live P2PCache installs both Racer workloads, even with zero Sites. Selecting
-it for Gantry additionally requires exactly one live cache annotated `"true"`, an
+Any live ClusterCache installs both Racer workloads, even with zero Sites. Selecting
+it for Gantry additionally requires the exact name `gantry`, an
 empty `siteSelector` (no match labels or expressions), full node coverage, and at
 least one live Site enabling Gantry. The empty selector selects every live Site,
 each with an independent cache universe. The operator starts Gantry's origin
 without waiting for Racer readiness; verify both rollouts afterward.
 
-You own the P2PCache, including its name, generation, and candidate policy. The
+You own the ClusterCache, including its generation and candidate policy. The
 operator does not create, adopt, modify, or delete it. Use a dedicated cache,
-never an unrelated application's P2PCache. The selected resource's name determines
+never an unrelated application's ClusterCache. The selected resource's name determines
 both socket paths. Recreating it with the same name changes its UID and cache
 identity and triggers a Gantry rollout.
 
-An absent annotation or the exact string `"false"` does not select a cache.
-Removing the annotation or deleting the selected cache returns Gantry to direct
-when no other cache is selected. Invalid annotation values (including `"True"`
-or an empty string), multiple selections, a nonempty selector, or failed
+Selection uses only the name `gantry`; other cache names are ignored, regardless
+of annotations. The legacy `unbounded-cloud.io/gantry-backing` annotation has no
+effect, including when set to `"false"` on `gantry`. A missing or deleting
+ClusterCache named `gantry` returns Gantry to direct. A nonempty selector or failed
 coverage/live-Site checks also select direct, with an `InvalidGantryBacking`
-diagnostic in the Site's `GantryReady` condition. Terminating caches do not vote.
+diagnostic in the Site's `GantryReady` condition.
 API read failures instead preserve the deployed pod configuration and retry.
 
 The operator preserves `gantry-config`, including upstream registries, and rolls
@@ -271,16 +268,16 @@ these flags, environment variables, and YAML settings.
 The preserved YAML must still parse successfully; generated flags do not hide
 malformed YAML or unknown configuration fields.
 
-On upgrade, an old operator-created cache or its `unbounded-cloud.io/gantry-cache`
-label is not selected automatically. To keep using that dedicated cache, ensure
-it satisfies the checks above and annotate it explicitly:
+On upgrade, an existing ClusterCache named `gantry` selects Racer if it satisfies
+the checks above, even without the former backing annotation or with that
+annotation set to `"false"`. A previously annotated cache with another name no
+longer selects Racer. The old `unbounded-cloud.io/gantry-cache` label is also
+ignored. To enable Racer, create the dedicated ClusterCache named `gantry`;
+Kubernetes resource names cannot be changed in place, and a new resource has a
+new cache identity. To keep direct distribution, `gantry` must be absent or deleting.
 
-```bash
-kubectl annotate p2pcache gantry unbounded-cloud.io/gantry-backing=true --overwrite
-```
-
-There is no automatic cache migration. Existing ConfigMap backend values are
-preserved but overridden by selection. Before upgrading, also copy any desired
+There is no automatic cache migration or retained-cache disable switch. Existing
+ConfigMap backend values are preserved but overridden by selection. Before upgrading, also copy any desired
 Site cache sizes to Node annotations as described in
 [Racer capacity and upgrade](../../concepts/racer/#cache-capacity-and-upgrade).
 
@@ -288,12 +285,13 @@ Site cache sizes to Node annotations as described in
 | --- | --- |
 | ClusterCache `gantry` | Racer serves `/run/racer/gantry/client/socket` |
 | Gantry origin | Gantry serves `/run/racer/gantry/origin/socket` with mode `0660` |
-| Shared hostPath | `/run/racer`, mounted read/write as a parent directory, without `subPath` |
-| Permissions | Parent, cache, client, and origin directory mode `2770`, group `65532`; Gantry UID `65532`, primary GID `0` for containerd, supplemental group `65532` |
+| Gantry hostPaths | Only `/run/racer/gantry/client` and `/run/racer/gantry/origin`, each `DirectoryOrCreate`, mounted read/write into init and Gantry without `subPath` or `subPathExpr` |
+| Permissions | Init sets only the mounted client and origin directories to mode `2770`, group `65532`; Gantry UID `65532`, primary GID `0` for containerd, supplemental group `65532` |
 
-Mounting the directory lets each process reconnect after socket replacement.
-Do not bind-mount individual socket files. The initialization container sets
-permissions before Gantry starts, independent of which daemon starts first.
+Mounting the socket directories lets each process reconnect after socket replacement.
+Do not mount `/run/racer`, the cache root, or individual socket files into Gantry.
+The initialization container sets permissions before Gantry starts, independent
+of which daemon starts first, without changing Racer ancestor directories.
 
 ### Content path, authentication, and limits
 
@@ -352,7 +350,8 @@ populate the local media-type index through its image walks, preserving known
 manifest and index types for local serving and Racer origin metadata.
 Ports 5001/5002 and service-account token mounting are omitted. Fresh Racer-mode
 installs do not create chair Leases or their Role/RoleBinding; existing chair
-resources are retained for rollback and stop being reconciled in Racer mode.
+resources remain in place and stop being reconciled in Racer mode; direct mode
+resumes their reconciliation.
 
 The origin registry must support usable metadata and bounded byte-range reads.
 Racer mode has no ordinary registry or direct local-content bypass. Unavailable
@@ -381,7 +380,7 @@ origin coverage are unsupported.
 ### Verify and roll back
 
 ```bash
-kubectl get p2pcache gantry
+kubectl get clustercache gantry
 kubectl -n unbounded-system rollout status deployment/racer-controlplane
 kubectl -n unbounded-system rollout status daemonset/racer-dataplane
 kubectl -n unbounded-system rollout status daemonset/gantry
@@ -412,20 +411,23 @@ Update dashboards and alerts from `outcome="verified"` to `outcome="completed"`
 and treat completion separately from consumer validation. A missing commit
 observation does not trigger automatic cache-wide eviction or a generation bump.
 
-To return operator-managed Gantry to direct distribution, remove the annotation
-or set it to `"false"`, then wait for Gantry's rollout:
+To return operator-managed Gantry to direct distribution, delete the named cache,
+then wait for the operator to select direct and for Gantry's rollout:
 
 ```bash
-kubectl annotate p2pcache gantry unbounded-cloud.io/gantry-backing-
+kubectl delete clustercache gantry
 kubectl -n unbounded-system rollout status daemonset/gantry
 ```
 
-Chair resources are reconciled again. Removing the annotation retains the
-P2PCache and Racer slab; delete the unused cache explicitly after Gantry's
-rollout. Deleting the selected cache also triggers direct selection. Returning
-to direct does not uninstall Racer or migrate or delete containerd's committed
-images. To uninstall Racer, remove all P2PCaches and then delete its Deployment
-and DaemonSet in either order; see [manual uninstall](../../concepts/racer/#manual-uninstall).
+Deletion starts direct selection even while the cache is terminating. Confirm
+the DaemonSet now has `--content-backend=direct`; changing or removing the legacy
+annotation cannot disable Racer while a valid `gantry` cache exists. Chair
+resources are reconciled again. This is not retained-cache rollback: recreating
+`gantry` enables Racer with a new UID and cache identity, without a warm-cache
+reuse guarantee. Returning to direct does not uninstall Racer or migrate or delete
+containerd's committed images. To uninstall Racer, remove all ClusterCaches and
+then delete its Deployment and DaemonSet in either order; see
+[manual uninstall](../../concepts/racer/#manual-uninstall).
 
 ### Recover from known incorrect cached content
 
@@ -433,13 +435,13 @@ Use explicit recovery after establishing a content mismatch:
 
 1. Fix the source so subsequent origin reads return bytes matching the expected
    OCI digest. Stop or finish affected pulls, including pre-bump requests.
-2. Read the dedicated P2PCache's current `spec.cacheGeneration` and increase it
+2. Read the dedicated ClusterCache's current `spec.cacheGeneration` and increase it
    monotonically. For example, this compare-and-swap patch changes **1 to 2**
    only if the stored value is still 1:
 
    ```bash
-   kubectl get p2pcache gantry -o yaml
-   kubectl patch p2pcache gantry --type=json -p='[{"op":"test","path":"/spec/cacheGeneration","value":1},{"op":"replace","path":"/spec/cacheGeneration","value":2}]'
+   kubectl get clustercache gantry -o yaml
+   kubectl patch clustercache gantry --type=json -p='[{"op":"test","path":"/spec/cacheGeneration","value":1},{"op":"replace","path":"/spec/cacheGeneration","value":2}]'
    ```
 
    Substitute the actual cache name, current value, and next value. If the test
@@ -462,7 +464,7 @@ Use explicit recovery after establishing a content mismatch:
 5. Retry the same image reference and confirm containerd accepts the expected
    digest. Verify Gantry readiness and subsequent warm reads as well.
 
-The generation bump is cache-wide logical invalidation for that P2PCache across
+The generation bump is cache-wide logical invalidation for that ClusterCache across
 its selected Sites, not per-object eviction or immediate physical deletion of
 old slab data. It does not delete containerd content or ingests, and activation
 does not change an already-started stream. Repairing the origin alone can leave
@@ -498,7 +500,8 @@ the intended data path.
 
 ### Standalone manifests
 
-For a manually managed installation, render with `make gantry-manifests` and set
+For a manually managed installation, render with
+`make gantry-manifests GANTRY_RACER_CACHE_NAME=gantry` and set
 these fields in the Gantry ConfigMap (or use equivalent standalone flags):
 
 ```yaml
@@ -507,8 +510,9 @@ racer_cache_name: gantry
 storage_mode: containerd
 ```
 
-Standalone Gantry defaults to `content_backend: direct` when omitted. It does not
-read the P2PCache backing annotation to select its backend. Deploy Racer and
+Standalone Gantry defaults to `content_backend: direct` when omitted. Its backend
+and cache name are explicit configuration, independent of operator selection.
+Deploy Racer and
 `deploy/gantry/rendered/examples/racer-cache.yaml`, and apply the socket/port patch:
 
 ```bash
@@ -517,11 +521,17 @@ kubectl -n unbounded-system patch daemonset gantry --type=strategic \
 kubectl -n unbounded-system rollout restart daemonset/gantry
 ```
 
-The patch assumes cache name `gantry`; change its directory initialization if
-you choose another name. Skip `rendezvous-leases.yaml` for a fresh Racer-only
+The render parameter sets both the example ClusterCache name and the patch's
+cache-name argument and scoped client/origin directory mounts. Standalone installs
+may choose another valid cache name because they configure their own backend;
+use the same `GANTRY_RACER_CACHE_NAME` and `racer_cache_name`. Omitting the render
+parameter produces an empty optional patch. The patch's explicit flags override
+YAML settings. Skip `rendezvous-leases.yaml` for a fresh Racer-only
 install. Standalone deployments must enforce the same all-node origin coverage
 and identical config themselves. The operator-managed path performs these checks
 and applies the pod changes automatically.
 
-For standalone rollback, set `content_backend: direct` and restore the direct
-pod configuration and chair resources before restarting Gantry.
+For standalone rollback, set `content_backend: direct`, remove the patch's Racer
+arguments and socket mounts by restoring the direct pod configuration, and restore
+chair resources before restarting Gantry. Deleting a cache alone does not change
+a standalone process's explicit backend configuration.

@@ -85,7 +85,7 @@ data:
 
     # ---------- Content distribution ----------
     # Standalone settings. For operator-managed Gantry, the sole backend input is
-    # a user-managed ClusterCache annotated unbounded-cloud.io/gantry-backing: "true".
+    # the user-managed ClusterCache named gantry, subject to coverage validation.
     # Generated pod flags override these keys and environment values.
     content_backend: "direct"
     racer_cache_name: {{ .RacerCacheName | quote }}

@@ -8,7 +8,6 @@ import (
 	"os"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -18,8 +17,10 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -150,7 +151,26 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 
 	quiet()
 
-	cache := &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
+	foreign := &racerapi.ClusterCache{
+		ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}},
+		Spec:       racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3},
+	}
+	if err := kube.Create(t.Context(), foreign); err != nil {
+		t.Fatal(err)
+	}
+
+	run()
+
+	var ignored appsv1.DaemonSet
+	get(&ignored, "gantry")
+
+	if ignored.ResourceVersion != direct.ResourceVersion || !reflect.DeepEqual(ignored.Spec.Template, direct.Spec.Template) {
+		t.Fatal("foreign annotated cache changed Gantry's direct baseline")
+	}
+
+	quiet()
+
+	cache := &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry"}}
 
 	cache.Spec = racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
 	if err := kube.Create(t.Context(), cache); err != nil {
@@ -170,16 +190,46 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 			t.Fatalf("Racer selection did not reach stored pod: %+v", ds.Spec.Template)
 		}
 
-		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.SecurityContext == nil || !slices.Contains(pod.SecurityContext.SupplementalGroups, int64(65532)) {
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.SecurityContext == nil || !slices.Equal(pod.SecurityContext.SupplementalGroups, []int64{65532}) {
 			t.Fatal("Racer socket security settings missing")
 		}
 
-		if !slices.ContainsFunc(pod.Volumes, func(v corev1.Volume) bool {
-			return v.Name == "racer-sockets" && v.HostPath != nil && v.HostPath.Path == "/run/racer"
-		}) ||
-			!slices.ContainsFunc(pod.Containers[0].VolumeMounts, func(v corev1.VolumeMount) bool { return v.Name == "racer-sockets" }) ||
-			!strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "/run/racer/"+string(cache.UID)) {
-			t.Fatal("Racer socket volume, mount, or init command missing")
+		// Compare the complete volume and mount sets to the direct baseline plus
+		// exactly two directories. This also rejects shared/cache roots, socket
+		// files, foreign cache paths, subPath variants, and leftover legacy mounts.
+		mounts := []corev1.VolumeMount{
+			{Name: "racer-client-sockets", MountPath: "/run/racer/gantry/client"},
+			{Name: "racer-origin-sockets", MountPath: "/run/racer/gantry/origin"},
+		}
+
+		wantVolumes := slices.Clone(direct.Spec.Template.Spec.Volumes)
+		for _, mount := range mounts {
+			wantVolumes = append(wantVolumes, corev1.Volume{Name: mount.Name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: mount.MountPath, Type: ptr.To(corev1.HostPathDirectoryOrCreate),
+			}}})
+		}
+
+		if diff := cmp.Diff(wantVolumes, pod.Volumes); diff != "" {
+			t.Fatalf("socket volumes are not isolated (-want +got):\n%s", diff)
+		}
+
+		if len(pod.Containers) != len(direct.Spec.Template.Spec.Containers) || len(pod.InitContainers) != len(direct.Spec.Template.Spec.InitContainers) {
+			t.Fatal("Racer changed the direct baseline container set")
+		}
+
+		baselineContainers := append(slices.Clone(direct.Spec.Template.Spec.Containers), direct.Spec.Template.Spec.InitContainers...)
+		for i, container := range append(slices.Clone(pod.Containers), pod.InitContainers...) {
+			wantMounts := append(slices.Clone(baselineContainers[i].VolumeMounts), mounts...)
+			if container.Name != baselineContainers[i].Name || !reflect.DeepEqual(wantMounts, container.VolumeMounts) {
+				t.Fatalf("%s socket mounts are not isolated (-want +got):\n%s", container.Name, cmp.Diff(wantMounts, container.VolumeMounts))
+			}
+		}
+
+		wantCommand := slices.Clone(direct.Spec.Template.Spec.InitContainers[0].Command)
+
+		wantCommand[len(wantCommand)-1] += "\nchgrp 65532 /run/racer/gantry/client /run/racer/gantry/origin\nchmod 2770 /run/racer/gantry/client /run/racer/gantry/origin\n"
+		if diff := cmp.Diff(wantCommand, pod.InitContainers[0].Command); diff != "" {
+			t.Fatalf("permission setup must touch only the mounted socket directories (-want +got):\n%s", diff)
 		}
 
 		for _, port := range pod.Containers[0].Ports {
@@ -192,9 +242,75 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 		get(&appsv1.DaemonSet{}, "racer-dataplane")
 		quiet()
 
+		var live racerapi.ClusterCache
+		if err := kube.Get(t.Context(), client.ObjectKey{Name: cache.Name}, &live); err != nil {
+			t.Fatal(err)
+		}
+
+		if live.ResourceVersion != cache.ResourceVersion {
+			t.Fatal("operator wrote user-owned ClusterCache")
+		}
+
 		return ds
 	}
 	first := assertRacer()
+
+	// Seed the old operator-owned broad root mount with the same SSA manager.
+	// An Update would not model ownership of fields that the new plan omits.
+	legacy := first.DeepCopy()
+	legacy.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
+	legacy.ObjectMeta = metav1.ObjectMeta{Name: "gantry", Namespace: namespace, Labels: map[string]string{component.AppliedHashLabel: "legacy-root-mount"}}
+	legacy.Status = appsv1.DaemonSetStatus{}
+	legacyPod := &legacy.Spec.Template.Spec
+	legacyPod.Volumes = append(slices.Clone(direct.Spec.Template.Spec.Volumes), corev1.Volume{
+		Name: "racer-sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/racer", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}},
+	})
+	legacyMount := corev1.VolumeMount{Name: "racer-sockets", MountPath: "/run/racer"}
+	legacyPod.Containers[0].VolumeMounts = append(slices.Clone(direct.Spec.Template.Spec.Containers[0].VolumeMounts), legacyMount)
+	legacyPod.InitContainers[0].VolumeMounts = append(slices.Clone(direct.Spec.Template.Spec.InitContainers[0].VolumeMounts), legacyMount)
+	legacyPod.InitContainers[0].Command = slices.Clone(direct.Spec.Template.Spec.InitContainers[0].Command)
+	legacyPod.InitContainers[0].Command[len(legacyPod.InitContainers[0].Command)-1] += "\nmkdir -p /run/racer/" + string(cache.UID) + "\nchmod 2770 /run/racer\n"
+
+	legacyObject, err := runtime.DefaultUnstructuredConverter.ToUnstructured(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delete(legacyObject, "status")
+
+	if err := kube.Apply(t.Context(), client.ApplyConfigurationFromUnstructured(&unstructured.Unstructured{Object: legacyObject}), client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
+		t.Fatal(err)
+	}
+
+	var storedLegacy appsv1.DaemonSet
+	get(&storedLegacy, "gantry")
+
+	if !reflect.DeepEqual(storedLegacy.Spec.Template, legacy.Spec.Template) {
+		t.Fatalf("legacy root-mount fixture was not stored (-want +got):\n%s", cmp.Diff(legacy.Spec.Template, storedLegacy.Spec.Template))
+	}
+
+	upgraded := assertRacer()
+	if !reflect.DeepEqual(upgraded.Spec.Template, first.Spec.Template) {
+		t.Fatalf("SSA upgrade failed to restore isolated pod (-want +got):\n%s", cmp.Diff(first.Spec.Template, upgraded.Spec.Template))
+	}
+
+	for _, annotation := range []string{"true", "false", "malformed", ""} {
+		cache.Annotations = map[string]string{"unbounded-cloud.io/gantry-backing": annotation}
+		if annotation == "" {
+			cache.Annotations = nil
+		}
+
+		if err := kube.Update(t.Context(), cache); err != nil {
+			t.Fatal(err)
+		}
+
+		quiet()
+
+		unchanged := assertRacer()
+		if unchanged.ResourceVersion != upgraded.ResourceVersion || !reflect.DeepEqual(unchanged.Spec.Template, upgraded.Spec.Template) {
+			t.Fatalf("legacy annotation %q changed named cache selection or rolled Gantry", annotation)
+		}
+	}
 
 	var retained appsv1.DaemonSet
 	get(&retained, "racer-dataplane")
@@ -258,15 +374,54 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 	}
 
 	quiet()
-	delete(cache.Annotations, "unbounded-cloud.io/gantry-backing")
 
+	if err := kube.Delete(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	assertDirect()
+
+	recreate := func(previous appsv1.DaemonSet) appsv1.DaemonSet {
+		t.Helper()
+
+		oldUID := cache.UID
+
+		cache = &racerapi.ClusterCache{
+			ObjectMeta: metav1.ObjectMeta{Name: "gantry"},
+			Spec:       racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3},
+		}
+		if err := kube.Create(t.Context(), cache); err != nil {
+			t.Fatal(err)
+		}
+
+		if cache.UID == oldUID {
+			t.Fatal("API reused deleted cache UID")
+		}
+
+		replacement := assertRacer()
+		if replacement.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] == previous.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] {
+			t.Fatal("same-name cache replacement did not change pod rollout identity")
+		}
+
+		want := previous.Spec.Template.DeepCopy()
+
+		want.Annotations["unbounded-cloud.io/gantry-cache-uid"] = string(cache.UID)
+		if diff := cmp.Diff(*want, replacement.Spec.Template); diff != "" {
+			t.Fatalf("same-name recreation changed more than rollout identity (-want +got):\n%s", diff)
+		}
+
+		return replacement
+	}
+	replacement := recreate(first)
+
+	cache.Spec.SiteSelector = metav1.LabelSelector{MatchLabels: map[string]string{"other": "true"}}
 	if err := kube.Update(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
 
 	assertDirect()
 
-	cache.Annotations = map[string]string{"unbounded-cloud.io/gantry-backing": "true"}
+	cache.Spec.SiteSelector = metav1.LabelSelector{}
 	if err := kube.Update(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
@@ -279,29 +434,16 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 
 	assertDirect()
 
-	oldUID := cache.UID
-	cache = &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
+	recreate(replacement)
 
-	cache.Spec = racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
-	if err := kube.Create(t.Context(), cache); err != nil {
-		t.Fatal(err)
-	}
+	for _, owned := range []*racerapi.ClusterCache{cache, foreign} {
+		var live racerapi.ClusterCache
+		if err := kube.Get(t.Context(), client.ObjectKey{Name: owned.Name}, &live); err != nil {
+			t.Fatal(err)
+		}
 
-	if cache.UID == oldUID {
-		t.Fatal("API reused deleted cache UID")
-	}
-
-	replacement := assertRacer()
-	if replacement.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] == first.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] {
-		t.Fatal("same-name cache replacement did not change pod rollout identity")
-	}
-
-	var live racerapi.ClusterCache
-	if err := kube.Get(t.Context(), client.ObjectKey{Name: cache.Name}, &live); err != nil {
-		t.Fatal(err)
-	}
-
-	if live.ResourceVersion != cache.ResourceVersion {
-		t.Fatal("operator wrote user-owned ClusterCache")
+		if live.ResourceVersion != owned.ResourceVersion {
+			t.Fatalf("operator wrote user-owned ClusterCache %s", owned.Name)
+		}
 	}
 }

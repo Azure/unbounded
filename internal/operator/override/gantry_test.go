@@ -9,8 +9,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/gantry"
 )
 
 func TestGantryBackendAuthority(t *testing.T) {
@@ -55,17 +60,10 @@ func TestGantryBackendAuthority(t *testing.T) {
 }
 
 func TestGantryRacerPodSelectionProtected(t *testing.T) {
-	no := false
-	ds := &appsv1.DaemonSet{Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"unbounded-cloud.io/gantry-cache-uid": "selected-uid"}},
-		Spec: corev1.PodSpec{
-			AutomountServiceAccountToken: &no,
-			SecurityContext:              &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}},
-			Volumes:                      []corev1.Volume{{Name: "racer-sockets"}},
-			InitContainers:               []corev1.Container{{Name: "chown-hostpaths", Command: []string{"sh", "-c", "mkdir -p /run/racer/selected-uid"}}},
-			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-name=selected"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/run/racer"}}}},
-		},
-	}}}
+	_, ds := managedGantryRacerPlan(t)
+	if err := validateGantryConfig(component.ToUnstructured(ds), component.ToUnstructured(ds)); err != nil {
+		t.Fatalf("unmodified managed pod rejected: %v", err)
+	}
 
 	for _, tc := range []struct {
 		name   string
@@ -80,6 +78,27 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 		}},
 		{name: "mount", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].VolumeMounts = nil }},
 		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-name=other" }},
+		{name: "client hostPath", mutate: func(p *corev1.PodTemplateSpec) {
+			for i := range p.Spec.Volumes {
+				if p.Spec.Volumes[i].Name == "racer-client-sockets" {
+					p.Spec.Volumes[i].HostPath.Path = "/run/racer"
+				}
+			}
+		}},
+		{name: "origin hostPath", mutate: func(p *corev1.PodTemplateSpec) {
+			for i := range p.Spec.Volumes {
+				if p.Spec.Volumes[i].Name == "racer-origin-sockets" {
+					p.Spec.Volumes[i].HostPath.Path = "/run/racer/other/origin"
+				}
+			}
+		}},
+		{name: "root socket mount", mutate: func(p *corev1.PodTemplateSpec) {
+			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "root", MountPath: "/run/racer"})
+		}},
+		{name: "init permissions", mutate: func(p *corev1.PodTemplateSpec) {
+			p.Spec.InitContainers[0].Command = []string{"sh", "-c", "chmod -R 777 /run/racer"}
+		}},
+		{name: "scheduling", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.NodeSelector = map[string]string{"subset": "true"} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := ds.DeepCopy()
@@ -87,6 +106,69 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 
 			if err := validateGantryConfig(component.ToUnstructured(ds), component.ToUnstructured(candidate)); err == nil {
 				t.Fatal("accepted change to operator-owned backend wiring")
+			}
+		})
+	}
+}
+
+func managedGantryRacerPlan(t *testing.T) (*component.Plan, *appsv1.DaemonSet) {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, racerapi.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cache := &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "selected-uid"}}
+	env := &component.Env{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cache).Build(), Namespace: component.DefaultNamespace}
+
+	plan, result, err := gantry.New().Plan(t.Context(), env, []machina.Site{{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}})
+	if err != nil || !result.Ready {
+		t.Fatalf("managed Gantry plan: result=%#v err=%v", result, err)
+	}
+
+	for _, op := range plan.Operations {
+		if op.Kind != component.OpDelete && op.Object.GetKind() == "DaemonSet" && op.Object.GetName() == "gantry" {
+			ds := &appsv1.DaemonSet{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, ds); err != nil {
+				t.Fatal(err)
+			}
+
+			return plan, ds
+		}
+	}
+
+	t.Fatal("missing managed Gantry DaemonSet")
+
+	return nil, nil
+}
+
+func TestScopedGantrySocketsProtectRacerCoverage(t *testing.T) {
+	for _, racer := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "racer"}[racer], func(t *testing.T) {
+			plan := component.NewPlan()
+			if racer {
+				plan, _ = managedGantryRacerPlan(t)
+			}
+
+			ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "dataplane"}}}}}}
+			plan.Add(component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: "racer-dataplane", Overridable: true})
+
+			entries := entriesFrom(t, doc(`  - component: racer-dataplane
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              subset: "true"
+`))
+
+			report := Apply(plan, entries, nil)
+			if report.Failed() != racer || (racer && len(report.Withheld) != 1) {
+				t.Fatalf("scoped sockets must activate Racer origin coverage guard: %#v", report)
 			}
 		})
 	}

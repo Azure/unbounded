@@ -6,24 +6,28 @@ The original proposal below is historical. Gantry is now an enabled-by-default,
 version-matched cluster singleton managed by `internal/operator/components/gantry`.
 The existing `gantry-config` ConfigMap is preserved for registry and runtime
 configuration, but it does not select the managed backend. Direct is the default.
-Exactly one live user-managed P2PCache annotated
-`unbounded-cloud.io/gantry-backing: "true"` selects Racer if its selector is empty,
+The live user-managed ClusterCache named `gantry` selects Racer if its selector is empty,
 all nonterminating Nodes have managed Racer coverage, and at least one live Site
 enables Gantry. The operator never creates, adopts, changes, or deletes this
-cache. Missing/false/removed annotations and selected-cache deletion return to
-direct; invalid intent returns to direct with an `InvalidGantryBacking`
-diagnostic. Failed API reads instead preserve the deployed configuration and
-retry (`internal/operator/components/gantry/racer.go:37`).
+cache. Selection uses only that name; other names and the legacy
+`unbounded-cloud.io/gantry-backing` annotation are ignored. A missing or deleting
+`gantry` cache returns to direct; invalid selector/coverage/live-Site checks return
+to direct with an `InvalidGantryBacking` diagnostic. Failed API reads instead preserve the deployed configuration and
+retry (`internal/operator/components/gantry/racer.go:39`).
 
 Generated backend arguments override legacy ConfigMap backend settings. Gantry
-starts its origin without a Racer-readiness gate; parent-directory socket mounts
-survive socket replacement. The selected cache UID is stamped on the pod
-template, so same-name cache recreation rolls Gantry
-(`internal/operator/components/gantry/racer.go:122`, `:139`). Standalone processes
+starts its origin without a Racer-readiness gate. Init and Gantry mount only
+`/run/racer/gantry/client` and `/run/racer/gantry/origin` as read/write
+`DirectoryOrCreate` hostPaths, without socket-file mounts, `subPath`, or
+`subPathExpr`. Init sets group `65532` and mode `2770` only on those mounted
+directories; it neither mounts nor changes permissions on `/run/racer` or the
+cache root. Directory mounts survive socket replacement. The selected cache UID
+is stamped on the pod template, so same-name cache recreation rolls Gantry
+(`internal/operator/components/gantry/racer.go:102`, `:119`, `:163`). Standalone processes
 still support backend flags, environment variables, and YAML. The unbounded
 agent owns containerd mirror wiring.
 
-Any live P2PCache installs both Racer workloads, including with zero Sites or no
+Any live ClusterCache installs both Racer workloads, including with zero Sites or no
 selector matches. Without live caches, each existing workload is maintained
 independently with update-only operations. Removing all caches and then deleting
 the Deployment and DaemonSet in either order uninstalls the workloads; support
@@ -33,9 +37,18 @@ resources alone never reinstall them
 The Site Racer `enabled` and `cacheSize` fields have been removed. Capacity is
 the Node `racer.unbounded-cloud.io/cache-size` annotation, then `10Gi` when absent
 (`internal/racer/cache_size.go:53`). Before upgrade, copy desired inherited Site
-sizes to Node annotations. There is no automatic cache migration or automatic
-selection of an old operator-created cache: annotate that cache explicitly to
-keep using it. The old `unbounded-cloud.io/gantry-cache` label is ignored.
+sizes to Node annotations. On upgrade, an existing valid `gantry` cache selects
+Racer even without the old backing annotation or with it set to `"false"`.
+Previously annotated caches with other names no longer select Racer. The old
+`unbounded-cloud.io/gantry-cache` label is ignored. There is no automatic cache
+migration: creating `gantry` gives it a new UID and cache identity.
+
+Returning managed Gantry to direct requires deleting `gantry`, then waiting for
+the direct pod rollout. Annotation changes cannot disable a valid named cache.
+There is no retained-cache rollback contract; recreating `gantry` enables Racer
+with a new identity, without guaranteed warm-cache reuse. Standalone deployments
+keep explicit backend and cache-name configuration, including custom names;
+their rendered patch mounts only that name's client and origin directories.
 
 The supported rollout and limitations are documented in
 [the public Gantry guide](../docs/content/guides/gantry.md#optional-racer-backend).

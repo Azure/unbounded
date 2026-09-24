@@ -69,16 +69,23 @@ upstream_registries:
     endpoint: http://127.0.0.1:18081
 ```
 
-For operator-managed Gantry, select a dedicated user-managed P2PCache through
-`unbounded-cloud.io/gantry-backing: "true"`, following the
+For operator-managed Gantry, create the dedicated user-managed ClusterCache
+named `gantry`, following the
 [Gantry guide](../../docs/content/guides/gantry.md#operator-managed-enablement).
 The operator validates full node coverage and generates the backend arguments;
-editing `content_backend` in its ConfigMap does not select Racer.
+editing `content_backend` in its ConfigMap does not select Racer. Other cache
+names and the legacy `unbounded-cloud.io/gantry-backing` annotation are ignored.
+A missing or deleting `gantry` cache rolls Gantry to direct. Returning to direct
+by deleting it does not preserve that cache's identity for rollback.
 
 For a standalone Gantry process, set `content_backend: racer` and
 `racer_cache_name: gantry` in its YAML, or pass `--content-backend=racer` and
 `--racer-cache-name=gantry`, and provide the matching Racer cache and socket
-mounts. Without that standalone setting, Gantry uses direct distribution.
+mounts. Mount only `/run/racer/gantry/client` and `/run/racer/gantry/origin` as
+`DirectoryOrCreate` hostPaths into init and Gantry, without socket-file or
+`subPath` mounts; init changes group/mode only on those directories. Standalone
+cache names may be customized if configuration and scoped mounts agree. Without
+that standalone setting, Gantry uses direct distribution.
 
 Keep other required Gantry configuration and upstream entries. Gantry owns its
 Racer origin socket; the loadgen registry does not replace it. Wait for Gantry
@@ -274,8 +281,8 @@ kubectl -n unbounded-system get pods -l app=image-loadgen -o wide
 Ports 18081 and 18082 must be free on participating nodes. The puller uses host
 networking to reach Gantry's node-local `127.0.0.1:5000`. Ensure every Gantry/Racer
 origin node has a prepared registry before measuring fleet throughput. This workload
-uses Gantry's existing P2PCache and requires no loadgen socket mounts or extra
-P2PCache. Keep the default unbounded duration for the DaemonSet; a finite duration
+uses Gantry's existing ClusterCache and requires no loadgen socket mounts or extra
+ClusterCache. Keep the default unbounded duration for the DaemonSet; a finite duration
 causes Kubernetes to restart it. Delete the example to stop the benchmark:
 
 ```sh

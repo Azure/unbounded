@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	kubeyaml "sigs.k8s.io/yaml"
 
@@ -24,7 +26,18 @@ import (
 )
 
 func TestRacerStandalonePatch(t *testing.T) {
-	const name = "gantry"
+	for _, name := range []string{"gantry", "custom-cache", "0", strings.Repeat("a", 63)} {
+		t.Run(name, func(t *testing.T) {
+			testRacerStandalonePatch(t, name, false)
+			t.Run("legacy root mount", func(t *testing.T) {
+				testRacerStandalonePatch(t, name, true)
+			})
+		})
+	}
+}
+
+func testRacerStandalonePatch(t *testing.T, name string, legacyRoot bool) {
+	t.Helper()
 
 	output := t.TempDir()
 	if err := render.Render(filepath.Dir(sourceFile(t)), output, map[string]string{"RacerCacheName": name}); err != nil {
@@ -46,6 +59,25 @@ func TestRacerStandalonePatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if legacyRoot {
+		var ds appsv1.DaemonSet
+		if err := json.Unmarshal(baseJSON, &ds); err != nil {
+			t.Fatal(err)
+		}
+
+		pod := &ds.Spec.Template.Spec
+		mount := corev1.VolumeMount{Name: "racer-sockets", MountPath: "/run/racer"}
+		pod.InitContainers[0].VolumeMounts = append(pod.InitContainers[0].VolumeMounts, mount)
+		pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, mount)
+		pod.InitContainers[0].Command = []string{"sh", "-ec", "chmod 2770 /run/racer"}
+		pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "racer-sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/racer"}}})
+
+		baseJSON, err = json.Marshal(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	patchJSON, err := kubeyaml.YAMLToJSON(patch)
 	if err != nil {
 		t.Fatal(err)
@@ -62,12 +94,15 @@ func TestRacerStandalonePatch(t *testing.T) {
 	}
 
 	pod := ds.Spec.Template.Spec
-	if *pod.AutomountServiceAccountToken || pod.SecurityContext.SupplementalGroups[0] != 65532 {
+	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.SecurityContext == nil || !slices.Equal(pod.SecurityContext.SupplementalGroups, []int64{65532}) {
 		t.Fatal("Racer origin group/token configuration missing")
 	}
 
-	if !strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "chmod 2770 /run/racer /run/racer/"+name+" /run/racer/"+name+"/client /run/racer/"+name+"/origin") {
-		t.Fatal("cache parent permissions missing")
+	directories := "/run/racer/" + name + "/client /run/racer/" + name + "/origin"
+
+	wantCommand := []string{"sh", "-ec", "chown -R 65532:65532 /var/lib/gantry/libp2p\nchmod 0700 /var/lib/gantry/libp2p\nchgrp 65532 " + directories + "\nchmod 2770 " + directories + "\n"}
+	if len(pod.InitContainers) != 1 || !slices.Equal(pod.InitContainers[0].Command, wantCommand) {
+		t.Fatalf("init must change permissions only on mounted directories: %#v", pod.InitContainers)
 	}
 
 	if ds.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-name"] != name || !slices.Contains(pod.Containers[0].Args, "--racer-cache-name="+name) || !slices.Contains(pod.Containers[0].Args, "--content-backend=racer") {
@@ -80,18 +115,72 @@ func TestRacerStandalonePatch(t *testing.T) {
 				t.Fatal("direct port retained")
 			}
 		}
+	}
 
-		found := false
+	wantMounts := map[string]corev1.VolumeMount{
+		"racer-client-sockets": {Name: "racer-client-sockets", MountPath: "/run/racer/" + name + "/client"},
+		"racer-origin-sockets": {Name: "racer-origin-sockets", MountPath: "/run/racer/" + name + "/origin"},
+	}
+
+	wantPaths := map[string]string{}
+	for volumeName, mount := range wantMounts {
+		wantPaths[volumeName] = mount.MountPath
+	}
+
+	paths := map[string]string{}
+
+	for _, volume := range pod.Volumes {
+		if !strings.HasPrefix(volume.Name, "racer-") && (volume.HostPath == nil || !strings.HasPrefix(volume.HostPath.Path, "/run/racer")) {
+			continue
+		}
+
+		if volume.HostPath == nil || volume.HostPath.Type == nil || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+			t.Fatalf("Racer volume must be DirectoryOrCreate: %#v", volume)
+		}
+
+		paths[volume.Name] = volume.HostPath.Path
+	}
+
+	if !reflect.DeepEqual(paths, wantPaths) {
+		t.Fatalf("Racer hostPaths = %v, want exactly %v", paths, wantPaths)
+	}
+
+	for _, c := range append(slices.Clone(pod.InitContainers), pod.Containers...) {
+		mounts := map[string]corev1.VolumeMount{}
 
 		for _, mount := range c.VolumeMounts {
-			if mount.Name == "racer-sockets" {
-				found = mount.MountPath == "/run/racer" && mount.SubPath == "" && !mount.ReadOnly
+			if strings.HasPrefix(mount.Name, "racer-") || strings.HasPrefix(mount.MountPath, "/run/racer") {
+				if _, duplicate := mounts[mount.Name]; duplicate {
+					t.Fatalf("%s has duplicate Racer mount %s", c.Name, mount.Name)
+				}
+
+				mounts[mount.Name] = mount
 			}
 		}
 
-		if !found {
-			t.Fatal("missing restart-safe parent mount")
+		if !reflect.DeepEqual(mounts, wantMounts) {
+			t.Fatalf("%s Racer mounts = %#v, want exactly %#v (no socket files or subPaths)", c.Name, mounts, wantMounts)
 		}
+	}
+
+	cacheRaw, err := os.ReadFile(filepath.Join(output, "examples/racer-cache.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var cache struct {
+		Kind     string
+		Metadata struct {
+			Name        string
+			Annotations map[string]string
+		}
+	}
+	if err := yaml.Unmarshal(cacheRaw, &cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.Kind != "ClusterCache" || cache.Metadata.Name != name || len(cache.Metadata.Annotations) != 0 {
+		t.Fatalf("example must match the explicitly selected cache without selection annotations: %#v", cache)
 	}
 }
 

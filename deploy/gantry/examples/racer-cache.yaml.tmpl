@@ -1,11 +1,10 @@
-# User-managed Gantry backing cache. Apply exactly one annotated cache to select
-# Racer for operator-managed Gantry. The operator never creates or edits it.
+# User-managed Gantry backing cache. The name gantry selects Racer for
+# operator-managed Gantry. The operator never creates or edits this cache.
+# Standalone installs may customize the name with --set RacerCacheName=<name>.
 apiVersion: racer.unbounded-cloud.io/v1alpha1
 kind: ClusterCache
 metadata:
-  name: gantry
-  annotations:
-    unbounded-cloud.io/gantry-backing: "true"
+  name: {{ default "gantry" .RacerCacheName | quote }}
 spec:
   # Empty is required: every live Site participates, with Gantry on every node.
   siteSelector: {}
