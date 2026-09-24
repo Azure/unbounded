@@ -215,38 +215,51 @@ def run_quiet(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
 
 
 def download_file(url: str, destination: Path, auth: str = "") -> None:
-    run([
-        "curl",
-        "-fsSL",
-        "--connect-timeout", "30",
-        "--retry", "5",
-        "--retry-delay", "5",
-        "--retry-all-errors",
-        "--remove-on-error",
-        *auth_headers(auth),
-        "-o", str(destination),
-        url,
-    ])
+    config = curl_auth_config(auth)
+    try:
+        run([
+            "curl",
+            "-fsSL",
+            "--connect-timeout", "30",
+            "--retry", "5",
+            "--retry-delay", "5",
+            "--retry-all-errors",
+            "--remove-on-error",
+            *(["--config", "-"] if config else []),
+            "-o", str(destination),
+            url,
+        ], input=config, text=True)
+    except subprocess.CalledProcessError as exc:
+        die(f"downloading {url} failed (curl exit {exc.returncode})")
 
 
 def http_get(url: str, auth: str = "") -> str:
-    return capture([
-        "curl", "-fsSL", "--connect-timeout", "30",
-        "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
-        *auth_headers(auth), url,
-    ])
+    config = curl_auth_config(auth)
+    try:
+        return capture([
+            "curl", "-fsSL", "--connect-timeout", "30",
+            "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
+            *(["--config", "-"] if config else []), url,
+        ], input=config)
+    except subprocess.CalledProcessError as exc:
+        die(f"fetching {url} failed (curl exit {exc.returncode})")
+        raise AssertionError("unreachable") from exc
 
 
-def auth_headers(auth: str) -> list[str]:
-    """Return the curl arguments needed to read a protected source.
+def curl_auth_config(auth: str) -> str:
+    """Return a curl config that authenticates to a protected source.
 
     Azure Blob Storage is reached with an AAD bearer token rather than a shared
     key or a SAS: the account that publishes the ACL image disables both, so
     there is no static credential to hold and nothing useful to put in a secret
     beyond the federated identity itself.
+
+    The token goes to curl on stdin rather than in its arguments, which a
+    failed command prints. GitHub does not know to mask a token minted during
+    the job, so it is registered as a mask as well.
     """
     if not auth:
-        return []
+        return ""
 
     if auth != "azure-storage":
         die(f"unknown auth mode {auth!r}")
@@ -256,8 +269,10 @@ def auth_headers(auth: str) -> list[str]:
         "--resource", "https://storage.azure.com/",
         "--query", "accessToken", "-o", "tsv",
     ])
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{token}", flush=True)
 
-    return ["-H", f"Authorization: Bearer {token}", "-H", "x-ms-version: 2021-12-02"]
+    return f'header = "Authorization: Bearer {token}"\nheader = "x-ms-version: 2021-12-02"\n'
 
 
 def verify_sha256(path: Path, expected: str) -> None:
@@ -267,15 +282,19 @@ def verify_sha256(path: Path, expected: str) -> None:
     test, so a truncated or substituted file would surface as an unexplained
     boot failure rather than as a download problem.
     """
+    got = file_sha256(path)
+    if got != expected.lower():
+        path.unlink(missing_ok=True)
+        die(f"{path.name} sha256 {got} does not match the published {expected}")
+
+
+def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
 
-    got = digest.hexdigest()
-    if got != expected:
-        path.unlink(missing_ok=True)
-        die(f"{path.name} sha256 {got} does not match the published {expected}")
+    return digest.hexdigest()
 
 
 def capture(args: list[str], **kw: Any) -> str:
@@ -2280,19 +2299,34 @@ def acquire_host_image(image: HostImage) -> Path:
         if not image_file.exists():
             image_file.symlink_to(source)
         log(f"Using local image: {source}")
-    elif image_file.exists():
-        # Named for the build it came from, so an existing file is that build
-        # and not a stale download under a reused name.
+    elif image_file.exists() and _existing_image_is_intact(image_file, image):
         log(f"Using existing image: {image_file}")
     else:
         log(f"Downloading {HOST_BASE_OS} host image...")
-        download_file(image.url, image_file, auth=image.auth)
+        # Downloaded under another name and renamed only once verified, so an
+        # interrupted download never sits under the name that is trusted.
+        partial = image_file.with_name(image_file.name + ".part")
+        partial.unlink(missing_ok=True)
+        download_file(image.url, partial, auth=image.auth)
         if image.sha256:
-            verify_sha256(image_file, image.sha256)
+            verify_sha256(partial, image.sha256)
+        partial.replace(image_file)
 
     run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
 
     return image_file
+
+
+def _existing_image_is_intact(image_file: Path, image: HostImage) -> bool:
+    """Check an image left by an earlier run or restored from the CI cache. Its
+    name says which build it should be, not that it is complete. One that does
+    not match is removed so it is downloaded again."""
+    if not image.sha256 or file_sha256(image_file) == image.sha256.lower():
+        return True
+
+    log(f"Existing image {image_file.name} does not match its published digest; downloading it again")
+    image_file.unlink()
+    return False
 
 
 def create_vm() -> None:

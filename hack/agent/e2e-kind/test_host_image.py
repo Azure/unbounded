@@ -199,5 +199,104 @@ class TestVerifySHA256(unittest.TestCase):
             self.assertTrue(target.exists())
 
 
+class TestAcquireHostImage(unittest.TestCase):
+    """Only a verified image is kept under the name later runs trust."""
+
+    GOOD = b"the image"
+
+    def _image(self):
+        import hashlib
+
+        return e2e.HostImage(url="https://example.test/acl.qcow2", file_name="acl-b.qcow2",
+                             backing_format="qcow2", sudo_group="sudo", packages=[],
+                             ssh_user="core", provisioning="ignition", host_prefix="/opt/unbounded",
+                             sha256=hashlib.sha256(self.GOOD).hexdigest(), auth="")
+
+    def _acquire(self, tmp, download_writes):
+        downloads = []
+
+        def download(url, destination, auth=""):
+            downloads.append(destination)
+            destination.write_bytes(download_writes)
+
+        with patch.object(e2e, "VM_DIR", Path(tmp)), \
+                patch.object(e2e, "download_file", side_effect=download), \
+                patch.object(e2e, "run"):
+            e2e.acquire_host_image(self._image())
+        return downloads
+
+    def test_an_intact_existing_image_is_reused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "acl-b.qcow2").write_bytes(self.GOOD)
+            self.assertEqual(self._acquire(tmp, self.GOOD), [])
+
+    def test_a_damaged_existing_image_is_downloaded_again(self):
+        """A cache restore or an interrupted download can leave the right name
+        on the wrong bytes."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "acl-b.qcow2"
+            target.write_bytes(b"truncated")
+            self.assertEqual(len(self._acquire(tmp, self.GOOD)), 1)
+            self.assertEqual(target.read_bytes(), self.GOOD)
+
+    def test_a_download_is_renamed_only_once_verified(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                downloads = self._acquire(tmp, b"wrong bytes")
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [],
+                             "neither the partial file nor the trusted name may be left behind")
+
+            downloads = self._acquire(tmp, self.GOOD)
+            self.assertEqual([p.name for p in downloads], ["acl-b.qcow2.part"])
+            self.assertEqual((Path(tmp) / "acl-b.qcow2").read_bytes(), self.GOOD)
+            self.assertFalse((Path(tmp) / "acl-b.qcow2.part").exists())
+
+
+class TestCurlAuthConfig(unittest.TestCase):
+    """The storage token must not reach curl's arguments, which a failed
+    command prints."""
+
+    def test_the_token_goes_to_stdin_and_is_masked(self):
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append((args, kw))
+
+        with patch.object(e2e, "capture", return_value="secret-token"), \
+                patch.object(e2e, "run", side_effect=fake_run), \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch("builtins.print") as printed:
+            e2e.download_file("https://example.test/x", Path("/tmp/x"), auth="azure-storage")
+
+        args, kw = calls[0]
+        self.assertNotIn("secret-token", " ".join(args))
+        self.assertIn("--config", args)
+        self.assertIn('header = "Authorization: Bearer secret-token"', kw["input"])
+        printed.assert_any_call("::add-mask::secret-token", flush=True)
+
+    def test_a_failed_download_does_not_print_the_command(self):
+        import subprocess
+
+        def failing_run(args, **kw):
+            raise subprocess.CalledProcessError(22, args)
+
+        with patch.object(e2e, "capture", return_value="secret-token"), \
+                patch.object(e2e, "run", side_effect=failing_run), \
+                patch.object(e2e, "die", side_effect=SystemExit) as died:
+            with self.assertRaises(SystemExit):
+                e2e.download_file("https://example.test/x", Path("/tmp/x"), auth="azure-storage")
+
+        self.assertNotIn("secret-token", died.call_args.args[0])
+
+    def test_no_auth_needs_no_config(self):
+        self.assertEqual(e2e.curl_auth_config(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

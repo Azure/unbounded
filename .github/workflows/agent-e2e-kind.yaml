@@ -142,7 +142,7 @@ jobs:
 
       - name: Azure login
         if: matrix.host-base-os == 'acl'
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
           tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
@@ -159,6 +159,7 @@ jobs:
           # This is the same call e2e.py makes, for the same reason.
           token="$(az account get-access-token \
             --resource https://storage.azure.com/ --query accessToken -o tsv)"
+          echo "::add-mask::${token}"
           manifest="$(curl -fsSL --retry 3 --retry-all-errors \
             -H "Authorization: Bearer ${token}" \
             -H "x-ms-version: 2021-12-02" \
@@ -174,9 +175,12 @@ jobs:
 
       # Keyed on the build, so a refreshed image misses and is downloaded once
       # rather than every run re-fetching 630 MiB from the storage account.
+      # Restore and save are separate steps because Cleanup deletes .vm-e2e
+      # before a combined action's post step would save it.
       - name: Restore the host image
         if: matrix.host-base-os == 'acl'
-        uses: actions/cache@640a1c2554105b57832a23eea0b4672fc7a790d5 # v4.2.3
+        id: acl-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
           key: acl-image-${{ steps.acl-image.outputs.build }}
@@ -186,6 +190,16 @@ jobs:
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
           vm-subnet: ${{ env.VM_SUBNET }}
+
+      # create-vm, in the step above, has downloaded and verified the image.
+      # Saving here rather than at the end means a later test failure does not
+      # stop the next run reusing it.
+      - name: Save the host image
+        if: matrix.host-base-os == 'acl' && steps.acl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
+          key: acl-image-${{ steps.acl-image.outputs.build }}
 
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup
