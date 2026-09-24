@@ -206,6 +206,40 @@ or retain the request's origin data. Missing or empty data means absent.
 Malformed, duplicate, noncanonical, or decoded-oversize data returns 400 before
 calling the store; an encoded value over 87,384 bytes returns 431.
 
+### Request-scoped metadata resolution
+
+A `RangeStore` may additionally implement `ResolvedRangeStore`:
+
+```go
+ResolveRange(ctx context.Context, target string, originData []byte) (ResolvedRange, error)
+
+// ResolvedRange:
+Metadata() Metadata
+OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error)
+Close() error
+```
+
+`NewRangeOrigin` detects this capability and uses it instead of the separate
+`Stat`/`OpenRange` calls. Resolve once per request without reading payloads;
+the handle's immutable metadata drives preconditions and range decisions.
+HEAD, failed preconditions, 304, and 416 responses never open payloads. Accepted GETs call the
+handle's `OpenRange` once, including zero-length GETs. The handle must pin the
+resolved representation atomically when opening, or return `ErrVersionChanged`;
+resolution alone does not relax the immutable ETag contract.
+
+Origin closes a successful body before closing the handle. Every successful
+resolution is closed exactly once, including invalid metadata, rejected
+preconditions/ranges, open failures, cancellation, and interrupted responses.
+Return a non-nil handle/body on success. A handle or body returned with an error
+remains owned by the implementation. Store resolution must support concurrent
+requests; methods on each handle are called serially.
+
+Only this capability permits retaining decoded origin data in the handle until
+`Close`. Release it then, and never mutate, log, persist, or share it across
+requests. This supports registry metadata, resolved URL kinds, and delegated
+authorization without a global metadata or credential cache. Existing `Store`
+and `RangeStore` implementations need no changes.
+
 Return `*HTTPError` to preserve upstream HTTP errors and bounded challenge/retry
 fields. `ErrVersionChanged`, `fs.ErrNotExist`, and `fs.ErrPermission` also map to
 412, 404, and 403. Origin aborts short streaming responses rather than completing

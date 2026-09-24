@@ -72,13 +72,44 @@ func validOriginData(data []byte) bool {
 // Stat prefers local metadata, using registry HEAD when local media type is
 // unknown. It never guesses a manifest/index media type or reads payload.
 func (o *Origin) Stat(ctx context.Context, target string, originData []byte) (sdk.Metadata, error) {
+	resolved, err := o.ResolveRange(ctx, target, originData)
+	if err != nil {
+		return sdk.Metadata{}, err
+	}
+	defer resolved.Close() //nolint:errcheck // Release metadata-only request state.
+
+	return resolved.Metadata(), nil
+}
+
+var _ sdk.ResolvedRangeStore = (*Origin)(nil)
+
+type resolvedRange struct {
+	origin     *Origin
+	ref        ifaces.OriginRef
+	meta       sdk.Metadata
+	originData []byte
+	remote     bool
+}
+
+func (r *resolvedRange) Metadata() sdk.Metadata { return r.meta }
+
+func (r *resolvedRange) Close() error {
+	r.originData = nil
+	r.origin = nil
+
+	return nil
+}
+
+// ResolveRange keeps metadata resolution and delegated credentials within one
+// request. No payload is opened until the handler accepts the GET.
+func (o *Origin) ResolveRange(ctx context.Context, target string, originData []byte) (sdk.ResolvedRange, error) {
 	if !validOriginData(originData) {
-		return sdk.Metadata{}, &sdk.HTTPError{StatusCode: http.StatusUnauthorized}
+		return nil, &sdk.HTTPError{StatusCode: http.StatusUnauthorized}
 	}
 
 	ref, err := o.reference(target)
 	if err != nil {
-		return sdk.Metadata{}, err
+		return nil, err
 	}
 
 	size, contentType := int64(-1), ""
@@ -90,23 +121,32 @@ func (o *Origin) Stat(ctx context.Context, target string, originData []byte) (sd
 		} else if localErr != nil {
 			var missing *ifaces.ErrNotFound
 			if !errors.As(localErr, &missing) {
-				return sdk.Metadata{}, localErr
+				return nil, localErr
 			}
 		}
 	}
 
-	if size < 0 {
+	remote := size < 0
+	if remote {
 		meta, headErr := o.Registry.HeadMetadata(originContext(ctx, originData), ref)
 		if headErr != nil {
-			return sdk.Metadata{}, originError(headErr)
+			return nil, originError(headErr)
 		}
 
+		if meta.Ref.Digest != ref.Digest || meta.Ref.Registry != ref.Registry || meta.Ref.Repository != ref.Repository {
+			return nil, sdk.ErrVersionChanged
+		}
+
+		ref = meta.Ref
 		size, contentType = meta.Size, objectContentType(meta.Ref.Kind, meta.ContentType)
 	}
 
 	ttl := MetadataTTL
 
-	return sdk.Metadata{Size: size, ETag: `"` + ref.Digest.Hex() + `"`, ContentType: contentType, TTL: &ttl}, nil
+	return &resolvedRange{
+		origin: o, ref: ref, originData: originData, remote: remote,
+		meta: sdk.Metadata{Size: size, ETag: `"` + ref.Digest.Hex() + `"`, ContentType: contentType, TTL: &ttl},
+	}, nil
 }
 
 func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {
@@ -123,15 +163,58 @@ func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, len
 		return nil, sdk.ErrVersionChanged
 	}
 
+	resolved, err := o.ResolveRange(ctx, target, originData)
+	if err != nil {
+		return nil, err
+	}
+	defer resolved.Close() //nolint:errcheck // The returned body owns its own resources.
+
+	return resolved.OpenRange(ctx, offset, length)
+}
+
+func (r *resolvedRange) OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if r.origin == nil {
+		return nil, fs.ErrClosed
+	}
+
+	if offset < 0 || length < 0 || offset > r.meta.Size || length > r.meta.Size-offset {
+		return nil, sdk.ErrVersionChanged
+	}
+
+	o, ref := r.origin, r.ref
+
 	if o.Local != nil {
 		body, size, localErr := o.Local.Open(ctx, ref.Digest)
 		if localErr == nil {
-			if offset < 0 || length < 0 || offset > size || length > size-offset {
-				_ = body.Close() //nolint:errcheck // Reject invalid bounds and release snapshot.
+			if size != r.meta.Size {
+				_ = body.Close() //nolint:errcheck // Release snapshot with a changed size.
 				return nil, sdk.ErrVersionChanged
 			}
 
 			seeker, ok := body.(io.Seeker)
+			// A local object may have appeared after remote resolution. Require
+			// known, matching representation metadata before using it.
+			if ok && r.remote {
+				desc, err := o.Local.Descriptor(ctx, ref.Digest)
+
+				var missing *ifaces.ErrNotFound
+				if err != nil && !errors.As(err, &missing) {
+					_ = body.Close() //nolint:errcheck // Release unusable local snapshot.
+					return nil, err
+				}
+
+				ok = err == nil && desc.MediaType != ""
+				if ok && (desc.Size != r.meta.Size || objectContentType(ref.Kind, desc.MediaType) != r.meta.ContentType) {
+					_ = body.Close() //nolint:errcheck // Release changed representation.
+					return nil, sdk.ErrVersionChanged
+				}
+			}
+
+			var err error
 			if ok {
 				_, err = seeker.Seek(offset, io.SeekStart)
 				if err == nil {
@@ -152,18 +235,27 @@ func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, len
 		}
 	}
 
-	ctx = originContext(ctx, originData)
+	ctx = originContext(ctx, r.originData)
 
-	meta, err := o.Registry.HeadMetadata(ctx, ref)
-	if err != nil {
-		return nil, originError(err)
+	if !r.remote {
+		meta, err := o.Registry.HeadMetadata(ctx, ref)
+		if err != nil {
+			return nil, originError(err)
+		}
+
+		if meta.Ref.Digest != ref.Digest || meta.Ref.Registry != ref.Registry || meta.Ref.Repository != ref.Repository ||
+			meta.Size != r.meta.Size || objectContentType(meta.Ref.Kind, meta.ContentType) != r.meta.ContentType {
+			return nil, sdk.ErrVersionChanged
+		}
+
+		ref = meta.Ref
 	}
 
-	if length == 0 && offset == 0 && meta.Size == 0 {
+	if length == 0 && offset == 0 && r.meta.Size == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
 
-	body, err := o.Registry.OpenRange(ctx, meta.Ref, offset, length, meta.Size)
+	body, err := o.Registry.OpenRange(ctx, ref, offset, length, r.meta.Size)
 
 	return body, originError(err)
 }

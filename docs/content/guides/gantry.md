@@ -304,6 +304,18 @@ Gantry's origin adapter serves local containerd content or bounded registry
 range reads. The origin never calls the Gantry mirror or Racer recursively.
 OCI target keys include registry, repository, object kind, and digest.
 
+The origin uses the SDK's request-scoped resolved-range capability. A remote
+GET resolves registry metadata once, then opens its bounded GET using that
+resolved reference, size, and request authorization. Ordinary resolution uses
+one HEAD; blob-to-manifest discovery can require a second HEAD, and authentication
+negotiation or redirects can add exchanges. Opening the GET does not repeat
+resolution. HEAD and conditional/range rejections remain metadata-only. Empty
+remote objects need no payload GET. If local content disappears or cannot be
+read as a seekable source after metadata resolution, registry fallback must match
+the resolved size and normalized content type before opening its GET. A mismatch
+returns 412. Resolved state is released at request completion and credentials
+are never cached across requests by this adapter.
+
 Basic/Bearer authorization travels with the request through the Racer SDK and
 authenticated peer transport to the node-local origin for upstream access.
 Credentials are not cache keys and are not persisted with content. All origin

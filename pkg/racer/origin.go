@@ -61,7 +61,36 @@ type RangeStore interface {
 	OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error)
 }
 
+// ResolvedRangeStore is an optional RangeStore capability used by NewRangeOrigin
+// instead of Stat and OpenRange. ResolveRange resolves metadata without opening
+// payloads and returns a non-nil, request-scoped handle. Calls must be safe for
+// concurrent use and honor ctx. Errors follow Store's HTTP mapping; the store retains
+// ownership of any handle returned with an error.
+// Unlike Store methods, ResolveRange may retain originData in the returned handle
+// until Close, but must not mutate, log, persist, or share it across requests.
+type ResolvedRangeStore interface {
+	ResolveRange(ctx context.Context, target string, originData []byte) (ResolvedRange, error)
+}
+
+// ResolvedRange binds metadata and a subsequent payload open to one immutable
+// representation, with the same ETag identity rules as Store. Metadata must stay
+// constant. OpenRange must atomically pin that representation or return
+// ErrVersionChanged, honor ctx, and return exactly length bytes. Origin calls it
+// once per accepted GET (including length zero), after preconditions and ranges,
+// never for HEAD. It must return a non-nil body on success; ownership of a body
+// returned with an error stays with the handle.
+// Origin closes a successful body exactly once, then closes the handle exactly
+// once on every path, including rejected requests and aborted responses. Close
+// releases request state, including originData, even if no body was opened.
+// Handle methods are called serially and need not support concurrent use.
+type ResolvedRange interface {
+	Metadata() Metadata
+	OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error)
+	io.Closer
+}
+
 // NewRangeOrigin binds the protocol to a sequential, range-oriented backend.
+// If store implements ResolvedRangeStore, each request uses its resolved handle.
 func NewRangeOrigin(store RangeStore) (*Origin, error) {
 	if store == nil {
 		return nil, fmt.Errorf("racer: nil range store")
@@ -115,11 +144,23 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		m   Metadata
-		err error
+		m        Metadata
+		err      error
+		resolved ResolvedRange
 	)
 
-	if o.ranges != nil {
+	if store, ok := o.ranges.(ResolvedRangeStore); ok {
+		resolved, err = store.ResolveRange(r.Context(), target, originData)
+		if err == nil {
+			if resolved == nil {
+				emptyResponse(w, http.StatusInternalServerError)
+				return
+			}
+			defer resolved.Close() //nolint:errcheck // Release request state on every response path.
+
+			m = resolved.Metadata()
+		}
+	} else if o.ranges != nil {
 		m, err = o.ranges.Stat(r.Context(), target, originData)
 	} else {
 		m, err = o.store.Stat(r.Context(), target, originData)
@@ -154,7 +195,13 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	source, err := o.openRange(r.Context(), target, m.ETag, start, length, originData)
+	var source io.ReadCloser
+	if resolved != nil {
+		source, err = resolved.OpenRange(r.Context(), start, length)
+	} else {
+		source, err = o.openRange(r.Context(), target, m.ETag, start, length, originData)
+	}
+
 	if err != nil {
 		storeError(w, err)
 		return
