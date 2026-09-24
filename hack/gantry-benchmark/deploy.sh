@@ -688,6 +688,18 @@ private_dns_ip() {
   exit 1
 }
 
+install_containerd_pull_tuning() {
+  export KUBECONFIG
+  kubectl create namespace "$GANTRY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-benchmark-containerd-config \
+    --ignore-not-found=true --wait=true
+  kubectl -n "$GANTRY_NAMESPACE" delete configmap gantry-benchmark-containerd-config \
+    --ignore-not-found=true
+  kubectl apply -f "$repo_root/hack/gantry-benchmark/manifests/containerd-pull-tuning.yaml"
+  kubectl -n "$GANTRY_NAMESPACE" rollout status \
+    daemonset/gantry-benchmark-containerd-pull-tuning --timeout=45m
+}
+
 install_private_dns_guard() {
   export KUBECONFIG
   kubectl create namespace "$GANTRY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -852,6 +864,8 @@ replace_private_pull_tls_nodes() {
     return 1
   }
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
+    daemonset/gantry-benchmark-containerd-pull-tuning --timeout=30m
+  kubectl -n "$GANTRY_NAMESPACE" rollout status \
     daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
 
@@ -916,9 +930,78 @@ PROBE
   kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-baseline-acr-pull-probe --wait=true
 }
 
+assert_legacy_helm_resource() {
+  local resource=$1
+  shift
+
+  local output
+  if ! output=$(kubectl "$@" get "$resource" -o json 2>/dev/null); then
+    return
+  fi
+
+  local managed_by
+  managed_by=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$output")
+  [[ "$managed_by" == Helm ]] || {
+    echo "$resource exists without legacy Helm-rendered ownership; remove or restore it before deployment" >&2
+    exit 1
+  }
+}
+
+migrate_legacy_gantry_install() {
+  local release_secrets
+  release_secrets=$(kubectl -n "$GANTRY_NAMESPACE" get secrets \
+    -l owner=helm,name=gantry -o json)
+  if [[ $(jq '.items | length' <<<"$release_secrets") -gt 0 ]]; then
+    return
+  fi
+
+  local legacy=false
+  if kubectl -n "$GANTRY_NAMESPACE" get daemonset gantry >/dev/null 2>&1 || \
+    kubectl get priorityclass gantry-low >/dev/null 2>&1; then
+    legacy=true
+  fi
+  [[ "$legacy" == true ]] || return
+
+  local resource
+  for resource in \
+    daemonset/gantry \
+    daemonset/gantry-containerd-config \
+    configmap/gantry-config \
+    configmap/gantry-containerd-hosts \
+    serviceaccount/gantry \
+    role/gantry-agent \
+    rolebinding/gantry-agent; do
+    assert_legacy_helm_resource "$resource" -n "$GANTRY_NAMESPACE"
+  done
+  assert_legacy_helm_resource priorityclass/gantry-low
+
+  local leases
+  leases=$(kubectl -n "$GANTRY_NAMESPACE" get leases -l gantry.io/chair=true -o json)
+  jq -e 'all(.items[]; .metadata.labels["app.kubernetes.io/managed-by"] == "Helm")' \
+    <<<"$leases" >/dev/null || {
+    echo "chair Leases exist without legacy Helm-rendered ownership; remove or restore them before deployment" >&2
+    exit 1
+  }
+
+  log "removing legacy rendered Gantry resources before first Helm install"
+  kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry gantry-containerd-config \
+    --ignore-not-found=true --wait=true
+  kubectl -n "$GANTRY_NAMESPACE" delete \
+    configmap/gantry-config \
+    configmap/gantry-containerd-hosts \
+    serviceaccount/gantry \
+    role/gantry-agent \
+    rolebinding/gantry-agent \
+    --ignore-not-found=true
+  kubectl -n "$GANTRY_NAMESPACE" delete leases -l gantry.io/chair=true \
+    --ignore-not-found=true --wait=true
+  kubectl delete priorityclass gantry-low --ignore-not-found=true --wait=true
+}
+
 deploy_gantry() {
   export KUBECONFIG
   GOTOOLCHAIN=auto make -C "$repo_root" install-helm
+  migrate_legacy_gantry_install
   "$repo_root/bin/helm" upgrade --install gantry "$repo_root/deploy/gantry/chart" \
     --namespace "$GANTRY_NAMESPACE" \
     --create-namespace \
@@ -1025,6 +1108,7 @@ ensure_role "$kubelet_object_id" AcrPull \
   "$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query id -o tsv)"
 
 wait_for_nodes
+install_containerd_pull_tuning
 install_private_dns_guard
 install_monitoring
 
@@ -1045,7 +1129,7 @@ assert_equal "Gantry ACR public access" \
 
 kubectl -n "$MONITORING_NAMESPACE" get endpoints "$PROMETHEUS_SERVICE" -o json | \
   jq -e '.subsets | any(.addresses | length > 0)' >/dev/null
-for daemonset in gantry-acr-private-dns-guard gantry-containerd-config gantry; do
+for daemonset in gantry-benchmark-containerd-pull-tuning gantry-acr-private-dns-guard gantry-containerd-config gantry; do
   namespace=$GANTRY_NAMESPACE
   desired=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.desiredNumberScheduled}')
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')

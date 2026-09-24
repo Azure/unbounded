@@ -18,10 +18,11 @@ make -C hack/gantry-benchmark deploy-status
 The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
-images, deterministic node-side ACR routing, bounded Prometheus discovery,
-Gantry, and the private operator VM. It leaves the stack preflight-ready by
-default; set `START_BENCHMARK=true` in `deploy.env` only when the same invocation
-should start the benchmark after every deployment gate passes.
+images, deterministic node-side ACR routing, benchmark pull tuning, bounded
+Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
+preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
+the same invocation should start the benchmark after every deployment gate
+passes.
 
 The deployment config contains names and topology only. Credentials remain in
 Azure managed identities and short-lived ACR tokens.
@@ -48,6 +49,9 @@ When invoking the benchmark tool directly, it expects:
   a Grafana dashboard sidecar. The workflow installs benchmark-owned
   PodMonitors for Gantry and, in proxy mode, the proxy.
 - Containerd configured to read `/etc/containerd/certs.d`.
+- Containerd configured by the deployment with a 30-minute no-progress timeout
+  and six concurrent transfer-service downloads. The benchmark changes no other
+  containerd daemon settings.
 - Containerd metrics listening on `0.0.0.0:10257`. Preflight refuses to run
   without a containerd scrape from every target node. Debug logging is optional;
   stock logging omits per-layer and image-unpack journal telemetry.

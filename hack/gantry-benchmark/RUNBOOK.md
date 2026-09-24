@@ -89,8 +89,10 @@ The graphroot must be `/opt/gantry-benchmark/containers`.
 
 ## 2. Start The Full Lifecycle
 
-The benchmark preserves the cluster's containerd daemon tuning. Gantry's chart
-owns only the registry routing under `/etc/containerd/certs.d`.
+The benchmark deployment sets containerd's `image_pull_progress_timeout` to 30
+minutes and transfer-service `max_concurrent_downloads` to six. It changes no
+other daemon tuning. Gantry's Helm chart separately owns only registry routing
+under `/etc/containerd/certs.d`.
 
 ```bash
 export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"

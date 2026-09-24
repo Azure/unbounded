@@ -142,6 +142,7 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 	if err != nil {
 		return phasePerformanceTelemetry{}, err
 	}
+
 	journalPodsObserved, unpackTelemetry := summarizeContainerdJournal(journalEvents)
 
 	return phasePerformanceTelemetry{
@@ -274,6 +275,7 @@ func parseContainerdJournal(
 func summarizeContainerdJournal(events []containerdJournalEvent) (int, bool) {
 	observedPods := map[string]struct{}{}
 	unpackTelemetry := false
+
 	for _, event := range events {
 		observedPods[event.ObserverPod] = struct{}{}
 		if event.Type == "layer_unpacked" || event.Type == "image_unpacked" {

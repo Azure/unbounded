@@ -290,7 +290,7 @@ func renderedContainerScript(t *testing.T, rendered []byte, objectName, containe
 	return ""
 }
 
-func TestDeployDoesNotInstallContainerdBenchmarkConfig(t *testing.T) {
+func TestDeployDoesNotInstallLegacyContainerdBenchmarkConfig(t *testing.T) {
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		t.Fatalf("findRepoRoot: %v", err)
@@ -301,13 +301,67 @@ func TestDeployDoesNotInstallContainerdBenchmarkConfig(t *testing.T) {
 		t.Fatalf("read deploy script: %v", err)
 	}
 
-	for _, removed := range []string{
-		"manifests/containerd.yaml",
-		"gantry-benchmark-containerd-config",
+	if bytes.Contains(deployScript, []byte("manifests/containerd.yaml")) {
+		t.Fatal("deploy script still installs legacy benchmark containerd manifest")
+	}
+
+	if !bytes.Contains(deployScript, []byte("delete daemonset gantry-benchmark-containerd-config")) {
+		t.Fatal("deploy script does not remove the legacy benchmark containerd DaemonSet")
+	}
+}
+
+func TestContainerdPullTuningManifest(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(repoRoot, "hack/gantry-benchmark/manifests/containerd-pull-tuning.yaml"))
+	if err != nil {
+		t.Fatalf("read containerd pull tuning manifest: %v", err)
+	}
+
+	if kinds := decodeManifestKinds(t, manifest); !slices.Equal(kinds, []string{"ConfigMap", "DaemonSet"}) {
+		t.Fatalf("manifest kinds = %v, want ConfigMap and DaemonSet", kinds)
+	}
+
+	for _, setting := range []string{
+		`[plugins."io.containerd.cri.v1.images"]`,
+		`image_pull_progress_timeout = "30m"`,
+		`[plugins."io.containerd.transfer.v1.local"]`,
+		`max_concurrent_downloads = 6`,
+		`systemctl restart containerd`,
 	} {
-		if bytes.Contains(deployScript, []byte(removed)) {
-			t.Fatalf("deploy script still installs benchmark containerd configuration %q", removed)
+		if !bytes.Contains(manifest, []byte(setting)) {
+			t.Fatalf("containerd pull tuning manifest is missing %q", setting)
 		}
+	}
+
+	if bytes.Contains(manifest, []byte(`level = "debug"`)) {
+		t.Fatal("containerd pull tuning manifest must not enable debug logging")
+	}
+
+	deployScript, err := os.ReadFile(filepath.Join(repoRoot, "hack/gantry-benchmark/deploy.sh"))
+	if err != nil {
+		t.Fatalf("read deploy script: %v", err)
+	}
+
+	if !bytes.Contains(deployScript, []byte("manifests/containerd-pull-tuning.yaml")) {
+		t.Fatal("deploy script does not install containerd pull tuning manifest")
+	}
+
+	for _, legacyPath := range []string{
+		"97-gantry-benchmark.toml",
+		".gantry-benchmark-config",
+		".gantry-benchmark-backup",
+	} {
+		if !bytes.Contains(manifest, []byte(legacyPath)) {
+			t.Fatalf("containerd pull tuning manifest does not migrate %q", legacyPath)
+		}
+	}
+
+	if !bytes.Contains(deployScript, []byte("migrate_legacy_gantry_install\n  \"$repo_root/bin/helm\" upgrade --install gantry")) {
+		t.Fatal("deploy script does not migrate legacy Gantry resources before Helm install")
 	}
 }
 
