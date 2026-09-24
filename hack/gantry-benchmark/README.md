@@ -15,6 +15,14 @@ make -C hack/gantry-benchmark deploy
 make -C hack/gantry-benchmark deploy-status
 ```
 
+To resize an existing deployment, update both `AKS_NODE_COUNT` and
+`BENCHMARK_NODE_COUNT`, then reconcile the node pool before the full stack:
+
+```bash
+make -C hack/gantry-benchmark deploy-scale
+make -C hack/gantry-benchmark deploy
+```
+
 The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch

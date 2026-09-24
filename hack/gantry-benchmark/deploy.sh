@@ -9,12 +9,13 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh <plan|deploy|status> [config-file]
+Usage: deploy.sh <plan|scale|deploy|status> [config-file]
 
 One idempotent entrypoint for the complete Gantry benchmark stack. The config
 file is a shell environment file. No credentials are stored in it.
 
   plan    validate inputs and print the complete deployment contract
+  scale   resize the existing AKS node pool and wait for Ready nodes
   deploy  create or validate every resource and leave the benchmark ready
   status  report Azure and Kubernetes readiness without mutation
 USAGE
@@ -24,7 +25,7 @@ action=${1:-plan}
 config_file=${2:-${GANTRY_BENCHMARK_DEPLOY_CONFIG:-$script_dir/deploy.env}}
 
 case "$action" in
-plan | deploy | status) ;;
+plan | scale | deploy | status) ;;
 -h | --help | help)
   usage
   exit 0
@@ -499,6 +500,39 @@ ensure_aks() {
   assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
   assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
   assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
+}
+
+scale_aks_node_pool() {
+  az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null || {
+    echo "AKS cluster $AZURE_AKS_CLUSTER_NAME does not exist; run deploy first" >&2
+    exit 1
+  }
+
+  local subnet_id cluster_json pool_json current_count
+  subnet_id=$(az network vnet subnet show -g "$AZURE_RESOURCE_GROUP" --vnet-name "$VNET_NAME" \
+    -n "$AKS_SUBNET_NAME" --query id -o tsv)
+  cluster_json=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -o json)
+  pool_json=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+    -n "$AKS_NODE_POOL_NAME" -o json)
+
+  assert_equal "AKS location" "$(jq -r .location <<<"$cluster_json")" "$AZURE_LOCATION"
+  assert_equal "AKS Kubernetes version" "$(jq -r .kubernetesVersion <<<"$cluster_json")" "$AKS_KUBERNETES_VERSION"
+  assert_equal "AKS node resource group" "$(jq -r .nodeResourceGroup <<<"$cluster_json")" "$AZURE_NODE_RESOURCE_GROUP"
+  assert_equal "AKS node VM size" "$(jq -r .vmSize <<<"$pool_json")" "$AKS_NODE_VM_SIZE"
+  assert_equal "AKS max pods" "$(jq -r .maxPods <<<"$pool_json")" "$AKS_MAX_PODS"
+  assert_equal "AKS node OS disk" "$(jq -r .osDiskSizeGb <<<"$pool_json")" "$AKS_NODE_OS_DISK_GB"
+  assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
+  assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
+  assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
+
+  current_count=$(jq -r .count <<<"$pool_json")
+  if [[ "$current_count" == "$AKS_NODE_COUNT" ]]; then
+    log "AKS node pool already has $AKS_NODE_COUNT nodes"
+  else
+    log "submitting AKS node pool scale: $current_count -> $AKS_NODE_COUNT"
+    az aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+      -n "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" --no-wait --only-show-errors -o none
+  fi
 }
 
 ensure_role() {
@@ -1097,6 +1131,13 @@ release_operator_run_command_lock() {
 }
 
 guard_active_benchmark
+if [[ "$action" == scale ]]; then
+  scale_aks_node_pool
+  wait_for_nodes
+  log "AKS node pool scale complete"
+  exit 0
+fi
+
 ensure_group
 ensure_vnet
 ensure_acr "$BASELINE_ACR_NAME"
