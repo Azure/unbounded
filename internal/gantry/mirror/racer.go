@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,33 +26,36 @@ import (
 // NewRacer builds a Racer-backend Server with an explicit registry contract.
 // A nil backend sends local misses directly to the registry fallback.
 func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantryracer.Registry, backend *gantryracer.Backend, opts ...Option) *Server {
-	s := newServer(cfg, store, registry, opts...)
-	s.racerMode = true
-	s.racerRegistry = registry
-	s.racer = backend
-	s.manifestObservations = make(chan struct{}, 16)
-
 	limit := cfg.RacerMaxConcurrentTransfers
 	if limit <= 0 {
 		limit = 64
 	}
 
-	s.racerAdmission = make(chan struct{}, limit)
+	state := &racerState{
+		backend:              backend,
+		registry:             registry,
+		admission:            make(chan struct{}, limit),
+		manifestObservations: make(chan struct{}, 16),
+	}
+	// Install state before applying caller options, including Racer callbacks.
+	opts = append([]Option{func(s *Server) { s.racer = state }}, opts...)
 
-	return s
+	return newServer(cfg, store, registry, opts...)
 }
 
 // WithRacerMetrics registers Racer forwarding and registry fallback callbacks.
 func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), fallback func()) Option {
 	return func(s *Server) {
-		s.onRacerStream, s.onRacerFallback = stream, fallback
+		if s.racer != nil {
+			s.racer.onStream, s.racer.onFallback = stream, fallback
+		}
 	}
 }
 
 func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, logger *slog.Logger) {
 	select {
-	case s.racerAdmission <- struct{}{}:
-		defer func() { <-s.racerAdmission }()
+	case s.racer.admission <- struct{}{}:
+		defer func() { <-s.racer.admission }()
 	default:
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Racer transfer capacity exhausted", http.StatusServiceUnavailable)
@@ -80,7 +82,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 		return
 	}
 
-	if s.racer == nil {
+	if s.racer.backend == nil {
 		s.racerFallback(w, r, ref, logger)
 		return
 	}
@@ -96,7 +98,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	metadataCtx, metadataCancel := context.WithTimeout(streamCtx, metadataBudget)
-	obj, err := s.racer.Open(metadataCtx, ref)
+	obj, err := s.racer.backend.Open(metadataCtx, ref)
 
 	metadataCancel()
 
@@ -110,7 +112,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 
 	meta := obj.Metadata()
 	if meta.ETag != `"`+ref.Digest.Hex()+`"` {
-		s.racer.Quarantine(ref)
+		s.racer.backend.Quarantine(ref)
 		s.racerFallback(w, r, ref, logger)
 
 		return
@@ -144,9 +146,9 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 		return
 	}
 
-	defer stream.Close() //nolint:errcheck // Abandoned streams must release sockets.
-
 	if err = stream.Prepare(); err != nil {
+		_ = stream.Close() //nolint:errcheck // Preparation failed before forwarding takes ownership.
+
 		if !writeRacerAuthError(w, err) {
 			s.racerFallback(w, r, ref, logger)
 		}
@@ -154,79 +156,35 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 		return
 	}
 
-	// Hijacking is essential: passing ResponseWriter or the buffered writer to
-	// WriteTo hides the TCP socket and turns forwarding into a userspace copy.
-	// One response per connection is deliberate; Connection: close gives exact
-	// framing without maintaining a second HTTP keep-alive request parser.
-	conn, buffered, err := http.NewResponseController(w).Hijack()
-	if err != nil {
-		s.racerFallback(w, r, ref, logger)
-		return
-	}
-	defer conn.Close() //nolint:errcheck // One response per hijacked connection.
-
-	s.racerMu.Lock()
-	if s.draining.Load() {
-		s.racerMu.Unlock()
-		return
-	}
-
-	if s.racerConnections == nil {
-		s.racerConnections = make(map[net.Conn]context.CancelFunc)
-	}
-
-	s.racerConnections[conn] = cancel
-	s.racerMu.Unlock()
-
-	defer func() { s.racerMu.Lock(); delete(s.racerConnections, conn); s.racerMu.Unlock() }()
-
-	deadline, _ := transferCtx.Deadline()
-
-	if err := conn.SetDeadline(deadline); err != nil {
-		return
-	}
-
-	stopWatcher := watchRacerDisconnect(conn, buffered.Reader, cancel)
-	defer stopWatcher()
-
 	status := http.StatusOK
 	if partial {
 		status = http.StatusPartialContent
 	}
 
-	racerHeaders(w.Header(), ref, meta, length)
-	w.Header().Set("Connection", "close")
+	// Keep forwarding headers private until hijack succeeds, so a failed
+	// hijack leaves the ResponseWriter available for a clean registry fallback.
+	header := w.Header().Clone()
+	racerHeaders(header, ref, meta, length)
+	header.Set("Connection", "close")
 
 	if partial {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, meta.Size))
+		header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, meta.Size))
 	}
 
-	_, err = fmt.Fprintf(buffered, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
-	if err == nil {
-		err = w.Header().Write(buffered)
+	result := s.racer.forward(streamCtx, cancel, w, stream, status, header)
+	if result.ownership == racerFallbackAllowed {
+		s.racerFallback(w, r, ref, logger)
+		return
 	}
 
-	if err == nil {
-		_, err = buffered.WriteString("\r\n")
+	if s.racer.onStream != nil {
+		s.racer.onStream(stream.Stats(), partial, result.err)
 	}
 
-	if err == nil {
-		err = buffered.Flush()
-	}
+	s.fireMirrorBytesServed(ref.Kind, "racer", result.written)
 
-	var written int64
-	if err == nil {
-		written, err = stream.WriteTo(conn)
-	}
-
-	if s.onRacerStream != nil {
-		s.onRacerStream(stream.Stats(), partial, err)
-	}
-
-	s.fireMirrorBytesServed(ref.Kind, "racer", written)
-
-	if err != nil {
-		logger.Debug("mirror: Racer stream aborted", slog.Any("err", err), slog.Int64("written", written))
+	if result.err != nil {
+		logger.Debug("mirror: Racer stream aborted", slog.Any("err", result.err), slog.Int64("written", result.written))
 
 		return
 	}
@@ -349,12 +307,12 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		// The server resets it after finishing this response, before keep-alive.
 	}()
 
-	if s.onRacerFallback != nil {
-		s.onRacerFallback()
+	if s.racer.onFallback != nil {
+		s.racer.onFallback()
 	}
 
 	if r.Method == http.MethodHead {
-		size, ct, err := s.racerRegistry.Head(r.Context(), ref)
+		size, ct, err := s.racer.registry.Head(r.Context(), ref)
 		if err != nil {
 			writeOriginError(w, err, logger)
 			return
@@ -379,7 +337,7 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 
 	s.fireOriginStreamStarted(ref.Kind)
 
-	body, size, contentType, err := s.racerRegistry.PullWithMetadata(r.Context(), ref)
+	body, size, contentType, err := s.racer.registry.PullWithMetadata(r.Context(), ref)
 	if err != nil {
 		s.fireOriginStreamFailed(ref.Kind)
 		writeOriginError(w, err, logger)
@@ -445,32 +403,6 @@ type lastByteWriter struct {
 	last    byte
 	has     bool
 	written int64
-}
-
-// Hijack disables net/http's disconnect monitoring. Drain the hijacker's reader
-// (including any buffered pipelined requests) until EOF, then cancel upstream.
-// Connection: close means these bytes never represent another served request.
-// No response payload passes through this watcher; WriteTo still gets raw conn.
-func watchRacerDisconnect(conn net.Conn, reader *bufio.Reader, cancel context.CancelFunc) func() {
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		var scratch [1024]byte
-		for {
-			if _, err := reader.Read(scratch[:]); err != nil {
-				cancel()
-				return
-			}
-		}
-	}()
-
-	return func() {
-		_ = conn.SetReadDeadline(time.Now()) //nolint:errcheck // Wake and join the watcher before releasing the connection.
-
-		<-done
-	}
 }
 
 func (w *lastByteWriter) Write(p []byte) (int, error) {

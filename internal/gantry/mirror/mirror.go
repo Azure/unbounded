@@ -51,10 +51,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
-	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
-	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -72,21 +70,13 @@ type AuthenticationChallenger interface {
 
 // Server is the mirror HTTP handler.
 type Server struct {
-	cfg                  *config.Config
-	store                ifaces.LocalContentStore
-	origin               ifaces.OriginPuller
-	auth                 AuthenticationChallenger
-	logger               *slog.Logger
-	metrics              metricsHooks
-	racer                *gantryracer.Backend
-	racerMode            bool
-	racerRegistry        gantryracer.Registry
-	onRacerStream        func(sdk.TransferStats, bool, error)
-	onRacerFallback      func()
-	racerMu              sync.Mutex
-	racerConnections     map[net.Conn]context.CancelFunc
-	manifestObservations chan struct{}
-	racerAdmission       chan struct{}
+	cfg     *config.Config
+	store   ifaces.LocalContentStore
+	origin  ifaces.OriginPuller
+	auth    AuthenticationChallenger
+	logger  *slog.Logger
+	metrics metricsHooks
+	racer   *racerState
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -200,13 +190,9 @@ type Server struct {
 // 503 immediately. Idempotent. Safe to call from a signal handler.
 func (s *Server) Drain() {
 	s.draining.Store(true)
-	s.racerMu.Lock()
-	defer s.racerMu.Unlock()
 
-	for conn, cancel := range s.racerConnections {
-		cancel()
-
-		_ = conn.Close() //nolint:errcheck // Interrupt hijacked streams during shutdown.
+	if s.racer != nil {
+		s.racer.drain()
 	}
 }
 
@@ -773,7 +759,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
-	if s.racerMode && r.Header.Get("Gantry-Mirrored") != "" {
+	if s.racer != nil && r.Header.Get("Gantry-Mirrored") != "" {
 		http.Error(w, "incompatible direct peer protocol", http.StatusConflict)
 		return
 	}
@@ -890,7 +876,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	s.bumpCacheMiss()
 
-	if s.racerMode {
+	if s.racer != nil {
 		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
 		return
 	}
@@ -2665,11 +2651,11 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 		return
 	}
 
-	if s.manifestObservations != nil {
+	if s.racer != nil {
 		select {
-		case s.manifestObservations <- struct{}{}:
+		case s.racer.manifestObservations <- struct{}{}:
 			go func() {
-				defer func() { <-s.manifestObservations }()
+				defer func() { <-s.racer.manifestObservations }()
 
 				s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 			}()
