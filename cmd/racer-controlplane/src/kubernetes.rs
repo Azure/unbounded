@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -144,8 +145,11 @@ impl Runtime {
         let mut revisions = None;
         let mut dirty = BTreeSet::new();
         let mut storage_dirty = BTreeSet::new();
+        let mut storage_cursor = String::new();
+        let mut continue_storage = false;
         let mut placements = BTreeMap::<String, PlacementCache>::new();
         let mut tick = tokio::time::interval(self.options.retry_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let store = RevisionStore::new(
             client.clone(),
             &self.options.namespace,
@@ -157,12 +161,24 @@ impl Runtime {
                 event = receive.recv() => {
                     let Some((kind, event)) = event else { break; };
                     index.event(kind, event, &mut dirty, &mut storage_dirty)?;
-                    // Drain only a bounded batch; continuous events cannot starve commits.
-                    for _ in 0..1024 { match receive.try_recv() { Ok((kind, event)) => index.event(kind, event, &mut dirty, &mut storage_dirty)?, Err(_) => break } }
                 },
                 _ = tick.tick() => {
                     // Storage/status retry uses indexed current Nodes, not request scans.
                     storage_dirty.extend(index.objects[&Kind::Node].keys().cloned());
+                },
+                // Finish pending batches without waiting for another watch event
+                // or retry tick. Failed rounds still wait for those retry signals.
+                _ = std::future::ready(()), if continue_storage => {}
+            }
+            continue_storage = false;
+            // Drain a bounded batch on continuation/timer rounds too, so watch updates
+            // refresh CAS versions before the next bounded storage batch.
+            for _ in 0..1024 {
+                match receive.try_recv() {
+                    Ok((kind, event)) => {
+                        index.event(kind, event, &mut dirty, &mut storage_dirty)?
+                    }
+                    Err(_) => break,
                 }
             }
             let context = (self.subscriptions.security)();
@@ -220,6 +236,7 @@ impl Runtime {
             // Check authoritative lease/CA state and checkpoint existence before
             // each publication batch. Suspend serving on uncertain authority.
             let authority_deadline = Instant::now() + self.options.authority_timeout;
+            let storage_deadline = Instant::now() + self.options.authority_timeout / 4;
             if let Err(error) = store.verify(&fence).await {
                 tracing::warn!(%error, "runtime authority unavailable");
                 self.subscriptions.set_fence(None);
@@ -259,20 +276,35 @@ impl Runtime {
             self.subscriptions.set_live_selections(live);
             // Invalid intent keeps last-good publications usable. A universe
             // without a committed publication still fails its own selection.
-            let nodes = std::mem::take(&mut storage_dirty);
+            // A full-cluster serial pass can outlive authority and starve watch
+            // consumption. Bound each round by count and elapsed time, and rotate
+            // past the last attempted node so retries/churn cannot starve the tail.
+            let nodes: Vec<_> = storage_dirty
+                .range((Excluded(storage_cursor.clone()), Unbounded))
+                .chain(storage_dirty.range(..=storage_cursor.clone()))
+                .take(32)
+                .cloned()
+                .collect();
             for node in nodes {
+                if Instant::now() >= storage_deadline {
+                    break;
+                }
+                storage_dirty.remove(&node);
+                storage_cursor = node.clone();
                 if let Err(error) = self
                     .reconcile_storage(&store, revisions, &index, &node, &fence)
                     .await
                 {
                     tracing::warn!(%node, %error, "storage reconcile retry");
-                    storage_dirty.insert(node);
+                    // The periodic sweep retries failures with refreshed watch
+                    // state, rather than immediately replaying the same stale CAS.
                 }
             }
             if let Err(error) = self.publish_cache_status(&client, &index, &fence).await {
                 tracing::warn!(%error, "cache status retry");
             }
             if store.verify(&fence).await.is_ok() {
+                continue_storage = !storage_dirty.is_empty();
                 // Use the round's start, not the I/O completion time: a delayed
                 // response must not extend authority based on an old read.
                 self.subscriptions.authority_until(authority_deadline);

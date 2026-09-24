@@ -210,6 +210,9 @@ struct ApiData {
     stall_checkpoint_get: Option<CancellationToken>,
     stall_status_patch: Option<CancellationToken>,
     stalled_requests: usize,
+    node_patch_delay: Duration,
+    conflict_node_patch: bool,
+    node_patch_conflicts: usize,
 }
 impl FakeApi {
     fn new() -> Self {
@@ -268,6 +271,27 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or_default().to_string();
     let method = request.method().clone();
+    if method == "PATCH" && path.starts_with("/api/v1/nodes/") {
+        let delay = api.inner.lock().unwrap().node_patch_delay;
+        tokio::time::sleep(delay).await;
+        let changed = {
+            let mut data = api.inner.lock().unwrap();
+            if data.conflict_node_patch {
+                data.conflict_node_patch = false;
+                let mut node = data.objects[&path].clone();
+                node["metadata"]["annotations"] =
+                    json!({"racer.unbounded-cloud.io/cache-size":"1Gi"});
+                Some(node)
+            } else {
+                None
+            }
+        };
+        if let Some(changed) = changed {
+            // A concurrent writer changes intent after the controller's watch
+            // snapshot, making its first status PATCH conflict.
+            api.put(&path, changed);
+        }
+    }
     let stall = {
         let mut data = api.inner.lock().unwrap();
         let stall = if method == "GET" && path.ends_with(CHECKPOINT) {
@@ -412,6 +436,9 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
                 old["metadata"]["resourceVersion"] != object["metadata"]["resourceVersion"]
             })
         {
+            if method == "PATCH" && path.starts_with("/api/v1/nodes/") {
+                data.node_patch_conflicts += 1;
+            }
             return api_error(StatusCode::CONFLICT);
         }
         if method == "PATCH" {
@@ -1685,6 +1712,110 @@ fn in_memory_publication_rejects_regression_and_preserves_last_good() {
     let fresh = restarted.publish(desired, RANGE_SIZE + 1).unwrap();
     assert!(fresh.revision > first.revision);
     assert_eq!(fresh.identity, first.identity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_backlog_yields_to_authority_watches_and_conflict_recovery() {
+    let credentials = credentials().await;
+    let context = credentials.context.clone();
+    let api = FakeApi::new();
+    seed(&api, &context.state);
+    for i in 1..1500 {
+        let name = format!("node-z{i:04}");
+        api.put(
+            &format!("/api/v1/nodes/{name}"),
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":name,"uid":name,"labels":{"unbounded-cloud.io/site":"site-a","kubernetes.io/os":"linux"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}),
+        );
+    }
+    {
+        let mut data = api.inner.lock().unwrap();
+        // Aggregate storage latency exceeds authority even though each request
+        // is healthy. The first node also races with a live capacity change.
+        data.node_patch_delay = Duration::from_millis(3);
+        data.conflict_node_patch = true;
+    }
+    let (client, api_task) = api.serve().await;
+    let mut options = RuntimeOptions::new("system");
+    options.retry_interval = Duration::from_millis(100);
+    options.authority_timeout = Duration::from_secs(2);
+    let runtime = Runtime::new(options, Arc::new(move || Some(context.clone())));
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.clone().run(client, stop.clone()));
+    until(|| runtime.ready()).await;
+    assert!(api.inner.lock().unwrap().objects["/api/v1/nodes/node-z1499"]["metadata"]
+        ["annotations"]["racer.unbounded-cloud.io/cache-status"]
+        .is_null());
+    assert!(
+        runtime
+            .selection(
+                &identity("universe", "site-a"),
+                &identity("node", "node-uid")
+            )
+            .is_some()
+    );
+    let mut pod =
+        api.inner.lock().unwrap().objects["/api/v1/namespaces/system/pods/racer-a"].clone();
+    pod["status"]["phase"] = json!("Failed");
+    api.put("/api/v1/namespaces/system/pods/racer-a", pod.clone());
+    until(|| {
+        runtime.ready()
+            && runtime
+                .selection(
+                    &identity("universe", "site-a"),
+                    &identity("node", "node-uid"),
+                )
+                .is_none()
+    })
+    .await;
+    assert!(api.inner.lock().unwrap().objects["/api/v1/nodes/node-z1499"]["metadata"]
+        ["annotations"]["racer.unbounded-cloud.io/cache-status"]
+        .is_null(), "live membership must update before the full storage pass");
+    pod["status"]["phase"] = json!("Running");
+    api.put("/api/v1/namespaces/system/pods/racer-a", pod);
+    until(|| {
+        runtime
+            .selection(
+                &identity("universe", "site-a"),
+                &identity("node", "node-uid"),
+            )
+            .is_some()
+    })
+    .await;
+    let changed = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let current = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
+            if current
+                .storage_policy
+                .as_ref()
+                .is_some_and(|p| p.desired_bytes == 1 << 30)
+            {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("conflicted status must recover using refreshed storage intent");
+    assert!(changed.storage_policy.is_some());
+    // Every periodic tick requeues early nodes. The round-robin cursor must
+    // nevertheless reach the tail while keeping enrollment authority usable.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            assert!(runtime.ready(), "healthy storage backlog expired authority");
+            let complete = {
+                let data = api.inner.lock().unwrap();
+                ["/api/v1/nodes/node-a", "/api/v1/nodes/node-z1499"].iter().all(|path| {
+                    data.objects[*path]["metadata"]["annotations"]["racer.unbounded-cloud.io/cache-status"].is_string()
+                })
+            };
+            if complete { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("storage retries must not starve later nodes");
+    assert!(api.inner.lock().unwrap().node_patch_conflicts >= 1);
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    api_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
