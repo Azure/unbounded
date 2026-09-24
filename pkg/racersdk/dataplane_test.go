@@ -35,7 +35,7 @@ func TestDataplaneInterop(t *testing.T) {
 	}
 
 	store := &memoryStore{data: data, meta: Metadata{Size: int64(len(data)), ETag: checksumTag(data), TTL: durationPointer(time.Hour)}}
-	origin, _ := NewOrigin(conformanceStore{sdk: store})
+	origin, _ := NewRangeOrigin(conformanceStore{sdk: store})
 
 	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.RequestURI == "/sdk%2Fblob?b=2&a=1&a=3" {
@@ -188,7 +188,7 @@ func TestDataplaneInterop(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	c, err := NewClient(cacheSocket, ClientOptions{Concurrency: 3})
+	c, err := NewClient(cacheSocket, ClientOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,10 +214,10 @@ func TestDataplaneInterop(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		out := make(sliceWriter, len(data))
+		var out bytes.Buffer
 
-		n, err := object.Download(ctx, out)
-		if err != nil || n != int64(len(data)) || !bytes.Equal(out, data) {
+		n, err := writeObject(ctx, object, &out)
+		if err != nil || n != int64(len(data)) || !bytes.Equal(out.Bytes(), data) {
 			t.Fatalf("transfer %d: n=%d err=%v", i, n, err)
 		}
 	}
@@ -233,10 +233,16 @@ func TestDataplaneInterop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := make([]byte, 17)
+	stream, err := object.ReadRange(ctx, PageSize-5, 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
 
-	n, err := object.ReadAt(ctx, out, PageSize-5)
-	if err != nil || n != len(out) || !bytes.Equal(out, data[PageSize-5:PageSize+12]) {
+	var out bytes.Buffer
+
+	n, err := stream.WriteTo(&out)
+	if err != nil || n != 17 || !bytes.Equal(out.Bytes(), data[PageSize-5:PageSize+12]) {
 		t.Fatal("cross-page read", n, err)
 	}
 
@@ -244,7 +250,7 @@ func TestDataplaneInterop(t *testing.T) {
 		t.Fatal("origin data changed persistent cache identity")
 	}
 
-	t.Logf("verified HEAD + 3 cold pages + warm reuse + cross-page ReadAt (%d bytes)", len(data))
+	t.Logf("verified HEAD + 3 cold pages + warm reuse + cross-page stream (%d bytes)", len(data))
 	t.Run("direct", func(t *testing.T) { runReadConformance(t, server.Listener.Addr().String()) })
 	t.Run("cached", func(t *testing.T) { runReadConformance(t, cacheSocket) })
 

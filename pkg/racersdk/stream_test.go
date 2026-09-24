@@ -39,14 +39,6 @@ func TestAuthorizationViewsAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"Racer-Origin-Data": {""}}}); err == nil {
-		t.Fatal("protocol-owned header accepted")
-	}
-
-	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"racer-origin-data": {"a", "b"}}}); err == nil {
-		t.Fatal("duplicate protocol-owned header accepted")
-	}
-
 	var wg sync.WaitGroup
 
 	for _, value := range []string{"a", "b", "", "\x00\xff\r\n binary "} {
@@ -126,6 +118,25 @@ type rangeTestStore struct {
 	offset, length int64
 }
 
+func (s *rangeTestStore) ResolveRange(ctx context.Context, target string, data []byte) (ResolvedRange, error) {
+	m, err := s.Stat(ctx, target, data)
+
+	return &testResolvedRange{meta: m, open: func(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+		return s.OpenRange(ctx, target, m.ETag, off, length, data)
+	}}, err
+}
+
+type testResolvedRange struct {
+	meta Metadata
+	open func(context.Context, int64, int64) (io.ReadCloser, error)
+}
+
+func (r *testResolvedRange) Metadata() Metadata { return r.meta }
+func (r *testResolvedRange) Close() error       { return nil }
+func (r *testResolvedRange) OpenRange(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+	return r.open(ctx, off, length)
+}
+
 func (s *rangeTestStore) Stat(_ context.Context, _ string, originData []byte) (Metadata, error) {
 	s.auth = string(originData)
 	return Metadata{Size: int64(len(s.data)), ETag: checksumTag(s.data), ContentType: "application/vnd.oci.image.manifest.v1+json"}, nil
@@ -179,8 +190,10 @@ func TestRangeOriginSingleOpenAndContentType(t *testing.T) {
 	}
 	defer s.Close()
 
-	got, err := io.ReadAll(s)
-	if err != nil || !bytes.Equal(got, store.data[7:100007]) {
+	var got bytes.Buffer
+
+	_, err = s.WriteTo(&got)
+	if err != nil || !bytes.Equal(got.Bytes(), store.data[7:100007]) {
 		t.Fatal(err)
 	}
 
@@ -273,10 +286,12 @@ func TestStreamSequentialPagesAndRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := io.ReadAll(s)
+	var data bytes.Buffer
+
+	_, err = s.WriteTo(&data)
 	_ = s.Close()
 
-	if err != nil || len(data) != 10 {
+	if err != nil || data.Len() != 10 {
 		t.Fatal(err)
 	}
 }
@@ -313,6 +328,14 @@ func TestStreamBuffered(t *testing.T) {
 type failingRangeStore struct {
 	rangeTestStore
 	err error
+}
+
+func (s *failingRangeStore) ResolveRange(ctx context.Context, target string, data []byte) (ResolvedRange, error) {
+	m, err := s.Stat(ctx, target, data)
+
+	return &testResolvedRange{meta: m, open: func(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+		return s.OpenRange(ctx, target, m.ETag, off, length, data)
+	}}, err
 }
 
 func (s *failingRangeStore) OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {

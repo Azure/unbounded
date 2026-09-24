@@ -30,6 +30,7 @@ origins sharing the dataset; footprint must be an exact multiple of object size.
 
 Use `./bin/racer-loadgen -h` for all flags and defaults, including concurrency,
 Zipf sampling, and timeouts. Omit `-duration` to run until interrupted.
+Each object worker consumes a sequential SDK stream with one active page request.
 
 ## Container-image mode
 
@@ -150,7 +151,7 @@ be exact. There are at most one million layers and 100,000 images. Layers are
 unique across images. Identity depends on footprint, layer size, and layer
 index; changing the sampling seed preserves content and warm cache keys.
 The puller takes the dataset from the catalog; dataset flags apply to the
-registry. Racer-only `-endpoint`, `-origin-socket`, `-page-concurrency`, and `-ttl`
+registry. Racer-only `-endpoint`, `-origin-socket`, and `-ttl`
 do not configure the image data path. Gantry/Racer controls its own page fetching
 and metadata TTL. The fixture serves HEAD, full GET, and byte-range GET with
 digest/length/media-type metadata; it does not implement general registry push,

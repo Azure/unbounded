@@ -4,7 +4,6 @@
 package racersdk
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -16,24 +15,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-type sliceWriter []byte
-
-func (b sliceWriter) WriteAt(p []byte, off int64) (int, error) {
-	n := copy(b[off:], p)
-	if n != len(p) {
-		return n, io.ErrShortWrite
-	}
-
-	return n, nil
-}
 
 func socketDirectory(t testing.TB) string {
 	t.Helper()
@@ -68,7 +53,6 @@ func unixTestServer(t testing.TB, handler http.Handler) *httptest.Server {
 
 func newTestClient(t testing.TB, handler http.Handler, options ClientOptions) *Client {
 	t.Helper()
-
 	s := unixTestServer(t, handler)
 
 	c, err := NewClient(s.Listener.Addr().String(), options)
@@ -92,134 +76,25 @@ func payload(size int) []byte {
 
 func checksumTag(data []byte) string { return fmt.Sprintf(`"%x"`, sha256.Sum256(data)) }
 
-func TestDownloadHEADThenBoundedConcurrentPages(t *testing.T) {
-	data := payload(int(3*PageSize + 17))
-
-	var heads, gets, active, peak atomic.Int32
-
-	gate := make(chan struct{})
-
-	var (
-		release sync.Once
-		ranges  sync.Map
-	)
-
-	target := "/a%2fb//../c?b=2&a=1&a=3"
-	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.RequestURI != target || r.Header.Get("Accept-Encoding") != "identity" || r.Header.Get("Authorization") != "Bearer token" {
-			t.Errorf("request identity/headers lost: %s %v", r.RequestURI, r.Header)
-		}
-
-		w.Header().Set("ETag", checksumTag(data))
-		w.Header().Set("Content-Type", "application/octet-stream")
-
-		if r.Method == "HEAD" {
-			heads.Add(1)
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-
-			return
-		}
-
-		if heads.Load() != 1 || r.Header.Get("If-Match") != checksumTag(data) {
-			t.Error("GET before HEAD or without pinned validator")
-		}
-
-		gets.Add(1)
-
-		n := active.Add(1)
-		defer active.Add(-1)
-
-		for old := peak.Load(); n > old; old = peak.Load() {
-			if peak.CompareAndSwap(old, n) {
-				break
-			}
-		}
-
-		if n == 2 {
-			release.Do(func() { close(gate) })
-		}
-
-		select {
-		case <-gate:
-		case <-r.Context().Done():
-			return
-		}
-
-		start, end, ok := pageRange(r.Header.Get("Range"), int64(len(data)))
-		if !ok {
-			t.Error("invalid page range")
-			w.WriteHeader(416)
-
-			return
-		}
-
-		if _, loaded := ranges.LoadOrStore(start, true); loaded {
-			t.Error("duplicate page")
-		}
-
-		w.Header().Set("Content-Range", contentRange(start, end, int64(len(data))))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.WriteHeader(206)
-		_, _ = w.Write(data[start : end+1])
-	}), ClientOptions{Concurrency: 2, MaxIdleConnections: 1, MaxActiveRequests: 3, Header: http.Header{"Authorization": {"Bearer token"}}})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	dst := make(sliceWriter, len(data))
-
-	m, err := c.Download(ctx, target, dst)
-	if err != nil || m.Size != int64(len(data)) || !bytes.Equal(dst, data) {
-		t.Fatalf("download: %+v %v", m, err)
+func writeObject(ctx context.Context, o *Object, dst io.Writer) (int64, error) {
+	s, err := o.Stream(ctx)
+	if err != nil {
+		return 0, err
 	}
+	defer s.Close()
 
-	if heads.Load() != 1 || gets.Load() != 4 || peak.Load() != 2 {
-		t.Fatalf("HEAD=%d GET=%d concurrency=%d", heads.Load(), gets.Load(), peak.Load())
-	}
+	return s.WriteTo(dst)
 }
 
-func TestReadAtBoundariesAndEOF(t *testing.T) {
-	data := payload(int(2*PageSize + 17))
-
-	var heads atomic.Int32
-
-	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "HEAD" {
-			heads.Add(1)
-		}
-
-		w.Header().Set("ETag", checksumTag(data))
-		http.ServeContent(w, r, "object", time.Time{}, bytes.NewReader(data))
-	}), ClientOptions{})
-
-	o, err := c.Open(context.Background(), "/object?")
+func fetchObject(ctx context.Context, c *Client, target string, dst io.Writer) (Metadata, error) {
+	o, err := c.Open(ctx, target)
 	if err != nil {
-		t.Fatal(err)
+		return Metadata{}, err
 	}
 
-	for _, tc := range []struct {
-		off  int64
-		size int
-		want int
-		err  error
-	}{
-		{PageSize - 3, 10, 10, nil},
-		{1, int(PageSize + 5), int(PageSize + 5), nil},
-		{int64(len(data)) - 4, 10, 4, io.EOF},
-		{int64(len(data)), 1, 0, io.EOF},
-		{0, 0, 0, nil},
-	} {
-		p := make([]byte, tc.size)
+	_, err = writeObject(ctx, o, dst)
 
-		n, err := o.ReadAt(context.Background(), p, tc.off)
-		if n != tc.want || !errors.Is(err, tc.err) || !bytes.Equal(p[:n], data[tc.off:tc.off+int64(n)]) {
-			t.Fatalf("ReadAt %+v: %d %v", tc, n, err)
-		}
-	}
-
-	if heads.Load() != 1 {
-		t.Fatal("snapshot repeated HEAD")
-	}
+	return o.Metadata(), err
 }
 
 func TestRejectInvalidPages(t *testing.T) {
@@ -256,50 +131,11 @@ func TestRejectInvalidPages(t *testing.T) {
 				}
 			}), ClientOptions{})
 
-			_, err := c.Download(context.Background(), "/x", make(sliceWriter, 3))
+			_, err := fetchObject(t.Context(), c, "/x", io.Discard)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("got %v want %v", err, tc.want)
 			}
 		})
-	}
-}
-
-func TestCancellationAndWorkerJoin(t *testing.T) {
-	started := make(chan struct{})
-	done := make(chan struct{})
-	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("ETag", checksumTag(payload(int(2*PageSize))))
-		w.Header().Set("Content-Length", strconv.FormatInt(2*PageSize, 10))
-
-		if r.Method == "HEAD" {
-			return
-		}
-
-		if r.Header.Get("Range") == fmt.Sprintf("bytes=0-%d", PageSize-1) {
-			close(started)
-			<-r.Context().Done()
-			close(done)
-
-			return
-		}
-
-		<-started
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(412)
-	}), ClientOptions{Concurrency: 2})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err := c.Download(ctx, "/x", make(sliceWriter, 2*PageSize))
-	if !errors.Is(err, ErrVersionChanged) {
-		t.Fatal(err)
-	}
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("sibling request not canceled")
 	}
 }
 
@@ -320,9 +156,9 @@ func TestValidatorPolicyEmptyAndStatuses(t *testing.T) {
 
 			var err error
 			if stat {
-				_, err = c.Stat(context.Background(), "/empty")
+				_, err = c.Stat(t.Context(), "/empty")
 			} else {
-				_, err = c.Download(context.Background(), "/empty", make(sliceWriter, 0))
+				_, err = fetchObject(t.Context(), c, "/empty", io.Discard)
 			}
 
 			if tag != checksumTag(nil) {
@@ -336,7 +172,7 @@ func TestValidatorPolicyEmptyAndStatuses(t *testing.T) {
 	}
 
 	c := newTestClient(t, http.NotFoundHandler(), ClientOptions{})
-	_, err := c.Stat(context.Background(), "/missing")
+	_, err := c.Stat(t.Context(), "/missing")
 
 	var status *HTTPError
 	if !errors.Is(err, fs.ErrNotExist) || !errors.As(err, &status) || status.StatusCode != 404 {
@@ -351,28 +187,28 @@ func TestClientValidationAndRedirect(t *testing.T) {
 		}
 	}
 
+	if _, err := NewClient("/cache", ClientOptions{Timeout: -time.Second}); err == nil {
+		t.Fatal("accepted negative timeout")
+	}
+
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Location", "/other"); w.WriteHeader(302) }), ClientOptions{})
 	for _, target := range []string{"relative", "/space here", "/x#fragment", "/x\r\nHeader: x", "/bad%zz"} {
-		if _, err := c.Stat(context.Background(), target); err == nil {
+		if _, err := c.Stat(t.Context(), target); err == nil {
 			t.Errorf("accepted %q", target)
 		}
 	}
 
-	_, err := c.Stat(context.Background(), "/x")
+	_, err := c.Stat(t.Context(), "/x")
 
 	var status *HTTPError
 	if !errors.As(err, &status) || status.StatusCode != 302 {
 		t.Fatal(err)
 	}
-
-	if _, err := NewClient("/run/racer/test-uid/cache", ClientOptions{Header: http.Header{"rAnGe": {"bytes=0-1"}}}); err == nil {
-		t.Fatal("accepted reserved header")
-	}
 }
 
 type failingWriter struct{ err error }
 
-func (w failingWriter) WriteAt([]byte, int64) (int, error) { return 0, w.err }
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func TestDestinationError(t *testing.T) {
 	want := errors.New("disk full")
@@ -381,7 +217,7 @@ func TestDestinationError(t *testing.T) {
 		http.ServeContent(w, r, "x", time.Time{}, strings.NewReader("abc"))
 	}), ClientOptions{})
 
-	_, err := c.Download(context.Background(), "/x", failingWriter{want})
+	_, err := fetchObject(t.Context(), c, "/x", failingWriter{want})
 	if !errors.Is(err, want) {
 		t.Fatal(err)
 	}
@@ -390,67 +226,6 @@ func TestDestinationError(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-type signalingBody struct {
-	io.Reader
-	done chan struct{}
-}
-
-func (b signalingBody) Close() error { close(b.done); return nil }
-
-func TestReadAtPartialCountWithOutOfOrderCompletion(t *testing.T) {
-	// The final page completes before the first one truncates. Only the first
-	// page's successful prefix contributes to ReaderAt's count.
-	done := make(chan struct{})
-
-	cl, err := NewClient("/run/racer/test-uid/cache", ClientOptions{Concurrency: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cl.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		h := http.Header{"Etag": {checksumTag(append(payload(int(PageSize)), []byte("xyz")...))}}
-
-		resp := &http.Response{StatusCode: 200, Header: h, ContentLength: PageSize + 3, Body: io.NopCloser(strings.NewReader(""))}
-		if r.Method == "HEAD" {
-			return resp, nil
-		}
-
-		start, end, _ := pageRange(r.Header.Get("Range"), PageSize+3)
-		resp.StatusCode = 206
-		resp.ContentLength = end - start + 1
-		h.Set("Content-Range", contentRange(start, end, PageSize+3))
-
-		if start == 0 {
-			select {
-			case <-done:
-			case <-r.Context().Done():
-				return nil, r.Context().Err()
-			}
-
-			resp.Body = io.NopCloser(strings.NewReader("ab"))
-		} else {
-			resp.Body = signalingBody{strings.NewReader("xyz"), done}
-		}
-
-		return resp, nil
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	o, err := cl.Open(ctx, "/x")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	p := make([]byte, PageSize+3)
-
-	n, err := o.ReadAt(ctx, p, 0)
-	if n != 2 || !errors.Is(err, io.ErrUnexpectedEOF) || string(p[:2]) != "ab" || string(p[PageSize:]) != "xyz" {
-		t.Fatalf("n=%d err=%v", n, err)
-	}
-}
 
 func TestProtocolFramingAndCanceledContext(t *testing.T) {
 	for _, tc := range []struct {
@@ -476,7 +251,7 @@ func TestProtocolFramingAndCanceledContext(t *testing.T) {
 				return r, nil
 			})
 
-			_, err = c.Stat(context.Background(), "/x")
+			_, err = c.Stat(t.Context(), "/x")
 			if !errors.Is(err, tc.want) {
 				t.Fatal(err)
 			}
@@ -493,27 +268,33 @@ func TestProtocolFramingAndCanceledContext(t *testing.T) {
 		}
 	}), ClientOptions{})
 
-	o, err := c.Open(context.Background(), "/x")
+	o, err := c.Open(t.Context(), "/x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A 200 is valid for the whole object, but never for a partial request.
-	if _, err := o.Download(context.Background(), make(sliceWriter, 10)); err != nil {
+	if _, err := writeObject(t.Context(), o, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := o.ReadAt(context.Background(), make([]byte, 3), 0); !errors.Is(err, ErrProtocol) {
+	s, err := o.ReadRange(t.Context(), 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.Prepare(); !errors.Is(err, ErrProtocol) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if n, err := o.ReadAt(ctx, make([]byte, 10), 0); n != 0 || !errors.Is(err, context.Canceled) {
-		t.Fatal(n, err)
+	if _, err := o.ReadRange(ctx, 0, 10); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
 
-	if n, err := o.Download(ctx, make(sliceWriter, 10)); n != 0 || !errors.Is(err, context.Canceled) {
-		t.Fatal(n, err)
+	if _, err := o.Stream(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
 }

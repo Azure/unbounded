@@ -34,9 +34,9 @@ func (s conformanceStore) Stat(ctx context.Context, target string, _ []byte) (Me
 	return Metadata{Size: int64(len(conformanceBody(target))), ETag: tag, TTL: durationPointer(0)}, nil
 }
 
-func (s conformanceStore) Open(ctx context.Context, target, etag string, _ []byte) (Source, error) {
+func (s conformanceStore) ResolveRange(ctx context.Context, target string, originData []byte) (ResolvedRange, error) {
 	if target == "/sdk%2Fblob?b=2&a=1&a=3" {
-		return s.sdk.Open(ctx, target, etag, nil)
+		return s.sdk.ResolveRange(ctx, target, originData)
 	}
 
 	m, err := s.Stat(ctx, target, nil)
@@ -44,20 +44,14 @@ func (s conformanceStore) Open(ctx context.Context, target, etag string, _ []byt
 		return nil, err
 	}
 
-	if target == "/changed" {
-		m.ETag = checksumTag([]byte("replacement"))
-	}
+	return &testResolvedRange{meta: m, open: func(_ context.Context, off, length int64) (io.ReadCloser, error) {
+		if target == "/changed" {
+			return nil, ErrVersionChanged
+		}
 
-	if m.ETag != etag {
-		return nil, ErrVersionChanged
-	}
-
-	return conformanceSource{bytes.NewReader(conformanceBody(target))}, nil
+		return io.NopCloser(io.NewSectionReader(bytes.NewReader(conformanceBody(target)), off, length)), nil
+	}}, nil
 }
-
-type conformanceSource struct{ *bytes.Reader }
-
-func (conformanceSource) Close() error { return nil }
 
 func conformanceBody(target string) []byte {
 	if target == "/empty" {
@@ -68,7 +62,7 @@ func conformanceBody(target string) []byte {
 }
 
 func TestOriginConformance(t *testing.T) {
-	o, _ := NewOrigin(conformanceStore{})
+	o, _ := NewRangeOrigin(conformanceStore{})
 
 	s := unixTestServer(t, o)
 
@@ -117,9 +111,9 @@ func runReadConformance(t *testing.T, endpoint string) {
 			c, _ := NewClient(endpoint, ClientOptions{})
 			defer c.CloseIdleConnections()
 
-			out := make(sliceWriter, len(want))
-			if _, err := c.Download(context.Background(), target, out); err != nil || !bytes.Equal(out, want) {
-				t.Fatalf("SDK download: %v %q", err, out)
+			var out bytes.Buffer
+			if _, err := fetchObject(context.Background(), c, target, &out); err != nil || !bytes.Equal(out.Bytes(), want) {
+				t.Fatalf("SDK stream: %v %q", err, out.Bytes())
 			}
 
 			object, err := c.Open(context.Background(), target)
@@ -127,15 +121,22 @@ func runReadConformance(t *testing.T, endpoint string) {
 				t.Fatal(err)
 			}
 
-			p := make([]byte, 4)
-
-			n, err := object.ReadAt(context.Background(), p, 1)
+			off, length := int64(1), int64(4)
 			if len(want) == 0 {
-				if n != 0 || !errors.Is(err, io.EOF) {
-					t.Fatal(n, err)
-				}
-			} else if err != nil || n != 4 || !bytes.Equal(p, want[1:5]) {
-				t.Fatal(n, err, p)
+				off, length = 0, 0
+			}
+
+			stream, err := object.ReadRange(context.Background(), off, length)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+
+			out.Reset()
+
+			n, err := stream.WriteTo(&out)
+			if err != nil || n != length || !bytes.Equal(out.Bytes(), want[off:off+length]) {
+				t.Fatal(n, err, out.Bytes())
 			}
 		})
 	}
@@ -216,7 +217,7 @@ func runReadConformance(t *testing.T, endpoint string) {
 	c, _ := NewClient(endpoint, ClientOptions{})
 	defer c.CloseIdleConnections()
 
-	if _, err := c.Download(context.Background(), "/changed", discardWriterAt{}); !errors.Is(err, ErrVersionChanged) {
+	if _, err := fetchObject(context.Background(), c, "/changed", io.Discard); !errors.Is(err, ErrVersionChanged) {
 		t.Fatalf("changed snapshot: %v", err)
 	}
 	// Absolute form must discard authority, preserving the raw path/query.

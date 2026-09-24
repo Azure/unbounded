@@ -70,15 +70,19 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 			t.Errorf("Stat(%q) = %v, want not-exist", target, err)
 		}
 
-		if _, err := d.Open(ctx, target, m.ETag, nil); !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("Open(%q) = %v, want not-exist", target, err)
+		if _, err := d.ResolveRange(ctx, target, nil); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("ResolveRange(%q) = %v, want not-exist", target, err)
 		}
 	}
 
-	for _, tag := range []string{"", "wrong", "W/" + m.ETag} {
-		if _, err := d.Open(ctx, d.target(2), tag, nil); !errors.Is(err, racersdk.ErrVersionChanged) {
-			t.Errorf("Open with ETag %q = %v", tag, err)
-		}
+	resolved, err := d.ResolveRange(ctx, d.target(2), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolved.Close()
+
+	if resolved.Metadata().ETag != m.ETag {
+		t.Fatal("resolved identity changed")
 	}
 
 	canceled, cancel := context.WithCancel(ctx)
@@ -88,8 +92,12 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 		t.Errorf("canceled Stat = %v", err)
 	}
 
-	if _, err := d.Open(canceled, d.target(2), m.ETag, nil); !errors.Is(err, context.Canceled) {
-		t.Errorf("canceled Open = %v", err)
+	if _, err := d.ResolveRange(canceled, d.target(2), nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled ResolveRange = %v", err)
+	}
+
+	if _, err := resolved.OpenRange(canceled, 0, 1); !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled OpenRange = %v", err)
 	}
 }
 
@@ -395,26 +403,10 @@ func TestDatasetPublicationFailure(t *testing.T) {
 	}
 }
 
-func sourceForTest(t *testing.T, d *dataset, id int) racersdk.Source {
+func sourceForTest(t *testing.T, d *dataset, id int) syntheticSource {
 	t.Helper()
 
-	m, err := d.Stat(context.Background(), d.target(id), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := d.Open(context.Background(), d.target(id), m.ETag, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	return s
+	return d.source(d.target(id))
 }
 
 func TestSyntheticReadAtAlignmentSplitsAndEOF(t *testing.T) {
@@ -504,7 +496,7 @@ func TestHandlerPreservesRawTargets(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	newMetrics(reg)
 
-	h, _ := racersdk.NewOrigin(d)
+	h, _ := racersdk.NewRangeOrigin(d)
 	for target, want := range map[string]int{
 		"/healthz": 404, "/metrics": 404, d.target(0): 200,
 		d.prefix + "00": 404, d.prefix + "%30": 404, d.prefix + "./0": 404,
@@ -526,7 +518,7 @@ func TestDatasetOriginMetadataConsistency(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 4099, objectSize: 4099, ttl: 17 * time.Second})
 	target := d.target(0)
 
-	origin, err := racersdk.NewOrigin(d)
+	origin, err := racersdk.NewRangeOrigin(d)
 	if err != nil {
 		t.Fatal(err)
 	}

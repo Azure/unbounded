@@ -19,20 +19,12 @@ type originDataStore struct {
 	want []byte
 }
 
-func (s *originDataStore) Stat(ctx context.Context, target string, data []byte) (Metadata, error) {
+func (s *originDataStore) ResolveRange(ctx context.Context, target string, data []byte) (ResolvedRange, error) {
 	if !bytes.Equal(data, s.want) {
 		s.t.Error("Stat origin data changed")
 	}
 
-	return s.memoryStore.Stat(ctx, target, data)
-}
-
-func (s *originDataStore) Open(ctx context.Context, target, etag string, data []byte) (Source, error) {
-	if !bytes.Equal(data, s.want) {
-		s.t.Error("Open origin data changed")
-	}
-
-	return s.memoryStore.Open(ctx, target, etag, data)
+	return s.memoryStore.ResolveRange(ctx, target, data)
 }
 
 func TestOriginDataValidationAndDelivery(t *testing.T) {
@@ -65,7 +57,7 @@ func TestOriginDataValidationAndDelivery(t *testing.T) {
 				store := &originDataStore{t: t, want: tc.want, memoryStore: memoryStore{data: []byte("body"), meta: Metadata{Size: 4, ETag: checksumTag([]byte("body"))}}}
 				ranges := &rangeTestStore{data: []byte("body")}
 
-				origin, err := NewOrigin(store)
+				origin, err := NewRangeOrigin(store)
 				if ranged {
 					origin, err = NewRangeOrigin(ranges)
 				}

@@ -30,7 +30,15 @@ func (s *memoryStore) Stat(context.Context, string, []byte) (Metadata, error) {
 	return s.meta, s.err
 }
 
-func (s *memoryStore) Open(_ context.Context, _, etag string, _ []byte) (Source, error) {
+func (s *memoryStore) ResolveRange(ctx context.Context, target string, data []byte) (ResolvedRange, error) {
+	m, err := s.Stat(ctx, target, data)
+
+	return &testResolvedRange{meta: m, open: func(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+		return s.openRange(ctx, m.ETag, off, length)
+	}}, err
+}
+
+func (s *memoryStore) openRange(_ context.Context, etag string, off, length int64) (io.ReadCloser, error) {
 	s.opens.Add(1)
 
 	if s.err != nil {
@@ -41,11 +49,11 @@ func (s *memoryStore) Open(_ context.Context, _, etag string, _ []byte) (Source,
 		return nil, ErrVersionChanged
 	}
 
-	return &memorySource{Reader: bytes.NewReader(s.data), closes: &s.closes}, nil
+	return &memorySource{Reader: io.NewSectionReader(bytes.NewReader(s.data), off, length), closes: &s.closes}, nil
 }
 
 type memorySource struct {
-	*bytes.Reader
+	io.Reader
 	closes *atomic.Int32
 }
 
@@ -57,7 +65,7 @@ func TestOriginWireContract(t *testing.T) {
 	data := payload(int(PageSize + 7))
 	store := &memoryStore{data: data, meta: Metadata{Size: int64(len(data)), ETag: checksumTag(data), TTL: durationPointer(time.Minute)}}
 
-	origin, err := NewOrigin(store)
+	origin, err := NewRangeOrigin(store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +159,7 @@ func TestOriginWireContract(t *testing.T) {
 
 func TestOriginRejectsBadTargetsAndMetadata(t *testing.T) {
 	store := &memoryStore{meta: Metadata{ETag: `"ok"`}}
-	o, _ := NewOrigin(store)
+	o, _ := NewRangeOrigin(store)
 
 	for _, target := range []string{"", "relative", "/x#frag", "/has space", "/cr\r\n"} {
 		r := httptest.NewRequest("HEAD", "/metadata", nil)
@@ -191,7 +199,7 @@ func TestOriginErrorsAndTruncation(t *testing.T) {
 		status int
 	}{{fs.ErrNotExist, 404}, {fs.ErrPermission, 403}, {ErrVersionChanged, 412}, {errors.New("private backend failure"), 500}} {
 		store := &memoryStore{err: tc.err}
-		o, _ := NewOrigin(store)
+		o, _ := NewRangeOrigin(store)
 
 		for _, method := range []string{"HEAD", "GET"} {
 			path := "/metadata"
@@ -212,7 +220,7 @@ func TestOriginErrorsAndTruncation(t *testing.T) {
 	}
 
 	store := &memoryStore{data: []byte("ab"), meta: Metadata{Size: 3, ETag: checksumTag([]byte("abc"))}}
-	o, _ := NewOrigin(store)
+	o, _ := NewRangeOrigin(store)
 
 	s := httptest.NewServer(o)
 	defer s.Close()
@@ -242,15 +250,17 @@ type changingStore struct {
 	retain  bool
 }
 
-func (s *changingStore) Stat(ctx context.Context, target string, _ []byte) (Metadata, error) {
-	m, err := s.memoryStore.Stat(ctx, target, nil)
+func (s *changingStore) ResolveRange(ctx context.Context, target string, _ []byte) (ResolvedRange, error) {
+	m, err := s.Stat(ctx, target, nil)
 	// Simulate publication after Stat resolves the old version.
 	s.meta.ETag = checksumTag([]byte("new"))
 
-	return m, err
+	return &testResolvedRange{meta: m, open: func(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+		return s.openRange(ctx, m.ETag, off, length)
+	}}, err
 }
 
-func (s *changingStore) Open(ctx context.Context, target, etag string, _ []byte) (Source, error) {
+func (s *changingStore) openRange(ctx context.Context, etag string, off, length int64) (io.ReadCloser, error) {
 	if s.openErr != nil {
 		s.opens.Add(1)
 		return &memorySource{Reader: bytes.NewReader(nil), closes: &s.closes}, s.openErr
@@ -264,10 +274,10 @@ func (s *changingStore) Open(ctx context.Context, target, etag string, _ []byte)
 			return nil, ErrVersionChanged
 		}
 
-		return &memorySource{Reader: bytes.NewReader(s.data), closes: &s.closes}, nil
+		return &memorySource{Reader: io.NewSectionReader(bytes.NewReader(s.data), off, length), closes: &s.closes}, nil
 	}
 
-	return s.memoryStore.Open(ctx, target, etag, nil)
+	return s.memoryStore.openRange(ctx, etag, off, length)
 }
 
 func TestOriginVersionBinding(t *testing.T) {
@@ -286,7 +296,7 @@ func TestOriginVersionBinding(t *testing.T) {
 				memoryStore: memoryStore{data: []byte("old"), meta: Metadata{Size: 3, ETag: checksumTag([]byte("old"))}},
 				retain:      tc.retain, openErr: tc.openErr,
 			}
-			o, _ := NewOrigin(store)
+			o, _ := NewRangeOrigin(store)
 			r := httptest.NewRequest("GET", "/page", nil)
 			r.Header.Set("X-Racer-Target", "/object")
 			r.Header.Set("If-Match", checksumTag([]byte("old")))
@@ -322,7 +332,7 @@ func (w cancelResponse) Write(p []byte) (int, error) {
 
 func TestOriginClosesSourceOnCancellation(t *testing.T) {
 	store := &memoryStore{data: payload(64 << 10), meta: Metadata{Size: 64 << 10, ETag: checksumTag(payload(64 << 10))}}
-	o, _ := NewOrigin(store)
+	o, _ := NewRangeOrigin(store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -367,7 +377,7 @@ func TestETagLists(t *testing.T) {
 func BenchmarkOriginPage(b *testing.B) {
 	data := payload(int(PageSize))
 	store := &memoryStore{data: data, meta: Metadata{Size: PageSize, ETag: checksumTag(data)}}
-	o, _ := NewOrigin(store)
+	o, _ := NewRangeOrigin(store)
 	r := httptest.NewRequest("GET", "/page", nil)
 	r.Header.Set("X-Racer-Target", "/x")
 	r.Header.Set("Range", "bytes=0-"+strconv.FormatInt(PageSize-1, 10))
@@ -388,59 +398,3 @@ type discardResponse struct{ h http.Header }
 func (w discardResponse) Header() http.Header         { return w.h }
 func (w discardResponse) WriteHeader(int)             {}
 func (w discardResponse) Write(p []byte) (int, error) { return len(p), nil }
-
-type discardWriterAt struct{}
-
-// SDK fixtures deliberately require aligned page fetches, even though origins
-// also serve full objects and arbitrary ranges.
-func pageRange(value string, size int64) (int64, int64, bool) {
-	h := make(http.Header)
-	h.Set("Range", value)
-	start, length, status := objectRange(h, Metadata{Size: size})
-
-	return start, start + length - 1, status == 206 && start%PageSize == 0 && length == min(PageSize, size-start)
-}
-
-func (discardWriterAt) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
-
-func BenchmarkDownload(b *testing.B) {
-	data := payload(int(8 * PageSize))
-	tag := checksumTag(data)
-
-	for _, concurrency := range []int{1, 4, 8} {
-		b.Run(strconv.Itoa(concurrency), func(b *testing.B) {
-			c := newTestClient(b, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("ETag", tag)
-
-				if r.Method == "HEAD" {
-					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-					return
-				}
-
-				start, end, ok := pageRange(r.Header.Get("Range"), int64(len(data)))
-				if !ok {
-					w.WriteHeader(416)
-					return
-				}
-
-				w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-				w.Header().Set("Content-Range", contentRange(start, end, int64(len(data))))
-				w.WriteHeader(206)
-				_, _ = w.Write(data[start : end+1])
-			}), ClientOptions{Concurrency: concurrency})
-			if _, err := c.Download(context.Background(), "/x", discardWriterAt{}); err != nil {
-				b.Fatal(err)
-			}
-
-			b.SetBytes(int64(len(data)))
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
-				if _, err := c.Download(context.Background(), "/x", discardWriterAt{}); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}

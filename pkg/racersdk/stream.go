@@ -33,8 +33,6 @@ type streamPool struct {
 	endpoint string
 	limit    int
 	timeout  time.Duration
-	prefetch bool
-	pending  map[*streamPrefetch]struct{}
 }
 
 func (p *streamPool) get(ctx context.Context) (*streamConn, error) {
@@ -92,13 +90,7 @@ func (p *streamPool) closeIdle() {
 	p.mu.Lock()
 	idle := p.idle
 	p.idle = nil
-	pending := p.pending
-	p.pending = nil
 	p.mu.Unlock()
-
-	for next := range pending {
-		next.discard()
-	}
 
 	for _, c := range idle {
 		_ = c.Close() //nolint:errcheck // Idle connection cleanup.
@@ -136,14 +128,13 @@ func (c *streamConn) response(r *http.Request) (*http.Response, error) {
 
 // Stream reads a pinned snapshot sequentially, issuing one GET per aligned
 // 64 MiB page. It allocates no page-sized buffers. Close cancels blocked I/O.
-// Read and WriteTo are serialized; Close may run concurrently with either.
+// WriteTo calls are serialized; Close may run concurrently with WriteTo.
 type Stream struct {
 	mu                   sync.Mutex
 	object               *Object
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	conn                 *streamConn
-	permit               *requestPermit
 	stop                 func() bool
 	stopped              chan struct{}
 	offset, end, pageEnd int64
@@ -151,14 +142,12 @@ type Stream struct {
 	err                  error
 	closed               bool
 	stats                TransferStats
-	next                 *streamPrefetch
-	pageCancel           context.CancelFunc
 }
 
 // TransferStats distinguishes actual kernel splice traffic from buffered
 // header read-ahead and portable copies. Stats are per stream, not global.
 // BufferedBytes counts bytes read through userspace;
-// SpliceBytes counts bytes successfully forwarded to the destination socket or file.
+// SpliceBytes counts bytes successfully forwarded to the destination socket.
 type TransferStats struct {
 	SpliceBytes   int64
 	SpliceCalls   int64
@@ -215,7 +204,7 @@ func (o *Object) Stream(ctx context.Context) (*Stream, error) {
 
 // ReadRange opens [offset, offset+length), rejecting out-of-bounds intervals.
 // Requests are lazy and pinned by If-Match to Open's HEAD snapshot. Consumption
-// is sequential; ClientOptions.StreamPrefetch optionally prepares one page ahead.
+// is sequential, with one active page request per stream.
 // Close is required even when a caller stops reading early.
 func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, error) {
 	if offset < 0 || length < 0 || offset > o.meta.Size || length > o.meta.Size-offset {
@@ -237,14 +226,6 @@ func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, 
 }
 
 func (s *Stream) release(reuse bool) {
-	defer func() { s.permit.release(); s.permit = nil }()
-
-	if s.pageCancel != nil {
-		defer s.pageCancel()
-
-		s.pageCancel = nil
-	}
-
 	if s.conn == nil {
 		return
 	}
@@ -277,44 +258,13 @@ func (s *Stream) nextPage() error {
 		return fmt.Errorf("%w: bytes beyond response length", ErrProtocol)
 	}
 
-	if s.conn != nil && (s.responseClose || s.object.client.admission != nil || s.next != nil) {
-		s.release(!s.responseClose)
+	if s.conn != nil && s.responseClose {
+		s.release(false)
 	}
 
-	if s.next != nil {
-		next := s.next
-		s.next = nil
-
-		used, err := next.take(s)
-		if err != nil {
-			return err
-		}
-
-		if used {
-			s.startPrefetch()
-			return nil
-		}
-	}
-
-	if s.conn == nil {
-		permit, err := s.object.client.admission.acquire(s.ctx)
-		if err != nil {
-			return err
-		}
-
-		s.permit = permit
-	}
-
-	if err := s.preparePage(); err != nil {
-		return err
-	}
-
-	s.startPrefetch()
-
-	return nil
+	return s.preparePage()
 }
 
-// preparePage uses the permit already owned by s, including speculative permits.
 func (s *Stream) preparePage() error {
 	if err := s.ctx.Err(); err != nil {
 		return err
@@ -329,12 +279,9 @@ func (s *Stream) preparePage() error {
 		s.conn = c
 		s.stopped = make(chan struct{})
 		done := s.stopped
-		permit := s.permit
 
 		s.stop = context.AfterFunc(s.ctx, func() {
 			_ = c.Close() //nolint:errcheck // Cancellation interrupts socket I/O.
-
-			permit.release()
 
 			close(done)
 		})
@@ -374,7 +321,6 @@ func (s *Stream) preparePage() error {
 }
 
 func (s *Stream) finish() error {
-	s.discardPrefetch()
 	s.release(!s.responseClose)
 
 	return io.EOF
@@ -386,17 +332,9 @@ func (s *Stream) fail(err error) error {
 	}
 
 	s.err = err
-	s.discardPrefetch()
 	s.release(false)
 
 	return err
-}
-
-func (s *Stream) Read(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.read(p)
 }
 
 func (s *Stream) read(p []byte) (int, error) {
@@ -446,14 +384,6 @@ func (s *Stream) read(p []byte) (int, error) {
 		return n, err
 	}
 
-	if s.offset == s.pageEnd && s.object.client.admission != nil {
-		if s.conn.reader.Buffered() != 0 {
-			return n, s.fail(fmt.Errorf("%w: bytes beyond response length", ErrProtocol))
-		}
-
-		s.release(!s.responseClose)
-	}
-
 	return n, nil
 }
 
@@ -465,7 +395,6 @@ func (s *Stream) Close() error {
 	defer s.mu.Unlock()
 
 	s.closed = true
-	s.discardPrefetch()
 	s.release(false)
 
 	return nil

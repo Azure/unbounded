@@ -123,7 +123,7 @@ func TestManagementAndOriginSeparation(t *testing.T) {
 
 	c := config{
 		endpoint: path, originSocket: path, listen: "127.0.0.1:0", footprint: 64, objectSize: 64,
-		concurrency: 1, pageConcurrency: 1, timeout: time.Second, ttl: time.Second,
+		concurrency: 1, timeout: time.Second, ttl: time.Second,
 	}
 	if err := serve(ctx, c); err != nil {
 		t.Fatal(err)
