@@ -151,13 +151,13 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 			}
 
 			if mode == "unsupported-hijack" || mode == "failed-hijack" {
-				if fallbacks != 1 || streams != 0 || completed != 1 || recorder.Code != http.StatusOK || !bytes.Equal(recorder.Body.Bytes(), data) {
-					t.Fatal("pre-hijack failure did not complete fallback", fallbacks, streams, completed, recorder.Code)
+				if fallbacks != 0 || len(up.seen) != 0 || streams != 0 || completed != 0 || recorder.Code != http.StatusServiceUnavailable {
+					t.Fatal("pre-hijack failure bypassed Racer", fallbacks, streams, completed, recorder.Code)
 				}
 
-				for _, header := range []string{"Content-Range", "Connection", "ETag", "Accept-Ranges"} {
+				for _, header := range []string{"Content-Range", "Connection", "ETag", "Accept-Ranges", "Docker-Content-Digest", "Content-Length"} {
 					if recorder.Header().Get(header) != "" {
-						t.Error("forwarding header leaked into fallback", header)
+						t.Error("forwarding header leaked into error", header)
 					}
 				}
 			} else if fallbacks != 0 || len(up.seen) != 0 || streams != 1 || streamErr == nil || completed != 0 || fault.closes == 0 || recorder.Body.Len() != 0 {

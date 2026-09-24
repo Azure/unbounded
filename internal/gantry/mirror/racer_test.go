@@ -47,7 +47,7 @@ type metadataOnlyRegistry struct {
 }
 
 func (*metadataOnlyRegistry) Pull(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	panic("Racer fallback must use PullWithMetadata")
+	panic("Racer mirror must not pull directly")
 }
 
 func TestNewRacerInitializationAndNilBackend(t *testing.T) {
@@ -79,12 +79,8 @@ func TestNewRacerInitializationAndNilBackend(t *testing.T) {
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), data) || response.Header().Get("Content-Type") != "application/octet-stream" || fallbacks != 1 || misses != 1 {
-		t.Fatal("nil backend did not use registry metadata", response.Code, response.Header(), fallbacks, misses)
-	}
-
-	if got := <-registry.seen; got != "Bearer delegated" {
-		t.Fatal("lost delegated authorization", got)
+	if response.Code != http.StatusServiceUnavailable || len(registry.seen) != 0 || fallbacks != 0 || misses != 1 {
+		t.Fatal("nil backend bypassed Racer", response.Code, response.Header(), fallbacks, misses)
 	}
 
 	request.Header.Set("Gantry-Mirrored", "1")
@@ -92,7 +88,7 @@ func TestNewRacerInitializationAndNilBackend(t *testing.T) {
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusConflict || fallbacks != 1 {
+	if response.Code != http.StatusConflict || fallbacks != 0 {
 		t.Fatal("constructor did not select Racer mode", response.Code, fallbacks)
 	}
 
@@ -101,7 +97,7 @@ func TestNewRacerInitializationAndNilBackend(t *testing.T) {
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusServiceUnavailable || fallbacks != 1 {
+	if response.Code != http.StatusServiceUnavailable || fallbacks != 0 {
 		t.Fatal("drain did not block fallback", response.Code, fallbacks)
 	}
 }
@@ -281,29 +277,21 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 
 	before := cacheRequests.Load()
 
-	resp, body, err = get("")
-	if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, data) || cacheRequests.Load() != before+1 {
-		t.Fatal("metadata mismatch did not use registry", err)
-	}
-
-	if auth := <-up.seen; auth != "Bearer delegated" {
-		t.Fatal(auth)
+	resp, _, err = get("")
+	if err != nil || resp.StatusCode != 503 || len(up.seen) != 0 || cacheRequests.Load() != before+1 {
+		t.Fatal("metadata mismatch bypassed Racer", err)
 	}
 
 	wrongETag.Store(false)
 
 	before = cacheRequests.Load()
 
-	resp, body, err = get("")
-	if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, data) || cacheRequests.Load() != before {
-		t.Fatal("quarantine did not use registry", err)
+	resp, _, err = get("")
+	if err != nil || resp.StatusCode != 503 || len(up.seen) != 0 || cacheRequests.Load() != before {
+		t.Fatal("quarantine bypassed Racer", err)
 	}
 
-	if auth := <-up.seen; auth != "Bearer delegated" {
-		t.Fatal(auth)
-	}
-
-	if len(results) != 0 || completed.Load() != 4 {
+	if len(results) != 0 || completed.Load() != 2 {
 		t.Fatal("incorrect stream or completion callbacks", len(results), completed.Load())
 	}
 }
@@ -415,12 +403,16 @@ func TestRacerRegistryRangeOriginAndFallback(t *testing.T) {
 				if resp.StatusCode != want || resp.Header.Get("WWW-Authenticate") == "" || ordinary.Load() != 0 {
 					t.Fatal(resp.Status)
 				}
-			} else if resp.StatusCode != 200 || !bytes.Equal(body, data) {
-				t.Fatal(resp.Status, len(body))
+			} else if mode == "ok" {
+				if resp.StatusCode != 200 || !bytes.Equal(body, data) {
+					t.Fatal(resp.Status, len(body))
+				}
+			} else if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatal("Racer failure did not fail closed", resp.Status)
 			}
 
-			if mode != "ok" && mode != "auth401" && mode != "auth403" && mode != "get-auth403" && ordinary.Load() != 1 {
-				t.Fatal("missing ordinary fallback")
+			if ordinary.Load() != 0 {
+				t.Fatal("ordinary registry fallback was called")
 			}
 		})
 	}
@@ -443,7 +435,7 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 		path, mirrored string
 		status         int
 	}{
-		{"/v2/repo/blobs/" + d.String(), "", 200},
+		{"/v2/repo/blobs/" + d.String(), "", 503},
 		{"/v2/repo/manifests/latest", "", 503},
 		{"/v2/repo/blobs/" + d.String(), "1", 409},
 	} {
@@ -470,8 +462,7 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	if len(up.seen) != 0 {
 		t.Fatal("local/tag/incompatible request contacted registry")
 	}
-	// Ordinary fallback forwards same-length corrupt bytes for containerd to
-	// verify at commit, just like the primary raw Racer stream.
+	// Even available registry bytes must not bypass an unavailable Racer backend.
 	corrupt := &authorizationCapturingOrigin{body: bytes.Repeat([]byte("x"), len(data)), seen: make(chan string, 1)}
 
 	bad := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), corrupt, nil).Handler())
@@ -485,8 +476,8 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	body, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	if readErr != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, corrupt.body) || digestOf(body) == d {
-		t.Fatal("corrupt fallback was not fully forwarded", resp.Status, len(body), readErr)
+	if readErr != nil || resp.StatusCode != http.StatusServiceUnavailable || bytes.Equal(body, corrupt.body) || len(corrupt.seen) != 0 {
+		t.Fatal("unavailable Racer contacted registry", resp.Status, len(body), readErr)
 	}
 }
 
@@ -533,11 +524,17 @@ func TestRacerOutageAndEmptyObject(t *testing.T) {
 			body, err := io.ReadAll(resp.Body)
 
 			_ = resp.Body.Close()
-			if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, data) {
+
+			want := http.StatusServiceUnavailable
+			if empty {
+				want = http.StatusOK
+			}
+
+			if err != nil || resp.StatusCode != want || empty && !bytes.Equal(body, data) {
 				t.Fatal(resp.Status, err)
 			}
 
-			if empty && fallbacks.Load() != 0 || !empty && fallbacks.Load() != 1 {
+			if fallbacks.Load() != 0 || len(up.seen) != 0 {
 				t.Fatal("incorrect fallback", fallbacks.Load())
 			}
 		})

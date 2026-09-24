@@ -64,8 +64,8 @@ type Config struct {
 	RacerCacheName string `yaml:"racer_cache_name"`
 	// RacerMetadataTimeout bounds cache HEAD only, not cold-page preparation.
 	RacerMetadataTimeout time.Duration `yaml:"racer_metadata_timeout"`
-	// RacerMaxConcurrentTransfers bounds active cache-miss requests, including
-	// ordinary registry fallback. PeerFetchTimeout bounds each complete transfer.
+	// RacerMaxConcurrentTransfers bounds active Racer requests.
+	// PeerFetchTimeout bounds each complete transfer.
 	RacerMaxConcurrentTransfers int `yaml:"racer_max_concurrent_transfers"`
 	// ---------- Listeners ----------
 
@@ -703,7 +703,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ContentBackend, "content-backend", c.ContentBackend, "content distribution backend (direct or racer)")
 	fs.StringVar(&c.RacerCacheName, "racer-cache-name", c.RacerCacheName, "Racer cache name deriving /dev/racer/<name>/{cache,origin}")
 	fs.DurationVar(&c.RacerMetadataTimeout, "racer-metadata-timeout", c.RacerMetadataTimeout, "Racer HEAD availability budget (cold pages use peer-fetch-timeout)")
-	fs.IntVar(&c.RacerMaxConcurrentTransfers, "racer-max-concurrent-transfers", c.RacerMaxConcurrentTransfers, "maximum active Racer and registry fallback transfers")
+	fs.IntVar(&c.RacerMaxConcurrentTransfers, "racer-max-concurrent-transfers", c.RacerMaxConcurrentTransfers, "maximum active Racer transfers")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")

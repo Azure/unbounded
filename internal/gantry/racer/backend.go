@@ -50,7 +50,7 @@ func (b *Backend) Open(ctx context.Context, ref ifaces.OriginRef) (*sdk.Object, 
 	return view.Open(ctx, target)
 }
 
-// Quarantine bypasses a corrupt target for one minute, bounded to 1024 targets.
+// Quarantine rejects a corrupt target for one minute, bounded to 1024 targets.
 func (b *Backend) Quarantine(ref ifaces.OriginRef) {
 	target, err := Target(ref)
 	if err != nil {

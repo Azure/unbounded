@@ -19,11 +19,9 @@ import (
 // racerState is present only on Racer mirrors, even when the backend is nil.
 type racerState struct {
 	backend              *gantryracer.Backend
-	registry             gantryracer.Registry
 	admission            chan struct{}
 	manifestObservations chan struct{}
 	onStream             func(sdk.TransferStats, bool, error)
-	onFallback           func()
 
 	mu          sync.Mutex
 	draining    bool
@@ -69,12 +67,12 @@ func (s *racerState) unregister(conn net.Conn) {
 type racerForwardOwnership uint8
 
 const (
-	racerFallbackAllowed racerForwardOwnership = iota
+	racerResponseWriterOwned racerForwardOwnership = iota
 	racerConnectionOwned
 )
 
 type racerForwardResult struct {
-	// Once hijack succeeds, fallback is forbidden even if no headers or body
+	// Once hijack succeeds, HTTP error responses are forbidden even if no headers or body
 	// reached the client. Only this helper may write to or close the socket.
 	ownership racerForwardOwnership
 	written   int64
@@ -92,11 +90,12 @@ func (s *racerState) forward(ctx context.Context, cancel context.CancelFunc, w h
 	// connection avoids maintaining a second HTTP keep-alive request parser.
 	conn, buffered, err := http.NewResponseController(w).Hijack()
 	if err != nil {
-		return racerForwardResult{ownership: racerFallbackAllowed, err: err}
+		return racerForwardResult{ownership: racerResponseWriterOwned, err: err}
 	}
 	defer conn.Close() //nolint:errcheck // One response per hijacked connection.
 
 	result := racerForwardResult{ownership: racerConnectionOwned}
+
 	if !s.register(conn, cancel) {
 		result.err = errors.New("mirror: Racer is draining")
 		return result

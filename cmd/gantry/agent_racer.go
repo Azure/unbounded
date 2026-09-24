@@ -80,7 +80,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 	defer originHTTP.Close() //nolint:errcheck // Shutdown cleanup.
 
 	onRacerStream := newRacerStreamMetrics(reg)
-	fallback := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_fallback_total", Help: "Pre-header ordinary registry fallbacks."})
+	reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_fallback_total", Help: "Deprecated compatibility counter; always zero because Racer requests never bypass Racer."})
 	available := reg.NewGauge("racer", prometheus.GaugeOpts{Name: "gantry_racer_available", Help: "Cache and origin UDS and containerd readiness."})
 	tracker := newStreamCommitTracker(store, logger,
 		func(n int) { p9.containerdCommitObserved.Add(float64(n)) },
@@ -95,7 +95,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 
 	server := mirror.NewRacer(c, local, origin, &gantryracer.Backend{Client: client},
 		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
-		mirror.WithRacerMetrics(onRacerStream, fallback.Inc),
+		mirror.WithRacerMetrics(onRacerStream, nil),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
@@ -312,7 +312,7 @@ func racerSocketReady(ctx context.Context, socket, target string) bool {
 // or origin/peer routing. This proves the selected cache UDS can accept, parse
 // and respond, without making rollout readiness depend on other Gantry origins.
 // Require the parser's exact response rather than accepting arbitrary errors.
-// Cache data availability is still enforced per request, with registry fallback;
+// Cache data availability is still enforced per request, without bypassing Racer;
 // this probe does not claim storage health or fleet-wide origin availability.
 func racerCacheSocketReady(ctx context.Context, socket string) bool {
 	return racerProbeSocket(ctx, socket, http.MethodOptions, "/", func(response *http.Response) bool {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -21,7 +20,7 @@ import (
 )
 
 // NewRacer builds a Racer-backend Server with an explicit registry contract.
-// A nil backend sends local misses directly to the registry fallback.
+// A nil backend fails requests until Racer is available.
 func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantryracer.Registry, backend *gantryracer.Backend, opts ...Option) *Server {
 	limit := cfg.RacerMaxConcurrentTransfers
 	if limit <= 0 {
@@ -30,7 +29,6 @@ func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantr
 
 	state := &racerState{
 		backend:              backend,
-		registry:             registry,
 		admission:            make(chan struct{}, limit),
 		manifestObservations: make(chan struct{}, 16),
 	}
@@ -40,11 +38,12 @@ func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantr
 	return newServer(cfg, store, registry, opts...)
 }
 
-// WithRacerMetrics registers Racer forwarding and registry fallback callbacks.
-func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), fallback func()) Option {
+// WithRacerMetrics registers Racer forwarding metrics. The legacy fallback
+// callback is retained for compatibility but is never called.
+func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), _ func()) Option {
 	return func(s *Server) {
 		if s.racer != nil {
-			s.racer.onStream, s.racer.onFallback = stream, fallback
+			s.racer.onStream = stream
 		}
 	}
 }
@@ -80,7 +79,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	if s.racer.backend == nil {
-		s.racerFallback(w, r, ref, logger)
+		writeRacerError(w, nil)
 		return
 	}
 
@@ -100,9 +99,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	metadataCancel()
 
 	if err != nil {
-		if !writeRacerAuthError(w, err) {
-			s.racerFallback(w, r, ref, logger)
-		}
+		writeRacerError(w, err)
 
 		return
 	}
@@ -110,7 +107,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	meta := obj.Metadata()
 	if meta.ETag != `"`+ref.Digest.Hex()+`"` {
 		s.racer.backend.Quarantine(ref)
-		s.racerFallback(w, r, ref, logger)
+		writeRacerError(w, gantryracer.ErrQuarantined)
 
 		return
 	}
@@ -139,16 +136,14 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	if err != nil {
-		s.racerFallback(w, r, ref, logger)
+		writeRacerError(w, err)
 		return
 	}
 
 	if err = stream.Prepare(); err != nil {
 		_ = stream.Close() //nolint:errcheck // Preparation failed before forwarding takes ownership.
 
-		if !writeRacerAuthError(w, err) {
-			s.racerFallback(w, r, ref, logger)
-		}
+		writeRacerError(w, err)
 
 		return
 	}
@@ -159,7 +154,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	// Keep forwarding headers private until hijack succeeds, so a failed
-	// hijack leaves the ResponseWriter available for a clean registry fallback.
+	// hijack leaves the ResponseWriter available for a clean error response.
 	header := w.Header().Clone()
 	racerHeaders(header, ref, meta, length)
 	header.Set("Connection", "close")
@@ -169,8 +164,8 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	result := s.racer.forward(streamCtx, cancel, w, stream, status, header)
-	if result.ownership == racerFallbackAllowed {
-		s.racerFallback(w, r, ref, logger)
+	if result.ownership == racerResponseWriterOwned {
+		writeRacerError(w, result.err)
 		return
 	}
 
@@ -205,23 +200,38 @@ func racerHeaders(h http.Header, ref ifaces.OriginRef, meta sdk.Metadata, length
 	}
 }
 
-func writeRacerAuthError(w http.ResponseWriter, err error) bool {
+// Only forward bounded SDK error metadata, never an upstream body or raw error
+// that could contain request credentials. Other failures are retryable outages.
+func writeRacerError(w http.ResponseWriter, err error) {
+	code := http.StatusServiceUnavailable
+	message := "Racer content unavailable"
+
+	w.Header().Set("Retry-After", "1")
+
 	var status *sdk.HTTPError
-	if !errors.As(err, &status) || (status.StatusCode != 401 && status.StatusCode != 403) {
-		return false
+	if errors.As(err, &status) {
+		switch status.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			code, message = status.StatusCode, "registry authorization rejected"
+			if status.WWWAuthenticate != "" {
+				w.Header().Set("WWW-Authenticate", status.WWWAuthenticate)
+			}
+		case http.StatusNotFound:
+			code, message = status.StatusCode, "content not found"
+		case http.StatusTooManyRequests:
+			code = status.StatusCode
+		}
+
+		if code != http.StatusServiceUnavailable {
+			w.Header().Del("Retry-After")
+		}
+
+		if status.RetryAfter != "" {
+			w.Header().Set("Retry-After", status.RetryAfter)
+		}
 	}
 
-	if status.WWWAuthenticate != "" {
-		w.Header().Set("WWW-Authenticate", status.WWWAuthenticate)
-	}
-
-	if status.RetryAfter != "" {
-		w.Header().Set("Retry-After", status.RetryAfter)
-	}
-
-	http.Error(w, "registry authorization rejected", status.StatusCode)
-
-	return true
+	http.Error(w, message, code)
 }
 
 func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64, partial, invalid bool) {
@@ -273,128 +283,4 @@ func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64
 	}
 
 	return start, end - start + 1, true, false
-}
-
-// racerFallback uses the original delegated context. Range is deliberately
-// ignored with a full 200 response. Like raw Racer forwarding, it leaves OCI
-// digest verification to containerd while checking transport and declared size.
-func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, logger *slog.Logger) {
-	// net/http's header timeout does not bound response writes. Cancellation
-	// must also interrupt a Write blocked on a downstream that stopped reading.
-	controller := http.NewResponseController(w)
-
-	deadline, _ := r.Context().Deadline()
-	if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		panic(http.ErrAbortHandler)
-	}
-
-	interrupted := make(chan struct{})
-	stop := context.AfterFunc(r.Context(), func() {
-		_ = controller.SetWriteDeadline(time.Now()) //nolint:errcheck // Best-effort interruption during cancellation.
-
-		close(interrupted)
-	})
-
-	defer func() {
-		if !stop() {
-			<-interrupted
-		}
-
-		// Leave the deadline in place for net/http's final header/chunk flush.
-		// The server resets it after finishing this response, before keep-alive.
-	}()
-
-	if s.racer.onFallback != nil {
-		s.racer.onFallback()
-	}
-
-	if r.Method == http.MethodHead {
-		size, ct, err := s.racer.registry.Head(r.Context(), ref)
-		if err != nil {
-			writeOriginError(w, err, logger)
-			return
-		}
-
-		h := w.Header()
-		h.Set("Docker-Content-Digest", ref.Digest.String())
-
-		h["Content-Type"] = nil
-		if ct != "" {
-			h.Set("Content-Type", ct)
-		}
-
-		if size >= 0 {
-			h.Set("Content-Length", strconv.FormatInt(size, 10))
-		}
-
-		w.WriteHeader(http.StatusOK)
-
-		return
-	}
-
-	// HTTP/1.0 close-delimited bodies cannot distinguish an abort from success.
-	if !r.ProtoAtLeast(1, 1) {
-		http.Error(w, "registry streaming requires HTTP/1.1 or later", http.StatusHTTPVersionNotSupported)
-		return
-	}
-
-	s.fireOriginStreamStarted(ref.Kind)
-
-	body, size, contentType, err := s.racer.registry.PullWithMetadata(r.Context(), ref)
-	if err != nil {
-		s.fireOriginStreamFailed(ref.Kind)
-		writeOriginError(w, err, logger)
-
-		return
-	}
-
-	defer body.Close() //nolint:errcheck // Upstream response cleanup.
-
-	w.Header().Set("Docker-Content-Digest", ref.Digest.String())
-
-	w.Header()["Content-Type"] = nil
-	if contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	}
-
-	// Do not expose the declared length as downstream framing: reaching it
-	// cannot signal success before we check EOF for overruns or late errors.
-	// Flushing headers also prevents net/http from synthesizing Content-Length
-	// for small/empty bodies. HTTP/1.1 uses chunks; HTTP/2 uses stream termination.
-	w.Header().Del("Content-Length")
-	w.WriteHeader(http.StatusOK)
-
-	err = controller.Flush()
-
-	var written int64
-	if err == nil {
-		written, err = io.Copy(w, body)
-	}
-
-	if err == nil && size >= 0 && written != size {
-		err = fmt.Errorf("origin size mismatch: declared %d, forwarded %d", size, written)
-	}
-
-	if err == nil {
-		err = r.Context().Err()
-	}
-
-	if err == nil {
-		err = controller.Flush()
-	}
-
-	s.fireMirrorBytesServed(ref.Kind, "origin", written)
-
-	if err != nil {
-		s.fireOriginStreamFailed(ref.Kind)
-		// Abort chunked framing too: net/http must not emit the final chunk.
-		panic(http.ErrAbortHandler)
-	}
-
-	// Completion reports forwarding only, including same-length corrupt bytes.
-	// Containerd's later digest-checked commit is observed separately.
-	s.fireOriginStreamCompleted(ref.Kind)
-	s.fireMirrorResponseCompleted(ref.Digest, ref.Kind, "origin")
-	s.fireLiveStreamCompleted(ref.Digest)
-	s.firePrefetch(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
 }
