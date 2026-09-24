@@ -14,6 +14,14 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
+	if c.ArtifactStreamingEnabled {
+		t.Fatal("ArtifactStreamingEnabled = true, want disabled by default")
+	}
+
+	if c.ArtifactStreamingPeerLookupTimeout != 250*time.Millisecond || c.ArtifactStreamingMaxPeerAttempts != 3 {
+		t.Fatalf("artifact streaming peer defaults = %v/%d, want 250ms/3", c.ArtifactStreamingPeerLookupTimeout, c.ArtifactStreamingMaxPeerAttempts)
+	}
+
 	if c.OriginPullProgressTimeout != 5*time.Minute {
 		t.Fatalf("OriginPullProgressTimeout = %v, want 5m", c.OriginPullProgressTimeout)
 	}
@@ -73,6 +81,97 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestArtifactStreamingConfig(t *testing.T) {
+	t.Run("YAML", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadYAML(strings.NewReader(`
+artifact_streaming_enabled: true
+artifact_streaming_allowed_host_suffixes:
+  - .data.azurecr.io
+artifact_streaming_peer_lookup_timeout: 100ms
+artifact_streaming_max_peer_attempts: 2
+artifact_streaming_max_concurrent_origin_reads: 8
+artifact_streaming_origin_response_header_timeout: 5s
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled || len(c.ArtifactStreamingAllowedHostSuffixes) != 1 ||
+			c.ArtifactStreamingPeerLookupTimeout != 100*time.Millisecond || c.ArtifactStreamingMaxPeerAttempts != 2 ||
+			c.ArtifactStreamingMaxConcurrentOriginReads != 8 || c.ArtifactStreamingOriginResponseHeaderTimeout != 5*time.Second {
+			t.Fatalf("unexpected artifact streaming config: %+v", c)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			switch key {
+			case "GANTRY_ARTIFACT_STREAMING_ENABLED":
+				return "true"
+			case "GANTRY_ARTIFACT_STREAMING_MAX_PEER_ATTEMPTS":
+				return "4"
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled || c.ArtifactStreamingMaxPeerAttempts != 4 {
+			t.Fatalf("enabled/attempts = %v/%d, want true/4", c.ArtifactStreamingEnabled, c.ArtifactStreamingMaxPeerAttempts)
+		}
+	})
+
+	t.Run("flags", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--artifact-streaming-enabled", "--artifact-streaming-peer-lookup-timeout=75ms"}); err != nil {
+			t.Fatal(err)
+		}
+
+		if !c.ArtifactStreamingEnabled || c.ArtifactStreamingPeerLookupTimeout != 75*time.Millisecond {
+			t.Fatalf("enabled/timeout = %v/%v, want true/75ms", c.ArtifactStreamingEnabled, c.ArtifactStreamingPeerLookupTimeout)
+		}
+	})
+}
+
+func TestValidateArtifactStreaming(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		field  string
+	}{
+		{name: "empty hosts", mutate: func(c *Config) { c.ArtifactStreamingEnabled = true; c.ArtifactStreamingAllowedHostSuffixes = nil }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "invalid host", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"https://example.com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "wildcard host", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"*.example.com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "empty label", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"example..com"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "leading hyphen", mutate: func(c *Config) { c.ArtifactStreamingAllowedHostSuffixes = []string{"-bad.example"} }, field: "artifact_streaming_allowed_host_suffixes"},
+		{name: "zero lookup", mutate: func(c *Config) { c.ArtifactStreamingPeerLookupTimeout = 0 }, field: "artifact_streaming_peer_lookup_timeout"},
+		{name: "zero attempts", mutate: func(c *Config) { c.ArtifactStreamingMaxPeerAttempts = 0 }, field: "artifact_streaming_max_peer_attempts"},
+		{name: "zero concurrency", mutate: func(c *Config) { c.ArtifactStreamingMaxConcurrentOriginReads = 0 }, field: "artifact_streaming_max_concurrent_origin_reads"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			test.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("Validate error = %v, want %s", err, test.field)
+			}
+		})
 	}
 }
 
