@@ -48,10 +48,7 @@ func TestIntegrationTransitionsFromSignedOriginToCompletePeer(t *testing.T) {
 
 	policy := streaming.URLPolicy{AllowedHostSuffixes: []string{"localhost"}, AllowHTTP: true}
 
-	originClient, err := streaming.NewOriginClient(policy, 2, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	originClient := streaming.NewOriginClient(policy)
 
 	discovery := &discoveryStub{}
 

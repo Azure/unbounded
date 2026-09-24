@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/httprange"
@@ -45,10 +44,7 @@ func TestOriginClientFetchRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := streaming.NewOriginClient(policy, 1, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := streaming.NewOriginClient(policy)
 
 	rc, total, _, err := client.FetchRange(context.Background(), origin, httprange.Range{Start: 2, End: 5})
 	if err != nil {
@@ -89,10 +85,7 @@ func TestOriginClientRejectsInvalidRangeResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := streaming.NewOriginClient(policy, 1, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := streaming.NewOriginClient(policy)
 
 	rc, _, _, err := client.FetchRange(context.Background(), origin, httprange.Range{Start: 2, End: 5})
 	if rc != nil {
@@ -127,10 +120,7 @@ func TestOriginClientRedirectRequiresSameDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := streaming.NewOriginClient(policy, 1, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := streaming.NewOriginClient(policy)
 
 	_, _, _, err = client.FetchRange(context.Background(), origin, httprange.Range{Start: 0, End: 0})
 	if err == nil || strings.Contains(err.Error(), "d=sha256") {
@@ -148,14 +138,7 @@ func TestOriginClientInvalidRequestErrorDoesNotExposeSignedQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := streaming.NewOriginClient(
-		streaming.URLPolicy{AllowedHostSuffixes: []string{"localhost"}, AllowHTTP: true},
-		1,
-		time.Second,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := streaming.NewOriginClient(streaming.URLPolicy{AllowedHostSuffixes: []string{"localhost"}, AllowHTTP: true})
 
 	_, _, _, err = client.FetchRange(context.Background(), streaming.OriginURL{
 		Raw:    "://invalid?sig=" + secret,

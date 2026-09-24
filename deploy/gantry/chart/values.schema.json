@@ -201,7 +201,6 @@
       "required": [
         "enabled",
         "address",
-        "logLevel",
         "image",
         "nodeSelector",
         "tolerations"
@@ -213,11 +212,6 @@
         "address": {
           "type": "string",
           "pattern": "^http://localhost:[0-9]+/blobs$"
-        },
-        "logLevel": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 3
         },
         "image": {
           "type": "object",
@@ -346,11 +340,7 @@
           "additionalProperties": false,
           "required": [
             "enabled",
-            "allowedHostSuffixes",
-            "peerLookupTimeout",
-            "maxPeerAttempts",
-            "maxConcurrentOriginReads",
-            "originResponseHeaderTimeout"
+            "allowedHostSuffixes"
           ],
           "properties": {
             "enabled": {
@@ -363,22 +353,6 @@
                 "type": "string",
                 "minLength": 1
               }
-            },
-            "peerLookupTimeout": {
-              "type": "string",
-              "minLength": 1
-            },
-            "maxPeerAttempts": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "maxConcurrentOriginReads": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "originResponseHeaderTimeout": {
-              "type": "string",
-              "minLength": 1
             }
           }
         },
