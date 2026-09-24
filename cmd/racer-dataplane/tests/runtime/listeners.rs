@@ -857,7 +857,15 @@ fn local_fixture(
     v.peers.clear();
     let topology = v.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
-    topology.neighbors.clear();
+    topology.product = Some(crate::control::proto::ProductTopology {
+        left_factor: 1,
+        right_factor: 1,
+        members: vec!["02".repeat(32)],
+        roles: vec![0],
+        local_member: 0,
+        candidate_width: 1,
+        candidates: vec![0; topology.slot_count as usize],
+    });
     (trust, config)
 }
 
@@ -872,7 +880,13 @@ fn peer_fixture(
     v.cache_socket = crate::control::tests::test_socket(a, "cache");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers = vec![peer.clone()];
-    v.topology.as_mut().unwrap().neighbors[0].peer = peer;
+    v.topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = peer;
     (trust, config)
 }
 

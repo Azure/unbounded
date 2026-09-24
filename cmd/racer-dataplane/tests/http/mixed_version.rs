@@ -9,7 +9,7 @@ pub(super) fn cycle_handler(epoch: u64, remote: &str, address: std::net::SocketA
     volume.peers = vec![remote.into()];
     let topology = volume.topology.as_mut().unwrap();
     topology.epoch = epoch;
-    topology.neighbors[0].peer = remote.into();
+    topology.product.as_mut().unwrap().members[1] = remote.into();
     let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
     // Both independently converging nodes currently believe they own slot zero.
     let backend = Backend::new("127.0.0.1:1", "cycle-origin").unwrap();

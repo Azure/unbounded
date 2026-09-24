@@ -27,15 +27,14 @@ pub(crate) mod tests {
         config.peers[0].fabric = config.fabric.clone();
         config.volumes[0].peers = vec![config.peers[0].id.clone()];
         config.volumes[0].topology = Some(proto::Topology {
-            product: None,
+            product: Some(proto::ProductTopology {
+                left_factor: 1, right_factor: 2, members: vec!["02".repeat(32), "03".repeat(32)], roles: vec![0, 1],
+                local_member: if node == 2 { 0 } else { 1 }, candidate_width: 2, candidates: vec![0, 1, 1, 0],
+            }),
             routing_algorithm: Some(1),
             epoch: 1,
             slot_count: 2,
             local_slots: vec![if node == 2 { 0 } else { 1 }],
-            neighbors: vec![proto::SlotPeer {
-                slot: if node == 2 { 1 } else { 0 },
-                peer: config.peers[0].id.clone(),
-            }],
         });
         change(&mut config);
         control::tests::scope_peers(&mut config);

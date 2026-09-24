@@ -7,10 +7,7 @@ use super::{
     routing::{Algorithm, Cursor, Routing, invalid},
 };
 use crate::{product::Product, topology::Topology};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io,
-};
+use std::{collections::BTreeSet, io};
 
 pub(super) struct Physical {
     pub(super) config: proto::ProductTopology,
@@ -117,7 +114,6 @@ impl Routing {
             || config.candidate_width as usize > count
             || config.candidates.len()
                 != geometry.slot_count() as usize * config.candidate_width as usize
-            || !topology.neighbors.is_empty()
             || config.members.windows(2).any(|w| w[0] >= w[1])
             || config
                 .members
@@ -176,7 +172,7 @@ impl Routing {
             return Err(invalid());
         }
         let mut hash = blake3::Hasher::new();
-        hash.update(b"racer/product-routing/v2");
+        hash.update(b"racer/product-routing/v1");
         for bytes in [universe, volume.id.as_bytes()] {
             hash.update(&(bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
@@ -203,13 +199,12 @@ impl Routing {
             algorithm: Algorithm::Product,
             geometry,
             local,
-            neighbors: BTreeMap::new(),
             identity: *hash.finalize().as_bytes(),
-            product: Some(Physical {
+            product: Physical {
                 config,
                 graph,
                 bundles,
-            }),
+            },
             #[cfg(test)]
             namespace: crate::cache::Namespace::volume(
                 universe,
@@ -221,7 +216,7 @@ impl Routing {
     }
 
     pub(super) fn validate_product(&self, c: &Cursor) -> io::Result<()> {
-        let p = self.product.as_ref().ok_or_else(invalid)?;
+        let p = &self.product;
         if c.algorithm != Algorithm::Product
             || c.identity != self.identity
             || c.owner >= self.geometry.slot_count()
@@ -254,7 +249,7 @@ impl Routing {
     /// Only the caller holding evidence about this immediate exchange may invoke repair.
     pub fn repair(&self, c: &Cursor) -> io::Result<Cursor> {
         self.validate_product(c)?;
-        let p = self.product.as_ref().ok_or_else(invalid)?;
+        let p = &self.product;
         if c.failed != u32::MAX || c.path[c.position as usize] != p.config.local_member {
             return Err(invalid());
         }

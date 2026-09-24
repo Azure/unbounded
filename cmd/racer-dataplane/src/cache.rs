@@ -1729,7 +1729,7 @@ impl Cache {
                     routing: [0; 32],
                     version: 0,
                     destination: 0,
-                    dependency: crate::buffers::NetworkDependency::Canonical { slot: 0 },
+                    dependency: crate::buffers::NetworkDependency::LocalShared,
                 });
             }
             // Isolate only request flights. Routing, dependencies, slab keys and

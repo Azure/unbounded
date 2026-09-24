@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -357,8 +356,7 @@ impl Topology {
                 || !ids.insert(&volume.id)
                 || volume.slots == 0
                 || volume.slots > SLOT_COUNT
-                || ![ROUTING_ALGORITHM, PRODUCT_ROUTING_ALGORITHM]
-                    .contains(&volume.routing_algorithm)
+                || volume.routing_algorithm != PRODUCT_ROUTING_ALGORITHM
                 || !(1..=8).contains(&volume.max_candidate_attempts)
                 || (!volume.owners.is_empty() && volume.owners.len() != volume.slots as usize)
                 || [&volume.cache_socket, &volume.origin_socket]
@@ -413,38 +411,19 @@ impl Topology {
         for name in self.generation.nodes.keys() {
             let (mut work, mut records, mut wire) =
                 (0u64, self.members.members.len() as u64, membership_bytes);
-            for (v, local) in self.generation.volumes.iter().zip(&self.local) {
-                if v.routing_algorithm == PRODUCT_ROUTING_ALGORITHM {
-                    if let Some(product) = &self.generation.product {
-                        if let Ok(index) = product
-                            .members
-                            .binary_search(&self.generation.nodes[name].id)
-                        {
-                            let direct =
-                                peer_counts.as_ref().unwrap()[product.roles[index] as usize];
-                            let (w, r, b) = crate::product_topology::budget(product, v, direct)?;
-                            work += w;
-                            records += r;
-                            wire += b;
-                        }
+            for v in &self.generation.volumes {
+                if let Some(product) = &self.generation.product {
+                    if let Ok(index) = product
+                        .members
+                        .binary_search(&self.generation.nodes[name].id)
+                    {
+                        let direct = peer_counts.as_ref().unwrap()[product.roles[index] as usize];
+                        let (w, r, b) = crate::product_topology::budget(product, v, direct)?;
+                        work += w;
+                        records += r;
+                        wire += b;
                     }
-                    continue;
                 }
-                let l = local.get(name.as_str()).map_or(0, |s| s.len()) as u64;
-                if l == 0 {
-                    continue;
-                }
-                let p = u64::from(v.slots);
-                let d = u64::from(degree(v.slots));
-                let edges = (p - l).min(l * d);
-                let direct = (local.len() as u64 - 1).min(2 * l * d);
-                work += 64 * l;
-                records += l + edges + 4 * direct;
-                wire += 5 * l
-                    + 80 * edges
-                    + 2048 * direct
-                    + (v.cache_socket.len() + v.origin_socket.len() + v.id.len()) as u64
-                    + 1024;
             }
             if work > 64 * 1024 * 1024
                 || records > 2 * 1024 * 1024
@@ -477,118 +456,23 @@ impl Topology {
         };
         let mut peers = BTreeMap::new();
         for (v, local) in g.volumes.iter().zip(&self.local) {
-            if v.routing_algorithm == PRODUCT_ROUTING_ALGORITHM {
-                if let Some(product) = &g.product {
-                    if let Ok(index) = product
-                        .members
-                        .binary_search_by(|member| member.as_str().cmp(id))
-                    {
-                        let (volume, direct) = crate::product_topology::snapshot(
-                            g,
-                            product,
-                            v,
-                            index,
-                            local.get(name).cloned().unwrap_or_default(),
-                            &self.by_id,
-                        );
-                        snapshot.volumes.push(volume);
-                        peers.extend(direct);
-                    }
-                }
-                continue;
-            }
-            let Some(slots) = local.get(name) else {
-                continue;
-            };
-            let p = v.slots as usize;
-            let d = degree(v.slots) as usize;
-            let mut outgoing = BTreeSet::new();
-            let mut direct_slots = BTreeSet::new();
-            let mut dense_outgoing = (slots.len() * d > p).then(|| vec![false; p]);
-            let mut dense_direct = dense_outgoing.as_ref().map(|_| vec![false; p]);
-            for &slot in slots {
-                for digit in 0..d {
-                    let next = (slot as usize * d + digit) % p;
-                    let incoming = (slot as usize + digit * p) / d;
-                    if let (Some(out), Some(direct)) = (&mut dense_outgoing, &mut dense_direct) {
-                        out[next] = true;
-                        direct[next] = true;
-                        direct[incoming] = true;
-                    } else {
-                        outgoing.insert(next);
-                        direct_slots.insert(next);
-                        direct_slots.insert(incoming);
-                    }
-                }
-            }
-            let mut neighbors = Vec::new();
-            let mut out = BTreeSet::new();
-            let mut direct = BTreeMap::new();
-            let edge_slots: Box<dyn Iterator<Item = usize>> = if let Some(direct) = dense_direct {
-                Box::new(
-                    direct
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(slot, present)| present.then_some(slot)),
-                )
-            } else {
-                Box::new(direct_slots.into_iter())
-            };
-            for slot in edge_slots {
-                let owner = &v.owners[slot];
-                if owner == name {
-                    continue;
-                }
-                let remote = &g.nodes[owner];
-                if dense_outgoing
-                    .as_ref()
-                    .map_or_else(|| outgoing.contains(&slot), |out| out[slot])
+            if let Some(product) = &g.product {
+                if let Ok(index) = product
+                    .members
+                    .binary_search_by(|member| member.as_str().cmp(id))
                 {
-                    neighbors.push(proto::SlotPeer {
-                        slot: slot as u32,
-                        peer: remote.id.clone(),
-                    });
-                    out.insert(remote.id.clone());
-                }
-                {
-                    direct
-                        .entry(remote.id.clone())
-                        .or_insert_with(|| proto::Peer {
-                            id: remote.id.clone(),
-                            fabric: remote.fabric.clone(),
-                            http_address: SocketAddr::new(remote.ip.unwrap(), 9443).to_string(),
-                            pod_uid: remote.pod_uid.clone(),
-                        });
+                    let (volume, direct) = crate::product_topology::snapshot(
+                        g,
+                        product,
+                        v,
+                        index,
+                        local.get(name).cloned().unwrap_or_default(),
+                        &self.by_id,
+                    );
+                    snapshot.volumes.push(volume);
+                    peers.extend(direct);
                 }
             }
-            let endpoints = proto::VolumePeerEndpoints {
-                peers: direct
-                    .values()
-                    .map(|p| proto::VolumePeerEndpoint {
-                        peer: p.id.clone(),
-                        http_address: p.http_address.clone(),
-                    })
-                    .collect(),
-            };
-            peers.extend(direct);
-            snapshot.volumes.push(proto::Volume {
-                id: v.id.clone(),
-                cache_generation: v.cache_generation,
-                peers: out.into_iter().collect(),
-                cache_socket: v.cache_socket.clone(),
-                origin_socket: v.origin_socket.clone(),
-                max_candidate_attempts: Some(v.max_candidate_attempts),
-                peer_endpoints: Some(endpoints),
-                topology: Some(proto::Topology {
-                    epoch: g.revision,
-                    slot_count: v.slots,
-                    local_slots: slots.clone(),
-                    neighbors,
-                    routing_algorithm: Some(v.routing_algorithm),
-                    product: None,
-                }),
-                member_catalog: Some(0),
-            });
         }
         snapshot.peers = peers.into_values().collect();
         if !snapshot.volumes.is_empty() {

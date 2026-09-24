@@ -633,7 +633,6 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
         epoch: 2,
         slot_count: 2,
         local_slots: vec![0, 1],
-        neighbors: vec![],
     });
     config.peers.clear();
     let second = address();

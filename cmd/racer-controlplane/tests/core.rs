@@ -9,7 +9,7 @@ use racer_controlplane::model::*;
 mod publication;
 use publication::*;
 use racer_controlplane::storage::*;
-use racer_controlplane::topology::{Topology, compile, degree, place_in_universe};
+use racer_controlplane::topology::{Topology, compile, place_in_universe};
 
 fn inventory(count: usize) -> Inventory {
     Inventory {
@@ -46,47 +46,14 @@ fn inventory(count: usize) -> Inventory {
 
 fn geometry(slots: u32, count: usize) -> Generation {
     let input = inventory(count);
-    let mut g = Generation::empty(&input.universe);
+    let mut g = compile(&input, None).unwrap();
     g.revision = 7;
-    for node in &input.nodes {
-        let p = &node.pods[0];
-        g.nodes.insert(
-            node.name.clone(),
-            Member {
-                id: identity("node", &node.uid),
-                ip: Some(p.ip.parse().unwrap()),
-                fabric: node.fabric.clone(),
-                pod_uid: p.uid.clone(),
-                pod_namespace: p.namespace.clone(),
-                pod_name: p.name.clone(),
-            },
-        );
-    }
-    let names: BTreeMap<_, _> = g
-        .nodes
-        .iter()
-        .map(|(name, m)| (m.id.clone(), name.clone()))
-        .collect();
-    g.volumes.push(Volume {
-        id: "cache-uid".into(),
-        name: "cache-a".into(),
-        resource_generation: 1,
-        cache_socket: "/dev/racer/cache-a/cache".into(),
-        origin_socket: "/dev/racer/cache-a/origin".into(),
-        slots,
-        cache_generation: 0,
-        routing_algorithm: ROUTING_ALGORITHM,
-        max_candidate_attempts: 3,
-        owners: place_in_universe(
-            slots,
-            &g.universe,
-            &names.keys().cloned().collect::<Vec<_>>(),
-        )
-        .unwrap()
-        .into_iter()
-        .map(|id| names[&id].clone())
-        .collect(),
-    });
+    g.volumes[0].slots = slots;
+    g.volumes[0].owners.truncate(slots as usize);
+    let product = g.product.as_mut().unwrap();
+    product
+        .candidates
+        .truncate(slots as usize * product.candidate_width as usize);
     g
 }
 
@@ -269,7 +236,6 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
         second.name = "other".into();
         second.cache_socket = "/dev/racer/other/cache".into();
         second.origin_socket = "/dev/racer/other/origin".into();
-        second.owners.rotate_left(1);
         g.volumes.push(second);
         let topology = Topology::new(&g).unwrap();
         for (name, member) in &g.nodes {
@@ -281,43 +247,27 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
             );
             assert_eq!(snapshot.revision, 7);
             let mut all_direct = BTreeSet::new();
-            assert_eq!(
-                snapshot.idle,
-                g.volumes.iter().all(|v| !v.owners.contains(name))
-            );
-            assert_eq!(
-                snapshot.volumes.len(),
-                g.volumes.iter().filter(|v| v.owners.contains(name)).count()
-            );
+            assert_eq!(snapshot.idle, false);
+            assert_eq!(snapshot.volumes.len(), g.volumes.len());
             for actual in &snapshot.volumes {
                 let v = g.volumes.iter().find(|v| v.id == actual.id).unwrap();
-                let mut edges = BTreeMap::new();
-                let mut direct = BTreeSet::new();
-                for source in 0..p {
-                    for digit in 0..degree(p) {
-                        let dest = (source * degree(p) + digit) % p;
-                        let from = &v.owners[source as usize];
-                        let to = &v.owners[dest as usize];
-                        if from == name && to != name {
-                            edges.insert(dest, g.nodes[to].id.clone());
-                            direct.insert(g.nodes[to].id.clone());
-                        }
-                        if to == name && from != name {
-                            direct.insert(g.nodes[from].id.clone());
-                        }
-                    }
-                }
                 let actual_top = actual.topology.as_ref().unwrap();
+                let product = actual_top.product.as_ref().unwrap();
+                let graph = racer_controlplane::product::Product::new(
+                    product.left_factor,
+                    product.right_factor,
+                )
+                .unwrap();
+                let adjacent = graph.neighbors(product.roles[product.local_member as usize]);
+                let direct: BTreeSet<_> = product
+                    .members
+                    .iter()
+                    .zip(&product.roles)
+                    .filter(|(_, role)| adjacent.contains(role))
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 assert_eq!(actual_top.epoch, 7);
                 assert_eq!(actual_top.routing_algorithm, Some(1));
-                assert_eq!(
-                    actual_top
-                        .neighbors
-                        .iter()
-                        .map(|e| (e.slot, e.peer.clone()))
-                        .collect::<BTreeMap<_, _>>(),
-                    edges
-                );
                 assert_eq!(
                     actual_top.local_slots,
                     v.owners
@@ -329,7 +279,7 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
                 );
                 assert_eq!(
                     actual.peers.iter().cloned().collect::<BTreeSet<_>>(),
-                    edges.into_values().collect()
+                    direct
                 );
                 assert_eq!(
                     actual
@@ -396,11 +346,11 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
     let mut legacy = compile(&input, Some(&new)).unwrap();
     legacy.product = None;
     for volume in &mut legacy.volumes {
-        volume.routing_algorithm = ROUTING_ALGORITHM;
+        volume.routing_algorithm = PRODUCT_ROUTING_ALGORITHM;
     }
     assert!(
         Topology::new(&legacy).is_err(),
-        "five legacy full local volumes exceed profile work budget"
+        "product topology is mandatory"
     );
     let mut malformed = new.clone();
     malformed.volumes[0].owners.pop();
@@ -663,7 +613,7 @@ fn ten_thousand_members_have_sparse_recipient_snapshots() {
         let snapshot = topology.snapshot(&g.nodes[name].id).unwrap();
         let top = snapshot.volumes[0].topology.as_ref().unwrap();
         assert!((1..=64).contains(&top.local_slots.len()));
-        assert!(top.neighbors.len() <= top.local_slots.len() * 64);
+        assert!(top.product.is_some());
         assert!(snapshot.peers.len() <= top.local_slots.len() * 128);
         assert!(snapshot.peers.len() < g.nodes.len());
         assert!(snapshot.encoded_len() < 4 * 1024 * 1024);
@@ -682,17 +632,10 @@ fn ten_thousand_members_have_sparse_recipient_snapshots() {
 
 #[test]
 fn placement_independent_membership_compiler_to_dataplane() {
-    let mut old = geometry(64, 16);
-    old.volumes[0].owners = (0..64).map(|s| format!("node-{:05}", s % 16)).collect();
+    let old = geometry(64, 16);
     let mut new = old.clone();
     new.revision += 1;
-    for owner in &mut new.volumes[0].owners {
-        if owner == "node-00000" {
-            *owner = "node-00007".into();
-        } else if owner == "node-00007" {
-            *owner = "node-00000".into();
-        }
-    }
+    new.product.as_mut().unwrap().roles.swap(0, 7);
     // Same inventory participates in every selected volume. One catalog, not
     // sixteen copies of process identities or expanded per-volume endpoint maps.
     for i in 1..16 {
@@ -703,22 +646,12 @@ fn placement_independent_membership_compiler_to_dataplane() {
         new.volumes.push(v);
     }
     let a = &old.nodes["node-00000"].id;
-    let b = &old.nodes["node-00002"].id;
     let old_top = Topology::new(&old).unwrap();
     let new_top = Topology::new(&new).unwrap();
     let before = old_top.snapshot(a).unwrap();
+    let b = &before.volumes[0].peers[0];
     let after = new_top.snapshot(b).unwrap();
-    assert_eq!(degree(64), 4);
     assert!(before.volumes[0].peers.contains(b));
-    assert!(!after.peers.iter().any(|p| &p.id == a));
-    assert!(
-        !new_top
-            .snapshot(a)
-            .unwrap()
-            .peers
-            .iter()
-            .any(|p| &p.id == b)
-    );
     assert_eq!(after.member_catalogs.len(), 1);
     assert_eq!(after.member_catalogs[0].members.len(), 16);
     assert!(after.volumes.iter().all(|v| v.member_catalog == Some(0)));

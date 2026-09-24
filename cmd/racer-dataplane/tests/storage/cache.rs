@@ -622,7 +622,7 @@ pub(crate) mod tests {
                 routing: [7; 32],
                 version: 2,
                 destination: 3,
-                dependency: crate::buffers::NetworkDependency::Canonical { slot: 1 },
+                dependency: crate::buffers::NetworkDependency::LocalShared,
             }),
             ..Fake::default()
         }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::collections::BTreeMap;
 
 pub(crate) fn volume(
     left: u32,
@@ -29,7 +30,7 @@ pub(crate) fn volume(
             } else {
                 vec![]
             },
-            routing_algorithm: Some(2),
+            routing_algorithm: Some(1),
             product: Some(proto::ProductTopology {
                 left_factor: left,
                 right_factor: right,
@@ -125,7 +126,7 @@ fn bundles_candidates_and_validation() {
         assert!(Routing::new(&[1; 32], &bad).is_err());
     }
     let bytes = r.start_key(&[0; 32]).encode();
-    assert!(Cursor::decode(&bytes).is_err());
+    assert!(Cursor::decode(&bytes).is_ok());
     for (index, value) in [(44, 5), (45, 0), (65, 0), (70, 1)] {
         let mut bad = bytes.clone();
         bad[index] = value;
@@ -164,7 +165,7 @@ fn production_compiler_product_snapshots() {
                     .unwrap();
                 let r = prepared.volumes()[0].routing().clone();
                 assert_eq!(r.algorithm, Algorithm::Product);
-                let local = r.product.as_ref().unwrap().config.local_member;
+                let local = r.product.config.local_member;
                 let mut bad = snapshot.clone();
                 bad.volumes[0]
                     .topology
@@ -244,7 +245,7 @@ fn product_cursor_rejects_forged_ownership_paths_and_repairs() {
             6 => c.failed = 3,
             7 => c.repair_position = 1,
             8 => c.path.push(3),
-            _ => c.algorithm = Algorithm::Canonical,
+            _ => c.identity[0] ^= 1,
         }
         assert!(r.validate(&c, &[0; 32]).is_err(), "mutation {mutate}");
     }

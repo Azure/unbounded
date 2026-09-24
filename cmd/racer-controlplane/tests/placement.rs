@@ -173,10 +173,7 @@ fn compiler_ignores_history_and_volatile_fields_and_shares_universe_placement() 
 #[test]
 fn zero_slot_live_nodes_are_idle_and_remain_in_membership_catalog() {
     let mut generation = compile(&input(4), None).unwrap();
-    // Legacy graph fixtures retain the zero-slot idle contract. Product roles
-    // forward regardless of whether the physical node wins a placement slot.
-    generation.product = None;
-    generation.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
+    generation.product.as_mut().unwrap().candidates.truncate(3);
     let by_id: BTreeMap<_, _> = generation
         .nodes
         .iter()
@@ -197,8 +194,16 @@ fn zero_slot_live_nodes_are_idle_and_remain_in_membership_catalog() {
             assert_eq!(snapshot.volumes.len(), 1);
             assert_eq!(snapshot.member_catalogs[0].members.len(), 4);
         } else {
-            assert!(snapshot.idle);
-            assert!(snapshot.volumes.is_empty() && snapshot.peers.is_empty());
+            assert!(!snapshot.idle);
+            assert_eq!(snapshot.volumes.len(), 1);
+            assert!(
+                snapshot.volumes[0]
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .local_slots
+                    .is_empty()
+            );
         }
     }
 }

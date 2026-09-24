@@ -95,43 +95,32 @@ fn multihop(routed: bool) {
             if !routed {
                 handler.set_peer(peer);
             } else {
-                handler
-                    .upstream
-                    .peers
-                    .borrow_mut()
-                    .insert("next".into(), Rc::new(RefCell::new(peer)));
+                handler.upstream.peers.borrow_mut().insert(
+                    format!("{:02x}", node + 1).repeat(32),
+                    Rc::new(RefCell::new(peer)),
+                );
             }
         }
         if routed {
-            let local: Vec<u32> = match node {
-                1 => vec![0],
-                2 => vec![1],
-                _ => (2..8).collect(),
-            };
-            let mut neighbors = std::collections::BTreeSet::new();
-            for slot in &local {
-                for digit in 0..2 {
-                    let next = (slot * 2 + digit) % 8;
-                    if !local.contains(&next) {
-                        neighbors.insert(next);
-                    }
-                }
-            }
             let volume = &mut config.volumes[0];
-            volume.peers = vec!["next".into()];
+            volume.peers = (1..=3)
+                .filter(|n| *n != node)
+                .map(|n| format!("{n:02x}").repeat(32))
+                .collect();
             volume.topology = Some(crate::control::proto::Topology {
-                product: None,
+                product: Some(crate::control::proto::ProductTopology {
+                    left_factor: 1,
+                    right_factor: 3,
+                    members: (1..=3).map(|n| format!("{n:02x}").repeat(32)).collect(),
+                    roles: vec![0, 1, 2],
+                    local_member: u32::from(node - 1),
+                    candidate_width: 1,
+                    candidates: vec![2; 8],
+                }),
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 8,
-                local_slots: local,
-                neighbors: neighbors
-                    .into_iter()
-                    .map(|slot| crate::control::proto::SlotPeer {
-                        slot,
-                        peer: "next".into(),
-                    })
-                    .collect(),
+                local_slots: if node == 3 { (0..8).collect() } else { vec![] },
             });
             let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
             if node == 1 {

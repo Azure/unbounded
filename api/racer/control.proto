@@ -57,7 +57,7 @@ message Topology {
   uint64 epoch = 1;
   uint32 slot_count = 2;
   repeated uint32 local_slots = 3;
-  repeated SlotPeer neighbors = 4;
+  reserved 4;
   optional uint32 routing_algorithm = 5;
   optional ProductTopology product = 6;
 }
@@ -71,10 +71,6 @@ message ProductTopology {
   uint32 local_member = 5;
   uint32 candidate_width = 6;
   repeated uint32 candidates = 7 [packed=true];
-}
-message SlotPeer {
-  uint32 slot = 1;
-  string peer = 2;
 }
 
 message Configuration {

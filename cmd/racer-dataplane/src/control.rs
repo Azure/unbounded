@@ -111,7 +111,7 @@ impl Trust {
                         t.local_slots.len() as u64 * 64
                     })
                     .ok_or_else(|| invalid("work overflow"))?;
-                records += t.local_slots.len() + t.neighbors.len();
+                records += t.local_slots.len();
                 if let Some(p) = &t.product {
                     records += p.members.len() + p.roles.len();
                     work = work
@@ -1501,12 +1501,9 @@ pub mod routing {
     use super::product_routing::Physical;
     use crate::{
         control::proto,
-        topology::{Epoch, Step, Topology},
+        topology::{Epoch, Topology},
     };
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        io,
-    };
+    use std::{collections::BTreeSet, io};
 
     pub(super) fn invalid() -> io::Error {
         io::Error::new(
@@ -1517,20 +1514,17 @@ pub mod routing {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub enum Algorithm {
-        Canonical = 1,
-        Product = 2,
+        Product = 1,
     }
     impl Algorithm {
         pub fn wire_version(self) -> u8 {
             match self {
-                Self::Canonical => 1,
-                Self::Product => 2,
+                Self::Product => 1,
             }
         }
         pub fn magic(self) -> &'static [u8; 4] {
             match self {
-                Self::Canonical => b"RR01",
-                Self::Product => b"RR02",
+                Self::Product => b"RR01",
             }
         }
     }
@@ -1539,105 +1533,25 @@ pub mod routing {
         pub algorithm: Algorithm,
         pub geometry: Topology,
         pub local: BTreeSet<u32>,
-        pub neighbors: BTreeMap<u32, String>,
         pub identity: [u8; 32],
-        pub(super) product: Option<Physical>,
+        pub(super) product: Physical,
         #[cfg(test)]
         pub(super) namespace: crate::cache::Namespace,
     }
     impl Routing {
         pub fn new(universe: &[u8], volume: &proto::Volume) -> io::Result<Self> {
-            let config = volume.topology.clone().unwrap_or(proto::Topology {
-                routing_algorithm: Some(1),
-                epoch: 1,
-                slot_count: 1,
-                local_slots: vec![0],
-                neighbors: vec![],
-                product: None,
-            });
-            let algorithm = match config.routing_algorithm {
-                Some(1) => Algorithm::Canonical,
-                Some(2) => Algorithm::Product,
-                _ => return Err(invalid()),
-            };
-            if (volume.topology.is_none() && !volume.peers.is_empty())
+            let config = volume.topology.clone().ok_or_else(invalid)?;
+            if config.routing_algorithm != Some(1)
                 || config.epoch == 0
                 || config.slot_count > super::MAX_SLOTS
                 || volume.peers.len() > 100000
                 || config.local_slots.len() > super::MAX_SLOTS as usize
-                || config.neighbors.len() > super::MAX_SLOTS as usize
             {
                 return Err(invalid());
             }
             let geometry = Topology::new(config.slot_count, Epoch::new(config.epoch))
                 .map_err(|_| invalid())?;
-            if algorithm == Algorithm::Product {
-                return Self::new_product(universe, volume, config, geometry);
-            }
-            if config.product.is_some() {
-                return Err(invalid());
-            }
-            let local: BTreeSet<_> = config.local_slots.iter().copied().collect();
-            if local.is_empty()
-                || local.len() != config.local_slots.len()
-                || local.iter().any(|s| geometry.slot(*s).is_err())
-            {
-                return Err(invalid());
-            }
-            let mut required = vec![false; config.slot_count as usize];
-            let mut local_bits = vec![false; config.slot_count as usize];
-            for &s in &local {
-                local_bits[s as usize] = true;
-            }
-            for &s in &local {
-                for digit in 0..geometry.degree() {
-                    let next = ((u64::from(s) * u64::from(geometry.degree()) + u64::from(digit))
-                        % u64::from(config.slot_count)) as u32;
-                    if !local_bits[next as usize] {
-                        required[next as usize] = true;
-                    }
-                }
-            }
-            let mut neighbors = BTreeMap::new();
-            let peers: BTreeSet<_> = volume.peers.iter().collect();
-            let mut used = BTreeSet::new();
-            for n in &config.neighbors {
-                if !required.get(n.slot as usize).copied().unwrap_or(false)
-                    || !peers.contains(&n.peer)
-                    || neighbors.insert(n.slot, n.peer.clone()).is_some()
-                {
-                    return Err(invalid());
-                }
-                used.insert(&n.peer);
-            }
-            if neighbors.len() != required.iter().filter(|b| **b).count() || peers != used {
-                return Err(invalid());
-            }
-            let mut identity = blake3::Hasher::new();
-            identity.update(b"racer/topology/v1");
-            identity.update(universe);
-            identity.update(volume.id.as_bytes());
-            identity.update(&volume.cache_generation.to_le_bytes());
-            identity.update(&config.epoch.to_le_bytes());
-            identity.update(&config.slot_count.to_le_bytes());
-            identity.update(b"/algorithm/");
-            identity.update(&(algorithm as u32).to_le_bytes());
-            Ok(Self {
-                #[cfg(test)]
-                namespace: crate::cache::Namespace::volume(
-                    universe,
-                    &volume.id,
-                    volume.cache_generation,
-                    crate::cache::Namespace::new(&volume.id)
-                        .map_err(crate::cache::Error::into_io)?,
-                ),
-                algorithm,
-                geometry,
-                local,
-                neighbors,
-                identity: *identity.finalize().as_bytes(),
-                product: None,
-            })
+            Self::new_product(universe, volume, config, geometry)
         }
         #[cfg(test)]
         pub(crate) fn start(&self, target: &str) -> Cursor {
@@ -1652,10 +1566,7 @@ pub mod routing {
             let mut cursor = Cursor {
                 algorithm: self.algorithm,
                 identity: self.identity,
-                source: self
-                    .product
-                    .as_ref()
-                    .map_or_else(|| *self.local.first().unwrap(), |p| p.config.local_member),
+                source: self.product.config.local_member,
                 owner,
                 attempt: 0,
                 position: 0,
@@ -1663,7 +1574,8 @@ pub mod routing {
                 failed: u32::MAX,
                 repair_position: 0,
             };
-            if let Some(p) = &self.product {
+            {
+                let p = &self.product;
                 cursor.source = p.config.local_member;
                 cursor.path = p
                     .route(cursor.source, self.destination(&cursor))
@@ -1672,15 +1584,10 @@ pub mod routing {
             cursor
         }
         pub fn candidate_count(&self) -> u32 {
-            self.product
-                .as_ref()
-                .map_or(self.geometry.slot_count(), |p| p.config.candidate_width)
+            self.product.config.candidate_width
         }
         pub fn distributed(&self) -> bool {
-            self.product.as_ref().map_or(
-                self.local.len() < self.geometry.slot_count() as usize,
-                |p| p.config.members.len() > 1,
-            )
+            self.product.config.members.len() > 1
         }
         pub fn advance_candidate(&self, c: &mut Cursor) -> io::Result<()> {
             if c.attempt >= self.candidate_count().saturating_sub(1) {
@@ -1690,186 +1597,77 @@ pub mod routing {
             c.position = 0;
             c.failed = u32::MAX;
             c.repair_position = 0;
-            if let Some(p) = &self.product {
-                c.path = p.route(c.source, self.destination(c))?;
-            }
+            c.path = self.product.route(c.source, self.destination(c))?;
             Ok(())
         }
         pub fn destination(&self, c: &Cursor) -> u32 {
-            if let Some(p) = &self.product {
-                return p
-                    .config
-                    .candidates
-                    .get(c.owner as usize * p.config.candidate_width as usize + c.attempt as usize)
-                    .copied()
-                    .unwrap_or(u32::MAX);
-            }
-            ((u64::from(c.owner) + u64::from(c.attempt)) % u64::from(self.geometry.slot_count()))
-                as u32
+            let p = &self.product;
+            p.config
+                .candidates
+                .get(c.owner as usize * p.config.candidate_width as usize + c.attempt as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
         }
-        /// Namespace authentication is performed by the caller before rebasing.
-        /// Placement revisions are hints, not immutable object identity.
+        /// A cursor is valid only in its exact pinned topology.
         pub fn receive(&self, c: Cursor, key: &[u8; 32]) -> io::Result<Cursor> {
             if c.attempt >= 8 {
                 return Err(invalid());
-            }
-            if c.identity != self.identity {
-                if self.algorithm == Algorithm::Product || c.algorithm == Algorithm::Product {
-                    return Err(invalid());
-                }
-                let mut local = self.start_key(key);
-                // Candidate retries remain bounded independently of placement.
-                local.attempt = c.attempt.min(self.geometry.slot_count() - 1);
-                return Ok(local);
             }
             self.validate(&c, key)?;
             Ok(c)
         }
         fn path(&self, c: &Cursor) -> io::Result<Vec<u32>> {
-            if self.product.is_some() {
-                self.validate_product(c)?;
-                return Ok(c.path.clone());
-            }
-            if c.identity != self.identity
-                || c.algorithm != self.algorithm
-                || c.owner >= self.geometry.slot_count()
-                || c.attempt >= self.geometry.slot_count()
-            {
-                return Err(invalid());
-            }
-            let mut route = self
-                .geometry
-                .route(
-                    self.geometry.slot(c.source).map_err(|_| invalid())?,
-                    self.geometry
-                        .slot(self.destination(c))
-                        .map_err(|_| invalid())?,
-                )
-                .map_err(|_| invalid())?;
-            let mut path = vec![c.source];
-            while let Step::Forward { next } = route.advance() {
-                if let Some(index) = path.iter().position(|s| *s == next.get()) {
-                    path.truncate(index + 1);
-                } else {
-                    path.push(next.get());
-                }
-            }
-            Ok(path)
+            self.validate_product(c)?;
+            Ok(c.path.clone())
         }
         pub fn validate(&self, c: &Cursor, key: &[u8; 32]) -> io::Result<()> {
             if c.owner != self.geometry.owner(key).get() {
                 return Err(invalid());
             }
             let path = self.path(c)?;
-            if let Some(p) = &self.product {
-                return if path.get(c.position as usize) == Some(&p.config.local_member) {
-                    Ok(())
-                } else {
-                    Err(invalid())
-                };
+            let p = &self.product;
+            if path.get(c.position as usize) == Some(&p.config.local_member) {
+                Ok(())
+            } else {
+                Err(invalid())
             }
-            if !path
-                .get(c.position as usize)
-                .is_some_and(|s| self.local.contains(s))
-            {
-                return Err(invalid());
-            }
-            Ok(())
         }
         pub fn next(&self, c: &Cursor) -> io::Result<Option<(String, Cursor)>> {
-            if let Some(p) = &self.product {
-                self.validate_product(c)?;
-                if c.path.get(c.position as usize) != Some(&p.config.local_member) {
-                    return Err(invalid());
-                }
-                let mut next = c.clone();
-                next.position += 1;
-                return Ok(c
-                    .path
-                    .get(next.position as usize)
-                    .map(|&member| (p.config.members[member as usize].clone(), next)));
-            }
-            let path = self.path(c)?;
-            let mut next = c.clone();
-            // Co-located later slots are local transitions; bypassing the intervening
-            // network segment prevents a shared cache flight from waiting on itself.
-            next.position = self.normalized_position(c)?;
-            for &slot in path.iter().skip(next.position as usize + 1) {
-                next.position += 1;
-                if !self.local.contains(&slot) {
-                    return Ok(Some((
-                        self.neighbors.get(&slot).ok_or_else(invalid)?.clone(),
-                        next,
-                    )));
-                }
-            }
-            Ok(None)
-        }
-        pub fn normalized_position(&self, c: &Cursor) -> io::Result<u8> {
-            if let Some(p) = &self.product {
-                self.validate_product(c)?;
-                return if c.path.get(c.position as usize) == Some(&p.config.local_member) {
-                    Ok(c.position)
-                } else {
-                    Err(invalid())
-                };
-            }
-            let path = self.path(c)?;
-            if !path
-                .get(c.position as usize)
-                .is_some_and(|s| self.local.contains(s))
-            {
+            let p = &self.product;
+            self.validate_product(c)?;
+            if c.path.get(c.position as usize) != Some(&p.config.local_member) {
                 return Err(invalid());
             }
-            path.iter()
-                .enumerate()
-                .skip(c.position as usize)
-                .filter(|(_, slot)| self.local.contains(slot))
-                .map(|(i, _)| i as u8)
-                .next_back()
-                .ok_or_else(invalid)
+            let mut next = c.clone();
+            next.position += 1;
+            Ok(c.path
+                .get(next.position as usize)
+                .map(|&member| (p.config.members[member as usize].clone(), next)))
         }
-        /// Local shortcuts only move down the canonical rank. Different local
-        /// slots need distinct flights: physical-host identity can create cycles.
-        pub fn dependency(&self, c: &Cursor) -> io::Result<crate::buffers::NetworkDependency> {
-            let position = self.normalized_position(c)?;
-            Ok(crate::buffers::NetworkDependency::Canonical {
-                slot: self.path(c)?[position as usize],
-            })
+        pub fn normalized_position(&self, c: &Cursor) -> io::Result<u8> {
+            let p = &self.product;
+            self.validate_product(c)?;
+            if c.path.get(c.position as usize) == Some(&p.config.local_member) {
+                Ok(c.position)
+            } else {
+                Err(invalid())
+            }
         }
         pub fn compatible(&self, a: &Cursor, b: &Cursor) -> bool {
-            if self.product.is_some() {
-                return a == b && self.validate_product(a).is_ok();
-            }
-            a.identity == b.identity
-                && self.destination(a) == self.destination(b)
-                && self
-                    .dependency(a)
-                    .ok()
-                    .zip(self.dependency(b).ok())
-                    .is_some_and(|(a, b)| a == b)
+            a == b && self.validate_product(a).is_ok()
         }
         /// Sparse slot ownership proves physical finality, never endpoint equality.
         pub fn last_hop(&self, c: &Cursor) -> bool {
             self.final_peer(c).is_some()
         }
         pub(crate) fn final_peer(&self, c: &Cursor) -> Option<&str> {
-            if let Some(p) = &self.product {
-                self.validate_product(c).ok()?;
-                if c.path.get(c.position as usize) != Some(&p.config.local_member) {
-                    return None;
-                }
-                return (c.path.get(c.position as usize + 1) == Some(&self.destination(c)))
-                    .then(|| p.config.members[self.destination(c) as usize].as_str());
-            }
-            if c.identity != self.identity {
+            let p = &self.product;
+            self.validate_product(c).ok()?;
+            if c.path.get(c.position as usize) != Some(&p.config.local_member) {
                 return None;
             }
-            let (peer, _) = self.next(c).ok().flatten()?;
-            self.neighbors
-                .get(&self.destination(c))
-                .filter(|owner| **owner == peer)
-                .map(String::as_str)
+            (c.path.get(c.position as usize + 1) == Some(&self.destination(c)))
+                .then(|| p.config.members[self.destination(c) as usize].as_str())
         }
     }
 
@@ -1886,9 +1684,9 @@ pub mod routing {
         pub repair_position: u8,
     }
     impl Cursor {
-        pub const LEN: usize = 45;
+        pub const LEN: usize = 71;
         pub const PRODUCT_LEN: usize = 71;
-        /// Encode the cursor body. The enclosing RR01/RR02 magic must
+        /// Encode the cursor body. The enclosing RR01 magic must
         /// be selected from `algorithm`; the body alone is not a wire descriptor.
         pub fn encode(&self) -> Vec<u8> {
             let mut bytes = self.identity.to_vec();
@@ -1896,7 +1694,7 @@ pub mod routing {
             bytes.extend(self.owner.to_le_bytes());
             bytes.extend(self.attempt.to_le_bytes());
             bytes.push(self.position);
-            if self.algorithm == Algorithm::Product {
+            {
                 bytes.push(self.path.len() as u8);
                 for i in 0..5 {
                     bytes.extend(self.path.get(i).copied().unwrap_or(u32::MAX).to_le_bytes());
@@ -1908,23 +1706,15 @@ pub mod routing {
         }
         /// Decode a canonical RR01 body.
         pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-            Self::decode_algorithm(bytes, Algorithm::Canonical)
+            Self::decode_algorithm(bytes, Algorithm::Product)
         }
         pub fn decode_algorithm(bytes: &[u8], algorithm: Algorithm) -> io::Result<Self> {
-            let product = algorithm == Algorithm::Product;
-            if bytes.len()
-                != if product {
-                    Self::PRODUCT_LEN
-                } else {
-                    Self::LEN
-                }
-                || bytes[44] > if product { 4 } else { 3 }
-            {
+            if bytes.len() != Self::LEN || bytes[44] > 4 {
                 return Err(invalid());
             }
             let mut path = Vec::new();
-            let (mut failed, mut repair_position) = (u32::MAX, 0);
-            if product {
+            let (failed, repair_position);
+            {
                 let len = bytes[45] as usize;
                 if !(1..=5).contains(&len) || bytes[44] as usize >= len {
                     return Err(invalid());

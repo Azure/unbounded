@@ -50,12 +50,11 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     };
     c.reload(1, Some(1));
     let result = c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&cursor))]);
-    assert_eq!(result.0, 200);
-    assert_eq!(result.1.len(), crate::cache::METADATA_SIZE);
-    assert_eq!(c.hits.lock().unwrap().len(), 1);
+    assert_eq!(result.0, 400);
+    assert_eq!(c.hits.lock().unwrap().len(), 0);
     let current = c.config(1);
     let new_routing = &current.volumes[0].routing;
-    assert_eq!(new_routing.algorithm, crate::routing::Algorithm::Canonical);
+    assert_eq!(new_routing.algorithm, crate::routing::Algorithm::Product);
     assert_ne!(new_routing.identity, routing.identity);
     let current_cursor = new_routing.start(&target);
     assert_eq!(
@@ -65,7 +64,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     );
     let unknown = wire(&cursor).replacen("52443031", "52443032", 1);
     assert_eq!(c.get_headers(1, "/", &[("X-Racer-Fault", &unknown)]).0, 409);
-    for (field, status) in [("position", 400), ("identity", 200), ("attempt", 400)] {
+    for (field, status) in [("position", 400), ("identity", 400), ("attempt", 400)] {
         let mut bad = current_cursor.clone();
         match field {
             "position" => bad.position = 3,
@@ -85,7 +84,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     assert_eq!(
         c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&expired))])
             .0,
-        200
+        400
     );
 }
 
@@ -117,15 +116,19 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
                 }],
             }),
             topology: Some(proto::Topology {
-                product: None,
+                product: Some(proto::ProductTopology {
+                    left_factor: 1,
+                    right_factor: 2,
+                    members: vec!["02".repeat(32), "03".repeat(32)],
+                    roles: vec![0, 1],
+                    local_member: 0,
+                    candidate_width: 2,
+                    candidates: vec![0, 1, 1, 0],
+                }),
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,
                 local_slots: vec![0],
-                neighbors: vec![proto::SlotPeer {
-                    slot: 1,
-                    peer: "03".repeat(32),
-                }],
             }),
             ..Default::default()
         }],
@@ -167,8 +170,24 @@ fn member_catalog_is_required_and_process_identity_is_exact() {
     local.peers.clear();
     local.volumes[0].peers.clear();
     local.volumes[0].peer_endpoints = Some(proto::VolumePeerEndpoints::default());
-    local.volumes[0].topology = None;
-    local.member_catalogs[0].members.clear();
+    local.volumes[0].topology = Some(proto::Topology {
+        epoch: 1,
+        slot_count: 1,
+        local_slots: vec![0],
+        routing_algorithm: Some(1),
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 1,
+            members: vec!["02".repeat(32)],
+            roles: vec![0],
+            local_member: 0,
+            candidate_width: 1,
+            candidates: vec![0],
+        }),
+    });
+    local.member_catalogs[0]
+        .members
+        .retain(|m| m.node == local.node);
     trust.prepare(raw(local.clone())).unwrap();
     local.volumes[0].member_catalog = None;
     assert!(trust.prepare(raw(local)).is_err());
@@ -194,12 +213,18 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
             })
             .collect(),
     }];
+    snapshot.member_catalogs[0].members.push(proto::Member {
+        node: snapshot.node.clone(),
+        pod_uid: "test-pod".into(),
+        fabric: snapshot.fabric.clone(),
+    });
     for volume in &mut snapshot.volumes {
         volume.member_catalog = Some(0);
         if volume.peer_endpoints.as_ref().is_some_and(|scope| {
             scope.peers.len() != 1
                 || scope.peers[0].peer != "03".repeat(32)
-                || !scope.peers[0].http_address.is_empty()
+                || (scope.peers[0].http_address != "127.0.0.1:8081"
+                    && !scope.peers[0].http_address.is_empty())
         }) {
             continue;
         }
@@ -236,19 +261,15 @@ pub(crate) fn cluster_config(
     volume.cache_socket = test_socket(addresses[node], "cache");
     volume.origin_socket = test_socket(backend, "origin");
     volume.peers.clear();
-    let mut neighbors = Vec::new();
     let id = |n: usize| {
         crate::peer_identity::NodeId::from_bytes(&[n as u8 + 10; 32])
             .unwrap()
             .to_string()
     };
-    for next in [node * 2 % 8, (node * 2 + 1) % 8] {
+    let graph = crate::product::choose(8).unwrap();
+    for next in graph.neighbors(node as u32).into_iter().map(|n| n as usize) {
         if next != node {
             volume.peers.push(id(next));
-            neighbors.push(proto::SlotPeer {
-                slot: next as u32,
-                peer: id(next),
-            });
             config.peers.push(proto::Peer {
                 pod_uid: format!("pod-{next}"),
                 id: id(next),
@@ -258,12 +279,19 @@ pub(crate) fn cluster_config(
         }
     }
     volume.topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: graph.codes().0,
+            right_factor: graph.codes().1,
+            members: (0..8).map(id).collect(),
+            roles: (0..8).collect(),
+            local_member: node as u32,
+            candidate_width: 3,
+            candidates: (0..8).flat_map(|s| [s, (s + 1) % 8, (s + 2) % 8]).collect(),
+        }),
         routing_algorithm: algorithm,
         epoch: 1,
         slot_count: 8,
         local_slots: vec![node as u32],
-        neighbors,
     });
     for source in 0..8 {
         if source != node
@@ -298,15 +326,19 @@ pub(crate) fn runtime_pair(
     config.peers[0].fabric = config.fabric.clone();
     config.peers[0].http_address = remote.to_string();
     config.volumes[0].topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 2,
+            members: vec!["02".repeat(32), "03".repeat(32)],
+            roles: vec![0, 1],
+            local_member: if node == 2 { 0 } else { 1 },
+            candidate_width: 2,
+            candidates: vec![0, 1, 1, 0],
+        }),
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
         local_slots: vec![if node == 2 { 0 } else { 1 }],
-        neighbors: vec![proto::SlotPeer {
-            slot: if node == 2 { 1 } else { 0 },
-            peer: config.peers[0].id.clone(),
-        }],
     });
     config.volumes[0].peers = vec![config.peers[0].id.clone()];
     prepare_snapshot(&trust, config)
@@ -405,7 +437,7 @@ fn protojson_wire_and_complete_replacement() {
         );
         assert_eq!(
             trust.prepare(wire).is_ok(),
-            cap.is_none_or(|n| (1..=8).contains(&n))
+            cap.is_some_and(|n| (1..=8).contains(&n))
         );
     }
     let pinned = updates.latest(0).unwrap();
@@ -472,9 +504,26 @@ fn topology_validation_and_reload_are_atomic() {
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(3),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(2),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().local_slots.push(0),
-        |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors.clear(),
-        |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors[0].slot = 0,
-        |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors[0].peer = "unknown".into(),
+        |v: &mut proto::Volume| v.topology.as_mut().unwrap().product = None,
+        |v: &mut proto::Volume| {
+            v.topology
+                .as_mut()
+                .unwrap()
+                .product
+                .as_mut()
+                .unwrap()
+                .roles
+                .clear()
+        },
+        |v: &mut proto::Volume| {
+            v.topology
+                .as_mut()
+                .unwrap()
+                .product
+                .as_mut()
+                .unwrap()
+                .members[0] = "unknown".into()
+        },
     ] {
         let mut config = original.clone();
         mutate(&mut config.volumes[0]);
@@ -507,13 +556,7 @@ fn topology_validation_and_reload_are_atomic() {
     standalone.volumes[0].peers.clear();
     standalone.volumes[0].topology = None;
     standalone.peers.clear();
-    assert_eq!(
-        trust.prepare(envelope(standalone)).unwrap().volumes[0]
-            .routing
-            .geometry
-            .slot_count(),
-        1
-    );
+    assert!(trust.prepare(envelope(standalone)).is_err());
 }
 
 #[test]
@@ -624,7 +667,14 @@ pub(crate) fn rdma_fixture() -> (Trust, proto::Snapshot) {
     snapshot.peers[0].id = "ab".repeat(32);
     snapshot.peers[0].fabric = snapshot.fabric.clone();
     snapshot.volumes[0].peers = vec![snapshot.peers[0].id.clone()];
-    snapshot.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = snapshot.peers[0].id.clone();
+    snapshot.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = snapshot.peers[0].id.clone();
     (trust, snapshot)
 }
 
@@ -635,11 +685,18 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
     let v = &mut snapshot.volumes[0];
     v.peers.clear();
     v.topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 1,
+            members: vec!["02".repeat(32)],
+            roles: vec![0],
+            local_member: 0,
+            candidate_width: 1,
+            candidates: vec![0; MAX_SLOTS as usize],
+        }),
         epoch: 1,
         slot_count: MAX_SLOTS,
         local_slots: (0..MAX_SLOTS).collect(),
-        neighbors: vec![],
         routing_algorithm: Some(1),
     });
     let start = Instant::now();
@@ -660,16 +717,20 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
     let v = &mut snapshot.volumes[0];
     v.peers = vec![peer.clone()];
     v.topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 2,
+            members: vec!["02".repeat(32), peer.clone()],
+            roles: vec![0, 1],
+            local_member: 0,
+            candidate_width: 2,
+            candidates: (0..512)
+                .flat_map(|s| if s < 65 { [0, 1] } else { [1, 0] })
+                .collect(),
+        }),
         epoch: 1,
         slot_count: 512,
         local_slots: (0..65).collect(),
-        neighbors: (65..512)
-            .map(|slot| proto::SlotPeer {
-                slot,
-                peer: peer.clone(),
-            })
-            .collect(),
         routing_algorithm: Some(1),
     });
     trust.prepare(envelope(snapshot.clone())).unwrap();
@@ -677,15 +738,21 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
         .topology
         .as_mut()
         .unwrap()
-        .neighbors
+        .product
+        .as_mut()
+        .unwrap()
+        .candidates
         .pop();
     assert!(trust.prepare(envelope(snapshot.clone())).is_err());
     snapshot.volumes[0]
         .topology
         .as_mut()
         .unwrap()
-        .neighbors
-        .push(proto::SlotPeer { slot: 0, peer });
+        .product
+        .as_mut()
+        .unwrap()
+        .candidates
+        .push(8);
     assert!(trust.prepare(envelope(snapshot)).is_err());
 }
 
@@ -780,7 +847,6 @@ fn rdma_eligibility_binds_direct_membership_endpoint_and_snapshot() {
 fn rdma_ineligible_configuration_preserves_http_routes() {
     let (trust, original) = rdma_fixture();
     for mutate in [
-        |s: &mut proto::Snapshot| s.peers[0].id = "02".repeat(32),
         |s: &mut proto::Snapshot| s.fabric.clear(),
         |s: &mut proto::Snapshot| s.peers[0].fabric.clear(),
         |s: &mut proto::Snapshot| s.peers[0].fabric = "rack-2".into(),
@@ -802,8 +868,14 @@ fn rdma_ineligible_configuration_preserves_http_routes() {
         let mut snapshot = original.clone();
         mutate(&mut snapshot);
         snapshot.volumes[0].peers = vec![snapshot.peers[0].id.clone()];
-        snapshot.volumes[0].topology.as_mut().unwrap().neighbors[0].peer =
-            snapshot.peers[0].id.clone();
+        snapshot.volumes[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .product
+            .as_mut()
+            .unwrap()
+            .members[1] = snapshot.peers[0].id.clone();
         let prepared = trust.prepare(envelope(snapshot.clone())).unwrap();
         assert_eq!(prepared.eligible_peers().count(), 0, "{snapshot:?}");
         assert_eq!(prepared.peers.len(), 1);
@@ -829,12 +901,26 @@ fn rdma_node_ids_require_canonical_hex_and_unique_membership() {
         let mut invalid = snapshot.clone();
         invalid.peers[0].id = id.clone();
         invalid.volumes[0].peers = vec![id.clone()];
-        invalid.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = id;
+        invalid.volumes[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .product
+            .as_mut()
+            .unwrap()
+            .members[1] = id;
         assert!(trust.prepare(envelope(invalid)).is_err());
     }
     snapshot.peers[0].id.make_ascii_uppercase();
     snapshot.volumes[0].peers = vec![snapshot.peers[0].id.clone()];
-    snapshot.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = snapshot.peers[0].id.clone();
+    snapshot.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = snapshot.peers[0].id.clone();
     assert!(trust.prepare(envelope(snapshot.clone())).is_err());
     let mut duplicate = snapshot.peers[0].clone();
     duplicate.id.make_ascii_lowercase();
@@ -858,25 +944,26 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     snapshot.volumes[0].peers = vec![second.id.clone(), "ef".repeat(32), first.clone()];
     snapshot.volumes[0].topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 4,
+            members: vec![
+                "02".repeat(32),
+                first.clone(),
+                second.id.clone(),
+                "ef".repeat(32),
+            ],
+            roles: vec![0, 1, 2, 3],
+            local_member: 0,
+            candidate_width: 3,
+            candidates: (0..27)
+                .flat_map(|s| [s % 4, (s + 1) % 4, (s + 2) % 4])
+                .collect(),
+        }),
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 27,
-        local_slots: vec![1],
-        neighbors: vec![
-            proto::SlotPeer {
-                slot: 3,
-                peer: second.id.clone(),
-            },
-            proto::SlotPeer {
-                slot: 4,
-                peer: "ef".repeat(32),
-            },
-            proto::SlotPeer {
-                slot: 5,
-                peer: first.clone(),
-            },
-        ],
+        local_slots: (0..27).filter(|s| s % 4 == 0).collect(),
     });
     let mut volume = snapshot.volumes[0].clone();
     volume.id = "v2".into();
@@ -884,16 +971,26 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     volume.origin_socket = "/dev/racer/second/origin".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 4,
+            members: vec![
+                "02".repeat(32),
+                first.clone(),
+                second.id.clone(),
+                "ef".repeat(32),
+            ],
+            roles: vec![0, 1, 2, 3],
+            local_member: 0,
+            candidate_width: 3,
+            candidates: vec![0, 1, 2, 1, 0, 3],
+        }),
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
         local_slots: vec![0],
-        neighbors: vec![proto::SlotPeer {
-            slot: 1,
-            peer: first.clone(),
-        }],
     });
+    volume.peers = snapshot.volumes[0].peers.clone();
     snapshot.volumes.push(volume);
     let prepared = trust.prepare(envelope(snapshot)).unwrap();
     let ordered: Vec<_> = prepared
@@ -905,7 +1002,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     assert!(
         prepared
             .eligible_peer_for_volume("v2", &second.id)
-            .is_none()
+            .is_some()
     );
     assert!(prepared.select_eligible_peer("unknown", "/").is_none());
     let mut slots = BTreeSet::new();
@@ -939,12 +1036,19 @@ fn rdma_capabilities_pin_original_policy_and_do_not_survive_removal_in_new_gener
     next.peers.clear();
     next.volumes[0].peers.clear();
     next.volumes[0].topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 1,
+            members: vec!["02".repeat(32)],
+            roles: vec![0],
+            local_member: 0,
+            candidate_width: 1,
+            candidates: vec![0, 0],
+        }),
         routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,
         local_slots: vec![0, 1],
-        neighbors: vec![],
     });
     updates
         .publish(trust.prepare(envelope(next)).unwrap())

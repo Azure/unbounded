@@ -149,34 +149,16 @@ fn candidate_reservation_is_bounded_and_strict_at_exhaustion() {
 }
 
 #[test]
-fn colocated_positions_share_only_normalized_candidate_scope() {
+fn product_flights_keep_candidate_and_generation_scope() {
     let (_, mut config) = crate::control::tests::fixture();
     let volume = &mut config.volumes[0];
-    volume.peers = vec!["p2".into(), "p3".into()];
-    volume.topology = Some(crate::control::proto::Topology {
-        product: None,
-        routing_algorithm: Some(1),
-        epoch: 1,
-        slot_count: 8,
-        local_slots: vec![0, 1],
-        neighbors: vec![
-            crate::control::proto::SlotPeer {
-                slot: 2,
-                peer: "p2".into(),
-            },
-            crate::control::proto::SlotPeer {
-                slot: 3,
-                peer: "p3".into(),
-            },
-        ],
-    });
     let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
     let target = (0..)
         .map(|i| format!("/colocated-{i}"))
-        .find(|t| routing.start(t).owner == 7)
+        .find(|t| routing.start(t).owner == 1)
         .unwrap();
     let cursor = routing.start(&target);
-    assert_eq!(routing.normalized_position(&cursor).unwrap(), 1);
+    assert_eq!(routing.normalized_position(&cursor).unwrap(), 0);
     let mut provider = Provider {
         routing: Some(routing.clone()),
         active: Some(Rc::new(RefCell::new(RouteState {

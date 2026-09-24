@@ -392,15 +392,6 @@ impl Provider {
         // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
         // routed descriptors, budget accounting, or peer request headers.
         if cache::peer_wire::request_len(request, self.active.is_some(), true)?
-            + if self
-                .routing
-                .as_ref()
-                .is_some_and(|r| r.algorithm == crate::routing::Algorithm::Product)
-            {
-                crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN
-            } else {
-                0
-            }
             + cache::peer_wire::CHAIN_LEN
             > MAX_DESCRIPTOR
         {
@@ -535,11 +526,7 @@ impl Upstream for Provider {
             routing: state.cursor.identity,
             version: state.cursor.algorithm.wire_version(),
             destination: routing.destination(&state.cursor),
-            dependency: if state.origin && routing.algorithm != crate::routing::Algorithm::Product {
-                routing.dependency(&state.cursor).expect("validated route")
-            } else {
-                crate::buffers::NetworkDependency::Independent(self.flight)
-            },
+            dependency: crate::buffers::NetworkDependency::Independent(self.flight),
         })
     }
     fn peer_validated(&mut self, retry: &mut Exchange, valid: bool) {
@@ -630,8 +617,7 @@ impl Upstream for Provider {
         // A typed, initiated immediate HTTP failure can repair an intermediate.
         // RDMA first recovers over the same peer's HTTP transport. Remote reports,
         // pressure, cancellations and content failures are never local link evidence.
-        if routing.algorithm == crate::routing::Algorithm::Product
-            && let Some(failure) = failure
+        if let Some(failure) = failure
             && !failure.reported
             && !failure.route.final_hop
             && routing.compatible(&failure.route.cursor, &state.cursor)
@@ -1065,7 +1051,6 @@ impl Handler {
         provider.reply_route = reply;
         if let (Some(routing), Some(state), Some((_, _, _, candidate))) =
             (&provider.routing, &provider.active, chain)
-            && routing.algorithm == crate::routing::Algorithm::Product
             && routing.destination(&state.borrow().cursor) != candidate
         {
             return Err(invalid("product chain candidate mismatch").into());

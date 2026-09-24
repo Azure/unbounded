@@ -5,6 +5,7 @@
 #[path = "../src/security.rs"]
 #[allow(dead_code)]
 mod security;
+use racer_controlplane::model;
 
 use anyhow::{Result, ensure};
 use security::*;

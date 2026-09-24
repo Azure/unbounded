@@ -110,8 +110,7 @@ impl Provider {
             // New metadata/page resolutions can avoid a recently proven failed
             // intermediate. The evidence is generation-local and expires; a mere
             // open breaker or admission rejection cannot authorize a repair.
-            if routing.algorithm == crate::routing::Algorithm::Product
-                && let Some(state) = &self.active
+            if let Some(state) = &self.active
                 && let Some(peer) = selected
                     .as_ref()
                     .and_then(|id| self.peers.borrow().get(id).cloned())

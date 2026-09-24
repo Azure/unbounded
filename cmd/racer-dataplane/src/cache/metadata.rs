@@ -125,26 +125,14 @@ pub(crate) mod peer_wire {
         bytes: &[u8],
     ) -> super::Result<(Option<crate::routing::Cursor>, PeerDescriptor<'_>)> {
         let (bytes, _) = budget_descriptor(bytes)?;
-        if bytes.starts_with(b"RR01") || bytes.starts_with(b"RR02") {
-            let algorithm = if bytes.starts_with(b"RR02") {
-                crate::routing::Algorithm::Product
-            } else {
-                crate::routing::Algorithm::Canonical
-            };
-            let len = if algorithm == crate::routing::Algorithm::Product {
-                crate::routing::Cursor::PRODUCT_LEN
-            } else {
-                crate::routing::Cursor::LEN
-            };
+        if bytes.starts_with(b"RR01") {
+            let len = crate::routing::Cursor::LEN;
             if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + len {
                 return Err(invalid("short routed descriptor").into());
             }
             let end = 4 + len;
             Ok((
-                Some(crate::routing::Cursor::decode_algorithm(
-                    &bytes[4..end],
-                    algorithm,
-                )?),
+                Some(crate::routing::Cursor::decode(&bytes[4..end])?),
                 decode_descriptor(&bytes[end..])?,
             ))
         } else {
