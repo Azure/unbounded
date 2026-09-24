@@ -138,6 +138,57 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	require.Equal(t, "fingerprint-1", r.ConfigFingerprint)
 }
 
+// TestBeginTeardownChoosesOnePrefix covers where reset gets its prefix. The
+// teardown and the sync of what it removed both use this value, so a record
+// that has no prefix must not leave one of them on the default.
+func TestBeginTeardownChoosesOnePrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		record string // "" for none; otherwise a prefix, "legacy", or "unreadable"
+		want   string
+	}{
+		{name: "record prefix", record: "/opt/recorded", want: "/opt/recorded"},
+		{name: "record without a prefix", record: "legacy", want: "/opt/applied"},
+		{name: "no record", record: "", want: "/opt/applied"},
+		{name: "unreadable record", record: "unreadable", want: "/opt/applied"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
+
+			switch tt.record {
+			case "":
+			case "unreadable":
+				require.NoError(t, os.MkdirAll(store.Root(), 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(store.Root(), "install-state.json"), []byte("{"), 0o600))
+			case "legacy":
+				r, err := installstate.NewRecord("machine", "fingerprint", "")
+				require.NoError(t, err)
+				require.NoError(t, store.Save(r))
+			default:
+				r, err := installstate.NewRecord("machine", "fingerprint", tt.record)
+				require.NoError(t, err)
+				require.NoError(t, store.Save(r))
+			}
+
+			prefix, err := beginTeardown(discardLogger(), store, func() string { return "/opt/applied" })
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, prefix)
+
+			saved, err := store.Load()
+			require.NoError(t, err)
+			assert.Equal(t, installstate.Resetting, saved.Phase)
+			assert.Equal(t, tt.want, saved.HostPrefix, "a retried reset must find the same prefix")
+		})
+	}
+}
+
 // TestResetRemovesTheFirstBootUnitBeforeArtifacts pins that reset actually runs
 // the removal, not merely that the removal works.
 //

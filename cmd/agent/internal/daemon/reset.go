@@ -26,7 +26,9 @@ import (
 // the daemon first. The daemon's own operation path stops it last instead, so
 // that ordering stays with the caller.
 func ResetAgent(log *slog.Logger) phases.Task {
-	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log, ResolveHostPrefix(log))))
+	return ownedReset(log, installstate.DefaultStore(), func(prefix string) phases.Task {
+		return phases.Serial(log, StopDaemon(log), resetResources(log, prefix))
+	})
 }
 
 type lifecycleTask struct {
@@ -37,10 +39,13 @@ type lifecycleTask struct {
 func (t lifecycleTask) Name() string                 { return t.name }
 func (t lifecycleTask) Do(ctx context.Context) error { return t.run(ctx) }
 
-func ownedReset(log *slog.Logger, store *installstate.Store, inner phases.Task) phases.Task {
+// ownedReset runs a teardown under the installation lock. The teardown is
+// built from the prefix once the lock is held, so that it and the sync of what
+// it removed use the same one.
+func ownedReset(log *slog.Logger, store *installstate.Store, build func(prefix string) phases.Task) phases.Task {
 	// The composed name keeps the underlying cleanup sequence visible to callers
-	// and to the reset ordering test.
-	return lifecycleTask{name: "owned-reset(" + inner.Name() + ")", run: func(ctx context.Context) error {
+	// and to the reset ordering test. Task names do not depend on the prefix.
+	return lifecycleTask{name: "owned-reset(" + build("").Name() + ")", run: func(ctx context.Context) error {
 		lock, err := store.AcquireLock()
 		if err != nil {
 			return err
@@ -51,7 +56,7 @@ func ownedReset(log *slog.Logger, store *installstate.Store, inner phases.Task) 
 			}
 		}()
 
-		return resetUnderLock(ctx, log, store, inner)
+		return resetUnderLock(ctx, log, store, build)
 	}}
 }
 
@@ -75,14 +80,9 @@ func recordForTeardown(log *slog.Logger, store *installstate.Store) (installstat
 	return installstate.NewRecord("legacy-reset", "legacy-reset", "")
 }
 
-func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, inner phases.Task) error {
-	r, err := recordForTeardown(log, store)
+func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, build func(prefix string) phases.Task) error {
+	prefix, err := beginTeardown(log, store, func() string { return goalstates.HostPrefixFromAppliedConfig(log) })
 	if err != nil {
-		return err
-	}
-
-	r.Phase = installstate.Resetting
-	if err := store.Save(r); err != nil {
 		return err
 	}
 	// Cancel recovery waiting on ownership before removing its executable.
@@ -90,7 +90,32 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 		return err
 	}
 
-	return durableReset(ctx, store, inner, teardownSyncPaths(r.HostPrefix, store.Root()), unix.Syncfs)
+	return durableReset(ctx, store, build(prefix), teardownSyncPaths(prefix, store.Root()), unix.Syncfs)
+}
+
+// beginTeardown marks the installation as resetting and returns the prefix the
+// reset works on.
+//
+// The record's prefix is used when it has one. When it does not, because it
+// was unreadable, absent, or written before it carried one, the applied
+// config's is. It is saved in the resetting record, so a reset that is retried
+// after the applied config is gone still finds the same files.
+func beginTeardown(log *slog.Logger, store *installstate.Store, appliedConfigPrefix func() string) (string, error) {
+	r, err := recordForTeardown(log, store)
+	if err != nil {
+		return "", err
+	}
+
+	if r.HostPrefix == "" {
+		r.HostPrefix = appliedConfigPrefix()
+	}
+
+	r.Phase = installstate.Resetting
+	if err := store.Save(r); err != nil {
+		return "", err
+	}
+
+	return r.HostPrefix, nil
 }
 
 // teardownSyncPaths returns the directories whose filesystems have to be
