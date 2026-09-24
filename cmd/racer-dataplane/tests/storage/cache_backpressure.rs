@@ -1,6 +1,96 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+#[test]
+fn saturated_relay_receives_can_starve_an_independent_owner_fault() {
+    // Isolate receive admission from network speed and page size. A relay's
+    // upstream exchange owns its destination while its next hop resolves.
+    // Preserve the original zero-reserve reproduction and its protected-slot control.
+    for reserve in [0, 1] {
+        let mut ring = match Ring::http_test_ring(
+            buffers::io_test_pool_config(buffers::Config::new(
+                std::num::NonZeroUsize::new(4).unwrap(),
+            )),
+            uring::Config::default(),
+        ) {
+            Ok(ring) => ring,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::ENOSYS | libc::ENOMEM)
+                ) || error.kind() == io::ErrorKind::Unsupported =>
+            {
+                assert!(
+                    std::env::var_os("RACER_REQUIRE_URING").is_none(),
+                    "io_uring required: {error}"
+                );
+                eprintln!("SKIP relay admission test: {error}");
+                return;
+            }
+            Err(error) => panic!("ring: {error}"),
+        };
+        let pool = ring.pool().clone();
+        let mut cache = cache(1);
+        let mut relay = Fake {
+            peer: true,
+            receive_reserve: reserve,
+            replies: (0..4).map(|_| Reply::Hold).collect(),
+            ..Fake::default()
+        };
+        let mut held = Vec::new();
+        for index in 0..4 {
+            let meta = metadata(&cache, &format!("/relay-holder-{index}"), 3, 0);
+            let fault = cache.page(&meta, 0, deadline()).unwrap();
+            let (fault, _) = pending_fault(&mut cache, &mut ring, &mut relay, fault);
+            held.push(fault);
+        }
+        assert_eq!(relay.starts.len(), 4 - reserve);
+        let mut owner = Fake::default();
+        let meta = metadata(&cache, "/independent-owner", 3, 0);
+        let fault = cache.page(&meta, 0, deadline()).unwrap();
+        let end = fault.deadline();
+        let (mut fault, _) = pending_fault(&mut cache, &mut ring, &mut owner, fault);
+        if reserve == 0 {
+            assert!(
+                pool.private_fill().is_err(),
+                "relay receives did not fill the pool"
+            );
+            assert!(
+                fault.buffer_wait.is_some(),
+                "initial owner wait missing, starts={}",
+                owner.starts.len()
+            );
+            // Polling the reactor cannot make progress: all capacity is held by
+            // unresolved peer receives, and even the final owner cannot start.
+            for _ in 0..128 {
+                ring.progress().unwrap();
+                cache.poll(&mut ring, 16).unwrap();
+                let (next, work) = pending_fault(&mut cache, &mut ring, &mut owner, fault);
+                fault = next;
+                assert!(!work.runnable);
+                assert_eq!(work.deadline, Some(end));
+                assert!(
+                    fault.buffer_wait.is_some(),
+                    "owner wait disappeared, starts={}, acquiring={}",
+                    owner.starts.len(),
+                    matches!(fault.state, Loading::Acquire)
+                );
+                assert_eq!(fault.resource_retries, 0);
+                assert!(owner.starts.is_empty());
+            }
+            // Cancellation, rather than downstream service, breaks the hold.
+            drop(held.pop());
+            (fault, _) = pending_fault(&mut cache, &mut ring, &mut owner, fault);
+        }
+        assert_eq!(owner.starts.len(), 1);
+        assert!(fault.buffer_wait.is_none());
+        drop((fault, held));
+        cache.shutdown(&mut ring).unwrap();
+        ring.shutdown().unwrap();
+        pool.assert_recovered();
+    }
+}
+
 fn buffer_backpressure() {
     let mut ring =
         Ring::http_test_ring(buffers::io_test_pool(1), uring::Config::default()).unwrap();

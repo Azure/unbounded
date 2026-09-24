@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn cycle_handler(epoch: u64, remote: &str, address: std::net::SocketAddr) -> Handler {
+pub(super) fn cycle_handler(epoch: u64, remote: &str, address: std::net::SocketAddr) -> Handler {
     let (_, mut config) = crate::control::tests::fixture();
     let volume = &mut config.volumes[0];
     volume.peers = vec![remote.into()];
@@ -44,7 +44,7 @@ fn target(handler: &Handler) -> String {
         .unwrap()
 }
 
-fn page_target(handler: &Handler) -> String {
+pub(super) fn page_target(handler: &Handler) -> String {
     (0..)
         .map(|n| format!("/cycle-page-{n}"))
         .find(|t| {

@@ -65,6 +65,7 @@ impl Provider {
         let mut request = Self {
             namespace: self.namespace,
             chain: Rc::new(RefCell::new(Chain::default())),
+            receive_rank: None,
             flight: NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             reply_route: None,
             volume: self.volume.clone(),

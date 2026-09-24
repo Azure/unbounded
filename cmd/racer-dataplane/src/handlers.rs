@@ -178,6 +178,9 @@ pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 3
 pub struct Provider {
     namespace: cache::Namespace,
     chain: Rc<RefCell<Chain>>,
+    // Frozen for this local resolution: retries cannot enter a downstream rank
+    // while an earlier child or canceled transport still holds resources.
+    receive_rank: Option<usize>,
     flight: u64,
     reply_route: Option<([u8; 32], u32)>,
     volume: Option<String>,
@@ -331,6 +334,7 @@ impl Provider {
         Self {
             namespace: backend.namespace,
             chain: Rc::new(RefCell::new(Chain::default())),
+            receive_rank: None,
             flight: 0,
             reply_route: None,
             volume: None,
@@ -557,10 +561,25 @@ impl Upstream for Provider {
     fn has_peer(&self) -> bool {
         self.peer.is_some()
     }
-    fn receive_reserve(&self) -> cache::Result<usize> {
-        // Independent placements have no common resource rank. Cache admission
-        // parks with bounded resource retries and the original candidate deadline.
-        Ok(0)
+    fn receive_reserve(&mut self, capacity: usize) -> cache::Result<usize> {
+        // The wire hop allowance decreases even when a receiving peer rebases
+        // placement. Only a fresh local payload may shorten it to fit this pool.
+        // Received providers already have a frozen rank from peer_provider.
+        let rank = *self.receive_rank.get_or_insert_with(|| {
+            let mut chain = self.chain.borrow_mut();
+            chain.hops = usize::from(chain.hops).min(capacity.saturating_sub(1)) as u8;
+            usize::from(chain.hops)
+        });
+        if !self.has_peer() {
+            return Ok(0);
+        }
+        self.forward_available()?;
+        if rank >= capacity {
+            return Err(cache::busy(
+                "peer receive rank exceeds local buffer capacity",
+            ));
+        }
+        Ok(rank)
     }
     fn peer_failed(&mut self, error: cache::Error) -> cache::Result<bool> {
         self.forward_available()?;
@@ -987,6 +1006,7 @@ impl Handler {
         provider.reply_route = reply;
         if let Some((_, hops, work, _)) = chain {
             provider.chain = Rc::new(RefCell::new(Chain { hops, work }));
+            provider.receive_rank = Some(usize::from(hops));
         }
         Ok(provider)
     }

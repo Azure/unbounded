@@ -93,6 +93,20 @@ Each new metadata or page resolution receives at most eight hops and 255 units
 of work. Forwarding splits work between the child and local recovery; admission
 retries do not spend it. Placement rebasing and transport retries never renew it.
 
+Payload receive admission reserves slots by the resolution's initial local hop
+allowance, independent of placement. A newly originated payload chain caps its
+hops to `min(8, NUMA pool slots - 1)` before its first receive. A received chain
+keeps its allowance unchanged, including after rebasing. Forwarding decrements
+that allowance; local retries retain their original admission rank even after
+spending hops. A peer-dependent receive whose rank cannot fit the local pool
+fails with local-capacity Busy instead of clamping the received rank. Local-owner
+fetches and completed cache hits need no forwarding reserve. Thus a four-slot
+pool supports three-hop cold payload paths; extra rebases or recovery attempts
+can exhaust that bounded chain. Metadata does not consume payload slots or use
+this capacity cap. Mixed fleets and heterogeneous pool sizes may reject payload
+chains originated with a larger allowance; this does not authorize origin
+fallback or prove owner unavailability.
+
 Distributed client target admission reserves 410 bytes for the largest page,
 cursor, budget, and chain framing, allowing **3,090 target bytes**.
 

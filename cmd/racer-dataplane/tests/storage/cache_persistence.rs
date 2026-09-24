@@ -905,7 +905,7 @@ impl Upstream for Fake {
     fn has_peer(&self) -> bool {
         self.peer
     }
-    fn receive_reserve(&self) -> Result<usize> {
+    fn receive_reserve(&mut self, _: usize) -> Result<usize> {
         Ok(self.receive_reserve)
     }
     fn start(
