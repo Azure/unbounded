@@ -461,6 +461,7 @@ async fn config_inner(
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || header(&headers, "x-racer-profile") != "1"
+        || header(&headers, "x-racer-storage-policy") != "1"
         || cursor.len() > 1024
         || !cursor.bytes().all(|b| (0x21..=0x7e).contains(&b))
         || headers.get("content-length").is_some_and(|v| v != "0")
@@ -512,9 +513,7 @@ async fn config_inner(
                 report.offer(policy.as_deref());
             }
         }
-        let storage = policy
-            .filter(|_| header(&headers, "x-racer-storage-policy") == "1")
-            .and_then(|p| p.wire());
+        let storage = policy.and_then(|p| p.wire());
         let cursor_for = |digest: &str| {
             hex::encode(Sha256::digest(
                 serde_json::to_vec(&(&universe, &node, &pod, boot, digest, &storage)).unwrap(),

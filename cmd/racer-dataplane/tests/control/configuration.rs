@@ -105,6 +105,7 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
             ..Default::default()
         }],
         volumes: vec![proto::Volume {
+            max_candidate_attempts: Some(3),
             id: "v1".into(),
             cache_socket: "/dev/racer/v1/cache".into(),
             origin_socket: "/dev/racer/v1/origin".into(),
@@ -145,6 +146,12 @@ fn member_catalog_is_required_and_process_identity_is_exact() {
     };
     trust.prepare(raw(snapshot.clone())).unwrap();
     for mutate in [
+        |s: &mut proto::Snapshot| s.volumes[0].max_candidate_attempts = None,
+        |s: &mut proto::Snapshot| {
+            s.volumes[0].peer_endpoints.as_mut().unwrap().peers[0]
+                .http_address
+                .clear()
+        },
         |s: &mut proto::Snapshot| s.volumes[0].member_catalog = None,
         |s: &mut proto::Snapshot| s.volumes[0].member_catalog = Some(1),
         |s: &mut proto::Snapshot| s.member_catalogs.clear(),
@@ -202,7 +209,7 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
                 .iter()
                 .map(|peer| proto::VolumePeerEndpoint {
                     peer: peer.id.clone(),
-                    http_address: String::new(),
+                    http_address: peer.http_address.clone(),
                 })
                 .collect(),
         });

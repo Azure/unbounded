@@ -161,7 +161,10 @@ impl Trust {
         let mut sockets = BTreeSet::new();
         let mut volumes = Vec::new();
         for volume in &config.volumes {
-            if !(1..=8).contains(&volume.max_candidate_attempts.unwrap_or(3)) {
+            if !volume
+                .max_candidate_attempts
+                .is_some_and(|n| (1..=8).contains(&n))
+            {
                 return Err(invalid("max_candidate_attempts must be in 1..=8"));
             }
             let cache_socket = crate::socket::UnixPath::new(&volume.cache_socket)?;
@@ -291,11 +294,10 @@ fn effective_peers(
         let peer = global
             .get(endpoint.peer.as_str())
             .ok_or_else(|| invalid("unknown scoped peer"))?;
-        let url = if endpoint.http_address.is_empty() {
-            &peer.http_address
-        } else {
-            &endpoint.http_address
-        };
+        let url = &endpoint.http_address;
+        if url.is_empty() {
+            return Err(invalid("scoped peer HTTP address required"));
+        }
         if result
             .insert(peer.id.clone(), (url.clone(), peer.fabric.clone()))
             .is_some()

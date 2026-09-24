@@ -37,7 +37,6 @@ pub struct Observation {
     pub healthy: bool,
     pub local_state: String,
     pub rejected_revision: u64,
-    pub storage_supported: bool,
     pub offered: Option<([u8; 32], u64)>,
     pub storage_state: String,
     pub applied_bytes: u64,
@@ -64,7 +63,6 @@ impl Observation {
             healthy: false,
             local_state: String::new(),
             rejected_revision: 0,
-            storage_supported: false,
             offered: None,
             storage_state: "pending".into(),
             applied_bytes: 0,
@@ -84,12 +82,6 @@ impl Observation {
             .take(16)
             .collect();
         next.rejected_revision = number(headers, "x-racer-rejected-revision").unwrap_or(0);
-        next.storage_supported = header(headers, "x-racer-storage-policy") == "1";
-        if !next.storage_supported {
-            next.storage_state = "unsupported".into();
-            next.offered = None;
-            return next;
-        }
         let identity = header(headers, "x-racer-storage-identity");
         let version = number(headers, "x-racer-storage-version");
         let bytes = number(headers, "x-racer-storage-applied-bytes");
@@ -131,7 +123,7 @@ impl Observation {
     }
 
     pub fn offer(&mut self, policy: Option<&StoragePolicy>) {
-        if let Some(policy) = policy.filter(|p| self.storage_supported && p.wire().is_some()) {
+        if let Some(policy) = policy.filter(|p| p.wire().is_some()) {
             let offered = Some((policy.identity, policy.version));
             if self.offered != offered {
                 self.storage_state = "pending".into();

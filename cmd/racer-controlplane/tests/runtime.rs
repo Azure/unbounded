@@ -1141,6 +1141,28 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscription_requires_storage_policy_v1_capability() {
+    let credentials = credentials().await;
+    let context = credentials.context.clone();
+    let runtime = Runtime::new(
+        RuntimeOptions::new("system"),
+        Arc::new(move || Some(context.clone())),
+    );
+    for capability in [None, Some("0"), Some("2")] {
+        let mut req = request(&credentials.peer, &credentials.boot, "");
+        req.headers_mut().remove("x-racer-storage-policy");
+        if let Some(value) = capability {
+            req.headers_mut()
+                .insert("x-racer-storage-policy", value.parse().unwrap());
+        }
+        assert_eq!(
+            runtime.router().oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("racer_controlplane=warn")

@@ -100,7 +100,7 @@ pub(crate) mod peer_wire {
     }
     // RB01 budgets cover RD01/RR01/RR02 and are bound by authenticated transports.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
-    pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
+    pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Duration)> {
         let bytes = if chain(bytes)?.is_some() {
             &bytes[CHAIN_LEN..]
         } else {
@@ -118,7 +118,7 @@ pub(crate) mod peer_wire {
         }
         Ok((
             &bytes[8..],
-            Some(Duration::from_millis(u64::from(ms)).min(MAX_CANDIDATE)),
+            Duration::from_millis(u64::from(ms)).min(MAX_CANDIDATE),
         ))
     }
     pub(crate) fn routed_descriptor(

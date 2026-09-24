@@ -481,7 +481,7 @@ fn four_hop_eight_candidate_budget_reserves_return_slack_once() {
         );
         let wire = p.budget_wire(&request, service).unwrap();
         let (_, budget) = budget_descriptor(&wire).unwrap();
-        let child = crate::environment::now() + budget.unwrap();
+        let child = crate::environment::now() + budget;
         // Relative millisecond framing rounds down; allow bounded local test work.
         assert!(child <= inherited);
         assert!(child > cap - RETURN_SLACK * hop - Duration::from_millis(100));

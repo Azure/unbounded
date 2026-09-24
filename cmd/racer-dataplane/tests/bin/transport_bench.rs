@@ -56,7 +56,7 @@ fn real_peer_descriptor_and_payload_contracts() {
             .unwrap();
         f.validate_descriptor(&descriptor).unwrap();
         let (_, budget) = crate::cache::peer_wire::budget_descriptor(&descriptor).unwrap();
-        assert!(budget.is_some());
+        assert!(!budget.is_zero());
         let mut corrupt = descriptor.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(f.validate_descriptor(&corrupt).is_err());

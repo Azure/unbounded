@@ -310,7 +310,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             assert!(descriptor.with_expected([0; 32], 3).key(namespace).is_err());
             assert_eq!(
                 budget_descriptor(&bounded).unwrap().1,
-                Some(Duration::from_millis(1500))
+                Duration::from_millis(1500)
             );
             // Context binds the transmitted budget as well as cursor/value.
             let digest = blake3::hash(&bounded);
@@ -323,7 +323,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             let now = crate::environment::now();
             assert_eq!(remote_deadline(&bounded, now).unwrap(), now);
             bounded[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-            assert_eq!(budget_descriptor(&bounded).unwrap().1, Some(MAX_CANDIDATE));
+            assert_eq!(budget_descriptor(&bounded).unwrap().1, MAX_CANDIDATE);
             bounded[4..8].fill(0);
             assert!(routed_descriptor(&bounded).is_err());
             bounded[4..8].copy_from_slice(&1u32.to_le_bytes());

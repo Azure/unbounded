@@ -74,7 +74,7 @@ use attempt::candidate_end;
 
 pub(crate) fn remote_deadline(bytes: &[u8], local: Instant) -> io::Result<Instant> {
     let (_, remaining) = budget_descriptor(bytes)?;
-    Ok(local.min(crate::environment::now() + remaining.unwrap_or(MAX_CANDIDATE)))
+    Ok(local.min(crate::environment::now() + remaining))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -1047,8 +1047,8 @@ impl Handler {
     fn peer_provider(&self, bytes: &[u8]) -> cache::Result<Provider> {
         let (cursor, descriptor) = routed_descriptor(bytes)?;
         let chain = cache::peer_wire::chain(bytes)?;
-        if (self.upstream.routing.is_some() || self.upstream.has_peer()) && chain.is_none() {
-            return Err(invalid("missing bounded request chain").into());
+        if chain.is_none() || cursor.is_none() {
+            return Err(invalid("missing bounded request chain or cursor").into());
         }
         if chain.is_some_and(|(namespace, _, _, _)| namespace != *self.namespace.digest()) {
             return Err(invalid("foreign cache namespace").into());
