@@ -19,6 +19,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -194,6 +195,56 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+	}
+}
+
+// FetchRangeFromPeer fetches one exact byte range from a peer holding a
+// complete, committed blob. Registry authorization is deliberately not
+// forwarded: digest and range are sufficient at the peer boundary.
+func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
+	if _, err := httprange.New(requested.Start, requested.End); err != nil {
+		return nil, 0, "", err
+	}
+
+	url, err := buildPeerURL(peerAddr, ifaces.OriginRef{Digest: d, Kind: ifaces.KindBlob})
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Range", requested.HeaderValue())
+	req.URL.Scheme = "http"
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		size, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
+		if err != nil {
+			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
+		}
+
+		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
+	case http.StatusNotFound:
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: d}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close

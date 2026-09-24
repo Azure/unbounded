@@ -101,6 +101,97 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	}
 }
 
+func TestArtifactStreamingDefaultsRenderDisabled(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderTemplates(t)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered configmap: %v", err)
+	}
+
+	var configMap struct {
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal(raw, &configMap); err != nil {
+		t.Fatalf("unmarshal rendered configmap: %v", err)
+	}
+
+	config := configMap.Data["config.yaml"]
+	for _, expected := range []string{
+		"artifact_streaming_enabled: false",
+		"artifact_streaming_peer_lookup_timeout: \"250ms\"",
+		"artifact_streaming_max_peer_attempts: 3",
+		"artifact_streaming_max_concurrent_origin_reads: 32",
+		".data.mcr.microsoft.com",
+		".blob.core.windows.net",
+	} {
+		if !strings.Contains(config, expected) {
+			t.Errorf("rendered config missing %q:\n%s", expected, config)
+		}
+	}
+}
+
+func TestOverlayBDConfiguratorIsOptIn(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderStandaloneTemplates(t)
+	if _, err := os.Stat(filepath.Join(outputDir, "overlaybd-config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("overlaybd-config.yaml exists by default; err=%v", err)
+	}
+}
+
+func TestOverlayBDConfiguratorEnabled(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderChart(t, false,
+		"--set", "overlaybdConfig.enabled=true",
+		"--set", "gantry.artifactStreaming.enabled=true",
+		"--set-string", "overlaybdConfig.image.reference=gantry-node-config:test",
+		"--set-string", "overlaybdConfig.nodeSelector.kubernetes\\.azure\\.com/host-os=AzureLinux",
+	)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "overlaybd-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered OverlayBD configurator: %v", err)
+	}
+
+	var daemonSet struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					HostPID      bool              `yaml:"hostPID"`
+					NodeSelector map[string]string `yaml:"nodeSelector"`
+					Containers   []struct {
+						Image           string `yaml:"image"`
+						SecurityContext struct {
+							Privileged bool `yaml:"privileged"`
+						} `yaml:"securityContext"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &daemonSet); err != nil {
+		t.Fatalf("unmarshal OverlayBD configurator: %v", err)
+	}
+
+	if !daemonSet.Spec.Template.Spec.HostPID {
+		t.Error("hostPID = false, want true")
+	}
+
+	if got := daemonSet.Spec.Template.Spec.NodeSelector["kubernetes.azure.com/host-os"]; got != "AzureLinux" {
+		t.Errorf("node selector = %q, want AzureLinux", got)
+	}
+
+	if len(daemonSet.Spec.Template.Spec.Containers) != 1 ||
+		daemonSet.Spec.Template.Spec.Containers[0].Image != "gantry-node-config:test" ||
+		!daemonSet.Spec.Template.Spec.Containers[0].SecurityContext.Privileged {
+		t.Fatalf("unexpected configurator container: %+v", daemonSet.Spec.Template.Spec.Containers)
+	}
+}
+
 func TestRendersFixedChairLeaseSet(t *testing.T) {
 	t.Parallel()
 
@@ -417,6 +508,13 @@ func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
 	standaloneObjects := renderedObjects(t, renderStandaloneTemplates(t))
 
 	delete(operatorObjects, "Namespace//unbounded-system")
+
+	const overlayBDConfigKey = "DaemonSet/unbounded-system/gantry-overlaybd-config"
+	if _, ok := operatorObjects[overlayBDConfigKey]; !ok {
+		t.Fatalf("operator profile is missing %s", overlayBDConfigKey)
+	}
+
+	delete(operatorObjects, overlayBDConfigKey)
 	delete(standaloneObjects, "ConfigMap/unbounded-system/gantry-containerd-hosts")
 	delete(standaloneObjects, "DaemonSet/unbounded-system/gantry-containerd-config")
 
@@ -467,7 +565,7 @@ func renderStandaloneTemplates(t *testing.T) string {
 	return renderChart(t, false)
 }
 
-func renderChart(t *testing.T, operatorProfile bool) string {
+func renderChart(t *testing.T, operatorProfile bool, extraArgs ...string) string {
 	t.Helper()
 
 	deployDir := filepath.Dir(sourceFile(t))
@@ -498,6 +596,8 @@ func renderChart(t *testing.T, operatorProfile bool) string {
 			"--skip-schema-validation",
 		)
 	}
+
+	args = append(args, extraArgs...)
 
 	cmd := exec.Command(helm, args...)
 

@@ -28,6 +28,20 @@ nodeConfig:
   hostPath: /etc/containerd/certs.d
   reconcileIntervalSeconds: 5
 
+overlaybdConfig:
+  enabled: false
+  address: http://localhost:5000/blobs
+  logLevel: 0
+  image:
+    reference: ""
+    repository: ghcr.io/azure/gantry-node-config
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+
 registryCredentials:
   secretName: gantry-registry-credentials
 
@@ -53,10 +67,27 @@ resources:
     limits:
       cpu: 50m
       memory: 16Mi
+  overlaybdConfig:
+    requests:
+      cpu: 5m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
 
 gantry:
   config: ""
   pprofListen: ""
+  artifactStreaming:
+    enabled: false
+    allowedHostSuffixes:
+      - .azurecr.io
+      - .data.mcr.microsoft.com
+      - .blob.core.windows.net
+    peerLookupTimeout: 250ms
+    maxPeerAttempts: 3
+    maxConcurrentOriginReads: 32
+    originResponseHeaderTimeout: 30s
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com

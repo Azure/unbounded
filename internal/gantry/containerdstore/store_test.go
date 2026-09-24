@@ -23,6 +23,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -295,6 +296,54 @@ func TestStore_HasAndOpen(t *testing.T) {
 	var nf *ifaces.ErrNotFound
 	if !errors.As(err, &nf) {
 		t.Errorf("Open(absent) err = %v, want *ErrNotFound", err)
+	}
+}
+
+func TestStore_OpenRange(t *testing.T) {
+	cs := newFake()
+	payload := []byte("0123456789")
+	cs.put(godigest.FromBytes(payload), payload)
+	s := New(cs)
+	d := mustDigest(t, payload)
+
+	r, size, err := s.OpenRange(context.Background(), d, httprange.Range{Start: 3, End: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }() //nolint:errcheck // best-effort close
+
+	if size != int64(len(payload)) {
+		t.Fatalf("size = %d, want %d", size, len(payload))
+	}
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "3456" {
+		t.Fatalf("body = %q, want %q", got, "3456")
+	}
+}
+
+func TestStore_OpenRangeUnsatisfiable(t *testing.T) {
+	cs := newFake()
+	payload := []byte("small")
+	cs.put(godigest.FromBytes(payload), payload)
+	s := New(cs)
+	d := mustDigest(t, payload)
+
+	r, size, err := s.OpenRange(context.Background(), d, httprange.Range{Start: 4, End: 5})
+	if r != nil {
+		_ = r.Close() //nolint:errcheck // best-effort close
+	}
+
+	if !errors.Is(err, httprange.ErrUnsatisfiable) {
+		t.Fatalf("error = %v, want ErrUnsatisfiable", err)
+	}
+
+	if size != int64(len(payload)) {
+		t.Fatalf("size = %d, want %d", size, len(payload))
 	}
 }
 

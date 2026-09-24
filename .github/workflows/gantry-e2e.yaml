@@ -10,6 +10,7 @@ on:
       - internal/gantry/**
       - deploy/gantry/**
       - images/gantry/**
+      - images/gantry-node-config/**
       - e2e/gantry/**
       - hack/cmd/render-manifests/**
       - go.mod
@@ -25,6 +26,7 @@ on:
       - internal/gantry/**
       - deploy/gantry/**
       - images/gantry/**
+      - images/gantry-node-config/**
       - e2e/gantry/**
       - hack/cmd/render-manifests/**
       - go.mod
@@ -62,7 +64,9 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Install kind
-        run: go install sigs.k8s.io/kind@v0.30.0
+        run: |
+          make install-kind
+          echo "$PWD/bin" >> "$GITHUB_PATH"
 
       # The suite skips when prerequisites are absent. Verify them first so CI
       # cannot report success without creating a cluster.

@@ -821,7 +821,7 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     strategy:
-      # One bad component must not cancel the other ten. Runner minutes are the
+      # One bad component must not cancel the other eleven. Runner minutes are the
       # wrong thing to optimize on a release: knowing the full blast radius in
       # one pass beats discovering it one re-run at a time, and it keeps the
       # re-run down to the job that actually failed. When v0.5.0's
@@ -852,6 +852,10 @@ jobs:
             trivy: true
           - name: gantry
             file: images/gantry/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: gantry-node-config
+            file: images/gantry-node-config/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: unbounded-storage-supervisor

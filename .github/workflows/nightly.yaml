@@ -266,6 +266,7 @@ jobs:
   #   - netboot                       : PXE artifact referenced by metalman
   #   - unbounded-storage-supervisor  : per-Site storage supervisor DaemonSet
   #   - gantry                        : cluster-wide gantry DaemonSet
+  #   - gantry-node-config            : optional AKS OverlayBD configurator
   #   - orca                          : deployed separately by deploy-orca
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
@@ -294,6 +295,8 @@ jobs:
             file: images/unbounded-operator/Containerfile
           - name: gantry
             file: images/gantry/Containerfile
+          - name: gantry-node-config
+            file: images/gantry-node-config/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator

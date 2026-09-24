@@ -100,6 +100,26 @@ spec:
                       (for example the Gantry print column) whenever a components block is
                       present. A site that omits the components block entirely is not defaulted.
                     properties:
+                      artifactStreaming:
+                        description: |-
+                          ArtifactStreaming configures Gantry as the node-local range proxy for
+                          AKS ACR Artifact Streaming. It is disabled when omitted. Because Gantry is
+                          a cluster singleton, every Site that enables it must use the same node
+                          selector.
+                        properties:
+                          enabled:
+                            description: Enabled controls the Gantry range endpoint
+                              and OverlayBD configurator.
+                            type: boolean
+                          nodeSelector:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              NodeSelector must select only AKS node pools with Artifact Streaming
+                              enabled. It is required when Enabled is true.
+                            minProperties: 1
+                            type: object
+                        type: object
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean

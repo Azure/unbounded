@@ -148,6 +148,7 @@ GANTRY_CHART_APP_VERSION ?= $(VERSION_TAG)
 GANTRY_CHART_PACKAGE_DIR := build/charts
 GANTRY_CHART_STAGE_DIR := tmp/gantry-chart-package
 GANTRY_CHART_IMAGE_REPOSITORY ?= $(CONTAINER_REGISTRY)/gantry
+GANTRY_NODE_CONFIG_IMAGE ?= $(CONTAINER_REGISTRY)/gantry-node-config:$(VERSION_TAG)
 
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
@@ -291,7 +292,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -312,6 +313,7 @@ help: ## Show this help
 	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo "  install-helm                     Download pinned Helm into bin/"
+	@echo "  install-kind                     Install pinned kind into bin/"
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
@@ -464,6 +466,10 @@ ACTIONLINT_VERSION ?= v1.7.12
 HELM_VERSION ?= 3.21.3
 HELM ?= $(CURDIR)/bin/helm
 HELM_STAMP := $(CURDIR)/bin/.helm-v$(HELM_VERSION)
+KIND_VERSION ?= v0.30.0
+KIND ?= $(CURDIR)/bin/kind
+KIND_STAMP := $(CURDIR)/bin/.kind-$(KIND_VERSION)
+GANTRY_E2E_RUN ?= .
 
 HELM_UNAME_S := $(shell uname -s)
 HELM_UNAME_M := $(shell uname -m)
@@ -528,6 +534,17 @@ install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
 
 install-helm: $(HELM) ## Download pinned Helm into bin/
+
+install-kind: $(KIND) ## Install pinned kind into bin/
+
+$(KIND_STAMP):
+	@mkdir -p $(dir $(KIND))
+	GOBIN=$(CURDIR)/bin $(GOCMD) install sigs.k8s.io/kind@$(KIND_VERSION)
+	@$(KIND) version
+	@touch $(KIND_STAMP)
+
+$(KIND): $(KIND_STAMP)
+	@test -x $(KIND) || { rm -f $(KIND_STAMP); $(MAKE) $(KIND_STAMP); }
 
 $(HELM_STAMP):
 	@test -n "$(HELM_SHA256)" || { echo "unsupported Helm platform $(HELM_OS)-$(HELM_ARCH)" >&2; exit 1; }
@@ -618,9 +635,16 @@ test: lint machina-manifests token-refresher-manifests machine-ops-manifests pla
 
 endif
 
-e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
-	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
-		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
+e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
+	@set -eu; \
+	if [ "$(CONTAINER_ENGINE)" = "podman" ] && [ "$$($(CONTAINER_ENGINE) info --format '{{.Host.Security.Rootless}}')" = "true" ]; then \
+		command -v systemd-run >/dev/null 2>&1 || { echo "rootless Podman requires systemd-run" >&2; exit 1; }; \
+		exec systemd-run --user --scope --quiet -p Delegate=yes \
+			env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+			$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry; \
+	fi; \
+	exec env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+		$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
@@ -1433,6 +1457,16 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
+.PHONY: image-gantry-node-config-local image-gantry-node-config-push
+image-gantry-node-config-local: ## Build the Gantry OverlayBD node configurator image locally
+	$(CONTAINER_ENGINE) build \
+		-t gantry-node-config:$(VERSION_TAG) -t $(GANTRY_NODE_CONFIG_IMAGE) \
+		-f ./images/gantry-node-config/Containerfile .
+	$(call trivy-maybe,$(GANTRY_NODE_CONFIG_IMAGE))
+
+image-gantry-node-config-push: image-gantry-node-config-local ## Build and push the Gantry OverlayBD node configurator image
+	$(CONTAINER_ENGINE) push $(GANTRY_NODE_CONFIG_IMAGE)
+
 ##@ Orca
 
 .PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
@@ -1583,7 +1617,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-node-config-local ## Build all container images locally
 
 ##@ Net Frontend
 

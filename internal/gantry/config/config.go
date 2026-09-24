@@ -78,6 +78,30 @@ type Config struct {
 	// for the full opt-in checklist.
 	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
+	// ArtifactStreamingEnabled enables the node-local OverlayBD range endpoint
+	// on /blobs/ under MirrorListen.
+	ArtifactStreamingEnabled bool `yaml:"artifact_streaming_enabled"`
+
+	// ArtifactStreamingAllowedHostSuffixes limits signed-origin requests to
+	// approved Azure data endpoints. A leading dot denotes a DNS suffix; values
+	// without a leading dot are exact hosts.
+	ArtifactStreamingAllowedHostSuffixes []string `yaml:"artifact_streaming_allowed_host_suffixes"`
+
+	// ArtifactStreamingPeerLookupTimeout bounds complete-provider discovery for
+	// one range request before the signed origin URL is used.
+	ArtifactStreamingPeerLookupTimeout time.Duration `yaml:"artifact_streaming_peer_lookup_timeout"`
+
+	// ArtifactStreamingMaxPeerAttempts caps complete providers tried per range.
+	ArtifactStreamingMaxPeerAttempts int `yaml:"artifact_streaming_max_peer_attempts"`
+
+	// ArtifactStreamingMaxConcurrentOriginReads bounds signed-origin range
+	// responses independently of complete chair pulls.
+	ArtifactStreamingMaxConcurrentOriginReads int `yaml:"artifact_streaming_max_concurrent_origin_reads"`
+
+	// ArtifactStreamingOriginResponseHeaderTimeout bounds the wait for signed
+	// origin response headers. Body progress remains request-context governed.
+	ArtifactStreamingOriginResponseHeaderTimeout time.Duration `yaml:"artifact_streaming_origin_response_header_timeout"`
+
 	// TransferListen is the peer-facing HTTP/2 endpoint (the design doc). The bind is
 	// typically 0.0.0.0; cluster-internal isolation comes from
 	// NetworkPolicy + the `Gantry-Mirrored: 1` request-header gate +
@@ -473,15 +497,25 @@ func NewDefault() *Config {
 	return &Config{
 		MirrorListen:               "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback: false,
-		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "0.0.0.0:9095",
-		PprofListen:                "",
-		Libp2pListen:               nil,
-		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:      900,
-		Libp2pConnManagerLow:       600,
-		Libp2pConnManagerGrace:     time.Minute,
-		ChairListen:                "0.0.0.0:5002",
+		ArtifactStreamingEnabled:   false,
+		ArtifactStreamingAllowedHostSuffixes: []string{
+			".azurecr.io",
+			".data.mcr.microsoft.com",
+			".blob.core.windows.net",
+		},
+		ArtifactStreamingPeerLookupTimeout:           250 * time.Millisecond,
+		ArtifactStreamingMaxPeerAttempts:             3,
+		ArtifactStreamingMaxConcurrentOriginReads:    32,
+		ArtifactStreamingOriginResponseHeaderTimeout: 30 * time.Second,
+		TransferListen:         "0.0.0.0:5001",
+		MetricsListen:          "0.0.0.0:9095",
+		PprofListen:            "",
+		Libp2pListen:           nil,
+		Libp2pIdentityPath:     "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:  900,
+		Libp2pConnManagerLow:   600,
+		Libp2pConnManagerGrace: time.Minute,
+		ChairListen:            "0.0.0.0:5002",
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -620,6 +654,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
+	setBool("ARTIFACT_STREAMING_ENABLED", &c.ArtifactStreamingEnabled)
+	setDur("ARTIFACT_STREAMING_PEER_LOOKUP_TIMEOUT", &c.ArtifactStreamingPeerLookupTimeout)
+	setInt("ARTIFACT_STREAMING_MAX_PEER_ATTEMPTS", &c.ArtifactStreamingMaxPeerAttempts)
+	setInt("ARTIFACT_STREAMING_MAX_CONCURRENT_ORIGIN_READS", &c.ArtifactStreamingMaxConcurrentOriginReads)
+	setDur("ARTIFACT_STREAMING_ORIGIN_RESPONSE_HEADER_TIMEOUT", &c.ArtifactStreamingOriginResponseHeaderTimeout)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("PPROF_LISTEN", &c.PprofListen)
@@ -704,6 +743,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
+	fs.BoolVar(&c.ArtifactStreamingEnabled, "artifact-streaming-enabled", c.ArtifactStreamingEnabled, "enable the node-local OverlayBD /blobs/ range endpoint")
+	fs.DurationVar(&c.ArtifactStreamingPeerLookupTimeout, "artifact-streaming-peer-lookup-timeout", c.ArtifactStreamingPeerLookupTimeout, "complete-provider lookup budget for one OverlayBD range")
+	fs.IntVar(&c.ArtifactStreamingMaxPeerAttempts, "artifact-streaming-max-peer-attempts", c.ArtifactStreamingMaxPeerAttempts, "maximum complete Gantry providers tried per OverlayBD range")
+	fs.IntVar(&c.ArtifactStreamingMaxConcurrentOriginReads, "artifact-streaming-max-concurrent-origin-reads", c.ArtifactStreamingMaxConcurrentOriginReads, "maximum concurrent signed-origin OverlayBD range reads")
+	fs.DurationVar(&c.ArtifactStreamingOriginResponseHeaderTimeout, "artifact-streaming-origin-response-header-timeout", c.ArtifactStreamingOriginResponseHeaderTimeout, "timeout waiting for signed-origin response headers")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
@@ -836,6 +880,35 @@ func (c *Config) Validate() error {
 	mustAddr("mirror_listen", c.MirrorListen)
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
+
+	if c.ArtifactStreamingPeerLookupTimeout <= 0 {
+		errs = append(errs, errors.New("artifact_streaming_peer_lookup_timeout must be positive"))
+	}
+
+	if c.ArtifactStreamingMaxPeerAttempts < 1 {
+		errs = append(errs, errors.New("artifact_streaming_max_peer_attempts must be at least 1"))
+	}
+
+	if c.ArtifactStreamingMaxConcurrentOriginReads < 1 {
+		errs = append(errs, errors.New("artifact_streaming_max_concurrent_origin_reads must be at least 1"))
+	}
+
+	if c.ArtifactStreamingOriginResponseHeaderTimeout <= 0 {
+		errs = append(errs, errors.New("artifact_streaming_origin_response_header_timeout must be positive"))
+	}
+
+	if c.ArtifactStreamingEnabled && len(c.ArtifactStreamingAllowedHostSuffixes) == 0 {
+		errs = append(errs, errors.New("artifact_streaming_enabled requires artifact_streaming_allowed_host_suffixes"))
+	}
+
+	for _, allowed := range c.ArtifactStreamingAllowedHostSuffixes {
+		value := strings.TrimSpace(strings.TrimSuffix(allowed, "."))
+
+		base := strings.TrimPrefix(value, ".")
+		if !validArtifactStreamingHostRule(value, base) {
+			errs = append(errs, fmt.Errorf("artifact_streaming_allowed_host_suffixes contains invalid host %q", allowed))
+		}
+	}
 
 	if c.PprofListen != "" {
 		mustAddr("pprof_listen", c.PprofListen)
@@ -1150,6 +1223,30 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+func validArtifactStreamingHostRule(value, base string) bool {
+	if value == "" || base == "" || net.ParseIP(base) != nil || strings.ContainsAny(base, "*/:?#@") || len(base) > 253 {
+		return false
+	}
+
+	for _, label := range strings.Split(base, ".") {
+		if len(label) == 0 || len(label) > 63 || !isDNSAlphaNumeric(label[0]) || !isDNSAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+
+		for index := 1; index < len(label)-1; index++ {
+			if !isDNSAlphaNumeric(label[index]) && label[index] != '-' {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func isDNSAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
 // ResolveUpstream returns the UpstreamRegistry whose Name (or NSAlias)
 // equals ns. Returns false if ns does not match any configured registry.
 func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
@@ -1169,6 +1266,7 @@ func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
 func (c *Config) Redacted() *Config {
 	cp := *c
 	cp.UpstreamRegistries = append([]UpstreamRegistry(nil), c.UpstreamRegistries...)
+	cp.ArtifactStreamingAllowedHostSuffixes = append([]string(nil), c.ArtifactStreamingAllowedHostSuffixes...)
 	// CredentialsPath is a path, not the secret; safe to log as-is.
 	return &cp
 }

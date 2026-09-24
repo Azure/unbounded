@@ -130,9 +130,53 @@ containerd's `certs.d` directory. Include the port when the image reference
 uses a non-default port. Gantry requires at least one accelerated upstream
 registry.
 
+### 4. Optional: Enable ACR Artifact Streaming
 
+ACR Artifact Streaming support requires an AKS node pool that already runs the
+OverlayBD daemon and snapshotter. Gantry configures that existing installation;
+it does not provision OverlayBD on other nodes.
 
-### 4. Private Registry Authentication
+For the standalone chart, set both feature gates and select only the AKS
+streaming node pool:
+
+```yaml
+gantry:
+   artifactStreaming:
+      enabled: true
+
+overlaybdConfig:
+   enabled: true
+   nodeSelector:
+      kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+For operator-managed Gantry, use the `Site` API instead:
+
+```yaml
+spec:
+   components:
+      gantry:
+         enabled: true
+         artifactStreaming:
+            enabled: true
+            nodeSelector:
+               kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+Every Site that enables the cluster-wide feature must specify the same
+selector. The node configurator records the previous OverlayBD configuration,
+does not restart services on a no-op, and restores its previous value on
+graceful removal only when no other writer changed the file.
+
+To roll back, drain active streaming workloads first. Operator-managed installs
+then set `spec.components.gantry.artifactStreaming.enabled` to `false`; the
+operator removes the configurator before rolling Gantry back without the range
+endpoint. Standalone installs first set `overlaybdConfig.enabled=false` while
+leaving `gantry.artifactStreaming.enabled=true`, wait for
+`DaemonSet/gantry-overlaybd-config` to be deleted, and only then disable the
+Gantry endpoint.
+
+### 5. Private Registry Authentication
 
 #### Requester-Delegated Authentication
 
@@ -172,7 +216,7 @@ file causes the pod to fail, so do not add `credentials_path` unless the Secret
 is present. Prefer requester-delegated authentication when possible because it
 avoids distributing a shared registry credential to every node.
 
-### 5. Verify Distribution
+### 6. Verify Distribution
 
 First verify one agent directly. Select a pod and forward its health and
 metrics listener:

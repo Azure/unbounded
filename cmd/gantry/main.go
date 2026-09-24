@@ -49,6 +49,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	streamingapi "github.com/Azure/unbounded/internal/gantry/streaming"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -148,6 +149,7 @@ func runAgent(args []string) error {
 	reg.RegisterDefaultCollectors()
 	inst := newPhase1Metrics(reg)
 	p2 := newPhase2Metrics(reg)
+	streamingMetrics := newArtifactStreamingMetrics(reg)
 	layerProgress := newLayerProgressTracker(p2.layerCompletedAt, c.NodeName, time.Now)
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
@@ -660,12 +662,65 @@ func runAgent(args []string) error {
 		mirror.WithStartupReadinessGate(),
 	)
 
-	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
+	var artifactStreamingSrv *streamingapi.Server
+
+	mirrorHandler := mirrorSrv.Handler()
+
+	if c.ArtifactStreamingEnabled {
+		urlPolicy := streamingapi.URLPolicy{AllowedHostSuffixes: c.ArtifactStreamingAllowedHostSuffixes}
+
+		streamingOrigin, originErr := streamingapi.NewOriginClient(
+			urlPolicy,
+			c.ArtifactStreamingMaxConcurrentOriginReads,
+			c.ArtifactStreamingOriginResponseHeaderTimeout,
+		)
+		if originErr != nil {
+			return fmt.Errorf("artifact streaming origin client: %w", originErr)
+		}
+
+		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingOrigin, streamingapi.Options{
+			URLPolicy:         urlPolicy,
+			PeerLookupTimeout: c.ArtifactStreamingPeerLookupTimeout,
+			MaxPeerAttempts:   c.ArtifactStreamingMaxPeerAttempts,
+			SelfPeerID:        ifaces.NodeID(disco.PeerID().String()),
+			StartupGated:      true,
+			Logger:            logger,
+			Metrics: streamingapi.MetricsHooks{
+				OnRequest: func(source, outcome string, duration time.Duration, bytes int64) {
+					streamingMetrics.requests.WithLabelValues(source, outcome).Inc()
+					streamingMetrics.duration.WithLabelValues(source, outcome).Observe(duration.Seconds())
+
+					if bytes > 0 {
+						streamingMetrics.bytes.WithLabelValues(source).Add(float64(bytes))
+					}
+				},
+				OnFirstByte: func(source string, duration time.Duration) {
+					streamingMetrics.firstByte.WithLabelValues(source).Observe(duration.Seconds())
+				},
+				OnInflight: func(source string, delta int) {
+					streamingMetrics.inflight.WithLabelValues(source).Add(float64(delta))
+				},
+				OnReject: func(reason string) {
+					streamingMetrics.rejected.WithLabelValues(reason).Inc()
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("artifact streaming server: %w", err)
+		}
+
+		mirrorHandler = routeNodeLocalHandlers(artifactStreamingSrv, mirrorHandler)
+	}
+
+	mirrorStop, err := mirrorSrv.ListenAndServeHandler(c.MirrorListen, mirrorHandler)
 	if err != nil {
 		return fmt.Errorf("mirror listen: %w", err)
 	}
 
-	logger.Info("mirror endpoint listening", slog.String("addr", c.MirrorListen))
+	logger.Info("mirror endpoint listening",
+		slog.String("addr", c.MirrorListen),
+		slog.Bool("artifact_streaming", artifactStreamingSrv != nil),
+	)
 
 	// /4 - cdsub event loop. cdsub no longer calls DHT.Provide
 	// directly in containerd mode; every event is routed through the
@@ -878,6 +933,11 @@ func runAgent(args []string) error {
 			case <-t.C:
 				if _, ok := readyCheck(); ok {
 					mirrorSrv.MarkReady()
+
+					if artifactStreamingSrv != nil {
+						artifactStreamingSrv.MarkReady()
+					}
+
 					logger.Info("mirror: startup gate released; /v2/ now serving")
 
 					return
@@ -923,6 +983,7 @@ func runAgent(args []string) error {
 	gracefulShutdown(shutdownDeps{
 		logger:         logger,
 		mirrorSrv:      mirrorSrv,
+		streamingSrv:   artifactStreamingSrv,
 		transferStop:   transferStop,
 		mirrorStop:     mirrorStop,
 		cdsubSrc:       cdsubSrc,

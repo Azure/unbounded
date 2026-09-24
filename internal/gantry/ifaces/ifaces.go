@@ -512,3 +512,18 @@ type ErrPeerHTTPStatus struct {
 func (e *ErrPeerHTTPStatus) Error() string {
 	return fmt.Sprintf("peer %s returned %d", e.PeerAddr, e.StatusCode)
 }
+
+// ErrPeerProtocol reports a peer response that violated the transfer wire
+// contract. Callers should temporarily suppress the provider for this digest;
+// unlike an availability error, retrying the same response immediately cannot
+// succeed safely.
+type ErrPeerProtocol struct {
+	PeerAddr string
+	Err      error
+}
+
+func (e *ErrPeerProtocol) Error() string {
+	return fmt.Sprintf("peer %s protocol error: %v", e.PeerAddr, e.Err)
+}
+
+func (e *ErrPeerProtocol) Unwrap() error { return e.Err }

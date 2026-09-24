@@ -196,6 +196,27 @@ type StorageComponentSpec struct {
 // sets enabled to false.
 type GantryComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+
+	// ArtifactStreaming configures Gantry as the node-local range proxy for
+	// AKS ACR Artifact Streaming. It is disabled when omitted. Because Gantry is
+	// a cluster singleton, every Site that enables it must use the same node
+	// selector.
+	// +optional
+	ArtifactStreaming *GantryArtifactStreamingSpec `json:"artifactStreaming,omitempty"`
+}
+
+// GantryArtifactStreamingSpec selects the AKS nodes whose Azure-managed
+// OverlayBD installation should be configured to use Gantry.
+type GantryArtifactStreamingSpec struct {
+	// Enabled controls the Gantry range endpoint and OverlayBD configurator.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// NodeSelector must select only AKS node pools with Artifact Streaming
+	// enabled. It is required when Enabled is true.
+	// +kubebuilder:validation:MinProperties=1
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 }
 
 // TokenRefresherComponentSpec configures bootstrap token refresh for a Site.

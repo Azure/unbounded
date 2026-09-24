@@ -29,6 +29,7 @@ const bomSchemaVersion = 2
 
 var releaseImageNames = []string{
 	"gantry",
+	"gantry-node-config",
 	"host-ubuntu2404",
 	"inventory-aggregator",
 	"inventory-inspector",

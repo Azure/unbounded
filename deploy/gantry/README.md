@@ -98,6 +98,87 @@ derived from `hosts.toml.template` (substitute `${REGISTRY_SERVER}`
 with the registry's `https://...` URL). containerd reloads `certs.d`
 on its own; no restart needed.
 
+## ACR Artifact Streaming
+
+This integration configures an existing AKS Artifact Streaming node pool. It
+does not install OverlayBD or register its snapshotter with containerd. Enable
+it only on nodes where AKS already provides
+`/opt/acr/tools/overlaybd/config.sh`, `overlaybd-tcmu`, and
+`overlaybd-snapshotter`.
+
+For a standalone Helm installation, enable the Gantry range endpoint and its
+host configurator together, with an explicit selector for only the streaming
+node pool:
+
+```yaml
+gantry:
+   artifactStreaming:
+      enabled: true
+
+overlaybdConfig:
+   enabled: true
+   nodeSelector:
+      kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+The configurator waits for `/artifact-streaming/readyz`, snapshots the current
+host configuration under `/var/lib/gantry/overlaybd-config`, then uses the
+AKS-provided configuration tool to set OverlayBD's P2P address to
+`http://localhost:5000/blobs`. It restarts the OverlayBD services only when the
+effective configuration changes. A second writer is never overwritten: if the
+host file differs from Gantry's managed snapshot, apply or rollback preserves
+that file and reports the conflict.
+
+For an operator-managed installation, opt in through every participating
+`Site` using the same selector:
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+   name: <site-name>
+spec:
+   components:
+      gantry:
+         enabled: true
+         artifactStreaming:
+            enabled: true
+            nodeSelector:
+               kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+The operator rejects an empty selector, a Site that enables Artifact Streaming
+while disabling Gantry, or conflicting selectors across Sites.
+
+### Artifact Streaming rollback
+
+Drain workloads using active OverlayBD devices before disabling the operator
+setting. The operator issues deletion of
+`DaemonSet/gantry-overlaybd-config` before applying the non-streaming Gantry
+DaemonSet, and the configurator's `preStop` restores the original host
+configuration when it still owns the current value. Kubernetes deletion and
+pod termination are asynchronous, which is why workloads must be drained
+before this transition.
+
+For standalone Helm, keep the Gantry endpoint available during restoration:
+
+```sh
+helm upgrade gantry oci://ghcr.io/azure/charts/gantry \
+   --reuse-values \
+   --set overlaybdConfig.enabled=false \
+   --set gantry.artifactStreaming.enabled=true \
+   --wait
+
+kubectl -n gantry-system wait --for=delete \
+   daemonset/gantry-overlaybd-config --timeout=5m
+```
+
+After the configurator is gone and streaming workloads are drained, disable
+`gantry.artifactStreaming.enabled`. If the host OverlayBD file was changed by
+another owner after Gantry configured it, rollback deliberately leaves that
+new value in place; inspect the configurator logs and resolve ownership before
+removing the saved state.
+
 ## What to verify after rollout
 
 | Check | How |
@@ -111,6 +192,8 @@ on its own; no restart needed.
 | Advertiser reconciling | `gantry_advertise_reconcile_total` increases at the configured cadence |
 | Leases are being created on `please_pull` | `gantry_containerd_lease_created_total` increments during cold-start rollouts |
 | Origin fallback is rare | `p2p_origin_fallback_total` stays at ~0 |
+| Streaming endpoint is ready | `/artifact-streaming/readyz` returns 200 on port 5000 for enabled target nodes |
+| Streaming source transition | `gantry_streaming_requests_total{source="origin",outcome="success"}` serves cold ranges, then `source="peer"` increases after complete providers advertise |
 
 See `docs/detailed-design.md` §7.6 for the full metric catalog.
 
