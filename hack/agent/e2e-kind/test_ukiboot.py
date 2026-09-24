@@ -10,8 +10,12 @@ header arithmetic underneath it, because a wrong offset does not fail loudly:
 it writes plausible bytes into the wrong part of an EFI executable, and the
 first sign of trouble is a guest that will not boot.
 """
+import io
+import os
 import struct
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import ukiboot
 
@@ -113,33 +117,83 @@ class TestPESectionTable(unittest.TestCase):
 
 
 class TestAddonCapacity(unittest.TestCase):
-    """The padding assumption the in-place patch depends on.
+    """The room an addon's .cmdline section has for the addition.
 
     An addon can only be extended without reallocating because its .cmdline
-    section's raw size is padded well past the string in it. These reproduce
-    the selection arithmetic so a change to it has to be deliberate.
+    section's raw size is padded well past the string in it.
     """
 
-    @staticmethod
-    def _fits(current: str, extra: str, raw_size: int) -> bool:
-        merged = f"{current} {extra}".strip()
-        return len(merged) + 1 <= raw_size
-
     def test_room_is_measured_against_the_raw_size(self):
-        self.assertTrue(self._fits("a=1", "b=2", raw_size=1024))
+        self.assertEqual(ukiboot.fit_cmdline("a=1", "b=2", raw_size=1024), b"a=1 b=2")
 
     def test_a_full_section_is_rejected(self):
         """Rejected rather than truncated: a silently shortened kernel command
         line would drop the Ignition config URL and boot a host that provisions
         itself from nothing."""
-        self.assertFalse(self._fits("x" * 1000, "y" * 100, raw_size=1024))
+        self.assertIsNone(ukiboot.fit_cmdline("x" * 1000, "y" * 100, raw_size=1024))
 
     def test_the_terminator_is_counted(self):
         """The NUL has to fit too, so a merge that exactly fills the section is
         one byte too long."""
-        self.assertFalse(self._fits("", "x" * 16, raw_size=16))
-        self.assertTrue(self._fits("", "x" * 15, raw_size=16))
+        self.assertIsNone(ukiboot.fit_cmdline("", "x" * 16, raw_size=16))
+        self.assertIsNotNone(ukiboot.fit_cmdline("", "x" * 15, raw_size=16))
 
+    def test_size_is_counted_in_encoded_bytes(self):
+        """Counting characters would let a non-ASCII command line overrun the
+        section into whatever follows it."""
+        self.assertIsNone(ukiboot.fit_cmdline("", "\u00e9" * 8, raw_size=16))
+        self.assertEqual(ukiboot.fit_cmdline("", "\u00e9" * 8, raw_size=17), "\u00e9".encode() * 8)
+
+
+class TestSingleUKI(unittest.TestCase):
+    def test_exactly_one_uki_is_required(self):
+        """With more than one, the one patched may not be the one that boots."""
+        self.assertEqual(ukiboot.single_uki(["vmlinuz.efi", "readme.txt"], Path("d")), "vmlinuz.efi")
+        for names in ([], ["readme.txt"], ["a.efi", "b.EFI"]):
+            with self.subTest(names=names):
+                with self.assertRaises(RuntimeError):
+                    ukiboot.single_uki(names, Path("d"))
+
+
+class TestNbdServerStartup(unittest.TestCase):
+    """A failed start must not leave the temporary directory behind, since
+    __exit__ never runs for a constructor that raised."""
+
+    def _start(self, popen):
+        made = []
+        real_mkdtemp = ukiboot.tempfile.mkdtemp
+
+        def mkdtemp(**kw):
+            made.append(real_mkdtemp(**kw))
+            return made[-1]
+
+        with patch.object(ukiboot.tempfile, "mkdtemp", side_effect=mkdtemp), \
+                patch.object(ukiboot.subprocess, "Popen", side_effect=popen):
+            with self.assertRaises((RuntimeError, FileNotFoundError)):
+                ukiboot.NbdServer("image.qcow2")
+        return made[0]
+
+    def test_qemu_nbd_exiting_cleans_up(self):
+        class Exited:
+            stderr = io.BytesIO(b"cannot open image")
+            returncode = 1
+
+            def poll(self):
+                return 1
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 1
+
+        self.assertFalse(os.path.exists(self._start(lambda *a, **kw: Exited())))
+
+    def test_qemu_nbd_missing_cleans_up(self):
+        def missing(*_args, **_kw):
+            raise FileNotFoundError("qemu-nbd")
+
+        self.assertFalse(os.path.exists(self._start(missing)))
 
 if __name__ == "__main__":
     unittest.main()
