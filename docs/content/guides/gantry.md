@@ -286,10 +286,10 @@ Site cache sizes to Node annotations as described in
 
 | Resource | Node-local mapping |
 | --- | --- |
-| P2PCache `gantry` | Racer serves `/dev/racer/gantry/cache` |
-| Gantry origin | Gantry serves `/dev/racer/gantry/origin` with mode `0660` |
-| Shared hostPath | `/dev/racer`, mounted read/write as a parent directory, without `subPath` |
-| Permissions | Parent and cache directory mode `2770`, group `65532`; Gantry UID `65532`, primary GID `0` for containerd, supplemental group `65532` |
+| ClusterCache `gantry` | Racer serves `/run/racer/gantry/client/socket` |
+| Gantry origin | Gantry serves `/run/racer/gantry/origin/socket` with mode `0660` |
+| Shared hostPath | `/run/racer`, mounted read/write as a parent directory, without `subPath` |
+| Permissions | Parent, cache, client, and origin directory mode `2770`, group `65532`; Gantry UID `65532`, primary GID `0` for containerd, supplemental group `65532` |
 
 Mounting the directory lets each process reconnect after socket replacement.
 Do not bind-mount individual socket files. The initialization container sets
@@ -365,7 +365,7 @@ aborted rather than spliced together with a second source. Racer's origin adapte
 still reads registry/containerd content to fill Racer. There is no bypass flag.
 Tag resolution and containerd's own configured host retry chain are separate
 from Gantry's digest-serving path. Readiness requires working containerd, origin
-UDS, and cache UDS. `P2PCache Ready` describes cache activation, not Gantry origin
+UDS, and client UDS. `ClusterCache Ready` describes cache activation, not Gantry origin
 availability, so verify Gantry readiness separately.
 
 The operator reports invalid coverage and rolls Gantry back to direct. It
@@ -393,7 +393,7 @@ across multiple nodes. Do not use DHT/chair metrics as Racer readiness evidence.
 
 | Signal | Meaning |
 | --- | --- |
-| `gantry_racer_available` | Gantry's cache/origin UDS and containerd readiness. |
+| `gantry_racer_available` | Gantry's client/origin UDS and containerd readiness. |
 | `gantry_racer_stream_total{outcome="completed"}` | Full response forwarded; neither OCI verification nor containerd commit is implied. Replaces the former `verified` outcome. |
 | `gantry_racer_stream_total{outcome="partial"}` | Range response forwarded successfully. |
 | `gantry_racer_stream_total{outcome="aborted"}` | Response forwarding failed. Gantry no longer emits a Racer `digest_mismatch` outcome. |

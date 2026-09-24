@@ -106,8 +106,10 @@ spec:
 Save this as `application-cache.yaml` and run `kubectl apply -f application-cache.yaml`.
 An empty `siteSelector` selects all live Sites, each with an independent cache
 universe. Applications serve their node-local origin at
-`/dev/racer/application-cache/origin` and access the cache at
-`/dev/racer/application-cache/cache`. For container images, use the dedicated
+`/run/racer/application-cache/origin/socket` and access the client socket at
+`/run/racer/application-cache/client/socket`. Paths use the ClusterCache's
+metadata.name and are published as `status.originSocket` and `status.clientSocket`.
+For container images, use the dedicated
 [Gantry backing cache](../../guides/gantry/#operator-managed-enablement) instead.
 
 After the last live P2PCache is removed, each existing Racer workload is retained
