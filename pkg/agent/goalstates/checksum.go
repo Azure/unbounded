@@ -16,7 +16,11 @@ import (
 // for the given nspawn machine's applied config, e.g.
 // /etc/unbounded/agent/kube1-applied-config.json.sha256.
 func AppliedConfigChecksumPath(machineName string) string {
-	return AppliedConfigPath(machineName) + ".sha256"
+	return appliedConfigChecksumPathIn(AgentConfigDir, machineName)
+}
+
+func appliedConfigChecksumPathIn(configDir, machineName string) string {
+	return appliedConfigPathIn(configDir, machineName) + ".sha256"
 }
 
 // ComputeChecksum returns the lowercase hex-encoded SHA-256 digest of data.

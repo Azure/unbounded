@@ -117,6 +117,31 @@ func TestHostPrefixFromAppliedConfig(t *testing.T) {
 		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
 	})
 
+	t.Run("config matching its checksum is used", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube1, prefixed)
+		require.NoError(t, os.WriteFile(appliedConfigChecksumPathIn(dir, NSpawnMachineKube1),
+			[]byte(ComputeChecksum([]byte(prefixed))+"\n"), 0o600))
+
+		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
+	})
+
+	// FindActiveMachine refuses a config that fails its checksum, and so must
+	// this: the prefix picks which directories are written to and swept.
+	t.Run("config failing its checksum is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube1, `{"MachineName":"m","HostPrefix":"/opt/corrupt"}`)
+		require.NoError(t, os.WriteFile(appliedConfigChecksumPathIn(dir, NSpawnMachineKube1),
+			[]byte(ComputeChecksum([]byte(prefixed))+"\n"), 0o600))
+		write(t, dir, NSpawnMachineKube2, prefixed)
+
+		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
+	})
+
 	t.Run("config without a prefix yields the default", func(t *testing.T) {
 		t.Parallel()
 

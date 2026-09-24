@@ -176,6 +176,17 @@ func hostPrefixFromAppliedConfigIn(log *slog.Logger, configDir string) string {
 			continue
 		}
 
+		// The same integrity check FindActiveMachine applies. The prefix decides
+		// which directories get written to and swept, so a corrupt copy must not
+		// supply it.
+		if err := VerifyChecksum(data, appliedConfigChecksumPathIn(configDir, name)); err != nil {
+			if log != nil {
+				log.Warn("applied config failed its checksum while resolving the host prefix", "path", path, "error", err)
+			}
+
+			continue
+		}
+
 		// Only the prefix is needed here, so decode into the shared config type
 		// rather than a consumer-specific wrapper. Unknown fields are ignored.
 		var cfg config.AgentConfig
