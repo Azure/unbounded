@@ -175,13 +175,15 @@ func TestGantryRacerStriped(t *testing.T) {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	after := len(f.hits)
+	f.mu.Unlock()
 
-	if len(f.hits) != before {
-		t.Fatalf("warm reads contacted offline origins: before=%d after=%d", before, len(f.hits))
+	if after != before {
+		t.Fatalf("warm reads contacted offline origins: before=%d after=%d", before, after)
 	}
 
 	t.Logf("verified %d downstream bytes, four exact origin pages, owners=%v, offline warm reuse, boundary/final ranges, real splice without tee", len(data), owners)
+	t.Run("LocalMetadataWithoutLibp2p", func(t *testing.T) { gantryLocalMetadataWithoutLibp2p(t, f) })
 }
 
 func TestGantryRacerAuthorization(t *testing.T) {
