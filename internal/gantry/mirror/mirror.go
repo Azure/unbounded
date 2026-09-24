@@ -357,10 +357,10 @@ func WithLiveStreamThrough() Option {
 }
 
 // WithOriginStreamMetrics wires the the live-stream-through origin
-// counters. Hooks fire only from the direct-origin stream-through path:
-// start at the moment the mirror commits to the origin path, completed
-// after the full body has been proxied and the final digest check passes,
-// and failed on any terminal error before that completion point.
+// counters, including Racer's registry fallback. Start fires when the mirror
+// commits to the origin path, completed after the full body has been proxied,
+// and failed on any terminal error before that completion point. Only the
+// direct backend checks the digest in-process; completion never implies commit.
 func WithOriginStreamMetrics(started, completed, failed func(kind string)) Option {
 	return func(s *Server) {
 		s.metrics.onOriginStreamStarted = started
@@ -371,8 +371,9 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 
 // WithLiveStreamCompletedHook registers a callback fired after any live
 // stream-through response (peer, origin, or Racer) fully completes. Direct peer
-// and origin paths also check the digest in-process; Racer forwarding leaves
-// OCI digest verification to containerd. Completion does not imply a commit.
+// and origin paths in the direct backend also check the digest in-process;
+// Racer forwarding and its registry fallback leave OCI digest verification to
+// containerd. Completion does not imply a commit.
 // Callers use this to correlate the response with a later containerd
 // inventory observation without forcing the mirror to ingest the bytes
 // itself.

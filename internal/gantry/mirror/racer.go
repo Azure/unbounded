@@ -4,10 +4,7 @@
 package mirror
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -279,8 +276,8 @@ func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64
 }
 
 // racerFallback uses the original delegated context. Range is deliberately
-// ignored with a full 200 response, which remains fully SHA-256 verified even
-// when the upstream cannot serve ranges or reports an unknown size.
+// ignored with a full 200 response. Like raw Racer forwarding, it leaves OCI
+// digest verification to containerd while checking transport and declared size.
 func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, logger *slog.Logger) {
 	// net/http's header timeout does not bound response writes. Cancellation
 	// must also interrupt a Write blocked on a downstream that stopped reading.
@@ -288,7 +285,7 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 
 	deadline, _ := r.Context().Deadline()
 	if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		return
+		panic(http.ErrAbortHandler)
 	}
 
 	interrupted := make(chan struct{})
@@ -335,6 +332,12 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
+	// HTTP/1.0 close-delimited bodies cannot distinguish an abort from success.
+	if !r.ProtoAtLeast(1, 1) {
+		http.Error(w, "registry streaming requires HTTP/1.1 or later", http.StatusHTTPVersionNotSupported)
+		return
+	}
+
 	s.fireOriginStreamStarted(ref.Kind)
 
 	body, size, contentType, err := s.racer.registry.PullWithMetadata(r.Context(), ref)
@@ -347,16 +350,6 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 
 	defer body.Close() //nolint:errcheck // Upstream response cleanup.
 
-	br := bufio.NewReader(body)
-	prefix, _ := br.Peek(512) //nolint:errcheck // Short prefixes are valid; copy checks stream errors.
-	// Empty objects must be verified before committing headers.
-	if len(prefix) == 0 && ref.Digest.Hex() != fmt.Sprintf("%x", sha256.Sum256(nil)) {
-		s.fireOriginStreamFailed(ref.Kind)
-		http.Error(w, "origin digest mismatch", http.StatusBadGateway)
-
-		return
-	}
-
 	w.Header().Set("Docker-Content-Digest", ref.Digest.String())
 
 	w.Header()["Content-Type"] = nil
@@ -364,27 +357,33 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		w.Header().Set("Content-Type", contentType)
 	}
 
-	if size >= 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	// Do not expose the declared length as downstream framing: reaching it
+	// cannot signal success before we check EOF for overruns or late errors.
+	// Flushing headers also prevents net/http from synthesizing Content-Length
+	// for small/empty bodies. HTTP/1.1 uses chunks; HTTP/2 uses stream termination.
+	w.Header().Del("Content-Length")
+	w.WriteHeader(http.StatusOK)
+
+	err = controller.Flush()
+
+	var written int64
+	if err == nil {
+		written, err = io.Copy(w, body)
 	}
 
-	hash := sha256.New()
-	hold := &lastByteWriter{dst: w}
-
-	written, err := io.Copy(io.MultiWriter(hold, hash), br)
 	if err == nil && size >= 0 && written != size {
-		err = io.ErrUnexpectedEOF
-	}
-
-	if err == nil && hex.EncodeToString(hash.Sum(nil)) != ref.Digest.Hex() {
-		err = sdk.ErrDigestMismatch
+		err = fmt.Errorf("origin size mismatch: declared %d, forwarded %d", size, written)
 	}
 
 	if err == nil {
-		err = hold.finish()
+		err = r.Context().Err()
 	}
 
-	s.fireMirrorBytesServed(ref.Kind, "origin", hold.written)
+	if err == nil {
+		err = controller.Flush()
+	}
+
+	s.fireMirrorBytesServed(ref.Kind, "origin", written)
 
 	if err != nil {
 		s.fireOriginStreamFailed(ref.Kind)
@@ -392,60 +391,10 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		panic(http.ErrAbortHandler)
 	}
 
+	// Completion reports forwarding only, including same-length corrupt bytes.
+	// Containerd's later digest-checked commit is observed separately.
 	s.fireOriginStreamCompleted(ref.Kind)
 	s.fireMirrorResponseCompleted(ref.Digest, ref.Kind, "origin")
 	s.fireLiveStreamCompleted(ref.Digest)
 	s.firePrefetch(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
-}
-
-type lastByteWriter struct {
-	dst     io.Writer
-	last    byte
-	has     bool
-	written int64
-}
-
-func (w *lastByteWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	if w.has {
-		n, err := w.dst.Write([]byte{w.last})
-		w.written += int64(n)
-
-		if err != nil {
-			return 0, err
-		}
-	}
-
-	n, err := w.dst.Write(p[:len(p)-1])
-
-	w.written += int64(n)
-	if err != nil {
-		return n, err
-	}
-
-	if n != len(p)-1 {
-		return n, io.ErrShortWrite
-	}
-
-	w.last, w.has = p[len(p)-1], true
-
-	return len(p), nil
-}
-
-func (w *lastByteWriter) finish() error {
-	if !w.has {
-		return nil
-	}
-
-	n, err := w.dst.Write([]byte{w.last})
-
-	w.written += int64(n)
-	if err == nil && n != 1 {
-		return io.ErrShortWrite
-	}
-
-	return err
 }

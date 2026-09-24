@@ -470,20 +470,23 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	if len(up.seen) != 0 {
 		t.Fatal("local/tag/incompatible request contacted registry")
 	}
-	// The ordinary fallback also withholds its last byte on digest mismatch.
-	corrupt := &authorizationCapturingOrigin{body: bytes.Repeat([]byte("x"), 16384), seen: make(chan string, 1)}
+	// Ordinary fallback forwards same-length corrupt bytes for containerd to
+	// verify at commit, just like the primary raw Racer stream.
+	corrupt := &authorizationCapturingOrigin{body: bytes.Repeat([]byte("x"), len(data)), seen: make(chan string, 1)}
 
 	bad := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), corrupt, nil).Handler())
 	defer bad.Close()
 
 	resp, err := bad.Client().Get(bad.URL + "/v2/repo/blobs/" + d.String())
-	if err == nil {
-		body, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		if readErr == nil || len(body) >= len(corrupt.body) {
-			t.Fatal("corrupt fallback completed", len(body), readErr)
-		}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if readErr != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, corrupt.body) || digestOf(body) == d {
+		t.Fatal("corrupt fallback was not fully forwarded", resp.Status, len(body), readErr)
 	}
 }
 

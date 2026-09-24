@@ -318,7 +318,14 @@ are not rehashed on each foreground read; background scrubbing detects changes
 relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
 consumers must validate content themselves. The SDK's `StreamVerified` remains
 available for callers that supply an independent expected SHA-256 digest.
-Gantry's ordinary registry fallback still checks SHA-256 in-process.
+In Racer mode, Gantry's ordinary registry fallback also leaves OCI digest
+verification to containerd. It streams with bounded memory, validates the
+declared size, and aborts response framing on transport or size failures.
+Fallback GETs require HTTP/1.1 or later and use streaming framing rather than
+downstream `Content-Length`, so late errors and overruns cannot appear complete.
+Range fallback returns the full object with `200`; the actual registry GET's
+media type is preserved, including an absent `Content-Type`.
+Fallback completion metrics report forwarding only, not a containerd commit.
 
 Racer mode is demand-only: no direct Gantry transfer server,
 chair calls, please-pull coordination, DHT content advertising, or speculative
