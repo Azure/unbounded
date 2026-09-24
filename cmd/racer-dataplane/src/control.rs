@@ -1011,26 +1011,19 @@ impl Subscriber {
                                             command.revision,
                                             hex(&command.snapshot_digest),
                                         );
-                                        let envelope =
-                                            command.configuration.clone().ok_or_else(|| {
-                                                invalid("desired state missing configuration")
-                                            })?;
+                                        let envelope = command.configuration.ok_or_else(|| {
+                                            invalid("desired state missing configuration")
+                                        })?;
                                         use sha2::Digest;
-                                        let raw = match envelope.contents.as_ref() {
-                                            Some(proto::configuration::Contents::Snapshot(s)) => {
-                                                s.encode_to_vec()
-                                            }
+                                        let snapshot = match envelope.contents.as_ref() {
+                                            Some(proto::configuration::Contents::Snapshot(s)) => s,
                                             None => return Err(invalid("missing snapshot")),
                                         };
-                                        let hash = sha2::Sha256::digest(&raw);
+                                        let hash = sha2::Sha256::digest(snapshot.encode_to_vec());
                                         if hash.as_slice() != command.snapshot_digest {
                                             return Err(invalid("candidate digest mismatch"));
                                         }
-                                        if proto::Snapshot::decode(raw.as_slice())
-                                            .map_err(invalid)?
-                                            .revision
-                                            != command.revision
-                                        {
+                                        if snapshot.revision != command.revision {
                                             return Err(invalid("candidate revision mismatch"));
                                         }
                                         if digest != hex(&hash) {

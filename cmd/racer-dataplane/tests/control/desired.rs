@@ -42,6 +42,36 @@ fn independent_workers_skip_failed_revisions_and_finish_granted_commit() {
 }
 
 #[test]
+fn desired_digest_and_revision_mismatches_preserve_receipt_and_last_good() {
+    for revision_mismatch in [false, true] {
+        let server = Server::new();
+        let (subscriber, updates, trust, mut config) = server.start();
+        let (mut socket, _, _) = server.next();
+        reply(&mut socket, &signed(&trust, config.clone()), "\"one\"");
+        let (mut socket, _, _) = server.next();
+        config.revision = 2;
+        let mut command = proto::DesiredState::decode(signed(&trust, config).as_slice()).unwrap();
+        if revision_mismatch {
+            command.revision = 3;
+        } else {
+            command.snapshot_digest[0] ^= 1;
+        }
+        reply(&mut socket, &command.encode_to_vec(), "\"bad\"");
+        let (_socket, request, _) = server.next();
+        assert!(request.contains("X-Racer-Cursor: cursor-2\r\n"));
+        assert!(request.contains("X-Racer-Applied-Revision: 1\r\n"));
+        assert!(request.contains(&format!("X-Racer-Rejected-Revision: {}\r\n", command.revision)));
+        assert_eq!(updates.active().unwrap().config.revision, 1);
+        assert!(updates.status()["lastError"].as_str().unwrap().contains(if revision_mismatch {
+            "revision mismatch"
+        } else {
+            "digest mismatch"
+        }));
+        drop(subscriber);
+    }
+}
+
+#[test]
 fn desired_cursor_survives_rejection_and_local_ack_interrupts_poll() {
     let server = Server::new();
     let (subscriber, updates, trust, mut config) = server.start();

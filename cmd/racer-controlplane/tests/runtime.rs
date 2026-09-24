@@ -1690,7 +1690,10 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
 
 #[test]
 fn in_memory_publication_rejects_regression_and_preserves_last_good() {
-    use racer_controlplane::{publication::Publication, storage::StoragePolicy};
+    #[path = "support/publication.rs"]
+    mod publication;
+    use publication::Publication;
+    use racer_controlplane::storage::StoragePolicy;
     let desired = StoragePolicy::for_node("uid")
         .resolve("site-a", Some("1Gi"), None)
         .unwrap();

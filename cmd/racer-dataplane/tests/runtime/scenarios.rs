@@ -620,7 +620,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     volumes.poll(&mut ring, 16).unwrap();
     let old = generation(&volumes, first);
     assert_eq!(old._config.config_snapshot().revision, 1);
-    old.handlers[0]
+    old.handler
         .borrow_mut()
         .cache_mut()
         .metrics()
@@ -648,13 +648,14 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     assert!(generation(&volumes, first)._config.peers().is_empty());
     assert_eq!(old._config.peers().len(), 1);
     for server in volumes.servers.values() {
-        for handler in &server.handler().current.handlers {
-            handler
-                .borrow_mut()
-                .cache_mut()
-                .metrics()
-                .request(crate::metrics::Traffic::ClientHttp);
-        }
+        server
+            .handler()
+            .current
+            .handler
+            .borrow_mut()
+            .cache_mut()
+            .metrics()
+            .request(crate::metrics::Traffic::ClientHttp);
     }
     assert_eq!(
         ring.metrics().values()[0],

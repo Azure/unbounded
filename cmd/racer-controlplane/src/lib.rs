@@ -5,10 +5,14 @@
 
 pub mod kubernetes;
 pub mod model;
+#[cfg(test)]
+extern crate self as racer_controlplane;
 #[path = "../../../internal/racer/product.rs"]
 pub mod product;
 mod product_topology;
-pub mod publication;
+#[cfg(test)]
+#[path = "../tests/support/publication.rs"]
+mod publication;
 pub mod security;
 pub mod service;
 pub mod status;

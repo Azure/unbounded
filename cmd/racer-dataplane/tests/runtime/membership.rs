@@ -196,7 +196,7 @@ fn compiler_snapshots_http_and_rdma() {
     handler.set_routing(br.clone(), BTreeMap::new());
     let generation = Rc::new(Generation {
         volume: volume.clone(),
-        handlers: vec![Rc::new(RefCell::new(handler))],
+        handler: Rc::new(RefCell::new(handler)),
         _config: b.clone(),
         manager: None,
         active: Cell::new(true),
@@ -309,9 +309,6 @@ fn compiler_snapshots_http_and_rdma() {
     origin_task.join().unwrap();
     crate::negotiation::tests::compiler_membership(&mut ring, a, b, &aid, &bid, &ca, ROUTING);
     server.shutdown(&mut ring).unwrap();
-    generation.handlers[0]
-        .borrow_mut()
-        .shutdown(&mut ring)
-        .unwrap();
+    generation.handler.borrow_mut().shutdown(&mut ring).unwrap();
     ring.shutdown().unwrap();
 }

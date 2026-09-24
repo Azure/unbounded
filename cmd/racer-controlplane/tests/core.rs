@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prost::Message;
 use racer_controlplane::model::*;
-use racer_controlplane::publication::*;
+#[path = "support/publication.rs"]
+mod publication;
+use publication::*;
 use racer_controlplane::storage::*;
 use racer_controlplane::topology::{Topology, compile, degree, place_in_universe};
 

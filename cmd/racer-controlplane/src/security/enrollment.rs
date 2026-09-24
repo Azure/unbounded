@@ -108,39 +108,7 @@ fn owned_by(
         })
 }
 
-pub fn racer_identity(domain: &str, value: &str) -> String {
-    digest(format!("racer/{domain}/v1\0{value}").as_bytes())
-}
-
-/// Exact Go UniverseForSite mapping, including long DNS-subdomain Site names.
-pub fn universe_for_site(site: &str) -> String {
-    let legal = site.is_empty()
-        || (site.len() <= 63
-            && site.as_bytes()[0].is_ascii_alphanumeric()
-            && site.as_bytes()[site.len() - 1].is_ascii_alphanumeric()
-            && site
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)));
-    if legal {
-        return site.into();
-    }
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut result = String::from("site_");
-    let mut bits = 0u32;
-    let mut count = 0;
-    for byte in Sha256::digest(site.as_bytes()) {
-        bits = (bits << 8) | u32::from(byte);
-        count += 8;
-        while count >= 5 {
-            count -= 5;
-            result.push(ALPHABET[((bits >> count) & 31) as usize] as char);
-        }
-    }
-    if count > 0 {
-        result.push(ALPHABET[((bits << (5 - count)) & 31) as usize] as char);
-    }
-    result
-}
+pub use crate::model::{identity as racer_identity, universe_for_site};
 
 /// Only the canonical Site label assigns membership.
 pub fn node_site(node: &ObjectMetadata) -> &str {
