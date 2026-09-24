@@ -692,15 +692,15 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		originStreamStarted: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_started_total",
-			Help: "Live mirror requests that entered the direct-origin stream-through path. Labeled by digest kind so manifest-vs-layer traffic stays distinguishable.",
+			Help: "Live mirror requests that entered registry stream-through, including Racer's ordinary registry fallback. Labeled by digest kind so manifest-vs-layer traffic stays distinguishable.",
 		}, []string{"kind"}),
 		originStreamCompleted: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_completed_total",
-			Help: "Live direct-origin stream-through responses that fully completed and digest-verified in-process. This does NOT imply the requesting containerd committed the digest yet.",
+			Help: "Live registry stream-through responses whose forwarding completed, including Racer's ordinary registry fallback. Only the direct backend verifies the OCI digest in-process; Racer fallback leaves verification to containerd. Completion does not imply a containerd commit.",
 		}, []string{"kind"}),
 		originStreamFailed: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_failed_total",
-			Help: "Live direct-origin stream-through attempts that failed before completion (origin-side error, truncated body, or digest mismatch). Labeled by digest kind.",
+			Help: "Live registry stream-through attempts that failed before forwarding completed, including Racer fallback transport or declared-size failures and direct-backend digest mismatches. Containerd's later digest rejection is not a forwarding failure. Labeled by digest kind.",
 		}, []string{"kind"}),
 		containerdCommitObserved: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_observed_total",

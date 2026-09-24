@@ -18,6 +18,8 @@ The test target uses those binaries and runs seven suites: `TestGantryRacerStrip
 with an external 60-second hard
 deadline and `go test -timeout 50s -count 1 -v`. Builds are outside those
 deadlines. Rerun the build target after changing binary or test sources.
+`RegistryFallback` is a subtest of `TestGantryRacerCorruption`, so it runs within
+that suite's deadline and does not add an eighth native suite.
 
 `RollingSwitch` verifies containerd pulls through direct, mixed enablement,
 all-Racer, mixed rollback, and restored direct operation on two nodes. The final
@@ -56,6 +58,27 @@ committed bytes and then reads through Racer on both peers with origins offline.
 The valid image config is fetched through containerd's resolver before the pulls,
 so layer rejection cannot cancel a sibling config fetch and introduce an unrelated
 fallback. Manifest and layer fetching use the normal pull path.
+
+After that recovery campaign, `Corruption/RegistryFallback` uses a distinct image
+and consumer namespace, stops the requesting node's real Racer daemon, and forces
+ordinary registry fallback through the production Gantry mirror. A range request
+receives the full same-length corrupt body as a complete chunked `200` response,
+with the registry GET's media type and delegated authorization preserved. A normal
+containerd `Client.Pull` then rejects that layer with the specific unexpected
+commit digest (`FailedPrecondition`): neither the expected nor corrupt digest is
+committed, no image is published, and the retained ingest contains the full layer.
+`gantry_origin_stream_completed_total` increases while the origin forwarding-failure
+counter and Racer stream-completion counter do not. This proves fallback completion
+means forwarding, not digest verification or commit. The original two-peer
+corruption, generation recovery, same-reference retry, and offline-read assertions
+run before this subtest.
+
+Mirror unit tests separately cover fallback short/long bodies, unknown and empty
+sizes, late transport errors, downstream failures and cancellation, HTTP/1.0 GET
+rejection with `505`, and preservation of an absent registry `Content-Type`.
+Fallback streams with bounded memory and checks transport and declared size;
+containerd performs OCI digest verification. The primary Racer path continues to
+pass the raw downstream TCP connection to the SDK for splice forwarding.
 
 The native `gantryFixture` helpers for follow-on tests are:
 
