@@ -7,19 +7,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 )
-
-// ErrDigestMismatch means a full stream did not match the caller's SHA-256.
-var ErrDigestMismatch = errors.New("racer: SHA-256 digest mismatch")
 
 type streamConn struct {
 	net.Conn
@@ -137,21 +131,16 @@ type Stream struct {
 	responseClose        bool
 	err                  error
 	closed               bool
-	digest               hash.Hash
-	expected             [32]byte
-	verified             bool
 	stats                TransferStats
 }
 
-// TransferStats distinguishes actual kernel splice/tee traffic from buffered
+// TransferStats distinguishes actual kernel splice traffic from buffered
 // header read-ahead and portable copies. Stats are per stream, not global.
-// BufferedBytes counts bytes read, including a withheld verification suffix;
+// BufferedBytes counts bytes read through userspace;
 // SpliceBytes counts bytes successfully forwarded to the destination socket.
 type TransferStats struct {
 	SpliceBytes   int64
 	SpliceCalls   int64
-	TeeBytes      int64
-	TeeCalls      int64
 	BufferedBytes int64
 }
 
@@ -165,7 +154,7 @@ func (s *Stream) Stats() TransferStats {
 // Prepare fetches and validates the first page's headers without consuming its
 // body. Call before committing downstream HTTP headers to surface authorization,
 // version, and framing errors while an HTTP error response is still possible.
-// Empty streams verify their digest here without issuing a GET.
+// Empty streams complete without issuing a GET.
 func (s *Stream) Prepare() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -197,25 +186,10 @@ func (s *Stream) Prepare() error {
 	return nil
 }
 
-// Stream opens the entire snapshot. It does not assume ETag is a content hash.
+// Stream opens the entire snapshot without verifying a content digest.
+// It does not assume ETag is a content hash.
 func (o *Object) Stream(ctx context.Context) (*Stream, error) {
 	return o.ReadRange(ctx, 0, o.meta.Size)
-}
-
-// StreamVerified verifies the complete object against an explicit SHA-256,
-// independent of Racer's opaque version ETag. WriteTo withholds the final byte
-// until verification succeeds, so a digest mismatch cannot complete a framed
-// HTTP body. Verification requires hashing a tee copy in userspace, while the
-// forwarding leg still uses splice. Partial ranges cannot verify a full digest.
-func (o *Object) StreamVerified(ctx context.Context, expected [32]byte) (*Stream, error) {
-	s, err := o.Stream(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	s.digest, s.expected = sha256.New(), expected
-
-	return s, nil
 }
 
 // ReadRange opens [offset, offset+length), rejecting out-of-bounds intervals.
@@ -328,15 +302,6 @@ func (s *Stream) nextPage() error {
 }
 
 func (s *Stream) finish() error {
-	if s.digest != nil && !s.verified {
-		var sum [32]byte
-		if !bytes.Equal(s.digest.Sum(sum[:0]), s.expected[:]) {
-			return s.fail(ErrDigestMismatch)
-		}
-
-		s.verified = true
-	}
-
 	s.release(!s.responseClose)
 
 	return io.EOF
@@ -389,9 +354,6 @@ func (s *Stream) read(p []byte) (int, error) {
 	s.offset += int64(n)
 
 	s.stats.BufferedBytes += int64(n)
-	if s.digest != nil {
-		_, _ = s.digest.Write(p[:n])
-	}
 
 	if err != nil && (err != io.EOF || s.offset != s.pageEnd) {
 		if err == io.EOF {

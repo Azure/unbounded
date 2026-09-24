@@ -326,8 +326,9 @@ not proof that those bytes match an OCI digest. Incorrect origin bytes can have
 a self-consistent CRC and be cached and forwarded. File-backed local cache hits
 are not rehashed on each foreground read; background scrubbing detects changes
 relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
-consumers must validate content themselves. The SDK's `StreamVerified` remains
-available for callers that supply an independent expected SHA-256 digest.
+and SDK consumers must validate content themselves against an independently
+trusted expected digest. The SDK no longer provides inline SHA-256 verification;
+see its [API migration note](https://github.com/Azure/unbounded/blob/main/pkg/racer/STREAMING.md#migration-inline-verification-removed).
 Gantry's ordinary registry fallback still checks SHA-256 in-process.
 
 Racer mode is demand-only: no direct Gantry transfer server,

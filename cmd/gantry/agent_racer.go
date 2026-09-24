@@ -212,16 +212,14 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 func newRacerStreamMetrics(reg *metrics.Registry) func(sdk.TransferStats, bool, error) {
 	spliceCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_calls_total", Help: "Actual SDK splice syscalls."})
 	spliceBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_bytes_total", Help: "Payload bytes forwarded with splice."})
-	teeCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_calls_total", Help: "Actual SDK verification tee syscalls; expected to be zero because Gantry forwards Racer streams without a verification tee."})
-	teeBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_bytes_total", Help: "Bytes duplicated by SDK verification tee; expected to be zero because containerd performs OCI digest verification."})
+	reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_calls_total", Help: "Compatibility counter, always zero: SDK verification tee syscalls have been removed."})
+	reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_bytes_total", Help: "Compatibility counter, always zero: SDK verification tee bytes have been removed."})
 	bufferedBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_buffered_bytes_total", Help: "Payload bytes forwarded through userspace."})
 	streams := reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_stream_total", Help: "Racer response forwarding outcomes: completed (full response), partial (range response), or aborted. Completion does not imply OCI digest verification or a containerd commit; containerd verifies the digest separately."}, []string{"outcome"})
 
 	return func(stats sdk.TransferStats, partial bool, err error) {
 		spliceCalls.Add(float64(stats.SpliceCalls))
 		spliceBytes.Add(float64(stats.SpliceBytes))
-		teeCalls.Add(float64(stats.TeeCalls))
-		teeBytes.Add(float64(stats.TeeBytes))
 		bufferedBytes.Add(float64(stats.BufferedBytes))
 
 		outcome := "completed"

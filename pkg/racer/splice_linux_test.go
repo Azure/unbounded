@@ -50,7 +50,7 @@ func downstreamPair(t *testing.T, network string) (net.Conn, net.Conn) {
 	return server, client
 }
 
-func TestSpliceVerifiedContentAndReuse(t *testing.T) {
+func TestSpliceContentAndReuse(t *testing.T) {
 	data := payload(2 << 20)
 
 	for _, network := range []string{"tcp", "unix"} {
@@ -96,15 +96,10 @@ func TestSpliceVerifiedContentAndReuse(t *testing.T) {
 
 			var previous *streamConn
 
-			for _, valid := range []bool{true, true, false} {
+			for range 2 {
 				dst, receiver := downstreamPair(t, network)
 
-				sum := sha256.Sum256(data)
-				if !valid {
-					sum[0] ^= 1
-				}
-
-				s, err := o.StreamVerified(t.Context(), sum)
+				s, err := o.Stream(t.Context())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -119,32 +114,24 @@ func TestSpliceVerifiedContentAndReuse(t *testing.T) {
 				stats := s.Stats()
 				_ = s.Close()
 
-				if valid && (err != nil || n != int64(len(data)) || !bytes.Equal(body, data)) {
+				if err != nil || n != int64(len(data)) || !bytes.Equal(body, data) {
 					t.Fatal(n, err, len(body))
 				}
 
-				if !valid && (!errors.Is(err, ErrDigestMismatch) || n != int64(len(data)-1) || !bytes.Equal(body, data[:len(data)-1])) {
-					t.Fatal(n, err, len(body))
-				}
-
-				if stats.SpliceBytes < 1<<20 || stats.SpliceCalls == 0 || stats.TeeBytes != stats.SpliceBytes || stats.TeeCalls == 0 || stats.BufferedBytes+stats.SpliceBytes != int64(len(data)) {
-					t.Fatalf("not verified splice: %+v", stats)
+				if stats.SpliceBytes < 1<<20 || stats.SpliceCalls == 0 || stats.BufferedBytes+stats.SpliceBytes != int64(len(data)) {
+					t.Fatalf("not actual splice: %+v", stats)
 				}
 
 				c.streamPool.mu.Lock()
-				if valid {
-					if len(c.streamPool.idle) != 1 {
-						t.Error("complete connection not pooled")
-					} else {
-						current := c.streamPool.idle[0]
-						if previous != nil && previous != current {
-							t.Error("connection not reused")
-						}
-
-						previous = current
+				if len(c.streamPool.idle) != 1 {
+					t.Error("complete connection not pooled")
+				} else {
+					current := c.streamPool.idle[0]
+					if previous != nil && previous != current {
+						t.Error("connection not reused")
 					}
-				} else if len(c.streamPool.idle) != 0 {
-					t.Error("failed connection pooled")
+
+					previous = current
 				}
 				c.streamPool.mu.Unlock()
 			}
@@ -304,7 +291,7 @@ func TestStreamRawFailures(t *testing.T) {
 	}
 }
 
-func TestSpliceVerifiedAcrossPagesAndBufferedPrefix(t *testing.T) {
+func TestSpliceAcrossPagesAndBufferedPrefix(t *testing.T) {
 	size := PageSize + 137
 	c := generatedStreamClient(t, size, nil)
 
@@ -324,7 +311,7 @@ func TestSpliceVerifiedAcrossPagesAndBufferedPrefix(t *testing.T) {
 	var expected [32]byte
 	copy(expected[:], h.Sum(nil))
 
-	s, err := o.StreamVerified(t.Context(), expected)
+	s, err := o.Stream(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,35 +352,39 @@ func TestSpliceVerifiedAcrossPagesAndBufferedPrefix(t *testing.T) {
 	}
 
 	stats := s.Stats()
-	if stats.SpliceBytes < PageSize-16384 || stats.TeeBytes != stats.SpliceBytes || stats.BufferedBytes+stats.SpliceBytes != size {
+	if stats.SpliceBytes < PageSize-16384 || stats.BufferedBytes < int64(len(prefix)) || stats.BufferedBytes+stats.SpliceBytes != size {
 		t.Fatal(stats)
 	}
 }
 
 func TestStreamPrepareEmptyAndTimeout(t *testing.T) {
-	c := generatedStreamClient(t, 0, nil)
+	var requests []string
+
+	c := generatedStreamClient(t, 0, &requests)
 
 	o, err := c.Open(t.Context(), "/empty")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, valid := range []bool{true, false} {
-		sum := sha256.Sum256(nil)
-		if !valid {
-			sum[0] ^= 1
-		}
-
-		s, err := o.StreamVerified(t.Context(), sum)
+	for _, network := range []string{"tcp", "unix"} {
+		s, err := o.Stream(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = s.Prepare()
+		if err := s.Prepare(); err != nil {
+			t.Fatal(err)
+		}
+
+		dst, receiver := downstreamPair(t, network)
+		n, err := s.WriteTo(dst)
+		_ = dst.Close()
+		body, readErr := io.ReadAll(receiver)
 		_ = s.Close()
 
-		if valid && err != nil || !valid && !errors.Is(err, ErrDigestMismatch) {
-			t.Fatal(err)
+		if err != nil || readErr != nil || n != 0 || len(body) != 0 || s.Stats() != (TransferStats{}) || len(requests) != 0 {
+			t.Fatalf("empty %s stream: n=%d err=%v readErr=%v body=%d stats=%+v requests=%v", network, n, err, readErr, len(body), s.Stats(), requests)
 		}
 	}
 

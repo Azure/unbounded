@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
@@ -418,7 +419,7 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 	}
 
 	if err == nil && hex.EncodeToString(hash.Sum(nil)) != ref.Digest.Hex() {
-		err = sdk.ErrDigestMismatch
+		err = digestpipe.ErrDigestMismatch
 	}
 
 	if err == nil {

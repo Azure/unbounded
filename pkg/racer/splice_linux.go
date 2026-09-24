@@ -114,15 +114,6 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 	}
 	defer p.close()
 
-	var tee *splicePipe
-	if s.digest != nil {
-		tee, err = newSplicePipe()
-		if err != nil {
-			return 0, s.fail(err), true
-		}
-		defer tee.close()
-	}
-
 	buf := copyBuffers.Get().(*[]byte) //nolint:errcheck // The private pool only contains *[]byte.
 	defer copyBuffers.Put(buf)
 
@@ -155,17 +146,11 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		remaining := s.pageEnd - s.offset
-		if s.digest != nil {
-			remaining = min(remaining, s.end-s.offset-1)
-		}
 		// Drain only bytes the HTTP header reader already consumed. Do not
 		// read another buffer from the socket before switching to splice.
 		buffered := min(int64(s.conn.reader.Buffered()), remaining)
-		if buffered > 0 || remaining == 0 {
+		if buffered > 0 {
 			length := min(buffered, int64(len(*buf)))
-			if remaining == 0 {
-				length = 1
-			}
 
 			n, err := s.read((*buf)[:length])
 			if err != nil && err != io.EOF {
@@ -206,76 +191,19 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		for n > 0 {
-			ready := n
-			if tee != nil {
-				ready, err = s.teeHash(p, tee, int(n), *buf)
-				if err != nil {
-					return total, s.fail(err), true
-				}
+			written, err := spliceReady(raw, true, p.fd[0], int(n), &s.stats)
+			total += written
+			s.offset += written
+			s.stats.SpliceBytes += written
+			n -= written
+
+			if err != nil {
+				return total, s.fail(err), true
 			}
-			// Consume exactly the prefix duplicated by tee before teeing again.
-			// Repeating tee without this drain would hash the same bytes twice.
-			for ready > 0 {
-				written, err := spliceReady(raw, true, p.fd[0], int(ready), &s.stats)
-				total += written
-				s.offset += written
-				s.stats.SpliceBytes += written
-				n -= written
-				ready -= written
 
-				if err != nil {
-					return total, s.fail(err), true
-				}
-
-				if written == 0 {
-					return total, s.fail(io.ErrNoProgress), true
-				}
+			if written == 0 {
+				return total, s.fail(io.ErrNoProgress), true
 			}
 		}
 	}
-}
-
-func (s *Stream) teeHash(src, dst *splicePipe, count int, buf []byte) (int64, error) {
-	var (
-		n   int64
-		err error
-	)
-
-	for {
-		s.stats.TeeCalls++
-
-		n, err = unix.Tee(src.fd[0], dst.fd[1], count, unix.SPLICE_F_NONBLOCK)
-		if !errors.Is(err, unix.EINTR) {
-			break
-		}
-	}
-
-	if err != nil {
-		return 0, err
-	}
-
-	if n == 0 {
-		return 0, io.ErrNoProgress
-	}
-
-	s.stats.TeeBytes += n
-	for left := n; left > 0; {
-		read, err := unix.Read(dst.fd[0], buf[:min(left, int64(len(buf)))])
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-
-		if err != nil {
-			return 0, err
-		}
-
-		if read == 0 {
-			return 0, io.ErrUnexpectedEOF
-		}
-
-		_, _ = s.digest.Write(buf[:read])
-		left -= int64(read)
-	}
-
-	return n, nil
 }

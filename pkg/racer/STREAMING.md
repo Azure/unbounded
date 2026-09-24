@@ -33,8 +33,6 @@ truncated. Origin data is never included in SDK error text.
   verifying a content digest.
 - `object.ReadRange(ctx, offset, length) (*Stream, error)` reads an exact pinned
   interval without verifying a content digest.
-- `object.StreamVerified(ctx, expectedSHA256 [32]byte) (*Stream, error)` reads
-  the whole object and verifies an independently supplied SHA-256 digest.
 - `stream.Prepare() error` opens and validates the first GET response headers
   before the caller commits downstream HTTP headers. It consumes no payload.
 - `stream.Read`, `stream.WriteTo`, `stream.Close`, and `stream.Stats` expose
@@ -42,59 +40,64 @@ truncated. Origin data is never included in SDK error text.
 
 Streams fetch aligned 64 MiB pages sequentially with `If-Match`. Payload scratch
 space is bounded independently of page/object size: a pooled 32 KiB buffer,
-8 KiB socket/header buffers, and, on Linux, one pipe or two for verification.
+8 KiB socket/header buffers, and, on Linux, one forwarding pipe.
 There are no per-page payload allocations. HTTP request/response metadata still
 allocates. Close every stream, including ones abandoned after Prepare.
 
 `WriteTo` explicitly calls `splice(2)` for concrete `*net.TCPConn` and
 `*net.UnixConn` destinations on Linux. The header reader's buffered payload
 prefix is drained first. `Stats().SpliceCalls`/`SpliceBytes` measure actual
-syscalls/forwarded bytes; `TeeCalls`/`TeeBytes` measure verification duplication.
-Read-ahead bytes and portable copies appear in `BufferedBytes`.
+syscalls/forwarded bytes. Read-ahead bytes and portable copies appear in
+`BufferedBytes`.
 
 For a Gantry HTTP/1 mirror, prepare the stream, hijack the response connection,
 write status and headers (including exact Content-Length and Content-Type),
 flush the hijacker's buffered writer, then call `stream.WriteTo(conn)`.
 The mirror owns the hijacked connection and request framing. Gantry serves one
 response per connection with `Connection: close`.
-Close that connection on any transfer/verification error. Do not pass the
+Close that connection on any transfer error. Do not pass the
 buffered writer or `http.ResponseWriter` when splice is required. TLS writers
 and non-Linux platforms use bounded userspace copies.
 
-Verified splice duplicates pipe buffers with `tee(2)` and hashes a bounded
-userspace copy. Forwarding remains socket-to-pipe-to-socket splice. The final
-payload byte is withheld by `WriteTo` until SHA-256 succeeds. A mismatch returns
-`ErrDigestMismatch`, leaving a framed HTTP body incomplete. Already delivered
-bytes cannot be recalled. For empty objects call Prepare before headers so a
-wrong empty-object digest is rejected before response completion. `Read` follows
-normal Go reader semantics and may return final bytes alongside a digest error;
-callers using Read must inspect that error.
+Forwarding uses socket-to-pipe-to-socket splice without a hashing tee or a
+withheld final byte. Empty streams complete without issuing a GET. Racer's ETag
+is a version identity, not necessarily SHA-256. A partial range cannot establish
+the full object's digest; verify a complete object separately when that assurance
+is required.
 
-Racer's ETag is a version identity, not necessarily SHA-256. To use
-`StreamVerified`, supply the expected digest independently. A partial range cannot
-establish the full object's digest; verify a complete object separately when that
-assurance is required.
+### Migration: inline verification removed
+
+`Object.StreamVerified`, `racer.ErrDigestMismatch`, and
+`TransferStats.TeeCalls`/`TeeBytes` have been removed. Replace `StreamVerified`
+calls with `Stream` and move any required digest verification to the consumer,
+using an independently trusted expected digest before accepting the content.
+Callers that implement their own hashing must own mismatch errors and any
+buffering or response-completion policy; `Stream` does not withhold bytes or
+report digest mismatches. Remove SDK tee-stat consumers. Gantry's compatibility
+tee metrics remain exported at zero.
 
 ### Gantry's integrity boundary
 
 Gantry uses `Stream` for full Racer responses and `ReadRange` for single ranges.
-Its former SHA-256 verification tee is removed; `StreamVerified` remains available
-to SDK callers. Gantry checks the metadata ETag against the requested OCI digest,
-but matching metadata does not prove that the payload hashes to that digest.
+The SDK performs no inline SHA-256 verification. Gantry checks the metadata ETag
+against the requested OCI digest, but matching metadata does not prove that the
+payload hashes to that digest.
 Containerd's expected OCI digest check at commit determines whether downloaded
 image content is accepted. HTTP completion and Gantry's
 `gantry_racer_stream_total{outcome="completed"}` report forwarding only. The former
 `verified` outcome is replaced by `completed`; Racer forwarding no longer emits
 `digest_mismatch`. Gantry's `gantry_racer_tee_calls_total` and
-`gantry_racer_tee_bytes_total` remain exported and are expected to be zero.
+`gantry_racer_tee_bytes_total` remain exported at zero for compatibility.
+Gantry's direct-origin fallback independently verifies SHA-256 and withholds its
+final byte until verification succeeds.
 
 Racer retains CRC64/ECMA-182 validation at peer transfer admission and background
 disk scrubbing. Origin admission computes a CRC over received bytes, not an OCI
 SHA-256 proof; incorrect origin bytes can have a consistent CRC. File-backed
 local hits are not rehashed in the foreground. Version pinning and these CRC
 checks therefore do not replace end-to-end content validation. Generic SDK/HTTP
-consumers must validate content themselves, using `StreamVerified` or their own
-check against an independently trusted expected digest before accepting it.
+consumers must validate content themselves against an independently trusted
+expected digest before accepting it.
 
 Known incorrect cached origin bytes require source repair and explicit cache
 generation recovery. A missing downstream commit signal alone does not establish
