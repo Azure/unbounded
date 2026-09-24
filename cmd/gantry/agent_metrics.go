@@ -712,12 +712,12 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		containerdCommitObserveDur: reg.NewHistogram("storage", prometheus.HistogramOpts{
 			Name:    "gantry_containerd_commit_observation_duration_seconds",
-			Help:    "Time from a digest-verified live stream-through response completing to the digest becoming openable in containerd. Resolution is bounded by the storage probe interval.",
+			Help:    "Time from a full live stream-through response completing to the digest becoming openable in containerd. Response completion alone does not imply digest verification or commit. Resolution is bounded by the storage probe interval.",
 			Buckets: prometheus.ExponentialBuckets(0.25, 2, 9),
 		}),
 		containerdCommitLatestDur: reg.NewGauge("storage", prometheus.GaugeOpts{
 			Name: "gantry_containerd_commit_latest_observation_duration_seconds",
-			Help: "Most recent measured time from a digest-verified live stream-through response completing to the digest becoming openable in containerd. Resolution is bounded by the storage probe interval.",
+			Help: "Most recent measured time from a full live stream-through response completing to the digest becoming openable in containerd. Response completion alone does not imply digest verification or commit. Resolution is bounded by the storage probe interval.",
 		}),
 		dhtStaleOnly: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_dht_stale_only_total",
@@ -729,7 +729,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		commitMissingAfterStream: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_missing_after_stream_total",
-			Help: "Stream-through mirror responses that completed successfully but the digest did NOT become openable in the local containerd content store within the verification window. Indicates either kubelet aborted the pull mid-stream or Gantry's response completed without a later containerd commit. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until storage is available again. \"Origin metric semantics\".",
+			Help: "Stream-through mirror responses that completed successfully but the digest did NOT become openable in the local containerd content store within the observation window. A missing commit is not evidence of corruption or a digest mismatch. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until storage is available again.",
 		}),
 		advertiseTotal: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_total",
