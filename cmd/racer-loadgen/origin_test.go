@@ -521,3 +521,96 @@ func TestHandlerPreservesRawTargets(t *testing.T) {
 		})
 	}
 }
+
+func TestDatasetOriginMetadataConsistency(t *testing.T) {
+	d := datasetForTest(t, config{footprint: 4099, objectSize: 4099, ttl: 17 * time.Second})
+	target := d.target(0)
+
+	origin, err := racer.NewOrigin(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a real HTTP server so net/http's automatic Content-Type sniffing is
+	// exercised. The dataplane requires GET metadata to match the preceding HEAD.
+	server := httptest.NewServer(origin)
+	t.Cleanup(server.Close)
+
+	head, err := server.Client().Head(server.URL + target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer head.Body.Close()
+
+	body, err := io.ReadAll(head.Body)
+	if err != nil || len(body) != 0 || head.StatusCode != http.StatusOK || head.ContentLength != d.size {
+		t.Fatalf("HEAD: status=%d length=%d body=%d err=%v", head.StatusCode, head.ContentLength, len(body), err)
+	}
+
+	if head.Header.Get("ETag") != expectedETag(t, d, target) || head.Header.Get("Cache-Control") != "max-age=17" || head.Header.Get("Accept-Ranges") != "bytes" {
+		t.Fatalf("HEAD metadata: %v", head.Header)
+	}
+
+	if values := head.Header.Values("Content-Type"); len(values) != 0 {
+		t.Fatalf("HEAD Content-Type = %q, want absent for untyped dataset", values)
+	}
+
+	payload := make([]byte, d.size)
+	if _, err := d.source(target).ReadAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, byteRange string
+		status          int
+		start, end      int64
+	}{
+		{"full", "", http.StatusOK, 0, d.size},
+		{"whole range", "bytes=0-4098", http.StatusPartialContent, 0, d.size},
+		{"prefix", "bytes=0-511", http.StatusPartialContent, 0, 512},
+		{"tail", "bytes=4096-4098", http.StatusPartialContent, 4096, d.size},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+target, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req.Header.Set("If-Match", head.Header.Get("ETag"))
+
+			if tc.byteRange != "" {
+				req.Header.Set("Range", tc.byteRange)
+			}
+
+			resp, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != tc.status || resp.ContentLength != tc.end-tc.start || !bytes.Equal(body, payload[tc.start:tc.end]) {
+				t.Fatalf("GET: status=%d length=%d body=%d err=%v", resp.StatusCode, resp.ContentLength, len(body), err)
+			}
+
+			for _, field := range []string{"Content-Type", "ETag", "Cache-Control", "Accept-Ranges"} {
+				if got, want := resp.Header.Get(field), head.Header.Get(field); got != want {
+					t.Errorf("GET %s = %q, HEAD = %q", field, got, want)
+				}
+			}
+
+			if values := resp.Header.Values("Content-Type"); len(values) != 0 {
+				t.Errorf("GET Content-Type = %q, want absent without payload sniffing", values)
+			}
+
+			wantRange := ""
+			if tc.status == http.StatusPartialContent {
+				wantRange = fmt.Sprintf("bytes %d-%d/%d", tc.start, tc.end-1, d.size)
+			}
+
+			if got := resp.Header.Get("Content-Range"); got != wantRange {
+				t.Errorf("Content-Range = %q, want %q", got, wantRange)
+			}
+		})
+	}
+}
