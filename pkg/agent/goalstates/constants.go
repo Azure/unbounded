@@ -23,6 +23,10 @@ const (
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
 
+	// NFTablesFlushUnit clears stale firewall rules before the nspawn machines
+	// start.
+	NFTablesFlushUnit = "nftables-flush.service"
+
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 

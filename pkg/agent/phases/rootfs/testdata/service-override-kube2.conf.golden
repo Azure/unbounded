@@ -30,10 +30,15 @@
 # and is a bpffs mount before the .nspawn Bind= directive exposes it inside the
 # machine. eBPF CNIs need a usable bpffs at /sys/fs/bpf to create and share BPF
 # maps, but each nspawn machine should get its own pinned-object namespace.
+#
+# nftables-flush.service clears stale firewall rules, and has to finish before
+# the machine starts for the node to come up with a clean ruleset. Its
+# [Install] section makes every machine require it, which does not order them.
 
 [Unit]
 Requires=unbounded-agent-regenerate-config@kube2.service
 After=unbounded-agent-regenerate-config@kube2.service
+After=nftables-flush.service
 StartLimitIntervalSec=0
 
 [Service]

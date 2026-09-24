@@ -309,6 +309,21 @@ func TestServiceOverride_ConfigRegenerationDependency(t *testing.T) {
 	require.Less(t, strings.Index(out, "After=unbounded-agent-regenerate-config@kube1.service"), strings.Index(out, "[Service]"))
 }
 
+// TestServiceOverride_OrdersAfterTheNFTablesFlush pins the ordering that gives
+// the machine a clean ruleset. The flush unit makes every machine require it,
+// but only this line orders them.
+func TestServiceOverride_OrdersAfterTheNFTablesFlush(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
+
+	out := buf.String()
+	require.Contains(t, out, "\nAfter="+goalstates.NFTablesFlushUnit+"\n")
+	require.Less(t, strings.Index(out, "[Unit]"), strings.Index(out, "After="+goalstates.NFTablesFlushUnit))
+	require.Less(t, strings.Index(out, "After="+goalstates.NFTablesFlushUnit), strings.Index(out, "[Service]"))
+}
+
 func TestConfigRegenerationUnit(t *testing.T) {
 	t.Parallel()
 

@@ -106,7 +106,8 @@ func TestNFTablesFlushUnitOutranksTheImageFirewall(t *testing.T) {
 	assert.NotContains(t, unit, "Wants=iptables.service")
 	assert.NotContains(t, unit, "Requires=iptables.service")
 
-	// The flush still has to precede the machine, which is what gives the node
-	// a clean ruleset rather than merely a later one.
-	assert.Contains(t, unit, "Before=systemd-nspawn@.service")
+	// The machines order themselves after the flush; see the rootfs service
+	// override. Before= on the bare template would name this unit's own
+	// instance and order nothing.
+	assert.NotContains(t, unit, "Before=systemd-nspawn@.service")
 }
