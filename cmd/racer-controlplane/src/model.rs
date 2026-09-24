@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 use crate::{Error, Result};
 
 pub const SLOT_COUNT: u32 = 262_144;
-/// Canonical placement with 64MiB page striping, matching the dataplane.
+/// Legacy slot graph with 64MiB page striping, accepted for compatibility.
 pub const ROUTING_ALGORITHM: u32 = 1;
+/// Physical-owner HRW with independent Cartesian-product routing roles.
+pub const PRODUCT_ROUTING_ALGORITHM: u32 = 2;
 pub const GENERATION_FORMAT: u32 = 1;
 pub const SOCKET_ROOT: &str = "/dev/racer";
 
@@ -161,7 +163,8 @@ pub struct Volume {
     pub owners: Vec<String>,
 }
 
-/// A versioned content format derived solely from current inventory.
+/// Process-local desired state. Physical placement derives solely from inventory;
+/// valid previous roles may be retained to reduce graph churn within a leadership.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
     pub format: u32,
@@ -169,6 +172,20 @@ pub struct Generation {
     pub revision: u64,
     pub nodes: BTreeMap<String, Member>,
     pub volumes: Vec<Volume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<ProductPlacement>,
+}
+
+/// Process-local role assignments and universe-wide physical owner rankings.
+/// Roles may be reassigned after leadership restart; rankings never use roles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductPlacement {
+    pub left_factor: u32,
+    pub right_factor: u32,
+    pub members: Vec<String>,
+    pub roles: Vec<u32>,
+    pub candidate_width: u32,
+    pub candidates: Vec<u32>,
 }
 
 impl Generation {
@@ -179,6 +196,7 @@ impl Generation {
             revision: 0,
             nodes: BTreeMap::new(),
             volumes: Vec::new(),
+            product: None,
         }
     }
 

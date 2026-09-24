@@ -165,7 +165,10 @@ impl Cluster {
         use crate::{buffers::Key, http_client as client};
         let key =
             *blake3::hash(format!("response {node} {target} {headers:?}").as_bytes()).as_bytes();
-        let fill = self.rings[node].pool().stage(Key::new(key)).unwrap();
+        // The external client has its own pool. Holding its response destination
+        // in the daemon's pool consumes the slot protected by hop-rank admission.
+        let mut client_ring = crate::conformance::ring(2, uring::Config::default());
+        let fill = client_ring.pool().stage(Key::new(key)).unwrap();
         let end = Instant::now() + Duration::from_secs(15);
         let mut peer_headers: Vec<_> = headers
             .iter()
@@ -226,9 +229,13 @@ impl Cluster {
             .unwrap();
         loop {
             self.turn();
-            if let Progress::Ready(mut response) = request.poll(&mut self.rings[node], 64).unwrap()
-            {
-                return (response.status(), response.body().to_vec());
+            client_ring.progress().unwrap();
+            if let Progress::Ready(mut response) = request.poll(&mut client_ring, 64).unwrap() {
+                let result = (response.status(), response.body().to_vec());
+                drop((response, request));
+                client_ring.shutdown().unwrap();
+                client_ring.pool().assert_recovered();
+                return result;
             }
             assert!(Instant::now() < end, "topology request stalled");
         }
@@ -621,6 +628,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     config.revision = 2;
     config.volumes[0].peers.clear();
     config.volumes[0].topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,

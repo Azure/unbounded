@@ -857,6 +857,10 @@ pub trait Upstream {
     fn proven_failure(&self, _error: &Error) -> bool {
         false
     }
+    /// Same-owner path repair retains the current candidate's absolute deadline.
+    fn repaired_candidate(&self) -> bool {
+        false
+    }
     /// Pin the network dependency for this candidate, independent of completed
     /// value identity. Routed adapters must supply this for local owners too.
     fn network_scope(&self, _value: [u8; 32]) -> Option<crate::buffers::NetworkFlightKey> {
@@ -2004,7 +2008,9 @@ impl Cache {
             Route::Backend
         };
         fault.scope = None;
-        fault.candidate_deadline = None;
+        if !upstream.repaired_candidate() {
+            fault.candidate_deadline = None;
+        }
         fault.buffer_wait = None;
         fault.network_done = false;
         fault.state = Loading::Acquire;

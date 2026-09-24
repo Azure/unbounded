@@ -81,7 +81,10 @@ pub(crate) mod peer_wire {
     /// HEAD and local owners, so ownership changes cannot
     /// change whether a representation is supported by a distributed volume.
     pub(crate) fn client_fits(target: usize) -> bool {
-        encoded_len(target, true, true, true).saturating_add(CHAIN_LEN) <= MAX_DESCRIPTOR
+        encoded_len(target, true, true, true)
+            .saturating_add(crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN)
+            .saturating_add(CHAIN_LEN)
+            <= MAX_DESCRIPTOR
     }
     pub(crate) fn request_len(
         request: &UpstreamRequest,
@@ -95,7 +98,7 @@ pub(crate) mod peer_wire {
         };
         Ok(encoded_len(target, page, routed, budget))
     }
-    // RB01 budgets cover RD01/RR01 and are bound by authenticated transports.
+    // RB01 budgets cover RD01/RR01/RR02 and are bound by authenticated transports.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
     pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
         let bytes = if chain(bytes)?.is_some() {
@@ -122,13 +125,26 @@ pub(crate) mod peer_wire {
         bytes: &[u8],
     ) -> super::Result<(Option<crate::routing::Cursor>, PeerDescriptor<'_>)> {
         let (bytes, _) = budget_descriptor(bytes)?;
-        if bytes.starts_with(b"RR01") {
-            if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + crate::routing::Cursor::LEN {
+        if bytes.starts_with(b"RR01") || bytes.starts_with(b"RR02") {
+            let algorithm = if bytes.starts_with(b"RR02") {
+                crate::routing::Algorithm::Product
+            } else {
+                crate::routing::Algorithm::Canonical
+            };
+            let len = if algorithm == crate::routing::Algorithm::Product {
+                crate::routing::Cursor::PRODUCT_LEN
+            } else {
+                crate::routing::Cursor::LEN
+            };
+            if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + len {
                 return Err(invalid("short routed descriptor").into());
             }
-            let end = 4 + crate::routing::Cursor::LEN;
+            let end = 4 + len;
             Ok((
-                Some(crate::routing::Cursor::decode(&bytes[4..end])?),
+                Some(crate::routing::Cursor::decode_algorithm(
+                    &bytes[4..end],
+                    algorithm,
+                )?),
                 decode_descriptor(&bytes[end..])?,
             ))
         } else {

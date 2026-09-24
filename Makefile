@@ -925,6 +925,7 @@ racer-dataplane-fmt-check:
 	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
 
 racer-fmt-check: racer-controlplane-fmt-check racer-dataplane-fmt-check ## Check both Rust crates, including explicitly included tests
+	rustfmt --edition 2024 --check internal/racer/product.rs internal/racer/product_tests.rs
 
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
 racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real daemon

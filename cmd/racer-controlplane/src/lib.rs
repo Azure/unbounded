@@ -5,6 +5,9 @@
 
 pub mod kubernetes;
 pub mod model;
+#[path = "../../../internal/racer/product.rs"]
+pub mod product;
+mod product_topology;
 pub mod publication;
 pub mod security;
 pub mod service;

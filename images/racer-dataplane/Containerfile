@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY api/racer/control.proto api/racer/control.proto
+COPY internal/racer/product.rs internal/racer/product.rs
 COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock cmd/racer-dataplane/build.rs cmd/racer-dataplane/
 COPY cmd/racer-dataplane/src/ cmd/racer-dataplane/src/
 COPY cmd/racer-dataplane/bench/ cmd/racer-dataplane/bench/

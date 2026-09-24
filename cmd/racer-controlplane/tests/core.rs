@@ -237,7 +237,7 @@ fn normalized_inventory_selects_processes_and_keeps_removal_authority() {
     let replaced = compile(&input, Some(&first)).unwrap();
     assert!(replaced.nodes["node-00000"].ip.is_some());
     assert_ne!(replaced.nodes["node-00000"].id, id);
-    assert_eq!(replaced, compile(&input, None).unwrap());
+    assert_eq!(replaced.volumes, compile(&input, None).unwrap().volumes);
     assert!(Topology::new(&replaced).unwrap().snapshot(&id).is_none());
     input.nodes[1].pods[0].uid = "new-process".into();
     input.nodes[1].pods[0].ready = true;
@@ -402,9 +402,14 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
         cache.uid = format!("cache-uid-{i}");
         input.caches.push(cache);
     }
+    let mut legacy = compile(&input, Some(&new)).unwrap();
+    legacy.product = None;
+    for volume in &mut legacy.volumes {
+        volume.routing_algorithm = ROUTING_ALGORITHM;
+    }
     assert!(
-        compile(&input, Some(&new)).is_err(),
-        "five full local volumes exceed profile work budget"
+        Topology::new(&legacy).is_err(),
+        "five legacy full local volumes exceed profile work budget"
     );
     let mut malformed = new.clone();
     malformed.volumes[0].owners.pop();
@@ -415,7 +420,10 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
 fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
     let input = inventory(1);
     let compiled = compile(&input, None).unwrap();
-    assert_eq!(compiled.volumes[0].routing_algorithm, 1);
+    assert_eq!(
+        compiled.volumes[0].routing_algorithm,
+        PRODUCT_ROUTING_ALGORITHM
+    );
     let mut publication = Publication::<Generation>::default();
     publication.publish(compiled, 1).unwrap();
     // Serialization remains a wire/fixture contract, not restart authority.
@@ -434,10 +442,10 @@ fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
             .as_ref()
             .unwrap()
             .routing_algorithm,
-        Some(1)
+        Some(PRODUCT_ROUTING_ALGORITHM)
     );
     // Old object routing must not be served to a page-striped dataplane.
-    for algorithm in [0, 2, 3, 4, u32::MAX] {
+    for algorithm in [0, 3, 4, u32::MAX] {
         let mut invalid = loaded.clone();
         invalid.volumes[0].routing_algorithm = algorithm;
         assert!(Topology::new(&invalid).is_err(), "algorithm {algorithm}");

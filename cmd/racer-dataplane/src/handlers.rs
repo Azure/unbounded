@@ -8,7 +8,7 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RD01/RR01/RB01 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RD01/RR01/RR02/RB01 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
@@ -145,13 +145,28 @@ pub struct Peer {
     http: HttpOrigin,
     rdma: Option<Rc<rdma::Connection>>,
     breaker: crate::breaker::CircuitBreaker,
+    // Actual immediate transport failure, never inferred from breaker rejection.
+    repair_evidence: Option<Instant>,
 }
 impl Peer {
+    fn record_repair_failure(&mut self, permit: &crate::breaker::Permit) {
+        if permit.current() {
+            self.repair_evidence = Some(crate::environment::now());
+        }
+    }
+
+    fn clear_repair_failure(&mut self, permit: &crate::breaker::Permit) {
+        if permit.current() {
+            self.repair_evidence = None;
+        }
+    }
+
     pub fn from_endpoint(endpoint: Endpoint) -> Self {
         Self {
             http: HttpOrigin::peer(endpoint),
             rdma: None,
             breaker: crate::breaker::CircuitBreaker::new(COOLDOWN),
+            repair_evidence: None,
         }
     }
     pub fn new(http_address: &str, rdma: Option<rdma::Connection>) -> io::Result<Self> {
@@ -159,6 +174,7 @@ impl Peer {
             http: HttpOrigin::peer(Endpoint::parse(http_address)?),
             rdma: rdma.map(Rc::new),
             breaker: crate::breaker::CircuitBreaker::new(COOLDOWN),
+            repair_evidence: None,
         })
     }
 }
@@ -181,6 +197,9 @@ pub struct Provider {
     // Frozen for this local resolution: retries cannot enter a downstream rank
     // while an earlier child or canceled transport still holds resources.
     receive_rank: Option<usize>,
+    repaired_candidate: bool,
+    // Absolute consumer cap, distinct from the private candidate/service cap.
+    caller_deadline: Option<Instant>,
     flight: u64,
     reply_route: Option<([u8; 32], u32)>,
     volume: Option<String>,
@@ -335,6 +354,8 @@ impl Provider {
             namespace: backend.namespace,
             chain: Rc::new(RefCell::new(Chain::default())),
             receive_rank: None,
+            repaired_candidate: false,
+            caller_deadline: None,
             flight: 0,
             reply_route: None,
             volume: None,
@@ -374,6 +395,15 @@ impl Provider {
         // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
         // routed descriptors, budget accounting, or peer request headers.
         if cache::peer_wire::request_len(request, self.active.is_some(), true)?
+            + if self
+                .routing
+                .as_ref()
+                .is_some_and(|r| r.algorithm == crate::routing::Algorithm::Product)
+            {
+                crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN
+            } else {
+                0
+            }
             + cache::peer_wire::CHAIN_LEN
             > MAX_DESCRIPTOR
         {
@@ -472,7 +502,7 @@ impl Upstream for Provider {
                     .with_authorization(meta.authorization()),
                 service_end,
             )?
-            .service_deadline(service_end < deadline)
+            .service_deadline(self.private_service_deadline(service_end, deadline))
             .retry_idle_backend(&self.metrics);
         self.metrics.upstream(
             crate::metrics::Upstream::BackendHttp,
@@ -484,6 +514,8 @@ impl Upstream for Provider {
         error.attempt_failure().is_some_and(|f| f.owner_evidence())
     }
     fn candidate_deadline(&mut self, caller: Instant) -> Instant {
+        self.caller_deadline = Some(self.caller_deadline.map_or(caller, |old| old.min(caller)));
+        let caller = self.caller_deadline.unwrap();
         let now = crate::environment::now();
         let Some(state) = &self.active else {
             return caller;
@@ -494,7 +526,7 @@ impl Upstream for Provider {
         }
         let total = self
             .max_attempts
-            .min(self.routing.as_ref().unwrap().geometry.slot_count());
+            .min(self.routing.as_ref().unwrap().candidate_count());
         let remaining = total.saturating_sub(state.cursor.attempt).max(1);
         candidate_end(now, caller, remaining)
     }
@@ -506,7 +538,7 @@ impl Upstream for Provider {
             routing: state.cursor.identity,
             version: state.cursor.algorithm.wire_version(),
             destination: routing.destination(&state.cursor),
-            dependency: if state.origin {
+            dependency: if state.origin && routing.algorithm != crate::routing::Algorithm::Product {
                 routing.dependency(&state.cursor).expect("validated route")
             } else {
                 crate::buffers::NetworkDependency::Independent(self.flight)
@@ -544,7 +576,11 @@ impl Upstream for Provider {
             }
             if valid {
                 if let Some(peer) = self.peer.as_mut() {
-                    peer.borrow_mut().http.recycle(connection.take());
+                    let mut peer = peer.borrow_mut();
+                    if let Some(permit) = permit.as_ref() {
+                        peer.clear_repair_failure(permit);
+                    }
+                    peer.http.recycle(connection.take());
                 }
             } else {
                 connection.take();
@@ -582,6 +618,7 @@ impl Upstream for Provider {
         Ok(rank)
     }
     fn peer_failed(&mut self, error: cache::Error) -> cache::Result<bool> {
+        self.repaired_candidate = false;
         self.forward_available()?;
         let Some(state) = self.active.clone() else {
             return Ok(false);
@@ -593,6 +630,28 @@ impl Upstream for Provider {
         }
         let destination = routing.destination(&state.cursor);
         let failure = error.attempt_failure();
+        // A typed, initiated immediate HTTP failure can repair an intermediate.
+        // RDMA first recovers over the same peer's HTTP transport. Remote reports,
+        // pressure, cancellations and content failures are never local link evidence.
+        if routing.algorithm == crate::routing::Algorithm::Product
+            && let Some(failure) = failure
+            && !failure.reported
+            && !failure.route.final_hop
+            && routing.compatible(&failure.route.cursor, &state.cursor)
+            && failure.route.candidate == destination
+            && failure.evidence.as_ref().is_some_and(|e| {
+                e.transport == crate::outcome::Transport::Http
+                    && e.endpoint.tcp() == Some(failure.route.endpoint)
+                    && e.owner_evidence()
+            })
+            && let Ok(repaired) = routing.repair(&state.cursor)
+        {
+            state.cursor = repaired;
+            self.repaired_candidate = true;
+            drop(state);
+            self.select_peer();
+            return Ok(true);
+        }
         let transport_failure = failure.is_some_and(|f| {
             f.owner_evidence()
                 && routing.compatible(&f.route.cursor, &state.cursor)
@@ -606,10 +665,10 @@ impl Upstream for Provider {
             return Err(OwnerUnavailable(destination).into());
         }
         loop {
-            state.cursor.attempt += 1;
-            if state.cursor.attempt >= routing.geometry.slot_count().min(self.max_attempts) {
+            if state.cursor.attempt + 1 >= routing.candidate_count().min(self.max_attempts) {
                 return Err(cache::Error::Unavailable);
             }
+            routing.advance_candidate(&mut state.cursor)?;
             if !self
                 .owners
                 .borrow()
@@ -623,6 +682,9 @@ impl Upstream for Provider {
         drop(state);
         self.select_peer();
         Ok(true)
+    }
+    fn repaired_candidate(&self) -> bool {
+        self.repaired_candidate
     }
     fn start(
         &mut self,
@@ -750,7 +812,7 @@ impl Upstream for Provider {
                                 destination,
                                 service_end,
                             )?
-                            .service_deadline(service_end < deadline)
+                            .service_deadline(self.private_service_deadline(service_end, deadline))
                             .retry_idle_backend(&self.metrics),
                     ),
                     request,
@@ -1004,6 +1066,13 @@ impl Handler {
             true,
         )?);
         provider.reply_route = reply;
+        if let (Some(routing), Some(state), Some((_, _, _, candidate))) =
+            (&provider.routing, &provider.active, chain)
+            && routing.algorithm == crate::routing::Algorithm::Product
+            && routing.destination(&state.borrow().cursor) != candidate
+        {
+            return Err(invalid("product chain candidate mismatch").into());
+        }
         if let Some((_, hops, work, _)) = chain {
             provider.chain = Rc::new(RefCell::new(Chain { hops, work }));
             provider.receive_rank = Some(usize::from(hops));
@@ -1069,11 +1138,11 @@ impl Provider {
                 .borrow()
                 .blocked(cursor.identity, routing.destination(&cursor))
             {
-                if cursor.attempt + 1 >= routing.geometry.slot_count().min(self.max_attempts) {
+                if cursor.attempt + 1 >= routing.candidate_count().min(self.max_attempts) {
                     exhausted = true;
                     break;
                 }
-                cursor.attempt += 1;
+                routing.advance_candidate(&mut cursor)?;
             }
         }
         routing.validate(&cursor, key)?;

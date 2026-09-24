@@ -45,6 +45,7 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
                 }],
             }),
             topology: Some(proto::Topology {
+                product: None,
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,

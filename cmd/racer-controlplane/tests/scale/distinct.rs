@@ -32,7 +32,7 @@ use crate::{
         Authority, CaState, Identity, IdentityKind, SignedClaims, StateImage, TlsSnapshot,
         certificate_claims,
     },
-    topology::place_in_universe,
+    topology::PlacementCache,
 };
 use openssl::{
     asn1::Asn1Time,
@@ -1035,15 +1035,24 @@ async fn scenario(
             .iter()
             .map(|(name, member)| (member.id.clone(), name.clone()))
             .collect();
-        let owners = place_in_universe(
-            slots,
-            &generation.universe,
-            &names.keys().cloned().collect::<Vec<_>>(),
-        )
-        .unwrap()
-        .into_iter()
-        .map(|id| names[&id].clone())
-        .collect();
+        let members: Vec<_> = names.keys().cloned().collect();
+        let width = 3.min(members.len() as u32);
+        let candidates = PlacementCache::default()
+            .candidates(slots, &generation.universe, &members, width)
+            .unwrap();
+        let owners = candidates
+            .chunks_exact(width as usize)
+            .map(|row| names[&members[row[0] as usize]].clone())
+            .collect();
+        let (product, roles) = crate::product_topology::assign(&members, None).unwrap();
+        generation.product = Some(crate::model::ProductPlacement {
+            left_factor: product.left.order(),
+            right_factor: product.right.order(),
+            members,
+            roles,
+            candidate_width: width,
+            candidates,
+        });
         generation.volumes.push(Volume {
             id: "cache-uid".into(),
             name: "cache-a".into(),
@@ -1052,7 +1061,7 @@ async fn scenario(
             origin_socket: "/dev/racer/cache-a/origin".into(),
             slots,
             cache_generation: 1,
-            routing_algorithm: crate::model::ROUTING_ALGORITHM,
+            routing_algorithm: crate::model::PRODUCT_ROUTING_ALGORITHM,
             max_candidate_attempts: 3,
             owners,
         });

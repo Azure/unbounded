@@ -59,6 +59,18 @@ message Topology {
   repeated uint32 local_slots = 3;
   repeated SlotPeer neighbors = 4;
   optional uint32 routing_algorithm = 5;
+  optional ProductTopology product = 6;
+}
+// Physical ownership and routing roles are independent. Candidate rows are
+// slot-major, ranked distinct indexes into the canonical sorted member list.
+message ProductTopology {
+  uint32 left_factor = 1;
+  uint32 right_factor = 2;
+  repeated string members = 3;
+  repeated uint32 roles = 4;
+  uint32 local_member = 5;
+  uint32 candidate_width = 6;
+  repeated uint32 candidates = 7 [packed=true];
 }
 message SlotPeer {
   uint32 slot = 1;

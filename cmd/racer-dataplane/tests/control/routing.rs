@@ -20,6 +20,7 @@ mod tests {
             origin_socket: "/tmp/origin.sock".into(),
             peers: slots.iter().map(|s| s.to_string()).collect(),
             topology: Some(proto::Topology {
+                product: None,
                 epoch: 1,
                 slot_count: p,
                 local_slots: local.to_vec(),
@@ -39,6 +40,9 @@ mod tests {
 
     fn cursor(r: &Routing, source: u32, owner: u32, position: u8) -> Cursor {
         Cursor {
+            path: Vec::new(),
+            failed: u32::MAX,
+            repair_position: 0,
             algorithm: r.algorithm,
             identity: r.identity,
             source,

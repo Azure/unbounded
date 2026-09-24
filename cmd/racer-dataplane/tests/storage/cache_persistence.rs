@@ -816,6 +816,7 @@ struct Fake {
     release: bool,
     candidate_cap: Option<Duration>,
     proven: bool,
+    repaired: bool,
     advances: usize,
     scope: Option<crate::buffers::NetworkFlightKey>,
     peer: bool,
@@ -881,6 +882,9 @@ impl Upstream for Fake {
     }
     fn proven_failure(&self, error: &Error) -> bool {
         self.proven && matches!(error.root(), Error::Unavailable)
+    }
+    fn repaired_candidate(&self) -> bool {
+        self.repaired
     }
     fn peer_failed(&mut self, error: Error) -> Result<bool> {
         // Match production attribution: local admission is not owner failure
@@ -1571,6 +1575,52 @@ fn semantic_fallback(ring: &mut Ring) {
     ));
     drop(fill(ring.pool(), key));
     cache.shutdown(ring).unwrap();
+}
+
+#[test]
+fn product_repair_retains_candidate_deadline_in_cache() {
+    let Some(mut ring) = crate::conformance::kernel_ring(2, uring::Config::default()) else {
+        return;
+    };
+    for repaired in [false, true] {
+        let mut cache = cache(1);
+        let mut upstream = Fake {
+            peer: true,
+            proven: true,
+            repaired,
+            candidate_cap: Some(Duration::from_secs(2)),
+            replies: [Reply::Error(Error::Unavailable), Reply::Hold].into(),
+            ..Fake::default()
+        };
+        let fault = cache
+            .metadata("/product-repair-deadline", deadline())
+            .unwrap();
+        let (fault, _) = pending(
+            cache
+                .poll_metadata(fault, &mut ring, &mut upstream)
+                .unwrap(),
+        );
+        let cap = fault.0.candidate_deadline.unwrap();
+        let (fault, _) = pending(
+            cache
+                .poll_metadata(fault, &mut ring, &mut upstream)
+                .unwrap(),
+        );
+        assert_eq!(fault.0.candidate_deadline, repaired.then_some(cap));
+        assert_eq!(upstream.advances, 1);
+        let (fault, _) = pending(
+            cache
+                .poll_metadata(fault, &mut ring, &mut upstream)
+                .unwrap(),
+        );
+        if repaired {
+            assert_eq!(upstream.starts[1].4, cap);
+        }
+        drop(fault);
+        cache.shutdown(&mut ring).unwrap();
+    }
+    ring.shutdown().unwrap();
+    ring.pool().assert_recovered();
 }
 
 fn peer_retry_reacquisition() {

@@ -111,6 +111,9 @@ impl Fixture {
         let mut bytes = b"RR01".to_vec();
         bytes.extend(
             crate::routing::Cursor {
+                path: Vec::new(),
+                failed: u32::MAX,
+                repair_position: 0,
                 algorithm: crate::routing::Algorithm::Canonical,
                 identity: [7; 32],
                 source: 0,

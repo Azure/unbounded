@@ -514,6 +514,7 @@ type Topology struct {
 	LocalSlots       []uint32               `protobuf:"varint,3,rep,packed,name=local_slots,json=localSlots,proto3" json:"local_slots,omitempty"`
 	Neighbors        []*SlotPeer            `protobuf:"bytes,4,rep,name=neighbors,proto3" json:"neighbors,omitempty"`
 	RoutingAlgorithm *uint32                `protobuf:"varint,5,opt,name=routing_algorithm,json=routingAlgorithm,proto3,oneof" json:"routing_algorithm,omitempty"`
+	Product          *ProductTopology       `protobuf:"bytes,6,opt,name=product,proto3,oneof" json:"product,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -583,6 +584,107 @@ func (x *Topology) GetRoutingAlgorithm() uint32 {
 	return 0
 }
 
+func (x *Topology) GetProduct() *ProductTopology {
+	if x != nil {
+		return x.Product
+	}
+	return nil
+}
+
+// Physical ownership and routing roles are independent. Candidate rows are
+// slot-major, ranked distinct indexes into the canonical sorted member list.
+type ProductTopology struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	LeftFactor     uint32                 `protobuf:"varint,1,opt,name=left_factor,json=leftFactor,proto3" json:"left_factor,omitempty"`
+	RightFactor    uint32                 `protobuf:"varint,2,opt,name=right_factor,json=rightFactor,proto3" json:"right_factor,omitempty"`
+	Members        []string               `protobuf:"bytes,3,rep,name=members,proto3" json:"members,omitempty"`
+	Roles          []uint32               `protobuf:"varint,4,rep,packed,name=roles,proto3" json:"roles,omitempty"`
+	LocalMember    uint32                 `protobuf:"varint,5,opt,name=local_member,json=localMember,proto3" json:"local_member,omitempty"`
+	CandidateWidth uint32                 `protobuf:"varint,6,opt,name=candidate_width,json=candidateWidth,proto3" json:"candidate_width,omitempty"`
+	Candidates     []uint32               `protobuf:"varint,7,rep,packed,name=candidates,proto3" json:"candidates,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ProductTopology) Reset() {
+	*x = ProductTopology{}
+	mi := &file_control_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProductTopology) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProductTopology) ProtoMessage() {}
+
+func (x *ProductTopology) ProtoReflect() protoreflect.Message {
+	mi := &file_control_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProductTopology.ProtoReflect.Descriptor instead.
+func (*ProductTopology) Descriptor() ([]byte, []int) {
+	return file_control_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ProductTopology) GetLeftFactor() uint32 {
+	if x != nil {
+		return x.LeftFactor
+	}
+	return 0
+}
+
+func (x *ProductTopology) GetRightFactor() uint32 {
+	if x != nil {
+		return x.RightFactor
+	}
+	return 0
+}
+
+func (x *ProductTopology) GetMembers() []string {
+	if x != nil {
+		return x.Members
+	}
+	return nil
+}
+
+func (x *ProductTopology) GetRoles() []uint32 {
+	if x != nil {
+		return x.Roles
+	}
+	return nil
+}
+
+func (x *ProductTopology) GetLocalMember() uint32 {
+	if x != nil {
+		return x.LocalMember
+	}
+	return 0
+}
+
+func (x *ProductTopology) GetCandidateWidth() uint32 {
+	if x != nil {
+		return x.CandidateWidth
+	}
+	return 0
+}
+
+func (x *ProductTopology) GetCandidates() []uint32 {
+	if x != nil {
+		return x.Candidates
+	}
+	return nil
+}
+
 type SlotPeer struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          uint32                 `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
@@ -593,7 +695,7 @@ type SlotPeer struct {
 
 func (x *SlotPeer) Reset() {
 	*x = SlotPeer{}
-	mi := &file_control_proto_msgTypes[8]
+	mi := &file_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -605,7 +707,7 @@ func (x *SlotPeer) String() string {
 func (*SlotPeer) ProtoMessage() {}
 
 func (x *SlotPeer) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[8]
+	mi := &file_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -618,7 +720,7 @@ func (x *SlotPeer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlotPeer.ProtoReflect.Descriptor instead.
 func (*SlotPeer) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{8}
+	return file_control_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SlotPeer) GetSlot() uint32 {
@@ -647,7 +749,7 @@ type Configuration struct {
 
 func (x *Configuration) Reset() {
 	*x = Configuration{}
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -659,7 +761,7 @@ func (x *Configuration) String() string {
 func (*Configuration) ProtoMessage() {}
 
 func (x *Configuration) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -672,7 +774,7 @@ func (x *Configuration) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Configuration.ProtoReflect.Descriptor instead.
 func (*Configuration) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{9}
+	return file_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Configuration) GetContents() isConfiguration_Contents {
@@ -721,7 +823,7 @@ type DesiredState struct {
 
 func (x *DesiredState) Reset() {
 	*x = DesiredState{}
-	mi := &file_control_proto_msgTypes[10]
+	mi := &file_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -733,7 +835,7 @@ func (x *DesiredState) String() string {
 func (*DesiredState) ProtoMessage() {}
 
 func (x *DesiredState) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[10]
+	mi := &file_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -746,7 +848,7 @@ func (x *DesiredState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredState.ProtoReflect.Descriptor instead.
 func (*DesiredState) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{10}
+	return file_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *DesiredState) GetUniverse() []byte {
@@ -830,7 +932,7 @@ type StoragePolicy struct {
 
 func (x *StoragePolicy) Reset() {
 	*x = StoragePolicy{}
-	mi := &file_control_proto_msgTypes[11]
+	mi := &file_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -842,7 +944,7 @@ func (x *StoragePolicy) String() string {
 func (*StoragePolicy) ProtoMessage() {}
 
 func (x *StoragePolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[11]
+	mi := &file_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -855,7 +957,7 @@ func (x *StoragePolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoragePolicy.ProtoReflect.Descriptor instead.
 func (*StoragePolicy) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{11}
+	return file_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *StoragePolicy) GetIdentity() []byte {
@@ -922,7 +1024,7 @@ const file_control_proto_rawDesc = "" +
 	"\x05peers\x18\x01 \x03(\v2$.racer.control.v1.VolumePeerEndpointR\x05peers\"K\n" +
 	"\x12VolumePeerEndpoint\x12\x12\n" +
 	"\x04peer\x18\x01 \x01(\tR\x04peer\x12!\n" +
-	"\fhttp_address\x18\x02 \x01(\tR\vhttpAddress\"\xe2\x01\n" +
+	"\fhttp_address\x18\x02 \x01(\tR\vhttpAddress\"\xb0\x02\n" +
 	"\bTopology\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1d\n" +
 	"\n" +
@@ -930,8 +1032,22 @@ const file_control_proto_rawDesc = "" +
 	"\vlocal_slots\x18\x03 \x03(\rR\n" +
 	"localSlots\x128\n" +
 	"\tneighbors\x18\x04 \x03(\v2\x1a.racer.control.v1.SlotPeerR\tneighbors\x120\n" +
-	"\x11routing_algorithm\x18\x05 \x01(\rH\x00R\x10routingAlgorithm\x88\x01\x01B\x14\n" +
-	"\x12_routing_algorithm\"2\n" +
+	"\x11routing_algorithm\x18\x05 \x01(\rH\x00R\x10routingAlgorithm\x88\x01\x01\x12@\n" +
+	"\aproduct\x18\x06 \x01(\v2!.racer.control.v1.ProductTopologyH\x01R\aproduct\x88\x01\x01B\x14\n" +
+	"\x12_routing_algorithmB\n" +
+	"\n" +
+	"\b_product\"\xf5\x01\n" +
+	"\x0fProductTopology\x12\x1f\n" +
+	"\vleft_factor\x18\x01 \x01(\rR\n" +
+	"leftFactor\x12!\n" +
+	"\fright_factor\x18\x02 \x01(\rR\vrightFactor\x12\x18\n" +
+	"\amembers\x18\x03 \x03(\tR\amembers\x12\x14\n" +
+	"\x05roles\x18\x04 \x03(\rR\x05roles\x12!\n" +
+	"\flocal_member\x18\x05 \x01(\rR\vlocalMember\x12'\n" +
+	"\x0fcandidate_width\x18\x06 \x01(\rR\x0ecandidateWidth\x12\"\n" +
+	"\n" +
+	"candidates\x18\a \x03(\rB\x02\x10\x01R\n" +
+	"candidates\"2\n" +
 	"\bSlotPeer\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\rR\x04slot\x12\x12\n" +
 	"\x04peer\x18\x02 \x01(\tR\x04peer\"U\n" +
@@ -968,7 +1084,7 @@ func file_control_proto_rawDescGZIP() []byte {
 	return file_control_proto_rawDescData
 }
 
-var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_control_proto_goTypes = []any{
 	(*Snapshot)(nil),            // 0: racer.control.v1.Snapshot
 	(*MemberCatalog)(nil),       // 1: racer.control.v1.MemberCatalog
@@ -978,10 +1094,11 @@ var file_control_proto_goTypes = []any{
 	(*VolumePeerEndpoints)(nil), // 5: racer.control.v1.VolumePeerEndpoints
 	(*VolumePeerEndpoint)(nil),  // 6: racer.control.v1.VolumePeerEndpoint
 	(*Topology)(nil),            // 7: racer.control.v1.Topology
-	(*SlotPeer)(nil),            // 8: racer.control.v1.SlotPeer
-	(*Configuration)(nil),       // 9: racer.control.v1.Configuration
-	(*DesiredState)(nil),        // 10: racer.control.v1.DesiredState
-	(*StoragePolicy)(nil),       // 11: racer.control.v1.StoragePolicy
+	(*ProductTopology)(nil),     // 8: racer.control.v1.ProductTopology
+	(*SlotPeer)(nil),            // 9: racer.control.v1.SlotPeer
+	(*Configuration)(nil),       // 10: racer.control.v1.Configuration
+	(*DesiredState)(nil),        // 11: racer.control.v1.DesiredState
+	(*StoragePolicy)(nil),       // 12: racer.control.v1.StoragePolicy
 }
 var file_control_proto_depIdxs = []int32{
 	3,  // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
@@ -991,15 +1108,16 @@ var file_control_proto_depIdxs = []int32{
 	7,  // 4: racer.control.v1.Volume.topology:type_name -> racer.control.v1.Topology
 	5,  // 5: racer.control.v1.Volume.peer_endpoints:type_name -> racer.control.v1.VolumePeerEndpoints
 	6,  // 6: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
-	8,  // 7: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
-	0,  // 8: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
-	9,  // 9: racer.control.v1.DesiredState.configuration:type_name -> racer.control.v1.Configuration
-	11, // 10: racer.control.v1.DesiredState.storage_policy:type_name -> racer.control.v1.StoragePolicy
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	9,  // 7: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
+	8,  // 8: racer.control.v1.Topology.product:type_name -> racer.control.v1.ProductTopology
+	0,  // 9: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
+	10, // 10: racer.control.v1.DesiredState.configuration:type_name -> racer.control.v1.Configuration
+	12, // 11: racer.control.v1.DesiredState.storage_policy:type_name -> racer.control.v1.StoragePolicy
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_control_proto_init() }
@@ -1009,7 +1127,7 @@ func file_control_proto_init() {
 	}
 	file_control_proto_msgTypes[4].OneofWrappers = []any{}
 	file_control_proto_msgTypes[7].OneofWrappers = []any{}
-	file_control_proto_msgTypes[9].OneofWrappers = []any{
+	file_control_proto_msgTypes[10].OneofWrappers = []any{
 		(*Configuration_Snapshot)(nil),
 	}
 	type x struct{}
@@ -1018,7 +1136,7 @@ func file_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_proto_rawDesc), len(file_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

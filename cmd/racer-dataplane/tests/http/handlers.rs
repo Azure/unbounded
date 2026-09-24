@@ -13,6 +13,8 @@ mod hop_admission;
 mod mixed_version;
 #[path = "peer_recovery.rs"]
 mod peer_recovery;
+#[path = "product.rs"]
+mod product;
 
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
@@ -152,6 +154,7 @@ fn colocated_positions_share_only_normalized_candidate_scope() {
     let volume = &mut config.volumes[0];
     volume.peers = vec!["p2".into(), "p3".into()];
     volume.topology = Some(crate::control::proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 8,

@@ -53,10 +53,14 @@ impl Provider {
 
     pub(super) fn service_end(&self, deadline: Instant) -> Instant {
         let now = crate::environment::now();
-        // Static peer chains also forward budgets. A one-second cap would be
-        // consumed entirely by return slack before the second relay's backend.
-        let window = MAX_CANDIDATE;
-        (now + window).min(deadline.checked_sub(RETURN_SLACK).unwrap_or(now).max(now))
+        // The exchange retains the parent's cap. prepare_budget_wire reserves
+        // return slack once when granting the child its shorter service budget.
+        // Charging here too exhausts an eight-candidate budget in four hops.
+        (now + MAX_CANDIDATE).min(deadline)
+    }
+
+    pub(super) fn private_service_deadline(&self, service: Instant, candidate: Instant) -> bool {
+        service < self.caller_deadline.unwrap_or(candidate)
     }
 
     /// Create an independently routed request over the shared endpoint registry.
@@ -66,6 +70,8 @@ impl Provider {
             namespace: self.namespace,
             chain: Rc::new(RefCell::new(Chain::default())),
             receive_rank: None,
+            repaired_candidate: false,
+            caller_deadline: None,
             flight: NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             reply_route: None,
             volume: self.volume.clone(),
@@ -97,10 +103,34 @@ impl Provider {
 
     pub(super) fn select_peer(&mut self) {
         if let Some(routing) = &self.routing {
-            let selected = self
+            let mut selected = self
                 .active
                 .as_ref()
                 .and_then(|s| routing.next(&s.borrow().cursor).ok().flatten().map(|n| n.0));
+            // New metadata/page resolutions can avoid a recently proven failed
+            // intermediate. The evidence is generation-local and expires; a mere
+            // open breaker or admission rejection cannot authorize a repair.
+            if routing.algorithm == crate::routing::Algorithm::Product
+                && let Some(state) = &self.active
+                && let Some(peer) = selected
+                    .as_ref()
+                    .and_then(|id| self.peers.borrow().get(id).cloned())
+                && peer
+                    .borrow()
+                    .repair_evidence
+                    .is_some_and(|at| at + COOLDOWN > crate::environment::now())
+                && let Ok(repaired) = {
+                    let state = state.borrow();
+                    routing.repair(&state.cursor)
+                }
+            {
+                state.borrow_mut().cursor = repaired;
+                selected = routing
+                    .next(&state.borrow().cursor)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.0);
+            }
             self.peer = selected
                 .as_ref()
                 .and_then(|id| self.peers.borrow().get(id).cloned());

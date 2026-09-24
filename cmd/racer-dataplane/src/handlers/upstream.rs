@@ -161,7 +161,17 @@ impl Provider {
         }
         let result = (|| match progress.map_err(|error| {
             if let Some(attempt) = &attempt {
-                let evidence = error.evidence().attempt.cloned();
+                let mut evidence = error.evidence().attempt.cloned();
+                // A late poll cannot turn actual caller expiry into owner or
+                // intermediate evidence, even if the exchange had a private cap.
+                if self
+                    .caller_deadline
+                    .is_some_and(|end| crate::environment::now() >= end)
+                    && let Some(e) = &mut evidence
+                    && e.cause == crate::outcome::Cause::ServiceTimeout
+                {
+                    e.cause = crate::outcome::Cause::CallerDeadline;
+                }
                 cache::Error::from(AttemptFailure {
                     route: attempt.route.clone(),
                     evidence,
@@ -315,6 +325,20 @@ impl Provider {
             }
         })();
         if let Err(error) = &result {
+            if peer
+                && let Some(permit) = permit.as_ref()
+                && let Some(failure) = error.attempt_failure()
+                && !failure.reported
+                && failure.evidence.as_ref().is_some_and(|e| {
+                    e.endpoint.tcp() == Some(failure.route.endpoint) && e.owner_evidence()
+                })
+            {
+                self.peer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .record_repair_failure(permit);
+            }
             if let Some(a) = attempt.as_mut()
                 && let Some(failure) = error.attempt_failure()
                 && failure.owner_evidence()
@@ -331,6 +355,13 @@ impl Provider {
             }
         }
         if let Some(permit) = permit {
+            if peer {
+                self.peer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .clear_repair_failure(&permit);
+            }
             permit.success();
         }
         result
@@ -471,7 +502,7 @@ impl Provider {
                 Some(destination) => HttpGet::Payload(
                     connection
                         .get(request_wire, destination, service_end.min(deadline))?
-                        .service_deadline(service_end < deadline)
+                        .service_deadline(self.private_service_deadline(service_end, deadline))
                         .connect_cap(COOLDOWN),
                 ),
                 None => HttpGet::Metadata(
@@ -481,7 +512,7 @@ impl Provider {
                             cache::METADATA_SIZE,
                             service_end.min(deadline),
                         )?
-                        .service_deadline(service_end < deadline)
+                        .service_deadline(self.private_service_deadline(service_end, deadline))
                         .connect_cap(COOLDOWN),
                 ),
             };
