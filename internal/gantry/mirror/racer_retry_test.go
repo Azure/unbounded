@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
@@ -21,6 +22,10 @@ import (
 // Exercise the actual hijacked TCP/splice path with a complete verified object,
 // not only a tiny partial range. Each page fails once before returning payload.
 func TestRacerPinnedRetryCompletesVerifiedObject(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux splice and proc fd paths")
+	}
+
 	payload := make([]byte, sdk.PageSize+17)
 	for i := range payload {
 		payload[i] = byte(i * 31)
