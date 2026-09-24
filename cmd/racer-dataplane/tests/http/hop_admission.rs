@@ -72,6 +72,51 @@ fn local_candidate_then_remote_candidate_cannot_reset_receive_rank() {
 }
 
 #[test]
+fn flight_rank_covers_metadata_and_both_payload_capacities_without_retry_rebase() {
+    for (flights, payloads, expected) in [
+        (128, None, 8),
+        (4, None, 3),
+        (128, Some(4), 3),
+        (4, Some(16), 3),
+    ] {
+        let mut provider = static_provider();
+        assert_eq!(
+            provider.flight_reserve(flights, payloads).unwrap(),
+            expected
+        );
+        provider.chain.borrow_mut().forward().unwrap();
+        assert_eq!(provider.flight_reserve(128, Some(16)).unwrap(), expected);
+        assert_eq!(provider.receive_reserve(16).unwrap(), expected);
+        assert_eq!(provider.receive_rank, Some(expected));
+        let peer = provider.peer.take();
+        assert_eq!(provider.flight_reserve(1, None).unwrap(), 0);
+        provider.peer = peer;
+        assert!(provider.flight_reserve(expected, None).is_err());
+        assert_eq!(provider.receive_rank, Some(expected));
+        let mut next = provider.routed(None);
+        assert_eq!(next.flight_reserve(128, None).unwrap(), 8);
+    }
+    let mut received = static_provider();
+    received.receive_rank = Some(7);
+    received.chain.borrow_mut().hops = 7;
+    assert!(received.flight_reserve(4, None).is_err());
+    assert_eq!(received.chain.borrow().hops, 7);
+    received.peer = None;
+    assert_eq!(received.flight_reserve(4, None).unwrap(), 0);
+}
+
+#[test]
+fn local_flight_candidate_freezes_rank_before_remote_reselection() {
+    let mut provider = static_provider();
+    let peer = provider.peer.take();
+    assert_eq!(provider.flight_reserve(128, Some(4)).unwrap(), 0);
+    assert_eq!(provider.receive_rank, Some(3));
+    provider.peer = peer;
+    assert_eq!(provider.flight_reserve(128, Some(16)).unwrap(), 3);
+    assert_eq!(provider.receive_reserve(16).unwrap(), 3);
+}
+
+#[test]
 fn product_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants() {
     let Some(mut ring) = crate::conformance::kernel_ring(4, uring::Config::default()) else {
         return;
@@ -104,10 +149,16 @@ fn product_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants(
     let pool = ring.pool().clone();
     let mut held = Vec::new();
     let mut blocked = Vec::new();
+    let mut flights = Vec::new();
     for (hop, expected) in [3, 2, 1].into_iter().enumerate() {
         assert!(provider.has_peer());
-        let rank = provider.receive_reserve(pool.capacity()).unwrap();
+        let rank = provider
+            .flight_reserve(pool.flight_capacity(), Some(pool.capacity()))
+            .unwrap();
         assert_eq!(rank, expected);
+        assert_eq!(provider.receive_reserve(pool.capacity()).unwrap(), rank);
+        let key = provider.network_scope([hop as u8; 32]).unwrap();
+        flights.push(pool.network_flight_reserved(key, rank).unwrap());
         let mut wait =
             pool.wait_stage_reserved(crate::buffers::Key::new(*page.key()), rank, deadline());
         let std::task::Poll::Ready(Ok(fill)) = wait.poll(std::task::Waker::noop()) else {
@@ -135,6 +186,14 @@ fn product_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants(
     // The final slot is protected from every forwarding rank. Exhausted cyclic
     // work cannot consume it or create a new chain; owner work still can.
     assert_eq!(provider.receive_reserve(pool.capacity()).unwrap(), 0);
+    let rank = provider
+        .flight_reserve(pool.flight_capacity(), Some(pool.capacity()))
+        .unwrap();
+    assert_eq!(rank, 0);
+    flights.push(
+        pool.network_flight_reserved(provider.network_scope([99; 32]).unwrap(), rank)
+            .unwrap(),
+    );
     let owner = pool.private_fill().unwrap();
     drop(owner);
     for wait in &mut blocked {
@@ -144,7 +203,7 @@ fn product_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants(
     // before polling, then recover all capacity without renewing any budgets.
     drop(held.pop());
     drop(blocked.pop());
-    drop((held, blocked));
+    drop((held, blocked, flights));
     pool.assert_recovered();
     ring.shutdown().unwrap();
 }

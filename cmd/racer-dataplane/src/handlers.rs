@@ -581,9 +581,20 @@ impl Upstream for Provider {
     fn has_peer(&self) -> bool {
         self.peer.is_some()
     }
+    fn flight_reserve(
+        &mut self,
+        capacity: usize,
+        payload_capacity: Option<usize>,
+    ) -> cache::Result<usize> {
+        // Use one frozen rank for every resource held across a downstream
+        // dependency. Metadata only holds coordination; payloads must fit both
+        // pools before forwarding. Reselection/repair must not lower this rank
+        // while an earlier child can still be live. A terminal owner needs zero.
+        self.receive_reserve(payload_capacity.map_or(capacity, |n| n.min(capacity)))
+    }
     fn receive_reserve(&mut self, capacity: usize) -> cache::Result<usize> {
         // The wire hop allowance decreases at every forwarding hop.
-        // Only a fresh local payload may shorten it to fit this pool.
+        // Only a fresh local resolution may shorten it to fit its resource pools.
         // Received providers already have a frozen rank from peer_provider.
         let rank = *self.receive_rank.get_or_insert_with(|| {
             let mut chain = self.chain.borrow_mut();
@@ -595,9 +606,7 @@ impl Upstream for Provider {
         }
         self.forward_available()?;
         if rank >= capacity {
-            return Err(cache::busy(
-                "peer receive rank exceeds local buffer capacity",
-            ));
+            return Err(cache::busy("peer receive rank exceeds local capacity"));
         }
         Ok(rank)
     }

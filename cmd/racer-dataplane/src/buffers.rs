@@ -465,8 +465,19 @@ impl WorkerPool {
             shard: assignment.id(),
         })
     }
+    #[cfg(test)]
     pub(crate) fn network_flight(&self, key: NetworkFlightKey) -> Result<NetworkFlight, Exhausted> {
-        self.node.flights.join(key)
+        self.network_flight_reserved(key, 0)
+    }
+    pub(crate) fn flight_capacity(&self) -> usize {
+        self.node.flights.capacity
+    }
+    pub(crate) fn network_flight_reserved(
+        &self,
+        key: NetworkFlightKey,
+        reserve: usize,
+    ) -> Result<NetworkFlight, Exhausted> {
+        self.node.flights.join(key, reserve)
     }
 }
 
@@ -866,7 +877,7 @@ pub(crate) enum NetworkProgress {
     File(crate::allocator::FileValue),
 }
 impl NetworkFlights {
-    fn join(&self, key: NetworkFlightKey) -> Result<NetworkFlight, Exhausted> {
+    fn join(&self, key: NetworkFlightKey, reserve: usize) -> Result<NetworkFlight, Exhausted> {
         let mut registry = self.registry.lock().unwrap();
         registry.retain(|_, state| state.strong_count() != 0);
         let existing = registry
@@ -879,7 +890,10 @@ impl NetworkFlights {
         let state = if let Some(state) = existing {
             state
         } else {
-            if self.count.load(Ordering::Acquire) >= self.capacity {
+            // The same NUMA-wide lock serializes admission across workers and
+            // volumes. Buffer waiters retain flights, so downstream ranks need
+            // reserved coordination capacity before they can reach buffer admission.
+            if self.count.load(Ordering::Acquire) >= self.capacity.saturating_sub(reserve) {
                 return Err(Exhausted);
             }
             self.count.fetch_add(1, Ordering::Relaxed);
