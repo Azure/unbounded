@@ -80,7 +80,14 @@ fn cold_nonowner_streams_multiple_pages_with_independent_page_resolution_budgets
     peer_listener.set_tls(ca.context(&bid, false), ExpectedPeer::Identity(aid));
     let (_, mut config) = crate::control::tests::fixture();
     config.volumes[0].peers = vec![bid.node.clone()];
-    config.volumes[0].topology.as_mut().unwrap().product.as_mut().unwrap().members[1] = bid.node.clone();
+    config.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = bid.node.clone();
     let routing =
         Arc::new(crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap());
     let mut ingress = Handler::new(cache(&backend, 4), backend.clone());

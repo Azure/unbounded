@@ -106,7 +106,14 @@ fn peer_rotation_child() {
     listener.set_tls_revision(1);
     let (_, mut config) = crate::control::tests::fixture();
     config.volumes[0].peers = vec![bid.node.clone()];
-    config.volumes[0].topology.as_mut().unwrap().product.as_mut().unwrap().members[1] = bid.node.clone();
+    config.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = bid.node.clone();
     let mut ingress = Handler::new(cache(&backend, 4), backend.clone());
     ingress.set_attempt_policy(1).unwrap();
     ingress.set_routing(

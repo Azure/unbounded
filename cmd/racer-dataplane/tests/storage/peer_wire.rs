@@ -85,9 +85,7 @@ fn bounded_chain_rejects_truncation_nesting_and_oversized_hops() {
     wire.push(b'x');
     assert!(routed_descriptor(&wire).is_err());
     assert!(client_fits(
-        MAX_DESCRIPTOR
-            - encoded_len(0, true, true, true)
-            - CHAIN_LEN
+        MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN
     ));
     assert!(!client_fits(
         MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN + 1

@@ -118,23 +118,58 @@ mod conformance {
     fn product_v1_corpus_preserves_membership_ownership_and_rejects_malformed() {
         use prost::Message;
         let dir = compiler_snapshots();
-        let files: Vec<String> = serde_json::from_slice(&std::fs::read(dir.join("files.json")).unwrap()).unwrap();
+        let files: Vec<String> =
+            serde_json::from_slice(&std::fs::read(dir.join("files.json")).unwrap()).unwrap();
         for file in files {
-            let snapshot = crate::control::proto::Snapshot::decode(std::fs::read(dir.join(&file)).unwrap().as_slice()).unwrap();
-            let trust = crate::control::Trust { universe: snapshot.universe.clone().try_into().unwrap(), node: snapshot.node.clone().try_into().unwrap() };
-            let wrap = |s| crate::control::proto::Configuration { contents: Some(crate::control::proto::configuration::Contents::Snapshot(s)) };
+            let snapshot = crate::control::proto::Snapshot::decode(
+                std::fs::read(dir.join(&file)).unwrap().as_slice(),
+            )
+            .unwrap();
+            let trust = crate::control::Trust {
+                universe: snapshot.universe.clone().try_into().unwrap(),
+                node: snapshot.node.clone().try_into().unwrap(),
+            };
+            let wrap = |s| crate::control::proto::Configuration {
+                contents: Some(crate::control::proto::configuration::Contents::Snapshot(s)),
+            };
             let prepared = trust.prepare(wrap(snapshot.clone())).unwrap();
             let (prefix, _) = file.rsplit_once('-').unwrap();
-            let owners: Vec<String> = serde_json::from_slice(&std::fs::read(dir.join(format!("{prefix}-owners.json"))).unwrap()).unwrap();
-            let ids: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(dir.join(format!("{prefix}-ids.json"))).unwrap()).unwrap();
-            let product = snapshot.volumes[0].topology.as_ref().unwrap().product.as_ref().unwrap();
-            assert_eq!(snapshot.member_catalogs[0].members.len(), product.members.len());
+            let owners: Vec<String> = serde_json::from_slice(
+                &std::fs::read(dir.join(format!("{prefix}-owners.json"))).unwrap(),
+            )
+            .unwrap();
+            let ids: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                &std::fs::read(dir.join(format!("{prefix}-ids.json"))).unwrap(),
+            )
+            .unwrap();
+            let product = snapshot.volumes[0]
+                .topology
+                .as_ref()
+                .unwrap()
+                .product
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                snapshot.member_catalogs[0].members.len(),
+                product.members.len()
+            );
             for (slot, owner) in owners.iter().enumerate() {
-                assert_eq!(product.members[product.candidates[slot * product.candidate_width as usize] as usize], ids[owner]);
+                assert_eq!(
+                    product.members
+                        [product.candidates[slot * product.candidate_width as usize] as usize],
+                    ids[owner]
+                );
             }
             assert_eq!(prepared.volumes().len(), 1);
             let mut malformed = snapshot;
-            malformed.volumes[0].topology.as_mut().unwrap().product.as_mut().unwrap().candidates[0] = u32::MAX;
+            malformed.volumes[0]
+                .topology
+                .as_mut()
+                .unwrap()
+                .product
+                .as_mut()
+                .unwrap()
+                .candidates[0] = u32::MAX;
             assert!(trust.prepare(wrap(malformed)).is_err());
         }
     }
@@ -656,7 +691,9 @@ mod endpoint_tests {
         {
             for name in ["cache"] {
                 let s = proto::Snapshot::decode(
-                    std::fs::read(dir.join("p262144-n2-fresh-0.pb")).unwrap().as_slice(),
+                    std::fs::read(dir.join("p262144-n2-fresh-0.pb"))
+                        .unwrap()
+                        .as_slice(),
                 )
                 .unwrap();
                 assert_eq!(s.volumes[0].origin_socket, "/dev/racer/cache-a/origin");

@@ -28,8 +28,13 @@ pub(crate) mod tests {
         config.volumes[0].peers = vec![config.peers[0].id.clone()];
         config.volumes[0].topology = Some(proto::Topology {
             product: Some(proto::ProductTopology {
-                left_factor: 1, right_factor: 2, members: vec!["02".repeat(32), "03".repeat(32)], roles: vec![0, 1],
-                local_member: if node == 2 { 0 } else { 1 }, candidate_width: 2, candidates: vec![0, 1, 1, 0],
+                left_factor: 1,
+                right_factor: 2,
+                members: vec!["02".repeat(32), "03".repeat(32)],
+                roles: vec![0, 1],
+                local_member: if node == 2 { 0 } else { 1 },
+                candidate_width: 2,
+                candidates: vec![0, 1, 1, 0],
             }),
             routing_algorithm: Some(1),
             epoch: 1,

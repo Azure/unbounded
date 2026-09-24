@@ -60,13 +60,21 @@ fn desired_digest_and_revision_mismatches_preserve_receipt_and_last_good() {
         let (_socket, request, _) = server.next();
         assert!(request.contains("X-Racer-Cursor: cursor-2\r\n"));
         assert!(request.contains("X-Racer-Applied-Revision: 1\r\n"));
-        assert!(request.contains(&format!("X-Racer-Rejected-Revision: {}\r\n", command.revision)));
+        assert!(request.contains(&format!(
+            "X-Racer-Rejected-Revision: {}\r\n",
+            command.revision
+        )));
         assert_eq!(updates.active().unwrap().config.revision, 1);
-        assert!(updates.status()["lastError"].as_str().unwrap().contains(if revision_mismatch {
-            "revision mismatch"
-        } else {
-            "digest mismatch"
-        }));
+        assert!(
+            updates.status()["lastError"]
+                .as_str()
+                .unwrap()
+                .contains(if revision_mismatch {
+                    "revision mismatch"
+                } else {
+                    "digest mismatch"
+                })
+        );
         drop(subscriber);
     }
 }
