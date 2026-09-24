@@ -74,11 +74,12 @@ mod conformance {
             ));
         }
         let files: Vec<String> = serde_json::from_slice(&read_json("files.json")?)?;
-        // All recipients for 2, 3, and 7 nodes at four slot geometries.
+        // All recipients for 2, 3, and 7 nodes at five slot geometries, including
+        // one-slot HRW placement with live idle recipients.
         let expected: std::collections::BTreeSet<_> = [2, 3, 7]
             .into_iter()
             .flat_map(|nodes| {
-                [8, 17, 64, 262_144].into_iter().flat_map(move |slots| {
+                [1, 8, 17, 64, 262_144].into_iter().flat_map(move |slots| {
                     (0..nodes).map(move |node| format!("p{slots}-n{nodes}-fresh-{node}.pb"))
                 })
             })
@@ -134,7 +135,7 @@ mod conformance {
         assert!(validate_compiler_export(&dir, "run").is_err());
         let mut files = Vec::new();
         for nodes in [2, 3, 7] {
-            for slots in [8, 17, 64, 262_144] {
+            for slots in [1, 8, 17, 64, 262_144] {
                 let prefix = format!("p{slots}-n{nodes}-fresh");
                 for node in 0..nodes {
                     let file = format!("{prefix}-{node}.pb");
@@ -151,6 +152,19 @@ mod conformance {
             std::fs::write(dir.join(file), b"fixture").unwrap();
         }
         validate_compiler_export(&dir, "run").unwrap();
+        // An old export that omits idle-member geometry is incomplete even when
+        // all of its listed payloads and the current run receipt are present.
+        let without_idle: Vec<_> = files
+            .iter()
+            .filter(|file| !file.starts_with("p1-"))
+            .collect();
+        std::fs::write(
+            dir.join("files.json"),
+            serde_json::to_vec(&without_idle).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_compiler_export(&dir, "run").is_err());
+        std::fs::write(dir.join("files.json"), serde_json::to_vec(&files).unwrap()).unwrap();
         let wrong_producer = serde_json::json!({"producer": "fixture", "run_id": "run"});
         std::fs::write(dir.join("export-receipt.json"), wrong_producer.to_string()).unwrap();
         assert!(validate_compiler_export(&dir, "run").is_err());
