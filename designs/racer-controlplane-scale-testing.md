@@ -12,6 +12,13 @@
   runtime workers. Selecting it requires `RACER_SCALE_CAPACITY_QUALIFIED=1`;
   missing qualification or a debug build fails rather than returning success.
   Qualification is an operator attestation, not automatic proof of capacity.
+- `subscription::distinct_scale::distinct_tls_rollout_churn` is an ignored
+  release regression: 1,500 distinct TLS recipients, one universe, 262,144
+  slots, and a member endpoint publication every 100 ms plus installation time.
+  Publishing continues until every recipient receives its first configuration.
+  Early recipients keep subscribing during that churn. The original 35-second
+  first-byte deadlines, digest checks, successor delivery, and reconnect checks
+  remain enabled.
 
 Reserve CPU capacity for both endpoints and snapshot builders; avoid concurrent
 builds and resource-intensive suites. Record CPU affinity, cgroup quota/throttling,
@@ -90,6 +97,32 @@ current 10,000-client first-byte compliance. Reduced runs do not supersede the
 audit failure.
 
 ## Diagnostics and cancellation
+
+### Rollout queue starvation regression
+
+The September 24, 2026 local reproduction on the shared 48-logical-CPU host
+delivered only 25 of 1,500 initial configurations before first-byte deadlines
+expired. A changed request captured revision/selection/policy before waiting for
+a response permit, built the latest snapshot after admission, then discarded it
+because it differed from the pre-admission revision. Retrying at the back of the
+fleet queue repeated the same race on subsequent publications.
+
+The handler now refreshes desired state and authorization after admission and
+retains its response permit while retrying publication races. It still rejects
+superseded builds and revoked identities, and releases admission before an
+unchanged long poll. Admission limits and cache budgets are unchanged. With this
+fix, the same TLS churn scenario delivered all 1,500 initial configurations in
+9.41 seconds during 47 publications, with maximum first-byte latency 8.75
+seconds. The subsequent publication/reconnect phase also passed. These are local
+loopback results, not a cluster capacity guarantee.
+
+`queued_admission_refreshes_state_and_fails_closed` additionally exercises a
+deterministic competing queue, topology/policy changes, live binding revocation,
+authority loss, cancellation, and permit release with real TLS-derived identity.
+
+```sh
+timeout --kill-after=5s 110s cargo test --locked --release --manifest-path cmd/racer-controlplane/Cargo.toml --lib subscription::distinct_scale::distinct_tls_rollout_churn -- --exact --ignored --nocapture --test-threads=1
+```
 
 `SCALE_GEOMETRY` records dimensions, process limits and ephemeral port range.
 `SCALE_PROGRESS` appears at stage changes, every five seconds on a separate thread,
