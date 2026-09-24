@@ -1130,10 +1130,12 @@ release_operator_run_command_lock() {
   exec {operator_run_command_lock_fd}>&-
 }
 
+acquire_operator_run_command_lock
 guard_active_benchmark
 if [[ "$action" == scale ]]; then
   scale_aks_node_pool
   wait_for_nodes
+  release_operator_run_command_lock
   log "AKS node pool scale complete"
   exit 0
 fi
@@ -1161,10 +1163,8 @@ install_monitoring
 
 set_acrs_private
 
-acquire_operator_run_command_lock
 provision_operator
 build_operator_images
-release_operator_run_command_lock
 verify_private_baseline_pull
 deploy_gantry
 
@@ -1185,14 +1185,13 @@ done
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"
-  acquire_operator_run_command_lock
   az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
     --command-id RunShellScript \
     --scripts 'systemctl reset-failed gantry-benchmark-operator.service; systemctl start --no-block gantry-benchmark-operator.service' \
     --only-show-errors -o none
-  release_operator_run_command_lock
 fi
 
+release_operator_run_command_lock
 trap - EXIT INT TERM
 log "deployment complete"
 print_plan

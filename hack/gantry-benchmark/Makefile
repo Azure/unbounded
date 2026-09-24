@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -48,6 +48,7 @@ help: ## Show benchmark targets
 	@echo "  run-gantry   Execute only Gantry cold against the retained baseline"
 	@echo "  status       Print active benchmark state"
 	@echo "  disable      Restore routing and remove instrumentation"
+	@echo "  recover-direct-config  Accept expected direct-mode config drift and disable"
 
 test:
 	$(MAKE) operator-vm-check
@@ -187,6 +188,14 @@ enable prepare preflight run run-gantry status disable:
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark $@
+
+recover-direct-config:
+	@test -n "$(EXPECTED_GANTRY_CONFIG_SHA)" || { echo "EXPECTED_GANTRY_CONFIG_SHA is required" >&2; exit 2; }
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark recover-direct-config \
+		"$(EXPECTED_GANTRY_CONFIG_SHA)"
 
 prepare-adopt:
 	@test -n "$(ADOPT_BASELINE_IMAGE)" || { echo "ADOPT_BASELINE_IMAGE is required" >&2; exit 2; }
