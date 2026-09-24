@@ -396,6 +396,9 @@ impl std::fmt::Display for Exhausted {
 }
 impl std::error::Error for Exhausted {}
 impl WorkerPool {
+    pub(crate) fn capacity(&self) -> usize {
+        self.node.slots.len()
+    }
     pub fn numa_node_id(&self) -> NumaNodeId {
         self.node.mapping.node
     }

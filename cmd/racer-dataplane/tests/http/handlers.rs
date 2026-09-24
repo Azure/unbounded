@@ -7,6 +7,8 @@ use crate::tls::{ExpectedPeer, PeerIdentity, TlsContext, TlsProgress, TlsSession
 use cache::adapter_fixture::page_request;
 use http::cache_responses::accept;
 
+#[path = "hop_admission.rs"]
+mod hop_admission;
 #[path = "mixed_version.rs"]
 mod mixed_version;
 #[path = "peer_recovery.rs"]

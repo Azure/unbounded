@@ -869,9 +869,11 @@ pub trait Upstream {
         false
     }
     /// Free payload slots required for downstream progress before peer receives.
-    /// Routed adapters use remaining canonical distance, including on fallback.
-    /// Local-only adapters need no reserve.
-    fn receive_reserve(&self) -> Result<usize> {
+    /// Called before acquisition, including retries. Routed adapters retain an
+    /// admission rank that decreases along forwarding, independent of placement.
+    /// Only fresh payload chains may be capped to fit capacity; received ranks
+    /// must not be clamped. Local-only adapters need no reserve.
+    fn receive_reserve(&mut self, _capacity: usize) -> Result<usize> {
         Ok(0)
     }
     /// Return true to reselect a destination. Topology adapters must never
@@ -2222,7 +2224,7 @@ impl Cache {
                 let reserve = if fault.route == Route::Backend {
                     0
                 } else {
-                    upstream.receive_reserve()?
+                    upstream.receive_reserve(ring.pool().capacity())?
                 };
                 match Self::poll_buffer(fault, ring, reserve)? {
                     Some(fill) => {
@@ -2290,7 +2292,8 @@ impl Cache {
             Loading::RetryPeer { exchange } => {
                 // Preserve the continuation across pressure;
                 // never hand the old authority to a new transport destination.
-                match Self::poll_buffer(fault, ring, upstream.receive_reserve()?)? {
+                let reserve = upstream.receive_reserve(ring.pool().capacity())?;
+                match Self::poll_buffer(fault, ring, reserve)? {
                     Some(fill) => {
                         let (authority, destination) = fill.split_destination();
                         let exchange = upstream.resume_peer(
