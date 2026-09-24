@@ -5,234 +5,230 @@ package mirror_test
 
 import (
 	"bytes"
-	"context"
-	"errors"
+	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
-	"github.com/Azure/unbounded/internal/gantry/origin"
+	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
+	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
-type fallbackRegistry struct {
-	metadataOnlyRegistry
-	body io.ReadCloser
-	size int64
-}
-
-func (o *fallbackRegistry) PullWithMetadata(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
-	return o.body, o.size, "", nil
-}
-
-type fallbackBody struct {
-	reader   *bytes.Reader
-	terminal error
-	withData bool
-	closed   bool
-}
-
-func (b *fallbackBody) Read(p []byte) (int, error) {
-	n, err := b.reader.Read(p)
-	if err == io.EOF || b.withData && b.reader.Len() == 0 {
-		return n, b.terminal
-	}
-
-	return n, err
-}
-
-func (b *fallbackBody) Close() error {
-	b.closed = true
-	return nil
-}
-
-func TestRacerFallbackFramingAndCompletion(t *testing.T) {
-	data := bytes.Repeat([]byte("forwarded bytes!"), 8192)
-	size := int64(len(data))
-	failure := errors.New("origin transport failed")
-
-	for _, tc := range []struct {
-		name     string
-		data     []byte
-		size     int64
-		terminal error
-		withData bool
-		failed   bool
-	}{
-		{"known-size", data, size, io.EOF, false, false},
-		{"unknown-size", data, -1, io.EOF, false, false},
-		{"empty-known-size", nil, 0, io.EOF, false, false},
-		{"empty-unknown-size", nil, -1, io.EOF, false, false},
-		{"short", data, size + 1, io.EOF, false, true},
-		{"empty-short", nil, 1, io.EOF, false, true},
-		{"long", data, size - 1, io.EOF, false, true},
-		// Exactly one copy buffer is followed by an extra byte. Content-Length
-		// framing could hide that byte and make an aborted transfer look valid.
-		{"overrun-after-full-buffer", data[:32769], 32768, io.EOF, false, true},
-		{"zero-size-overrun", data[:1], 0, io.EOF, false, true},
-		{"small-overrun", data[:2], 1, io.EOF, false, true},
-		{"initial-error", nil, 0, failure, false, true},
-		{"unknown-initial-error", nil, -1, failure, false, true},
-		{"late-error-at-size", data, size, failure, false, true},
-		{"small-late-error-at-size", data[:1], 1, failure, false, true},
-		{"unknown-late-error", data, -1, failure, false, true},
-		{"data-and-error", data, size, failure, true, true},
-		{"data-and-eof", data, size, io.EOF, true, false},
+// Keep the former fallback regressions, but enforce fail-closed responses.
+func TestRacerFailuresNeverBypass(t *testing.T) {
+	for _, mode := range []string{
+		"503", "404", "401", "403", "429", "500", "502", "504", "416",
+		"412", "timeout", "disconnect", "missing-length", "wrong-etag",
+		"missing-etag", "invalid-range", "oversized-error-header",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			body := &fallbackBody{reader: bytes.NewReader(tc.data), terminal: tc.terminal, withData: tc.withData}
-			up := &fallbackRegistry{body: body, size: tc.size}
-			// Intentionally unrelated, including for empty bodies: Gantry must
-			// not verify this digest or report a containerd commit.
-			d := digestOf([]byte("independent expected OCI digest"))
+		t.Run(mode, func(t *testing.T) {
+			for _, phase := range []string{"metadata", "prepare"} {
+				t.Run(phase, func(t *testing.T) {
+					for _, method := range []string{http.MethodHead, http.MethodGet} {
+						if method == http.MethodHead && phase == "prepare" {
+							continue
+						}
 
-			var (
-				started, completed, failed, responses, live int
-				served                                      int64
-			)
+						for _, kind := range []string{"manifests", "config", "layer"} {
+							t.Run(method+"/"+kind, func(t *testing.T) {
+								data := []byte("cached " + kind)
+								d := digestOf(data)
 
-			server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, nil,
-				mirror.WithOriginStreamMetrics(func(string) { started++ }, func(string) { completed++ }, func(string) { failed++ }),
-				mirror.WithByteMetrics(func(_, source string, n int64) {
-					if source != "origin" {
-						t.Error("wrong byte source", source)
+								var requests atomic.Int64
+
+								client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+									requests.Add(1)
+
+									auth, err := base64.StdEncoding.DecodeString(r.Header.Get("Racer-Origin-Data"))
+									if err != nil || string(auth) != "Bearer request-secret" || r.Header.Get("Authorization") != "" {
+										t.Error("incorrect credential delegation", err)
+									}
+
+									w.Header().Set("ETag", `"`+d.Hex()+`"`)
+
+									if phase == "prepare" && r.Method == http.MethodHead {
+										w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+										return
+									}
+									// These untrusted fields must never become error headers/body.
+									w.Header().Set("Racer-Origin-Data", "request-secret")
+									w.Header().Set("Authorization", "Bearer request-secret")
+									w.Header().Set("Content-Type", "application/secret")
+									w.Header().Set("Content-Range", "bytes 0-1/2")
+
+									switch mode {
+									case "timeout":
+										<-r.Context().Done()
+										return
+									case "disconnect":
+										conn, _, err := http.NewResponseController(w).Hijack()
+										if err == nil {
+											_ = conn.Close()
+										}
+
+										return
+									case "missing-length":
+										w.WriteHeader(200)
+										w.(http.Flusher).Flush()
+
+										return
+									case "wrong-etag":
+										w.Header().Set("ETag", `"wrong"`)
+									case "missing-etag":
+										w.Header().Del("ETag")
+									case "oversized-error-header":
+										w.Header().Set("WWW-Authenticate", strings.Repeat("x", 2048))
+										w.WriteHeader(http.StatusUnauthorized)
+
+										return
+									case "invalid-range":
+										w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+										w.WriteHeader(206)
+
+										return
+									default:
+										var status int
+
+										_, _ = fmt.Sscan(mode, &status)
+
+										w.Header().Set("WWW-Authenticate", `Bearer realm="https://registry/token"`)
+										w.Header().Set("Retry-After", "7")
+										w.WriteHeader(status)
+										_, _ = io.WriteString(w, "request-secret")
+
+										return
+									}
+
+									w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+									_, _ = w.Write(data)
+								}))
+								up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 16)}
+								local := fakes.NewCache()
+								local.Put(d, data) // Local content must also go through Racer's origin.
+
+								cfg := reviewConfig()
+								cfg.RacerMetadataTimeout = 100 * time.Millisecond
+								cfg.PeerFetchTimeout = 200 * time.Millisecond
+
+								var fallbacks, completed int
+
+								server := mirror.NewRacer(cfg, local, up, &gantryracer.Backend{Client: client},
+									mirror.WithRacerMetrics(nil, func() { fallbacks++ }),
+									mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
+
+								pathKind := "blobs"
+								if kind == "manifests" {
+									pathKind = kind
+								}
+
+								r := httptest.NewRequest(method, "/v2/repo/"+pathKind+"/"+d.String(), nil)
+								r.Header.Set("Authorization", "Bearer request-secret")
+
+								w := httptest.NewRecorder()
+								server.Handler().ServeHTTP(w, r)
+
+								want := 503
+
+								switch mode {
+								case "401", "403", "404", "429":
+									_, _ = fmt.Sscan(mode, &want)
+								}
+
+								if w.Code != want || requests.Load() == 0 || len(up.seen) != 0 || fallbacks != 0 || completed != 0 {
+									t.Fatal("failure bypassed Racer or reported completion", w.Code, requests.Load(), len(up.seen), fallbacks, completed)
+								}
+
+								for _, h := range []string{"ETag", "Content-Range", "Docker-Content-Digest", "Accept-Ranges", "Racer-Origin-Data", "Authorization"} {
+									if w.Header().Get(h) != "" {
+										t.Error("leaked header", h)
+									}
+								}
+
+								if strings.Contains(w.Body.String(), "request-secret") || w.Header().Get("Content-Type") == "application/secret" {
+									t.Fatal("upstream error content leaked")
+								}
+
+								if len(mode) == 3 && w.Header().Get("Retry-After") != "7" {
+									t.Fatal("lost retry hint", w.Header())
+								}
+
+								if mode == "401" || mode == "403" {
+									if w.Header().Get("WWW-Authenticate") != `Bearer realm="https://registry/token"` || w.Header().Get("Retry-After") != "7" {
+										t.Fatal("lost authentication metadata", w.Header())
+									}
+								} else if w.Header().Get("WWW-Authenticate") != "" {
+									t.Fatal("unrelated challenge leaked")
+								}
+							})
+						}
 					}
+				})
+			}
+		})
+	}
+}
 
-					served += n
-				}),
-				mirror.WithMirrorResponseCompletedHook(func(got digest.Digest, _, source string) {
-					if got != d || source != "origin" {
-						t.Error("wrong completion identity", got, source)
-					}
+func TestRacerRefusedSocketNeverBypasses(t *testing.T) {
+	// Unavailable sockets must fail for every digest kind and method.
+	for _, mode := range []string{"HEAD/manifests", "GET/manifests", "HEAD/config", "GET/config", "HEAD/layer", "GET/layer"} {
+		t.Run(mode, func(t *testing.T) {
+			dir, err := os.MkdirTemp(".", ".racer-refused-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
 
-					responses++
-				}),
-				mirror.WithLiveStreamCompletedHook(func(digest.Digest) { live++ }))
-			finished := make(chan struct{})
-			handler := server.Handler()
+			folder, err := os.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer folder.Close()
 
-			m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				defer close(finished)
+			path := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
 
-				handler.ServeHTTP(w, r)
-			}))
-			defer m.Close()
-
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, m.URL+"/v2/repo/blobs/"+d.String(), nil)
+			listener, err := net.Listen("unix", path)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			req.Header.Set("Range", "bytes=1-2")
+			listener.(*net.UnixListener).SetUnlinkOnClose(false)
+			_ = listener.Close()
 
-			resp, err := m.Client().Do(req)
+			client, err := sdk.NewClient(path, sdk.ClientOptions{Timeout: time.Second})
 			if err != nil {
-				t.Fatal("headers should precede body failure", err)
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+
+			up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
+			server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client})
+
+			method, kind, _ := strings.Cut(mode, "/")
+			if kind != "manifests" {
+				kind = "blobs"
 			}
 
-			got, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			w := httptest.NewRecorder()
+			server.Handler().ServeHTTP(w, httptest.NewRequest(method, "/v2/repo/"+kind+"/"+digestOf(nil).String(), nil))
 
-			<-finished
-
-			if resp.StatusCode != http.StatusOK || resp.ContentLength != -1 || len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" || resp.Header.Get("Content-Range") != "" || len(resp.Header.Values("Content-Type")) != 0 {
-				t.Fatal("incorrect full-response framing or metadata", resp)
-			}
-
-			if !body.closed || started != 1 || served != int64(len(tc.data)) {
-				t.Fatal("lost cleanup or byte accounting", body.closed, started, served)
-			}
-
-			if tc.failed {
-				if readErr == nil || failed != 1 || completed != 0 || responses != 0 || live != 0 {
-					t.Fatal("failed forwarding appeared complete", readErr, failed, completed, responses, live)
-				}
-			} else if readErr != nil || !bytes.Equal(got, tc.data) || failed != 0 || completed != 1 || responses != 1 || live != 1 {
-				t.Fatal("forwarding did not complete", readErr, len(got), failed, completed, responses, live)
+			if w.Code != 503 || len(up.seen) != 0 {
+				t.Fatal("refused socket bypassed Racer", w.Code)
 			}
 		})
 	}
 }
 
-type fallbackFaultWriter struct {
-	*httptest.ResponseRecorder
-	fault   string
-	flushes int
-}
-
-func (w *fallbackFaultWriter) SetWriteDeadline(time.Time) error {
-	if w.fault == "deadline" {
-		return errors.New("deadline failed")
-	}
-
-	return nil
-}
-
-func (w *fallbackFaultWriter) FlushError() error {
-	w.flushes++
-	if w.fault == "flush" || w.fault == "final-flush" && w.flushes == 2 {
-		return errors.New("flush failed")
-	}
-
-	w.Flush()
-
-	return nil
-}
-
-func (w *fallbackFaultWriter) Write(p []byte) (int, error) {
-	if w.fault == "write" {
-		return 0, errors.New("write failed")
-	}
-
-	if w.fault == "short-write" {
-		return len(p) - 1, nil
-	}
-
-	return w.ResponseRecorder.Write(p)
-}
-
-func TestRacerFallbackWriterFailureAborts(t *testing.T) {
-	for _, fault := range []string{"deadline", "flush", "final-flush", "write", "short-write", "canceled"} {
-		t.Run(fault, func(t *testing.T) {
-			body := &fallbackBody{reader: bytes.NewReader([]byte("payload")), terminal: io.EOF}
-			up := &fallbackRegistry{body: body, size: 7}
-
-			var completed int
-
-			server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, nil,
-				mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
-
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-
-			if fault == "canceled" {
-				cancel()
-			}
-
-			req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v2/repo/blobs/"+digestOf([]byte("payload")).String(), nil)
-			w := &fallbackFaultWriter{ResponseRecorder: httptest.NewRecorder(), fault: fault}
-
-			defer func() {
-				if got := recover(); got != http.ErrAbortHandler {
-					t.Error("failure did not abort framing", got)
-				}
-
-				if completed != 0 || fault != "deadline" && !body.closed {
-					t.Error("failure reported completion or leaked body", completed, body.closed)
-				}
-			}()
-
-			server.Handler().ServeHTTP(w, req)
-		})
-	}
-}
-
-func TestRacerFallbackRejectsCloseDelimitedGET(t *testing.T) {
+func TestRacerUnavailableRejectsCloseDelimitedGET(t *testing.T) {
 	up := &metadataOnlyRegistry{authorizationCapturingOrigin{seen: make(chan string, 1)}}
 	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v2/repo/blobs/"+digestOf(nil).String(), nil)
@@ -240,81 +236,144 @@ func TestRacerFallbackRejectsCloseDelimitedGET(t *testing.T) {
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 
-	if w.Code != http.StatusHTTPVersionNotSupported || len(up.seen) != 0 {
+	if w.Code != http.StatusServiceUnavailable || len(up.seen) != 0 {
 		t.Fatal("close-delimited fallback was allowed", w.Code)
 	}
 }
 
-func TestRacerFallbackStreamsAndCancelsOrigin(t *testing.T) {
-	data := bytes.Repeat([]byte("x"), 64<<10)
-	canceled := make(chan struct{})
+func TestRacerInvalidClientRangeDoesNotFetch(t *testing.T) {
+	data := []byte("Racer range content")
+	d := digestOf(data)
 
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(data)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-		close(canceled)
+	var gets atomic.Int64
+
+	client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			gets.Add(1)
+		}
+
+		w.Header().Set("ETag", `"`+d.Hex()+`"`)
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 	}))
-	defer up.Close()
+	up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
+	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/v2/repo/blobs/"+d.String(), nil)
+	r.Header.Set("Range", "bytes=999-1000")
+	server.Handler().ServeHTTP(w, r)
 
-	cfg := reviewConfig()
-	cfg.UpstreamRegistries[0].Endpoint = up.URL
-
-	registry, err := origin.New(cfg)
-	if err != nil {
-		t.Fatal(err)
+	if w.Code != 416 || w.Header().Get("Content-Range") != fmt.Sprintf("bytes */%d", len(data)) || gets.Load() != 0 || len(up.seen) != 0 {
+		t.Fatal("invalid client range fetched content", w.Code, w.Header(), gets.Load())
 	}
+}
 
-	var failed, completed int
+func TestRacerTruncatedBodyAbortsAfterHeaders(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 128<<10)
+	d := digestOf(data)
+	client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"`+d.Hex()+`"`)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 
-	server := mirror.NewRacer(cfg, fakes.NewCache(), registry, nil,
-		mirror.WithOriginStreamMetrics(nil, func(string) { completed++ }, func(string) { failed++ }))
+		if r.Method == http.MethodHead {
+			return
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[:len(data)/2])
+	}))
+	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 4)}
+
+	var completed, fallbacks int
+
+	result := make(chan error, 1)
+	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client},
+		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { result <- err }, func() { fallbacks++ }),
+		mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 	finished := make(chan struct{})
-	handler := server.Handler()
 
 	m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(finished)
 
-		handler.ServeHTTP(w, r)
+		server.Handler().ServeHTTP(w, r)
 	}))
 	defer m.Close()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.URL+"/v2/repo/blobs/"+digestOf(data).String(), nil)
+	resp, err := m.Client().Get(m.URL + "/v2/repo/blobs/" + d.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := m.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	// Read well before upstream EOF, proving forwarding does not buffer the
-	// whole object. Closing downstream must interrupt the blocked origin read.
-	got := make([]byte, 32<<10)
-	if _, err := io.ReadFull(resp.Body, got); err != nil || !bytes.Equal(got, data[:len(got)]) {
-		t.Fatal("body did not stream before EOF", err)
-	}
-
+	body, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	select {
-	case <-canceled:
-	case <-ctx.Done():
-		t.Fatal("downstream disconnect did not cancel origin")
-	}
+	<-finished
 
-	select {
-	case <-finished:
-	case <-ctx.Done():
-		t.Fatal("canceled fallback did not release handler")
+	if resp.StatusCode != 200 || readErr == nil || !bytes.Equal(body, data[:len(data)/2]) || <-result == nil || completed != 0 || fallbacks != 0 || len(up.seen) != 0 {
+		t.Fatal("truncated Racer response was completed or substituted", resp.Status, readErr, len(body), completed, fallbacks)
 	}
+}
 
-	if failed != 1 || completed != 0 {
-		t.Fatal("canceled stream reported completion", failed, completed)
+func TestRacerAndDirectBackendDigestSuccess(t *testing.T) {
+	for _, backend := range []string{"racer", "direct"} {
+		for _, kind := range []string{"manifests", "config", "layer"} {
+			for _, method := range []string{http.MethodHead, http.MethodGet} {
+				t.Run(backend+"/"+kind+"/"+method, func(t *testing.T) {
+					data := []byte("content for " + kind)
+					d := digestOf(data)
+
+					var requests atomic.Int64
+
+					client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						requests.Add(1)
+						w.Header().Set("ETag", `"`+d.Hex()+`"`)
+						http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+					}))
+					up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 4)}
+					cfg := reviewConfig()
+					cfg.ContentBackend = backend
+					store := fakes.NewCache()
+
+					var server *mirror.Server
+
+					if backend == "racer" {
+						store.Put(d, []byte("must not serve local content directly"))
+						server = mirror.NewRacer(cfg, store, up, &gantryracer.Backend{Client: client})
+					} else {
+						server = mirror.New(cfg, store, up)
+					}
+
+					m := httptest.NewServer(server.Handler())
+					defer m.Close()
+
+					pathKind := "blobs"
+					if kind == "manifests" {
+						pathKind = kind
+					}
+
+					r, err := http.NewRequestWithContext(t.Context(), method, m.URL+"/v2/repo/"+pathKind+"/"+d.String(), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					resp, err := m.Client().Do(r)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					body, err := io.ReadAll(resp.Body)
+
+					_ = resp.Body.Close()
+					if err != nil || resp.StatusCode != 200 || resp.ContentLength != int64(len(data)) || method == http.MethodGet && !bytes.Equal(body, data) || method == http.MethodHead && len(body) != 0 {
+						t.Fatal("digest response failed", resp.Status, resp.ContentLength, len(body), err)
+					}
+
+					if backend == "racer" && (requests.Load() == 0 || len(up.seen) != 0) || backend == "direct" && (requests.Load() != 0 || len(up.seen) != 1) {
+						t.Fatal("incorrect content backend", requests.Load(), len(up.seen))
+					}
+				})
+			}
+		}
 	}
 }

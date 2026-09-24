@@ -297,8 +297,9 @@ permissions before Gantry starts, independent of which daemon starts first.
 
 ### Content path, authentication, and limits
 
-Gantry checks local containerd first, then requests digest-addressed content
-through Racer. Racer distributes objects in **64 MiB stripes (pages)** and
+Gantry requests all digest-addressed manifests, configs, and layers through
+Racer, including HEAD probes and content already in local containerd.
+Racer distributes objects in **64 MiB stripes (pages)** and
 stores disposable cached data in its slab, normally under `/var/lib/racer`.
 Gantry's origin adapter serves local containerd content or bounded registry
 range reads. The origin never calls the Gantry mirror or Racer recursively.
@@ -341,21 +342,7 @@ relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
 and SDK consumers must validate content themselves against an independently
 trusted expected digest. The SDK no longer provides inline SHA-256 verification;
 see its [API migration note](https://github.com/Azure/unbounded/blob/main/pkg/racer/STREAMING.md#migration-inline-verification-removed).
-
-In Racer mode, Gantry's ordinary registry fallback also leaves OCI digest
-verification to containerd. It streams with bounded memory, checks the declared
-size when known, and aborts response framing on transport or size failures.
-Fallback GETs require HTTP/1.1 or later; HTTP/1.0 receives `505 HTTP Version Not
-Supported`. HTTP/1.1 fallback uses chunked framing rather than downstream
-`Content-Length`, withholding the final chunk until EOF and size checks pass so
-late errors and overruns cannot appear complete.
-Range fallback returns the full object with `200`; the actual registry GET's
-media type is preserved, including an absent `Content-Type`, without payload
-sniffing or a separate HEAD request to infer it.
-Fallback completion metrics report forwarding only, not a containerd commit.
-Same-length corrupt bytes can increment the completion counter before containerd
-rejects the digest; that rejection does not increment the forwarding-failure
-counter. The direct backend still verifies its live registry streams in-process.
+The direct backend still verifies its live registry streams in-process.
 
 Racer mode is demand-only: no direct Gantry transfer server,
 chair calls, please-pull coordination, DHT content advertising, or speculative
@@ -367,12 +354,17 @@ Ports 5001/5002 and service-account token mounting are omitted. Fresh Racer-mode
 installs do not create chair Leases or their Role/RoleBinding; existing chair
 resources are retained for rollback and stop being reconciled in Racer mode.
 
-The origin registry must support usable metadata and bounded byte-range reads
-for acceleration. Unsupported metadata/ranges or cache unavailability before
-response headers can use Gantry's ordinary registry fallback. This does not
-activate the direct Gantry peer backend. Authentication failures are propagated;
-an interrupted or invalid stream after headers is aborted rather than spliced
-together with a second source. Readiness requires working containerd, origin
+The origin registry must support usable metadata and bounded byte-range reads.
+Racer mode has no ordinary registry or direct local-content bypass. Unavailable
+sockets, timeouts, invalid metadata, unsupported origin ranges, and stream
+preparation failures return a retryable `503` before headers. Registry `401`/`403`
+responses preserve authentication challenges; `404` and `429` retain their status,
+and SDK-provided retry hints are preserved. Invalid client byte ranges return
+`416` with the object size. An interrupted or invalid stream after headers is
+aborted rather than spliced together with a second source. Racer's origin adapter
+still reads registry/containerd content to fill Racer. There is no bypass flag.
+Tag resolution and containerd's own configured host retry chain are separate
+from Gantry's digest-serving path. Readiness requires working containerd, origin
 UDS, and cache UDS. `P2PCache Ready` describes cache activation, not Gantry origin
 availability, so verify Gantry readiness separately.
 
@@ -408,9 +400,9 @@ across multiple nodes. Do not use DHT/chair metrics as Racer readiness evidence.
 | `gantry_racer_splice_calls_total`, `gantry_racer_splice_bytes_total` | Actual forwarding splice syscalls and bytes. |
 | `gantry_racer_tee_calls_total`, `gantry_racer_tee_bytes_total` | Compatibility counters, expected to remain zero because this path has no verification tee. |
 | `gantry_racer_buffered_bytes_total` | Payload forwarded through userspace, including buffered prefixes. |
-| `gantry_racer_fallback_total` | Pre-header ordinary registry fallbacks. |
-| `gantry_origin_stream_completed_total{kind}` | Full registry response forwarded, including Racer fallback; does not imply OCI verification in Racer mode or a containerd commit. |
-| `gantry_origin_stream_failed_total{kind}` | Registry forwarding failed, including Racer fallback transport or declared-size failures. A later containerd digest rejection is not counted here. |
+| `gantry_racer_fallback_total` | Deprecated compatibility counter, exported as zero in Racer mode. An absent series on older deployments may be treated as zero; a nonzero value identifies old fallback behavior. |
+| `gantry_origin_stream_completed_total{kind}` | Direct-backend registry response forwarded and digest-checked; does not imply a containerd commit. Racer origin fills do not increment this counter. |
+| `gantry_origin_stream_failed_total{kind}` | Direct-backend registry stream failed, including transport and digest failures. |
 | `gantry_mirror_bytes_served_total{source="racer"}` | Racer bytes forwarded, including incomplete responses. |
 | `gantry_containerd_commit_observed_total` | Completed live-stream digests later observed openable in local containerd. |
 | `gantry_containerd_commit_observation_duration_seconds`, `gantry_containerd_commit_latest_observation_duration_seconds` | Time from full response completion to observed openability; measurement resolution is bounded by the storage probe interval. |

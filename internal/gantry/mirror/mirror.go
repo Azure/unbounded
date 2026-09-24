@@ -356,8 +356,8 @@ func WithLiveStreamThrough() Option {
 	}
 }
 
-// WithOriginStreamMetrics wires the the live-stream-through origin
-// counters, including Racer's registry fallback. Start fires when the mirror
+// WithOriginStreamMetrics wires the direct backend's live-stream-through origin
+// counters. Start fires when the mirror
 // commits to the origin path, completed after the full body has been proxied,
 // and failed on any terminal error before that completion point. Only the
 // direct backend checks the digest in-process; completion never implies commit.
@@ -372,7 +372,7 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 // WithLiveStreamCompletedHook registers a callback fired after any live
 // stream-through response (peer, origin, or Racer) fully completes. Direct peer
 // and origin paths in the direct backend also check the digest in-process;
-// Racer forwarding and its registry fallback leave OCI digest verification to
+// Racer forwarding leaves OCI digest verification to
 // containerd. Completion does not imply a commit.
 // Callers use this to correlate the response with a later containerd
 // inventory observation without forcing the mirror to ingest the bytes
@@ -870,17 +870,20 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		slog.String("kind", kind.String()),
 	)
 
+	// Racer owns all digest content reads, including local content via its origin.
+	if s.racer != nil {
+		s.bumpCacheMiss()
+		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
+
+		return
+	}
+
 	// 1. Local content-store lookup.
 	if handled := s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger); handled {
 		return
 	}
 
 	s.bumpCacheMiss()
-
-	if s.racer != nil {
-		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
-		return
-	}
 
 	// 1a. HEAD short-circuit (fourteenth-review fix). See serveHeadMiss
 	// for the rationale (metadata-only requests MUST NOT please_pull,

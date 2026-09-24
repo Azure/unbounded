@@ -6,7 +6,6 @@ package mirror_test
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -15,17 +14,14 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
-	"github.com/Azure/unbounded/internal/gantry/origin"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
@@ -89,7 +85,7 @@ func TestRacerColdPagePreparationExceedsMetadataBudget(t *testing.T) {
 	}
 }
 
-func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
+func TestRacerAuthoritativeMetadataContentType(t *testing.T) {
 	for _, tc := range []struct {
 		name, contentType, payload string
 		blob                       bool
@@ -102,39 +98,20 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 		{"empty-object-no-type", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var heads atomic.Int64
-
-			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == "HEAD" {
-					heads.Add(1)
-					w.Header().Set("Content-Type", "wrong/head")
-
-					return
-				}
-
-				if tc.blob && strings.Contains(r.URL.Path, "/blobs/") {
-					w.WriteHeader(404)
-					return
-				}
+			d := digestOf([]byte(tc.payload))
+			client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"`+d.Hex()+`"`)
 
 				w.Header()["Content-Type"] = nil
 				if tc.contentType != "" {
 					w.Header().Set("Content-Type", tc.contentType)
 				}
 
-				_, _ = io.WriteString(w, tc.payload)
+				http.ServeContent(w, r, "", time.Time{}, strings.NewReader(tc.payload))
 			}))
-			defer up.Close()
+			up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
 
-			cfg := reviewConfig()
-			cfg.UpstreamRegistries[0].Endpoint = up.URL
-
-			registry, err := origin.New(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), registry, nil).Handler())
+			m := httptest.NewServer(mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client}).Handler())
 			defer m.Close()
 
 			kind := "manifests"
@@ -150,7 +127,7 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 			body, err := io.ReadAll(resp.Body)
 
 			_ = resp.Body.Close()
-			if err != nil || resp.StatusCode != http.StatusOK || string(body) != tc.payload || resp.Header.Get("Content-Type") != tc.contentType || heads.Load() != 0 {
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != tc.payload || resp.Header.Get("Content-Type") != tc.contentType || len(up.seen) != 0 {
 				t.Fatal(resp.Status, resp.Header, err)
 			}
 
@@ -161,53 +138,36 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 	}
 }
 
-type stalledFallbackOrigin struct {
-	opened, closed chan struct{}
-	once           sync.Once
-}
-
-func (o *stalledFallbackOrigin) PullWithMetadata(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
-	body, size, err := o.Pull(ctx, ref)
-	return body, size, "application/octet-stream", err
-}
-
-func (o *stalledFallbackOrigin) HeadMetadata(ctx context.Context, ref ifaces.OriginRef) (ifaces.OriginMetadata, error) {
-	size, contentType, err := o.Head(ctx, ref)
-	return ifaces.OriginMetadata{Ref: ref, Size: size, ContentType: contentType}, err
-}
-
-func (*stalledFallbackOrigin) OpenRange(context.Context, ifaces.OriginRef, int64, int64, int64) (io.ReadCloser, error) {
-	return nil, &ifaces.OriginRangeUnsupportedError{Reason: "fixture only serves full objects"}
-}
-
-func (o *stalledFallbackOrigin) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
-	return -1, "application/octet-stream", nil
-}
-
-func (o *stalledFallbackOrigin) Pull(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	o.once.Do(func() { close(o.opened) })
-	return &endlessBody{closed: o.closed}, -1, nil
-}
-
-type endlessBody struct{ closed chan struct{} }
-
-func (*endlessBody) Read(p []byte) (int, error) { clear(p); return len(p), nil }
-func (b *endlessBody) Close() error {
-	select {
-	case <-b.closed:
-	default:
-		close(b.closed)
-	}
-
-	return nil
-}
-
-func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
+func TestRacerStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 	cfg := reviewConfig()
 	cfg.PeerFetchTimeout = 500 * time.Millisecond
 	cfg.RacerMaxConcurrentTransfers = 1
-	up := &stalledFallbackOrigin{opened: make(chan struct{}), closed: make(chan struct{})}
-	server := mirror.NewRacer(cfg, fakes.NewCache(), up, nil)
+	opened, closed := make(chan struct{}), make(chan struct{})
+	d := digestOf([]byte("never completes"))
+	client := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"`+d.Hex()+`"`)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprint(sdk.PageSize))
+
+		if r.Method == http.MethodHead {
+			return
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", sdk.PageSize-1, sdk.PageSize))
+		w.WriteHeader(http.StatusPartialContent)
+
+		close(opened)
+		defer close(closed)
+
+		data := make([]byte, 64<<10)
+		for range sdk.PageSize / int64(len(data)) {
+			if _, err := w.Write(data); err != nil {
+				return
+			}
+		}
+	}))
+	up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
+	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client})
 	finished := make(chan struct{}, 4)
 	handler := server.Handler()
 
@@ -228,7 +188,7 @@ func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 		_ = tcp.SetReadBuffer(1024)
 	}
 
-	path := "/v2/repo/blobs/" + digestOf([]byte("never completes")).String()
+	path := "/v2/repo/blobs/" + d.String()
 
 	_, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: mirror\r\n\r\n", path)
 	if err != nil {
@@ -236,9 +196,9 @@ func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 	}
 
 	select {
-	case <-up.opened:
+	case <-opened:
 	case <-time.After(time.Second):
-		t.Fatal("fallback did not open")
+		t.Fatal("Racer stream did not open")
 	}
 
 	resp, err := m.Client().Get(m.URL + path)
@@ -252,9 +212,9 @@ func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 	}
 
 	select {
-	case <-up.closed:
+	case <-closed:
 	case <-time.After(2 * time.Second):
-		t.Fatal("stalled downstream retained origin body")
+		t.Fatal("stalled downstream retained Racer stream")
 	}
 	// The rejected request and the timed-out request both leave their handlers.
 	for range 2 {
@@ -276,7 +236,7 @@ func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 	}
 
 	_ = resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 || len(up.seen) != 0 {
 		t.Fatal("admission not released", resp.Status)
 	}
 }
