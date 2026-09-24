@@ -147,9 +147,9 @@ class TestACLImageResolution(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs.get("auth"), "azure-storage")
 
     def test_build_override_must_match_the_manifest(self):
-        """The override exists to pin a known-good build when a new one breaks
-        the suite. Silently ignoring it when the manifest has moved on would
-        leave the run on exactly the build it was trying to avoid."""
+        """On its own the build id checks the manifest rather than pinning it.
+        Silently ignoring it when the manifest has moved on would leave the run
+        on a build it was not expecting."""
         with patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)):
             with patch.object(e2e, "ACL_IMAGE_BUILD_ID", "2026010101"):
                 with self.assertRaises(SystemExit):
@@ -159,6 +159,61 @@ class TestACLImageResolution(unittest.TestCase):
                 _url, file_name, _digest = e2e.acl_image_from_manifest()
 
         self.assertEqual(file_name, "acl-2026091817.qcow2")
+
+    def test_a_malformed_build_id_is_refused(self):
+        """The build names the cached file, so an empty or odd one could make
+        different builds share a name, or a path."""
+        for build in ("", None, 2026, "../x", "a b"):
+            with self.subTest(build=build):
+                e2e.acl_image_from_manifest.cache_clear()
+                manifest = dict(self.MANIFEST, build_id=build)
+                with patch.object(e2e, "http_get", return_value=json.dumps(manifest)):
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_image_from_manifest()
+
+    def test_a_pinned_build_skips_the_manifest(self):
+        with patch.object(e2e, "ACL_IMAGE_URL", "https://example.test/old.qcow2"), \
+                patch.object(e2e, "ACL_IMAGE_SHA256", "ab" * 32), \
+                patch.object(e2e, "ACL_IMAGE_BUILD_ID", "2026010101"), \
+                patch.object(e2e, "http_get") as get:
+            self.assertEqual(e2e.acl_image_from_manifest(),
+                             ("https://example.test/old.qcow2", "acl-2026010101.qcow2", "ab" * 32))
+        get.assert_not_called()
+
+    def test_a_partial_pin_is_refused(self):
+        for url, digest, build in (("u", "", "b"), ("", "d", "b"), ("u", "d", "")):
+            with self.subTest(url=url, digest=digest, build=build):
+                e2e.acl_image_from_manifest.cache_clear()
+                with patch.object(e2e, "ACL_IMAGE_URL", url), \
+                        patch.object(e2e, "ACL_IMAGE_SHA256", digest), \
+                        patch.object(e2e, "ACL_IMAGE_BUILD_ID", build), \
+                        patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)):
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_image_from_manifest()
+
+    def test_resolve_host_image_exports_a_pin_that_reads_back(self):
+        """What resolve-host-image writes for later steps has to resolve to the
+        same image without reading the manifest."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file, output_file = Path(tmp) / "env", Path(tmp) / "output"
+            with patch.object(e2e, "HOST_BASE_OS", "acl"), \
+                    patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)), \
+                    patch.dict(os.environ, {"GITHUB_ENV": str(env_file), "GITHUB_OUTPUT": str(output_file)}):
+                e2e.resolve_host_image()
+
+            exported = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+            self.assertEqual(output_file.read_text(), "build=2026091817\n")
+
+        e2e.acl_image_from_manifest.cache_clear()
+        with patch.object(e2e, "ACL_IMAGE_URL", exported["ACL_IMAGE_URL"]), \
+                patch.object(e2e, "ACL_IMAGE_SHA256", exported["ACL_IMAGE_SHA256"]), \
+                patch.object(e2e, "ACL_IMAGE_BUILD_ID", exported["ACL_IMAGE_BUILD_ID"]), \
+                patch.object(e2e, "http_get") as get:
+            self.assertEqual(e2e.acl_image_from_manifest(), (
+                self.MANIFEST["qcow2"]["url"], "acl-2026091817.qcow2", self.MANIFEST["qcow2"]["sha256"]))
+        get.assert_not_called()
 
     def test_manifest_without_a_digest_is_refused(self):
         """An unverified image is the one thing worse than no image: it boots,

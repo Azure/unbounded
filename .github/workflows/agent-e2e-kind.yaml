@@ -148,30 +148,13 @@ jobs:
           tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
           subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
 
+      # Resolved once for the job. The image URL, digest and build are
+      # exported to the environment, so later e2e.py processes use this build
+      # rather than reading the manifest again, which may have moved on.
       - name: Resolve the Azure Container Linux build
         if: matrix.host-base-os == 'acl'
         id: acl-image
-        run: |
-          set -euo pipefail
-
-          # Fetched over REST rather than with `az storage blob download`,
-          # which requires a seekable target and so cannot write to a pipe.
-          # This is the same call e2e.py makes, for the same reason.
-          token="$(az account get-access-token \
-            --resource https://storage.azure.com/ --query accessToken -o tsv)"
-          echo "::add-mask::${token}"
-          manifest="$(curl -fsSL --retry 3 --retry-all-errors \
-            -H "Authorization: Bearer ${token}" \
-            -H "x-ms-version: 2021-12-02" \
-            https://aksflexaclimagestme.blob.core.windows.net/images/latest.json)"
-
-          build="$(printf '%s' "${manifest}" | jq -r .build_id)"
-          if [ -z "${build}" ] || [ "${build}" = "null" ]; then
-            echo "::error::latest.json does not name a build_id"; exit 1
-          fi
-
-          echo "Azure Container Linux build ${build}"
-          printf 'build=%s\n' "${build}" >> "${GITHUB_OUTPUT}"
+        run: python3 ./hack/agent/e2e-kind/e2e.py resolve-host-image
 
       # Keyed on the build, so a refreshed image misses and is downloaded once
       # rather than every run re-fetching 630 MiB from the storage account.

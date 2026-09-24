@@ -1631,6 +1631,11 @@ ACL_IMAGE_MANIFEST_URL = os.environ.get(
     "https://aksflexaclimagestme.blob.core.windows.net/images/latest.json",
 )
 ACL_IMAGE_BUILD_ID = os.environ.get("ACL_IMAGE_BUILD_ID", "")
+# Set together, these name the image directly and the manifest is not read.
+# resolve-host-image exports them, so CI resolves the manifest once per job.
+ACL_IMAGE_URL = os.environ.get("ACL_IMAGE_URL", "")
+ACL_IMAGE_SHA256 = os.environ.get("ACL_IMAGE_SHA256", "")
+ACL_BUILD_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def acl_host_image() -> HostImage:
@@ -1677,20 +1682,29 @@ def acl_host_image() -> HostImage:
 
 @functools.cache
 def acl_image_from_manifest() -> tuple[str, str, str]:
-    """Resolve the image URL and file name from the published manifest.
+    """Resolve the image URL, file name, and digest.
 
-    The manifest is followed rather than a build being pinned in the harness, so
-    a refreshed image is picked up without a code change. ACL_IMAGE_BUILD_ID
-    overrides that when a specific build is needed, which is the escape hatch if
-    a new one ever breaks the suite: it unblocks a run without a revert.
+    By default the published manifest is followed, so a refreshed image is
+    picked up without a code change. ACL_IMAGE_URL, ACL_IMAGE_SHA256 and
+    ACL_IMAGE_BUILD_ID together pin a build instead and skip the manifest.
+    ACL_IMAGE_BUILD_ID alone only checks that the manifest still publishes that
+    build.
     """
+    pinned = [ACL_IMAGE_URL, ACL_IMAGE_SHA256]
+    if any(pinned):
+        if not all(pinned) or not ACL_IMAGE_BUILD_ID:
+            die("ACL_IMAGE_URL, ACL_IMAGE_SHA256 and ACL_IMAGE_BUILD_ID must be set together")
+        _check_acl_build_id(ACL_IMAGE_BUILD_ID, "ACL_IMAGE_BUILD_ID")
+        return ACL_IMAGE_URL, f"acl-{ACL_IMAGE_BUILD_ID}.qcow2", ACL_IMAGE_SHA256
+
     manifest = json.loads(http_get(ACL_IMAGE_MANIFEST_URL, auth="azure-storage"))
     qcow2 = manifest.get("qcow2", {})
 
-    build = manifest.get("build_id", "")
+    build = manifest.get("build_id")
+    _check_acl_build_id(build, f"{ACL_IMAGE_MANIFEST_URL} build_id")
     if ACL_IMAGE_BUILD_ID and ACL_IMAGE_BUILD_ID != build:
         die(f"ACL_IMAGE_BUILD_ID={ACL_IMAGE_BUILD_ID} but the manifest publishes {build!r}; "
-            "point ACL_IMAGE_MANIFEST_URL at that build's manifest or clear the override")
+            "pin that build with ACL_IMAGE_URL and ACL_IMAGE_SHA256, or clear the override")
 
     url = qcow2.get("url", "")
     digest = qcow2.get("sha256", "")
@@ -1702,6 +1716,36 @@ def acl_image_from_manifest() -> tuple[str, str, str]:
     log(f"Azure Container Linux build {build} ({qcow2.get('size', 0)} bytes, sha256 {digest[:12]})")
 
     return url, f"acl-{build}.qcow2", digest
+
+
+def _check_acl_build_id(build: object, source: str) -> None:
+    """The build names the cached image file, so it has to be a plain name."""
+    if not isinstance(build, str) or not ACL_BUILD_ID_PATTERN.fullmatch(build):
+        die(f"{source} {build!r} is not a build id")
+
+
+def resolve_host_image() -> None:
+    """Resolve the Azure Container Linux image once and export it.
+
+    In GitHub Actions it is written to $GITHUB_ENV, so every later e2e.py
+    process in the job uses the same build instead of reading the manifest
+    again, and the build is also written to $GITHUB_OUTPUT for the cache key.
+    """
+    if HOST_BASE_OS != "acl":
+        die("resolve-host-image only applies to HOST_BASE_OS=acl")
+
+    url, file_name, digest = acl_image_from_manifest()
+    build = file_name.removeprefix("acl-").removesuffix(".qcow2")
+    exports = f"ACL_IMAGE_URL={url}\nACL_IMAGE_SHA256={digest}\nACL_IMAGE_BUILD_ID={build}\n"
+
+    github_env = os.environ.get("GITHUB_ENV", "")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as env_file:
+            env_file.write(exports)
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"build={build}\n")
+    else:
+        print(exports, end="")
 
 
 def ubuntu_netplan_write_files() -> str:
@@ -5869,6 +5913,7 @@ COMMANDS: dict[str, Command] = {
     "retire-lifecycle-vm": _without_node_config(retire_lifecycle_vm),
     "collect-logs": _without_node_config(collect_logs),
     "create-vm-bridge": _without_node_config(create_vm_bridge),
+    "resolve-host-image": _without_node_config(resolve_host_image),
     "create-vm": _without_node_config(create_vm),
     "prepare-blocked-network-vm": _without_node_config(prepare_blocked_network_vm),
     "block-external-network": _without_node_config(block_external_network),

@@ -40,9 +40,15 @@ first-boot unit runs preflight and bootstrap.
 The image is resolved from the manifest published alongside it, so a refreshed
 build is picked up without a code change. It is fetched with a federated Azure
 login, because the storage account holding it disables anonymous access and
-shared keys alike. `ACL_IMAGE_BUILD_ID` pins a specific build when a new one
-needs to be bypassed, and `HOST_IMAGE_PATH` boots a local file with no Azure
-login at all:
+shared keys alike. The image can be chosen in other ways:
+
+- `ACL_IMAGE_MANIFEST_URL` reads a different manifest.
+- `ACL_IMAGE_URL`, `ACL_IMAGE_SHA256` and `ACL_IMAGE_BUILD_ID`, set together,
+  pin a build and skip the manifest. `e2e.py resolve-host-image` prints them for
+  the current build; CI runs it once per job.
+- `ACL_IMAGE_BUILD_ID` alone fails the run unless the manifest publishes that
+  build.
+- `HOST_IMAGE_PATH` boots a local file with no Azure login at all:
 
 ```sh
 HOST_BASE_OS=acl HOST_IMAGE_PATH="$PWD/acl.qcow2" \
