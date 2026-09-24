@@ -52,6 +52,48 @@ func downstreamPair(t *testing.T, network string) (net.Conn, net.Conn) {
 	return server, client
 }
 
+func TestStreamFailureSpliceTruncatedPage(t *testing.T) {
+	const sent = 128 << 10
+
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", checksumTag(nil))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprint(sent+1))
+
+		if r.Method == "HEAD" {
+			return
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", sent, sent+1))
+		w.WriteHeader(206)
+		_, _ = w.Write(make([]byte, sent))
+	}), ClientOptions{})
+
+	o, err := c.Open(t.Context(), "/object")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := o.Stream(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst, receiver := downstreamPair(t, "tcp")
+	done := make(chan int64, 1)
+
+	go func() { n, _ := io.Copy(io.Discard, receiver); done <- n }()
+
+	n, err := s.WriteTo(dst)
+	_ = dst.Close()
+	_ = s.Close()
+
+	f := s.Failure()
+	if !errors.Is(err, io.ErrUnexpectedEOF) || n != sent || <-done != sent || f == nil || f.Operation != "page_body" || f.Offset != sent || f.PageOffset != 0 || f.StatusCode != 206 || s.Stats().SpliceBytes == 0 {
+		t.Fatal(n, err, f, s.Stats())
+	}
+}
+
 func TestSpliceContentAndReuse(t *testing.T) {
 	data := payload(2 << 20)
 

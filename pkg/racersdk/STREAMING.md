@@ -47,6 +47,22 @@ Each stream issues one page request at a time, without speculative prefetch.
   before the caller commits downstream HTTP headers. It consumes no payload.
 - `stream.WriteTo`, `stream.Close`, and `stream.Stats` expose
   consumption, cancellation, and observed syscall traffic.
+- `stream.Failure()` returns the first failed operation, its requested page
+  offset, current object offset, response status, original error, and context
+  error at failure time. The snapshot survives Close and does not change error
+  return semantics. It is diagnostic evidence, not a safe retry offset: bytes
+  may already have been forwarded. Do not log the original error verbatim; it
+  can contain a target or socket path.
+
+Gantry samples Racer failures separately for admission, HEAD, Prepare, and
+forwarding, at most once per phase per 30 seconds per mirror. Samples contain
+the digest, operation, offsets, bytes forwarded, finite error class, original
+Racer HTTP status, context state, and suppressed count. They omit request
+targets, registry/repository names, origin data, raw errors, and response bodies.
+Cancellation without an observed HTTP error does not consume a sample. A
+later-page HTTP failure remains visible even after forwarding cleanup cancels
+the stream. Client-facing Racer 503 responses do not expose peer breaker history;
+these samples cannot establish the failure that originally opened a breaker.
 
 Streams fetch aligned 64 MiB pages sequentially with `If-Match`. Payload scratch
 space is bounded independently of page/object size: a pooled 32 KiB buffer,

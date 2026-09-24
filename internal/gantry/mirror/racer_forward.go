@@ -22,6 +22,7 @@ type racerState struct {
 	admission            chan struct{}
 	manifestObservations chan struct{}
 	onStream             func(sdk.TransferStats, bool, error)
+	diagnostics          racerDiagnostics
 
 	mu          sync.Mutex
 	draining    bool

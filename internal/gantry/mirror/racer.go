@@ -53,6 +53,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	case s.racer.admission <- struct{}{}:
 		defer func() { <-s.racer.admission }()
 	default:
+		s.reportRacerFailure(ref, racerAdmission, nil, nil, 0)
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Racer transfer capacity exhausted", http.StatusServiceUnavailable)
 
@@ -99,6 +100,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	metadataCancel()
 
 	if err != nil {
+		s.reportRacerFailure(ref, racerHead, err, nil, 0)
 		writeRacerError(w, err)
 
 		return
@@ -106,6 +108,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 
 	meta := obj.Metadata()
 	if meta.ETag != `"`+ref.Digest.Hex()+`"` {
+		s.reportRacerFailure(ref, racerHead, sdk.ErrVersionChanged, nil, 0)
 		s.racer.backend.Quarantine(ref)
 		writeRacerError(w, gantryracer.ErrQuarantined)
 
@@ -141,6 +144,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	if err = stream.Prepare(); err != nil {
+		s.reportRacerFailure(ref, racerPrepare, err, stream, 0)
 		_ = stream.Close() //nolint:errcheck // Preparation failed before forwarding takes ownership.
 
 		writeRacerError(w, err)
@@ -164,6 +168,10 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	}
 
 	result := s.racer.forward(streamCtx, cancel, w, stream, status, header)
+	if result.err != nil {
+		s.reportRacerFailure(ref, racerForward, result.err, stream, result.written)
+	}
+
 	if result.ownership == racerResponseWriterOwned {
 		writeRacerError(w, result.err)
 		return
