@@ -27,6 +27,9 @@ type ClientOptions struct {
 	// views, from before dialing until the response is consumed or abandoned.
 	// Zero leaves active requests unlimited; negative values are invalid.
 	MaxActiveRequests int
+	// StreamPrefetch enables one-page-ahead header preparation on a separate raw
+	// connection. Disabled by default; speculation skips unavailable admission.
+	StreamPrefetch bool
 	// Timeout bounds an entire HTTP request, including reading its body. Zero
 	// leaves the deadline to the operation's context. For sequential streams it
 	// bounds the whole stream, including all page requests and downstream writes.
@@ -94,7 +97,7 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 		c.admission = &requestAdmission{slots: make(chan struct{}, options.MaxActiveRequests)}
 	}
 
-	c.streamPool = &streamPool{endpoint: endpoint, limit: idle, timeout: options.Timeout}
+	c.streamPool = &streamPool{endpoint: endpoint, limit: idle, timeout: options.Timeout, prefetch: options.StreamPrefetch}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	// This pool always dials the configured local socket, never an HTTP proxy.
 	c.owned = &http.Transport{
@@ -114,7 +117,8 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 }
 
 // CloseIdleConnections releases idle connections and Linux splice pipes shared
-// by this client and its origin-data views. Active transfers are uninterrupted;
+// by this client and its origin-data views, and discards pending stream prefetch.
+// Foreground transfers are uninterrupted;
 // their checked-out pipes are closed on return. The client remains usable.
 func (c *Client) CloseIdleConnections() {
 	if c.streamPool != nil {

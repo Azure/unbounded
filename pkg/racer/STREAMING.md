@@ -34,7 +34,7 @@ truncated. Origin data is never included in SDK error text.
 
 | Option | Zero/default | Scope |
 | --- | --- | --- |
-| `Concurrency` | 8 | Page workers per `Download` or `ReadAt` operation. Sequential streams issue one page request at a time. |
+| `Concurrency` | 8 | Page workers per `Download` or `ReadAt` operation. Does not control stream prefetch. |
 | `MaxIdleConnections` | Effective `Concurrency` | Idle sockets retained **in each** of the net/http and raw streaming pools. Independent of worker count when explicitly set. |
 | `MaxActiveRequests` | Unlimited | Shared admission across HEAD, download/read page GETs, raw stream GETs, and every `WithOriginData` view. |
 
@@ -64,11 +64,12 @@ globally; callers still control the number of concurrent operations. Concurrent
 socket `WriteTo` calls can each own a pipe even while waiting for their next page.
 The pipe bounds below apply independently of request admission.
 
-There is no background stream prefetch option yet. The internal admission control
-provides a nonblocking `tryAcquire` for future one-page speculation: skip prefetch when no
-permit is immediately available, and transfer the acquired permit to the request
-without acquiring again. Speculation must never wait for capacity while holding
-a foreground response's permit.
+Stream prefetch uses nonblocking admission: it skips speculation when no permit
+is immediately available and transfers the acquired permit with the prepared
+socket, without acquiring again. A limit of one therefore runs sequentially.
+At each boundary, the consumed foreground response releases its permit before
+waiting for a pending page or acquiring the next foreground permit. Competing
+streams do not wait for speculative capacity while retaining current responses.
 
 ## Opt-in bounded random-access read-ahead
 
@@ -146,6 +147,43 @@ Each socket-to-pipe batch is bounded by the remaining page bytes, the actual
 capacity, and 1 MiB. The pipe is fully drained before the next batch.
 There are no per-page payload allocations. HTTP request/response metadata still
 allocates. Close every stream, including ones abandoned after Prepare.
+
+### Opt-in one-page-ahead stream prefetch
+
+Set `ClientOptions{StreamPrefetch: true}` to prepare the next page while the
+current page is consumed. The default is **disabled**. This applies to `Stream`
+and `ReadRange`, including origin-data views, and starts only after the first
+foreground page's headers validate (`Prepare`, `Read`, or `WriteTo`). It does not
+change `ReadAt`, `ReadAhead`, or `Download`.
+
+Each stream has at most one speculative GET, on a separate raw connection, and
+one background header-preparation goroutine. The next aligned page is clipped to
+the requested interval, including a partial last page. There is no page-sized Go
+body buffer: preparation stops after parsing and validating headers, with only
+the socket reader's bounded 8 KiB read-ahead. Unconsumed data can occupy kernel
+socket buffers. Current and pending responses together own at most two upstream
+sockets and two admission permits per stream; the shared `MaxActiveRequests`
+limit still applies. Prefetch allocates no additional splice pipe.
+
+This is speculative **upstream work**: the GET can cause a cache miss, origin
+fetch, or cache fill of the next page (up to 64 MiB), even if the caller closes
+before reaching it. Closing the socket cannot undo work already dispatched
+upstream. Enable it only when this tradeoff is appropriate.
+
+Consumption remains ordered. Every prepared page uses the same immutable
+`If-Match`, ETag, content-type, range, and framing validation as foreground
+pages. Next-page dial/header/validation errors are deferred to that page's
+boundary and do not truncate the successful current page. Body errors are
+reported when consuming that page. Cancellation and the whole-stream timeout
+still interrupt both connections immediately; prefetch does not extend deadlines.
+No speculative page starts its own successor: the stream must adopt it first.
+
+Error, cancellation, and `Close` release both responses and permits, including
+cancellation between admission and socket handoff. `CloseIdleConnections` also
+discards pending speculation without interrupting the current foreground page;
+the discarded page is fetched in the foreground when needed. A concurrent
+adoption makes that page foreground, so idle cleanup leaves it running. New
+prefetches can start after cleanup; the client remains usable.
 
 `WriteTo` explicitly calls `splice(2)` for concrete `*net.TCPConn` and
 `*net.UnixConn` destinations on Linux. The header reader's buffered payload
