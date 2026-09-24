@@ -72,13 +72,30 @@ fn local_candidate_then_remote_candidate_cannot_reset_receive_rank() {
 }
 
 #[test]
-fn rebased_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants() {
+fn product_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants() {
     let Some(mut ring) = crate::conformance::kernel_ring(4, uring::Config::default()) else {
         return;
     };
-    let a = super::mixed_version::cycle_handler(1, "b", "127.0.0.1:1".parse().unwrap());
-    let b = super::mixed_version::cycle_handler(2, "a", "127.0.0.1:1".parse().unwrap());
-    let object = super::mixed_version::page_target(&a);
+    let nodes: Vec<_> = (0..4)
+        .map(|index| {
+            let backend = Backend::new("127.0.0.1:1", "chain").unwrap();
+            let mut handler = Handler::new(cache(&backend, 1), backend);
+            handler.set_routing(
+                chain_routing(index, 4, 2),
+                if index < 3 {
+                    BTreeMap::from([(
+                        format!("{:02x}", index + 3).repeat(32),
+                        Peer::new("127.0.0.1:1", None).unwrap(),
+                    )])
+                } else {
+                    BTreeMap::new()
+                },
+            );
+            handler
+        })
+        .collect();
+    let a = &nodes[0];
+    let object = "/chain".to_owned();
     let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);
     let request = UpstreamRequest::PeerPage(page.clone());
     let mut provider = a
@@ -107,22 +124,17 @@ fn rebased_payload_chain_keeps_decreasing_rank_and_cancellation_recovers_grants(
         } else {
             assert_eq!(provider.receive_reserve(pool.capacity()).unwrap(), rank);
         }
-        provider = if hop % 2 == 0 {
-            b.peer_provider(&wire)
-        } else {
-            a.peer_provider(&wire)
-        }
-        .unwrap();
+        provider = nodes[hop + 1].peer_provider(&wire).unwrap();
         assert_eq!(provider.receive_rank, Some(rank - 1));
         assert_eq!(
             provider.active.as_ref().unwrap().borrow().cursor.position,
-            0,
-            "fixture must rebase"
+            hop as u8 + 1,
+            "product cursor advances without rebasing"
         );
     }
     // The final slot is protected from every forwarding rank. Exhausted cyclic
     // work cannot consume it or create a new chain; owner work still can.
-    assert!(provider.receive_reserve(pool.capacity()).is_err());
+    assert_eq!(provider.receive_reserve(pool.capacity()).unwrap(), 0);
     let owner = pool.private_fill().unwrap();
     drop(owner);
     for wait in &mut blocked {
@@ -176,12 +188,18 @@ fn saturated_three_hop_http_payloads_complete_with_four_buffers() {
                 Backend::new("127.0.0.1:1", "hop-admission").unwrap()
             };
             let mut handler = Handler::new(cache(&backend, 1), backend);
+            handler.upstream.routing = Some(chain_routing(index, 4, 2));
             if index > 0 {
                 handler.set_authentication(peer_policy(index as u8 + 2, index as u8 + 1));
             }
             if index < 3 {
-                handler.set_peer(Peer::new(&addresses[index + 1].to_string(), None).unwrap());
-                handler.upstream.selected = Some("peer".into());
+                let peer = peer_identity(index as u8 + 3).node;
+                handler.upstream.peers.borrow_mut().insert(
+                    peer.clone(),
+                    Rc::new(RefCell::new(
+                        Peer::new(&addresses[index + 1].to_string(), None).unwrap(),
+                    )),
+                );
                 let id = peer_identity(index as u8 + 2);
                 let credentials = crate::control::credentials::Provider::for_test(
                     id.clone(),
@@ -190,7 +208,7 @@ fn saturated_three_hop_http_payloads_complete_with_four_buffers() {
                 handler.set_peer_tls(
                     "v1",
                     credentials,
-                    &BTreeMap::from([("peer".into(), peer_identity(index as u8 + 3))]),
+                    &BTreeMap::from([(peer, peer_identity(index as u8 + 3))]),
                 );
             }
             http::Server::new(listener, handler, http::Config::default())

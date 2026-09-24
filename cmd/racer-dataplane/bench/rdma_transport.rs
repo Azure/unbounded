@@ -19,11 +19,14 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
         revision: 1,
         fabric: "benchmark".into(),
         member_catalogs: vec![proto::MemberCatalog {
-            members: vec![proto::Member {
-                node: vec![remote; 32],
-                pod_uid: "benchmark".into(),
-                fabric: "benchmark".into(),
-            }],
+            members: [local, remote]
+                .into_iter()
+                .map(|node| proto::Member {
+                    node: vec![node; 32],
+                    pod_uid: "benchmark".into(),
+                    fabric: "benchmark".into(),
+                })
+                .collect(),
         }],
         peers: vec![proto::Peer {
             id: peer.clone(),
@@ -33,6 +36,7 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
             ..Default::default()
         }],
         volumes: vec![proto::Volume {
+            max_candidate_attempts: Some(2),
             id: fixture::VOLUME.into(),
             member_catalog: Some(0),
             cache_socket: "/dev/racer/v1/cache".into(),
@@ -41,19 +45,26 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {
                     peer: peer.clone(),
-                    http_address: String::new(),
+                    http_address: o.address.to_string(),
                 }],
             }),
             topology: Some(proto::Topology {
-                product: None,
+                product: Some(proto::ProductTopology {
+                    left_factor: 1,
+                    right_factor: 2,
+                    members: [local.min(remote), local.max(remote)]
+                        .into_iter()
+                        .map(|n| format!("{n:02x}").repeat(32))
+                        .collect(),
+                    roles: vec![0, 1],
+                    local_member: u32::from(local > remote),
+                    candidate_width: 2,
+                    candidates: vec![0, 1, 1, 0],
+                }),
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,
-                local_slots: vec![if o.server { 0 } else { 1 }],
-                neighbors: vec![proto::SlotPeer {
-                    slot: if o.server { 1 } else { 0 },
-                    peer,
-                }],
+                local_slots: vec![u32::from(local > remote)],
             }),
             ..Default::default()
         }],

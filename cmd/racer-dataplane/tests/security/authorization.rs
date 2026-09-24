@@ -126,7 +126,6 @@ fn retry_metadata_survives_non_auth_failure_and_http_binding_validation() {
             path: Vec::new(),
             failed: u32::MAX,
             repair_position: 0,
-            algorithm: crate::routing::Algorithm::Canonical,
             identity: [1; 32],
             source: 0,
             owner: 2,

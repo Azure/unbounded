@@ -8,6 +8,7 @@ import (
 	"path"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -161,7 +162,14 @@ func validateRacerOriginCoverage(original, candidate *unstructured.Unstructured)
 
 			found = true
 
-			if !reflect.DeepEqual(old.Command, next.Command) || !reflect.DeepEqual(old.Args, next.Args) || !reflect.DeepEqual(old.Env, next.Env) || !reflect.DeepEqual(old.EnvFrom, next.EnvFrom) || !reflect.DeepEqual(old.VolumeMounts, next.VolumeMounts) || !reflect.DeepEqual(old.SecurityContext, next.SecurityContext) {
+			envEqual := reflect.DeepEqual(old.Env, next.Env)
+			if old.Name == "dataplane" {
+				oldEnv, oldErr := racerProtectedEnv(old.Env)
+				nextEnv, nextErr := racerProtectedEnv(next.Env)
+				envEqual = oldErr == nil && nextErr == nil && reflect.DeepEqual(oldEnv, nextEnv)
+			}
+
+			if !reflect.DeepEqual(old.Command, next.Command) || !reflect.DeepEqual(old.Args, next.Args) || !envEqual || !reflect.DeepEqual(old.EnvFrom, next.EnvFrom) || !reflect.DeepEqual(old.VolumeMounts, next.VolumeMounts) || !reflect.DeepEqual(old.SecurityContext, next.SecurityContext) {
 				return fmt.Errorf("racer container %q identity, socket mounts and startup are operator-owned while Gantry uses Racer", old.Name)
 			}
 		}
@@ -172,6 +180,37 @@ func validateRacerOriginCoverage(original, candidate *unstructured.Unstructured)
 	}
 
 	return nil
+}
+
+// Only literal positive tuning counts and a filename inside the managed cache
+// directory can vary. Identity, config, sockets, environment sources and the
+// operator-owned launcher stay protected.
+func racerProtectedEnv(env []corev1.EnvVar) ([]corev1.EnvVar, error) {
+	var protected []corev1.EnvVar
+
+	seen := map[string]bool{}
+	for _, value := range env {
+		if seen[value.Name] {
+			return nil, fmt.Errorf("duplicate Racer env %s", value.Name)
+		}
+
+		seen[value.Name] = true
+		switch value.Name {
+		case "RACER_IO_WORKERS", "RACER_COMPUTE_WORKERS", "RACER_SHARDS", "RACER_BUFFERS_PER_NODE", "RACER_STARTUP_SECONDS":
+			n, err := strconv.ParseUint(value.Value, 10, 32)
+			if err != nil || n == 0 || value.ValueFrom != nil || (value.Name == "RACER_BUFFERS_PER_NODE" && n < 4) {
+				return nil, fmt.Errorf("invalid Racer tuning env %s", value.Name)
+			}
+		case "RACER_SLAB_PATH":
+			if value.ValueFrom != nil || path.Clean(value.Value) != value.Value || path.Dir(value.Value) != "/cache" || !strings.HasSuffix(path.Base(value.Value), ".slab") || path.Base(value.Value) == ".slab" || strings.ContainsAny(value.Value, "\x00\r\n") {
+				return nil, fmt.Errorf("racer slab path must be a literal /cache/<filename>.slab")
+			}
+		default:
+			protected = append(protected, value)
+		}
+	}
+
+	return protected, nil
 }
 
 func configArgs(args []string) []string {

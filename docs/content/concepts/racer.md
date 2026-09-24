@@ -31,12 +31,13 @@ Each Site universe has 262,144 placement slots, shared by its caches. Stateless
 highest-random-weight (HRW) hashing chooses owners using the universe and Node
 UID-derived identity. An unchanged membership set produces the same ownership
 after a control-plane restart or Pod replacement. Balance is statistical;
-adjacent slots can have the same owner. Fallback attempts advance through slots,
-so they do not promise a different physical peer on every attempt.
+adjacent slots can have the same owner. Fallback attempts advance through distinct
+ranked physical peers, so each candidate attempt selects a different owner.
 
 Cache capacity is rounded up to a 64 MiB boundary, with a minimum of 512 MiB
-per storage shard. The managed agent uses eight page buffers (512 MiB total)
-on one NUMA node and requests 4 GiB of memory.
+per storage shard. The managed agent automatically sizes workers and page buffers
+within host CPU, memory, and locked-memory budgets. Its scheduling requests are
+100m CPU and 512 MiB memory, with no CPU or memory limits.
 
 When all eligible page buffers are in use, requests wait for a buffer release
 until their caller or selected-peer deadline expires. Releases wake eligible

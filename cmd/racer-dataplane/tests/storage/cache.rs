@@ -274,12 +274,54 @@ pub(crate) mod tests {
                     context.clone(),
                 );
                 let make_handler = || {
-                    let backend = Backend::new(&url, "test-origin").unwrap();
+                    let backend =
+                        Backend::new(if node == 1 { &url } else { "127.0.0.1:1" }, "test-origin")
+                            .unwrap();
                     let namespace = backend.namespace();
                     let mut handler = Handler::shared(cache.clone(), backend, namespace);
                     handler.test_authentication(node, &[1, 2, 3], (node > 1).then_some(node - 1));
-                    if let Some(url) = &peer {
-                        handler.set_peer(Peer::new(url, None).unwrap());
+                    // Place ingress and owner at opposite K2 x K2 corners so
+                    // metadata and pages traverse the same real intermediate.
+                    let graph = crate::product::Product::new(2, 2).unwrap();
+                    let path = graph.route(3, 0).unwrap();
+                    let middle = path[1];
+                    let roles = vec![0, middle, 3, 3 - middle];
+                    let members: Vec<_> = (1..=4).map(|n| identity(n).node).collect();
+                    let adjacent = graph.neighbors(roles[node as usize - 1]);
+                    let volume = crate::control::proto::Volume {
+                        id: "metadata-test".into(),
+                        peers: members
+                            .iter()
+                            .zip(&roles)
+                            .filter(|(_, role)| adjacent.contains(role))
+                            .map(|(id, _)| id.clone())
+                            .collect(),
+                        topology: Some(crate::control::proto::Topology {
+                            epoch: 1,
+                            slot_count: 1,
+                            routing_algorithm: Some(1),
+                            local_slots: if node == 1 { vec![0] } else { vec![] },
+                            product: Some(crate::control::proto::ProductTopology {
+                                left_factor: 2,
+                                right_factor: 2,
+                                members,
+                                roles,
+                                local_member: u32::from(node - 1),
+                                candidate_width: 1,
+                                candidates: vec![0],
+                            }),
+                        }),
+                        ..Default::default()
+                    };
+                    let routing =
+                        Arc::new(crate::routing::Routing::new(&[1; 32], &volume).unwrap());
+                    let peers = peer
+                        .as_ref()
+                        .map(|url| (identity(node - 1).node, Peer::new(url, None).unwrap()))
+                        .into_iter()
+                        .collect();
+                    handler.set_routing(routing, peers);
+                    if peer.is_some() {
                         let remote = identity(node - 1);
                         handler.set_peer_tls(
                             "metadata-test",
@@ -622,7 +664,7 @@ pub(crate) mod tests {
                 routing: [7; 32],
                 version: 2,
                 destination: 3,
-                dependency: crate::buffers::NetworkDependency::Canonical { slot: 1 },
+                dependency: crate::buffers::NetworkDependency::LocalShared,
             }),
             ..Fake::default()
         }

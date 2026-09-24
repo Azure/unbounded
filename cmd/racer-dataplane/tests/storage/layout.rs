@@ -5,6 +5,26 @@ use super::*;
 use std::collections::HashSet;
 
 #[test]
+fn automatic_storage_shards_scale_with_workers_and_small_geometry() {
+    for (capacity, workers, shards) in [
+        (50 << 30, 1, 4),
+        (50 << 30, 2, 8),
+        (50 << 30, 4, 16),
+        (MIN_CAPACITY, 1, 1),
+        (1 << 30, 2, 2),
+        (3 << 30, 2, 6),
+        (4 << 30, 2, 8),
+        (MAX_CAPACITY, 1024, 1024),
+    ] {
+        let plan = LayoutPlan::new(capacity, workers).unwrap();
+        assert_eq!(plan.shard_count(), shards);
+        for shard in 0..shards {
+            Geometry::new(capacity, shards, shard).unwrap();
+        }
+    }
+}
+
+#[test]
 fn filesystem_admission_reports_headroom_and_keeps_retry_contract() {
     // The live resize regression grows to 20 GiB. A generic 1 GiB free-disk
     // prerequisite cannot cover its full index reserve, even for metadata.
@@ -13,11 +33,11 @@ fn filesystem_admission_reports_headroom_and_keeps_retry_contract() {
     let required =
         geometry.range(Class::Index).1 as u64 * PAGE_SIZE as u64 * plan.shard_count() as u64
             + HEADROOM;
-    assert_eq!(required, 2_751_447_040);
+    assert_eq!(required, 2_751_430_656);
     let error = check_disk_headroom(Ok(1 << 30), required).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert!(error.to_string().contains("available=1073741824 bytes"));
-    assert!(error.to_string().contains("required=2751447040 bytes"));
+    assert!(error.to_string().contains("required=2751430656 bytes"));
     assert!(check_disk_headroom(Ok(required - 1), required).is_err());
     assert!(check_disk_headroom(Ok(required), required).is_ok());
     assert!(check_disk_headroom(Ok(u64::MAX), u64::MAX).is_ok());
@@ -695,7 +715,12 @@ fn populated_two_tib_memory_child() {
 fn populated_target_shard_structural_footprint_fits_accounting() {
     // Populate index descriptors without allocating/writing 16 GiB of payload.
     // This measures Rust container backing and object sizes, not allocator RSS.
-    let plan = LayoutPlan::new(TARGET_SHARD_SIZE, 1).unwrap();
+    // Exercise a full target-sized shard independently of automatic fan-out.
+    let plan = LayoutPlan {
+        capacity: TARGET_SHARD_SIZE,
+        shards: 1,
+        workers: 1,
+    };
     let path = std::env::temp_dir().join(format!("racer-layout-footprint-{}", std::process::id()));
     let mut slab = plan.create(&path, CheckpointBudget::default()).unwrap();
     std::fs::remove_file(path).unwrap();

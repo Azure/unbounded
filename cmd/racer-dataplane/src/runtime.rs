@@ -128,7 +128,6 @@ impl Retry {
 struct Outbound {
     id: String,
     target: String,
-    handler: usize,
     client: Option<negotiation::Client>,
     retry: Retry,
 }
@@ -136,7 +135,6 @@ struct Live {
     connection: Rc<rdma::Connection>,
     context: Rc<negotiation::Context>,
     peer: NodeId,
-    handler: usize,
     outbound: Option<usize>,
     confirmation: Option<Instant>,
 }
@@ -162,7 +160,6 @@ impl Manager {
         self.outbound.push(Outbound {
             id: peer.id().to_owned(),
             target: target.to_owned(),
-            handler: 0,
             client: None,
             retry: Retry::new(crate::environment::now()),
         });
@@ -261,14 +258,15 @@ impl Manager {
             return Err(unavailable());
         }
         let connection = Rc::new(established.connection);
-        let handler = outbound.map_or(0, |i| self.outbound[i].handler);
         if let Some(i) = outbound {
             self.outbound[i].retry.failures = 0;
-            generation.handlers[handler]
+            generation
+                .handler
                 .borrow_mut()
                 .set_routed_connection(&self.outbound[i].id, connection.clone());
         } else {
-            generation.handlers[handler]
+            generation
+                .handler
                 .borrow_mut()
                 .add_shared_connection(connection.clone());
         }
@@ -276,7 +274,6 @@ impl Manager {
             connection,
             context: established.context,
             peer: established.peer,
-            handler,
             outbound,
             confirmation: established.confirmation_deadline,
         });
@@ -312,7 +309,8 @@ impl Manager {
             {
                 let live = self.live.swap_remove(i);
                 let _ = live.connection.disconnect();
-                generation.handlers[live.handler]
+                generation
+                    .handler
                     .borrow_mut()
                     .remove_connection(&live.connection);
                 if let Some(i) = live.outbound.filter(|_| !replaced) {
@@ -399,7 +397,7 @@ impl Manager {
         }
         work
     }
-    fn clear(&mut self, handlers: &[Rc<RefCell<Handler>>]) {
+    fn clear(&mut self, handler: &Rc<RefCell<Handler>>) {
         self.outbound.clear();
         for server in self.inbound.values() {
             server.borrow_mut().clear();
@@ -407,9 +405,7 @@ impl Manager {
         self.inbound.clear();
         for live in self.live.drain(..) {
             let _ = live.connection.disconnect();
-            handlers[live.handler]
-                .borrow_mut()
-                .remove_connection(&live.connection);
+            handler.borrow_mut().remove_connection(&live.connection);
         }
     }
 }
@@ -423,7 +419,7 @@ struct PeerHandler {
     config: Option<Arc<Prepared>>,
     volumes: BTreeMap<String, VolumeHandler>,
 }
-struct PeerTask(io::Result<(String, Task)>);
+struct PeerTask(io::Result<Task>);
 impl http::Handler for PeerHandler {
     type Task = PeerTask;
     fn start(&mut self, request: http::Request) -> PeerTask {
@@ -447,17 +443,14 @@ impl http::Handler for PeerHandler {
                     Ok(None)
                 )
             {
-                let data = handler.current.handlers[0].clone();
+                let data = handler.current.handler.clone();
                 let task = data.borrow_mut().reject(request, 409);
-                return Ok((
-                    volume,
-                    Task {
-                        generation: handler.current.clone(),
-                        kind: TaskKind::Data(data, task),
-                    },
-                ));
+                return Ok(Task {
+                    generation: handler.current.clone(),
+                    kind: TaskKind::Data(data, task),
+                });
             }
-            Ok((volume, handler.start(request)))
+            Ok(handler.start(request))
         })())
     }
     fn poll(
@@ -466,16 +459,11 @@ impl http::Handler for PeerHandler {
         ring: &mut uring::Ring,
         budget: usize,
     ) -> io::Result<Progress<http::Completed>> {
-        let (_, task) = task
+        let task = task
             .0
             .as_mut()
             .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
-        VolumeHandler {
-            local: false,
-            current: task.generation.clone(),
-            draining: Vec::new(),
-        }
-        .poll(task, ring, budget)
+        task.poll(ring, budget)
     }
 }
 fn hex_identity(bytes: &[u8]) -> String {
@@ -565,7 +553,7 @@ impl http::Handler for VolumeHandler {
             && (request.headers().get("x-racer-fault").is_some()
                 || negotiation::is_negotiation(request.headers()))
         {
-            let handler = self.current.handlers[0].clone();
+            let handler = self.current.handler.clone();
             let task = handler.borrow_mut().reject(request, 403);
             return Task {
                 generation: self.current.clone(),
@@ -576,8 +564,7 @@ impl http::Handler for VolumeHandler {
             return self.negotiation(request);
         }
         let generation = match crate::handlers::routing_identity(request.headers()) {
-            // Handler checks the immutable RC01 namespace before rebasing the
-            // sender's placement hint onto current local routing.
+            // Handler checks both the immutable namespace and exact topology identity.
             Ok(Some(_)) if !self.local => {
                 (!self.current.expired.get()).then(|| self.current.clone())
             }
@@ -587,7 +574,7 @@ impl http::Handler for VolumeHandler {
             _ => None,
         };
         let Some(generation) = generation else {
-            let handler = self.current.handlers[0].clone();
+            let handler = self.current.handler.clone();
             let task = handler.borrow_mut().reject(request, 409);
             return Task {
                 generation: self.current.clone(),
@@ -595,7 +582,7 @@ impl http::Handler for VolumeHandler {
             };
         };
 
-        let handler = generation.handlers[0].clone();
+        let handler = generation.handler.clone();
 
         let task = handler.borrow_mut().start(request);
         Task {
@@ -609,6 +596,17 @@ impl http::Handler for VolumeHandler {
         ring: &mut uring::Ring,
         budget: usize,
     ) -> io::Result<Progress<http::Completed>> {
+        task.poll(ring, budget)
+    }
+}
+impl Task {
+    fn poll(
+        &mut self,
+        ring: &mut uring::Ring,
+        budget: usize,
+    ) -> io::Result<Progress<http::Completed>> {
+        use http::Handler as _;
+        let task = self;
         if task.generation.expired.get()
             || task
                 .generation
@@ -848,11 +846,10 @@ impl Volumes {
                 if !generation.active.get() || generation.expired.get() {
                     continue;
                 }
-                for handler in &generation.handlers {
-                    handler
-                        .borrow()
-                        .peer_metrics(&generation.volume, &mut peers);
-                }
+                generation
+                    .handler
+                    .borrow()
+                    .peer_metrics(&generation.volume, &mut peers);
             }
             metrics.publish_peers(peers);
             self.peer_metrics_deadline = Some(now + crate::metrics::INTERVAL);
@@ -969,9 +966,7 @@ impl Volumes {
             let handler = server.handler_mut();
             for generation in std::iter::once(&handler.current).chain(&handler.draining) {
                 generation.active.set(false);
-                for handler in &generation.handlers {
-                    handler.borrow_mut().begin_drain();
-                }
+                generation.handler.borrow_mut().begin_drain();
             }
         }
     }

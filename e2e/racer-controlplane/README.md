@@ -15,7 +15,7 @@ Create the two scratch directories first. The socket root must be an existing
 workspace directory whose absolute path is at most 36 bytes: production validates
 that even a maximum-length cache name fits a Unix socket address. Build the current
 Rust CP with `cargo build --locked --manifest-path cmd/racer-controlplane/Cargo.toml`.
-The daemon must support the v4 desired-state protocol.
+The daemon must support the v1 desired-state protocol.
 
 ## Prerequisites
 

@@ -115,6 +115,39 @@ func TestRacerOriginCoverageOverrides(t *testing.T) {
 		valid  bool
 	}{
 		{name: "image", valid: true, change: func(p *corev1.PodSpec) { p.Containers[0].Image = "racer:test" }},
+		{name: "tuning", valid: true, change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_IO_WORKERS", Value: "2"}, {Name: "RACER_COMPUTE_WORKERS", Value: "2"}, {Name: "RACER_SHARDS", Value: "8"}, {Name: "RACER_BUFFERS_PER_NODE", Value: "16"}}
+		}},
+		{name: "zero tuning", change: func(p *corev1.PodSpec) { p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_IO_WORKERS", Value: "0"}} }},
+		{name: "undersized pool", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_BUFFERS_PER_NODE", Value: "3"}}
+		}},
+		{name: "duplicate tuning", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_IO_WORKERS", Value: "2"}, {Name: "RACER_IO_WORKERS", Value: "3"}}
+		}},
+		{name: "indirect tuning", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_IO_WORKERS", Value: "2", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}}
+		}},
+		{name: "launcher", change: func(p *corev1.PodSpec) { p.Containers[0].Args = []string{"custom"} }},
+		{name: "storage path", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_SLAB_PATH", Value: "/other"}}
+		}},
+		{name: "fresh cache path", valid: true, change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_SLAB_PATH", Value: "/cache/cache-tuned-v1.slab"}}
+		}},
+		{name: "cache traversal", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_SLAB_PATH", Value: "/cache/../other.slab"}}
+		}},
+		{name: "cache subdirectory", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_SLAB_PATH", Value: "/cache/sub/cache.slab"}}
+		}},
+		{name: "startup allowance", valid: true, change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_STARTUP_SECONDS", Value: "600"}}
+		}},
+		{name: "socket env", change: func(p *corev1.PodSpec) {
+			p.Containers[0].Env = []corev1.EnvVar{{Name: "RACER_SOCKET_DIR", Value: "/other"}}
+		}},
+		{name: "opaque env", change: func(p *corev1.PodSpec) { p.Containers[0].EnvFrom = []corev1.EnvFromSource{{Prefix: "RACER_"}} }},
 		{name: "narrowed scheduling", change: func(p *corev1.PodSpec) { p.NodeSelector = map[string]string{"subset": "true"} }},
 		{name: "socket remount", change: func(p *corev1.PodSpec) { p.Containers[0].VolumeMounts[0].MountPath = "/different" }},
 		{name: "identity override", change: func(p *corev1.PodSpec) {

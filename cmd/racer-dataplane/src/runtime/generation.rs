@@ -6,7 +6,7 @@ use super::*;
 
 pub(super) struct Generation {
     pub(super) volume: String,
-    pub(super) handlers: Vec<Rc<RefCell<Handler>>>,
+    pub(super) handler: Rc<RefCell<Handler>>,
     pub(super) _config: Arc<Prepared>,
     pub(super) manager: Option<RefCell<Manager>>,
     pub(super) active: Cell<bool>,
@@ -30,7 +30,7 @@ impl Generation {
         self.active.set(false);
         self.expired.set(true);
         if let Some(manager) = &self.manager {
-            manager.borrow_mut().clear(&self.handlers);
+            manager.borrow_mut().clear(&self.handler);
         }
     }
     pub(super) fn poll(&self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
@@ -51,8 +51,8 @@ impl Generation {
         if let Some(manager) = &self.manager {
             work.merge(manager.borrow_mut().poll(self, ring, budget));
         }
-        for handler in &self.handlers {
-            let mut handler = handler.borrow_mut();
+        {
+            let mut handler = self.handler.borrow_mut();
             work.merge(handler.poll_background(ring, budget)?);
             let negotiations = handler.take_negotiations();
             if self.active.get()

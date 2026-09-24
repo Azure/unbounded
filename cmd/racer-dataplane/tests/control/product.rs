@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::collections::BTreeMap;
 
 pub(crate) fn volume(
     left: u32,
@@ -29,7 +30,7 @@ pub(crate) fn volume(
             } else {
                 vec![]
             },
-            routing_algorithm: Some(2),
+            routing_algorithm: Some(1),
             product: Some(proto::ProductTopology {
                 left_factor: left,
                 right_factor: right,
@@ -74,7 +75,7 @@ fn product_cursor_and_prefix_repair() {
             assert!(!fixed.path.contains(&c.path[at + 1]));
             assert_eq!(fixed.attempt, c.attempt);
             assert!(r.repair(&fixed).is_err());
-            let decoded = Cursor::decode_algorithm(&fixed.encode(), Algorithm::Product).unwrap();
+            let decoded = Cursor::decode(&fixed.encode()).unwrap();
             assert_eq!(decoded, fixed);
             for (position, &member) in fixed.path.iter().enumerate().skip(at) {
                 let receiver = Routing::new(
@@ -125,11 +126,11 @@ fn bundles_candidates_and_validation() {
         assert!(Routing::new(&[1; 32], &bad).is_err());
     }
     let bytes = r.start_key(&[0; 32]).encode();
-    assert!(Cursor::decode(&bytes).is_err());
+    assert!(Cursor::decode(&bytes).is_ok());
     for (index, value) in [(44, 5), (45, 0), (65, 0), (70, 1)] {
         let mut bad = bytes.clone();
         bad[index] = value;
-        assert!(Cursor::decode_algorithm(&bad, Algorithm::Product).is_err());
+        assert!(Cursor::decode(&bad).is_err());
     }
 }
 
@@ -143,7 +144,7 @@ fn production_compiler_product_snapshots() {
         let snapshots: Vec<_> = (0..count)
             .map(|i| {
                 proto::Snapshot::decode(
-                    std::fs::read(export.join(format!("product-n{count}-{i}.pb")))
+                    std::fs::read(export.join(format!("p262144-n{count}-fresh-{i}.pb")))
                         .unwrap()
                         .as_slice(),
                 )
@@ -163,8 +164,15 @@ fn production_compiler_product_snapshots() {
                     })
                     .unwrap();
                 let r = prepared.volumes()[0].routing().clone();
-                assert_eq!(r.algorithm, Algorithm::Product);
-                let local = r.product.as_ref().unwrap().config.local_member;
+                assert_eq!(
+                    snapshot.volumes[0]
+                        .topology
+                        .as_ref()
+                        .unwrap()
+                        .routing_algorithm,
+                    Some(1)
+                );
+                let local = r.product.config.local_member;
                 let mut bad = snapshot.clone();
                 bad.volumes[0]
                     .topology
@@ -244,7 +252,7 @@ fn product_cursor_rejects_forged_ownership_paths_and_repairs() {
             6 => c.failed = 3,
             7 => c.repair_position = 1,
             8 => c.path.push(3),
-            _ => c.algorithm = Algorithm::Canonical,
+            _ => c.identity[0] ^= 1,
         }
         assert!(r.validate(&c, &[0; 32]).is_err(), "mutation {mutate}");
     }

@@ -5,7 +5,7 @@
 use prost::Message;
 use racer_controlplane::{
     model::*,
-    topology::{Topology, compile, place_in_universe},
+    topology::{Topology, compile},
 };
 
 #[test]
@@ -55,42 +55,16 @@ fn export_dataplane_placement() {
         let persisted = generation.canonical_bytes();
         let restored = serde_json::from_slice(&persisted).unwrap();
         assert_eq!(compile(&input, Some(&restored)).unwrap(), generation);
-        // A separate production corpus lets consumers validate algorithm 2
-        // without reinterpreting the retained algorithm-1 geometry fixtures.
-        let product_topology = Topology::new(&generation).unwrap();
-        for (i, member) in generation.nodes.values().enumerate() {
-            let snapshot = product_topology.snapshot(&member.id).unwrap();
-            std::fs::write(
-                dir.join(format!("product-n{count}-{i}.pb")),
-                snapshot.encode_to_vec(),
-            )
-            .unwrap();
-        }
-        let names: Vec<_> = generation.nodes.keys().cloned().collect();
         // Default production geometry plus cube/noncube boundaries exercise the
         // same snapshot serializer with deterministic universe/Node identities.
         for slots in [1, 8, 17, 64, SLOT_COUNT] {
             let mut g = generation.clone();
-            // Retain the legacy conformance corpus alongside production exports.
-            g.product = None;
-            g.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
             g.volumes[0].slots = slots;
-            if slots != SLOT_COUNT {
-                let by_id: std::collections::BTreeMap<_, _> = g
-                    .nodes
-                    .iter()
-                    .map(|(name, member)| (member.id.clone(), name.clone()))
-                    .collect();
-                g.volumes[0].owners = place_in_universe(
-                    slots,
-                    &g.universe,
-                    &by_id.keys().cloned().collect::<Vec<_>>(),
-                )
-                .unwrap()
-                .into_iter()
-                .map(|id| by_id[&id].clone())
-                .collect();
-            }
+            g.volumes[0].owners.truncate(slots as usize);
+            let product = g.product.as_mut().unwrap();
+            product
+                .candidates
+                .truncate(slots as usize * product.candidate_width as usize);
             let top = Topology::new(&g).unwrap();
             let prefix = format!("p{slots}-n{count}-fresh");
             let ids: std::collections::BTreeMap<_, _> = g
@@ -113,26 +87,7 @@ fn export_dataplane_placement() {
                 let file = format!("{prefix}-{i}.pb");
                 std::fs::write(dir.join(&file), snapshot.encode_to_vec()).unwrap();
                 files.push(file);
-                if count == 2 && slots == SLOT_COUNT && i == 0 {
-                    std::fs::write(dir.join("default.pb"), snapshot.encode_to_vec()).unwrap();
-                }
             }
-        }
-        if count == 2 {
-            let mut historical = generation.clone();
-            historical.product = None;
-            historical.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
-            historical.volumes[0].slots = 8;
-            historical.volumes[0].owners =
-                (0..8).map(|s| names[usize::from(s >= 4)].clone()).collect();
-            let top = Topology::new(&historical).unwrap();
-            std::fs::write(
-                dir.join("historical.pb"),
-                top.snapshot(&historical.nodes[&names[1]].id)
-                    .unwrap()
-                    .encode_to_vec(),
-            )
-            .unwrap();
         }
     }
     std::fs::write(dir.join("files.json"), serde_json::to_vec(&files).unwrap()).unwrap();

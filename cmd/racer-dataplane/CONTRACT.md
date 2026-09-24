@@ -11,8 +11,8 @@ Control subscriptions, enrollment, proof, and replica proof use `/v1/config`,
 `/v1/enroll`, `/v1/proof`, and `/v1/replica-proof`. The protobuf package remains
 `racer.control.v1` and the subscription profile is 1. Every volume references
 an explicit member catalog, including volumes with no remote members. A supplied
-topology must explicitly select routing algorithm 2 for physical product routing.
-Algorithm 1 and its RR01 cursor remain accepted for legacy fixtures.
+topology must explicitly select routing algorithm 1 for physical product routing.
+Only the 71-byte RR01 product cursor is accepted.
 
 RDMA negotiation and offers use version 1, with `RCR1` transport frames. CA
 state, trust bundles, identity claims, generation records, and revision checkpoint
@@ -80,7 +80,7 @@ Use a fresh slab for this format.
 
 `X-Racer-Fault` is hexadecimal encoding of a descriptor bounded to 3,500 decoded
 bytes. Distinct four-byte tags identify version 1 of each layer: `RB01` budget,
-`RR02` product cursor (`RR01` for algorithm 1), and `RD01` descriptor:
+`RR01` product cursor (algorithm 1), and `RD01` descriptor:
 
 - Metadata: `RD01`, byte 0, then target bytes.
 - Page: `RD01`, byte 1, LE u64 offset, LE u64 object length, 32 checksum bytes,
@@ -89,22 +89,22 @@ bytes. Distinct four-byte tags identify version 1 of each layer: `RB01` budget,
 
 An outer RC01 chain wraps the RB01 budget and binds the immutable namespace
 and forwarding allowances: `RC01 | namespace:32 | hops:u8 | work:u8 |
-candidate:LE-u32 | RB01...`. The inner cursor is placement-specific. Algorithm 2
+candidate:LE-u32 | RB01...`. The inner cursor is placement-specific. Algorithm 1
 uses physical member indexes for candidate attribution, with distinct ranked
 physical candidates compiled per placement slot.
 Each new metadata or page resolution receives at most eight hops and 255 units
 of work. Forwarding splits work between the child and local recovery; admission
-retries do not spend it. Placement rebasing and transport retries never renew it.
+retries do not spend it. Transport retries never renew it.
 
 Payload receive admission reserves slots by the resolution's initial local hop
 allowance, independent of placement. A newly originated payload chain caps its
 hops to `min(8, NUMA pool slots - 1)` before its first receive. A received chain
-keeps its allowance unchanged, including after rebasing. Forwarding decrements
+keeps its allowance unchanged. Forwarding decrements
 that allowance; local retries retain their original admission rank even after
 spending hops. A peer-dependent receive whose rank cannot fit the local pool
 fails with local-capacity Busy instead of clamping the received rank. Local-owner
 fetches and completed cache hits need no forwarding reserve. Thus a four-slot
-pool supports three-hop cold payload paths; extra rebases or recovery attempts
+pool supports three-hop cold payload paths; recovery attempts
 can exhaust that bounded chain. Metadata does not consume payload slots or use
 this capacity cap. Mixed fleets and heterogeneous pool sizes may reject payload
 chains originated with a larger allowance; this does not authorize origin
@@ -113,7 +113,7 @@ fallback or prove owner unavailability.
 Distributed client target admission reserves 436 bytes for the largest page,
 cursor, budget, and chain framing, allowing **3,064 target bytes**.
 
-RR02 has a fixed 71-byte body: topology identity (32 bytes), source member,
+RR01 has a fixed 71-byte body: topology identity (32 bytes), source member,
 placement owner slot, candidate attempt (three LE u32 values), position (u8),
 path length (u8), five physical member indexes (LE u32, unused entries all ones),
 failed member (LE u32, all ones when absent), and repair position (u8).
@@ -121,7 +121,9 @@ Paths include endpoints and contain at most four successful physical edges.
 Each receiver reconstructs the deterministic healthy path or its single local
 repair and validates the entire path, selected candidate, and local position.
 Product requests with a different topology identity fail closed; they do not
-rebase and restart the four-edge allowance. Algorithm 1 retains bounded rebasing.
+rebase and restart the four-edge allowance. Historical 45-byte RR01 bodies,
+RR02 descriptors, algorithm 2, and slot-graph snapshots are rejected. Every
+volume requires explicit product topology, including K1 singleton volumes.
 
 Healthy product paths advance a distance-two coordinate first at every step.
 All members in adjacent role bundles are physical neighbors. Same-role endpoints

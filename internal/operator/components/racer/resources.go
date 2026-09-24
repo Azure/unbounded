@@ -192,23 +192,13 @@ func securityContext(bootstrap bool) *corev1.SecurityContext {
 }
 
 func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
-	// Static across capacity edits. The Rust populated_two_tib_memory fixture
-	// measures <1 GiB index RSS with full payload descriptors, metadata admission
-	// and three tree versions. Scaling to 4 TiB allows 2 GiB, plus <512 MiB for
-	// empty replacement/checkpoint drain and 1.5 GiB for pools, process/network
-	// state and allocator variation. This is an operational envelope, not the
-	// diagnostic sparse-tree worst case. Resize also checks current headroom.
-	// Equal requests/limits (including init) preserve Guaranteed QoS.
-	// RACER_SHARDS=1 restricts CpuPlan to one participating NUMA node, so the
-	// eight 64 MiB buffers consume 512 MiB even on multi-NUMA hosts. The 2 GiB
-	// memlock ceiling also leaves room for RDMA control and ring registrations.
+	// Scheduling floor only. The daemon bounds automatic parallelism and pools
+	// using affinity, physical topology, cgroup quota/headroom and memlock.
 	r := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("512Mi")},
 	}
 	if !bootstrap {
 		r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("128Mi")
-		r.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("512Mi")
 	}
 
 	return r
@@ -222,7 +212,9 @@ func dataplaneDaemonSet(namespace string, cfg component.Config) *appsv1.DaemonSe
 	main := corev1.Container{
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
-			"ulimit -l 2097152", ". /bootstrap/identity",
+			// Bounded registration allowance, not resident pool allocation. The
+			// daemon charges each ring/rail copy and reserves control headroom.
+			"ulimit -l 8388608", ". /bootstrap/identity",
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
 			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
@@ -238,13 +230,9 @@ func dataplaneDaemonSet(namespace string, cfg component.Config) *appsv1.DaemonSe
 			fieldEnv("RACER_POD_IP", "status.podIP"),
 			{Name: "RACER_SLAB_PATH", Value: "/cache/cache-v1.slab"},
 			// Creation defaults only. TLS-authenticated storage policy owns subsequent capacity;
-			// persisted geometry wins on restart. Keep the execution cap at one even
-			// when automatic runtime storage planning creates hundreds of shards.
+			// persisted geometry wins on restart. Omitted tuning env selects automatic
+			// process resource planning; explicit positive overrides remain supported.
 			{Name: "RACER_SLAB_SIZE", Value: "10737418240"},
-			{Name: "RACER_SHARDS", Value: "1"},
-			{Name: "RACER_IO_WORKERS", Value: "1"},
-			{Name: "RACER_COMPUTE_WORKERS", Value: "1"},
-			{Name: "RACER_BUFFERS_PER_NODE", Value: "8"},
 			{Name: "RACER_STARTUP_SECONDS", Value: "90"},
 			{Name: "RACER_STALL_SECONDS", Value: "5"},
 			{Name: "RACER_DRAIN_SECONDS", Value: "20"},

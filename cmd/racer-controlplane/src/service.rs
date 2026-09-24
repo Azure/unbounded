@@ -268,8 +268,6 @@ fn address(value: &str) -> String {
     }
 }
 
-/// Both kubelet projection and direct API reads use this unchanged public key.
-pub const TRUST_PROJECTION_PATH: &str = "/var/run/racer-trust/bundle.json";
 fn now_micro() -> Result<MicroTime> {
     Ok(serde_json::from_value(serde_json::Value::String(
         time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,
@@ -1315,14 +1313,9 @@ async fn issue_replica(
     active: &Active,
     pod: &Pod,
     identity: Identity,
+    request: ReplicaRequest,
 ) -> Result<()> {
     let uid = pod.uid().context("missing Pod UID")?;
-    let request = pod
-        .annotations()
-        .get(REPLICA_REQUEST)
-        .context("replica request missing")?;
-    ensure!(request.len() <= 16384, "replica request too large");
-    let request: ReplicaRequest = serde_json::from_str(request)?;
     ensure!(request.pod_uid == uid, "replica request UID mismatch");
     let boot = request.boot;
     let csr = request.csr;
@@ -1443,7 +1436,7 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
                 &request.boot,
             )
             .await?;
-            issue_replica(shared, active, pod, identity).await
+            issue_replica(shared, active, pod, identity, request).await
         }).await;
         match result {
             Ok(Ok(())) => (),

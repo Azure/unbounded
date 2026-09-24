@@ -435,30 +435,28 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/dev/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/dev/racer/node%d/origin", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
 		s := &pb.Snapshot{Universe: bytes.Repeat([]byte{1}, 32), Node: node, Revision: 1, Epoch: 1, Volumes: []*pb.Volume{v}, MemberCatalogs: []*pb.MemberCatalog{{}}}
 
-		degree := 1
-		for degree*degree*degree < nodes {
-			degree++
-		}
+		attempts := uint32(min(nodes, 3))
+		v.MaxCandidateAttempts = &attempts
+		v.Topology.Product = &pb.ProductTopology{LeftFactor: 1, RightFactor: uint32(nodes), LocalMember: uint32(i), CandidateWidth: attempts}
 
 		for j := 0; j < nodes; j++ {
+			id := gantryNode(j)
+			memberNode, _ := hex.DecodeString(id)
+			v.Topology.Product.Members = append(v.Topology.Product.Members, id)
+
+			v.Topology.Product.Roles = append(v.Topology.Product.Roles, uint32(j))
+			for k := range attempts {
+				v.Topology.Product.Candidates = append(v.Topology.Product.Candidates, (uint32(j)+k)%uint32(nodes))
+			}
+
+			s.MemberCatalogs[0].Members = append(s.MemberCatalogs[0].Members, &pb.Member{Node: memberNode, PodUid: fmt.Sprintf("pod%d", j)})
 			if i == j {
 				continue
 			}
 
-			id := gantryNode(j)
-			memberNode, _ := hex.DecodeString(id)
-			s.MemberCatalogs[0].Members = append(s.MemberCatalogs[0].Members, &pb.Member{Node: memberNode, PodUid: fmt.Sprintf("pod%d", j)})
 			s.Peers = append(s.Peers, &pb.Peer{Id: id, HttpAddress: fmt.Sprintf("127.0.0.%d:9443", j+2), PodUid: fmt.Sprintf("pod%d", j)})
-			v.PeerEndpoints.Peers = append(v.PeerEndpoints.Peers, &pb.VolumePeerEndpoint{Peer: id})
-
-			for digit := 0; digit < degree; digit++ {
-				if (i*degree+digit)%nodes == j {
-					v.Peers = append(v.Peers, id)
-					v.Topology.Neighbors = append(v.Topology.Neighbors, &pb.SlotPeer{Slot: uint32(j), Peer: id})
-
-					break
-				}
-			}
+			v.PeerEndpoints.Peers = append(v.PeerEndpoints.Peers, &pb.VolumePeerEndpoint{Peer: id, HttpAddress: fmt.Sprintf("127.0.0.%d:9443", j+2)})
+			v.Peers = append(v.Peers, id)
 		}
 
 		configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: s}}

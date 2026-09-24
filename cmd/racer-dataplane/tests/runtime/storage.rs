@@ -337,14 +337,17 @@ fn live_multiworker_grow_shrink_and_same_capacity_noop() {
     f.applied(1, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
     assert_eq!(f.shared().transaction.lock().unwrap().id, 0);
-    f.applied(2, 48 << 30); // three shards, two workers, uneven local counts
+    f.applied(2, 50 << 30);
+    assert_eq!(f.updates.status()["storage"]["shards"], 8);
     assert_ne!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
-    f.applied(3, 1 << 30);
+    f.applied(3, 7 * (512 << 20)); // seven shards, two workers, uneven local counts
+    assert_eq!(f.updates.status()["storage"]["shards"], 7);
+    f.applied(4, 1 << 30);
     for ((_, ring), original) in f.nodes.iter().zip(original_rings) {
         assert!(Rc::ptr_eq(ring.identity(), &original));
     }
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    f.applied(4, 1 << 30);
+    f.applied(5, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
 }
 
@@ -583,7 +586,15 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     volume.peers.clear();
     let topology = volume.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
-    topology.neighbors.clear();
+    topology.product = Some(crate::control::proto::ProductTopology {
+        left_factor: 1,
+        right_factor: 1,
+        members: vec!["02".repeat(32)],
+        roles: vec![0],
+        local_member: 0,
+        candidate_width: 1,
+        candidates: vec![0; topology.slot_count as usize],
+    });
     f.updates
         .publish(crate::control::tests::prepare_snapshot(
             &trust,

@@ -24,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     model::{self, Cache, Inventory, Node, Pod, identity, universe_for_site},
-    publication::Versioned,
     security::CaState,
     status,
     storage::StoragePolicy,
@@ -357,7 +356,6 @@ impl Runtime {
         let (mut desired, previous) = result?;
         if previous.as_deref() != Some(&desired) {
             desired.revision = next_revision(store, revisions, fence).await?;
-            desired.validate()?;
             store.verify(fence).await?;
             self.subscriptions.install(Arc::new(desired))?;
         }

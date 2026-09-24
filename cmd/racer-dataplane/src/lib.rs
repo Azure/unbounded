@@ -28,6 +28,7 @@ pub mod slab_io;
 pub mod socket;
 mod socket_listener;
 pub mod tls;
+pub mod tuning;
 pub mod uring;
 pub mod workers;
 

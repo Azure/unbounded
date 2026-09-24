@@ -8,7 +8,8 @@ mod tests {
     fn storage_metrics_have_fixed_series_and_do_not_change_readiness() {
         use crate::control::StorageResult;
         let updates = Arc::new(crate::control::Updates::default());
-        let registry = Registry::new(0, updates.clone());
+        let tuning = serde_json::json!({"ioWorkers": 2, "computeWorkers": 2, "buffersPerNode": 16});
+        let registry = Registry::new(0, updates.clone()).with_tuning(tuning.clone());
         let before = registry.status();
         let series = |text: String| -> std::collections::BTreeSet<String> {
             text.lines()
@@ -36,6 +37,7 @@ mod tests {
             assert!(text.contains("racer_dataplane_cache_storage_phase{phase=\"failed\"} 1\n"));
             assert_eq!(registry.status()["ready"], before["ready"]);
             assert_eq!(registry.status()["lastError"], before["lastError"]);
+            assert_eq!(registry.status()["tuning"], tuning);
         }
         let request = updates.desired_storage().unwrap();
         assert!(updates.report_storage(&request, StorageResult::Applied, 2 << 30));

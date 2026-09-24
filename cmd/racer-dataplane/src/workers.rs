@@ -68,6 +68,88 @@ impl ComputePlacement {
     }
 }
 impl CpuPlan {
+    /// Automatic daemon profile leaves half the allowed logical CPUs available
+    /// to co-located work, never uses SMT siblings, and caps automatic execution
+    /// at 16 physical cores. At least two disjoint cores are needed even under a
+    /// fractional quota; CFS still enforces that quota. Explicit counts retain
+    /// the existing per-NUMA semantics and bypass the automatic CPU budget.
+    pub fn discover_bounded(
+        config: Config,
+        counts: WorkerCounts,
+        limits: crate::tuning::Limits,
+        max_io: usize,
+    ) -> io::Result<Self> {
+        Self::bounded(config, counts, discover()?, limits, max_io)
+    }
+
+    fn bounded(
+        config: Config,
+        counts: WorkerCounts,
+        cpus: Vec<Cpu>,
+        limits: crate::tuning::Limits,
+        max_io: usize,
+    ) -> io::Result<Self> {
+        if counts.io_per_node.is_some() || counts.compute_per_node.is_some() {
+            return Self::build(config, counts, cpus);
+        }
+        let budget = (cpus.len() / 2)
+            .min(limits.cpu_quota.unwrap_or(usize::MAX))
+            .clamp(2, 16);
+        let all = place(
+            Config {
+                shard_count: NonZeroUsize::new(cpus.len()).ok_or_else(|| invalid("no CPUs"))?,
+            },
+            cpus.clone(),
+        )?;
+        let mut nodes: BTreeMap<NumaNodeId, Vec<CpuId>> = BTreeMap::new();
+        for p in all {
+            nodes.entry(p.node).or_default().push(p.cpu);
+        }
+        let mut nodes: Vec<_> = nodes
+            .into_iter()
+            .filter(|(_, cores)| cores.len() >= 2)
+            .take(
+                (budget / 2)
+                    .min(limits.max_nodes())
+                    .min(max_io)
+                    .min(config.shard_count.get()),
+            )
+            .map(|(_, cores)| (cores, 2usize))
+            .collect();
+        if nodes.is_empty() {
+            return Err(invalid(
+                "automatic tuning needs two physical cores on one NUMA node, memory for four buffers, and sufficient memlock",
+            ));
+        }
+        let mut remaining = budget - 2 * nodes.len();
+        while remaining > 0 {
+            let mut progress = false;
+            for (cores, count) in &mut nodes {
+                if remaining > 0 && *count < cores.len() {
+                    *count += 1;
+                    remaining -= 1;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        let selected: BTreeSet<_> = nodes
+            .iter()
+            .flat_map(|(cores, n)| cores.iter().take(*n).copied())
+            .collect();
+        Self::build(
+            Config {
+                shard_count: NonZeroUsize::new(config.shard_count.get().min(max_io)).unwrap(),
+            },
+            counts,
+            cpus.into_iter()
+                .filter(|c| selected.contains(&c.id))
+                .collect(),
+        )
+    }
+
     pub fn discover(config: Config, counts: WorkerCounts) -> io::Result<Self> {
         Self::build(config, counts, discover()?)
     }

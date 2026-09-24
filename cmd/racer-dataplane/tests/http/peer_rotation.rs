@@ -106,7 +106,14 @@ fn peer_rotation_child() {
     listener.set_tls_revision(1);
     let (_, mut config) = crate::control::tests::fixture();
     config.volumes[0].peers = vec![bid.node.clone()];
-    config.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = bid.node.clone();
+    config.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = bid.node.clone();
     let mut ingress = Handler::new(cache(&backend, 4), backend.clone());
     ingress.set_attempt_policy(1).unwrap();
     ingress.set_routing(
@@ -144,8 +151,8 @@ fn peer_rotation_child() {
     config.volumes[0].peers = vec![aid.node.clone()];
     let topology = config.volumes[0].topology.as_mut().unwrap();
     topology.local_slots = vec![1];
-    topology.neighbors[0].slot = 0;
-    topology.neighbors[0].peer = aid.node.clone();
+    topology.product.as_mut().unwrap().local_member = 1;
+    topology.product.as_mut().unwrap().members[0] = aid.node.clone();
     owner.set_routing(
         Arc::new(crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap()),
         BTreeMap::from([(aid.node.clone(), Peer::new("127.0.0.1:1", None).unwrap())]),

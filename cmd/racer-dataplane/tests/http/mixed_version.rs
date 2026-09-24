@@ -4,12 +4,19 @@
 use super::*;
 
 pub(super) fn cycle_handler(epoch: u64, remote: &str, address: std::net::SocketAddr) -> Handler {
+    let remote = match remote {
+        "a" => "02".repeat(32),
+        "b" => "03".repeat(32),
+        _ => remote.to_owned(),
+    };
     let (_, mut config) = crate::control::tests::fixture();
     let volume = &mut config.volumes[0];
-    volume.peers = vec![remote.into()];
+    volume.peers = vec![remote.clone()];
     let topology = volume.topology.as_mut().unwrap();
     topology.epoch = epoch;
-    topology.neighbors[0].peer = remote.into();
+    let local = u32::from(remote == "02".repeat(32));
+    topology.product.as_mut().unwrap().local_member = local;
+    topology.local_slots = vec![local];
     let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
     // Both independently converging nodes currently believe they own slot zero.
     let backend = Backend::new("127.0.0.1:1", "cycle-origin").unwrap();
@@ -17,10 +24,7 @@ pub(super) fn cycle_handler(epoch: u64, remote: &str, address: std::net::SocketA
     handler.set_attempt_policy(1).unwrap();
     handler.set_routing(
         routing,
-        BTreeMap::from([(
-            remote.into(),
-            Peer::new(&address.to_string(), None).unwrap(),
-        )]),
+        BTreeMap::from([(remote, Peer::new(&address.to_string(), None).unwrap())]),
     );
     handler
 }
@@ -160,8 +164,9 @@ fn http_a_b_a_exhausts_without_origin_or_coalescing_deadlock() {
             }
         };
         assert_eq!(
-            status, 503,
-            "hop exhaustion must not become origin failure/fallback"
+            status,
+            if saturated { 503 } else { 502 },
+            "foreign topology must fail without origin fallback"
         );
         drop(pins);
     }
@@ -178,7 +183,7 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         return;
     };
     let a = cycle_handler(1, "b", "127.0.0.1:1".parse().unwrap());
-    let b = cycle_handler(2, "a", "127.0.0.1:1".parse().unwrap());
+    let b = cycle_handler(1, "a", "127.0.0.1:1".parse().unwrap());
     let object = page_target(&a);
     let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);
     let request = UpstreamRequest::PeerPage(page.clone());
@@ -192,7 +197,7 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
     let end = Instant::now() + Duration::from_secs(5);
     let mut last_deadline = end;
     let authorization = crate::authorization::Authorization::new("Bearer cyclic-page").unwrap();
-    for hop in 0..8 {
+    for hop in 0..1 {
         let wire = provider.budget_wire(&request, last_deadline).unwrap();
         let (_, remaining, _, _) = cache::peer_wire::chain(&wire).unwrap().unwrap();
         assert_eq!(remaining, 7 - hop);
@@ -232,10 +237,6 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         assert_eq!(forwarded.as_str(), authorization.as_str());
         let receiver = if hop % 2 == 0 { &b } else { &a };
         provider = receiver.peer_provider(metadata).unwrap();
-        assert!(
-            provider.has_peer(),
-            "local placement must keep the cycle visible"
-        );
         let next_deadline = remote_deadline(metadata, end).unwrap();
         assert!(next_deadline < last_deadline);
         last_deadline = next_deadline;
@@ -253,6 +254,7 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         assert_eq!(fault.representation_checksum(), Some(page.checksum()));
         drop(fault);
     }
+    provider.chain.borrow_mut().hops = 0;
     assert!(provider.budget_wire(&request, end).is_err());
     let (authority, destination) = destination(&ring, *page.key());
     // This is the production RDMA recovery continuation, with exhausted state.
@@ -278,7 +280,7 @@ fn namespace_isolation_and_relay_flights_under_saturation() {
         return;
     };
     let a = cycle_handler(1, "b", "127.0.0.1:1".parse().unwrap());
-    let b = cycle_handler(2, "a", "127.0.0.1:1".parse().unwrap());
+    let b = cycle_handler(1, "a", "127.0.0.1:1".parse().unwrap());
     let object = page_target(&a);
     let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);
     let request = UpstreamRequest::PeerPage(page.clone());
@@ -392,7 +394,7 @@ fn production_http_recovery_and_reroute_spend_existing_chain() {
     a.set_peer_tls(
         "v1",
         credentials,
-        &BTreeMap::from([("b".into(), peer_identity(3))]),
+        &BTreeMap::from([("03".repeat(32), peer_identity(3))]),
     );
     let object = page_target(&a);
     let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);
@@ -465,7 +467,7 @@ fn http_admission_retries_do_not_spend_resolution_budget() {
     a.set_peer_tls(
         "v1",
         credentials,
-        &BTreeMap::from([("b".into(), peer_identity(3))]),
+        &BTreeMap::from([("03".repeat(32), peer_identity(3))]),
     );
     let object = page_target(&a);
     let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);

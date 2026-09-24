@@ -10,10 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::{Error, Result};
 
 pub const SLOT_COUNT: u32 = 262_144;
-/// Legacy slot graph with 64MiB page striping, accepted for compatibility.
-pub const ROUTING_ALGORITHM: u32 = 1;
 /// Physical-owner HRW with independent Cartesian-product routing roles.
-pub const PRODUCT_ROUTING_ALGORITHM: u32 = 2;
+pub const PRODUCT_ROUTING_ALGORITHM: u32 = 1;
 pub const GENERATION_FORMAT: u32 = 1;
 pub const SOCKET_ROOT: &str = "/dev/racer";
 

@@ -99,8 +99,15 @@ pub(crate) mod failure_tests {
         (PeerReason::MetadataChanged, 412, true),
     ];
     pub(crate) fn route(final_hop: bool) -> AttemptRoute {
+        let volume =
+            crate::control::product_routing::tests::volume(2, 2, (0..4).collect(), 0, vec![3]);
+        let routing = crate::routing::Routing::new(&[1; 32], &volume).unwrap();
+        let mut cursor = routing.start_key(&[0; 32]);
+        // Owner-health fixtures use the zero identity as their synthetic catalog.
+        // Keep a valid product cursor body while binding reports to that catalog.
+        cursor.identity = [0; 32];
         AttemptRoute {
-            cursor: crate::routing::Cursor::decode(&[0; crate::routing::Cursor::LEN]).unwrap(),
+            cursor,
             candidate: 3,
             endpoint: "127.0.0.1:1".parse().unwrap(),
             final_hop,
@@ -232,13 +239,16 @@ pub(crate) mod failure_tests {
         }
     }
     #[test]
-    fn owner_reports_require_exact_bounded_request_context() {
+    fn typed_reports_require_exact_bounded_request_context() {
         let route = route(false);
         let valid = format!(
             "X-Racer-Owner-Unavailable: 3\r\nX-Racer-Attempt: {}\r\n",
             route.context
         );
-        assert!(headers(&valid, |h| validate_owner_report(h, Some(0), &route)).is_ok());
+        assert!(headers(&valid, |h| validate_peer_report(h, Some(0), 503, &route)).is_err());
+        let error = headers(&valid, |h| cache::http_metadata::response_status(503, h)).unwrap();
+        assert_eq!(owner_failure(&error), None);
+        assert!(!error.attempt_failure().is_some_and(|f| f.owner_evidence()));
         for wire in [
             valid.replace("Unavailable: 3", "Unavailable: 4"),
             valid.replace(&route.context, &"b".repeat(96)),
@@ -248,10 +258,10 @@ pub(crate) mod failure_tests {
             "X-Racer-Owner-Unavailable: 3\r\n".into(),
             format!("{valid}Content-Encoding: gzip\r\n"),
         ] {
-            assert!(headers(&wire, |h| validate_owner_report(h, Some(0), &route)).is_err());
+            assert!(headers(&wire, |h| validate_peer_report(h, Some(0), 503, &route)).is_err());
         }
         for length in [None, Some(1), Some(u64::MAX)] {
-            assert!(headers(&valid, |h| validate_owner_report(h, length, &route)).is_err());
+            assert!(headers(&valid, |h| validate_peer_report(h, length, 503, &route)).is_err());
         }
         for (reason, status, _) in SEMANTICS {
             let failure = PeerFailure {
@@ -274,7 +284,6 @@ pub(crate) mod failure_tests {
             for malformed in [
                 format!("{wire}X-Racer-Failure: {encoded}\r\n"),
                 format!("{wire}Content-Encoding: gzip\r\n"),
-                format!("{wire}X-Racer-Owner-Unavailable: 4\r\n"),
                 wire.replace(&route.context, &"b".repeat(96)),
                 wire.replace(&encoded, "00"),
             ] {
@@ -447,12 +456,24 @@ mod attribution {
             metadata.iter().all(|(node, _)| *node == 0),
             "both metadata requests must choose successor 0"
         );
-        c.remove(1);
+        drop(c);
+        let mut c = crate::runtime::tests::Cluster::new().unwrap();
         let target = c.target(7, "failed-relay");
-        assert_eq!(c.get(4, &target).0, 502);
+        let config = c.config(0);
+        let routing = config.volumes()[0].routing();
+        let cursor = routing.start(&target);
+        assert!(cursor.path.len() > 2, "fixture requires an intermediate");
+        let repaired = routing.repair(&cursor).unwrap();
+        assert_ne!(cursor.path[1], repaired.path[1]);
+        assert_ne!(repaired.path[1], routing.destination(&cursor));
+        // A product route can repair one failed intermediate. Fail its repair
+        // too, while leaving the owner alive: neither failure is owner evidence.
+        c.remove(cursor.path[1] as usize);
+        c.remove(repaired.path[1] as usize);
+        assert_eq!(c.get(0, &target).0, 502);
         assert_eq!(
             c.hits.lock().unwrap().len(),
-            4,
+            0,
             "relay failure cannot authorize a backend"
         );
     }

@@ -2,6 +2,48 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+fn chain_routing(index: usize, count: usize, first: u8) -> Arc<crate::routing::Routing> {
+    let graph = crate::product::Product::new(2, 50).unwrap();
+    let path = (1..100)
+        .find_map(|target| {
+            let path = graph.route(0, target).unwrap();
+            (path.len() == count).then_some(path)
+        })
+        .unwrap();
+    let mut roles = path.clone();
+    roles.extend((0..100).filter(|role| !path.contains(role)));
+    let members: Vec<_> = (0..100)
+        .map(|n| format!("{:02x}", first + n).repeat(32))
+        .collect();
+    let adjacent = graph.neighbors(roles[index]);
+    let volume = crate::control::proto::Volume {
+        id: "chain".into(),
+        peers: members
+            .iter()
+            .zip(&roles)
+            .filter(|(_, role)| adjacent.contains(role))
+            .map(|(id, _)| id.clone())
+            .collect(),
+        topology: Some(crate::control::proto::Topology {
+            epoch: 1,
+            slot_count: 1,
+            local_slots: if index + 1 == count { vec![0] } else { vec![] },
+            routing_algorithm: Some(1),
+            product: Some(crate::control::proto::ProductTopology {
+                left_factor: 2,
+                right_factor: 50,
+                members,
+                roles,
+                local_member: index as u32,
+                candidate_width: 1,
+                candidates: vec![count as u32 - 1],
+            }),
+        }),
+        ..Default::default()
+    };
+    Arc::new(crate::routing::Routing::new(&[1; 32], &volume).unwrap())
+}
 use crate::http_auth::failure_tests::SEMANTICS;
 use crate::tls::{ExpectedPeer, PeerIdentity, TlsContext, TlsProgress, TlsSession};
 use cache::adapter_fixture::page_request;
@@ -149,34 +191,16 @@ fn candidate_reservation_is_bounded_and_strict_at_exhaustion() {
 }
 
 #[test]
-fn colocated_positions_share_only_normalized_candidate_scope() {
+fn product_flights_keep_candidate_and_generation_scope() {
     let (_, mut config) = crate::control::tests::fixture();
     let volume = &mut config.volumes[0];
-    volume.peers = vec!["p2".into(), "p3".into()];
-    volume.topology = Some(crate::control::proto::Topology {
-        product: None,
-        routing_algorithm: Some(1),
-        epoch: 1,
-        slot_count: 8,
-        local_slots: vec![0, 1],
-        neighbors: vec![
-            crate::control::proto::SlotPeer {
-                slot: 2,
-                peer: "p2".into(),
-            },
-            crate::control::proto::SlotPeer {
-                slot: 3,
-                peer: "p3".into(),
-            },
-        ],
-    });
     let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
     let target = (0..)
         .map(|i| format!("/colocated-{i}"))
-        .find(|t| routing.start(t).owner == 7)
+        .find(|t| routing.start(t).owner == 1)
         .unwrap();
     let cursor = routing.start(&target);
-    assert_eq!(routing.normalized_position(&cursor).unwrap(), 1);
+    assert_eq!(routing.normalized_position(&cursor).unwrap(), 0);
     let mut provider = Provider {
         routing: Some(routing.clone()),
         active: Some(Rc::new(RefCell::new(RouteState {
@@ -419,7 +443,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
     let error = provider
         .peer_failed(cache::Error::Shared(shared))
         .unwrap_err();
-    assert_eq!(owner_failure(&error), Some(1));
+    assert_eq!(crate::outcome::owner_failure(&error), Some(1));
     assert_eq!(
         relay.borrow().cursor.attempt,
         0,
@@ -499,7 +523,7 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
     let mut first = provider.routed(state());
     let second = provider.routed(state());
     let scope = second.network_scope([42; 32]).unwrap();
-    assert_eq!(first.network_scope([42; 32]), Some(scope.clone()));
+    assert_ne!(first.network_scope([42; 32]), Some(scope.clone()));
     assert!(Rc::ptr_eq(
         first.peer.as_ref().unwrap(),
         second.peer.as_ref().unwrap()
@@ -697,6 +721,23 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
     let mut client_server =
         http::Server::new(client_listener, client_handler, http::Config::default());
     handler.upstream.authentication = Some(peer_policy(3, 2));
+    let v = crate::control::product_routing::tests::volume(1, 1, vec![0], 0, vec![0]);
+    let routing = Arc::new(crate::routing::Routing::new(&[1; 32], &v).unwrap());
+    let key = cache::PeerDescriptor::metadata("/pinned")
+        .key(handler.namespace)
+        .unwrap();
+    let mut inner = b"RR01".to_vec();
+    inner.extend(routing.start_key(&key).encode());
+    inner.extend(b"RD01\0/pinned");
+    let peer_wire = cache::peer_wire::with_chain(
+        cache::peer_wire::with_budget(inner, Duration::from_secs(5)).unwrap(),
+        *handler.namespace.digest(),
+        7,
+        127,
+        0,
+    )
+    .unwrap();
+    handler.set_routing(routing, BTreeMap::new());
     let tls = PeerTls::new();
     let mut listener = http::Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -723,15 +764,9 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
             };
             let mut fields = Vec::new();
             if peer {
-                fields.push((
-                    "X-Racer-Fault".to_owned(),
-                    hex(b"RB01\x88\x13\0\0RD01\0/pinned").into_bytes(),
-                ));
+                fields.push(("X-Racer-Fault".to_owned(), hex(&peer_wire).into_bytes()));
                 fields.push(("X-Racer-Volume".to_owned(), b"test-volume".to_vec()));
-                let binding = crate::authorization::binding(
-                    b"RB01\x88\x13\0\0RD01\0/pinned",
-                    &Default::default(),
-                );
+                let binding = crate::authorization::binding(&peer_wire, &Default::default());
                 fields.push((
                     "X-Racer-Attempt".into(),
                     format!("{}{}", hex(binding.as_bytes()), "0".repeat(32)).into_bytes(),

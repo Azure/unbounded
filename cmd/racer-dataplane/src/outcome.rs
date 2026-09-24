@@ -24,14 +24,15 @@ pub(crate) fn peer_failure(
 ) -> PeerFailure {
     error.evidence().peer_failure(identity, candidate)
 }
+#[cfg(test)]
 pub(crate) fn owner_failure(error: &crate::cache::Error) -> Option<u32> {
     error.evidence().owner
 }
-#[allow(dead_code)] // Compatibility accessor for existing owning-module tests.
+#[cfg(test)]
 pub(crate) fn semantic_failure(error: &crate::cache::Error) -> Option<PeerFailure> {
     error.evidence().semantic
 }
-#[allow(dead_code)] // Compatibility accessor for existing owning-module tests.
+#[cfg(test)]
 pub(crate) fn attempt_evidence(error: &crate::cache::Error) -> Option<&Failure> {
     error.evidence().attempt
 }

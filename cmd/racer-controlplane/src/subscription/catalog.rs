@@ -94,12 +94,7 @@ fn encode_catalog(universe: &str, publication: &Published) -> Result<Vec<u8>, St
                 .ok_or(StatusCode::SERVICE_UNAVAILABLE)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut volumes: Vec<_> = generation
-        .volumes
-        .iter()
-        .filter(|v| v.routing_algorithm == crate::model::PRODUCT_ROUTING_ALGORITHM)
-        .map(|v| v.id.as_str())
-        .collect();
+    let mut volumes: Vec<_> = generation.volumes.iter().map(|v| v.id.as_str()).collect();
     volumes.sort_unstable();
     let catalog = Catalog {
         schema: 1,
