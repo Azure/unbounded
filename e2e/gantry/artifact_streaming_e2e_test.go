@@ -36,12 +36,37 @@ const (
 	streamingOriginHost = streamingOriginName + "." + namespace + ".svc.cluster.local"
 )
 
-func TestE2E_ArtifactStreamingOriginThenPeer(t *testing.T) {
+// artifactStreamingOriginRequestURI builds the ACR data-path form OverlayBD
+// receives after the registry redirect, doubled slash and encoded query
+// included. The origin rejects anything that does not arrive byte-for-byte.
+func artifactStreamingOriginRequestURI(digest, sentinel string) string {
+	hex := strings.TrimPrefix(digest, "sha256:")
+
+	return "/account//docker/registry/v2/blobs/sha256/" + hex[:2] + "/" + hex + "/data" +
+		"?se=2030-01-01T00%3A00%3A00Z&sig=" + sentinel + "&sp=r&sv=2018-03-28"
+}
+
+type artifactStreamingFixture struct {
+	t            *testing.T
+	ctx          context.Context
+	harness      *harness
+	body         []byte
+	digest       string
+	originURL    string
+	sentinel     string
+	requesterPod string
+	providerPod  string
+	providerNode string
+}
+
+func setupArtifactStreaming(t *testing.T) *artifactStreamingFixture {
+	t.Helper()
+
 	h := newHarness(t)
 	h.checkPrereqs()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	h.bootCluster(ctx)
 	t.Cleanup(func() {
@@ -55,55 +80,118 @@ func TestE2E_ArtifactStreamingOriginThenPeer(t *testing.T) {
 	h.applyManifests(ctx)
 	h.waitForRollout(ctx)
 
+	// A real SAS value is opaque, so use a sentinel that makes a leak unambiguous.
+	const sentinel = "e2eSasValueMustNotLeak"
+
 	body := []byte(fmt.Sprintf("0123456789-artifact-streaming-%d", time.Now().UnixNano()))
 	digest := artifactStreamingDigest(body)
+	requestURI := artifactStreamingOriginRequestURI(digest, sentinel)
+
 	caPEM, certPEM, keyPEM := generateArtifactStreamingCertificate(t, streamingOriginHost)
-	h.installArtifactStreamingOrigin(ctx, body, caPEM, certPEM, keyPEM)
+	h.installArtifactStreamingOrigin(ctx, body, requestURI, caPEM, certPEM, keyPEM)
 	h.enableArtifactStreaming(ctx, caPEM)
 	h.waitForRollout(ctx)
 	h.checkReadyz(ctx)
 
 	workers := h.workerNodes(ctx)
-	requesterPod := h.gantryPodOnNode(ctx, workers[0])
-	providerPod := h.gantryPodOnNode(ctx, workers[1])
-	// A real SAS value is opaque, so use a sentinel that makes a leak unambiguous.
-	const signedQuerySentinel = "e2eSasValueMustNotLeak"
 
-	originURL := "https://" + streamingOriginHost + ":8443/blob?d=" + digest + "&sig=" + signedQuerySentinel
+	return &artifactStreamingFixture{
+		t:            t,
+		ctx:          ctx,
+		harness:      h,
+		body:         body,
+		digest:       digest,
+		originURL:    "https://" + streamingOriginHost + ":8443" + requestURI,
+		sentinel:     sentinel,
+		requesterPod: h.gantryPodOnNode(ctx, workers[0]),
+		providerPod:  h.gantryPodOnNode(ctx, workers[1]),
+		providerNode: workers[1],
+	}
+}
 
-	originBefore := h.metricSumOnPod(ctx, requesterPod, "gantry_streaming_requests_total", `source="origin"`, `outcome="success"`)
-	response := h.requestArtifactStreamingRange(ctx, requesterPod, originURL, "bytes=2-5")
-	assertArtifactStreamingResponse(t, response, len(body))
-	h.waitForMetricIncreaseOnPod(ctx, requesterPod, "gantry_streaming_requests_total", originBefore, `source="origin"`, `outcome="success"`)
+func (f *artifactStreamingFixture) request() {
+	f.t.Helper()
 
-	advertiseBefore := h.metricSumOnPod(ctx, providerPod, "gantry_advertise_total")
-	h.ingestArtifactStreamingBlob(ctx, workers[1], digest, body)
-	h.waitForMetricIncreaseOnPod(ctx, providerPod, "gantry_advertise_total", advertiseBefore)
+	response := f.harness.requestArtifactStreamingRange(f.ctx, f.requesterPod, f.originURL, "bytes=2-5")
+	assertArtifactStreamingResponse(f.t, response, len(f.body))
+}
 
-	peerBefore := h.metricSumOnPod(ctx, requesterPod, "gantry_streaming_requests_total", `source="peer"`, `outcome="success"`)
+func (f *artifactStreamingFixture) streamingSuccesses(source string) float64 {
+	f.t.Helper()
+
+	return f.harness.metricSumOnPod(f.ctx, f.requesterPod,
+		"gantry_streaming_requests_total", `source="`+source+`"`, `outcome="success"`)
+}
+
+func (f *artifactStreamingFixture) waitForStreamingSuccess(source string, before float64) {
+	f.t.Helper()
+
+	f.harness.waitForMetricIncreaseOnPod(f.ctx, f.requesterPod,
+		"gantry_streaming_requests_total", before, `source="`+source+`"`, `outcome="success"`)
+}
+
+// serveFromPeer publishes the blob on the provider node and drives ranges until
+// the requester resolves one from the advertised peer.
+func (f *artifactStreamingFixture) serveFromPeer() {
+	f.t.Helper()
+
+	advertiseBefore := f.harness.metricSumOnPod(f.ctx, f.providerPod, "gantry_advertise_total")
+	f.harness.ingestArtifactStreamingBlob(f.ctx, f.providerNode, f.digest, f.body)
+	f.harness.waitForMetricIncreaseOnPod(f.ctx, f.providerPod, "gantry_advertise_total", advertiseBefore)
+
+	peerBefore := f.streamingSuccesses("peer")
 	deadline := time.Now().Add(2 * time.Minute)
 
 	for {
-		response = h.requestArtifactStreamingRange(ctx, requesterPod, originURL, "bytes=2-5")
-		assertArtifactStreamingResponse(t, response, len(body))
+		f.request()
 
-		if h.metricSumOnPod(ctx, requesterPod, "gantry_streaming_requests_total", `source="peer"`, `outcome="success"`) > peerBefore {
-			break
+		if f.streamingSuccesses("peer") > peerBefore {
+			return
 		}
 
 		if time.Now().After(deadline) {
-			h.dumpDiagnostics(ctx)
-			t.Fatal("artifact streaming did not transition from signed origin to complete peer within 2m")
+			f.harness.dumpDiagnostics(f.ctx)
+			f.t.Fatal("artifact streaming did not transition from signed origin to complete peer within 2m")
 		}
 
 		select {
-		case <-ctx.Done():
-			t.Fatalf("context canceled waiting for peer range service: %v", ctx.Err())
+		case <-f.ctx.Done():
+			f.t.Fatalf("context canceled waiting for peer range service: %v", f.ctx.Err())
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
 
-	h.assertNoSignedQueryLeak(ctx, signedQuerySentinel)
+func TestE2E_ArtifactStreamingOriginThenPeer(t *testing.T) {
+	f := setupArtifactStreaming(t)
+
+	originBefore := f.streamingSuccesses("origin")
+	f.request()
+	f.waitForStreamingSuccess("origin", originBefore)
+
+	f.serveFromPeer()
+
+	f.harness.assertNoSignedQueryLeak(f.ctx, f.sentinel)
+}
+
+// TestE2E_ArtifactStreamingStaleProviderFallsBackToOrigin covers the provider
+// record outliving the blob: libp2p has no protocol-level withdraw, so a peer
+// that can no longer serve must be failed over inside the same request.
+func TestE2E_ArtifactStreamingStaleProviderFallsBackToOrigin(t *testing.T) {
+	f := setupArtifactStreaming(t)
+
+	f.serveFromPeer()
+	f.harness.removeArtifactStreamingBlob(f.ctx, f.providerNode, f.digest)
+
+	originBefore := f.streamingSuccesses("origin")
+	peerBefore := f.streamingSuccesses("peer")
+
+	f.request()
+	f.waitForStreamingSuccess("origin", originBefore)
+
+	if peerAfter := f.streamingSuccesses("peer"); peerAfter != peerBefore {
+		t.Fatalf("peer served %.0f ranges after its blob was removed", peerAfter-peerBefore)
+	}
 }
 
 // assertNoSignedQueryLeak pins that a signed origin credential never reaches
@@ -198,10 +286,10 @@ func generateArtifactStreamingCertificate(t *testing.T, host string) ([]byte, []
 		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
 }
 
-func (h *harness) installArtifactStreamingOrigin(ctx context.Context, body, caPEM, certPEM, keyPEM []byte) {
+func (h *harness) installArtifactStreamingOrigin(ctx context.Context, body []byte, expectedRequestURI string, caPEM, certPEM, keyPEM []byte) {
 	h.t.Helper()
 
-	manifest := artifactStreamingOriginManifest(body, caPEM, certPEM, keyPEM)
+	manifest := artifactStreamingOriginManifest(body, expectedRequestURI, caPEM, certPEM, keyPEM)
 
 	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
 		h.t.Fatalf("apply artifact streaming origin: %v", err)
@@ -216,7 +304,7 @@ func (h *harness) installArtifactStreamingOrigin(ctx context.Context, body, caPE
 	}
 }
 
-func artifactStreamingOriginManifest(body, caPEM, certPEM, keyPEM []byte) string {
+func artifactStreamingOriginManifest(body []byte, expectedRequestURI string, caPEM, certPEM, keyPEM []byte) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -243,7 +331,11 @@ data:
         listen 8443 ssl;
         ssl_certificate /tls/tls.crt;
         ssl_certificate_key /tls/tls.key;
-        location / { root /usr/share/nginx/html; }
+        location / {
+          if ($request_uri = "%[7]s") { rewrite ^ /blob last; }
+          return 421;
+        }
+        location = /blob { root /usr/share/nginx/html; }
       }
     }
 ---
@@ -300,7 +392,8 @@ spec:
 		base64.StdEncoding.EncodeToString(caPEM),
 		base64.StdEncoding.EncodeToString(body),
 		base64.StdEncoding.EncodeToString(certPEM),
-		base64.StdEncoding.EncodeToString(keyPEM))
+		base64.StdEncoding.EncodeToString(keyPEM),
+		expectedRequestURI)
 }
 
 func TestArtifactStreamingOriginManifestIsValidYAML(t *testing.T) {
@@ -308,6 +401,7 @@ func TestArtifactStreamingOriginManifestIsValidYAML(t *testing.T) {
 
 	manifest := artifactStreamingOriginManifest(
 		[]byte("body"),
+		"/account//docker/registry/v2/blobs/sha256/ab/"+strings.Repeat("a", 64)+"/data?sig=x",
 		[]byte("ca"),
 		[]byte("certificate"),
 		[]byte("key"),
@@ -449,6 +543,15 @@ func (h *harness) ingestArtifactStreamingBlob(ctx context.Context, node, digest 
 			h.t.Logf("remove artifact streaming blob from %s: %v", node, err)
 		}
 	})
+}
+
+func (h *harness) removeArtifactStreamingBlob(ctx context.Context, node, digest string) {
+	h.t.Helper()
+
+	if err := h.run(ctx, h.containerEngine, "exec", node,
+		"ctr", "-n", "k8s.io", "content", "rm", digest); err != nil {
+		h.t.Fatalf("remove artifact streaming blob from %s: %v", node, err)
+	}
 }
 
 func (h *harness) requestArtifactStreamingRange(ctx context.Context, pod, originURL, requestedRange string) artifactStreamingResponse {
