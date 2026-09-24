@@ -663,12 +663,11 @@ async fn queued_admission_refreshes_state_and_fails_closed() {
     drop(stream);
     let image = StateImage {
         metadata: serde_json::to_vec(&json!({
-            "version":5,"namespace":"system","fence":"scale","generation":1,
+            "version":1,"namespace":"system","fence":"scale","generation":1,
             "active":ca.digest,"phase":"stable","authorities":[ca],
             "rotation_nonce":"","published_at":null,"overlap_delay":60,"retirement_skew":60
         }))
         .unwrap(),
-        shards: BTreeMap::new(),
     };
     let security = Arc::new(RwLock::new(Some(SecurityContext {
         fence: "scale".into(),
