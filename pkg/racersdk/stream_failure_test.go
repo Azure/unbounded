@@ -58,7 +58,7 @@ func TestStreamFailureLaterPagePreservesStatusAndOffset(t *testing.T) {
 	n, err := s.WriteTo(io.Discard)
 
 	var status *HTTPError
-	if n != 8 || !errors.As(err, &status) || status.StatusCode != 503 || requests.Load() != 2 {
+	if n != 8 || !errors.As(err, &status) || status.StatusCode != 503 || requests.Load() != 2+pageRetries {
 		t.Fatal(n, err, requests.Load())
 	}
 

@@ -266,7 +266,7 @@ func (s *Stream) nextPage() error {
 		s.release(false)
 	}
 
-	return s.preparePage()
+	return s.preparePageWithRetry()
 }
 
 func (s *Stream) preparePage() error {
@@ -325,6 +325,13 @@ func (s *Stream) preparePage() error {
 	s.statusCode = resp.StatusCode
 
 	s.operation = "page_validate"
+
+	if resp.StatusCode == 429 || resp.StatusCode == 503 || resp.StatusCode == 504 {
+		if err := identityResponse(resp); err != nil {
+			return err
+		}
+	}
+
 	if err := s.object.validatePage(resp, s.offset, s.pageEnd-1); err != nil {
 		return err
 	}

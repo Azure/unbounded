@@ -148,6 +148,34 @@ non-socket writers must provide their own cancellation for a blocked Write.
 Only fully consumed valid responses are pooled. Failed/abandoned responses are
 closed. Streams do not automatically retry stale idle sockets or version errors.
 
+### Bounded transient page recovery
+
+Prepare and subsequent page requests retry only HTTP 429, 503, and 504 received
+before consuming any body of that page. Each attempt uses the same immutable
+HEAD snapshot, target, exact Range, and If-Match; HEAD is not repeated. Earlier
+pages already forwarded are never replayed. Successful pages must still pass
+all version, content-type, length, and Content-Range checks. Authorization,
+version, framing, transport, body truncation, and downstream errors are terminal.
+Encoded/chunked transient error responses and malformed Retry-After fields are
+also terminal. A rejected response's connection and read-ahead are discarded
+without draining its body or returning it to the idle pool.
+
+There are at most four retries per page, one active attempt at a time, with
+exponential backoff bases of 100, 200, 400, and 800 milliseconds plus uniform
+jitter in [0, base). Retry-After accepts delay seconds or an HTTP date and is a
+minimum delay, with jitter added. Invalid hints or delays that exceed the
+five-second cumulative per-page wait budget or remaining stream deadline cause
+the original HTTP error to be returned; hints are never shortened. All attempts
+retain the original stream context/deadline, including ClientOptions.Timeout.
+Close and context cancellation interrupt retry waits and dispose of active
+sockets/pipes. No retry refreshes the total budget or adds parallel fanout.
+
+Recovered transient statuses do not populate Failure(); it describes the first
+terminal failure. Exhaustion still returns an error and records its final page
+status/offset. This bounded recovery tolerates brief rejection; it does not fix
+sustained overload or guarantee full-image completion. End-to-end digest
+verification remains the consumer's responsibility.
+
 Successful socket transfers return only drained pipes to an explicit shared
 cache holding at most eight pipes. Each pipe owns two FDs and its kernel-reported
 capacity; the 1 MiB request is a target, not an assumption about host limits or

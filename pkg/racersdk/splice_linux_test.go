@@ -55,6 +55,8 @@ func downstreamPair(t *testing.T, network string) (net.Conn, net.Conn) {
 func TestStreamFailureSpliceTruncatedPage(t *testing.T) {
 	const sent = 128 << 10
 
+	var requests atomic.Int32
+
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", checksumTag(nil))
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -63,6 +65,8 @@ func TestStreamFailureSpliceTruncatedPage(t *testing.T) {
 		if r.Method == "HEAD" {
 			return
 		}
+
+		requests.Add(1)
 
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", sent, sent+1))
 		w.WriteHeader(206)
@@ -89,7 +93,7 @@ func TestStreamFailureSpliceTruncatedPage(t *testing.T) {
 	_ = s.Close()
 
 	f := s.Failure()
-	if !errors.Is(err, io.ErrUnexpectedEOF) || n != sent || <-done != sent || f == nil || f.Operation != "page_body" || f.Offset != sent || f.PageOffset != 0 || f.StatusCode != 206 || s.Stats().SpliceBytes == 0 {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || n != sent || <-done != sent || f == nil || f.Operation != "page_body" || f.Offset != sent || f.PageOffset != 0 || f.StatusCode != 206 || s.Stats().SpliceBytes == 0 || requests.Load() != 1 {
 		t.Fatal(n, err, f, s.Stats())
 	}
 }
