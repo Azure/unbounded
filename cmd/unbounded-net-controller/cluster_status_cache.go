@@ -20,9 +20,8 @@ import (
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-// ClusterStatusCache maintains a pre-built ClusterStatusResponse in memory,
-// updated when events signal that the status is dirty. This avoids expensive
-// O(N*P*R) fetchClusterStatus calls on every HTTP request or WS broadcast.
+// ClusterStatusCache maintains pre-built overview metadata and observed facts.
+// Diagnostic arrays remain exclusively in the separate TTL detail lifecycle.
 type ClusterStatusCache struct {
 	mu     sync.RWMutex
 	status *ClusterStatusResponse
@@ -148,6 +147,12 @@ func (c *ClusterStatusCache) patchNode(
 	eventSeq uint64,
 ) {
 	now := time.Now()
+	if overview == nil {
+		projected := statuspkg.OverviewFromStatus(&nodeStatus, now)
+		overview = &projected
+	}
+
+	nodeStatus = statuspkg.OverviewMetadata(*overview)
 	nodeStatus.NodeInfo.ExternalIPs = c.resolveNodeExternalIPs(nodeName, now)
 
 	c.mu.Lock()
@@ -165,16 +170,11 @@ func (c *ClusterStatusCache) patchNode(
 		c.nodeEventSeq[nodeName] = eventSeq
 	}
 
-	if overview == nil {
-		delete(c.status.NodeOverviews, nodeName)
-	} else {
-		if c.status.NodeOverviews == nil {
-			c.status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
-		}
-
-		c.status.NodeOverviews[nodeName] = overview
+	if c.status.NodeOverviews == nil {
+		c.status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
 	}
 
+	c.status.NodeOverviews[nodeName] = overview
 	if i, ok := c.nodeIndex[nodeName]; ok && i < len(c.status.Nodes) {
 		// Preserve controller-enriched fields across node-agent status updates.
 		existing := c.status.Nodes[i]

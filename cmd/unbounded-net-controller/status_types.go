@@ -16,43 +16,41 @@ import (
 
 // ClusterStatusResponse is the top-level status response for the cluster.
 type ClusterStatusResponse struct {
-	Seq                uint64                                        `json:"seq"`
-	Timestamp          time.Time                                     `json:"timestamp"`
-	NodeCount          int                                           `json:"nodeCount"`
-	SiteCount          int                                           `json:"siteCount"`
-	AzureTenantID      string                                        `json:"azureTenantId,omitempty"`
-	LeaderInfo         *LeaderInfo                                   `json:"leaderInfo,omitempty"`
-	BuildInfo          *BuildInfo                                    `json:"buildInfo,omitempty"`
-	Nodes              []*NodeStatusResponse                         `json:"nodes"`
-	Sites              []SiteStatus                                  `json:"sites"`
-	GatewayPools       []GatewayPoolStatus                           `json:"gatewayPools"`
-	Peerings           []PeeringStatus                               `json:"peerings"`
-	Errors             []string                                      `json:"errors,omitempty"`
-	Warnings           []string                                      `json:"warnings,omitempty"`
-	Problems           []StatusProblem                               `json:"problems"`
-	ConnectivityMatrix map[string]*SiteMatrix                        `json:"connectivityMatrix,omitempty"`
-	PullEnabled        bool                                          `json:"pullEnabled"`
-	NodeOverviews      map[string]*statusv1alpha1.NodeStatusOverview `json:"-"`
+	Seq           uint64                                        `json:"seq"`
+	Timestamp     time.Time                                     `json:"timestamp"`
+	NodeCount     int                                           `json:"nodeCount"`
+	SiteCount     int                                           `json:"siteCount"`
+	AzureTenantID string                                        `json:"azureTenantId,omitempty"`
+	LeaderInfo    *LeaderInfo                                   `json:"leaderInfo,omitempty"`
+	BuildInfo     *BuildInfo                                    `json:"buildInfo,omitempty"`
+	Nodes         []*NodeStatusResponse                         `json:"nodes"`
+	Sites         []SiteStatus                                  `json:"sites"`
+	GatewayPools  []GatewayPoolStatus                           `json:"gatewayPools"`
+	Peerings      []PeeringStatus                               `json:"peerings"`
+	Errors        []string                                      `json:"errors,omitempty"`
+	Warnings      []string                                      `json:"warnings,omitempty"`
+	Problems      []StatusProblem                               `json:"problems"`
+	PullEnabled   bool                                          `json:"pullEnabled"`
+	NodeOverviews map[string]*statusv1alpha1.NodeStatusOverview `json:"-"`
 }
 
 // ClusterStatusDelta is a WebSocket delta update.
 type ClusterStatusDelta struct {
-	Seq                uint64                 `json:"seq"`
-	Timestamp          time.Time              `json:"timestamp"`
-	NodeCount          int                    `json:"nodeCount"`
-	SiteCount          int                    `json:"siteCount"`
-	AzureTenantID      string                 `json:"azureTenantId,omitempty"`
-	LeaderInfo         *LeaderInfo            `json:"leaderInfo,omitempty"`
-	Errors             []string               `json:"errors,omitempty"`
-	Warnings           []string               `json:"warnings,omitempty"`
-	Problems           []StatusProblem        `json:"problems"`
-	UpdatedNodes       []json.RawMessage      `json:"updatedNodes,omitempty"`
-	RemovedNodes       []string               `json:"removedNodes,omitempty"`
-	Sites              []SiteStatus           `json:"sites"`
-	GatewayPools       []GatewayPoolStatus    `json:"gatewayPools"`
-	Peerings           []PeeringStatus        `json:"peerings"`
-	ConnectivityMatrix map[string]*SiteMatrix `json:"connectivityMatrix,omitempty"`
-	PullEnabled        bool                   `json:"pullEnabled"`
+	Seq           uint64              `json:"seq"`
+	Timestamp     time.Time           `json:"timestamp"`
+	NodeCount     int                 `json:"nodeCount"`
+	SiteCount     int                 `json:"siteCount"`
+	AzureTenantID string              `json:"azureTenantId,omitempty"`
+	LeaderInfo    *LeaderInfo         `json:"leaderInfo,omitempty"`
+	Errors        []string            `json:"errors,omitempty"`
+	Warnings      []string            `json:"warnings,omitempty"`
+	Problems      []StatusProblem     `json:"problems"`
+	UpdatedNodes  []json.RawMessage   `json:"updatedNodes,omitempty"`
+	RemovedNodes  []string            `json:"removedNodes,omitempty"`
+	Sites         []SiteStatus        `json:"sites"`
+	GatewayPools  []GatewayPoolStatus `json:"gatewayPools"`
+	Peerings      []PeeringStatus     `json:"peerings"`
+	PullEnabled   bool                `json:"pullEnabled"`
 }
 
 // StatusProblem describes one unhealthy condition surfaced in cluster status.
@@ -147,22 +145,21 @@ type BpfEntry = statusv1alpha1.BpfEntry
 // everything from ClusterStatusResponse except detailed per-node status
 // (routes, peers, health check details), replacing those with NodeSummary rows.
 type ClusterSummary struct {
-	Seq                uint64                 `json:"seq"`
-	Timestamp          time.Time              `json:"timestamp"`
-	NodeCount          int                    `json:"nodeCount"`
-	SiteCount          int                    `json:"siteCount"`
-	AzureTenantID      string                 `json:"azureTenantId,omitempty"`
-	LeaderInfo         *LeaderInfo            `json:"leaderInfo,omitempty"`
-	BuildInfo          *BuildInfo             `json:"buildInfo,omitempty"`
-	Sites              []SiteStatus           `json:"sites"`
-	GatewayPools       []GatewayPoolStatus    `json:"gatewayPools"`
-	Peerings           []PeeringStatus        `json:"peerings"`
-	Errors             []string               `json:"errors,omitempty"`
-	Warnings           []string               `json:"warnings,omitempty"`
-	Problems           []StatusProblem        `json:"problems"`
-	PullEnabled        bool                   `json:"pullEnabled"`
-	NodeSummaries      []NodeSummary          `json:"nodeSummaries"`
-	ConnectivityMatrix map[string]*SiteMatrix `json:"connectivityMatrix,omitempty"`
+	Seq           uint64              `json:"seq"`
+	Timestamp     time.Time           `json:"timestamp"`
+	NodeCount     int                 `json:"nodeCount"`
+	SiteCount     int                 `json:"siteCount"`
+	AzureTenantID string              `json:"azureTenantId,omitempty"`
+	LeaderInfo    *LeaderInfo         `json:"leaderInfo,omitempty"`
+	BuildInfo     *BuildInfo          `json:"buildInfo,omitempty"`
+	Sites         []SiteStatus        `json:"sites"`
+	GatewayPools  []GatewayPoolStatus `json:"gatewayPools"`
+	Peerings      []PeeringStatus     `json:"peerings"`
+	Errors        []string            `json:"errors,omitempty"`
+	Warnings      []string            `json:"warnings,omitempty"`
+	Problems      []StatusProblem     `json:"problems"`
+	PullEnabled   bool                `json:"pullEnabled"`
+	NodeSummaries []NodeSummary       `json:"nodeSummaries"`
 }
 
 // NodeSummary is a compact per-node summary for use in ClusterSummary.
@@ -233,22 +230,21 @@ func buildClusterSummary(status *ClusterStatusResponse) *ClusterSummary {
 	sort.Slice(summaries, func(i, j int) bool { return summaries[i].Name < summaries[j].Name })
 
 	return &ClusterSummary{
-		Seq:                status.Seq,
-		Timestamp:          status.Timestamp,
-		NodeCount:          status.NodeCount,
-		SiteCount:          status.SiteCount,
-		AzureTenantID:      status.AzureTenantID,
-		LeaderInfo:         status.LeaderInfo,
-		BuildInfo:          status.BuildInfo,
-		Sites:              status.Sites,
-		GatewayPools:       status.GatewayPools,
-		Peerings:           status.Peerings,
-		Errors:             status.Errors,
-		Warnings:           status.Warnings,
-		Problems:           status.Problems,
-		PullEnabled:        status.PullEnabled,
-		NodeSummaries:      summaries,
-		ConnectivityMatrix: status.ConnectivityMatrix,
+		Seq:           status.Seq,
+		Timestamp:     status.Timestamp,
+		NodeCount:     status.NodeCount,
+		SiteCount:     status.SiteCount,
+		AzureTenantID: status.AzureTenantID,
+		LeaderInfo:    status.LeaderInfo,
+		BuildInfo:     status.BuildInfo,
+		Sites:         status.Sites,
+		GatewayPools:  status.GatewayPools,
+		Peerings:      status.Peerings,
+		Errors:        status.Errors,
+		Warnings:      status.Warnings,
+		Problems:      status.Problems,
+		PullEnabled:   status.PullEnabled,
+		NodeSummaries: summaries,
 	}
 }
 
@@ -312,33 +308,34 @@ type PeeringStatus struct {
 	HealthCheckEnabled bool     `json:"healthCheckEnabled,omitempty"`
 }
 
-// SiteMatrix contains connectivity results across site nodes.
-type SiteMatrix struct {
-	Nodes   []string                     `json:"nodes"`
-	Results map[string]map[string]string `json:"results"` // src -> dst -> status
-}
-
 // ClusterSummaryDelta contains only the fields of ClusterSummary that changed
 // since the last broadcast. NodeSummaries contains only added/changed entries;
 // RemovedNodes lists nodes that disappeared.
 type ClusterSummaryDelta struct {
-	Seq                uint64                 `json:"seq"`
-	Timestamp          time.Time              `json:"timestamp"`
-	NodeCount          *int                   `json:"nodeCount,omitempty"`
-	SiteCount          *int                   `json:"siteCount,omitempty"`
-	AzureTenantID      *string                `json:"azureTenantId,omitempty"`
-	LeaderInfo         *LeaderInfo            `json:"leaderInfo,omitempty"`
-	BuildInfo          *BuildInfo             `json:"buildInfo,omitempty"`
-	Sites              []SiteStatus           `json:"sites,omitempty"`
-	GatewayPools       []GatewayPoolStatus    `json:"gatewayPools,omitempty"`
-	Peerings           []PeeringStatus        `json:"peerings,omitempty"`
-	Errors             []string               `json:"errors,omitempty"`
-	Warnings           []string               `json:"warnings,omitempty"`
-	Problems           []StatusProblem        `json:"problems,omitempty"`
-	PullEnabled        *bool                  `json:"pullEnabled,omitempty"`
-	NodeSummaries      []NodeSummary          `json:"nodeSummaries,omitempty"`
-	RemovedNodes       []string               `json:"removedNodes,omitempty"`
-	ConnectivityMatrix map[string]*SiteMatrix `json:"connectivityMatrix,omitempty"`
+	Seq           uint64               `json:"seq"`
+	Timestamp     time.Time            `json:"timestamp"`
+	NodeCount     *int                 `json:"nodeCount,omitempty"`
+	SiteCount     *int                 `json:"siteCount,omitempty"`
+	AzureTenantID *string              `json:"azureTenantId,omitempty"`
+	LeaderInfo    **LeaderInfo         `json:"leaderInfo,omitempty"`
+	BuildInfo     **BuildInfo          `json:"buildInfo,omitempty"`
+	Sites         *[]SiteStatus        `json:"sites,omitempty"`
+	GatewayPools  *[]GatewayPoolStatus `json:"gatewayPools,omitempty"`
+	Peerings      *[]PeeringStatus     `json:"peerings,omitempty"`
+	Errors        *[]string            `json:"errors,omitempty"`
+	Warnings      *[]string            `json:"warnings,omitempty"`
+	Problems      *[]StatusProblem     `json:"problems,omitempty"`
+	PullEnabled   *bool                `json:"pullEnabled,omitempty"`
+	NodeSummaries []NodeSummary        `json:"nodeSummaries,omitempty"`
+	RemovedNodes  []string             `json:"removedNodes,omitempty"`
+}
+
+func summaryDeltaSlice[T any](values []T) *[]T {
+	if values == nil {
+		values = []T{}
+	}
+
+	return new(values)
 }
 
 // computeClusterSummaryDelta computes a delta between two ClusterSummary snapshots.
@@ -380,47 +377,42 @@ func computeClusterSummaryDelta(prev, curr *ClusterSummary) *ClusterSummaryDelta
 
 	// Compare LeaderInfo by JSON
 	if !jsonEqual(prev.LeaderInfo, curr.LeaderInfo) {
-		delta.LeaderInfo = curr.LeaderInfo
+		delta.LeaderInfo = new(curr.LeaderInfo)
 		changed = true
 	}
 
 	if !jsonEqual(prev.BuildInfo, curr.BuildInfo) {
-		delta.BuildInfo = curr.BuildInfo
+		delta.BuildInfo = new(curr.BuildInfo)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Sites, curr.Sites) {
-		delta.Sites = curr.Sites
+		delta.Sites = summaryDeltaSlice(curr.Sites)
 		changed = true
 	}
 
 	if !jsonEqual(prev.GatewayPools, curr.GatewayPools) {
-		delta.GatewayPools = curr.GatewayPools
+		delta.GatewayPools = summaryDeltaSlice(curr.GatewayPools)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Peerings, curr.Peerings) {
-		delta.Peerings = curr.Peerings
+		delta.Peerings = summaryDeltaSlice(curr.Peerings)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Errors, curr.Errors) {
-		delta.Errors = curr.Errors
+		delta.Errors = summaryDeltaSlice(curr.Errors)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Warnings, curr.Warnings) {
-		delta.Warnings = curr.Warnings
+		delta.Warnings = summaryDeltaSlice(curr.Warnings)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Problems, curr.Problems) {
-		delta.Problems = curr.Problems
-		changed = true
-	}
-
-	if !jsonEqual(prev.ConnectivityMatrix, curr.ConnectivityMatrix) {
-		delta.ConnectivityMatrix = curr.ConnectivityMatrix
+		delta.Problems = summaryDeltaSlice(curr.Problems)
 		changed = true
 	}
 

@@ -62,7 +62,8 @@ type nodeListRow struct {
 }
 
 // printNodeInfoPane prints fields similar to the UI node information panel.
-func printNodeInfoPane(w io.Writer, status clusterStatusResponse, node statusv1alpha1.NodeStatusResponse, useColor bool) error {
+func printNodeInfoPane(w io.Writer, status clusterStatusResponse, overview nodeSummary, useColor bool) error {
+	node := overview.statusMetadata()
 	gatewayByNode := map[string]string{}
 
 	for _, pool := range status.GatewayPools {
@@ -121,12 +122,12 @@ func printNodeInfoPane(w io.Writer, status clusterStatusResponse, node statusv1a
 		buildStr = "-"
 	}
 
-	k8sReady := valueOr(node.NodeInfo.K8sReady, "NotReady")
-	wgStatus := cniStatusLabel(node, status.PullEnabled)
+	k8sReady := valueOr(overview.K8sReady, "Unknown")
+	wgStatus := valueOr(overview.CniStatus, "Unknown")
 
 	if useColor {
 		k8sReady = colorize(k8sReady, k8sTone(k8sReady))
-		wgStatus = colorize(wgStatus, statusTone(node, status.PullEnabled))
+		wgStatus = colorize(wgStatus, valueOr(overview.CniTone, "yellow"))
 	}
 
 	rows := [][2]string{
@@ -136,6 +137,9 @@ func printNodeInfoPane(w io.Writer, status clusterStatusResponse, node statusv1a
 		{"Pool", valueOr(gatewayByNode[node.NodeInfo.Name], "-")},
 		{"K8s Status", k8sReady},
 		{"UN Status", wgStatus},
+		{"Node Error Count", fmt.Sprint(overview.ErrorCount)},
+		{"First Node Error", valueOr(overview.FirstError, "-")},
+		{"Fetch Error", valueOr(overview.FetchError, "-")},
 		{"WireGuard Public Key", func() string {
 			if node.NodeInfo.WireGuard != nil {
 				return valueOr(node.NodeInfo.WireGuard.PublicKey, "-")
@@ -157,37 +161,8 @@ func printNodeInfoPane(w io.Writer, status clusterStatusResponse, node statusv1a
 		{"K8s Node Updated", formatAgePtr(node.NodeInfo.K8sUpdatedAt)},
 		{"Status Push Updated", formatAgePtr(node.LastPushTime)},
 	}
-	if err := printKVRows(w, rows); err != nil {
-		return err
-	}
 
-	if len(node.NodeErrors) > 0 {
-		if _, err := fmt.Fprintln(w); err != nil {
-			return err
-		}
-
-		if _, err := fmt.Fprintln(w, "  Node Errors:"); err != nil {
-			return err
-		}
-
-		for _, ne := range node.NodeErrors {
-			msg := strings.TrimSpace(ne.Message)
-			if msg == "" {
-				continue
-			}
-
-			line := fmt.Sprintf("    - [%s] %s", ne.Type, msg)
-			if useColor {
-				line = colorize(line, "red")
-			}
-
-			if _, err := fmt.Fprintln(w, line); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return printKVRows(w, rows)
 }
 
 // printNodePeerings prints a peering table and optional details for one peer.
@@ -873,7 +848,7 @@ func buildNodeRowsFromSummary(summary clusterSummary) []nodeListRow {
 
 		k8s := ns.K8sReady
 		if k8s == "" {
-			k8s = "NotReady"
+			k8s = "Unknown"
 		}
 
 		cniStatus := ns.CniStatus

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useMemo, useState } from 'react';
-import { NodeStatus, NodeSummary, SiteStatus } from '../../types';
+import { NodeSummary, SiteStatus } from '../../types';
 
 type SummaryRow = {
   id: string;
@@ -19,13 +19,11 @@ type SortKey = 'name' | 'workers' | 'gateways' | 'state';
 function SitesCard({
   sites,
   siteCounts,
-  nodeSummaries,
-  nodes
+  nodeSummaries
 }: {
   sites: SiteStatus[];
   siteCounts: Map<string, { online: number; total: number }>;
   nodeSummaries: NodeSummary[];
-  nodes: NodeStatus[];
 }) {
   const [sort, setSort] = useState<{ key: SortKey; direction: 'asc' | 'desc' }>({ key: 'name', direction: 'asc' });
 
@@ -36,23 +34,12 @@ function SitesCard({
 
       let workers = 0;
       let gateways = 0;
-      if (nodeSummaries.length > 0) {
-        for (const ns of nodeSummaries) {
-          if ((ns.siteName || '-') !== name) continue;
-          if (ns.isGateway) {
-            gateways++;
-          } else {
-            workers++;
-          }
-        }
-      } else {
-        for (const node of nodes) {
-          if ((node.nodeInfo?.siteName || '-') !== name) continue;
-          if (node.nodeInfo?.isGateway) {
-            gateways++;
-          } else {
-            workers++;
-          }
+      for (const ns of nodeSummaries) {
+        if ((ns.siteName || '-') !== name) continue;
+        if (ns.isGateway) {
+          gateways++;
+        } else {
+          workers++;
         }
       }
 
@@ -66,7 +53,7 @@ function SitesCard({
         state: counts.total === 0 ? 'No Data' : counts.online === counts.total ? 'Healthy' : 'Unhealthy'
       };
     });
-  }, [nodeSummaries, nodes, siteCounts, sites]);
+  }, [nodeSummaries, siteCounts, sites]);
 
   const sortedRows = useMemo(() => {
     const direction = sort.direction === 'asc' ? 1 : -1;

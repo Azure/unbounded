@@ -213,11 +213,11 @@ The dashboard displays:
 - **Overview**: Cluster health summary with node counts, site counts, and gateway status
 - **Sites**: All configured sites with node counts and health indicators
 - **Nodes**: Detailed list of all nodes with filtering, sorting, and pagination
-  - Tunnel peer status (WireGuard peers or eBPF tunnel endpoints)
+  - Aggregate tunnel peer counts and health
   - Gateway health for each node
   - Site membership
   - Pod name, restart count, and pod age
-  - Click on any node to view detailed status including stale data warnings
+  - Select a node, then click **Load data** to inspect peers, routes, or BPF entries
 
 The dashboard uses **WebSocket** for real-time updates with delta compression, falling back to HTTP polling when WebSocket is unavailable. Features include:
 - Live status updates via push-based architecture (node agents push status to controller)
@@ -228,6 +228,58 @@ The dashboard uses **WebSocket** for real-time updates with delta compression, f
 
 The dashboard does not render a site connectivity graph or connectivity matrix.
 Use the Site summaries and filtered node list to inspect individual resources.
+
+### Explicit node diagnostics
+
+Selecting a node does not collect diagnostics. **Load data** reuses an unexpired
+snapshot when available; **Refresh** requests a fresh collection. Opening a
+dialog, reconnecting, receiving a summary, or reaching expiry never requests
+details automatically. The dialog reports loading, expiry, and errors rather
+than showing empty tables as if no configuration exists.
+
+The default detail lifetime is 300 seconds from receipt. The browser drops the
+snapshot at its advertised expiry. A failed Refresh may leave the previous
+still-valid snapshot visible with its age and the request error. Global
+**Cluster Status JSON** exports summaries only; full JSON belongs to a loaded
+single-node snapshot.
+
+CLI named-node show commands use the same cache/request lifecycle:
+
+```bash
+# Reuse valid cached data, or request and wait for one node's diagnostics
+kubectl unbounded net node show <node-name> peers
+kubectl unbounded net node show <node-name> routes
+kubectl unbounded net node show <node-name> bpf
+kubectl unbounded net node show <node-name> json
+
+# Force fresh collection without bypassing a request already in flight
+kubectl unbounded net node show <node-name> --refresh
+
+# Watch only cluster summaries
+kubectl unbounded net node list --watch
+```
+
+`node show --watch` is not supported: use summary list/watch or repeat an explicit
+show with `--refresh`. There is no full-cluster diagnostic refresh command.
+The `json` show format remains raw full node JSON, not the request envelope.
+The default info pane uses current overview health, node metadata, timestamps,
+and the error count/first error, independently of the diagnostic snapshot.
+Missing overview nodes or overview fetch failures are reported as errors; absent
+health fields display `Unknown`. Missing metadata is not filled from older
+diagnostics. The `json` format preserves the diagnostic snapshot unchanged,
+including all diagnostic errors; peers, routes, BPF data, and cache/refresh
+behavior are unchanged.
+
+Requests use an active, authenticated, capable node WebSocket when possible.
+Otherwise they try direct HTTP pull first, even if background pulling is
+disabled. If that fails, the next authenticated node status POST response
+delivers a pending command. Agents collect and reply immediately on receipt,
+not at the next periodic publication tick. All attempts share the original
+120-second request deadline.
+
+If both outbound publishers are disabled, direct node HTTP diagnostics remain
+available. A failed pull cannot use a POST fallback until publication resumes;
+the controller does not enable either publisher automatically.
 
 ### Health Endpoints
 
@@ -261,16 +313,37 @@ curl http://<node-agent-pod-ip>:9998/status/json
 #### Controller Status Endpoints
 
 ```bash
-# Cluster status JSON (leader only)
+# Cluster summary JSON (leader only, no peer/route/BPF arrays)
 curl http://<controller-pod-ip>:9999/status/json
 
-# Per-node status (supports ?live=true for force pull)
+# Per-node raw diagnostics (cached by default; ?live=true requests fresh data)
 curl http://<controller-pod-ip>:9999/status/node/<node-name>
 
 # Aggregated API status push endpoint (if enabled)
 # POST http://<apiserver>/apis/status.net.unbounded-cloud.io/v1alpha1/status/push
 # WebSocket: wss://<apiserver>/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews
 ```
+
+The asynchronous API uses the same viewer authorization and leader routing:
+
+| Request | Purpose |
+|---------|---------|
+| `POST /status/node/<name>/details` with `{"forceRefresh":false}` | Reuse cache or start/join a request |
+| `POST /status/node/<name>/details` with `{"forceRefresh":true}` | Start/join a fresh request |
+| `GET /status/node/<name>/details?requestId=<id>` | Read that request's result |
+
+Responses identify the node and request and return `pending` (202), `complete`
+(200), `expired` (410), `unavailable` (404), or `retryable` (503). Completed
+`details` include `collectedAt`, `receivedAt`, `expiresAt`, and full `status`.
+The request deadline governs pending work; snapshot expiry governs completed
+data. Reads never extend either lifetime. A pending response can include the
+failed pull's error while still waiting for a POST-delivered reply.
+
+For aggregated detail requests, use
+`/apis/status.net.unbounded-cloud.io/v1alpha1/nodes/<name>/details` with the
+same methods, body, and query. This maps to the `nodes/details` subresource,
+authorized by the status-viewer role without granting node publication access.
+Do not assume a raw controller URL bypasses viewer authentication.
 
 #### Gateway Health
 
@@ -625,6 +698,7 @@ The node agent status server listens on port 9998 (configurable via `--health-po
 | `/healthz` | GET | Liveness probe (API connectivity) |
 | `/readyz` | GET | Readiness probe |
 | `/status/json` | GET | Full node status (tunnels, routes, health, BPF entries) |
+| `/status/summary` | GET | Overview metadata and observed counts, without diagnostic arrays |
 | `/status` | GET | Human-readable status page |
 | `/metrics` | GET | Prometheus metrics |
 

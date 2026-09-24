@@ -36,6 +36,12 @@ func (m *nodeDetailRequests) ObserveLegacy(nodeName string, status *NodeStatusRe
 		return errors.New("legacy detail node identity is unavailable")
 	}
 
+	for _, previous := range m.requests {
+		if previous.nodeName == nodeName && previous.uid != uid {
+			m.invalidateLocked(previous)
+		}
+	}
+
 	var request *nodeDetailRequest
 
 	if snapshot, ok := m.cache.Get(nodeName); ok {
@@ -139,7 +145,10 @@ func (m *nodeDetailRequests) CompleteFailure(nodeName, requestID, message string
 		return errors.New("detail request is no longer pending")
 	}
 
-	request.cancel()
+	if !request.dispatching {
+		request.cancel()
+	}
+
 	request.state = statusv1alpha1.NodeDetailUnavailable
 	request.message = message
 	request.poll = false

@@ -168,7 +168,7 @@ func TestClusterOverviewRejectsOutOfOrderCacheNotifications(t *testing.T) {
 	}, 1)
 
 	status := cluster.Get()
-	if status.NodeOverviews["node"] != nil || len(status.Nodes[0].Peers) != 1 {
+	if status.NodeOverviews["node"] == nil || status.NodeOverviews["node"].PeerCount != 1 {
 		t.Fatalf("stale overview replaced newer full status: %+v", status)
 	}
 }

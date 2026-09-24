@@ -29,6 +29,19 @@ detail as possible: steps to reproduce, expected behavior, actual behavior, and 
 4. Make sure your code follows the existing style and conventions.
 5. Write a clear PR description explaining what your change does and why.
 
+### CI and Post-Merge Workflows
+
+The CI workflow validates pull requests and merge-queue groups without repeating
+the same checks on pushes to `main`. Release-branch pushes and manual CI runs
+remain supported. Changes to `main` must pass the required pre-merge checks;
+bypassing those checks does not trigger a compensating post-merge CI run.
+
+Post-merge Orca development images are published separately by `orca-image.yaml`,
+using the merged commit for both `orca:main` and `orca:main-<sha>`. Publication
+relies on the pre-merge checks rather than rerunning them. CodeQL retains its
+`main` push trigger to maintain default-branch code-scanning results. Workflows
+that do not run in the merge queue retain their existing triggers.
+
 ### Coding Standards
 
 - Do not cross `cmd/` package boundaries. For example, `cmd/agent` should not import from

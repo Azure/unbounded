@@ -220,6 +220,8 @@ func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Reques
 }
 
 func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool, health *healthState, webhookServer *webhookpkg.Server, certMgr *certmanager.CertManager, tokenIssuer *authn.TokenIssuer, tokenCfg tokenEndpointConfig) {
+	health.statusCache.RequireDetails()
+
 	mux := webhookServer.Mux()
 
 	// Register webhook handlers (validate, mutate-nodes, aggregated API discovery).
@@ -232,10 +234,10 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	clusterStatusCache := NewClusterStatusCache(health)
 
 	health.clusterStatusCache = clusterStatusCache
-	go clusterStatusCache.Run(context.Background())
+	go clusterStatusCache.Run(ctx)
 
 	broadcaster := NewWSBroadcaster(health)
-	go broadcaster.Run(context.Background())
+	go broadcaster.Run(ctx)
 	// Node status changes patch the pre-built cache in-place and notify the broadcaster.
 	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse, eventSeq uint64) {
 		statusCopy := *status
@@ -400,7 +402,7 @@ func serveStatusJSON(health *healthState, w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if err := json.NewEncoder(w).Encode(status); err != nil {
+	if err := json.NewEncoder(w).Encode(buildClusterSummary(status)); err != nil {
 		klog.V(4).Infof("status json encode failed: %v", err)
 	}
 }
@@ -434,84 +436,7 @@ func registerStatusHandlers(mux *http.ServeMux, health *healthState, requireDash
 			return
 		}
 
-		forcePull := r.URL.Query().Get("live") == "true"
-		if !forcePull {
-			if cached, ok := health.statusCache.Get(nodeName); ok {
-				age := time.Since(cached.ReceivedAt)
-				if age < health.staleThreshold {
-					result := cached.Status
-					t := cached.ReceivedAt
-					result.LastPushTime = &t
-
-					w.Header().Set("Content-Type", "application/json")
-
-					if err := json.NewEncoder(w).Encode(result); err != nil {
-						klog.V(4).Infof("status json encode failed: %v", err)
-					}
-
-					return
-				}
-
-				if !health.pullEnabled.Load() {
-					result := cached.Status
-					t := cached.ReceivedAt
-					result.LastPushTime = &t
-					result.StatusSource = "stale-cache"
-					result.FetchError = fmt.Sprintf("stale status (%s old), pull disabled", formatDurationAgo(age))
-
-					w.Header().Set("Content-Type", "application/json")
-
-					if err := json.NewEncoder(w).Encode(result); err != nil {
-						klog.V(4).Infof("status json encode failed: %v", err)
-					}
-
-					return
-				}
-			} else if !health.pullEnabled.Load() {
-				http.Error(w, "no cached status for node (pull disabled)", http.StatusNotFound)
-				return
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		if health.nodeLister == nil {
-			http.Error(w, "node informer not ready", http.StatusServiceUnavailable)
-			return
-		}
-
-		node, err := health.nodeLister.Get(nodeName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("node not found: %v", err), http.StatusNotFound)
-			return
-		}
-
-		var nodeIP string
-
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == "InternalIP" {
-				nodeIP = addr.Address
-				break
-			}
-		}
-
-		if nodeIP == "" {
-			http.Error(w, "no InternalIP found for node", http.StatusInternalServerError)
-			return
-		}
-
-		nodeStatus, err := fetchNodeStatus(ctx, nodeIP, health.nodeAgentHealthPort)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to fetch node status: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-
-		if err := json.NewEncoder(w).Encode(nodeStatus); err != nil {
-			klog.V(4).Infof("status json encode failed: %v", err)
-		}
+		serveLegacyNodeDetails(health, w, r, nodeName)
 	})
 }
 
@@ -1139,11 +1064,10 @@ func registerDashboardHandlers(mux *http.ServeMux, health *healthState, broadcas
 
 		ctx, cancel := context.WithCancel(r.Context())
 		client := &WSClient{
-			conn:                    conn,
-			send:                    make(chan []byte, 16),
-			ctx:                     ctx,
-			cancel:                  cancel,
-			nodeDetailSubscriptions: make(map[string]bool),
+			conn:   conn,
+			send:   make(chan []byte, 16),
+			ctx:    ctx,
+			cancel: cancel,
 		}
 		broadcaster.Register(client)
 
