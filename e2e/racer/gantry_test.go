@@ -554,6 +554,137 @@ func TestGantryRacerCorruption(t *testing.T) {
 	}
 
 	t.Logf("revision=%d; peer pages=%g; full corrupt HTTP forwarding, downstream digest rejection, explicit idle-ingest abort, same-ref commit, and offline warm reads verified", revision, peerPages)
+
+	t.Run("RegistryFallback", func(t *testing.T) {
+		gantryAssertFallbackCorruption(t, f, resolver)
+	})
+}
+
+func gantryAssertFallbackCorruption(t *testing.T, f *gantryFixture, resolver remotes.Resolver) {
+	t.Helper()
+
+	// Keep the primary Racer recovery campaign intact. A distinct image prevents
+	// its successful commit or retained ingest from satisfying this pull locally.
+	data := bytes.Repeat([]byte("fallback-integrity"), 1<<16)
+	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: ocidigest.FromBytes(data), Size: int64(len(data))}
+	config := fmt.Appendf(nil, `{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[%q]}}`, desc.Digest)
+	manifest := fmt.Appendf(nil, `{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":%d,"digest":%q},"layers":[{"mediaType":%q,"size":%d,"digest":%q}]}`, ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageConfig, len(config), ocidigest.FromBytes(config), desc.MediaType, desc.Size, desc.Digest)
+	path := gantryPath("public", "blobs", data)
+	objects := map[string]gantryObject{
+		path:                                  {data: data, mediaType: desc.MediaType, corrupt: true},
+		gantryPath("public", "blobs", config): {data: config, mediaType: ocispec.MediaTypeImageConfig},
+		gantryPath("public", "manifests", manifest): {data: manifest, mediaType: ocispec.MediaTypeImageManifest},
+	}
+
+	f.mu.Lock()
+	for path, object := range objects {
+		f.objects[path] = object
+	}
+	f.mu.Unlock()
+
+	f.offline.Store(false)
+	// A real daemon outage forces pre-header fallback in the production Racer
+	// mirror, without swapping its constructor or sending the pull to origin.
+	f.racers[0].stop()
+	streams := f.metric(0, `gantry_racer_stream_total{outcome="completed"}`)
+	fallbacks := f.metric(0, "gantry_racer_fallback_total")
+	completed := f.metric(0, `gantry_origin_stream_completed_total{kind="layer"}`)
+	failed := f.metric(0, `gantry_origin_stream_failed_total{kind="layer"}`)
+	bad := bytes.Clone(data)
+	bad[len(bad)/2] ^= 1
+	badDigest := ocidigest.FromBytes(bad)
+
+	// Even a range request completes as a full, chunk-terminated 200 with the
+	// registry's MIME type and delegated credentials, despite the wrong digest.
+	resp, body, err := f.request(0, http.MethodGet, path, "Bearer fallback-caller", "bytes=1-2")
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, bad) || int64(len(body)) != desc.Size || ocidigest.FromBytes(body) == desc.Digest {
+		t.Fatalf("complete corrupt fallback: status=%v bytes=%d err=%v", resp, len(body), err)
+	}
+
+	if resp.ContentLength != -1 || len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" || resp.Header.Get("Content-Range") != "" || resp.Header.Get("Content-Type") != desc.MediaType || resp.Header.Get("Docker-Content-Digest") != desc.Digest.String() {
+		t.Fatalf("fallback framing/metadata: %+v", resp)
+	}
+
+	gantryAwait(t, "corrupt fallback HTTP completion", func() bool {
+		return f.metric(0, "gantry_racer_fallback_total") == fallbacks+1 && f.metric(0, `gantry_origin_stream_completed_total{kind="layer"}`) == completed+1
+	})
+
+	ctx, release, err := f.containerd.WithLease(namespaces.WithNamespace(t.Context(), "fallback-corruption-pull"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release(ctx)
+
+	imageRef := "fixture.test/public@" + ocidigest.FromBytes(manifest).String()
+	store := f.containerd.ContentStore()
+
+	fetcher, err := resolver.Fetcher(ctx, imageRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Avoid sibling config cancellation obscuring the corrupt layer outcome.
+	if err := remotes.Fetch(ctx, store, fetcher, ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: ocidigest.FromBytes(config), Size: int64(len(config))}); err != nil {
+		t.Fatal(err)
+	}
+
+	gantryAwait(t, "fallback config completion", func() bool {
+		return f.metric(0, `gantry_origin_stream_completed_total{kind="layer"}`) == completed+2
+	})
+
+	_, err = f.containerd.Pull(ctx, imageRef, containerd.WithResolver(resolver))
+
+	want := fmt.Sprintf("unexpected commit digest %s, expected %s", badDigest, desc.Digest)
+	if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("fallback normal pull: expected OCI digest commit rejection, got %v", err)
+	}
+
+	for _, digest := range []ocidigest.Digest{desc.Digest, badDigest} {
+		if _, err := store.Info(ctx, digest); !errdefs.IsNotFound(err) {
+			t.Fatalf("fallback content %s should be absent: %v", digest, err)
+		}
+	}
+
+	if _, err := f.containerd.GetImage(ctx, imageRef); !errdefs.IsNotFound(err) {
+		t.Fatalf("fallback failed pull published an image: %v", err)
+	}
+
+	ingestRef := remotes.MakeRefKey(ctx, desc)
+
+	status, err := store.Status(ctx, ingestRef)
+	if err != nil || status.Ref != ingestRef || status.Offset != desc.Size || status.Total != desc.Size {
+		t.Fatalf("fallback did not deliver a complete layer to containerd: %+v err=%v", status, err)
+	}
+
+	gantryAwait(t, "rejected layer forwarding completion", func() bool {
+		return f.metric(0, `gantry_origin_stream_completed_total{kind="layer"}`) == completed+3
+	})
+
+	if f.metric(0, `gantry_origin_stream_failed_total{kind="layer"}`) != failed || f.metric(0, `gantry_racer_stream_total{outcome="completed"}`) != streams {
+		t.Fatal("digest rejection was attributed to a forwarding failure or a Racer stream")
+	}
+
+	gantryAssertNoTee(t, f, 0)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var layerGETs int
+
+	for _, hit := range f.hits {
+		if hit.path != path || hit.method != http.MethodGet {
+			continue
+		}
+
+		layerGETs++
+		if hit.node != 0 || hit.rangeValue != "" || layerGETs == 1 && hit.auth != "Bearer fallback-caller" {
+			t.Errorf("fallback registry request lost routing/auth or forwarded Range: %+v", hit)
+		}
+	}
+
+	if layerGETs != 2 {
+		t.Fatalf("fallback layer GETs=%d, want one HTTP probe and one containerd fetch", layerGETs)
+	}
+
+	t.Logf("ordinary registry fallback: complete corrupt HTTP response; containerd FailedPrecondition, retained offset=%d total=%d, neither digest nor image committed", status.Offset, status.Total)
 }
 
 type gantryRoundTripper func(*http.Request) (*http.Response, error)
