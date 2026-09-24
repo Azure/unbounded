@@ -23,8 +23,8 @@ import (
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
-// WithRacer installs the explicit post-local-miss backend. Partial streams are
-// version pinned but cannot establish the complete OCI SHA-256 digest.
+// WithRacer installs the explicit post-local-miss backend. Racer streams are
+// version pinned; containerd verifies the complete OCI SHA-256 digest.
 func WithRacer(backend *gantryracer.Backend, stream func(sdk.TransferStats, bool, error), fallback func()) Option {
 	return func(s *Server) {
 		s.racer, s.onRacerStream, s.onRacerFallback = backend, stream, fallback
@@ -118,12 +118,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	if partial {
 		stream, err = obj.ReadRange(streamCtx, offset, length)
 	} else {
-		var expected [sha256.Size]byte
-
-		_, err = hex.Decode(expected[:], []byte(ref.Digest.Hex()))
-		if err == nil {
-			stream, err = obj.StreamVerified(streamCtx, expected)
-		}
+		stream, err = obj.Stream(streamCtx)
 	}
 
 	if err != nil {
@@ -134,10 +129,6 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	defer stream.Close() //nolint:errcheck // Abandoned streams must release sockets.
 
 	if err = stream.Prepare(); err != nil {
-		if errors.Is(err, sdk.ErrDigestMismatch) {
-			s.racer.Quarantine(ref)
-		}
-
 		if !writeRacerAuthError(w, err) {
 			s.racerFallback(w, r, ref, logger)
 		}
@@ -217,15 +208,11 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	s.fireMirrorBytesServed(ref.Kind, "racer", written)
 
 	if err != nil {
-		if errors.Is(err, sdk.ErrDigestMismatch) {
-			s.racer.Quarantine(ref)
-		}
-
 		logger.Debug("mirror: Racer stream aborted", slog.Any("err", err), slog.Int64("written", written))
 
 		return
 	}
-	// A partial response is not a verified object or a containerd commit.
+	// Full response completion records forwarding, not a containerd commit.
 	if !partial {
 		s.fireMirrorResponseCompleted(ref.Digest, ref.Kind, "racer")
 		s.fireLiveStreamCompleted(ref.Digest)

@@ -5,7 +5,6 @@ package mirror_test
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -66,11 +65,13 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 		t.Skip("Linux splice and proc fd paths")
 	}
 
-	data := bytes.Repeat([]byte("verified-splice!"), 160000)
+	data := bytes.Repeat([]byte("forwarded-splice!"), 160000)
+	corruptData := bytes.Repeat([]byte("!"), len(data))
 	d := digestOf(data)
 
 	var (
 		corrupt       atomic.Bool
+		wrongETag     atomic.Bool
 		cacheRequests atomic.Int64
 	)
 
@@ -87,11 +88,16 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 		}
 
 		w.Header().Set("ETag", `"`+d.Hex()+`"`)
+
+		if wrongETag.Load() {
+			w.Header().Set("ETag", `"`+digestOf(corruptData).Hex()+`"`)
+		}
+
 		w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
 
 		payload := data
 		if corrupt.Load() {
-			payload = bytes.Repeat([]byte("!"), len(data))
+			payload = corruptData
 		}
 
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(payload))
@@ -115,7 +121,14 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 		mirror.WithRacer(&gantryracer.Backend{Client: cache}, func(s sdk.TransferStats, p bool, err error) { results <- result{s, p, err} }, nil),
 		mirror.WithLiveStreamCompletedHook(func(_ digest.Digest) { completed.Add(1) }))
 
-	m := httptest.NewServer(server.Handler())
+	finished := make(chan struct{}, 1)
+	handler := server.Handler()
+
+	m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { finished <- struct{}{} }()
+
+		handler.ServeHTTP(w, r)
+	}))
 	defer m.Close()
 
 	get := func(rangeHeader string) (*http.Response, []byte, error) {
@@ -138,20 +151,22 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 
+		<-finished
+
 		return resp, body, err
 	}
 
 	resp, body, err := get("")
-	if err != nil || !bytes.Equal(body, data) || resp.Header.Get("Content-Type") != "application/vnd.oci.image.index.v1+json" || !resp.Close {
+	if err != nil || resp.StatusCode != 200 || resp.ContentLength != int64(len(data)) || !bytes.Equal(body, data) || resp.Header.Get("Content-Type") != "application/vnd.oci.image.index.v1+json" || !resp.Close {
 		t.Fatal(resp.Status, len(body), err)
 	}
 
 	first := <-results
-	if first.err != nil || first.stats.SpliceCalls == 0 || first.stats.SpliceBytes < 1<<20 || first.stats.TeeCalls == 0 || first.stats.TeeBytes != first.stats.SpliceBytes {
-		t.Fatalf("not actual verified splice: %+v", first)
+	if first.err != nil || first.partial || first.stats.SpliceCalls == 0 || first.stats.SpliceBytes < 1<<20 || first.stats.TeeCalls != 0 || first.stats.TeeBytes != 0 || first.stats.SpliceBytes+first.stats.BufferedBytes != int64(len(data)) {
+		t.Fatalf("not actual forwarding without verification: %+v", first)
 	}
 
-	t.Logf("raw mirror verified splice: calls=%d bytes=%d tee_calls=%d tee_bytes=%d buffered_bytes=%d", first.stats.SpliceCalls, first.stats.SpliceBytes, first.stats.TeeCalls, first.stats.TeeBytes, first.stats.BufferedBytes)
+	t.Logf("raw mirror splice: calls=%d bytes=%d tee_calls=%d tee_bytes=%d buffered_bytes=%d", first.stats.SpliceCalls, first.stats.SpliceBytes, first.stats.TeeCalls, first.stats.TeeBytes, first.stats.BufferedBytes)
 
 	resp, body, err = get("bytes=123-456")
 	if err != nil || resp.StatusCode != 206 || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes 123-456/%d", len(data)) || !bytes.Equal(body, data[123:457]) {
@@ -159,23 +174,43 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 	}
 
 	partial := <-results
-	if !partial.partial || partial.stats.TeeCalls != 0 {
+	if partial.err != nil || !partial.partial || partial.stats.TeeCalls != 0 || partial.stats.TeeBytes != 0 || completed.Load() != 1 {
 		t.Fatalf("partial misclassified: %+v", partial)
 	}
 
 	corrupt.Store(true)
 
-	_, body, err = get("")
-	if !errors.Is(err, io.ErrUnexpectedEOF) || len(body) != len(data)-1 {
-		t.Fatal("corrupt body completed", len(body), err)
+	resp, body, err = get("")
+	if err != nil || resp.StatusCode != 200 || resp.ContentLength != int64(len(data)) || !bytes.Equal(body, corruptData) || completed.Load() != 2 {
+		t.Fatal("same-size corrupt body was not fully forwarded", len(body), err)
 	}
 
 	bad := <-results
-	if !errors.Is(bad.err, sdk.ErrDigestMismatch) {
-		t.Fatal(bad.err)
+	if bad.err != nil || bad.partial || bad.stats.SpliceBytes < 1<<20 || bad.stats.TeeCalls != 0 || bad.stats.TeeBytes != 0 || bad.stats.SpliceBytes+bad.stats.BufferedBytes != int64(len(data)) {
+		t.Fatalf("corrupt payload was not forwarded without verification: %+v", bad)
 	}
 
+	if len(up.seen) != 0 {
+		t.Fatal("forwarded responses contacted registry")
+	}
+
+	// Payload forwarding does not quarantine. A mismatched metadata identity does.
+	wrongETag.Store(true)
+
 	before := cacheRequests.Load()
+
+	resp, body, err = get("")
+	if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, data) || cacheRequests.Load() != before+1 {
+		t.Fatal("metadata mismatch did not use registry", err)
+	}
+
+	if auth := <-up.seen; auth != "Bearer delegated" {
+		t.Fatal(auth)
+	}
+
+	wrongETag.Store(false)
+
+	before = cacheRequests.Load()
 
 	resp, body, err = get("")
 	if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, data) || cacheRequests.Load() != before {
@@ -184,6 +219,10 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 
 	if auth := <-up.seen; auth != "Bearer delegated" {
 		t.Fatal(auth)
+	}
+
+	if len(results) != 0 || completed.Load() != 4 {
+		t.Fatal("incorrect stream or completion callbacks", len(results), completed.Load())
 	}
 }
 
