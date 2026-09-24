@@ -331,6 +331,7 @@ func TestContainerdPullTuningManifest(t *testing.T) {
 		`[plugins."io.containerd.transfer.v1.local"]`,
 		`max_concurrent_downloads = 6`,
 		`systemctl restart containerd`,
+		`timeoutSeconds: 10`,
 	} {
 		if !bytes.Contains(manifest, []byte(setting)) {
 			t.Fatalf("containerd pull tuning manifest is missing %q", setting)

@@ -120,6 +120,7 @@ spec:
                   printf '%s\n' "$config_dump" | grep -Eq "^[[:space:]]*image_pull_progress_timeout = ['\"]30m(0s)?['\"]$"
                   printf '%s\n' "$config_dump" | grep -Eq '^[[:space:]]*max_concurrent_downloads = 6$'
             initialDelaySeconds: 10
+            timeoutSeconds: 10
             periodSeconds: 10
             failureThreshold: 30
           resources:
