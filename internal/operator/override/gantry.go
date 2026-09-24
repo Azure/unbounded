@@ -56,12 +56,12 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 		// Keep the generated prefix intact: inserting a positional argument or
 		// '--' before the flags makes Go's flag parser stop before selection.
 		if !reflect.DeepEqual(c.Command, oldContainer.Command) || len(c.Args) < len(oldContainer.Args) || !slices.Equal(c.Args[:len(oldContainer.Args)], oldContainer.Args) || !reflect.DeepEqual(configArgs(c.Args), configArgs(oldContainer.Args)) || !reflect.DeepEqual(c.EnvFrom, oldContainer.EnvFrom) {
-			return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache annotations; command, generated args, config/backend flags and envFrom cannot redirect it")
+			return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache/gantry; command, generated args, config/backend flags and envFrom cannot redirect it")
 		}
 
 		for _, env := range c.Env {
 			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_NAME" {
-				return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache annotations, not %s", env.Name)
+				return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache/gantry, not %s", env.Name)
 			}
 		}
 
@@ -87,7 +87,7 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 		return fmt.Errorf("gantry config volume is owned by gantry-config config.yaml")
 	}
 
-	if namedVolume(oldPod.Volumes, "racer-sockets") != nil {
+	if namedVolume(oldPod.Volumes, "racer-client-sockets") != nil || namedVolume(oldPod.Volumes, "racer-origin-sockets") != nil {
 		if !reflect.DeepEqual(oldPod.NodeSelector, newPod.NodeSelector) || !reflect.DeepEqual(oldPod.Affinity, newPod.Affinity) || !reflect.DeepEqual(oldPod.Tolerations, newPod.Tolerations) || !reflect.DeepEqual(oldPod.Volumes, newPod.Volumes) || !reflect.DeepEqual(oldPod.SecurityContext, newPod.SecurityContext) || !reflect.DeepEqual(oldPod.InitContainers, newPod.InitContainers) {
 			return fmt.Errorf("gantry Racer scheduling, socket volumes, groups and initialization are operator-owned to guarantee origin coverage")
 		}
@@ -114,7 +114,7 @@ func gantryUsesRacer(plan *component.Plan) bool {
 		}
 
 		for _, raw := range volumes {
-			if volume, ok := raw.(map[string]any); ok && volume["name"] == "racer-sockets" {
+			if volume, ok := raw.(map[string]any); ok && (volume["name"] == "racer-client-sockets" || volume["name"] == "racer-origin-sockets") {
 				return true
 			}
 		}

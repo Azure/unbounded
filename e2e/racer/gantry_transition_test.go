@@ -28,8 +28,10 @@ import (
 
 // Roll the actual agent processes one node at a time while retaining containerd,
 // the node identity, YAML configuration and Racer slabs. The operator/API test
-// separately checks annotation selection and the pod template that drives these
-// restarts; this fixture checks normal containerd pulls during mixed backends.
+// separately checks selection of the ClusterCache named gantry and the pod
+// template that drives these restarts. This standalone fixture checks normal
+// containerd pulls during mixed backends; retained slabs here do not establish
+// retained-cache rollback for managed Gantry, which returns to direct on deletion.
 func TestGantryRacerRollingSwitch(t *testing.T) {
 	if gantryNamespace(t) {
 		return

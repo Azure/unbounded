@@ -8,14 +8,15 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -26,51 +27,30 @@ import (
 )
 
 const (
-	backingAnnotation  = "unbounded-cloud.io/gantry-backing"
+	backingCacheName   = "gantry"
 	cacheUIDAnnotation = "unbounded-cloud.io/gantry-cache-uid"
 )
 
 // selectBackingCache distinguishes invalid desired state (a direct plan and a
 // visible diagnostic) from failed API reads (no plan, so the current pod stays).
-// ConfigMap contents and the old gantry-cache label are not selection inputs.
+// Only ClusterCache/gantry selects Racer. ConfigMap contents and legacy cache
+// annotations and labels are not selection inputs.
 // Gantry still parses its preserved YAML strictly before applying generated flags.
 func selectBackingCache(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*racerv1alpha1.ClusterCache, component.Result, error) {
 	invalid := func(message string) (*racerv1alpha1.ClusterCache, component.Result, error) {
 		return nil, component.NotReady("InvalidGantryBacking", message+"; using direct backend"), nil
 	}
 
-	caches := &racerv1alpha1.ClusterCacheList{}
-	if err := env.Client.List(ctx, caches); err != nil {
-		return nil, component.Result{}, fmt.Errorf("list Gantry backing caches: %w", err)
+	selected := &racerv1alpha1.ClusterCache{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: backingCacheName}, selected); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, component.Reconciled(), nil
+		}
+
+		return nil, component.Result{}, fmt.Errorf("get Gantry backing ClusterCache %q: %w", backingCacheName, err)
 	}
 
-	slices.SortFunc(caches.Items, func(a, b racerv1alpha1.ClusterCache) int { return strings.Compare(a.Name, b.Name) })
-
-	var selected *racerv1alpha1.ClusterCache
-
-	for i := range caches.Items {
-		cache := &caches.Items[i]
-		if !cache.DeletionTimestamp.IsZero() {
-			continue
-		}
-
-		value, present := cache.Annotations[backingAnnotation]
-		if !present || value == "false" {
-			continue
-		}
-
-		if value != "true" {
-			return invalid(fmt.Sprintf("ClusterCache %q annotation %s must be true or false, got %q", cache.Name, backingAnnotation, value))
-		}
-
-		if selected != nil {
-			return invalid(fmt.Sprintf("multiple Gantry backing caches: %q and %q", selected.Name, cache.Name))
-		}
-
-		selected = cache
-	}
-
-	if selected == nil {
+	if !selected.DeletionTimestamp.IsZero() {
 		return nil, component.Reconciled(), nil
 	}
 
@@ -183,17 +163,25 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.Cl
 func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
 	pod.AutomountServiceAccountToken = ptr.To(false)
 	pod.SecurityContext = &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}}
-	pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "racer-sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
-	mount := corev1.VolumeMount{Name: "racer-sockets", MountPath: racermeta.SocketRoot}
+	clientDirectory := racermeta.SocketRoot + "/" + cacheName + "/client"
+	originDirectory := racermeta.SocketRoot + "/" + cacheName + "/origin"
+
+	mounts := []corev1.VolumeMount{
+		{Name: "racer-client-sockets", MountPath: clientDirectory},
+		{Name: "racer-origin-sockets", MountPath: originDirectory},
+	}
+	for _, mount := range mounts {
+		pod.Volumes = append(pod.Volumes, corev1.Volume{Name: mount.Name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.MountPath, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
+	}
 
 	for i := range pod.InitContainers {
 		init := &pod.InitContainers[i]
 		if init.Name == "chown-hostpaths" {
-			init.VolumeMounts = append(init.VolumeMounts, mount)
-			root := racermeta.SocketRoot
-			directory := root + "/" + cacheName
-			directories := directory + " " + directory + "/client " + directory + "/origin"
-			init.Command[len(init.Command)-1] += "\nmkdir -p " + directories + "\nchgrp 65532 " + root + " " + directories + "\nchmod 2770 " + root + " " + directories + "\n"
+			init.VolumeMounts = append(init.VolumeMounts, mounts...)
+			directories := clientDirectory + " " + originDirectory
+			// Kubelet creates these directories. Limit permission changes to
+			// these mounts so other caches and the socket root remain isolated.
+			init.Command[len(init.Command)-1] += "\nchgrp 65532 " + directories + "\nchmod 2770 " + directories + "\n"
 		}
 	}
 
@@ -203,7 +191,7 @@ func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
 			continue
 		}
 
-		c.VolumeMounts = append(c.VolumeMounts, mount)
+		c.VolumeMounts = append(c.VolumeMounts, mounts...)
 
 		ports := c.Ports[:0]
 		for _, port := range c.Ports {
@@ -223,23 +211,26 @@ func setupRacerWatches(b *builder.Builder, env *component.Env) {
 }
 
 func backingCachePredicate() predicate.Predicate {
+	match := func(obj client.Object) bool {
+		cache, ok := obj.(*racerv1alpha1.ClusterCache)
+
+		return ok && cache != nil && cache.Name == backingCacheName
+	}
+
 	return predicate.Funcs{
-		CreateFunc: func(event.CreateEvent) bool { return true },
-		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		CreateFunc: func(e event.CreateEvent) bool { return match(e.Object) },
+		DeleteFunc: func(e event.DeleteEvent) bool { return match(e.Object) },
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			old, oldOK := e.ObjectOld.(*racerv1alpha1.ClusterCache)
 
 			next, nextOK := e.ObjectNew.(*racerv1alpha1.ClusterCache)
-			if !oldOK || !nextOK {
+			if !oldOK || !nextOK || !match(old) || !match(next) {
 				return false
 			}
 
-			oldValue, oldPresent := old.Annotations[backingAnnotation]
-			newValue, newPresent := next.Annotations[backingAnnotation]
-
 			// A relist can report same-name recreation as an Update even when
 			// intent is identical. The new UID must reach the pod rollout stamp.
-			return old.UID != next.UID || oldValue != newValue || oldPresent != newPresent || !reflect.DeepEqual(old.Spec, next.Spec) || !old.DeletionTimestamp.Equal(next.DeletionTimestamp)
+			return old.UID != next.UID || !reflect.DeepEqual(old.Spec, next.Spec) || !old.DeletionTimestamp.Equal(next.DeletionTimestamp)
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}

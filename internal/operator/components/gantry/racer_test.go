@@ -26,6 +26,8 @@ import (
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
+const backingAnnotation = "unbounded-cloud.io/gantry-backing"
+
 func racerSite() unboundedv1alpha3.Site {
 	return unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}
 }
@@ -80,18 +82,6 @@ func TestRacerPlan(t *testing.T) {
 			t.Fatal("must preserve nonroot containerd socket access")
 		}
 
-		found := false
-
-		for _, mount := range c.VolumeMounts {
-			if mount.Name == "racer-sockets" {
-				found = mount.MountPath == "/run/racer" && mount.SubPath == "" && !mount.ReadOnly
-			}
-		}
-
-		if !found {
-			t.Fatal("missing restart-safe writable Racer parent mount")
-		}
-
 		for _, port := range c.Ports {
 			if port.ContainerPort == 5001 || port.ContainerPort == 5002 {
 				t.Fatal("direct listeners exposed in Racer mode")
@@ -99,15 +89,67 @@ func TestRacerPlan(t *testing.T) {
 		}
 	}
 
-	command := strings.Join(pod.InitContainers[0].Command, " ")
-	if !strings.Contains(command, "mkdir -p /run/racer/gantry") || !strings.Contains(command, "chgrp 65532 /run/racer /run/racer/gantry") || !strings.Contains(command, "chmod 2770 /run/racer /run/racer/gantry") {
-		t.Fatalf("cache directory must be writable before either process starts: %s", command)
+	assertIsolatedRacerSockets(t, pod)
+}
+
+func assertIsolatedRacerSockets(t *testing.T, pod corev1.PodSpec) {
+	t.Helper()
+
+	want := map[string]string{
+		"racer-client-sockets": "/run/racer/gantry/client",
+		"racer-origin-sockets": "/run/racer/gantry/origin",
 	}
+	found := map[string]string{}
 
 	for _, volume := range pod.Volumes {
-		if volume.Name == "racer-sockets" && (volume.HostPath == nil || volume.HostPath.Path != "/run/racer" || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate) {
+		if want[volume.Name] == "" && (volume.HostPath == nil || !strings.HasPrefix(volume.HostPath.Path, "/run/racer")) {
+			continue
+		}
+
+		if volume.HostPath == nil || want[volume.Name] != volume.HostPath.Path || volume.HostPath.Type == nil || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate {
 			t.Fatalf("unexpected socket hostPath: %#v", volume)
 		}
+
+		found[volume.Name] = volume.HostPath.Path
+	}
+
+	if !reflect.DeepEqual(found, want) {
+		t.Fatalf("socket volumes=%v want=%v", found, want)
+	}
+
+	for _, c := range append(slices.Clone(pod.Containers), pod.InitContainers...) {
+		found = map[string]string{}
+
+		for _, mount := range c.VolumeMounts {
+			if want[mount.Name] == "" && !strings.HasPrefix(mount.MountPath, "/run/racer") {
+				continue
+			}
+
+			if want[mount.Name] != mount.MountPath || mount.SubPath != "" || mount.SubPathExpr != "" || mount.ReadOnly {
+				t.Fatalf("%s has nonisolated or non-restart-safe mount: %#v", c.Name, mount)
+			}
+
+			found[mount.Name] = mount.MountPath
+		}
+
+		if !reflect.DeepEqual(found, want) {
+			t.Fatalf("%s socket mounts=%v want=%v", c.Name, found, want)
+		}
+	}
+
+	var socketCommands []string
+
+	for _, line := range strings.Split(pod.InitContainers[0].Command[len(pod.InitContainers[0].Command)-1], "\n") {
+		if strings.Contains(line, "/run/racer") {
+			socketCommands = append(socketCommands, line)
+		}
+	}
+
+	if !slices.Equal(socketCommands, []string{
+		"chgrp 65532 /run/racer/gantry/client /run/racer/gantry/origin",
+		"chmod 2770 /run/racer/gantry/client /run/racer/gantry/origin",
+	}) {
+		t.Fatalf("permission setup must touch only the mounted socket directories: %v", socketCommands)
 	}
 }
 
@@ -126,7 +168,7 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		// freeze a former Racer pod configuration after cache removal.
 		{name: "unknown config field", valid: true, payload: "content_backnd: racer"},
 		{name: "malformed YAML", valid: true, payload: "[not: yaml"},
-		{name: "Racer disabled", valid: true, direct: true, cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "false"}}}},
+		{name: "Racer disabled", valid: true, cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "false"}}}},
 		{name: "Racer omitted", valid: true},
 		{name: "Gantry disabled", mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) {
 			s.Spec.Components.Gantry = &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
@@ -156,7 +198,7 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		{name: "tolerated taint", valid: true, mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) {
 			n.Spec.Taints = []corev1.Taint{{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoExecute}}
 		}},
-		{name: "foreign cache", valid: true, direct: true, cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid"}}},
+		{name: "foreign cache", valid: true, direct: true, cache: backingCache("other")},
 		{name: "selector excludes origin", cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "true"}}, Spec: racerv1alpha1.ClusterCacheSpec{SiteSelector: metav1.LabelSelector{MatchLabels: map[string]string{"other": "true"}}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -201,13 +243,17 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 }
 
 func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
-	cache := backingCache("custom")
+	cache := backingCache("gantry")
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
 	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_name: custom"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if !slices.Contains(plannedDaemonSet(t, plan).Spec.Template.Spec.Containers[0].Args, "--racer-cache-name=gantry") {
+		t.Fatal("named cache must override configured cache name")
 	}
 
 	for _, op := range plan.Operations {
@@ -218,7 +264,7 @@ func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
 }
 
 func TestReturnToDirectRetainsCacheAndRestoresChairs(t *testing.T) {
-	cache := &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Labels: map[string]string{"unbounded-cloud.io/gantry-cache": "true"}}}
+	cache := &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "other", UID: "cache-uid", Labels: map[string]string{"unbounded-cloud.io/gantry-cache": "true"}, Annotations: map[string]string{backingAnnotation: "true"}}}
 	env := testEnv(t, cache, racerConfig("content_backend: racer"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
@@ -244,7 +290,7 @@ func TestReturnToDirectRetainsCacheAndRestoresChairs(t *testing.T) {
 			}
 
 			for _, volume := range ds.Spec.Template.Spec.Volumes {
-				if volume.Name == "racer-sockets" {
+				if strings.HasPrefix(volume.Name, "racer-") {
 					t.Fatal("direct mode must not mount Racer sockets")
 				}
 			}
@@ -293,19 +339,20 @@ func TestBackingCacheSelectionMatrix(t *testing.T) {
 		{name: "missing UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "" }},
 		{name: "unsafe UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "../other;id" }},
 		{name: "uppercase UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "UPPER" }},
-		{name: "name determines socket", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Name = "cache.with.dots" }},
-		{name: "false", mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
-		{name: "removed", mutate: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
-		{name: "label ignored", mutate: func(c *racerv1alpha1.ClusterCache) {
+		{name: "name determines socket", mutate: func(c *racerv1alpha1.ClusterCache) { c.Name = "cache.with.dots" }},
+		{name: "false", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
+		{name: "removed", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
+		{name: "label ignored", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) {
 			c.Annotations = nil
 			c.Labels = map[string]string{"unbounded-cloud.io/gantry-cache": "true"}
 		}},
-		{name: "empty invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "" }},
-		{name: "case invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "True" }},
-		{name: "whitespace invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = " true" }},
-		{name: "duplicate", extra: true, invalid: true},
+		// Historical invalid-annotation cases now prove annotations are ignored.
+		{name: "empty invalid", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "" }},
+		{name: "case invalid", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "True" }},
+		{name: "whitespace invalid", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = " true" }},
+		{name: "duplicate", extra: true, racer: true},
 		{name: "terminating", mutate: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
-		{name: "terminating duplicate ignored", extra: true, racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
+		{name: "terminating duplicate ignored", extra: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
 		{name: "expression selector", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) {
 			c.Spec.SiteSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "region", Operator: metav1.LabelSelectorOpExists}}
 		}},
@@ -380,6 +427,12 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	planPod(true)
+
+	if err := env.Client.Delete(t.Context(), &stored); err != nil {
+		t.Fatal(err)
+	}
+
 	direct := planPod(false)
 
 	baseObjects, err := decodeManifests(env, applyMutator(env.Config.Image(imageRepository), component.ConfigMapPayloadHash(cm)))
@@ -407,12 +460,13 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 	}
 
 	delete(stored.Annotations, backingAnnotation)
+	stored.ResourceVersion = ""
 
-	if err := env.Client.Update(t.Context(), &stored); err != nil {
+	if err := env.Client.Create(t.Context(), &stored); err != nil {
 		t.Fatal(err)
 	}
 
-	planPod(false)
+	planPod(true)
 
 	stored.Annotations[backingAnnotation] = "true"
 	if err := env.Client.Update(t.Context(), &stored); err != nil {
@@ -445,14 +499,7 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 			t.Fatalf("recreation changed cache name argument: %v", ds.Spec.Template.Spec.Containers[0].Args)
 		}
 
-		command := strings.Join(ds.Spec.Template.Spec.InitContainers[0].Command, " ")
-
-		for _, prefix := range []string{"mkdir -p ", "chgrp 65532 /run/racer ", "chmod 2770 /run/racer "} {
-			directory := "/run/racer/" + cache.Name
-			if !strings.Contains(command, prefix+directory+" "+directory+"/client "+directory+"/origin\n") {
-				t.Fatalf("recreation directory setup missing: %s", command)
-			}
-		}
+		assertIsolatedRacerSockets(t, ds.Spec.Template.Spec)
 	}
 
 	var preserved corev1.ConfigMap
@@ -504,17 +551,16 @@ func TestBackingCacheAPIReadFailuresPreservePlan(t *testing.T) {
 			failure := errors.New("API unavailable")
 			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
 				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					_, cacheList := list.(*racerv1alpha1.ClusterCacheList)
-
 					_, nodeList := list.(*corev1.NodeList)
-					if (failing == "caches" && cacheList) || (failing == "nodes" && nodeList) {
+					if failing == "nodes" && nodeList {
 						return failure
 					}
 
 					return c.List(ctx, list, opts...)
 				},
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if failing == "config" && key.Name == configName {
+					_, cache := obj.(*racerv1alpha1.ClusterCache)
+					if (failing == "config" && key.Name == configName) || (failing == "caches" && cache) {
 						return failure
 					}
 
@@ -525,6 +571,62 @@ func TestBackingCacheAPIReadFailuresPreservePlan(t *testing.T) {
 			plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 			if plan != nil || !errors.Is(err, failure) {
 				t.Fatalf("API error must preserve existing workload and retry: plan=%v err=%v", plan, err)
+			}
+		})
+	}
+}
+
+func TestBackingCacheUsesNamedGet(t *testing.T) {
+	for _, state := range []string{"absent", "live", "deleting"} {
+		t.Run(state, func(t *testing.T) {
+			cache := backingCache("gantry")
+			cache.Annotations = nil
+			objects := []client.Object{backingCache("other")}
+
+			if state == "deleting" {
+				cache.DeletionTimestamp = ptr.To(metav1.Now())
+				cache.Finalizers = []string{"user-owned"}
+			}
+
+			if state != "absent" {
+				objects = append(objects, cache)
+			}
+
+			env := testEnv(t, objects...)
+			gets := 0
+			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*racerv1alpha1.ClusterCache); ok {
+						gets++
+
+						if key != (client.ObjectKey{Name: "gantry"}) {
+							t.Fatalf("unexpected cache lookup: %v", key)
+						}
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				},
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*racerv1alpha1.ClusterCacheList); ok {
+						t.Fatal("selection must not list caches")
+					}
+
+					if _, ok := list.(*corev1.NodeList); ok && state != "live" {
+						t.Fatal("absent/deleting cache must select direct without node coverage reads")
+					}
+
+					return c.List(ctx, list, opts...)
+				},
+			})
+
+			plan, result, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
+			if err != nil || plan == nil || !result.Ready || gets != 1 {
+				t.Fatalf("named lookup: gets=%d result=%#v err=%v", gets, result, err)
+			}
+
+			args := plannedDaemonSet(t, plan).Spec.Template.Spec.Containers[0].Args
+			if slices.Contains(args, "--content-backend=racer") != (state == "live") {
+				t.Fatalf("unexpected backend: %v", args)
 			}
 		})
 	}
@@ -541,8 +643,8 @@ func TestBackingCacheWatches(t *testing.T) {
 		{name: "identical relist", change: func(*racerv1alpha1.ClusterCache) {}},
 		{name: "UID-only recreation", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.UID = "replacement-uid" }},
 		{name: "resource version only", change: func(c *racerv1alpha1.ClusterCache) { c.ResourceVersion = "new" }},
-		{name: "annotation", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
-		{name: "annotation removed", want: true, change: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
+		{name: "annotation", change: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
+		{name: "annotation removed", change: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
 		{name: "unrelated annotation", change: func(c *racerv1alpha1.ClusterCache) { c.Annotations["other"] = "new" }},
 		{name: "label", change: func(c *racerv1alpha1.ClusterCache) { c.Labels = map[string]string{"other": "new"} }},
 		{name: "status", change: func(c *racerv1alpha1.ClusterCache) {
@@ -562,8 +664,24 @@ func TestBackingCacheWatches(t *testing.T) {
 		})
 	}
 
-	if !p.Create(event.CreateEvent{Object: backingCache("new")}) || !p.Delete(event.DeleteEvent{Object: backingCache("old")}) || p.Generic(event.GenericEvent{Object: backingCache("gantry")}) {
+	if !p.Create(event.CreateEvent{Object: backingCache("gantry")}) || !p.Delete(event.DeleteEvent{Object: backingCache("gantry")}) || p.Generic(event.GenericEvent{Object: backingCache("gantry")}) {
 		t.Fatal("cache event types")
+	}
+
+	for _, obj := range []client.Object{nil, &racerv1alpha1.ClusterCache{}, backingCache("other"), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "gantry"}}} {
+		if p.Create(event.CreateEvent{Object: obj}) || p.Delete(event.DeleteEvent{Object: obj}) || p.Update(event.UpdateEvent{ObjectOld: obj, ObjectNew: backingCache("gantry")}) || p.Update(event.UpdateEvent{ObjectOld: backingCache("gantry"), ObjectNew: obj}) {
+			t.Fatalf("unexpected event for unrelated object: %#v", obj)
+		}
+	}
+
+	oldCache := backingCache("other")
+	nextCache := oldCache.DeepCopy()
+	nextCache.UID = "new"
+	nextCache.Spec.CacheGeneration++
+
+	nextCache.DeletionTimestamp = ptr.To(metav1.Now())
+	if p.Update(event.UpdateEvent{ObjectOld: oldCache, ObjectNew: nextCache}) {
+		t.Fatal("unrelated cache updates must not trigger reconciliation")
 	}
 
 	node := &corev1.Node{}

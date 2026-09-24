@@ -17,10 +17,10 @@ barriers. Historical Go-retirement results do not validate this replacement.
 
 ## Current installation and capacity inputs
 
-Racer installation is driven by live P2PCaches, not Site component votes. Any
+Racer installation is driven by live ClusterCaches, not Site component votes. Any
 nonterminating cache installs both workloads, even with zero Sites. When no live
 caches remain, the operator updates each surviving workload independently and
-does not recreate a missing sibling. Manual uninstall removes all P2PCaches,
+does not recreate a missing sibling. Manual uninstall removes all ClusterCaches,
 then the control-plane Deployment and dataplane DaemonSet in either order.
 Support resources are not reinstall markers
 (`internal/operator/components/racer/racer.go:41`, `:73`, `:85`, `:115`).
@@ -33,10 +33,14 @@ when absent. An invalid present annotation is an error, not a fallback
 to Node annotations before upgrading; Site Racer `enabled` and `cacheSize` fields
 have been removed.
 
-Gantry independently selects its backend using a user-managed P2PCache's
-`unbounded-cloud.io/gantry-backing: "true"` annotation. See the
+Gantry independently selects Racer using the user-managed ClusterCache named
+`gantry`, subject to the existing empty-selector and node-coverage checks. Other
+names and the legacy `unbounded-cloud.io/gantry-backing` annotation do not select
+its backend. A missing or deleting `gantry` cache rolls Gantry to direct; there
+is no retained-cache disable switch. Gantry mounts only that cache's client and
+origin socket directories, not the Racer root or socket files. See the
 [current integration contract](gantry-unbounded-integration.md#current-implementation)
-for validation, rollback, and legacy ConfigMap behavior.
+for validation, deletion-driven return to direct, and legacy ConfigMap behavior.
 
 ## Stateless placement and publication
 
@@ -90,7 +94,7 @@ The runtime owns a constant set of durable objects in its state namespace:
 | `Lease/racer-controlplane` | Current leadership |
 
 This constant object count excludes workload objects and status on existing
-Nodes/P2PCaches. Existing CP Pods hold only the current
+Nodes/ClusterCaches. Existing CP Pods hold only the current
 `racer.unbounded-cloud.io/pki-request` and `pki-response` annotations, each
 bounded to 16 KiB. Responses bind Pod UID, boot, and CSR digest; Pod UID and
 resourceVersion CAS fence writes. Private process keys remain process-local.

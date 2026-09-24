@@ -1,7 +1,9 @@
 # Strategic merge patch, not a standalone Kubernetes resource.
 # Standalone only: render with --set RacerCacheName=gantry.
 # Without a name this optional patch is empty. Operator-managed deployments use
-# the ClusterCache gantry-backing annotation and generate the whole pod atomically.
+# the ClusterCache named gantry and generate the whole pod atomically.
+# Mount only the selected cache's socket directories so socket replacement stays
+# visible without exposing other caches or changing their parent permissions.
 {{ if .RacerCacheName -}}
 {{ if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" .RacerCacheName) -}}
 {{ fail "RacerCacheName must be the selected ClusterCache metadata.name (1..63 lowercase alphanumeric/hyphen characters, alphanumeric edges)" }}
@@ -28,12 +30,15 @@ spec:
             - |
               chown -R 65532:65532 /var/lib/gantry/libp2p
               chmod 0700 /var/lib/gantry/libp2p
-              mkdir -p /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
-              chgrp 65532 /run/racer /run/racer/{{ .RacerCacheName }} /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
-              chmod 2770 /run/racer /run/racer/{{ .RacerCacheName }} /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
+              chgrp 65532 /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
+              chmod 2770 /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
           volumeMounts:
-            - name: racer-sockets
-              mountPath: /run/racer
+            - mountPath: /run/racer
+              $patch: delete
+            - name: racer-client-sockets
+              mountPath: /run/racer/{{ .RacerCacheName }}/client
+            - name: racer-origin-sockets
+              mountPath: /run/racer/{{ .RacerCacheName }}/origin
       containers:
         - name: gantry
           args:
@@ -47,11 +52,21 @@ spec:
             - containerPort: 5002
               $patch: delete
           volumeMounts:
-            - name: racer-sockets
-              mountPath: /run/racer
+            - mountPath: /run/racer
+              $patch: delete
+            - name: racer-client-sockets
+              mountPath: /run/racer/{{ .RacerCacheName }}/client
+            - name: racer-origin-sockets
+              mountPath: /run/racer/{{ .RacerCacheName }}/origin
       volumes:
         - name: racer-sockets
+          $patch: delete
+        - name: racer-client-sockets
           hostPath:
-            path: /run/racer
+            path: /run/racer/{{ .RacerCacheName }}/client
+            type: DirectoryOrCreate
+        - name: racer-origin-sockets
+          hostPath:
+            path: /run/racer/{{ .RacerCacheName }}/origin
             type: DirectoryOrCreate
 {{ end -}}

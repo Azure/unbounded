@@ -72,7 +72,7 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
-  # Gantry's optional Racer backend creates a dedicated cache and validates it.
+  # Gantry validates the user-owned ClusterCache named gantry without modifying it.
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercaches"]
     verbs: ["get", "list", "watch", "create"]
