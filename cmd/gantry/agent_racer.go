@@ -159,7 +159,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 			return false
 		}
 
-		return racerSocketReady(probeCtx, originSocket, readinessTarget) && racerSocketReady(probeCtx, cacheSocket, readinessTarget)
+		return racerSocketReady(probeCtx, originSocket, readinessTarget) && racerCacheSocketReady(probeCtx, cacheSocket)
 	}
 
 	go func() {
@@ -294,8 +294,9 @@ func startRacerOrigin(socket string, handler http.Handler) (*http.Server, <-chan
 	return server, done, nil
 }
 
-// Resolve once at startup so each node probes a stable metadata key rather than
-// concentrating the fleet's uncached negative lookups on one metadata owner.
+// Resolve once at startup for the local origin's reserved invalid target. Never
+// send this HEAD through the cache: its metadata owner may be an unswitched peer
+// whose Gantry origin is not running yet, which would block a rolling update.
 func racerReadinessTarget(nodeName string, hostname func() (string, error)) (string, error) {
 	if nodeName == "" {
 		var err error
@@ -313,17 +314,37 @@ func racerReadinessTarget(nodeName string, hostname func() (string, error)) (str
 	return "/gantry-readiness?node=" + url.QueryEscape(nodeName), nil
 }
 
-// A reserved invalid target must reach HTTP and return 404. A mere filesystem
-// existence check could release readiness before either socket is serving.
+// The local origin must handle HTTP and reject the reserved invalid target.
 func racerSocketReady(ctx context.Context, socket, target string) bool {
+	return racerProbeSocket(ctx, socket, http.MethodHead, target, func(response *http.Response) bool {
+		return response.StatusCode == http.StatusNotFound
+	})
+}
+
+// Racer rejects OPTIONS in its worker-local HTTP parser before cache admission
+// or origin/peer routing. This proves the selected cache UDS can accept, parse
+// and respond, without making rollout readiness depend on other Gantry origins.
+// Require the parser's exact response rather than accepting arbitrary errors.
+// Cache data availability is still enforced per request, with registry fallback;
+// this probe does not claim storage health or fleet-wide origin availability.
+func racerCacheSocketReady(ctx context.Context, socket string) bool {
+	return racerProbeSocket(ctx, socket, http.MethodOptions, "/", func(response *http.Response) bool {
+		return response.StatusCode == http.StatusMethodNotAllowed &&
+			response.Header.Get("Allow") == "GET, HEAD" && response.ContentLength == 0
+	})
+}
+
+func racerProbeSocket(ctx context.Context, socket, method, target string, ready func(*http.Response) bool) bool {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}
 	defer transport.CloseIdleConnections()
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://localhost"+target, nil)
+	req, err := http.NewRequestWithContext(ctx, method, "http://localhost"+target, nil)
 	if err != nil {
 		return false
 	}
@@ -332,9 +353,9 @@ func racerSocketReady(ctx context.Context, socket, target string) bool {
 	if err != nil {
 		return false
 	}
-	defer response.Body.Close() //nolint:errcheck // HEAD response cleanup.
+	defer response.Body.Close() //nolint:errcheck // Probe response cleanup.
 
-	return response.StatusCode == http.StatusNotFound
+	return ready(response)
 }
 
 func racerDiscoveryOptions(c *config.Config) discovery.Options {

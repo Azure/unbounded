@@ -104,7 +104,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	enabled := false
 
 	for i := range sites {
-		if EnabledFor(&sites[i]) {
+		if sites[i].DeletionTimestamp.IsZero() && EnabledFor(&sites[i]) {
 			enabled = true
 			break
 		}
@@ -129,26 +129,12 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
-	backend, err := contentConfig(ctx, env, configOp)
+	cache, result, err := selectBackingCache(ctx, env, sites)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
-	if backend.ContentBackend == "racer" {
-		if err := planRacer(ctx, env, sites, backend.RacerCacheName, plan); err != nil {
-			return nil, component.Result{}, err
-		}
-	}
-
 	dependsOn := legacyRefs
-
-	if backend.ContentBackend == "racer" {
-		for _, op := range plan.Operations {
-			if op.Object.GetKind() == "P2PCache" {
-				dependsOn = append(dependsOn, op.Ref())
-			}
-		}
-	}
 
 	if configOp != nil {
 		plan.Add(*configOp)
@@ -161,16 +147,23 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
+	if cache == nil {
+		objects, err = absentChairManifests(ctx, env, objects)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+	}
+
 	for _, obj := range objects {
-		if backend.ContentBackend == "racer" {
+		if cache != nil {
 			if obj.GetKind() == "Lease" || ((obj.GetKind() == "Role" || obj.GetKind() == "RoleBinding") && obj.GetName() == "gantry-agent") {
 				continue
 			}
+		}
 
-			if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
-				if err := configureRacerPod(obj, backend.RacerCacheName); err != nil {
-					return nil, component.Result{}, err
-				}
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
+			if err := configureBackendPod(obj, cache); err != nil {
+				return nil, component.Result{}, err
 			}
 		}
 
@@ -188,12 +181,47 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 
 		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
 			op.Overridable = true
+			// Direct startup uses the token and chair API immediately. Restore
+			// its prerequisites before switching the pod back from Racer.
+			op.DependsOn = append([]component.ObjectRef(nil), dependsOn...)
+
+			for _, dependency := range objects {
+				if dependency.GetKind() == "ServiceAccount" || (cache == nil && (dependency.GetKind() == "Lease" || dependency.GetKind() == "Role" || dependency.GetKind() == "RoleBinding")) {
+					op.DependsOn = append(op.DependsOn, (component.Operation{Object: dependency}).Ref())
+				}
+			}
 		}
 
 		plan.Add(op)
 	}
 
-	return plan, component.Reconciled(), nil
+	return plan, result, nil
+}
+
+// Existing chairs are authoritative, including their live holder/renewal data.
+// CreateIfAbsent means planning observed absence: an AlreadyExists race makes
+// dependent writes stale. Only missing chairs should become create dependencies.
+func absentChairManifests(ctx context.Context, env *component.Env, objects []*unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
+	leases := &coordinationv1.LeaseList{}
+	if err := env.LiveReader().List(ctx, leases, client.InNamespace(env.Namespace)); err != nil {
+		return nil, fmt.Errorf("read Gantry chair leases: %w", err)
+	}
+
+	existing := make(map[string]bool, len(leases.Items))
+	for _, lease := range leases.Items {
+		existing[lease.Name] = true
+	}
+
+	missing := objects[:0]
+	for _, obj := range objects {
+		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") && existing[obj.GetName()] {
+			continue
+		}
+
+		missing = append(missing, obj)
+	}
+
+	return missing, nil
 }
 
 // SetupWatches reconciles Gantry on changes to its active resources and when

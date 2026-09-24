@@ -43,6 +43,11 @@ const (
 
 	// OpDelete removes the object, treating absence as success.
 	OpDelete
+
+	// OpApplyExisting server-side applies desired fields only to the observed
+	// incarnation. Base must carry its UID and resourceVersion. Unlike OpApply,
+	// this operation cannot create an object removed after planning.
+	OpApplyExisting
 )
 
 // String renders an OpKind for error messages and test failures.
@@ -56,6 +61,8 @@ func (k OpKind) String() string {
 		return "MergePatch"
 	case OpDelete:
 		return "Delete"
+	case OpApplyExisting:
+		return "ApplyExisting"
 	default:
 		return fmt.Sprintf("OpKind(%d)", int(k))
 	}
@@ -93,8 +100,8 @@ type Operation struct {
 	Kind   OpKind
 	Object *unstructured.Unstructured
 
-	// Base is the observed state for OpMergePatch, and is ignored otherwise.
-	// The executor computes the patch from Base to Object.
+	// Base is the observed state for OpMergePatch and OpApplyExisting.
+	// The former computes a diff; the latter uses its identity as preconditions.
 	Base *unstructured.Unstructured
 
 	// Component names the component that planned this operation, and Site the

@@ -3,6 +3,9 @@
 > Historical pre-1.0 procedure. Do not use this migration procedure for Racer
 > 1.0. The inventory script has been removed; 1.0 requires fresh CA state and
 > slabs. See `cmd/racer-dataplane/CONTRACT.md` for the current format contract.
+> The Site enablement references below are also historical. Current installation
+> is P2PCache-driven, and Site Racer fields no longer exist. Use the
+> [current installation and uninstall guide](../docs/content/concepts/racer.md#cluster-wide-installation).
 
 This is a **coordinated fresh trust-domain cutover**, not a rolling upgrade or a
 backward-compatibility migration. Deploy matching CP and DP binaries together.

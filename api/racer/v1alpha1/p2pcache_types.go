@@ -11,7 +11,7 @@ const (
 )
 
 // P2PCache names a node-local HTTP cache backed by a node-local origin.
-// Each selected Racer-enabled Site has an independent cache universe.
+// Each selected nonterminating Site has an independent cache universe.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:subresource:status
@@ -30,7 +30,7 @@ type P2PCache struct {
 
 type P2PCacheSpec struct {
 	// SiteSelector matches Site labels. An omitted or empty selector matches all
-	// Sites, but only Sites with Racer enabled participate.
+	// nonterminating Sites.
 	// +optional
 	SiteSelector metav1.LabelSelector `json:"siteSelector,omitempty"`
 	// CacheGeneration invalidates cached data without changing the origin socket.

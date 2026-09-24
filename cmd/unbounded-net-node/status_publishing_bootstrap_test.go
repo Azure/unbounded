@@ -163,6 +163,7 @@ func TestWebSocketPublisherReportsBootstrapCNIGuard(t *testing.T) {
 
 			return
 		}
+
 		defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test complete") }()
 
 		for {

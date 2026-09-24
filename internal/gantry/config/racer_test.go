@@ -116,3 +116,49 @@ func TestRacerTransferBudgetConfiguration(t *testing.T) {
 		t.Fatal("unbounded admission accepted")
 	}
 }
+
+func TestGeneratedBackendFlagsOverrideLegacyConfiguration(t *testing.T) {
+	for _, backend := range []string{"direct", "racer"} {
+		t.Run(backend, func(t *testing.T) {
+			c := NewDefault()
+			if err := c.LoadYAML(strings.NewReader("content_backend: obsolete\nracer_cache_name: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.LoadEnv(func(key string) string {
+				return map[string]string{"GANTRY_CONTENT_BACKEND": "obsolete-env", "GANTRY_RACER_CACHE_NAME": "../stale-env"}[key]
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			flags := flag.NewFlagSet("test", flag.ContinueOnError)
+			c.BindFlags(flags)
+
+			args := []string{"--content-backend=" + backend}
+			if backend == "racer" {
+				args = append(args, "--racer-cache-name=selected")
+			}
+
+			if err := flags.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.Validate(); err != nil {
+				t.Fatalf("generated flags did not override stale config: %v", err)
+			}
+
+			if c.ContentBackend != backend || (backend == "racer" && c.RacerCacheName != "selected") || len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "private.example" {
+				t.Fatalf("incorrect merged config: %#v", c)
+			}
+		})
+	}
+}
+
+func TestBackendFlagsDoNotHideMalformedYAML(t *testing.T) {
+	for _, payload := range []string{"[not: yaml", "unknown_field: value", "racer_cache_name: [invalid, type]"} {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader(payload)); err == nil {
+			t.Fatalf("malformed configuration must remain an error: %q", payload)
+		}
+	}
+}

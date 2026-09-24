@@ -14,7 +14,7 @@ import (
 )
 
 func TestGantryBackendAuthority(t *testing.T) {
-	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: "gantry"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml"}}}}}}}
+	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: "gantry"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=direct"}}}}}}}
 
 	for _, tc := range []struct {
 		name   string
@@ -31,6 +31,15 @@ func TestGantryBackendAuthority(t *testing.T) {
 			c.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "hidden"}}}}
 		}},
 		{name: "command redirect", change: func(c *corev1.Container) { c.Command = []string{"custom"} }},
+		{name: "positional bypass", change: func(c *corev1.Container) { c.Args = append([]string{"agent", "ignored"}, c.Args[1:]...) }},
+		{name: "stop flags bypass", change: func(c *corev1.Container) { c.Args = append([]string{"agent", "--"}, c.Args[1:]...) }},
+		{name: "backend flag removed", change: func(c *corev1.Container) { c.Args = c.Args[:2] }},
+		{name: "config file shadow", change: func(c *corev1.Container) {
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "shadow", MountPath: "/etc/gantry/config.yaml"})
+		}},
+		{name: "config parent shadow", change: func(c *corev1.Container) {
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "shadow", MountPath: "/etc"})
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := ds.DeepCopy()
@@ -39,6 +48,44 @@ func TestGantryBackendAuthority(t *testing.T) {
 			err := validateGantryConfig(component.ToUnstructured(ds), component.ToUnstructured(candidate))
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid=%v error=%v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestGantryRacerPodSelectionProtected(t *testing.T) {
+	no := false
+	ds := &appsv1.DaemonSet{Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"unbounded-cloud.io/gantry-cache-uid": "selected-uid"}},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &no,
+			SecurityContext:              &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}},
+			Volumes:                      []corev1.Volume{{Name: "racer-sockets"}},
+			InitContainers:               []corev1.Container{{Name: "chown-hostpaths", Command: []string{"sh", "-c", "mkdir -p /dev/racer/cache"}}},
+			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-name=cache"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/dev/racer"}}}},
+		},
+	}}}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*corev1.PodTemplateSpec)
+	}{
+		{name: "UID", mutate: func(p *corev1.PodTemplateSpec) { p.Annotations["unbounded-cloud.io/gantry-cache-uid"] = "other" }},
+		{name: "token", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.AutomountServiceAccountToken = nil }},
+		{name: "groups", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.SecurityContext = nil }},
+		{name: "init", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.InitContainers = nil }},
+		{name: "ports", mutate: func(p *corev1.PodTemplateSpec) {
+			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "transfer", ContainerPort: 5001}}
+		}},
+		{name: "mount", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].VolumeMounts = nil }},
+		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-name=other" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := ds.DeepCopy()
+			tc.mutate(&candidate.Spec.Template)
+
+			if err := validateGantryConfig(component.ToUnstructured(ds), component.ToUnstructured(candidate)); err == nil {
+				t.Fatal("accepted change to operator-owned backend wiring")
 			}
 		})
 	}

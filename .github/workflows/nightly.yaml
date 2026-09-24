@@ -546,8 +546,8 @@ jobs:
         env:
           RACER_TARGETS: ${{ steps.racer.outputs.targets }}
         run: |
-          # Racer discovery includes the retained controller and enabled Sites'
-          # DaemonSets. The shared gate uses leader-aware controller health.
+          # Live caches require both Racer workloads; without caches, discovery
+          # includes only retained workloads. Controller health is leader-aware.
           # shellcheck disable=SC2086
           _deploy-tools/hack/release/wait-rollouts.sh \
             deploy/unbounded-operator \

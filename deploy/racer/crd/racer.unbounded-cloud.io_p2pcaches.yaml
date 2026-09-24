@@ -34,7 +34,7 @@ spec:
       openAPIV3Schema:
         description: |-
           P2PCache names a node-local HTTP cache backed by a node-local origin.
-          Each selected Racer-enabled Site has an independent cache universe.
+          Each selected nonterminating Site has an independent cache universe.
         properties:
           apiVersion:
             description: |-
@@ -80,7 +80,7 @@ spec:
               siteSelector:
                 description: |-
                   SiteSelector matches Site labels. An omitted or empty selector matches all
-                  Sites, but only Sites with Racer enabled participate.
+                  nonterminating Sites.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.

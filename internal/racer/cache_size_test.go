@@ -12,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
@@ -97,28 +96,27 @@ func TestResolveCacheSize(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		node    *corev1.Node
-		site    *machinav1alpha3.Site
 		want    int64
 		wantErr string
 	}{
 		{name: "nil inputs", want: 10 << 30},
-		{name: "empty objects", node: &corev1.Node{}, site: &machinav1alpha3.Site{}, want: 10 << 30},
-		{name: "no Site size", site: cacheSite(nil), want: 10 << 30},
-		{name: "Site default", site: cacheSite(new(resource.MustParse("2Ti"))), want: 2 << 40},
+		{name: "empty objects", node: &corev1.Node{}, want: 10 << 30},
+		{name: "no Site dependency", node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{racer.SiteLabelKey: "missing"}}}, want: 10 << 30},
+		{name: "Node default", node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, want: 10 << 30},
 		{name: "Node only", node: cacheNode("3Ti"), want: 3 << 40},
-		{name: "Node wins", node: cacheNode("512.5Mi"), site: cacheSite(new(resource.MustParse("2Ti"))), want: 576 << 20},
-		{name: "invalid unused Site", node: cacheNode("3Ti"), site: cacheSite(new(resource.MustParse("0"))), want: 3 << 40},
-		{name: "empty override blocks inheritance", node: cacheNode(""), site: cacheSite(new(resource.MustParse("2Ti"))), wantErr: racer.CacheSizeAnnotationKey},
-		{name: "invalid override blocks inheritance", node: cacheNode("invalid"), site: cacheSite(new(resource.MustParse("2Ti"))), wantErr: racer.CacheSizeAnnotationKey},
+		{name: "Node alignment", node: cacheNode("512.5Mi"), want: 576 << 20},
+		{name: "Node without Site", node: cacheNode("2Ti"), want: 2 << 40},
+		{name: "empty override blocks default", node: cacheNode(""), wantErr: racer.CacheSizeAnnotationKey},
+		{name: "invalid override blocks default", node: cacheNode("invalid"), wantErr: racer.CacheSizeAnnotationKey},
 		{name: "invalid override blocks builtin", node: cacheNode("0"), wantErr: racer.CacheSizeAnnotationKey},
-		{name: "zero Site blocks builtin", site: cacheSite(new(resource.MustParse("0"))), wantErr: "spec.components.racer.cacheSize"},
-		{name: "fractional Site blocks builtin", site: cacheSite(new(resource.MustParse("512.1Mi"))), wantErr: "spec.components.racer.cacheSize"},
-		{name: "overflow Site blocks builtin", site: cacheSite(new(resource.MustParse("8Ei"))), wantErr: "spec.components.racer.cacheSize"},
+		{name: "below minimum Node blocks builtin", node: cacheNode("511Mi"), wantErr: racer.CacheSizeAnnotationKey},
+		{name: "fractional Node blocks builtin", node: cacheNode("512.1Mi"), wantErr: racer.CacheSizeAnnotationKey},
+		{name: "overflow Node blocks builtin", node: cacheNode("8Ei"), wantErr: racer.CacheSizeAnnotationKey},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			nodeBefore, siteBefore := tc.node.DeepCopy(), tc.site.DeepCopy()
+			nodeBefore := tc.node.DeepCopy()
 
-			got, err := racer.ResolveCacheSize(tc.node, tc.site)
+			got, err := racer.ResolveCacheSize(tc.node)
 			if got != tc.want || (err != nil) != (tc.wantErr != "") {
 				t.Fatalf("ResolveCacheSize() = %d, %v; want %d, error containing %q", got, err, tc.want, tc.wantErr)
 			}
@@ -127,8 +125,8 @@ func TestResolveCacheSize(t *testing.T) {
 				t.Fatalf("error %q does not identify source %q", err, tc.wantErr)
 			}
 
-			if !reflect.DeepEqual(tc.node, nodeBefore) || !reflect.DeepEqual(tc.site, siteBefore) {
-				t.Fatal("resolution mutated Node or Site")
+			if !reflect.DeepEqual(tc.node, nodeBefore) {
+				t.Fatal("resolution mutated Node")
 			}
 		})
 	}
@@ -136,36 +134,41 @@ func TestResolveCacheSize(t *testing.T) {
 
 func TestResolveCacheSizeLiveInheritance(t *testing.T) {
 	node := &corev1.Node{}
-	site := cacheSite(new(resource.MustParse("2Ti")))
 	assertSize := func(want int64) {
 		t.Helper()
 
-		if got, err := racer.ResolveCacheSize(node, site); err != nil || got != want {
+		if got, err := racer.ResolveCacheSize(node); err != nil || got != want {
 			t.Fatalf("ResolveCacheSize() = %d, %v; want %d", got, err, want)
 		}
 	}
-	assertSize(2 << 40)
+	assertSize(10 << 30)
 
-	site.Spec.Components.Racer.CacheSize = new(resource.MustParse("3Ti"))
+	if node.Annotations != nil {
+		t.Fatal("builtin default copied to Node")
+	}
+
+	node.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "3Ti"}
 
 	assertSize(3 << 40)
 
-	if node.Annotations != nil {
-		t.Fatal("Site default copied to Node")
-	}
+	node.Labels = map[string]string{racer.SiteLabelKey: "site-a"}
 
-	node.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "10Gi"}
+	assertSize(3 << 40)
 
-	assertSize(10 << 30)
+	node.Labels[racer.SiteLabelKey] = "missing-site"
 
-	site.Spec.Components.Racer.CacheSize = new(resource.MustParse("4Ti"))
+	assertSize(3 << 40)
 
-	assertSize(10 << 30)
-	delete(node.Annotations, racer.CacheSizeAnnotationKey)
+	node.Annotations[racer.CacheSizeAnnotationKey] = "4Ti"
+
 	assertSize(4 << 40)
 
-	site.Spec.Components.Racer.CacheSize = nil
+	node.Annotations[racer.CacheSizeAnnotationKey] = "invalid"
+	if _, err := racer.ResolveCacheSize(node); err == nil {
+		t.Fatal("invalid live annotation silently fell back to default")
+	}
 
+	delete(node.Annotations, racer.CacheSizeAnnotationKey)
 	assertSize(10 << 30)
 }
 
@@ -173,13 +176,4 @@ func cacheNode(value string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-a", Annotations: map[string]string{racer.CacheSizeAnnotationKey: value},
 	}}
-}
-
-func cacheSite(size *resource.Quantity) *machinav1alpha3.Site {
-	return &machinav1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: machinav1alpha3.SiteSpec{Components: machinav1alpha3.SiteComponents{
-			Racer: &machinav1alpha3.RacerComponentSpec{CacheSize: size},
-		}},
-	}
 }

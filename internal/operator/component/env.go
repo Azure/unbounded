@@ -332,6 +332,10 @@ func DeleteOperation(obj client.Object, componentName, site string) Operation {
 // desired payload. Read failures are deliberately treated as cache misses so
 // reconciliation still attempts the authoritative write and surfaces its error.
 func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
+	return e.applyObject(ctx, obj, nil)
+}
+
+func (e *Env) applyObject(ctx context.Context, obj client.Object, observed *unstructured.Unstructured) error {
 	desired := ToUnstructured(obj).DeepCopy()
 
 	hash, err := AppliedPayloadHash(desired)
@@ -350,10 +354,27 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 
-	key := client.ObjectKeyFromObject(desired)
-	if err := e.Client.Get(ctx, key, current); err == nil &&
-		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(desired.Object, current.Object) {
+	if observed != nil {
+		// Planning already read this incarnation authoritatively. Reuse that
+		// snapshot for no-op detection; writes are guarded against later changes.
+		current = observed
+	} else if err := e.Client.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+		// A cache miss must not prevent ordinary apply from creating resources,
+		// and a partially populated failed read cannot establish convergence.
+		current = &unstructured.Unstructured{}
+	}
+
+	if current.GetLabels()[AppliedHashLabel] == hash && appliedFieldsMatch(desired, current) {
 		return nil
+	}
+
+	// Preconditions are transport state, not desired intent: including them in
+	// the hash would force a write after every resourceVersion change. SSA honors
+	// resourceVersion on update and rejects creation with a nonempty version;
+	// UID also prevents a stale plan from adopting a replacement at the same key.
+	if observed != nil {
+		desired.SetUID(observed.GetUID())
+		desired.SetResourceVersion(observed.GetResourceVersion())
 	}
 
 	applyCfg := client.ApplyConfigurationFromUnstructured(desired)
@@ -362,6 +383,21 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	}
 
 	return nil
+}
+
+// PriorityClass serializes globalDefault with omitempty, so an authoritative
+// false value is absent on reads. Keep false in the desired SSA payload to own
+// and repair the field, but recognize its absent wire representation as equal.
+// Do not generalize this to arbitrary missing fields: absence can mean drift.
+func appliedFieldsMatch(desired, current *unstructured.Unstructured) bool {
+	if desired.GetAPIVersion() == "scheduling.k8s.io/v1" && desired.GetKind() == "PriorityClass" && desired.Object["globalDefault"] == false {
+		if _, present := current.Object["globalDefault"]; !present {
+			current = current.DeepCopy()
+			current.Object["globalDefault"] = false
+		}
+	}
+
+	return DesiredFieldsMatch(desired.Object, current.Object)
 }
 
 // DesiredFieldsMatch reports whether every field declared by desired has the

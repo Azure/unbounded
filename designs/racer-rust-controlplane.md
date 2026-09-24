@@ -15,6 +15,29 @@ This contract supersedes the earlier durable topology/chunk store, placement
 history, participant shards, replica ConfigMaps, and fleet-proof rotation
 barriers. Historical Go-retirement results do not validate this replacement.
 
+## Current installation and capacity inputs
+
+Racer installation is driven by live P2PCaches, not Site component votes. Any
+nonterminating cache installs both workloads, even with zero Sites. When no live
+caches remain, the operator updates each surviving workload independently and
+does not recreate a missing sibling. Manual uninstall removes all P2PCaches,
+then the control-plane Deployment and dataplane DaemonSet in either order.
+Support resources are not reinstall markers
+(`internal/operator/components/racer/racer.go:41`, `:73`, `:85`, `:115`).
+
+Live Sites define universes; cache selectors choose among those Sites without
+a Racer enablement field (`cmd/racer-controlplane/src/kubernetes.rs:635`, `:841`).
+Capacity comes only from Node `racer.unbounded-cloud.io/cache-size`, then `10Gi`
+when absent. An invalid present annotation is an error, not a fallback
+(`cmd/racer-controlplane/src/storage.rs:116`). Copy desired inherited Site sizes
+to Node annotations before upgrading; Site Racer `enabled` and `cacheSize` fields
+have been removed.
+
+Gantry independently selects its backend using a user-managed P2PCache's
+`unbounded-cloud.io/gantry-backing: "true"` annotation. See the
+[current integration contract](gantry-unbounded-integration.md#current-implementation)
+for validation, rollback, and legacy ConfigMap behavior.
+
 ## Stateless placement and publication
 
 Each universe has **262,144 slots**. Highest-random-weight (HRW) rendezvous

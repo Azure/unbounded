@@ -803,7 +803,7 @@ e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and inde
 			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
 		done; \
 		failed=0; \
-		for suite in Striped Authorization Recovery Corruption ContainerImage Generation; do \
+		for suite in Striped Authorization Recovery Corruption ContainerImage Generation RollingSwitch; do \
 			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
 			$(RACER_TEST_HARNESS) run "gantry-$$suite" 60 $(GOTEST) -json -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v || failed=1; \
 		done; exit $$failed

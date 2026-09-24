@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -125,6 +126,7 @@ func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
 		"apps/v1":     appsv1.AddToScheme,
 		"core/v1":     corev1.AddToScheme,
 		"machina API": unboundedv1alpha3.AddToScheme,
+		"racer API":   racerv1alpha1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add %s to scheme: %v", name, err)
@@ -939,14 +941,13 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 				Metalman:       &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
 				Gantry:         &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
 				TokenRefresher: &unboundedv1alpha3.TokenRefresherComponentSpec{SiteComponentSpec: enabled()},
-				Racer:          &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: enabled()},
 			},
 		},
 	}}
 
 	targets := []*unboundedv1alpha3.Site{&sites[0]}
 
-	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache"}}).Build()
 	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
 
 	_, _, plan := planComponents(t.Context(), env, DefaultRegistry(), sites, targets)

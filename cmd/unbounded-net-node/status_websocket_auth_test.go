@@ -93,6 +93,7 @@ func TestWebSocketEstablishedFailureFallsBack(t *testing.T) {
 					if err != nil {
 						return
 					}
+
 					defer func() { _ = conn.CloseNow() }()
 
 					_, data, err := conn.Read(ctx)
@@ -279,6 +280,7 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 				if err != nil {
 					return
 				}
+
 				defer func() { _ = conn.CloseNow() }()
 
 				for {
@@ -518,6 +520,7 @@ func consumeTestWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+
 	defer func() { _ = conn.CloseNow() }()
 
 	for {
@@ -574,6 +577,7 @@ func TestWebSocketFallbackIndependentOfHTTP(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 
 			done := make(chan struct{})
+
 			go func() {
 				defer close(done)
 
@@ -658,6 +662,7 @@ func TestWebSocketUnauthorizedRefreshesToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan struct{})
+
 	go func() {
 		defer close(done)
 

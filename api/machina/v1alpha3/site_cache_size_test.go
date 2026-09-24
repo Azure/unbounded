@@ -11,37 +11,26 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
-	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
 	"sigs.k8s.io/yaml"
 )
 
 func TestSiteCacheSizeQuantityJSON(t *testing.T) {
 	for _, tc := range []struct {
 		value string
-		want  string
 	}{
-		{`{}`, ""},
-		{`{"cacheSize":null}`, ""},
-		{`{"cacheSize":"2Ti"}`, "2Ti"},
-		{`{"cacheSize":2199023255552}`, "2Ti"},
-		{`{"cacheSize":"32.5Mi"}`, "34078720"},
-		// Zero must remain explicit so resolution can reject it, not inherit.
-		{`{"cacheSize":"0"}`, "0"},
+		{`{}`},
+		{`{"cacheSize":null}`},
+		{`{"cacheSize":"2Ti"}`},
+		{`{"cacheSize":2199023255552}`},
+		{`{"cacheSize":"32.5Mi"}`},
+		{`{"cacheSize":"0"}`},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
-			var spec RacerComponentSpec
-			if err := json.Unmarshal([]byte(tc.value), &spec); err != nil {
+			// Legacy Racer configuration has no typed Site API representation.
+			var spec SiteComponents
+			if err := json.Unmarshal([]byte(`{"racer":`+tc.value+`}`), &spec); err != nil {
 				t.Fatal(err)
-			}
-
-			if tc.want == "" {
-				if spec.CacheSize != nil {
-					t.Fatal("absent cacheSize must remain nil")
-				}
-			} else if spec.CacheSize == nil || spec.CacheSize.Cmp(resource.MustParse(tc.want)) != 0 {
-				t.Fatalf("cacheSize = %v, want %s", spec.CacheSize, tc.want)
 			}
 
 			data, err := json.Marshal(spec)
@@ -54,8 +43,8 @@ func TestSiteCacheSizeQuantityJSON(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, present := fields["cacheSize"]; present != (tc.want != "") {
-				t.Fatalf("cacheSize presence changed on round trip: %s", data)
+			if _, present := fields["racer"]; present {
+				t.Fatalf("removed Racer configuration survived round trip: %s", data)
 			}
 		})
 	}
@@ -72,29 +61,13 @@ func TestSiteCacheSizeSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	racer := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["components"].Properties["racer"]
-
-	size, ok := racer.Properties["cacheSize"]
-	if !ok || !size.XIntOrString || size.Pattern == "" {
-		t.Fatal("cacheSize must have the Kubernetes quantity schema")
+	components := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["components"]
+	if _, present := components.Properties["racer"]; present {
+		t.Fatal("Site schema still exposes Racer configuration")
 	}
-
-	if size.Default != nil {
-		t.Fatal("cacheSize omission must be preserved for runtime inheritance")
-	}
-
-	for _, required := range racer.Required {
-		if required == "cacheSize" {
-			t.Fatal("cacheSize must remain optional")
-		}
-	}
-
-	assertSchemaValidations(t, size, map[string]string{
-		"isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('512Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.9375Gi')) <= 0": "cacheSize must be a quantity between 512Mi and 8589934591.9375Gi",
-	})
 
 	var internalSchema apiextensions.JSONSchemaProps
-	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&size, &internalSchema, nil); err != nil {
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&components, &internalSchema, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,38 +76,38 @@ func TestSiteCacheSizeSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	validator := cel.NewValidator(structural, false, 1000000)
-	if validator == nil {
-		t.Fatal("missing cacheSize CEL validator")
-	}
-
 	for _, tc := range []struct {
 		name  string
 		value any
-		valid bool
 	}{
-		{"minimum", "512Mi", true},
-		{"unaligned", "512.5Mi", true},
-		{"default", "10Gi", true},
-		{"large", "3Ti", true},
-		{"large decimal", "2.5Ti", true},
-		{"integer JSON", int64(2199023255552), true},
-		{"maximum", "9223372036787666944", true},
-		{"maximum Gi", "8589934591.9375Gi", true},
-		{"empty", "", false},
-		{"invalid unit", "10GiB", false},
-		{"zero", "0", false},
-		{"negative", "-32Mi", false},
-		{"below minimum", "536870911", false},
-		{"alignment overflow", "9223372036787666945", false},
-		{"Gi overflow", "8589934592Gi", false},
-		{"binary overflow", "8Ei", false},
-		{"decimal overflow", "1e100", false},
+		{"minimum", "512Mi"},
+		{"unaligned", "512.5Mi"},
+		{"default", "10Gi"},
+		{"large", "3Ti"},
+		{"large decimal", "2.5Ti"},
+		{"integer JSON", int64(2199023255552)},
+		{"maximum", "9223372036787666944"},
+		{"maximum Gi", "8589934591.9375Gi"},
+		{"empty", ""},
+		{"invalid unit", "10GiB"},
+		{"zero", "0"},
+		{"negative", "-32Mi"},
+		{"below minimum", "536870911"},
+		{"alignment overflow", "9223372036787666945"},
+		{"Gi overflow", "8589934592Gi"},
+		{"binary overflow", "8Ei"},
+		{"decimal overflow", "1e100"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			errs, _ := validator.Validate(t.Context(), field.NewPath("cacheSize"), structural, tc.value, nil, 1000000)
-			if (len(errs) == 0) != tc.valid {
-				t.Fatalf("CEL validation of %v = %v, want valid=%v", tc.value, errs, tc.valid)
+			object := map[string]any{"racer": map[string]any{"enabled": true, "cacheSize": tc.value}, "gantry": map[string]any{"enabled": false}}
+			pruning.Prune(object, structural, false)
+
+			if _, present := object["racer"]; present {
+				t.Fatalf("legacy Racer configuration was not pruned: %v", object)
+			}
+
+			if _, present := object["gantry"]; !present {
+				t.Fatal("pruning removed supported Site configuration")
 			}
 		})
 	}

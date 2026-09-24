@@ -440,6 +440,17 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 	case OpApply:
 		return e.ApplyObject(ctx, op.Object)
 
+	case OpApplyExisting:
+		if op.Base == nil || op.Base.GetUID() == "" || op.Base.GetResourceVersion() == "" || RefOf(op.Base) != op.Ref() {
+			return fmt.Errorf("apply existing %s: plan must carry matching observed UID and resourceVersion", op.Ref())
+		}
+
+		if !op.Base.GetDeletionTimestamp().IsZero() {
+			return nil
+		}
+
+		return e.applyObject(ctx, op.Object, op.Base)
+
 	case OpCreateIfAbsent:
 		return e.createIfAbsent(ctx, op)
 

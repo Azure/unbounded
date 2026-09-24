@@ -84,8 +84,9 @@ data:
     chair_api_timeout: "5s"
 
     # ---------- Content distribution ----------
-    # The operator reads these fields from this ConfigMap and provisions Racer
-    # integration when selected. Do not override them through pod env or flags.
+    # Standalone settings. For operator-managed Gantry, the sole backend input is
+    # a user-managed P2PCache annotated unbounded-cloud.io/gantry-backing: "true".
+    # Generated pod flags override these legacy keys and environment values.
     content_backend: "direct"
     racer_cache_name: "gantry"
 

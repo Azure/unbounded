@@ -280,6 +280,7 @@ func TestManagerIPReplacementJoinsSessionOutsideLookupLock(t *testing.T) {
 		<-entered
 
 		done := make(chan error, 1)
+
 		go func() { done <- m.AddPeer("peer", net.ParseIP("10.0.0.2"), DefaultSettings()) }()
 
 		synctest.Wait()

@@ -250,13 +250,13 @@ func TestOperatorFixturePlan(t *testing.T) {
 	site := testSite(primarySite)
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{core.AddToScheme, apps.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{core.AddToScheme, apps.AddToScheme, racerapi.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	env := &component.Env{Namespace: namespace, Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	env := &component.Env{Namespace: namespace, Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cacheResource("racer-volume", primarySite)).Build()}
 
 	control, _, err := operatorracer.NewControlPlane().Plan(t.Context(), env, []machina.Site{*site})
 	if err != nil {
@@ -400,7 +400,6 @@ func testSite(name string) *machina.Site {
 				Metalman:       &machina.MetalmanComponentSpec{SiteComponentSpec: disabled},
 				Gantry:         &machina.GantryComponentSpec{SiteComponentSpec: disabled},
 				TokenRefresher: &machina.TokenRefresherComponentSpec{SiteComponentSpec: disabled},
-				Racer:          &machina.RacerComponentSpec{SiteComponentSpec: machina.SiteComponentSpec{Enabled: ptr.To(true)}},
 			},
 		},
 	}
@@ -436,8 +435,8 @@ func (c *cluster) membershipChanges() {
 	c.checkSiteVolumeIsolation(primarySite, "racer-volume")
 	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 
-	// A disabled installation vote does not remove runtime participation.
-	c.must("patch", "sites.unbounded-cloud.io", secondSite, "--type=merge", "-p", `{"spec":{"components":{"racer":{"enabled":false}}}}`)
+	// Site metadata changes do not remove runtime participation.
+	c.must("annotate", "sites.unbounded-cloud.io", secondSite, "e2e.unbounded-cloud.io/updated=true")
 	c.awaitMembership(map[string]string{c.name + "-worker": primarySite, node: secondSite})
 	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 	c.leader()

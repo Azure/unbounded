@@ -211,6 +211,7 @@ func TestReconciliationPassesFreshHealthProfilesBeforeStateCommit(t *testing.T) 
 	}
 
 	original := configureWireGuardFunc
+
 	defer func() { configureWireGuardFunc = original }()
 
 	called := false

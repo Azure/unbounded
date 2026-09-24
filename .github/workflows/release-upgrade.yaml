@@ -518,8 +518,8 @@ jobs:
         run: |
           # METALMAN_TARGETS is deliberately unquoted: it carries one argument
           # per discovered Deployment, and Site names are RFC 1123 object names.
-          # Racer targets include the retained controller (leader-aware health)
-          # and enabled Sites' DaemonSets, including bootstrap image transitions.
+          # Live caches require both Racer workloads; without caches, discovery
+          # includes only retained workloads. Controller health is leader-aware.
           # shellcheck disable=SC2086
           _deploy-tools/hack/release/wait-rollouts.sh \
             deploy/unbounded-operator \

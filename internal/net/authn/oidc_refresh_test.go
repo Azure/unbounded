@@ -245,6 +245,7 @@ func TestOIDCUnknownKeyConcurrentRefresh(t *testing.T) {
 		ctx := &oidcTestWaitContext{Context: t.Context(), waiting: make(chan struct{})}
 
 		waiters = append(waiters, ctx)
+
 		go func() {
 			_, err := issuer.verifier.Verify(ctx, token)
 			results <- err
@@ -320,6 +321,7 @@ func TestOIDCConcurrentRefreshFailure(t *testing.T) {
 	results := make(chan error, 17)
 
 	unknown := issuer.token(t, "unknown")
+
 	go func() {
 		_, err := issuer.verifier.Verify(t.Context(), unknown)
 		results <- err
@@ -331,6 +333,7 @@ func TestOIDCConcurrentRefreshFailure(t *testing.T) {
 		ctx := &oidcTestWaitContext{Context: t.Context(), waiting: make(chan struct{})}
 
 		token := issuer.token(t, fmt.Sprintf("unknown-%d", i))
+
 		go func() {
 			_, err := issuer.verifier.Verify(ctx, token)
 			results <- err
@@ -492,6 +495,7 @@ func TestOIDCRefreshSurvivesInitiatingCallerCancellation(t *testing.T) {
 			leader := make(chan error, 1)
 
 			token := issuer.token(t, kid)
+
 			go func() {
 				_, err := issuer.verifier.Verify(ctx, token)
 				leader <- err
@@ -508,6 +512,7 @@ func TestOIDCRefreshSurvivesInitiatingCallerCancellation(t *testing.T) {
 			live := make(chan error, 1)
 
 			rotated := issuer.token(t, "rotated")
+
 			go func() {
 				_, err := issuer.verifier.Verify(liveCtx, rotated)
 				live <- err
@@ -566,6 +571,7 @@ func TestOIDCSharedRefreshTimeout(t *testing.T) {
 			started := time.Now()
 
 			results := make(chan error, 1)
+
 			go func() {
 				results <- verifier.refreshKeys(t.Context(), true)
 			}()

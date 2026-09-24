@@ -62,12 +62,21 @@ an endpoint reachable from **every** Gantry origin node (loopback works only for
 a single-node local setup):
 
 ```yaml
-content_backend: racer
-racer_cache_name: gantry
 upstream_registries:
   - name: image-fixture.test
     endpoint: http://127.0.0.1:18081
 ```
+
+For operator-managed Gantry, select a dedicated user-managed P2PCache through
+`unbounded-cloud.io/gantry-backing: "true"`, following the
+[Gantry guide](../../docs/content/guides/gantry.md#operator-managed-enablement).
+The operator validates full node coverage and generates the backend arguments;
+editing `content_backend` in its ConfigMap does not select Racer.
+
+For a standalone Gantry process, set `content_backend: racer` and
+`racer_cache_name: gantry` in its YAML, or pass `--content-backend=racer` and
+`--racer-cache-name=gantry`, and provide the matching Racer cache and socket
+mounts. Without that standalone setting, Gantry uses direct distribution.
 
 Keep other required Gantry configuration and upstream entries. Gantry owns its
 Racer origin socket; the loadgen registry does not replace it. Wait for Gantry

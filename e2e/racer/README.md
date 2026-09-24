@@ -11,13 +11,18 @@ make e2e-gantry-racer
 
 The build target builds `bin/gantry` and `bin/racer-loadgen`, builds the real
 Rust `racer-dataplane` with `cargo build --locked` (debug profile), and warms the Go e2e build cache.
-The test target uses those binaries and runs six suites: `TestGantryRacerStriped`,
+The test target uses those binaries and runs seven suites: `TestGantryRacerStriped`,
 `TestGantryRacerAuthorization`, `TestGantryRacerRecovery`,
-`TestGantryRacerCorruption`, `TestGantryRacerContainerImage`, and
-`TestGantryRacerGeneration` separately, each
+`TestGantryRacerCorruption`, `TestGantryRacerContainerImage`,
+`TestGantryRacerGeneration`, and `TestGantryRacerRollingSwitch` separately, each
 with an external 60-second hard
 deadline and `go test -timeout 50s -count 1 -v`. Builds are outside those
 deadlines. Rerun the build target after changing binary or test sources.
+
+`RollingSwitch` verifies containerd pulls through direct, mixed enablement,
+all-Racer, mixed rollback, and restored direct operation on two nodes. The final
+stage stops both dataplanes. Every stage checks committed manifest, config, and
+layer bytes, and the all-Racer stage also requires serving without fallback.
 
 `ContainerImage` starts separate loadgen registry and puller processes against
 one real Gantry/Racer pair. It verifies manifest, config, and two 64 MiB layers,
