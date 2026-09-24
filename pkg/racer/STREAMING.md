@@ -277,6 +277,46 @@ transfers can acquire and cache pipes afterward; the client remains usable.
 Unreachable pipe owners also have runtime cleanup as a nondeterministic backstop,
 not a replacement for explicit idle cleanup. There is no `sync.Pool` of FDs.
 
+## Positional file downloads
+
+Use `Object.DownloadFile(ctx, dst *os.File, dstOffset int64) (int64, error)`
+to download an opened snapshot into a regular file. The convenience method
+`Client.DownloadFile(ctx, target, dst, dstOffset) (Metadata, error)` performs HEAD
+first. Both use parallel aligned page GETs, bounded by `Concurrency` and shared
+`MaxActiveRequests`, including origin-data views. Each page uses the raw stream
+pool, existing version/framing checks, and its own timeout including admission.
+There is no additional stream prefetch beyond the scheduled pages.
+
+For sequential intervals, use `Object.ReadRange` followed by
+`Stream.WriteToFile(dst, dstOffset) (int64, error)`. This consumes the remaining
+stream, supports `Prepare`, and exposes `Stream.Stats()`. Linux drains header
+read-ahead with `WriteAt`, then uses socket-to-pipe-to-file `splice` with explicit
+file offsets. Neither path calls Seek on the destination or moves its cursor;
+parallel pages can safely share one `*os.File`. Splice calls and successfully
+written file bytes appear in `SpliceCalls` and `SpliceBytes`.
+
+Non-Linux systems use bounded `WriteAt` copies. Unsupported Linux syscalls
+(`ENOSYS`, `EINVAL`, `EOPNOTSUPP`, `EXDEV`) switch to that same copy path, first
+draining any pipe bytes at the exact next unwritten offset. Bytes already written
+are never repeated and bytes already consumed from the socket are never lost.
+Other errors are returned, without retrying the request. Pipes use the existing
+bounded shared cache and `CloseIdleConnections` lifecycle. Memory is bounded by
+per-worker transport buffers, one pooled 32 KiB copy buffer, and one pipe;
+page-sized userspace allocations are unnecessary.
+
+The caller retains ownership of the writable regular destination file. Keep it
+open until return, avoid overlapping concurrent writes, and do not open it with
+`O_APPEND`. Negative/overflowing destination intervals are rejected. Downloads
+never truncate, close, or sync the file; existing bytes outside the interval
+remain intact. A successful count equals the requested length. On failure the
+parallel download count sums actual writes across pages and may include holes;
+`WriteToFile` counts a contiguous written prefix. Partial output remains in place.
+Short responses return `io.ErrUnexpectedEOF`, short writes return
+`io.ErrShortWrite`, and protocol/version errors retain their existing identities.
+Socket waits and admission honor cancellation. Regular-file syscalls cannot be
+interrupted by context; cancellation is checked between them. No content digest
+is verified. Generic `Download(io.WriterAt)` remains available.
+
 ## Range-oriented origins
 
 `NewRangeOrigin(store RangeStore)` adapts:
@@ -338,3 +378,63 @@ them successfully. Existing local-file adapters can keep using `Store`,
 `Source` (`ReaderAt` plus `Close`), and `NewOrigin`. `Store.Stat` has the same
 signature above and `Store.Open` accepts
 `Open(ctx context.Context, target, etag string, originData []byte) (Source, error)`.
+
+### Optional pinned file ranges
+
+A successful `Store.Open` source, `RangeStore.OpenRange` body, or resolved
+`OpenRange` body may implement:
+
+```go
+// racer.PinnedFileRange
+FileRange() (file *os.File, offset, length int64)
+```
+
+The bounds describe the source's exact logical contents within a physical file:
+the complete metadata-sized object for `Source`, or the requested interval for
+a range body. Origin adjusts a full Source's physical offset for HTTP ranges.
+It checks the nonnegative bounds, regular-file type, and available size before
+committing success headers. Invalid capabilities produce 500; truncation or I/O
+failure during copying aborts the HTTP response. Open errors retain the existing
+HTTP mapping, including `ErrVersionChanged` to 412. HEAD and rejected requests
+never open a payload. Existing adapters need no changes.
+
+The successful source owns the file and must close it in its `Close`. Origin
+closes only the source, once on success, validation failure, cancellation, or
+aborted transfer, before closing a resolved handle. Objects returned with open
+errors remain adapter-owned. Provide an exclusively owned open-file description
+(a duplicated FD shares a cursor and is insufficient). Origin may seek and
+advance this source cursor; no other operation may concurrently use or close it.
+This ownership differs from destination files, whose cursor is always preserved.
+
+Opening must atomically pin the immutable representation matching the metadata
+ETag, or return `ErrVersionChanged`. Metadata and file bytes must identify the
+same snapshot. An open FD pins an inode, not immutable contents: prohibit
+in-place writes/truncation even after source Close, since kernel network queues
+may still reference file pages. Publish new inodes and replace/unlink old paths
+rather than modifying old file contents. File stat checks detect invalid bounds but cannot prove version
+identity or immutability. The adapter is responsible for that contract.
+
+Go 1.26.6 `io.CopyBuffer` honors `WriterTo`, then `ReaderFrom`, before using its
+buffer (`src/io/io.go:407`). Our length-limited reader hides `WriterTo` while
+preserving the file's `SyscallConn`. For ordinary cleartext HTTP/1 TCP,
+`net/http.response.ReadFrom` copies a small prefix, flushes framing, and delegates
+to `TCPConn.ReadFrom` (`src/net/http/server.go:589`). Its sendfile path unwraps a
+`LimitedReader` and accepts `syscall.Conn` (`src/net/sendfile.go:24`). This enables
+platform sendfile without hijacking HTTP or replacing framing. Native Linux tests
+instrument this dispatch and verify bytes bypass the userspace Read path.
+
+It is therefore incorrect to describe all existing `RangeStore` copies as
+buffered: a body already exposing an appropriate `SyscallConn` can reach Go's
+fast path. The generic `Store` SectionReader/context wrapper hides that capability;
+the explicit pin preserves it and makes bounds and cursor ownership deliberate.
+Go's HTTP server over Unix sockets does not have TCP's `ReaderFrom` path; Unix
+HTTP, TLS, HTTP/2, ResponseWriter wrappers hiding capabilities, and unsupported
+platform/filesystem combinations can use bounded userspace copies instead.
+Fast-path eligibility is not a guarantee of sendfile for every response.
+
+Portable reads check request cancellation. Pinned transfers also set a write
+deadline on cancellation through `http.ResponseController`, interrupting native
+HTTP network writes without taking connection ownership. Wrappers must expose
+`Unwrap`/deadline support or supply their own blocked-write cancellation. Regular
+file I/O itself remains non-interruptible. Configure server write timeouts as for
+other origin responses. The original source stays pinned until copying stops.

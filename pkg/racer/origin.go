@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -199,7 +200,7 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if resolved != nil {
 		source, err = resolved.OpenRange(r.Context(), start, length)
 	} else {
-		source, err = o.openRange(r.Context(), target, m.ETag, start, length, originData)
+		source, err = o.openRange(r.Context(), target, m.ETag, start, length, m.Size, originData)
 	}
 
 	if err != nil {
@@ -213,6 +214,16 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer source.Close() //nolint:errcheck // Release the snapshot after the response has been sent or aborted.
 
+	reader, err := originFileReader(r.Context(), source, length)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+
+	if _, ok := source.(PinnedFileRange); ok {
+		defer cancelOriginWrite(r.Context(), w)()
+	}
+
 	if status == http.StatusPartialContent {
 		w.Header().Set("Content-Range", contentRange(start, start+length-1, m.Size))
 	}
@@ -223,8 +234,8 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := copyBuffers.Get().(*[]byte) //nolint:errcheck // The private pool only contains *[]byte.
 	defer copyBuffers.Put(buf)
 
-	n, err := io.CopyBuffer(w, io.LimitReader(source, length), *buf)
-	if err != nil || n != length {
+	n, err := io.CopyBuffer(w, reader, *buf)
+	if err != nil || n != length || r.Context().Err() != nil {
 		// Abort instead of letting net/http finish a successful but short response.
 		panic(http.ErrAbortHandler)
 	}
@@ -235,7 +246,7 @@ type sourceRange struct {
 	io.Closer
 }
 
-func (o *Origin) openRange(ctx context.Context, target, etag string, start, length int64, originData []byte) (io.ReadCloser, error) {
+func (o *Origin) openRange(ctx context.Context, target, etag string, start, length, objectSize int64, originData []byte) (io.ReadCloser, error) {
 	if o.ranges != nil {
 		return o.ranges.OpenRange(ctx, target, etag, start, length, originData)
 	}
@@ -245,7 +256,18 @@ func (o *Origin) openRange(ctx context.Context, target, etag string, start, leng
 		return nil, err
 	}
 
-	return sourceRange{io.NewSectionReader(contextReaderAt{ctx, source}, start, length), source}, nil
+	r := sourceRange{io.NewSectionReader(contextReaderAt{ctx, source}, start, length), source}
+	if pin, ok := source.(PinnedFileRange); ok {
+		file, offset, size := pin.FileRange()
+		if offset < 0 || size != objectSize || start > size || length > size-start || offset > math.MaxInt64-size {
+			// Preserve ownership through the normal successful-source cleanup path.
+			return pinnedSourceRange{sourceRange: r, length: -1}, nil
+		}
+
+		return pinnedSourceRange{r, file, offset + start, length}, nil
+	}
+
+	return r, nil
 }
 
 type contextReaderAt struct {

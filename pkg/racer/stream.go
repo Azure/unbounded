@@ -158,7 +158,7 @@ type Stream struct {
 // TransferStats distinguishes actual kernel splice traffic from buffered
 // header read-ahead and portable copies. Stats are per stream, not global.
 // BufferedBytes counts bytes read through userspace;
-// SpliceBytes counts bytes successfully forwarded to the destination socket.
+// SpliceBytes counts bytes successfully forwarded to the destination socket or file.
 type TransferStats struct {
 	SpliceBytes   int64
 	SpliceCalls   int64
