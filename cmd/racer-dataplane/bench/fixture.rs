@@ -108,13 +108,12 @@ impl Fixture {
     pub fn descriptor(&self, deadline: Instant) -> io::Result<Vec<u8>> {
         // Benchmark fidelity: RD01/RR01/RB01 are real codecs, including a routed
         // cursor and the same bounded remaining budget used by peer requests.
-        let mut bytes = b"RR01".to_vec();
+        let mut bytes = crate::routing::Cursor::MAGIC.to_vec();
         bytes.extend(
             crate::routing::Cursor {
                 path: vec![0, 1],
                 failed: u32::MAX,
                 repair_position: 0,
-                algorithm: crate::routing::Algorithm::Product,
                 identity: [7; 32],
                 source: 0,
                 owner: 1,

@@ -122,7 +122,7 @@ pub(crate) mod peer_wire {
         bytes: &[u8],
     ) -> super::Result<(Option<crate::routing::Cursor>, PeerDescriptor<'_>)> {
         let (bytes, _) = budget_descriptor(bytes)?;
-        if bytes.starts_with(b"RR01") {
+        if bytes.starts_with(crate::routing::Cursor::MAGIC) {
             let len = crate::routing::Cursor::LEN;
             if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + len {
                 return Err(invalid("short routed descriptor").into());

@@ -34,7 +34,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     let wire = |cursor: &crate::routing::Cursor| {
         let mut bytes = b"RB01".to_vec();
         bytes.extend(5000u32.to_le_bytes());
-        bytes.extend(cursor.algorithm.magic());
+        bytes.extend(crate::routing::Cursor::MAGIC);
         bytes.extend(cursor.encode());
         bytes.extend(b"RD01\0");
         bytes.extend(target.as_bytes());
@@ -54,7 +54,15 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     assert_eq!(c.hits.lock().unwrap().len(), 0);
     let current = c.config(1);
     let new_routing = &current.volumes[0].routing;
-    assert_eq!(new_routing.algorithm, crate::routing::Algorithm::Product);
+    assert_eq!(
+        current.volumes[0]
+            .config
+            .topology
+            .as_ref()
+            .unwrap()
+            .routing_algorithm,
+        Some(1)
+    );
     assert_ne!(new_routing.identity, routing.identity);
     let current_cursor = new_routing.start(&target);
     assert_eq!(

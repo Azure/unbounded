@@ -146,7 +146,7 @@ fn compiler_snapshots_http_and_rdma() {
         .key(namespace)
         .unwrap();
     assert!(br.receive(cursor.clone(), &key).is_err());
-    let mut inner = cursor.algorithm.magic().to_vec();
+    let mut inner = crate::routing::Cursor::MAGIC.to_vec();
     inner.extend(cursor.encode());
     inner.extend(b"RD01\0");
     inner.extend(target.as_bytes());

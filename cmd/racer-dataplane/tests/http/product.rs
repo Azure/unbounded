@@ -510,7 +510,7 @@ fn product_wire_binds_candidate_and_authentication_across_repair() {
     let wire = p.budget_wire(&request, deadline()).unwrap();
     let (cursor, decoded) = routed_descriptor(&wire).unwrap();
     let cursor = cursor.unwrap();
-    assert_eq!(cursor.algorithm, crate::routing::Algorithm::Product);
+    assert_eq!(&budget_descriptor(&wire).unwrap().0[..4], b"RR01");
     assert_eq!(cursor.position, 1);
     assert_eq!(decoded.key(handler.namespace).unwrap(), *page.key());
     handler.upstream = provider(1);

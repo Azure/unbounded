@@ -1512,25 +1512,7 @@ pub mod routing {
         )
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-    pub enum Algorithm {
-        Product = 1,
-    }
-    impl Algorithm {
-        pub fn wire_version(self) -> u8 {
-            match self {
-                Self::Product => 1,
-            }
-        }
-        pub fn magic(self) -> &'static [u8; 4] {
-            match self {
-                Self::Product => b"RR01",
-            }
-        }
-    }
-
     pub struct Routing {
-        pub algorithm: Algorithm,
         pub geometry: Topology,
         pub local: BTreeSet<u32>,
         pub identity: [u8; 32],
@@ -1564,7 +1546,6 @@ pub mod routing {
         pub fn start_key(&self, key: &[u8; 32]) -> Cursor {
             let owner = self.geometry.owner(key).get();
             let mut cursor = Cursor {
-                algorithm: self.algorithm,
                 identity: self.identity,
                 source: self.product.config.local_member,
                 owner,
@@ -1574,13 +1555,10 @@ pub mod routing {
                 failed: u32::MAX,
                 repair_position: 0,
             };
-            {
-                let p = &self.product;
-                cursor.source = p.config.local_member;
-                cursor.path = p
-                    .route(cursor.source, self.destination(&cursor))
-                    .expect("validated product");
-            }
+            cursor.path = self
+                .product
+                .route(cursor.source, self.destination(&cursor))
+                .expect("validated product");
             cursor
         }
         pub fn candidate_count(&self) -> u32 {
@@ -1656,7 +1634,7 @@ pub mod routing {
         pub fn compatible(&self, a: &Cursor, b: &Cursor) -> bool {
             a == b && self.validate_product(a).is_ok()
         }
-        /// Sparse slot ownership proves physical finality, never endpoint equality.
+        /// The validated physical path proves the next peer is the selected owner.
         pub fn last_hop(&self, c: &Cursor) -> bool {
             self.final_peer(c).is_some()
         }
@@ -1673,7 +1651,6 @@ pub mod routing {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Cursor {
-        pub algorithm: Algorithm,
         pub identity: [u8; 32],
         pub source: u32,
         pub owner: u32,
@@ -1685,56 +1662,47 @@ pub mod routing {
     }
     impl Cursor {
         pub const LEN: usize = 71;
-        /// Encode the cursor body. The enclosing RR01 magic must
-        /// be selected from `algorithm`; the body alone is not a wire descriptor.
+        pub const MAGIC: &'static [u8; 4] = b"RR01";
+        pub const WIRE_VERSION: u8 = 1;
+        /// Encode the cursor body; the enclosing descriptor adds `MAGIC`.
         pub fn encode(&self) -> Vec<u8> {
             let mut bytes = self.identity.to_vec();
             bytes.extend(self.source.to_le_bytes());
             bytes.extend(self.owner.to_le_bytes());
             bytes.extend(self.attempt.to_le_bytes());
             bytes.push(self.position);
-            {
-                bytes.push(self.path.len() as u8);
-                for i in 0..5 {
-                    bytes.extend(self.path.get(i).copied().unwrap_or(u32::MAX).to_le_bytes());
-                }
-                bytes.extend(self.failed.to_le_bytes());
-                bytes.push(self.repair_position);
+            bytes.push(self.path.len() as u8);
+            for i in 0..5 {
+                bytes.extend(self.path.get(i).copied().unwrap_or(u32::MAX).to_le_bytes());
             }
+            bytes.extend(self.failed.to_le_bytes());
+            bytes.push(self.repair_position);
             bytes
         }
         /// Decode a canonical RR01 body.
         pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-            Self::decode_algorithm(bytes, Algorithm::Product)
-        }
-        pub fn decode_algorithm(bytes: &[u8], algorithm: Algorithm) -> io::Result<Self> {
             if bytes.len() != Self::LEN || bytes[44] > 4 {
                 return Err(invalid());
             }
             let mut path = Vec::new();
-            let (failed, repair_position);
-            {
-                let len = bytes[45] as usize;
-                if !(1..=5).contains(&len) || bytes[44] as usize >= len {
-                    return Err(invalid());
-                }
-                for i in 0..5 {
-                    let member =
-                        u32::from_le_bytes(bytes[46 + i * 4..50 + i * 4].try_into().unwrap());
-                    if i < len {
-                        path.push(member);
-                    } else if member != u32::MAX {
-                        return Err(invalid());
-                    }
-                }
-                failed = u32::from_le_bytes(bytes[66..70].try_into().unwrap());
-                repair_position = bytes[70];
-                if repair_position > bytes[44] || (failed == u32::MAX && repair_position != 0) {
+            let len = bytes[45] as usize;
+            if !(1..=5).contains(&len) || bytes[44] as usize >= len {
+                return Err(invalid());
+            }
+            for i in 0..5 {
+                let member = u32::from_le_bytes(bytes[46 + i * 4..50 + i * 4].try_into().unwrap());
+                if i < len {
+                    path.push(member);
+                } else if member != u32::MAX {
                     return Err(invalid());
                 }
             }
+            let failed = u32::from_le_bytes(bytes[66..70].try_into().unwrap());
+            let repair_position = bytes[70];
+            if repair_position > bytes[44] || (failed == u32::MAX && repair_position != 0) {
+                return Err(invalid());
+            }
             Ok(Self {
-                algorithm,
                 identity: bytes[..32].try_into().unwrap(),
                 source: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
                 owner: u32::from_le_bytes(bytes[36..40].try_into().unwrap()),

@@ -430,7 +430,7 @@ impl Provider {
                 .unwrap()
                 .next(&state.borrow().cursor)?
                 .ok_or_else(|| invalid("no next hop"))?;
-            let mut routed = next.algorithm.magic().to_vec();
+            let mut routed = crate::routing::Cursor::MAGIC.to_vec();
             routed.extend(next.encode());
             routed.append(&mut bytes);
             bytes = routed;
@@ -524,7 +524,7 @@ impl Upstream for Provider {
         Some(crate::buffers::NetworkFlightKey {
             value,
             routing: state.cursor.identity,
-            version: state.cursor.algorithm.wire_version(),
+            version: crate::routing::Cursor::WIRE_VERSION,
             destination: routing.destination(&state.cursor),
             dependency: crate::buffers::NetworkDependency::Independent(self.flight),
         })

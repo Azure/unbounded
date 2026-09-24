@@ -10,7 +10,7 @@ mod tests {
         let r = Routing::new(&[1; 32], &v).unwrap();
         let c = r.start_key(&[0; 32]);
         assert_eq!(c.encode().len(), 71);
-        assert_eq!(c.algorithm.magic(), b"RR01");
+        assert_eq!(v.topology.as_ref().unwrap().routing_algorithm, Some(1));
         assert_eq!(Cursor::decode(&c.encode()).unwrap(), c);
         assert!(Cursor::decode(&c.encode()[..45]).is_err());
         let mut old = b"RR02".to_vec();

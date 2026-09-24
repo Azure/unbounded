@@ -4,7 +4,7 @@
 //! Validated physical catalogs and deterministic, prefix-preserving local repair.
 use super::{
     proto,
-    routing::{Algorithm, Cursor, Routing, invalid},
+    routing::{Cursor, Routing, invalid},
 };
 use crate::{product::Product, topology::Topology};
 use std::{collections::BTreeSet, io};
@@ -196,7 +196,6 @@ impl Routing {
             hash.update(&candidate.to_le_bytes());
         }
         Ok(Self {
-            algorithm: Algorithm::Product,
             geometry,
             local,
             identity: *hash.finalize().as_bytes(),
@@ -217,8 +216,7 @@ impl Routing {
 
     pub(super) fn validate_product(&self, c: &Cursor) -> io::Result<()> {
         let p = &self.product;
-        if c.algorithm != Algorithm::Product
-            || c.identity != self.identity
+        if c.identity != self.identity
             || c.owner >= self.geometry.slot_count()
             || c.attempt >= p.config.candidate_width
             || c.source as usize >= p.config.members.len()

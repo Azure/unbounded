@@ -13,7 +13,7 @@ fn maximum_descriptor_http_bounds() {
         let cursor = routing.start(&target);
         let mut wire = b"RB01".to_vec();
         wire.extend(1000u32.to_le_bytes());
-        wire.extend(cursor.algorithm.magic());
+        wire.extend(crate::routing::Cursor::MAGIC);
         wire.extend(cursor.encode());
         wire.extend(b"RD01");
         wire.push(u8::from(page));
@@ -142,7 +142,7 @@ fn exact_descriptor_boundaries() {
                     }
                     if routed {
                         let c = routing.start(&target);
-                        wire.extend(c.algorithm.magic());
+                        wire.extend(crate::routing::Cursor::MAGIC);
                         wire.extend(c.encode());
                     }
                     wire.extend(inner.unwrap());
@@ -289,7 +289,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             let namespace = crate::cache::Namespace::new("transport-agreement").unwrap();
             let expected = decode_descriptor(inner).unwrap().key(namespace).unwrap();
             let cursor = routing.start_key(&expected);
-            let mut wire = cursor.algorithm.magic().to_vec();
+            let mut wire = crate::routing::Cursor::MAGIC.to_vec();
             wire.extend(cursor.encode());
             wire.extend(inner);
             assert!(routed_descriptor(&wire).is_err(), "budget is mandatory");
@@ -336,7 +336,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
         }
         let mut largest = b"RB01".to_vec();
         largest.extend(1000u32.to_le_bytes());
-        largest.extend(cursor.algorithm.magic());
+        largest.extend(crate::routing::Cursor::MAGIC);
         largest.extend(cursor.encode());
         largest.extend(&meta);
         largest.resize(MAX_DESCRIPTOR, b'x');
