@@ -83,8 +83,17 @@ writing chunks: `proposed` references never authorize serving. Collection first
 CAS-clears abandoned proposals while holding the gate, fencing delayed pointer
 completion. Committed references remain protected. Reused immutable chunks get
 a metadata RV update; collection deletes with UID/RV preconditions, so a paused
-old collector cannot delete a newly reused chunk. Cancellation releases the gate;
-a crash requires takeover. No wall-clock grace period establishes safety.
+old collector cannot delete a newly reused chunk. A local guard registers each
+acquisition before sending I/O and retains the operation, fence, and pre-write
+resourceVersion across cancellation. Release retries authoritative read/CAS for
+up to 30 seconds while holding the local lock; failed cleanup remains pending for
+the next call on the same RecordStore or its clones. Cleanup only clears its own
+operation and fence. It also invalidates a still-pending acquisition by touching
+its pre-write resourceVersion, or creating an empty gate to fence a delayed first
+create. A successor's changed resourceVersion ends cleanup without unlocking it.
+Losing pending local state (a process crash, runtime shutdown, or dropping all
+store clones after failed cleanup) requires takeover. No wall-clock grace period
+establishes safety or permits stealing a live same-fence operation.
 
 Collection runs every five minutes without recompiling universes. Lists use
 64-object pages and chunk lists request metadata only. The reference set has a

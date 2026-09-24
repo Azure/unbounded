@@ -83,12 +83,15 @@ func (c *campaign) worker(index int, site string) *dataplane {
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 	node, err = c.kube.CoreV1().Nodes().UpdateStatus(c.ctx, node, metav1.UpdateOptions{})
 	require(t, err)
-	s, err := c.dynamic.Resource(siteResource).Get(c.ctx, site, metav1.GetOptions{})
-	require(t, err)
 
-	labels := map[string]string{prefix + "dataplane": "true", prefix + "universe": site}
+	labels := map[string]string{prefix + "dataplane": "true", prefix + "component": "racer-dataplane"}
 	template := corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{ServiceAccountName: "racer-dataplane", Containers: []corev1.Container{{Name: "dataplane", Image: "fixture"}}}}
-	ds, err := c.kube.AppsV1().DaemonSets(namespace).Create(c.ctx, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: node.Name, Labels: map[string]string{prefix + "component": "racer-dataplane"}, OwnerReferences: []metav1.OwnerReference{owner("unbounded-cloud.io/v1alpha3", "Site", site, s.GetUID())}}, Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: template}}, metav1.CreateOptions{})
+
+	ds, err := c.kube.AppsV1().DaemonSets(namespace).Get(c.ctx, "racer-dataplane", metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		ds, err = c.kube.AppsV1().DaemonSets(namespace).Create(c.ctx, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Labels: labels}, Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: template}}, metav1.CreateOptions{})
+	}
+
 	require(t, err)
 
 	template.Spec.NodeName = node.Name
@@ -421,7 +424,7 @@ func TestProductionBinaryCampaign(t *testing.T) {
 
 	c.await("trust projection", 5*time.Second, func() error { _, err := os.Stat(filepath.Join(a.dir, "bundle.json")); return err })
 	// Exercise the actual bootstrap subcommand against API Node/Service data.
-	cmd := exec.Command(c.cpBinary, "--bootstrap-node", a.node.Name, "--bootstrap-universe", "edge", "--bootstrap-namespace", namespace)
+	cmd := exec.Command(c.cpBinary, "--bootstrap-node", a.node.Name, "--bootstrap-namespace", namespace)
 	cmd.Env = append(cleanEnv(), "KUBECONFIG="+c.kubeconfig, "POD_IP=10.1.0.2")
 	out, err := cmd.CombinedOutput()
 	require(t, err)

@@ -263,7 +263,7 @@ func TestOperatorFixturePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, _, err := operatorracer.NewDataplane().Plan(t.Context(), env, site)
+	data, _, err := operatorracer.NewDataplane().Plan(t.Context(), env, []machina.Site{*site})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,22 +436,10 @@ func (c *cluster) membershipChanges() {
 	c.checkSiteVolumeIsolation(primarySite, "racer-volume")
 	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 
-	// Disable a Site through the API and prove the operator removes its owned
-	// DaemonSet while the shared control plane and CA survive.
+	// A disabled installation vote does not remove runtime participation.
 	c.must("patch", "sites.unbounded-cloud.io", secondSite, "--type=merge", "-p", `{"spec":{"components":{"racer":{"enabled":false}}}}`)
-	c.awaitMembership(map[string]string{c.name + "-worker": primarySite})
-	c.await("disabled Site DaemonSet removed", func() error {
-		b, err := c.kubectl(nil, "get", "daemonset", operatorracer.SiteDaemonSetName(secondSite), "--ignore-not-found", "-o", "name")
-		if err != nil {
-			return err
-		}
-
-		if len(b) != 0 {
-			return fmt.Errorf("disabled Site still has a DaemonSet: %s", b)
-		}
-
-		return nil
-	})
+	c.awaitMembership(map[string]string{c.name + "-worker": primarySite, node: secondSite})
+	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 	c.leader()
 	c.checkCAUnchanged(keys)
 	c.must("delete", "p2pcache/site-b-volume")
@@ -476,24 +464,29 @@ func (c *cluster) awaitMembership(want map[string]string) {
 
 		for _, pod := range pods {
 			site, exists := want[pod.Spec.NodeName]
-			if !exists || seen[pod.Spec.NodeName] || !podReady(pod) || pod.Labels[racermeta.UniverseKey] != racermeta.UniverseForSite(site) {
+			if !exists || seen[pod.Spec.NodeName] || !podReady(pod) {
 				return fmt.Errorf("unexpected/unready dataplane %s on %s: %v", pod.Name, pod.Spec.NodeName, pod.Labels)
 			}
 
 			seen[pod.Spec.NodeName] = true
 
 			var ds apps.DaemonSet
-			if err := c.get("daemonset", operatorracer.SiteDaemonSetName(site), &ds); err != nil {
+			if err := c.get("daemonset", "racer-dataplane", &ds); err != nil {
 				return err
 			}
 
-			var owner machina.Site
-			if err := c.get("sites.unbounded-cloud.io", site, &owner); err != nil {
+			var node core.Node
+			if err := c.get("node", pod.Spec.NodeName, &node); err != nil {
 				return err
 			}
 
-			if len(ds.OwnerReferences) != 1 || ds.OwnerReferences[0].UID != owner.UID {
-				return fmt.Errorf("%s is not owned by Site %s", ds.Name, site)
+			if len(ds.OwnerReferences) != 0 || len(pod.OwnerReferences) != 1 || pod.OwnerReferences[0].UID != ds.UID || racermeta.NodeSite(&node) != site {
+				return fmt.Errorf("%s has unexpected singleton ownership or Site", pod.Name)
+			}
+
+			identity, err := c.kubectl(nil, "exec", pod.Name, "-c", "dataplane", "--", "/bin/sh", "-c", "cat /bootstrap/identity")
+			if err != nil || !strings.Contains(string(identity), "export RACER_UNIVERSE="+racermeta.UniverseIDForSite(site)+"\n") {
+				return fmt.Errorf("%s has stale bootstrap identity: %s (%v)", pod.Name, identity, err)
 			}
 		}
 
@@ -519,9 +512,22 @@ func (c *cluster) awaitVolume(probe, volume, target string, version int) {
 
 func (c *cluster) checkSiteVolumeIsolation(site, volume string) {
 	c.await("isolated TLS configuration for "+site, func() error {
-		pods, err := c.pods(dataplaneSelector + "," + racermeta.UniverseKey + "=" + racermeta.UniverseForSite(site))
+		all, err := c.pods(dataplaneSelector)
 		if err != nil {
 			return err
+		}
+
+		var pods []core.Pod
+
+		for _, pod := range all {
+			var node core.Node
+			if err := c.get("node", pod.Spec.NodeName, &node); err != nil {
+				return err
+			}
+
+			if racermeta.NodeSite(&node) == site {
+				pods = append(pods, pod)
+			}
 		}
 
 		if len(pods) != 1 {

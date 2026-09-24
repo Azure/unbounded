@@ -89,7 +89,7 @@ type SiteReconciler struct {
 }
 
 // DefaultRegistry returns the built-in component registry: the cluster
-// singletons followed by the metalman and Racer dataplane per-Site components. The slice
+// singletons followed by the metalman per-Site component. The slice
 // order is the stable Site status condition order (cluster first, then site).
 func DefaultRegistry() *component.Registry {
 	return &component.Registry{
@@ -99,10 +99,10 @@ func DefaultRegistry() *component.Registry {
 			gantry.New(),
 			tokenrefresher.New(),
 			racer.NewControlPlane(),
+			racer.NewDataplane(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),
-			racer.NewDataplane(),
 		},
 	}
 }

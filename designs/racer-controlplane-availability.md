@@ -15,6 +15,11 @@ sweep also changes a boot annotation on Pods without a hint, preventing an
 in-flight predecessor publication from restoring a stale route. The final Pod
 read precedes the durable fence check. Cancellation rejects requests even while
 endpoint updates propagate; shutdown also attempts to remove the local hint.
+Request serving starts only after publication completes in the current leadership
+term. Failed or canceled publication remains retryable, including an API write
+whose response was lost. Subsequent reconciliations read the local Pod's hint and
+boot annotation; an intact route requires no Pod writes or predecessor sweep.
+Missing or changed hints trigger a fenced sweep and republication.
 
 Rolling updates use one surge and one unavailable replica, with ten seconds of
 continuous readiness before availability credit. Healthy standbys let updates

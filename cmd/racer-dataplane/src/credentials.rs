@@ -274,6 +274,8 @@ impl Leaf {
         let body = serde_json::to_vec(&serde_json::json!({
             "csr": std::str::from_utf8(&request.csr_pem).map_err(invalid)?,
             "pod_namespace":settings.namespace,"pod_name":settings.pod,
+            "expected_universe": settings.identity.universe,
+            "expected_node": settings.identity.node,
         }))
         .map_err(invalid)?;
         let token = zeroize::Zeroizing::new(read_bounded(&settings.token, 16384)?);

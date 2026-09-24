@@ -163,9 +163,13 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 			CSR       string `json:"csr"`
 			Namespace string `json:"pod_namespace"`
 			Pod       string `json:"pod_name"`
+			Universe  string `json:"expected_universe"`
+			Node      string `json:"expected_node"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Namespace != "sdk" || request.Pod != "dataplane" || r.Header.Get("Authorization") != "Bearer sdk-test-token" {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Namespace != "sdk" || request.Pod != "dataplane" || request.Universe != strings.Repeat("01", 32) || request.Node != strings.Repeat("02", 32) || r.Header.Get("Authorization") != "Bearer sdk-test-token" {
+			t.Logf("enrollment identity: namespace=%q pod=%q universe=%q node=%q error=%v", request.Namespace, request.Pod, request.Universe, request.Node, err)
 			http.Error(w, "invalid enrollment", http.StatusForbidden)
+
 			return
 		}
 

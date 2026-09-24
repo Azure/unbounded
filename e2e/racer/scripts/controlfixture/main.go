@@ -161,6 +161,8 @@ func (f *fixture) enroll(w http.ResponseWriter, req *http.Request) {
 		CSR       string `json:"csr"`
 		Namespace string `json:"pod_namespace"`
 		Pod       string `json:"pod_name"`
+		Universe  string `json:"expected_universe"`
+		Node      string `json:"expected_node"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 16384)).Decode(&body); err != nil {
 		http.Error(w, "invalid enrollment", http.StatusBadRequest)
@@ -170,7 +172,7 @@ func (f *fixture) enroll(w http.ResponseWriter, req *http.Request) {
 	r, err := f.registration(body.Pod)
 
 	_, bootErr := boot(req)
-	if err != nil || bootErr != nil || body.Namespace != "probe" || req.Header.Get("Authorization") != "Bearer "+r.Token {
+	if err != nil || bootErr != nil || body.Namespace != "probe" || body.Universe != r.Universe || body.Node != r.Node || req.Header.Get("Authorization") != "Bearer "+r.Token {
 		http.Error(w, "unauthorized enrollment", http.StatusForbidden)
 		return
 	}

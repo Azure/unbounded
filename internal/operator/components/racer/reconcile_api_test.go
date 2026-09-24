@@ -91,7 +91,7 @@ func TestAPIDefaultedResourcesAreNoOp(t *testing.T) {
 
 	var ds appsv1.DaemonSet
 
-	key := client.ObjectKey{Namespace: namespace, Name: SiteDaemonSetName(site.Name)}
+	key := client.ObjectKey{Namespace: namespace, Name: dataplaneName}
 	if err := kube.Get(t.Context(), key, &ds); err != nil {
 		t.Fatal(err)
 	}

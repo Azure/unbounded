@@ -6,8 +6,8 @@ The original proposal below is historical. Gantry is now an enabled-by-default,
 version-matched cluster singleton managed by `internal/operator/components/gantry`.
 The existing `gantry-config` ConfigMap is preserved and is the authoritative
 deployment-wide configuration. `content_backend: direct` is the default;
-`content_backend: racer` provisions a dedicated P2PCache, validates identical
-Gantry/Racer Site enablement and all-node coverage, and installs restart-safe
+`content_backend: racer` provisions a dedicated P2PCache, validates a wanted or
+retained Racer installation and all-node coverage, and installs restart-safe
 parent-directory socket mounts. No Site API fields are needed for backend
 selection. The unbounded agent owns containerd mirror wiring.
 

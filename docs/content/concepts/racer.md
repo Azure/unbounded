@@ -66,19 +66,37 @@ Use Racer when many workers read the same blobs, repeated downloads limit
 throughput, or shared storage becomes a bottleneck. It is a good fit for
 data-intensive workloads such as machine learning and analytics.
 
-## Enable Racer for a Site
+## Cluster-wide installation
 
-With the Unbounded operator installed, enable Racer on an existing Site by
-setting `spec.components.racer.enabled` to `true`. Replace `my-site` with your
-Site's name:
+With the Unbounded operator installed, Racer defaults on when a Site exists.
+The operator creates one `Deployment/racer-controlplane` and one ownerless
+`DaemonSet/racer-dataplane`. To explicitly vote for installation on an existing
+Site, replace `my-site` with your Site's name:
 
 ```bash
 kubectl patch sites.unbounded-cloud.io my-site --type=merge \
   -p '{"spec":{"components":{"racer":{"enabled":true}}}}'
 ```
 
-The operator deploys the shared Racer control plane and cache agents for the
-Site. Racer is disabled by default.
+An omitted Racer block or `enabled` field means true. Explicit false opts a Site
+out of initial installation voting. If every Site opts out, a fresh installation
+is absent; once installed, both components are retained and repaired even after
+all Sites opt out or disappear. With no Sites and no existing installation,
+Racer is not installed.
+
+Agents run on eligible Linux nodes with nonempty Site membership, honoring the
+existing Racer exclusion label and taint restrictions. Canonical
+`unbounded-cloud.io/site` membership takes precedence over the deprecated label,
+including when its value is empty. Every existing, nonterminating Site remains
+an independent cache universe regardless of its installation vote. P2PCache
+Site selectors and cache capacity inheritance (Node annotation, Site setting,
+then 10 GiB) continue to apply.
+
+Bootstrap derives each process's identity from its Node UID and Site. Enrollment
+verifies the live Pod-to-singleton-DaemonSet ownership chain. When Node identity
+or Site membership changes, the old process is deconfigured and its Pod is
+gracefully replaced; it cannot join the new universe using its old identity.
+Both Racer workload override components are cluster-wide and reject `sites`.
 
 ## Build from Source
 

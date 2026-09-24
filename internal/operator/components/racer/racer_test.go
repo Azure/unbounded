@@ -54,20 +54,12 @@ func combinedPlan(t *testing.T, env *component.Env, sites ...*unboundedv1alpha3.
 		t.Fatalf("control plan: %+v %v", res, err)
 	}
 
-	for _, s := range sites {
-		var p *component.Plan
-		if NewDataplane().Enabled(s) {
-			p, res, err = NewDataplane().Plan(t.Context(), env, s)
-		} else {
-			p, res, err = NewDataplane().CleanupPlan(t.Context(), env, s)
-		}
-
-		if err != nil || res.RequeueAfter != 0 {
-			t.Fatalf("dataplane plan: %+v %v", res, err)
-		}
-
-		plan.Merge(p)
+	p, res, err := NewDataplane().Plan(t.Context(), env, values)
+	if err != nil || res.RequeueAfter != 0 {
+		t.Fatalf("dataplane plan: %+v %v", res, err)
 	}
+
+	plan.Merge(p)
 
 	return plan
 }
@@ -87,15 +79,24 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 	env := testEnv(t, interceptor.Funcs{})
 
 	site := testSite("rack-a")
-	for _, spec := range []*unboundedv1alpha3.RacerComponentSpec{nil, {}, {SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}} {
+	for _, spec := range []*unboundedv1alpha3.RacerComponentSpec{nil, {}, {SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)}}} {
 		site.Spec.Components.Racer = spec
-		if NewDataplane().Enabled(site) {
-			t.Fatal("Racer must be opt-in")
+		if !EnabledFor(site) {
+			t.Fatal("Racer must default on")
 		}
 
-		if p := combinedPlan(t, env, site); p.Len() != 0 {
-			t.Fatal("disabled fresh install planned writes")
+		if p := combinedPlan(t, env, site); p.Len() == 0 {
+			t.Fatal("default-on fresh install planned no writes")
 		}
+	}
+
+	site.Spec.Components.Racer = &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
+	if p := combinedPlan(t, env, site); p.Len() != 0 {
+		t.Fatal("disabled fresh install planned writes")
+	}
+
+	if p := combinedPlan(t, env); p.Len() != 0 {
+		t.Fatal("empty fresh install planned writes")
 	}
 
 	site = testSite("rack-a")
@@ -110,15 +111,11 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 	for _, op := range plan.Operations {
 		if op.Kind == component.OpDelete {
 			deletes++
-
-			if op.Object.GetKind() != "DaemonSet" || op.Object.GetName() != SiteDaemonSetName(site.Name) {
-				t.Fatal("cleanup deleted shared state")
-			}
 		}
 	}
 
-	if deletes != 1 {
-		t.Fatal("missing per-Site cleanup")
+	if deletes != 0 {
+		t.Fatal("Site opt-out deleted retained installation")
 	}
 
 	if result := execute(t, env, plan); result.Err() != nil {
@@ -152,6 +149,32 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 
 	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: env.Namespace, Name: controlPlaneName}, &appsv1.Deployment{}); err != nil {
 		t.Fatal("retained deployment was not repaired", err)
+	}
+}
+
+func TestSingletonRetentionMarkers(t *testing.T) {
+	for _, marker := range []client.Object{serviceAccount(controlPlaneName, "custom"), controlDeployment("custom", component.Config{}), dataplaneDaemonSet("custom", component.Config{})} {
+		t.Run(reflect.TypeOf(marker).String(), func(t *testing.T) {
+			env := testEnv(t, interceptor.Funcs{}, marker)
+			for _, sites := range [][]*unboundedv1alpha3.Site{nil, {testSite("a"), testSite("b")}} {
+				plan := combinedPlan(t, env, sites...)
+				workloads := map[string]int{}
+
+				for _, op := range plan.Operations {
+					if op.Site != "" || len(op.Object.GetOwnerReferences()) != 0 {
+						t.Fatal("singleton operation has Site scope or owner")
+					}
+
+					if op.Overridable {
+						workloads[op.Object.GetName()]++
+					}
+				}
+
+				if !reflect.DeepEqual(workloads, map[string]int{controlPlaneName: 1, dataplaneName: 1}) {
+					t.Fatalf("workloads: %v", workloads)
+				}
+			}
+		})
 	}
 }
 
@@ -206,7 +229,7 @@ func TestNoOpWritesDriftAndControllerOwnedState(t *testing.T) {
 
 	var ds appsv1.DaemonSet
 
-	key := client.ObjectKey{Namespace: env.Namespace, Name: SiteDaemonSetName(site.Name)}
+	key := client.ObjectKey{Namespace: env.Namespace, Name: dataplaneName}
 	if err := env.Client.Get(t.Context(), key, &ds); err != nil {
 		t.Fatal(err)
 	}
@@ -303,8 +326,8 @@ func TestDependencyFailureAndConflict(t *testing.T) {
 				blocked++
 			}
 
-			if blocked != 3 {
-				t.Fatalf("expected all three dependent workloads, got %d", blocked)
+			if blocked != 2 {
+				t.Fatalf("expected both dependent workloads, got %d", blocked)
 			}
 		})
 	}
@@ -313,7 +336,7 @@ func TestDependencyFailureAndConflict(t *testing.T) {
 func TestWatchesIntentNotStatus(t *testing.T) {
 	match := func(o client.Object) bool { return o.GetNamespace() == "custom" }
 	p := managedPredicate(match)
-	base := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
+	base := dataplaneDaemonSet("custom", component.Config{})
 
 	for _, tc := range []struct {
 		name   string
@@ -328,7 +351,9 @@ func TestWatchesIntentNotStatus(t *testing.T) {
 		{"racer label", func(d *appsv1.DaemonSet) { delete(d.Labels, componentLabel) }, true},
 		{"racer annotation", func(d *appsv1.DaemonSet) { d.Annotations = map[string]string{racermeta.CacheStatusAnnotationKey: "x"} }, true},
 		{"applied hash", func(d *appsv1.DaemonSet) { d.Labels[component.AppliedHashLabel] = "x" }, true},
-		{"owner", func(d *appsv1.DaemonSet) { d.OwnerReferences = nil }, true},
+		{"owner", func(d *appsv1.DaemonSet) {
+			d.OwnerReferences = []metav1.OwnerReference{component.SiteOwnerReference(testSite("foreign"))}
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			next := base.DeepCopy()
@@ -370,7 +395,6 @@ func TestOverridesKeepSiteAndExclusionAffinity(t *testing.T) {
 overrides:
 - component: racer-dataplane
   kind: DaemonSet
-  sites: [rack-a]
   patch:
     spec:
       template:
@@ -413,14 +437,14 @@ overrides:
 	for _, tc := range []struct {
 		site, disk, exclude string
 		want                bool
-	}{{"rack-a", "fast", "", true}, {"rack-b", "fast", "", false}, {"rack-a", "slow", "", false}, {"rack-a", "fast", "true", false}} {
+	}{{"rack-a", "fast", "", true}, {"rack-b", "fast", "", true}, {"rack-a", "slow", "", false}, {"rack-a", "fast", "true", false}} {
 		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{corev1.LabelOSStable: "linux", racermeta.SiteLabelKey: tc.site, "disk": tc.disk, racermeta.ExcludeLabelKey: tc.exclude}}}
 		if got := matchesNode(t, ds.Spec.Template.Spec, n); got != tc.want {
 			t.Fatalf("override widened membership: %+v", tc)
 		}
 	}
 
-	if ds.Spec.Template.Spec.Containers[0].Image != "custom.test/racer:pinned" || len(ds.OwnerReferences) != 1 || ds.Spec.Template.Labels[racermeta.UniverseKey] != site.Name {
+	if ds.Spec.Template.Spec.Containers[0].Image != "custom.test/racer:pinned" || len(ds.OwnerReferences) != 0 || ds.Spec.Template.Labels[racermeta.UniverseKey] != "" {
 		t.Fatal("override lost workload identity")
 	}
 }

@@ -190,7 +190,7 @@ The peer/chair/advertiser signals in this table apply to the direct backend.
 
 ## Optional Racer Backend
 
-Racer is opt-in. Existing installations with an omitted `content_backend`, or
+Using Racer as Gantry's backend is opt-in. Installations with an omitted `content_backend`, or
 with `content_backend: direct`, continue using direct distribution. Building
 Gantry does not require building Racer; Racer mode additionally requires the
 version-matched Racer control-plane and Linux dataplane deployment described in
@@ -198,14 +198,14 @@ the [Racer documentation](../../concepts/racer/).
 
 ### Operator-managed enablement
 
-1. Enable `spec.components.racer.enabled: true` on **every Gantry-enabled Site**.
-   Gantry and Racer must be enabled together on all participating Sites. Gantry
-   is a cluster-wide singleton, not a per-Site backend choice.
+1. Ensure Racer is installed or at least one Site votes to install it. Racer
+   defaults on and an installed Racer is retained. Site enablement votes need
+   not match Gantry's votes. Both components are cluster-wide.
 2. Every node covered by the Gantry DaemonSet must be Linux, assigned to one of
-   those Sites, and not labeled `racer.unbounded-cloud.io/exclude: "true"`.
+   the existing, nonterminating Sites, and not labeled `racer.unbounded-cloud.io/exclude: "true"`.
    Unassigned nodes, including control-plane nodes, must be accounted for.
    Custom `NoSchedule`/`NoExecute` taints unsupported by the managed Racer
-   DaemonSet are rejected. Wait for each Racer DaemonSet to become ready first.
+   DaemonSet are rejected. Wait for `DaemonSet/racer-dataplane` to become ready first.
 3. Edit the existing ConfigMap, preserving your registry configuration:
 
    ```bash
@@ -242,8 +242,9 @@ spec:
   maxCandidateAttempts: 3
 ```
 
-An empty selector selects every Racer-enabled Site. The enablement checks make
-this exactly the participating Gantry Site set. Each Site has an independent
+An empty selector selects every existing, nonterminating Site, including Sites
+whose installation vote is false. Coverage checks require Racer on every Gantry
+serving node. Each Site has an independent
 cache universe. The operator rejects an existing cache with a different owner
 label or a nonempty selector, and preserves the generation and candidate policy
 of an existing compatible cache. Use a dedicated cache name, never an unrelated
