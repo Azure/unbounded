@@ -84,7 +84,7 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				w.Header().Set("Content-Range", contentRange(0, int64(len(data))-1, int64(len(data))))
 				w.WriteHeader(206)
 				_, _ = w.Write(data)
-			}), ClientOptions{})
+			}), ClientOptions{Concurrency: 1, MaxIdleConnections: 2, MaxActiveRequests: 1})
 
 			c, err := c.WithOriginData([]byte("Bearer stream"))
 			if err != nil {
@@ -130,6 +130,8 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				body := <-result
 				stats := s.Stats()
 				_ = s.Close()
+
+				assertAdmissionFree(t, c)
 
 				if err != nil || n != int64(len(data)) || !bytes.Equal(body, data) {
 					t.Fatal(n, err, len(body))

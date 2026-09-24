@@ -4,8 +4,8 @@
 
 Create one `Client` for the cache UDS. Derive a request-local view with
 `WithOriginData(value []byte) (*Client, error)`. Views share the HTTP and streaming
-connection pools and Linux splice-pipe cache and copy the input. Nil or empty
-input removes origin data.
+connection pools, active request admission, and Linux splice-pipe cache and copy
+the input. Nil or empty input removes origin data.
 Values can contain arbitrary bytes up to `MaxOriginDataBytes` (65,536 bytes).
 Neither client is mutated by deriving a view. HTTP transports use one
 `Racer-Origin-Data` header containing canonical padded standard base64; RDMA
@@ -27,6 +27,48 @@ Use `errors.As(err, &status)` with `var status *racer.HTTPError` to obtain
 `StatusCode`, `WWWAuthenticate` (1,024 bytes), and `RetryAfter` (128 bytes).
 Invalid/duplicate/oversized fields produce `ErrProtocol`; values are never
 truncated. Origin data is never included in SDK error text.
+
+## Independent resource controls
+
+`ClientOptions` separates three limits:
+
+| Option | Zero/default | Scope |
+| --- | --- | --- |
+| `Concurrency` | 8 | Page workers per `Download` or `ReadAt` operation. Sequential streams issue one page request at a time. |
+| `MaxIdleConnections` | Effective `Concurrency` | Idle sockets retained **in each** of the net/http and raw streaming pools. Independent of worker count when explicitly set. |
+| `MaxActiveRequests` | Unlimited | Shared admission across HEAD, download/read page GETs, raw stream GETs, and every `WithOriginData` view. |
+
+All three reject negative values. Existing zero-valued options preserve the
+previous worker, idle, and unlimited-active behavior. For example,
+`ClientOptions{Concurrency: 8, MaxIdleConnections: 32, MaxActiveRequests: 16}`
+allows eight workers per operation, retains up to 32 idle sockets per pool, and
+admits at most 16 requests across all operations combined. Idle capacity neither
+limits active requests nor reserves capacity for an operation.
+
+Admission happens before dialing or checking out a raw socket. A permit covers
+header parsing, validation, and body consumption, including a paused stream after
+`Prepare`. Consumption, abandonment, cancellation, and any dial/header/validation/
+body error release it. Streams release admission at page boundaries and acquire
+again for the next page. No operation reserves all of its workers' permits at
+once. Waiting honors context cancellation; `Timeout` includes admission waiting
+in the per-request deadline for net/http and the whole-stream deadline for raw
+streams. Always close abandoned streams. As with any bounded client, do not wait
+for another request while retaining an unconsumed response that occupies the last
+permit: consume or close it first.
+
+With idle capacity I, the two pools retain at most 2I idle upstream socket FDs.
+With an active limit A, at most A requests are admitted, including those dialing;
+this is a request limit rather than a strict process FD limit (transport dialing
+and cleanup can overlap). Worker goroutines remain bounded per operation, not
+globally; callers still control the number of concurrent operations. Concurrent
+socket `WriteTo` calls can each own a pipe even while waiting for their next page.
+The pipe bounds below apply independently of request admission.
+
+There is no prefetch option yet. The internal admission control provides a
+nonblocking `tryAcquire` for future one-page speculation: skip prefetch when no
+permit is immediately available, and transfer the acquired permit to the request
+without acquiring again. Speculation must never wait for capacity while holding
+a foreground response's permit.
 
 ## Sequential reads and explicit splice
 
@@ -124,11 +166,13 @@ Only fully consumed valid responses are pooled. Failed/abandoned responses are
 closed. Streams do not automatically retry stale idle sockets or version errors.
 
 Successful socket transfers return only drained pipes to an explicit shared
-cache holding at most `min(ClientOptions.Concurrency, 8)` pipes (zero concurrency
-selects 8). Each pipe owns two FDs and its kernel-reported capacity; the 1 MiB
-request is a target, not an assumption about host limits or granted capacity.
+cache holding at most `min(effective MaxIdleConnections, 8)` pipes (zero idle
+capacity uses effective `Concurrency`, which defaults to 8). Each pipe owns two
+FDs and its kernel-reported capacity; the 1 MiB request is a target, not an
+assumption about host limits or granted capacity.
 Cached pipes contain no payload, though their capacity counts toward kernel pipe
-quotas. Active transfers are not limited by this cache or by `Concurrency`:
+quotas. Active transfers are not limited by this cache or by `Concurrency`;
+`MaxActiveRequests`, when set, limits their upstream requests:
 with A active socket transfers and I idle pipes, pipe FDs are bounded by
 `2 * (A + I)`. Pipe kernel capacity is the sum of those pipes' actual capacities.
 Error, cancellation, abandonment, nonempty, and overflow paths close their pipes.

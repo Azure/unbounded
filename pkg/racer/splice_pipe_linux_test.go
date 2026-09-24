@@ -150,6 +150,45 @@ func TestSplicePipePoolBoundsAndCleanup(t *testing.T) {
 	}
 }
 
+func TestSplicePipeIndependentIdleCapacity(t *testing.T) {
+	for _, idle := range []int{2, maxIdleSplicePipes + 1} {
+		c, err := NewClient("/unused", ClientOptions{Concurrency: 1, MaxIdleConnections: idle})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		t.Cleanup(c.CloseIdleConnections)
+
+		var pipes []*splicePipe
+		for range idle + 1 {
+			p, err := c.streamPool.pipes.get()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			pipes = append(pipes, p)
+		}
+
+		for _, p := range pipes {
+			c.streamPool.pipes.put(p, true, c.streamPool.limit)
+		}
+
+		if len(c.streamPool.pipes.idle) != min(idle, maxIdleSplicePipes) {
+			t.Fatal("pipe cache still tied to workers", len(c.streamPool.pipes.idle))
+		}
+
+		for _, p := range pipes[min(idle, maxIdleSplicePipes):] {
+			assertPipeClosed(t, p.fd)
+		}
+
+		c.CloseIdleConnections()
+
+		for _, p := range pipes {
+			assertPipeClosed(t, p.fd)
+		}
+	}
+}
+
 func TestSplicePipePoolRejectsNonemptyAndFailed(t *testing.T) {
 	for _, nonempty := range []bool{false, true} {
 		pool := &splicePipePool{}

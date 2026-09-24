@@ -41,13 +41,17 @@ func (p *streamPool) get(ctx context.Context) (*streamConn, error) {
 		i := len(p.idle) - 1
 		c := p.idle[i]
 
+		p.idle[i] = nil
 		p.idle = p.idle[:i]
+		p.mu.Unlock()
+
 		if time.Since(c.idle) < 90*time.Second {
-			p.mu.Unlock()
 			return c, nil
 		}
 
 		_ = c.Close() //nolint:errcheck // Expired idle socket cleanup.
+
+		p.mu.Lock()
 	}
 	p.mu.Unlock()
 
@@ -66,28 +70,31 @@ func (p *streamPool) put(c *streamConn) {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if len(p.idle) >= p.limit {
+		p.mu.Unlock()
+
 		_ = c.Close() //nolint:errcheck // The idle pool is full.
+
 		return
 	}
 
 	c.idle = time.Now()
 	p.idle = append(p.idle, c)
+	p.mu.Unlock()
 }
 
 func (p *streamPool) closeIdle() {
 	p.pipes.closeIdle()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	idle := p.idle
+	p.idle = nil
+	p.mu.Unlock()
 
-	for _, c := range p.idle {
+	for _, c := range idle {
 		_ = c.Close() //nolint:errcheck // Idle connection cleanup.
 	}
-
-	p.idle = nil
 }
 
 func (c *streamConn) response(r *http.Request) (*http.Response, error) {
@@ -128,6 +135,7 @@ type Stream struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	conn                 *streamConn
+	permit               *requestPermit
 	stop                 func() bool
 	stopped              chan struct{}
 	offset, end, pageEnd int64
@@ -218,6 +226,8 @@ func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, 
 }
 
 func (s *Stream) release(reuse bool) {
+	defer func() { s.permit.release(); s.permit = nil }()
+
 	if s.conn == nil {
 		return
 	}
@@ -250,11 +260,18 @@ func (s *Stream) nextPage() error {
 		return fmt.Errorf("%w: bytes beyond response length", ErrProtocol)
 	}
 
-	if s.conn != nil && s.responseClose {
-		s.release(false)
+	if s.conn != nil && (s.responseClose || s.object.client.admission != nil) {
+		s.release(!s.responseClose)
 	}
 
 	if s.conn == nil {
+		permit, err := s.object.client.admission.acquire(s.ctx)
+		if err != nil {
+			return err
+		}
+
+		s.permit = permit
+
 		c, err := s.object.client.streamPool.get(s.ctx)
 		if err != nil {
 			return err
@@ -266,6 +283,8 @@ func (s *Stream) nextPage() error {
 
 		s.stop = context.AfterFunc(s.ctx, func() {
 			_ = c.Close() //nolint:errcheck // Cancellation interrupts socket I/O.
+
+			permit.release()
 
 			close(done)
 		})
@@ -373,6 +392,14 @@ func (s *Stream) read(p []byte) (int, error) {
 		}
 
 		return n, err
+	}
+
+	if s.offset == s.pageEnd && s.object.client.admission != nil {
+		if s.conn.reader.Buffered() != 0 {
+			return n, s.fail(fmt.Errorf("%w: bytes beyond response length", ErrProtocol))
+		}
+
+		s.release(!s.responseClose)
 	}
 
 	return n, nil

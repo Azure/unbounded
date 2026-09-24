@@ -161,7 +161,7 @@ func TestDownloadHEADThenBoundedConcurrentPages(t *testing.T) {
 		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 		w.WriteHeader(206)
 		_, _ = w.Write(data[start : end+1])
-	}), ClientOptions{Concurrency: 2, Header: http.Header{"Authorization": {"Bearer token"}}})
+	}), ClientOptions{Concurrency: 2, MaxIdleConnections: 1, MaxActiveRequests: 3, Header: http.Header{"Authorization": {"Bearer token"}}})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

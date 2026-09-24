@@ -105,26 +105,29 @@ func (pool *splicePipePool) get() (*splicePipe, error) {
 
 func (pool *splicePipePool) put(p *splicePipe, reusable bool, limit int) {
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
 
 	if !reusable || p.buffered != 0 || p.generation != pool.generation || len(pool.idle) >= min(limit, maxIdleSplicePipes) {
+		pool.mu.Unlock()
 		p.close()
+
 		return
 	}
 
 	pool.idle = append(pool.idle, p)
+	pool.mu.Unlock()
 }
 
 func (pool *splicePipePool) closeIdle() {
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
 
 	pool.generation++
-	for _, p := range pool.idle {
+	idle := pool.idle
+	pool.idle = nil
+	pool.mu.Unlock()
+
+	for _, p := range idle {
 		p.close()
 	}
-
-	pool.idle = nil
 }
 
 // RawConn integrates EAGAIN with Go's poller, so socket deadlines and
