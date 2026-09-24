@@ -30,7 +30,17 @@ impl LayoutPlan {
         if workers == 0 || workers > MAX_PLANNED_SHARDS {
             return Err(invalid("planned worker count must be 1..=1024"));
         }
-        let shards = (capacity.div_ceil(TARGET_SHARD_SIZE) as usize).max(workers);
+        // Four independently checkpointed shards per reactor, while retaining
+        // the size floor and the format's 512 MiB minimum per shard. This same
+        // planner owns fresh startup and control-driven replacements. Existing
+        // layouts are opened as recorded, never rewritten for a tuning change.
+        let concurrency = workers
+            .saturating_mul(4)
+            .min(MAX_PLANNED_SHARDS)
+            .min((capacity / MIN_CAPACITY) as usize);
+        let shards = (capacity.div_ceil(TARGET_SHARD_SIZE) as usize)
+            .max(concurrency)
+            .max(workers);
         Geometry::new(capacity, shards, 0)?;
         Ok(Self {
             capacity,

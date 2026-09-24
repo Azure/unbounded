@@ -8,15 +8,15 @@
 //! RACER_SLAB_SIZE: size in bytes for a NEW slab, default 10 GiB.
 //! RACER_SHARDS: optional initial shard count and execution worker cap.
 //! RACER_IO_WORKERS / RACER_COMPUTE_WORKERS: optional positive counts PER NUMA node.
-//! Default: split allowed physical cores evenly (odd core goes to I/O). One
-//! override gives the other pool the remaining cores; two may leave cores idle.
+//! Default: co-location/quota-bounded physical cores, split evenly (odd to I/O).
+//! One override gives the other pool remaining cores; two may leave cores idle.
 //! Execution planning retains a default eight-worker cap; explicit RACER_SHARDS
 //! also sets this cap. Automatic storage shards scale independently with size.
 //! Persisted slabs require the same actual total I/O worker count; automatic
 //! startup discovers their recorded shard count.
 //! Legacy slabs without placement metadata require an explicit fresh cache path.
 //! Compute threads calculate and validate CRC64 before publishing incoming values.
-//! RACER_BUFFERS_PER_NODE: transient 64 MiB buffer count, minimum 4, default 8.
+//! RACER_BUFFERS_PER_NODE: transient 64 MiB buffer count, minimum 4, auto by default.
 //! RACER_METRICS_ADDR: management listener override (numeric socket address).
 //! RACER_POD_IP: default management bind IP on port 9090; unset uses 0.0.0.0.
 //! RACER_STARTUP_SECONDS / RACER_STALL_SECONDS: startup/progress limits, 90 / 5.
@@ -38,7 +38,7 @@ use racer_dataplane::{
     allocator::{self, Slab},
     buffers,
     cache::{Cache, Namespace},
-    control, crypto, lifecycle, metrics, rdma, runtime, uring, workers,
+    control, crypto, lifecycle, metrics, rdma, runtime, tuning, uring, workers,
 };
 use std::{
     env, io,
@@ -195,8 +195,10 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let io_stop = stop.clone();
     let slab_io = racer_dataplane::slab_io::Io::new(racer_dataplane::slab_io::Config::from_env()?)
         .with_stop(move || io_stop.is_stopping());
-    let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "8")?)?;
-    pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
+    let explicit_buffers = optional_count("RACER_BUFFERS_PER_NODE")?;
+    if let Some(count) = explicit_buffers {
+        daemon_pool_config(count)?;
+    }
     let source = control::Source::from_env()?;
     let peer = peer_address(|name| env::var(name))?;
     let trust = Arc::new(control::Trust::from_env()?);
@@ -206,13 +208,46 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let config = workers::Config {
         shard_count: setting("RACER_SHARDS", "8")?,
     };
-    let plan = workers::CpuPlan::discover(
+    let limits = tuning::Limits::discover()?;
+    let rdma_policy = rdma::StartupPolicy::from_env()?;
+    let registration_copies = rdma_policy.payload_registration_copies();
+    // Reserve the complete supported RDMA control envelope before CPU selection.
+    let control_reserve = if registration_copies > 1 {
+        256 << 20
+    } else {
+        0
+    };
+    let plan = workers::CpuPlan::discover_bounded(
         config,
         workers::WorkerCounts {
             io_per_node: optional_count("RACER_IO_WORKERS")?,
             compute_per_node: optional_count("RACER_COMPUTE_WORKERS")?,
         },
+        limits,
+        limits.max_io(registration_copies, control_reserve),
     )?;
+    let mut node_workers = std::collections::BTreeMap::new();
+    for worker in plan.io() {
+        *node_workers.entry(worker.numa_node_id()).or_insert(0usize) += 1;
+    }
+    let counts: Vec<_> = node_workers.values().copied().collect();
+    let buffers = limits.buffers(
+        &counts,
+        explicit_buffers,
+        registration_copies,
+        rdma_policy.control_bytes(plan.io().len())? as u64,
+    )?;
+    let mut pool_config = daemon_pool_config(buffers)?;
+    pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
+    let tuning_status = serde_json::json!({
+        "ioWorkers": plan.io().len(), "computeWorkers": plan.compute().cpus().len(),
+        "numaNodes": counts.len(), "buffersPerNode": buffers.get(),
+        "poolBytes": counts.len() * buffers.get() * buffers::BUFFER_SIZE,
+        "registrationBytes": plan.io().len() * registration_copies * buffers.get() * buffers::BUFFER_SIZE,
+        "availableMemoryBytes": limits.available_memory, "memlockBytes": limits.memlock,
+        "cpuQuotaCores": limits.cpu_quota,
+    });
+    eprintln!("effective startup tuning: {tuning_status}");
     life.configure_workers(plan.io().len());
     let _credentials = if matches!(source, control::Source::Http { .. }) {
         Some(loop {
@@ -230,7 +265,6 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     } else {
         None
     };
-    let rdma_policy = rdma::StartupPolicy::from_env()?;
     let windows = rdma_policy.validate_workers(plan.io().len())?;
     eprintln!(
         "RDMA process provisioning ceiling: {windows} windows, {} control bytes; payload pool registration additional per worker/rail",
@@ -276,6 +310,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let crypto_count = plan.compute().cpus().len();
     let registry = Arc::new(
         metrics::Registry::new(plan.io().len(), updates.clone())
+            .with_tuning(tuning_status)
             .with_lifecycle(life.clone())
             .with_slab_io(slab_io),
     );

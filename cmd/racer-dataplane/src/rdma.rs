@@ -219,6 +219,10 @@ impl StartupPolicy {
     pub fn control_bytes(&self, workers: usize) -> io::Result<usize> {
         Ok(self.validate_workers(workers)? * CONTROL)
     }
+    /// One io_uring registration plus one payload registration per selected rail.
+    pub fn payload_registration_copies(&self) -> usize {
+        1 + self.selectors.len()
+    }
 }
 
 /// Active device/port/GID candidates, ordered by that tuple. Ethernet requires

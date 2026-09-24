@@ -615,6 +615,88 @@ mod tests {
     }
 
     #[test]
+    fn automatic_plan_respects_topology_quota_and_pool_capacity() {
+        let topology = |cores: usize, numa: usize| {
+            (0..cores)
+                .flat_map(|core| {
+                    [core * 2, core * 2 + 1]
+                        .into_iter()
+                        .map(move |id| cpu(id, core % numa, &[core * 2, core * 2 + 1]))
+                })
+                .collect::<Vec<_>>()
+        };
+        let limits = crate::tuning::Limits {
+            cpu_quota: None,
+            available_memory: 29 << 30,
+            memlock: 8 << 30,
+        };
+        for (cores, numa, quota, max_io, expected) in [
+            (4, 1, None, 32, (2, 2)),
+            (8, 1, None, 32, (4, 4)),
+            (8, 2, None, 32, (4, 4)),
+            (8, 2, Some(3), 32, (2, 1)),
+            (8, 1, Some(1), 32, (1, 1)),
+            (64, 1, None, 32, (8, 8)),
+            (8, 2, None, 1, (1, 3)),
+        ] {
+            let plan = CpuPlan::bounded(
+                config(32),
+                WorkerCounts::default(),
+                topology(cores, numa),
+                crate::tuning::Limits {
+                    cpu_quota: quota,
+                    ..limits
+                },
+                max_io,
+            )
+            .unwrap();
+            assert_eq!((plan.io.len(), plan.compute.cpus.len()), expected);
+            let physical: BTreeSet<_> = plan
+                .io
+                .iter()
+                .map(|p| p.cpu.0 / 2)
+                .chain(plan.compute.cpus.iter().map(|(cpu, _)| cpu.0 / 2))
+                .collect();
+            assert_eq!(physical.len(), expected.0 + expected.1);
+        }
+        assert!(
+            CpuPlan::bounded(
+                config(8),
+                WorkerCounts::default(),
+                topology(4, 1),
+                limits,
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            CpuPlan::bounded(
+                config(8),
+                WorkerCounts::default(),
+                topology(1, 1),
+                limits,
+                8
+            )
+            .is_err()
+        );
+        let explicit = CpuPlan::bounded(
+            config(8),
+            WorkerCounts {
+                io_per_node: NonZeroUsize::new(3),
+                compute_per_node: NonZeroUsize::new(2),
+            },
+            topology(8, 1),
+            crate::tuning::Limits {
+                cpu_quota: Some(2),
+                ..limits
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!((explicit.io.len(), explicit.compute.cpus.len()), (3, 2));
+    }
+
+    #[test]
     fn compute_plan_excludes_smt_siblings_and_reserves_each_participating_node() {
         let cpus = vec![
             cpu(0, 0, &[0, 8]),

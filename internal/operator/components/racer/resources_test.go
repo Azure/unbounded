@@ -388,10 +388,9 @@ func TestShippingDataplaneProfile(t *testing.T) {
 			t.Fatalf("%s has ambient privilege", container.Name)
 		}
 
-		for _, r := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
-			if r.Cpu().Value() != 3 || r.Memory().Value() != 4*1024*1024*1024 {
-				t.Fatal("Guaranteed profile resource drift")
-			}
+		r := container.Resources.Requests
+		if r.Cpu().MilliValue() != 100 || r.Memory().Value() != 512*1024*1024 || len(container.Resources.Limits) != 0 {
+			t.Fatal("automatic profile must use low requests and no limits")
 		}
 
 		for _, mount := range container.VolumeMounts {
@@ -414,7 +413,13 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("unexpected host namespaces")
 	}
 
-	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache-v1.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
+	for _, name := range []string{"RACER_IO_WORKERS", "RACER_COMPUTE_WORKERS", "RACER_SHARDS", "RACER_BUFFERS_PER_NODE"} {
+		if _, exists := envValues(c)[name]; exists {
+			t.Fatalf("%s must select automatic tuning", name)
+		}
+	}
+
+	for name, value := range map[string]string{"RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache-v1.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
 		if envValues(c)[name] != value {
 			t.Fatalf("profile setting drift: %s", name)
 		}
@@ -423,7 +428,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	command := c.Args[0]
 
 	wantCommand := strings.Join([]string{
-		"ulimit -l 2097152",
+		"ulimit -l 8388608",
 		". /bootstrap/identity",
 		"chgrp 65532 /dev/racer",
 		"chmod 2770 /dev/racer",

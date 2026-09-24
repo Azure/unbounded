@@ -309,6 +309,7 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/metrics.rs"));
 
 /// Fixed worker slots. Registration happens once, inside the pinned factory.
 pub struct Registry {
+    tuning: Option<serde_json::Value>,
     slab_io: crate::slab_io::Io,
     lifecycle: Option<Arc<crate::lifecycle::Lifecycle>>,
     workers: Vec<OnceLock<Arc<Snapshot>>>,
@@ -317,6 +318,7 @@ pub struct Registry {
 impl Registry {
     pub fn new(workers: usize, updates: Arc<crate::control::Updates>) -> Self {
         Self {
+            tuning: None,
             slab_io: crate::slab_io::Io::default(),
             lifecycle: None,
             workers: (0..workers).map(|_| OnceLock::new()).collect(),
@@ -331,8 +333,15 @@ impl Registry {
         self.slab_io = io;
         self
     }
+    pub fn with_tuning(mut self, tuning: serde_json::Value) -> Self {
+        self.tuning = Some(tuning);
+        self
+    }
     fn status(&self) -> serde_json::Value {
         let mut status = self.updates.status();
+        if let Some(tuning) = &self.tuning {
+            status["tuning"] = tuning.clone();
+        }
         if let Some(life) = &self.lifecycle {
             let healthy = life.healthy();
             status["ready"] = (status["ready"] == true && healthy).into();

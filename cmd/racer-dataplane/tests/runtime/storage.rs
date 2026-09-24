@@ -337,14 +337,17 @@ fn live_multiworker_grow_shrink_and_same_capacity_noop() {
     f.applied(1, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
     assert_eq!(f.shared().transaction.lock().unwrap().id, 0);
-    f.applied(2, 48 << 30); // three shards, two workers, uneven local counts
+    f.applied(2, 50 << 30);
+    assert_eq!(f.updates.status()["storage"]["shards"], 8);
     assert_ne!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
-    f.applied(3, 1 << 30);
+    f.applied(3, 7 * (512 << 20)); // seven shards, two workers, uneven local counts
+    assert_eq!(f.updates.status()["storage"]["shards"], 7);
+    f.applied(4, 1 << 30);
     for ((_, ring), original) in f.nodes.iter().zip(original_rings) {
         assert!(Rc::ptr_eq(ring.identity(), &original));
     }
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    f.applied(4, 1 << 30);
+    f.applied(5, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
 }
 
