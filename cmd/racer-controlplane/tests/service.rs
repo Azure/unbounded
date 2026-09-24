@@ -1122,14 +1122,14 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         &bundle,
         Some((response["certificate"].as_str().unwrap(), &key)),
     );
-    let control = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n"), Some(config)).await?;
+    let control = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nX-Racer-Storage-Policy: 1\r\nConnection: close\r\n\r\n"), Some(config)).await?;
     ensure!(
         control.starts_with(b"HTTP/1.1 200"),
         "control failed: {}",
         String::from_utf8_lossy(&control)
     );
     next_sweep.resume.notify_one();
-    let wrong_boot = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n", "f".repeat(64)), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
+    let wrong_boot = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nX-Racer-Storage-Policy: 1\r\nConnection: close\r\n\r\n", "f".repeat(64)), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
     assert!(
         wrong_boot.starts_with(b"HTTP/1.1 403"),
         "header cannot replace signed boot"
