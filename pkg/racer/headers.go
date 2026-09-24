@@ -15,7 +15,8 @@ const MaxOriginDataBytes = 64 << 10
 
 const maxEncodedOriginDataBytes = (MaxOriginDataBytes + 2) / 3 * 4
 
-// WithOriginData returns an immutable view sharing both connection pools.
+// WithOriginData returns an immutable view sharing both connection pools and
+// the client-wide active request limit.
 // It copies arbitrary bytes; nil or empty removes origin data. Origin data is
 // forwarded on cache misses, not included in persistent object identity, and
 // must not be used for per-read authorization. Errors never include the data.

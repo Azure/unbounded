@@ -165,8 +165,10 @@ validation and background disk scrubbing, while file-backed foreground hits are
 not rehashed. A self-consistent admission CRC is not an OCI digest proof.
 `cmd/racer-dataplane/tests/http/peer_recovery.rs` separately checks malformed or
 missing peer CRCs and altered metadata, rejection without cache publication,
-healthy refetch, and subsequent cache reuse. Generic HTTP consumers must verify
-their own content; the SDK's `StreamVerified` remains available.
+healthy refetch, and subsequent cache reuse. Generic HTTP and SDK consumers must
+verify their own content against an independently trusted expected digest. The
+SDK no longer performs inline SHA-256 verification; see the
+[API migration note](../../pkg/racer/STREAMING.md#migration-inline-verification-removed).
 
 ### Prerequisites
 

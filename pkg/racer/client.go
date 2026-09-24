@@ -20,6 +20,16 @@ import (
 type ClientOptions struct {
 	// Concurrency bounds active page requests per operation; zero means 8.
 	Concurrency int
+	// MaxIdleConnections bounds each of the HTTP and raw streaming idle pools.
+	// Zero uses Concurrency (including its default); negative values are invalid.
+	MaxIdleConnections int
+	// MaxActiveRequests bounds requests across all operations and origin-data
+	// views, from before dialing until the response is consumed or abandoned.
+	// Zero leaves active requests unlimited; negative values are invalid.
+	MaxActiveRequests int
+	// StreamPrefetch enables one-page-ahead header preparation on a separate raw
+	// connection. Disabled by default; speculation skips unavailable admission.
+	StreamPrefetch bool
 	// Timeout bounds an entire HTTP request, including reading its body. Zero
 	// leaves the deadline to the operation's context. For sequential streams it
 	// bounds the whole stream, including all page requests and downstream writes.
@@ -38,6 +48,7 @@ type Client struct {
 	workers    int
 	owned      *http.Transport
 	streamPool *streamPool
+	admission  *requestAdmission
 }
 
 // NewClient connects to an absolute filesystem Unix socket, such as
@@ -61,6 +72,15 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 		return nil, fmt.Errorf("racer: concurrency must be positive")
 	}
 
+	if options.MaxIdleConnections < 0 || options.MaxActiveRequests < 0 {
+		return nil, fmt.Errorf("racer: connection and request limits must be nonnegative")
+	}
+
+	idle := options.MaxIdleConnections
+	if idle == 0 {
+		idle = workers
+	}
+
 	h := make(http.Header, len(options.Header))
 	for name, values := range options.Header {
 		switch strings.ToLower(name) {
@@ -74,14 +94,18 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	}
 
 	c := &Client{endpoint: "http://localhost", header: h, workers: workers}
-	c.streamPool = &streamPool{endpoint: endpoint, limit: workers, timeout: options.Timeout}
+	if options.MaxActiveRequests > 0 {
+		c.admission = &requestAdmission{slots: make(chan struct{}, options.MaxActiveRequests)}
+	}
+
+	c.streamPool = &streamPool{endpoint: endpoint, limit: idle, timeout: options.Timeout, prefetch: options.StreamPrefetch}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	// This pool always dials the configured local socket, never an HTTP proxy.
 	c.owned = &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "unix", endpoint)
 		},
-		MaxIdleConns: workers, MaxIdleConnsPerHost: workers,
+		MaxIdleConns: idle, MaxIdleConnsPerHost: idle,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true,
 		MaxResponseHeaderBytes: 8192,
@@ -93,7 +117,10 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	return c, nil
 }
 
-// CloseIdleConnections releases this client's pool. Active transfers are unaffected.
+// CloseIdleConnections releases idle connections and Linux splice pipes shared
+// by this client and its origin-data views, and discards pending stream prefetch.
+// Foreground transfers are uninterrupted;
+// their checked-out pipes are closed on return. The client remains usable.
 func (c *Client) CloseIdleConnections() {
 	if c.streamPool != nil {
 		c.streamPool.closeIdle()
@@ -132,7 +159,7 @@ func (c *Client) Stat(ctx context.Context, target string) (Metadata, error) {
 		return Metadata{}, err
 	}
 
-	resp, err := c.http.Do(r)
+	resp, err := c.do(r)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -260,6 +287,7 @@ func (w *offsetWriter) Write(p []byte) (int, error) {
 // ReadAt reads into p using concurrent GETs split at page boundaries. It follows
 // io.ReaderAt's EOF/count rules but accepts an explicit context. On other errors
 // the count is the contiguous completed prefix; later portions may be modified.
+// It requests only the requested bytes, with no caching or speculative reads.
 func (o *Object) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("racer: negative offset")
@@ -329,6 +357,19 @@ func (o *Object) pages(ctx context.Context, off, length int64, fn func(context.C
 	last := (off + length - 1) / PageSize
 	count := last - first + 1
 
+	if count == 1 {
+		err := fn(ctx, off, off+length-1)
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+
+		if err != nil {
+			return fmt.Errorf("racer: page at %d: %w", off, err)
+		}
+
+		return nil
+	}
+
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -385,7 +426,7 @@ func (o *Object) page(ctx context.Context, start, end int64) (*http.Response, er
 	r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	r.Header.Set("If-Match", o.meta.ETag)
 
-	resp, err := o.client.http.Do(r)
+	resp, err := o.client.do(r)
 	if err != nil {
 		return nil, err
 	}

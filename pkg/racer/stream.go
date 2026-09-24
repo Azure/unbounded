@@ -7,19 +7,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 )
-
-// ErrDigestMismatch means a full stream did not match the caller's SHA-256.
-var ErrDigestMismatch = errors.New("racer: SHA-256 digest mismatch")
 
 type streamConn struct {
 	net.Conn
@@ -33,11 +27,14 @@ type streamConn struct {
 // body reader would corrupt its framing and reuse state. Both pools are shared
 // by authorization views; credentials are written afresh for every request.
 type streamPool struct {
+	pipes    splicePipePool
 	mu       sync.Mutex
 	idle     []*streamConn
 	endpoint string
 	limit    int
 	timeout  time.Duration
+	prefetch bool
+	pending  map[*streamPrefetch]struct{}
 }
 
 func (p *streamPool) get(ctx context.Context) (*streamConn, error) {
@@ -46,13 +43,17 @@ func (p *streamPool) get(ctx context.Context) (*streamConn, error) {
 		i := len(p.idle) - 1
 		c := p.idle[i]
 
+		p.idle[i] = nil
 		p.idle = p.idle[:i]
+		p.mu.Unlock()
+
 		if time.Since(c.idle) < 90*time.Second {
-			p.mu.Unlock()
 			return c, nil
 		}
 
 		_ = c.Close() //nolint:errcheck // Expired idle socket cleanup.
+
+		p.mu.Lock()
 	}
 	p.mu.Unlock()
 
@@ -71,26 +72,37 @@ func (p *streamPool) put(c *streamConn) {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if len(p.idle) >= p.limit {
+		p.mu.Unlock()
+
 		_ = c.Close() //nolint:errcheck // The idle pool is full.
+
 		return
 	}
 
 	c.idle = time.Now()
 	p.idle = append(p.idle, c)
+	p.mu.Unlock()
 }
 
 func (p *streamPool) closeIdle() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.pipes.closeIdle()
 
-	for _, c := range p.idle {
-		_ = c.Close() //nolint:errcheck // Idle connection cleanup.
+	p.mu.Lock()
+	idle := p.idle
+	p.idle = nil
+	pending := p.pending
+	p.pending = nil
+	p.mu.Unlock()
+
+	for next := range pending {
+		next.discard()
 	}
 
-	p.idle = nil
+	for _, c := range idle {
+		_ = c.Close() //nolint:errcheck // Idle connection cleanup.
+	}
 }
 
 func (c *streamConn) response(r *http.Request) (*http.Response, error) {
@@ -131,27 +143,25 @@ type Stream struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	conn                 *streamConn
+	permit               *requestPermit
 	stop                 func() bool
 	stopped              chan struct{}
 	offset, end, pageEnd int64
 	responseClose        bool
 	err                  error
 	closed               bool
-	digest               hash.Hash
-	expected             [32]byte
-	verified             bool
 	stats                TransferStats
+	next                 *streamPrefetch
+	pageCancel           context.CancelFunc
 }
 
-// TransferStats distinguishes actual kernel splice/tee traffic from buffered
+// TransferStats distinguishes actual kernel splice traffic from buffered
 // header read-ahead and portable copies. Stats are per stream, not global.
-// BufferedBytes counts bytes read, including a withheld verification suffix;
-// SpliceBytes counts bytes successfully forwarded to the destination socket.
+// BufferedBytes counts bytes read through userspace;
+// SpliceBytes counts bytes successfully forwarded to the destination socket or file.
 type TransferStats struct {
 	SpliceBytes   int64
 	SpliceCalls   int64
-	TeeBytes      int64
-	TeeCalls      int64
 	BufferedBytes int64
 }
 
@@ -165,7 +175,7 @@ func (s *Stream) Stats() TransferStats {
 // Prepare fetches and validates the first page's headers without consuming its
 // body. Call before committing downstream HTTP headers to surface authorization,
 // version, and framing errors while an HTTP error response is still possible.
-// Empty streams verify their digest here without issuing a GET.
+// Empty streams complete without issuing a GET.
 func (s *Stream) Prepare() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -197,29 +207,15 @@ func (s *Stream) Prepare() error {
 	return nil
 }
 
-// Stream opens the entire snapshot. It does not assume ETag is a content hash.
+// Stream opens the entire snapshot without verifying a content digest.
+// It does not assume ETag is a content hash.
 func (o *Object) Stream(ctx context.Context) (*Stream, error) {
 	return o.ReadRange(ctx, 0, o.meta.Size)
 }
 
-// StreamVerified verifies the complete object against an explicit SHA-256,
-// independent of Racer's opaque version ETag. WriteTo withholds the final byte
-// until verification succeeds, so a digest mismatch cannot complete a framed
-// HTTP body. Verification requires hashing a tee copy in userspace, while the
-// forwarding leg still uses splice. Partial ranges cannot verify a full digest.
-func (o *Object) StreamVerified(ctx context.Context, expected [32]byte) (*Stream, error) {
-	s, err := o.Stream(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	s.digest, s.expected = sha256.New(), expected
-
-	return s, nil
-}
-
 // ReadRange opens [offset, offset+length), rejecting out-of-bounds intervals.
-// Requests are lazy, sequential, and pinned by If-Match to Open's HEAD snapshot.
+// Requests are lazy and pinned by If-Match to Open's HEAD snapshot. Consumption
+// is sequential; ClientOptions.StreamPrefetch optionally prepares one page ahead.
 // Close is required even when a caller stops reading early.
 func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, error) {
 	if offset < 0 || length < 0 || offset > o.meta.Size || length > o.meta.Size-offset {
@@ -241,6 +237,14 @@ func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, 
 }
 
 func (s *Stream) release(reuse bool) {
+	defer func() { s.permit.release(); s.permit = nil }()
+
+	if s.pageCancel != nil {
+		defer s.pageCancel()
+
+		s.pageCancel = nil
+	}
+
 	if s.conn == nil {
 		return
 	}
@@ -273,8 +277,47 @@ func (s *Stream) nextPage() error {
 		return fmt.Errorf("%w: bytes beyond response length", ErrProtocol)
 	}
 
-	if s.conn != nil && s.responseClose {
-		s.release(false)
+	if s.conn != nil && (s.responseClose || s.object.client.admission != nil || s.next != nil) {
+		s.release(!s.responseClose)
+	}
+
+	if s.next != nil {
+		next := s.next
+		s.next = nil
+
+		used, err := next.take(s)
+		if err != nil {
+			return err
+		}
+
+		if used {
+			s.startPrefetch()
+			return nil
+		}
+	}
+
+	if s.conn == nil {
+		permit, err := s.object.client.admission.acquire(s.ctx)
+		if err != nil {
+			return err
+		}
+
+		s.permit = permit
+	}
+
+	if err := s.preparePage(); err != nil {
+		return err
+	}
+
+	s.startPrefetch()
+
+	return nil
+}
+
+// preparePage uses the permit already owned by s, including speculative permits.
+func (s *Stream) preparePage() error {
+	if err := s.ctx.Err(); err != nil {
+		return err
 	}
 
 	if s.conn == nil {
@@ -286,9 +329,12 @@ func (s *Stream) nextPage() error {
 		s.conn = c
 		s.stopped = make(chan struct{})
 		done := s.stopped
+		permit := s.permit
 
 		s.stop = context.AfterFunc(s.ctx, func() {
 			_ = c.Close() //nolint:errcheck // Cancellation interrupts socket I/O.
+
+			permit.release()
 
 			close(done)
 		})
@@ -328,15 +374,7 @@ func (s *Stream) nextPage() error {
 }
 
 func (s *Stream) finish() error {
-	if s.digest != nil && !s.verified {
-		var sum [32]byte
-		if !bytes.Equal(s.digest.Sum(sum[:0]), s.expected[:]) {
-			return s.fail(ErrDigestMismatch)
-		}
-
-		s.verified = true
-	}
-
+	s.discardPrefetch()
 	s.release(!s.responseClose)
 
 	return io.EOF
@@ -348,6 +386,7 @@ func (s *Stream) fail(err error) error {
 	}
 
 	s.err = err
+	s.discardPrefetch()
 	s.release(false)
 
 	return err
@@ -389,9 +428,6 @@ func (s *Stream) read(p []byte) (int, error) {
 	s.offset += int64(n)
 
 	s.stats.BufferedBytes += int64(n)
-	if s.digest != nil {
-		_, _ = s.digest.Write(p[:n])
-	}
 
 	if err != nil && (err != io.EOF || s.offset != s.pageEnd) {
 		if err == io.EOF {
@@ -410,6 +446,14 @@ func (s *Stream) read(p []byte) (int, error) {
 		return n, err
 	}
 
+	if s.offset == s.pageEnd && s.object.client.admission != nil {
+		if s.conn.reader.Buffered() != 0 {
+			return n, s.fail(fmt.Errorf("%w: bytes beyond response length", ErrProtocol))
+		}
+
+		s.release(!s.responseClose)
+	}
+
 	return n, nil
 }
 
@@ -421,6 +465,7 @@ func (s *Stream) Close() error {
 	defer s.mu.Unlock()
 
 	s.closed = true
+	s.discardPrefetch()
 	s.release(false)
 
 	return nil

@@ -364,7 +364,7 @@ func TestRacerDisconnectCancelsLaterPage(t *testing.T) {
 
 	select {
 	case result := <-stats:
-		if result.SpliceBytes == 0 || result.TeeCalls != 0 || result.TeeBytes != 0 {
+		if result.SpliceBytes == 0 {
 			t.Fatal("lost splice forwarding without verification", result)
 		}
 	case <-time.After(time.Second):

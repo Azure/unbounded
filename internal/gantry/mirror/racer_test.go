@@ -244,11 +244,11 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 	}
 
 	first := <-results
-	if first.err != nil || first.partial || first.stats.SpliceCalls == 0 || first.stats.SpliceBytes < 1<<20 || first.stats.TeeCalls != 0 || first.stats.TeeBytes != 0 || first.stats.SpliceBytes+first.stats.BufferedBytes != int64(len(data)) {
+	if first.err != nil || first.partial || first.stats.SpliceCalls == 0 || first.stats.SpliceBytes < 1<<20 || first.stats.SpliceBytes+first.stats.BufferedBytes != int64(len(data)) {
 		t.Fatalf("not actual forwarding without verification: %+v", first)
 	}
 
-	t.Logf("raw mirror splice: calls=%d bytes=%d tee_calls=%d tee_bytes=%d buffered_bytes=%d", first.stats.SpliceCalls, first.stats.SpliceBytes, first.stats.TeeCalls, first.stats.TeeBytes, first.stats.BufferedBytes)
+	t.Logf("raw mirror splice: calls=%d bytes=%d buffered_bytes=%d", first.stats.SpliceCalls, first.stats.SpliceBytes, first.stats.BufferedBytes)
 
 	resp, body, err = get("bytes=123-456")
 	if err != nil || resp.StatusCode != 206 || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes 123-456/%d", len(data)) || !bytes.Equal(body, data[123:457]) {
@@ -256,7 +256,7 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 	}
 
 	partial := <-results
-	if partial.err != nil || !partial.partial || partial.stats.TeeCalls != 0 || partial.stats.TeeBytes != 0 || completed.Load() != 1 {
+	if partial.err != nil || !partial.partial || completed.Load() != 1 {
 		t.Fatalf("partial misclassified: %+v", partial)
 	}
 
@@ -268,7 +268,7 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 	}
 
 	bad := <-results
-	if bad.err != nil || bad.partial || bad.stats.SpliceBytes < 1<<20 || bad.stats.TeeCalls != 0 || bad.stats.TeeBytes != 0 || bad.stats.SpliceBytes+bad.stats.BufferedBytes != int64(len(data)) {
+	if bad.err != nil || bad.partial || bad.stats.SpliceBytes < 1<<20 || bad.stats.SpliceBytes+bad.stats.BufferedBytes != int64(len(data)) {
 		t.Fatalf("corrupt payload was not forwarded without verification: %+v", bad)
 	}
 

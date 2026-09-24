@@ -304,6 +304,18 @@ Gantry's origin adapter serves local containerd content or bounded registry
 range reads. The origin never calls the Gantry mirror or Racer recursively.
 OCI target keys include registry, repository, object kind, and digest.
 
+The origin uses the SDK's request-scoped resolved-range capability. A remote
+GET resolves registry metadata once, then opens its bounded GET using that
+resolved reference, size, and request authorization. Ordinary resolution uses
+one HEAD; blob-to-manifest discovery can require a second HEAD, and authentication
+negotiation or redirects can add exchanges. Opening the GET does not repeat
+resolution. HEAD and conditional/range rejections remain metadata-only. Empty
+remote objects need no payload GET. If local content disappears or cannot be
+read as a seekable source after metadata resolution, registry fallback must match
+the resolved size and normalized content type before opening its GET. A mismatch
+returns 412. Resolved state is released at request completion and credentials
+are never cached across requests by this adapter.
+
 Basic/Bearer authorization travels with the request through the Racer SDK and
 authenticated peer transport to the node-local origin for upstream access.
 Credentials are not cache keys and are not persisted with content. All origin
@@ -326,8 +338,10 @@ not proof that those bytes match an OCI digest. Incorrect origin bytes can have
 a self-consistent CRC and be cached and forwarded. File-backed local cache hits
 are not rehashed on each foreground read; background scrubbing detects changes
 relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
-consumers must validate content themselves. The SDK's `StreamVerified` remains
-available for callers that supply an independent expected SHA-256 digest.
+and SDK consumers must validate content themselves against an independently
+trusted expected digest. The SDK no longer provides inline SHA-256 verification;
+see its [API migration note](https://github.com/Azure/unbounded/blob/main/pkg/racer/STREAMING.md#migration-inline-verification-removed).
+
 In Racer mode, Gantry's ordinary registry fallback also leaves OCI digest
 verification to containerd. It streams with bounded memory, checks the declared
 size when known, and aborts response framing on transport or size failures.

@@ -6,7 +6,6 @@ package racer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -282,7 +281,7 @@ func TestStreamSequentialPagesAndRanges(t *testing.T) {
 	}
 }
 
-func TestStreamVerifiedBuffered(t *testing.T) {
+func TestStreamBuffered(t *testing.T) {
 	store := &rangeTestStore{data: payload(100000)}
 	origin, _ := NewRangeOrigin(store)
 	c := newTestClient(t, origin, ClientOptions{})
@@ -292,29 +291,22 @@ func TestStreamVerifiedBuffered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, valid := range []bool{true, false} {
-		sum := sha256.Sum256(store.data)
-		if !valid {
-			sum[0] ^= 1
-		}
+	s, err := o.Stream(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		s, err := o.StreamVerified(t.Context(), sum)
-		if err != nil {
-			t.Fatal(err)
-		}
+	var out bytes.Buffer
 
-		var out bytes.Buffer
+	n, err := s.WriteTo(&out)
+	_ = s.Close()
 
-		n, err := s.WriteTo(&out)
-		_ = s.Close()
+	if err != nil || n != int64(len(store.data)) || !bytes.Equal(out.Bytes(), store.data) {
+		t.Fatal(n, err)
+	}
 
-		if valid && (err != nil || !bytes.Equal(out.Bytes(), store.data)) {
-			t.Fatal(err)
-		}
-
-		if !valid && (!errors.Is(err, ErrDigestMismatch) || n >= int64(len(store.data))) {
-			t.Fatal(n, err)
-		}
+	if stats := s.Stats(); stats.BufferedBytes != n || stats.SpliceBytes != 0 || stats.SpliceCalls != 0 {
+		t.Fatal(stats)
 	}
 }
 

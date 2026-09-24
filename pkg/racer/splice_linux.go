@@ -8,30 +8,130 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Adapted from the removed racer-object adapter. RawConn integrates EAGAIN with
-// Go's poller, so socket deadlines and cancellation interrupt blocked splices.
-type splicePipe struct{ fd [2]int }
+const (
+	splicePipeSize     = 1 << 20
+	maxIdleSplicePipes = 8
+)
+
+type splicePipe struct {
+	fd         [2]int
+	capacity   int
+	buffered   int64
+	generation uint64
+	cleanup    runtime.Cleanup
+}
 
 func newSplicePipe() (*splicePipe, error) {
+	return newSplicePipeWithFcntl(unix.FcntlInt)
+}
+
+func newSplicePipeWithFcntl(fcntl func(uintptr, int, int) (int, error)) (*splicePipe, error) {
 	p := &splicePipe{}
 	if err := unix.Pipe2(p.fd[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
 		return nil, err
 	}
 
+	// Enlargement is only an optimization: quotas and unprivileged limits may
+	// deny it. Always query the actual capacity, even when enlargement succeeds.
+	_, _ = fcntl(uintptr(p.fd[1]), unix.F_SETPIPE_SZ, splicePipeSize) //nolint:errcheck // Enlargement is best-effort; query the actual capacity below.
+
+	capacity, err := fcntl(uintptr(p.fd[1]), unix.F_GETPIPE_SZ, 0)
+	if err != nil || capacity <= 0 {
+		closeSpliceFDs(p.fd)
+
+		if err == nil {
+			err = unix.EINVAL
+		}
+
+		return nil, err
+	}
+
+	p.capacity = capacity
+	// Explicit release handles normal lifetimes. Cleanup also owns FDs if an
+	// entire client and its idle cache become unreachable without a close call.
+	p.cleanup = runtime.AddCleanup(p, closeSpliceFDs, p.fd)
+
 	return p, nil
 }
 
 func (p *splicePipe) close() {
-	_ = unix.Close(p.fd[0]) //nolint:errcheck // Cleanup must preserve the transfer error.
-	_ = unix.Close(p.fd[1]) //nolint:errcheck // Cleanup must preserve the transfer error.
+	p.cleanup.Stop()
+	closeSpliceFDs(p.fd)
+	runtime.KeepAlive(p)
 }
 
+func closeSpliceFDs(fd [2]int) {
+	_ = unix.Close(fd[0]) //nolint:errcheck // Cleanup must preserve the transfer error.
+	_ = unix.Close(fd[1]) //nolint:errcheck // Cleanup must preserve the transfer error.
+}
+
+// Only exclusively owned, successfully drained pipes enter this bounded cache.
+// A generation change prevents active transfers from undoing closeIdle.
+type splicePipePool struct {
+	mu         sync.Mutex
+	idle       []*splicePipe
+	generation uint64
+}
+
+func (pool *splicePipePool) get() (*splicePipe, error) {
+	pool.mu.Lock()
+	if n := len(pool.idle); n > 0 {
+		p := pool.idle[n-1]
+		pool.idle[n-1] = nil
+		pool.idle = pool.idle[:n-1]
+		pool.mu.Unlock()
+
+		return p, nil
+	}
+
+	generation := pool.generation
+	pool.mu.Unlock()
+
+	p, err := newSplicePipe()
+	if err == nil {
+		p.generation = generation
+	}
+
+	return p, err
+}
+
+func (pool *splicePipePool) put(p *splicePipe, reusable bool, limit int) {
+	pool.mu.Lock()
+
+	if !reusable || p.buffered != 0 || p.generation != pool.generation || len(pool.idle) >= min(limit, maxIdleSplicePipes) {
+		pool.mu.Unlock()
+		p.close()
+
+		return
+	}
+
+	pool.idle = append(pool.idle, p)
+	pool.mu.Unlock()
+}
+
+func (pool *splicePipePool) closeIdle() {
+	pool.mu.Lock()
+
+	pool.generation++
+	idle := pool.idle
+	pool.idle = nil
+	pool.mu.Unlock()
+
+	for _, p := range idle {
+		p.close()
+	}
+}
+
+// RawConn integrates EAGAIN with Go's poller, so socket deadlines and
+// cancellation interrupt blocked splices.
 func spliceReady(socket syscall.RawConn, write bool, pipe, count int, stats *TransferStats) (int64, error) {
 	var (
 		n     int64
@@ -108,20 +208,16 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 	}()
 
-	p, err := newSplicePipe()
-	if err != nil {
-		return 0, s.fail(err), true
-	}
-	defer p.close()
+	var p *splicePipe
 
-	var tee *splicePipe
-	if s.digest != nil {
-		tee, err = newSplicePipe()
-		if err != nil {
-			return 0, s.fail(err), true
+	reusable := false
+	pool := s.object.client.streamPool
+
+	defer func() {
+		if p != nil {
+			pool.pipes.put(p, reusable && s.ctx.Err() == nil, pool.limit)
 		}
-		defer tee.close()
-	}
+	}()
 
 	buf := copyBuffers.Get().(*[]byte) //nolint:errcheck // The private pool only contains *[]byte.
 	defer copyBuffers.Put(buf)
@@ -147,6 +243,8 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 				err = nil
 			}
 
+			reusable = err == nil
+
 			return total, err, true
 		}
 
@@ -155,17 +253,11 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		remaining := s.pageEnd - s.offset
-		if s.digest != nil {
-			remaining = min(remaining, s.end-s.offset-1)
-		}
 		// Drain only bytes the HTTP header reader already consumed. Do not
 		// read another buffer from the socket before switching to splice.
 		buffered := min(int64(s.conn.reader.Buffered()), remaining)
-		if buffered > 0 || remaining == 0 {
+		if buffered > 0 {
 			length := min(buffered, int64(len(*buf)))
-			if remaining == 0 {
-				length = 1
-			}
 
 			n, err := s.read((*buf)[:length])
 			if err != nil && err != io.EOF {
@@ -196,7 +288,16 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 			return total, s.fail(err), true
 		}
 
-		n, err := spliceReady(r, false, p.fd[1], int(min(remaining, 1<<20)), &s.stats)
+		if p == nil {
+			p, err = pool.pipes.get()
+			if err != nil {
+				return total, s.fail(err), true
+			}
+		}
+
+		n, err := spliceReady(r, false, p.fd[1], int(min(remaining, int64(p.capacity), splicePipeSize)), &s.stats)
+		p.buffered += n
+
 		if err != nil {
 			return total, s.fail(err), true
 		}
@@ -205,77 +306,20 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 			return total, s.fail(io.ErrUnexpectedEOF), true
 		}
 
-		for n > 0 {
-			ready := n
-			if tee != nil {
-				ready, err = s.teeHash(p, tee, int(n), *buf)
-				if err != nil {
-					return total, s.fail(err), true
-				}
+		for p.buffered > 0 {
+			written, err := spliceReady(raw, true, p.fd[0], int(p.buffered), &s.stats)
+			total += written
+			s.offset += written
+			s.stats.SpliceBytes += written
+			p.buffered -= written
+
+			if err != nil {
+				return total, s.fail(err), true
 			}
-			// Consume exactly the prefix duplicated by tee before teeing again.
-			// Repeating tee without this drain would hash the same bytes twice.
-			for ready > 0 {
-				written, err := spliceReady(raw, true, p.fd[0], int(ready), &s.stats)
-				total += written
-				s.offset += written
-				s.stats.SpliceBytes += written
-				n -= written
-				ready -= written
 
-				if err != nil {
-					return total, s.fail(err), true
-				}
-
-				if written == 0 {
-					return total, s.fail(io.ErrNoProgress), true
-				}
+			if written == 0 {
+				return total, s.fail(io.ErrNoProgress), true
 			}
 		}
 	}
-}
-
-func (s *Stream) teeHash(src, dst *splicePipe, count int, buf []byte) (int64, error) {
-	var (
-		n   int64
-		err error
-	)
-
-	for {
-		s.stats.TeeCalls++
-
-		n, err = unix.Tee(src.fd[0], dst.fd[1], count, unix.SPLICE_F_NONBLOCK)
-		if !errors.Is(err, unix.EINTR) {
-			break
-		}
-	}
-
-	if err != nil {
-		return 0, err
-	}
-
-	if n == 0 {
-		return 0, io.ErrNoProgress
-	}
-
-	s.stats.TeeBytes += n
-	for left := n; left > 0; {
-		read, err := unix.Read(dst.fd[0], buf[:min(left, int64(len(buf)))])
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-
-		if err != nil {
-			return 0, err
-		}
-
-		if read == 0 {
-			return 0, io.ErrUnexpectedEOF
-		}
-
-		_, _ = s.digest.Write(buf[:read])
-		left -= int64(read)
-	}
-
-	return n, nil
 }

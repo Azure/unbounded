@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -54,9 +53,6 @@ func TestRacerStreamMetricsForwardingOutcomes(t *testing.T) {
 		{name: "truncated full response", err: io.ErrUnexpectedEOF, outcome: "aborted"},
 		{name: "truncated range response", partial: true, err: io.ErrUnexpectedEOF, outcome: "aborted"},
 		{name: "canceled response", err: context.Canceled, outcome: "aborted"},
-		// Stream does not verify digests. Even an injected SDK verification
-		// error must not create a Gantry digest-verification outcome.
-		{name: "injected verification error", err: fmt.Errorf("injected: %w", sdk.ErrDigestMismatch), outcome: "aborted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := metrics.New()

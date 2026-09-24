@@ -222,7 +222,7 @@ func TestOriginDataRegistryCredentials(t *testing.T) {
 				t.Fatalf("status %d, want %d", w.Code, tc.status)
 			}
 
-			if tc.status == 200 && (registry.heads != 2 || registry.opens != 1 || w.Body.String() != "payload") {
+			if tc.status == 200 && (registry.heads != 1 || registry.opens != 1 || w.Body.String() != "payload") {
 				t.Fatal("registry range request not delivered")
 			}
 

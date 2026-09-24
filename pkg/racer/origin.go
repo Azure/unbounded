@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,7 +62,36 @@ type RangeStore interface {
 	OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error)
 }
 
+// ResolvedRangeStore is an optional RangeStore capability used by NewRangeOrigin
+// instead of Stat and OpenRange. ResolveRange resolves metadata without opening
+// payloads and returns a non-nil, request-scoped handle. Calls must be safe for
+// concurrent use and honor ctx. Errors follow Store's HTTP mapping; the store retains
+// ownership of any handle returned with an error.
+// Unlike Store methods, ResolveRange may retain originData in the returned handle
+// until Close, but must not mutate, log, persist, or share it across requests.
+type ResolvedRangeStore interface {
+	ResolveRange(ctx context.Context, target string, originData []byte) (ResolvedRange, error)
+}
+
+// ResolvedRange binds metadata and a subsequent payload open to one immutable
+// representation, with the same ETag identity rules as Store. Metadata must stay
+// constant. OpenRange must atomically pin that representation or return
+// ErrVersionChanged, honor ctx, and return exactly length bytes. Origin calls it
+// once per accepted GET (including length zero), after preconditions and ranges,
+// never for HEAD. It must return a non-nil body on success; ownership of a body
+// returned with an error stays with the handle.
+// Origin closes a successful body exactly once, then closes the handle exactly
+// once on every path, including rejected requests and aborted responses. Close
+// releases request state, including originData, even if no body was opened.
+// Handle methods are called serially and need not support concurrent use.
+type ResolvedRange interface {
+	Metadata() Metadata
+	OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error)
+	io.Closer
+}
+
 // NewRangeOrigin binds the protocol to a sequential, range-oriented backend.
+// If store implements ResolvedRangeStore, each request uses its resolved handle.
 func NewRangeOrigin(store RangeStore) (*Origin, error) {
 	if store == nil {
 		return nil, fmt.Errorf("racer: nil range store")
@@ -115,11 +145,23 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		m   Metadata
-		err error
+		m        Metadata
+		err      error
+		resolved ResolvedRange
 	)
 
-	if o.ranges != nil {
+	if store, ok := o.ranges.(ResolvedRangeStore); ok {
+		resolved, err = store.ResolveRange(r.Context(), target, originData)
+		if err == nil {
+			if resolved == nil {
+				emptyResponse(w, http.StatusInternalServerError)
+				return
+			}
+			defer resolved.Close() //nolint:errcheck // Release request state on every response path.
+
+			m = resolved.Metadata()
+		}
+	} else if o.ranges != nil {
 		m, err = o.ranges.Stat(r.Context(), target, originData)
 	} else {
 		m, err = o.store.Stat(r.Context(), target, originData)
@@ -154,7 +196,13 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	source, err := o.openRange(r.Context(), target, m.ETag, start, length, originData)
+	var source io.ReadCloser
+	if resolved != nil {
+		source, err = resolved.OpenRange(r.Context(), start, length)
+	} else {
+		source, err = o.openRange(r.Context(), target, m.ETag, start, length, m.Size, originData)
+	}
+
 	if err != nil {
 		storeError(w, err)
 		return
@@ -166,6 +214,16 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer source.Close() //nolint:errcheck // Release the snapshot after the response has been sent or aborted.
 
+	reader, err := originFileReader(r.Context(), source, length)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+
+	if _, ok := source.(PinnedFileRange); ok {
+		defer cancelOriginWrite(r.Context(), w)()
+	}
+
 	if status == http.StatusPartialContent {
 		w.Header().Set("Content-Range", contentRange(start, start+length-1, m.Size))
 	}
@@ -176,8 +234,8 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := copyBuffers.Get().(*[]byte) //nolint:errcheck // The private pool only contains *[]byte.
 	defer copyBuffers.Put(buf)
 
-	n, err := io.CopyBuffer(w, io.LimitReader(source, length), *buf)
-	if err != nil || n != length {
+	n, err := io.CopyBuffer(w, reader, *buf)
+	if err != nil || n != length || r.Context().Err() != nil {
 		// Abort instead of letting net/http finish a successful but short response.
 		panic(http.ErrAbortHandler)
 	}
@@ -188,7 +246,7 @@ type sourceRange struct {
 	io.Closer
 }
 
-func (o *Origin) openRange(ctx context.Context, target, etag string, start, length int64, originData []byte) (io.ReadCloser, error) {
+func (o *Origin) openRange(ctx context.Context, target, etag string, start, length, objectSize int64, originData []byte) (io.ReadCloser, error) {
 	if o.ranges != nil {
 		return o.ranges.OpenRange(ctx, target, etag, start, length, originData)
 	}
@@ -198,7 +256,18 @@ func (o *Origin) openRange(ctx context.Context, target, etag string, start, leng
 		return nil, err
 	}
 
-	return sourceRange{io.NewSectionReader(contextReaderAt{ctx, source}, start, length), source}, nil
+	r := sourceRange{io.NewSectionReader(contextReaderAt{ctx, source}, start, length), source}
+	if pin, ok := source.(PinnedFileRange); ok {
+		file, offset, size := pin.FileRange()
+		if offset < 0 || size != objectSize || start > size || length > size-start || offset > math.MaxInt64-size {
+			// Preserve ownership through the normal successful-source cleanup path.
+			return pinnedSourceRange{sourceRange: r, length: -1}, nil
+		}
+
+		return pinnedSourceRange{r, file, offset + start, length}, nil
+	}
+
+	return r, nil
 }
 
 type contextReaderAt struct {
