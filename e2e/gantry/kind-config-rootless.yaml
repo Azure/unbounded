@@ -1,0 +1,16 @@
+# Reduced local topology for rootless Podman.
+#
+# Rootless node containers share the host user's inotify-instance quota. The
+# eight-node Docker CI topology can exhaust the common default of 128 instances
+# before the control-plane CRI plugin starts. One control-plane and one worker
+# retain the cross-node peer contract while keeping local resource use bounded.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: gantry-e2e
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+nodes:
+  - role: control-plane
+  - role: worker

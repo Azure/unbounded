@@ -341,15 +341,12 @@ provider cannot be satisfied until ACR recovers or another provider appears.
 
 ### Gantry restarts
 
-An active OverlayBD device must not stall indefinitely because its node-local
-Gantry endpoint is temporarily unavailable. Production deployment requires a
-fail-open path that retries the already-resolved range against origin and
-returns to Gantry after recovery.
-
-The preferred implementation is in OverlayBD because Gantry cannot provide
-fallback while Gantry itself is unavailable. An independently available
-node-local endpoint is an alternative, but adds another component and ownership
-boundary.
+An active OverlayBD device depends on its node-local Gantry endpoint while P2P
+configuration is enabled. This integration does not change OverlayBD to add a
+second fail-open path. Production rollout therefore keeps the Gantry DaemonSet
+available, uses its readiness and drain behavior for controlled replacement,
+and drains active streaming workloads before disabling the OverlayBD P2P
+configuration or removing the Gantry endpoint.
 
 ## Deployment model
 
@@ -378,7 +375,8 @@ The node must also:
 - enable containerd's remote snapshot annotations.
 
 AKS Artifact Streaming node pools already provide most of this stack. For
-Unbounded-managed nodes, the Unbounded agent must provision and manage it.
+nodes without that AKS-provided stack, provisioning and managing OverlayBD is
+out of scope for this integration.
 
 No containerd or OverlayBD snapshotter algorithm change is currently expected.
 The existing remote snapshot contracts provide the required image reference,

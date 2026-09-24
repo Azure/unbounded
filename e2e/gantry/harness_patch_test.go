@@ -31,6 +31,32 @@ func TestResolveContainerEngine(t *testing.T) {
 	}
 }
 
+func TestResolveKindConfig(t *testing.T) {
+	const root = "/repo"
+
+	t.Setenv("GANTRY_E2E_KIND_CONFIG", "")
+
+	if got := resolveKindConfig(root, "docker"); got != "/repo/e2e/gantry/kind-config.yaml" {
+		t.Fatalf("docker kind config = %q", got)
+	}
+
+	if got := resolveKindConfig(root, "podman"); got != "/repo/e2e/gantry/kind-config-rootless.yaml" {
+		t.Fatalf("podman kind config = %q", got)
+	}
+
+	t.Setenv("GANTRY_E2E_KIND_CONFIG", "custom/kind.yaml")
+
+	if got := resolveKindConfig(root, "podman"); got != "/repo/custom/kind.yaml" {
+		t.Fatalf("relative override = %q", got)
+	}
+
+	t.Setenv("GANTRY_E2E_KIND_CONFIG", "/tmp/kind.yaml")
+
+	if got := resolveKindConfig(root, "docker"); got != "/tmp/kind.yaml" {
+		t.Fatalf("absolute override = %q", got)
+	}
+}
+
 // TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:
@@ -227,5 +253,43 @@ func TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "anchor not found") {
 		t.Errorf("error message = %q, want it to mention 'anchor not found' so the operator knows to update configMapUpstreamRegistriesAnchor", err.Error())
+	}
+}
+
+func TestPatchConfigMapForArtifactStreamingE2E(t *testing.T) {
+	repoRoot := repoRoot(t)
+	manifests := renderGantryChart(t, repoRoot)
+
+	raw, err := os.ReadFile(filepath.Join(manifests, "configmap.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := patchConfigMapForE2E(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patched, err := patchConfigMapForArtifactStreamingE2E(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(patched, "    artifact_streaming_enabled: true") {
+		t.Fatal("artifact streaming was not enabled")
+	}
+
+	if !strings.Contains(patched, "      - "+streamingOriginHost) {
+		t.Fatalf("artifact streaming allowed hosts do not include %s", streamingOriginHost)
+	}
+
+	if !strings.Contains(patched, `    advertise_reconcile_interval: "2s"`) {
+		t.Fatal("artifact streaming E2E does not shorten advertiser reconciliation")
+	}
+}
+
+func TestPatchConfigMapForArtifactStreamingE2EFailsWithoutAnchors(t *testing.T) {
+	if _, err := patchConfigMapForArtifactStreamingE2E("data: {}"); err == nil {
+		t.Fatal("patchConfigMapForArtifactStreamingE2E succeeded without config anchors")
 	}
 }

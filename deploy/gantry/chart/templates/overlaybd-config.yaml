@@ -1,0 +1,79 @@
+{{- if or .Values.overlaybdConfig.enabled .Values.overlaybdConfig.renderOnly }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-overlaybd-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: overlaybd-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+      app.kubernetes.io/component: overlaybd-config
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "gantry.labels" . | nindent 8 }}
+        app.kubernetes.io/component: overlaybd-config
+      annotations:
+        gantry.unbounded-cloud.io/overlaybd-address: {{ .Values.overlaybdConfig.address | quote }}
+        gantry.unbounded-cloud.io/overlaybd-log-level: {{ .Values.overlaybdConfig.logLevel | quote }}
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: gantry-low
+      nodeSelector:
+        {{- toYaml .Values.overlaybdConfig.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.overlaybdConfig.tolerations | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: configure
+          image: {{ include "gantry.overlaybdConfigImage" . }}
+          imagePullPolicy: {{ .Values.overlaybdConfig.image.pullPolicy }}
+          env:
+            - name: OVERLAYBD_P2P_ADDRESS
+              value: {{ .Values.overlaybdConfig.address | quote }}
+            - name: OVERLAYBD_LOG_LEVEL
+              value: {{ .Values.overlaybdConfig.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources.overlaybdConfig | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/usr/local/bin/configure-overlaybd.sh", "restore"]
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/run/gantry-overlaybd/configured"]
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+            - name: run
+              mountPath: /run/gantry-overlaybd
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: run
+          emptyDir: {}
+{{- end }}

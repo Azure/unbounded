@@ -12,6 +12,13 @@ data:
     {{- else }}
     mirror_listen: "0.0.0.0:5000"
     mirror_bind_allow_non_loopback: true
+    artifact_streaming_enabled: {{ .Values.gantry.artifactStreaming.enabled }}
+    artifact_streaming_allowed_host_suffixes:
+      {{- toYaml .Values.gantry.artifactStreaming.allowedHostSuffixes | nindent 6 }}
+    artifact_streaming_peer_lookup_timeout: {{ .Values.gantry.artifactStreaming.peerLookupTimeout | quote }}
+    artifact_streaming_max_peer_attempts: {{ .Values.gantry.artifactStreaming.maxPeerAttempts }}
+    artifact_streaming_max_concurrent_origin_reads: {{ .Values.gantry.artifactStreaming.maxConcurrentOriginReads }}
+    artifact_streaming_origin_response_header_timeout: {{ .Values.gantry.artifactStreaming.originResponseHeaderTimeout | quote }}
     transfer_listen: "0.0.0.0:5001"
     chair_listen: "0.0.0.0:5002"
     metrics_listen: "0.0.0.0:9095"
