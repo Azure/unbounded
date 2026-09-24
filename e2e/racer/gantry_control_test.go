@@ -20,11 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,6 +222,51 @@ func TestGantryControlFixture(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("unchanged cursor must hold until cancellation: %v", err)
 		}
+
+		if i == 1 {
+			// Keep a real authenticated long poll outstanding across the bump.
+			// Whether publication wins the race with handler entry or not, the
+			// captured snapshot/channel pair must deliver the new revision.
+			r, err := http.NewRequestWithContext(t.Context(), "GET", controlURL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r.Header.Set("X-Racer-Boot", boot)
+			r.Header.Set("X-Racer-Cursor", desired.Cursor)
+
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				resp, err := nodeClient.Do(r)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer resp.Body.Close()
+
+				data, err := io.ReadAll(resp.Body)
+
+				var next pb.DesiredState
+				if err != nil || resp.StatusCode != 200 || proto.Unmarshal(data, &next) != nil {
+					t.Errorf("updated desired state: status=%d err=%v", resp.StatusCode, err)
+					return
+				}
+
+				raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(next.Configuration.GetSnapshot())
+
+				digest := sha256.Sum256(raw)
+				if next.Revision != 2 || next.Configuration.GetSnapshot().Volumes[0].CacheGeneration != 2 || next.Cursor == desired.Cursor || next.Cursor != hex.EncodeToString(digest[:]) || !bytes.Equal(next.SnapshotDigest, digest[:]) {
+					t.Error("generation bump did not bind a new revision and snapshot digest")
+				}
+			})
+			time.Sleep(25 * time.Millisecond)
+
+			if revision, err := f.advanceCacheGeneration("gantry"); err != nil || revision != 2 {
+				t.Fatalf("advance generation: revision=%d err=%v", revision, err)
+			}
+
+			wg.Wait()
+		}
 	}
 
 	for _, name := range []string{"untrusted-root", "wrong-server-name"} {
@@ -239,4 +288,216 @@ func TestGantryControlFixture(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGantryRecoveryFixture(t *testing.T) {
+	t.Run("atomic-generation-publication", func(t *testing.T) {
+		configs := map[string]*pb.Configuration{}
+		for i := range 2 {
+			configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: &pb.Snapshot{Revision: 7, Volumes: []*pb.Volume{{Id: "gantry", CacheGeneration: 3}, {Id: "other", CacheGeneration: 5}, {Id: "untouched", CacheGeneration: 9}}}}}
+		}
+
+		f := &gantryFixture{controlState: &gantryControl{configs: configs, changed: make(chan struct{})}}
+
+		old := f.controlState.changed
+		for _, ids := range [][]string{nil, {"missing"}, {"gantry", "missing"}, {"gantry", "gantry"}} {
+			if _, err := f.advanceCacheGeneration(ids...); err == nil {
+				t.Fatalf("accepted invalid selection %v", ids)
+			}
+		}
+
+		select {
+		case <-old:
+			t.Fatal("invalid update woke watchers")
+		default:
+		}
+
+		if revision, err := f.advanceCacheGeneration("gantry", "other"); err != nil || revision != 8 {
+			t.Fatalf("advance: revision=%d err=%v", revision, err)
+		}
+
+		select {
+		case <-old:
+		default:
+			t.Fatal("publication did not wake watchers")
+		}
+
+		for node, original := range configs {
+			s := f.controlState.configs[node].GetSnapshot()
+			if original.GetSnapshot().Revision != 7 || original.GetSnapshot().Volumes[0].CacheGeneration != 3 || s.Revision != 8 || s.Volumes[0].CacheGeneration != 4 || s.Volumes[1].CacheGeneration != 6 || s.Volumes[2].CacheGeneration != 9 {
+				t.Fatal("publication mutated old snapshots or wrong volumes")
+			}
+		}
+
+		if revision, err := f.advanceCacheGeneration("gantry"); err != nil || revision != 9 {
+			t.Fatalf("second advance: revision=%d err=%v", revision, err)
+		}
+	})
+
+	t.Run("reject-partial-and-exhausted-updates", func(t *testing.T) {
+		for _, tc := range []struct {
+			name                 string
+			revision, generation uint64
+			volume               string
+		}{
+			{"missing-on-one-node", 1, 1, "other"},
+			{"generation-overflow", 1, math.MaxInt64, "gantry"},
+			{"revision-overflow", math.MaxUint64, 1, "gantry"},
+			{"inconsistent-revision", 2, 1, "gantry"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				configs := map[string]*pb.Configuration{}
+
+				for i := range 2 {
+					s := &pb.Snapshot{Revision: 1, Volumes: []*pb.Volume{{Id: "gantry", CacheGeneration: 1}}}
+					if i == 1 {
+						s.Revision, s.Volumes[0].Id, s.Volumes[0].CacheGeneration = tc.revision, tc.volume, tc.generation
+					}
+
+					configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: s}}
+				}
+
+				f := &gantryFixture{controlState: &gantryControl{configs: configs, changed: make(chan struct{})}}
+				if _, err := f.advanceCacheGeneration("gantry"); err == nil {
+					t.Fatal("accepted invalid update")
+				}
+
+				for node, original := range configs {
+					if f.controlState.configs[node] != original || configs[gantryNode(0)].GetSnapshot().Revision != 1 {
+						t.Fatal("failed update partially published")
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("activation-not-offer", func(t *testing.T) {
+		var secondActive atomic.Bool
+
+		f := &gantryFixture{client: &http.Client{}, controlState: &gantryControl{configs: map[string]*pb.Configuration{"a": nil, "b": nil}}}
+
+		for i := range 2 {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/status" {
+					t.Errorf("activation queried %s", r.URL.Path)
+				}
+
+				active, state, workers := 1, "preparing", 1
+				if i == 0 || secondActive.Load() {
+					active, state, workers = 2, "applied", 2
+				}
+
+				_ = json.NewEncoder(w).Encode(map[string]any{"activeRevision": active, "candidateRevision": 2, "ready": true, "localState": state, "workers": 2, "activatedWorkers": workers})
+			}))
+			t.Cleanup(server.Close)
+			f.racerMetrics = append(f.racerMetrics, strings.TrimPrefix(server.URL, "http://"))
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		err := f.waitCacheRevision(ctx, 2)
+
+		cancel()
+
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), f.racerMetrics[1]) {
+			t.Fatalf("must wait for every active node with diagnostics: %v", err)
+		}
+
+		secondActive.Store(true)
+
+		if err := f.waitCacheRevision(t.Context(), 2); err != nil {
+			t.Fatal(err)
+		}
+
+		f.racerMetrics = f.racerMetrics[:1]
+		if err := f.waitCacheRevision(t.Context(), 2); err == nil {
+			t.Fatal("accepted missing dataplane status endpoint")
+		}
+	})
+
+	t.Run("origin-repair-and-counts", func(t *testing.T) {
+		data := []byte("good bytes")
+		path := gantryPath("public", "blobs", data)
+		objects := map[string]gantryObject{path: {data: data, corrupt: true}}
+		f := &gantryFixture{objects: cloneGantryObjects(objects)}
+		get := func() []byte {
+			w := httptest.NewRecorder()
+			f.registry(0, w, httptest.NewRequest("GET", path, nil))
+
+			return w.Body.Bytes()
+		}
+
+		corrupt := get()
+		if bytes.Equal(corrupt, data) || len(corrupt) != len(data) {
+			t.Fatal("fixture did not corrupt same-length bytes")
+		}
+
+		if err := f.setOriginObject("missing", gantryObject{}); err == nil {
+			t.Fatal("repair accepted unknown path")
+		}
+
+		if err := f.setOriginObject(path, gantryObject{data: data}); err != nil {
+			t.Fatal(err)
+		}
+
+		data[0] ^= 1 // Caller mutation cannot change published bytes.
+
+		if !bytes.Equal(get(), []byte("good bytes")) {
+			t.Fatal("repair did not publish owned good bytes")
+		}
+
+		var wg sync.WaitGroup
+		for range 20 {
+			wg.Go(func() {
+				if err := f.setOriginObject(path, gantryObject{data: []byte("good bytes")}); err != nil {
+					t.Error(err)
+				}
+
+				if !bytes.Equal(get(), []byte("good bytes")) {
+					t.Error("concurrent repair returned inconsistent bytes")
+				}
+
+				_ = f.originRequestCount("GET", path)
+			})
+		}
+
+		wg.Wait()
+		f.registry(1, httptest.NewRecorder(), httptest.NewRequest("HEAD", path, nil))
+		f.offline.Store(true)
+		get()
+
+		if f.originRequestCount("GET", path) != 23 || f.originRequestCount("HEAD", path) != 1 || f.originRequestCount("", "") != 24 || f.originRequestCount("GET", "missing") != 0 {
+			t.Fatal("incorrect origin request counts")
+		}
+	})
+
+	t.Run("activation-status-validation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			field string
+			value any
+		}{
+			{"old-active", "activeRevision", 1},
+			{"superseded", "candidateRevision", 3},
+			{"not-ready", "ready", false},
+			{"rejected", "rejected", true},
+			{"committing", "localState", "committing"},
+			{"partial-workers", "activatedWorkers", 1},
+			{"no-workers", "workers", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				status := map[string]any{"activeRevision": 2, "candidateRevision": 2, "ready": true, "rejected": false, "localState": "applied", "workers": 2, "activatedWorkers": 2}
+				status[tc.field] = tc.value
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					_ = json.NewEncoder(w).Encode(status)
+				}))
+				defer server.Close()
+
+				f := &gantryFixture{client: server.Client()}
+				if err := f.cacheRevisionStatus(t.Context(), strings.TrimPrefix(server.URL, "http://"), 2); err == nil {
+					t.Fatal("accepted incomplete activation")
+				}
+			})
+		}
+	})
 }

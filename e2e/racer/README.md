@@ -13,7 +13,8 @@ The build target builds `bin/gantry` and `bin/racer-loadgen`, builds the real
 Rust `racer-dataplane` with `cargo build --locked` (debug profile), and warms the Go e2e build cache.
 The test target uses those binaries and runs `TestGantryRacerStriped`,
 `TestGantryRacerAuthorization`, `TestGantryRacerRecovery`,
-`TestGantryRacerCorruption`, and `TestGantryRacerContainerImage` separately, each
+`TestGantryRacerCorruption`, `TestGantryRacerContainerImage`, and
+`TestGantryRacerGeneration` separately, each
 with an external 60-second hard
 deadline and `go test -timeout 50s -count 1 -v`. Builds are outside those
 deadlines. Rerun the build target after changing binary or test sources.
@@ -25,6 +26,70 @@ verified splice bytes, and zero Gantry fallback. `Striped` independently verifie
 multi-node page distribution and peer transport. See the
 [loadgen guide](../../cmd/racer-loadgen/README.md#container-image-mode) and
 [cluster example](examples/container-image-loadgen.yaml) for benchmarks.
+
+### Explicit generation recovery fixture
+
+`TestGantryRacerGeneration` exercises three real dataplanes: warm corrupt origin
+bytes, repair the origin at the same digest URL, prove warm old-generation reads
+still return the old bytes, increment the cache generation, await activation on
+every dataplane, then verify repaired bytes and offline warm reuse with zero
+Gantry fallback. It uses HTTP reads rather than a containerd corruption campaign.
+
+The native `gantryFixture` helpers for follow-on tests are:
+
+```go
+// Publish owned bytes atomically at an existing path, retaining the digest URL.
+err := f.setOriginObject(path, gantryObject{
+    data: goodBytes, mediaType: "application/octet-stream", corrupt: false,
+})
+// Check err before continuing. In-flight origin requests retain their old bytes.
+before := f.originRequestCount("GET", path)
+
+// Increment each named existing volume once across all nodes, then block until
+// every real dataplane has activated the resulting configuration revision.
+revision := f.bumpCacheGeneration("gantry")
+```
+
+For tests that need to separate publication from activation, use
+`revision, err := f.advanceCacheGeneration("gantry")`, check the error, then call
+`f.awaitCacheRevision(revision)`. The returned value is a **configuration
+revision**, not a cache generation. Multiple volume IDs are supported; invalid
+selections fail without publishing any node's update. Wait for each bump before
+issuing another. Publication wakes authenticated control long polls and assigns
+new snapshot digests/cursors without mutating previously offered snapshots.
+
+Activation checks each dataplane's `/status`: exact `activeRevision` and
+`candidateRevision`, `localState: applied`, all workers activated, `ready: true`,
+and no rejection. A desired-state offer, cursor, or `/readyz` alone is not an
+activation barrier. `waitCacheRevision(ctx, revision) error` provides a
+caller-controlled deadline; the assertion wrapper has a ten-second deadline
+and reports the last failing node/status.
+
+`originRequestCount(method, path)` counts attempts across all fixture origins,
+including offline failures. An empty method or path is a wildcard. Use GET counts
+for payload refetch assertions, keeping HEAD authorization/metadata traffic
+separate. Origin replacement and count inspection are safe during concurrent
+requests; replacement copies the caller's byte slice.
+
+In a real cluster, the equivalent operator action is an explicit patch of the
+existing P2PCache, for example when its current generation is 1:
+
+```sh
+kubectl patch p2pcache gantry --type=json -p='[{"op":"test","path":"/spec/cacheGeneration","value":1},{"op":"replace","path":"/spec/cacheGeneration","value":2}]'
+```
+
+Use the actual current and next values. Repair the origin before advancing the
+generation, and wait for every serving dataplane to activate the resulting
+configuration. Generation recovery is explicit; there is no automatic corruption
+feedback or new invalidation protocol.
+
+For a containerd recovery test, close the failed response and use a fresh ingest
+reference, or explicitly abort the failed reference in the same containerd
+namespace before retrying. `content.WriteBlob` closes its writer but does not
+abort a failed ingest; a reused reference can resume its old offset and bytes.
+Assert that the expected digest is absent after failure and present with verified
+bytes after recovery. Drain/finish pre-bump requests before asserting post-bump
+reads: activation does not retroactively change an already-started stream.
 
 ### Prerequisites
 

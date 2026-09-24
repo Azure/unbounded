@@ -197,6 +197,7 @@ type (
 		racerEnvs                      [][]string
 		client                         *http.Client
 		containerd                     *containerd.Client
+		controlState                   *gantryControl
 	}
 )
 
@@ -243,7 +244,7 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 		t.Fatalf("loopback: %v %s", err, out)
 	}
 
-	f := &gantryFixture{t: t, dir: dir, objects: objects, client: &http.Client{Timeout: 15 * time.Second}}
+	f := &gantryFixture{t: t, dir: dir, objects: cloneGantryObjects(objects), client: &http.Client{Timeout: 15 * time.Second}}
 	t.Cleanup(f.client.CloseIdleConnections)
 
 	cdConfig := filepath.Join(dir, "containerd.toml")
@@ -350,6 +351,8 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 			return r.StatusCode == 200
 		})
 	}
+
+	f.awaitCacheRevision(1)
 
 	return f
 }
@@ -461,6 +464,8 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: s}}
 	}
 
+	f.controlState = &gantryControl{configs: configs, changed: make(chan struct{})}
+
 	authenticatedNode := func(r *http.Request) string {
 		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates[0].URIs) != 1 {
 			return ""
@@ -500,19 +505,35 @@ func (f *gantryFixture) control(nodes int) [][]string {
 			return
 		}
 
-		c := configs[node]
-		s := c.GetSnapshot()
-		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(s)
-		sum := sha256.Sum256(raw)
+		deadline := time.NewTimer(28 * time.Second)
+		defer deadline.Stop()
 
-		cursor := hex.EncodeToString(sum[:])
-		if r.Header.Get("X-Racer-Cursor") == cursor {
-			deadline := time.NewTimer(28 * time.Second)
-			defer deadline.Stop()
+		for {
+			// Published configurations are immutable. Capture the wakeup channel
+			// with the snapshot so a concurrent bump cannot be lost.
+			f.controlState.mu.Lock()
+			c, changed := f.controlState.configs[node], f.controlState.changed
+			f.controlState.mu.Unlock()
+
+			s := c.GetSnapshot()
+			raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(s)
+			sum := sha256.Sum256(raw)
+			cursor := hex.EncodeToString(sum[:])
+
+			if r.Header.Get("X-Racer-Cursor") != cursor {
+				body, _ := proto.Marshal(&pb.DesiredState{Universe: s.Universe, Node: s.Node, Incarnation: boot, SnapshotDigest: sum[:], Revision: s.Revision, Configuration: c, Profile: 1, PodUid: fmt.Sprintf("pod%d", int(s.Node[0])-2), Cursor: cursor})
+
+				w.Header().Set("Content-Type", "application/x-protobuf")
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				_, _ = w.Write(body)
+
+				return
+			}
 
 			select {
 			case <-r.Context().Done():
 				return
+			case <-changed:
 			case <-deadline.C:
 				w.Header().Set("Content-Length", "0")
 				w.WriteHeader(http.StatusNoContent)
@@ -520,12 +541,6 @@ func (f *gantryFixture) control(nodes int) [][]string {
 				return
 			}
 		}
-
-		body, _ := proto.Marshal(&pb.DesiredState{Universe: s.Universe, Node: s.Node, Incarnation: boot, SnapshotDigest: sum[:], Revision: s.Revision, Configuration: c, Profile: 1, PodUid: fmt.Sprintf("pod%d", int(s.Node[0])-2), Cursor: cursor})
-
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-		_, _ = w.Write(body)
 	})
 	mux.HandleFunc("POST /v1/enroll", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
@@ -601,6 +616,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 func (f *gantryFixture) registry(node int, w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.hits = append(f.hits, gantryHit{node: node, method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"), rangeValue: r.Header.Get("Range")})
+	obj, ok := f.objects[r.URL.Path]
 	f.mu.Unlock()
 
 	if f.offline.Load() {
@@ -621,7 +637,6 @@ func (f *gantryFixture) registry(node int, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	obj, ok := f.objects[r.URL.Path]
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -642,7 +657,7 @@ func (f *gantryFixture) registry(node int, w http.ResponseWriter, r *http.Reques
 	}
 
 	data := obj.data
-	if obj.corrupt {
+	if obj.corrupt && len(data) != 0 {
 		data = bytes.Clone(data)
 		data[len(data)/2] ^= 1
 	}
