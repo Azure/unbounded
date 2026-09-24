@@ -7,4 +7,8 @@ package racer
 
 import "io"
 
+type splicePipePool struct{}
+
+func (*splicePipePool) closeIdle() {}
+
 func (s *Stream) spliceTo(io.Writer) (int64, error, bool) { return 0, nil, false }

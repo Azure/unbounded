@@ -4,7 +4,8 @@
 
 Create one `Client` for the cache UDS. Derive a request-local view with
 `WithOriginData(value []byte) (*Client, error)`. Views share the HTTP and streaming
-connection pools and copy the input. Nil or empty input removes origin data.
+connection pools and Linux splice-pipe cache and copy the input. Nil or empty
+input removes origin data.
 Values can contain arbitrary bytes up to `MaxOriginDataBytes` (65,536 bytes).
 Neither client is mutated by deriving a view. HTTP transports use one
 `Racer-Origin-Data` header containing canonical padded standard base64; RDMA
@@ -40,7 +41,14 @@ truncated. Origin data is never included in SDK error text.
 
 Streams fetch aligned 64 MiB pages sequentially with `If-Match`. Payload scratch
 space is bounded independently of page/object size: a pooled 32 KiB buffer,
-8 KiB socket/header buffers, and, on Linux, one forwarding pipe.
+8 KiB socket/header buffers, and, on Linux, at most one forwarding pipe per
+active socket `WriteTo`. A pipe is acquired lazily after the buffered prefix;
+empty and entirely buffered transfers create no pipe and issue no pipe syscalls.
+New pipes request 1 MiB with best-effort `F_SETPIPE_SZ`, then use `F_GETPIPE_SZ`
+to discover their actual capacity. Denied enlargement retains the default
+capacity; a failed capacity query closes both FDs and fails the transfer.
+Each socket-to-pipe batch is bounded by the remaining page bytes, the actual
+capacity, and 1 MiB. The pipe is fully drained before the next batch.
 There are no per-page payload allocations. HTTP request/response metadata still
 allocates. Close every stream, including ones abandoned after Prepare.
 
@@ -114,6 +122,25 @@ write deadline to the present; close the downstream after failure. Arbitrary
 non-socket writers must provide their own cancellation for a blocked Write.
 Only fully consumed valid responses are pooled. Failed/abandoned responses are
 closed. Streams do not automatically retry stale idle sockets or version errors.
+
+Successful socket transfers return only drained pipes to an explicit shared
+cache holding at most `min(ClientOptions.Concurrency, 8)` pipes (zero concurrency
+selects 8). Each pipe owns two FDs and its kernel-reported capacity; the 1 MiB
+request is a target, not an assumption about host limits or granted capacity.
+Cached pipes contain no payload, though their capacity counts toward kernel pipe
+quotas. Active transfers are not limited by this cache or by `Concurrency`:
+with A active socket transfers and I idle pipes, pipe FDs are bounded by
+`2 * (A + I)`. Pipe kernel capacity is the sum of those pipes' actual capacities.
+Error, cancellation, abandonment, nonempty, and overflow paths close their pipes.
+Streams abandoned before `WriteTo` acquire no pipe; concurrent `Stream.Close`
+cancels a running `WriteTo`, whose cleanup closes its pipe before returning.
+
+Call `Client.CloseIdleConnections` on the base client or any origin-data view to
+release cached pipe FDs deterministically. Checked-out pipes keep working but
+are closed when returned rather than repopulating that cache generation. New
+transfers can acquire and cache pipes afterward; the client remains usable.
+Unreachable pipe owners also have runtime cleanup as a nondeterministic backstop,
+not a replacement for explicit idle cleanup. There is no `sync.Pool` of FDs.
 
 ## Range-oriented origins
 

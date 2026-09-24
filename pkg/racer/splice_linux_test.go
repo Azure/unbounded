@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func downstreamPair(t *testing.T, network string) (net.Conn, net.Conn) {
@@ -94,6 +96,21 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// Exercise exact forwarding and reuse with denied enlargement on a
+			// real pipe, independent of the host's configured default capacity.
+			pipe, err := newSplicePipeWithFcntl(func(fd uintptr, cmd, value int) (int, error) {
+				if cmd == unix.F_SETPIPE_SZ {
+					return 0, unix.EPERM
+				}
+
+				return unix.FcntlInt(fd, cmd, value)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			c.streamPool.pipes.put(pipe, true, c.workers)
+
 			var previous *streamConn
 
 			for range 2 {
@@ -122,6 +139,15 @@ func TestSpliceContentAndReuse(t *testing.T) {
 					t.Fatalf("not actual splice: %+v", stats)
 				}
 
+				if idle := c.streamPool.pipes.idle; len(idle) != 1 || idle[0] != pipe || pipe.buffered != 0 {
+					t.Fatal("drained pipe not reused")
+				}
+
+				var probe [1]byte
+				if _, err := unix.Read(pipe.fd[0], probe[:]); !errors.Is(err, unix.EAGAIN) {
+					t.Fatal("cached pipe contains payload", err)
+				}
+
 				c.streamPool.mu.Lock()
 				if len(c.streamPool.idle) != 1 {
 					t.Error("complete connection not pooled")
@@ -135,6 +161,9 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				}
 				c.streamPool.mu.Unlock()
 			}
+
+			c.CloseIdleConnections()
+			assertPipeClosed(t, pipe.fd)
 		})
 	}
 }

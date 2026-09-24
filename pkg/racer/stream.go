@@ -27,6 +27,7 @@ type streamConn struct {
 // body reader would corrupt its framing and reuse state. Both pools are shared
 // by authorization views; credentials are written afresh for every request.
 type streamPool struct {
+	pipes    splicePipePool
 	mu       sync.Mutex
 	idle     []*streamConn
 	endpoint string
@@ -77,6 +78,8 @@ func (p *streamPool) put(c *streamConn) {
 }
 
 func (p *streamPool) closeIdle() {
+	p.pipes.closeIdle()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

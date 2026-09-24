@@ -92,7 +92,9 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	return c, nil
 }
 
-// CloseIdleConnections releases this client's pool. Active transfers are unaffected.
+// CloseIdleConnections releases idle connections and Linux splice pipes shared
+// by this client and its origin-data views. Active transfers are uninterrupted;
+// their checked-out pipes are closed on return. The client remains usable.
 func (c *Client) CloseIdleConnections() {
 	if c.streamPool != nil {
 		c.streamPool.closeIdle()
