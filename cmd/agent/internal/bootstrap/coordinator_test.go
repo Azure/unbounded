@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -173,7 +174,10 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 			}
 
 			stages := &fakeStages{store: store}
-			_, err = New(slog.New(slog.DiscardHandler), store, stages, nil).Run(t.Context(), id)
+			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
+			c.lockWait = 0 // waiting is covered by TestRunWaitsForTheInstallationLock
+
+			_, err = c.Run(t.Context(), id)
 			require.Error(t, err)
 			require.Empty(t, stages.calls)
 		})
@@ -288,4 +292,83 @@ func TestFailedRepairReportsWhatWasWrong(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, errInjected, "the fault that triggered the repair must still be reported")
 	require.ErrorIs(t, err, errRepairFailed, "and so must the reason repairing it did not work")
+}
+
+// TestRunWaitsForTheInstallationLock covers a reboot, where the daemon holds
+// the lock while it migrates the host and the first-boot unit runs start at
+// the same time.
+func TestRunWaitsForTheInstallationLock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		releaseIn time.Duration
+		lockWait  time.Duration
+		cancel    bool
+		wantErr   error
+		wantCalls []string
+	}{
+		{
+			name:      "released within the wait",
+			releaseIn: 100 * time.Millisecond,
+			lockWait:  10 * time.Second,
+			wantCalls: []string{"verify"},
+		},
+		{
+			name:      "still held at the deadline",
+			releaseIn: time.Hour,
+			lockWait:  100 * time.Millisecond,
+			wantErr:   installstate.ErrLockHeld,
+		},
+		{
+			name:      "canceled while waiting",
+			releaseIn: time.Hour,
+			lockWait:  10 * time.Second,
+			cancel:    true,
+			wantErr:   context.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+			r, err := installstate.NewRecord("machine", "fingerprint", "")
+			require.NoError(t, err)
+			require.NoError(t, store.MarkComplete(r))
+
+			held, err := store.AcquireLock()
+			require.NoError(t, err)
+
+			release := time.AfterFunc(tt.releaseIn, func() { _ = held.Release() })
+
+			t.Cleanup(func() {
+				release.Stop()
+
+				_ = held.Release()
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			if tt.cancel {
+				time.AfterFunc(100*time.Millisecond, cancel)
+			}
+
+			stages := &fakeStages{store: store}
+			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
+			c.lockWait = tt.lockWait
+			c.lockPoll = 10 * time.Millisecond
+
+			_, err = c.Run(ctx, Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tt.wantCalls, stages.calls)
+		})
+	}
 }

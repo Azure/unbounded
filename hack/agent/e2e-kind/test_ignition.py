@@ -214,3 +214,23 @@ class TestIgnitionHostBoundaries(unittest.TestCase):
                 e2e.run_agent(e2e.NodeConfig(name="n", node_labels={}, register_with_taints=[]))
 
         prepared.assert_not_called()
+
+
+class TestIgnitionReboot(unittest.TestCase):
+    """What counts as the first-boot unit repairing a healthy host on reboot."""
+
+    def test_a_verify_only_run_passes(self):
+        self.assertEqual(e2e.ignition_reboot_problems("active", "0", "verified\n", "1 2", "1 2"), [])
+
+    def test_each_sign_of_a_repair_is_reported(self):
+        cases = {
+            "failed unit": (("failed", "0", "", "1 2", "1 2"), "ActiveState=failed"),
+            "retried": (("active", "1", "", "1 2", "1 2"), "NRestarts=1"),
+            "unknown restarts": (("active", "", "", "1 2", "1 2"), "NRestarts=unknown"),
+            "daemon repaired": (("active", "0", 'msg="daemon unit started"', "1 2", "1 2"),
+                                "start repaired the daemon"),
+            "record rewritten": (("active", "0", "", "1 2", "3 4"), "the install record was rewritten"),
+        }
+        for name, (args, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(e2e.ignition_reboot_problems(*args), [want])

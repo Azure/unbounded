@@ -1415,7 +1415,8 @@ func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
 	require.Contains(t, unit, "RestartMaxDelaySec=300")
 	require.Contains(t, unit, "RestartSec=10s", "the first retry stays prompt")
 	require.Contains(t, unit, "Type=oneshot")
-	require.Contains(t, unit, "After=network-online.target nss-lookup.target systemd-sysext.service")
+	require.Contains(t, unit, "After=network-online.target nss-lookup.target systemd-sysext.service "+goalstates.DaemonUnit+"\n",
+		"on a reboot, start must not find the daemon still starting and repair it")
 
 	// start reads the config path from the environment; it has no flag for it.
 	require.Contains(t, unit, "Environment=UNBOUNDED_AGENT_CONFIG_FILE="+ignitionAgentConfigPath)

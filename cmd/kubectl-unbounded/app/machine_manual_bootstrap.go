@@ -1041,7 +1041,12 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// binaries, so it needs the network even though Ignition already fetched
 	// the agent itself. Ordering after systemd-sysext keeps any extension
 	// merged before the agent runs.
-	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
+	//
+	// On later boots the daemon unit starts in the same transaction, and is
+	// only active once the nspawn machine is up. Without ordering after it,
+	// start finds it not yet running and repairs a healthy host. On first boot
+	// the daemon unit does not exist yet, so this orders nothing.
+	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service " + goalstates.DaemonUnit + "\n")
 	// Assert rather than Condition. A failed condition is not an error: systemd
 	// marks the unit inactive and moves on, so a host whose binary Ignition
 	// never placed sits there looking healthy and never bootstraps. A failed

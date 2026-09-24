@@ -10,10 +10,20 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+)
+
+// defaultLockWait bounds how long Run waits for another lifecycle operation to
+// release the installation lock. On a reboot the daemon holds it briefly while
+// it migrates the host on startup, and the first-boot unit runs start then.
+const (
+	defaultLockWait  = 30 * time.Second
+	lockPollInterval = 250 * time.Millisecond
 )
 
 // Identity is what makes one installation distinguishable from another.
@@ -61,16 +71,25 @@ type Coordinator struct {
 	store    *installstate.Store
 	stages   Stages
 	reporter Reporter
+	lockWait time.Duration
+	lockPoll time.Duration
 }
 
 func New(log *slog.Logger, store *installstate.Store, stages Stages, reporter Reporter) *Coordinator {
-	return &Coordinator{log: log, store: store, stages: stages, reporter: reporter}
+	return &Coordinator{
+		log:      log,
+		store:    store,
+		stages:   stages,
+		reporter: reporter,
+		lockWait: defaultLockWait,
+		lockPoll: lockPollInterval,
+	}
 }
 
 type Outcome struct{ AlreadyComplete bool }
 
 func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
-	lock, err := c.store.AcquireLock()
+	lock, err := c.acquireLock(ctx)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -164,4 +183,30 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	}
 
 	return Outcome{}, nil
+}
+
+// acquireLock waits up to lockWait for the installation lock, and returns
+// installstate.ErrLockHeld if it is still held after that.
+func (c *Coordinator) acquireLock(ctx context.Context) (*installstate.Lock, error) {
+	deadline := time.Now().Add(c.lockWait)
+	logged := false
+
+	for {
+		lock, err := c.store.AcquireLock()
+		if !errors.Is(err, installstate.ErrLockHeld) || !time.Now().Before(deadline) {
+			return lock, err
+		}
+
+		if !logged {
+			c.log.Info("waiting for another lifecycle operation to release the installation lock", "timeout", c.lockWait)
+
+			logged = true
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(c.lockPoll):
+		}
+	}
 }

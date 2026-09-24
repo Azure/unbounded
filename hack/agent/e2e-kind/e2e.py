@@ -5657,11 +5657,59 @@ def reboot_host_and_wait() -> str:
     die("host did not return with a new boot ID within 300s")
 
 
+INSTALL_RECORD = "/var/lib/unbounded/agent/install-state.json"
+
+
+def install_record_stamp(deadline: float) -> str:
+    """Identify the install record's current contents. Every write replaces the
+    file, so the inode changes even within one second."""
+    return bounded_ssh(f"sudo stat -c '%i %Y' {INSTALL_RECORD}", deadline, check=True).stdout.strip()
+
+
+def ignition_reboot_problems(state: str, restarts: str, journal: str,
+                             record_before: str, record_after: str) -> list[str]:
+    """What the first-boot unit did on a reboot that it should not have.
+
+    The unit runs start on every boot. On a healthy host that only verifies:
+    it must not fail and retry, repair the daemon, or rewrite the record.
+    """
+    problems = []
+    if state != "active":
+        problems.append(f"ActiveState={state or 'unknown'}")
+    if restarts != "0":
+        problems.append(f"NRestarts={restarts or 'unknown'}")
+    if "daemon unit started" in journal:
+        problems.append("start repaired the daemon")
+    if record_after != record_before:
+        problems.append("the install record was rewritten")
+    return problems
+
+
+def validate_ignition_reboot(record_before: str, deadline: float) -> None:
+    unit = IGNITION_BOOTSTRAP_UNIT
+    state = ""
+    while time.monotonic() < deadline:
+        state = bounded_ssh(f"systemctl show {unit} -p ActiveState --value", deadline).stdout.strip()
+        if state in ("active", "failed"):
+            break
+        time.sleep(5)
+
+    restarts = bounded_ssh(f"systemctl show {unit} -p NRestarts --value", deadline).stdout.strip()
+    journal = bounded_ssh(f"sudo journalctl -b -u {unit} --no-pager", deadline).stdout
+    problems = ignition_reboot_problems(state, restarts, journal, record_before, install_record_stamp(deadline))
+    if problems:
+        log(journal)
+        die(f"{unit} after a reboot: " + "; ".join(problems))
+    log(f"{unit} verified the host after the reboot without repairing it")
+
+
 def validate_host_reboot() -> None:
     """Require fresh host/node identity and networking without repairing components."""
     previous = node_boot_id(AGENT_MACHINE_NAME)
     if not previous:
         die("node boot identity is absent before host reboot")
+    ignition = host_image().provisioning == "ignition"
+    record_before = install_record_stamp(time.monotonic() + 30) if ignition else ""
     reboot_host_and_wait()
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
@@ -5672,6 +5720,8 @@ def validate_host_reboot() -> None:
             ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in node.get("status", {}).get("conditions", []))
             if boot and boot != previous and ready:
                 bounded_ssh("systemctl is-active unbounded-agent-daemon.service", deadline, check=True)
+                if ignition:
+                    validate_ignition_reboot(record_before, deadline)
                 validate_workload()
                 log("Host reboot and fresh workload/DNS passed without component repair")
                 return
