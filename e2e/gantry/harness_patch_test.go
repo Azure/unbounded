@@ -195,7 +195,7 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 		t.Error("patched ConfigMap does not use an eight-chair seed cohort")
 	}
 
-	if !strings.Contains(patched, "chair_seed_percentage: 100") {
+	if !strings.Contains(patched, "chair_holder_count: 8") {
 		t.Error("patched ConfigMap does not select every eight-node kind agent as a chair")
 	}
 

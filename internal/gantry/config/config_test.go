@@ -58,8 +58,8 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("chair scale defaults = %d/%d, want 2048/100000", c.ChairClaimInitialDivisor, c.ChairClusterSizeEstimate)
 	}
 
-	if c.ChairCapacityDaemonSet != "gantry" || c.ChairSeedPercentage != 10 || c.ChairSeedCount != 50 {
-		t.Fatalf("chair capacity defaults = %q/%d/%d, want gantry/10/50", c.ChairCapacityDaemonSet, c.ChairSeedPercentage, c.ChairSeedCount)
+	if c.ChairCapacityDaemonSet != "gantry" || c.ChairHolderCount != 64 || c.ChairSeedCount != 8 {
+		t.Fatalf("chair capacity defaults = %q/%d/%d, want gantry/64/8", c.ChairCapacityDaemonSet, c.ChairHolderCount, c.ChairSeedCount)
 	}
 
 	if c.ChairAPITimeout != 5*time.Second {
@@ -84,8 +84,8 @@ func TestChairCapacityConfig(t *testing.T) {
 			switch key {
 			case "GANTRY_CHAIR_CAPACITY_DAEMONSET":
 				return "edge-gantry"
-			case "GANTRY_CHAIR_SEED_PERCENTAGE":
-				return "25"
+			case "GANTRY_CHAIR_HOLDER_COUNT":
+				return "32"
 			default:
 				return ""
 			}
@@ -94,19 +94,30 @@ func TestChairCapacityConfig(t *testing.T) {
 			t.Fatalf("LoadEnv: %v", err)
 		}
 
-		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairSeedPercentage != 25 {
-			t.Fatalf("chair capacity = %q/%d; want edge-gantry/25", c.ChairCapacityDaemonSet, c.ChairSeedPercentage)
+		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairHolderCount != 32 {
+			t.Fatalf("chair capacity = %q/%d; want edge-gantry/32", c.ChairCapacityDaemonSet, c.ChairHolderCount)
 		}
 	})
 
 	t.Run("YAML", func(t *testing.T) {
 		c := NewDefault()
-		if err := c.LoadYAML(strings.NewReader("chair_capacity_daemonset: edge-gantry\nchair_seed_percentage: 25\n")); err != nil {
+		if err := c.LoadYAML(strings.NewReader("chair_capacity_daemonset: edge-gantry\nchair_holder_count: 32\n")); err != nil {
 			t.Fatalf("LoadYAML: %v", err)
 		}
 
-		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairSeedPercentage != 25 {
-			t.Fatalf("chair capacity = %q/%d; want edge-gantry/25", c.ChairCapacityDaemonSet, c.ChairSeedPercentage)
+		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairHolderCount != 32 {
+			t.Fatalf("chair capacity = %q/%d; want edge-gantry/32", c.ChairCapacityDaemonSet, c.ChairHolderCount)
+		}
+	})
+
+	t.Run("legacy percentage is ignored", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader("chair_seed_percentage: 10\n")); err != nil {
+			t.Fatalf("LoadYAML: %v", err)
+		}
+
+		if c.ChairHolderCount != 64 || c.ChairSeedCount != 8 {
+			t.Fatalf("chair sizing = %d/%d; want 64/8", c.ChairHolderCount, c.ChairSeedCount)
 		}
 	})
 
@@ -115,12 +126,12 @@ func TestChairCapacityConfig(t *testing.T) {
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
 
-		if err := flags.Parse([]string{"--chair-capacity-daemonset=edge-gantry", "--chair-seed-percentage=25"}); err != nil {
+		if err := flags.Parse([]string{"--chair-capacity-daemonset=edge-gantry", "--chair-holder-count=32"}); err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
 
-		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairSeedPercentage != 25 {
-			t.Fatalf("chair capacity = %q/%d; want edge-gantry/25", c.ChairCapacityDaemonSet, c.ChairSeedPercentage)
+		if c.ChairCapacityDaemonSet != "edge-gantry" || c.ChairHolderCount != 32 {
+			t.Fatalf("chair capacity = %q/%d; want edge-gantry/32", c.ChairCapacityDaemonSet, c.ChairHolderCount)
 		}
 	})
 }
@@ -132,8 +143,8 @@ func TestValidateChairCapacity(t *testing.T) {
 		field  string
 	}{
 		{name: "empty DaemonSet", mutate: func(c *Config) { c.ChairCapacityDaemonSet = "" }, field: "chair_capacity_daemonset"},
-		{name: "zero percentage", mutate: func(c *Config) { c.ChairSeedPercentage = 0 }, field: "chair_seed_percentage"},
-		{name: "percentage above 100", mutate: func(c *Config) { c.ChairSeedPercentage = 101 }, field: "chair_seed_percentage"},
+		{name: "zero holders", mutate: func(c *Config) { c.ChairHolderCount = 0 }, field: "chair_holder_count"},
+		{name: "holders above chair slots", mutate: func(c *Config) { c.ChairHolderCount = 65 }, field: "chair_holder_count"},
 	}
 
 	for _, test := range tests {
@@ -156,7 +167,7 @@ func TestChairSeedCountConfig(t *testing.T) {
 
 		err := c.LoadEnv(func(key string) string {
 			if key == "GANTRY_CHAIR_SEED_COUNT" {
-				return "32"
+				return "4"
 			}
 
 			return ""
@@ -165,8 +176,8 @@ func TestChairSeedCountConfig(t *testing.T) {
 			t.Fatalf("LoadEnv: %v", err)
 		}
 
-		if c.ChairSeedCount != 32 {
-			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		if c.ChairSeedCount != 4 {
+			t.Fatalf("ChairSeedCount = %d, want 4", c.ChairSeedCount)
 		}
 	})
 
@@ -175,12 +186,12 @@ func TestChairSeedCountConfig(t *testing.T) {
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
 
-		if err := flags.Parse([]string{"--chair-seed-count=32"}); err != nil {
+		if err := flags.Parse([]string{"--chair-seed-count=4"}); err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
 
-		if c.ChairSeedCount != 32 {
-			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		if c.ChairSeedCount != 4 {
+			t.Fatalf("ChairSeedCount = %d, want 4", c.ChairSeedCount)
 		}
 	})
 }

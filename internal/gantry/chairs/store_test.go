@@ -234,6 +234,27 @@ func TestCacheUsesOldSnapshotWhenAPIUnavailable(t *testing.T) {
 	}
 }
 
+func TestCacheUsesScaledHolderTargetWhenAPIUnavailable(t *testing.T) {
+	reader := &countingReader{snapshot: occupiedSnapshotWithCount(32, 32)}
+	cache := chairs.NewCache(reader, chairs.Count)
+	cache.SetHolderCount(32)
+
+	if _, err := cache.Snapshot(context.Background(), 32); err != nil {
+		t.Fatalf("prime Snapshot: %v", err)
+	}
+
+	reader.err = errors.New("apiserver unavailable")
+
+	snapshot, err := cache.Snapshot(context.Background(), 33)
+	if err != nil {
+		t.Fatalf("stale Snapshot: %v", err)
+	}
+
+	if !snapshot.Stale || snapshot.Epoch != 32 {
+		t.Fatalf("snapshot = %+v, want stale epoch 32", snapshot)
+	}
+}
+
 func TestCacheCollapsesConcurrentFailedRefresh(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshot(2)}
 
@@ -301,8 +322,12 @@ func TestCacheCollapsesConcurrentFailedRefresh(t *testing.T) {
 }
 
 func occupiedSnapshot(epoch int64) chairs.Snapshot {
+	return occupiedSnapshotWithCount(epoch, chairs.SeedCount)
+}
+
+func occupiedSnapshotWithCount(epoch int64, count int) chairs.Snapshot {
 	snapshot := chairs.Snapshot{Epoch: epoch}
-	for index := range chairs.SeedCount {
+	for index := range count {
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID:              chairs.ID(index),
 			AssignmentEpoch: epoch,

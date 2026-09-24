@@ -33,8 +33,8 @@ data:
     chair_claim_initial_divisor: 2048
     chair_cluster_size_estimate: 100000
     chair_capacity_daemonset: gantry
-    chair_seed_percentage: 10
-    chair_seed_count: 50
+    chair_holder_count: 64
+    chair_seed_count: 8
     chair_api_timeout: "5s"
 
     storage_mode: "containerd"

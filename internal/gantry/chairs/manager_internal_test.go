@@ -82,8 +82,8 @@ func TestManagersClaimOnlyProportionalTargetSlots(t *testing.T) {
 			ClaimJitter:         time.Nanosecond,
 			ClaimInitialDivisor: 1,
 			RotationPeriod:      time.Hour,
-			SeedCount:           50,
-			SeedTarget:          func(context.Context) (int, error) { return 2, nil },
+			HolderCount:         50,
+			HolderTarget:        func(context.Context) (int, error) { return 2, nil },
 		})
 
 		if err := manager.Initialize(context.Background()); err != nil {
@@ -123,8 +123,8 @@ func TestManagerVacatesChairAboveReducedTarget(t *testing.T) {
 		Self:           self,
 		Now:            func() time.Time { return time.Unix(1, 0) },
 		RotationPeriod: time.Hour,
-		SeedCount:      50,
-		SeedTarget:     func(context.Context) (int, error) { return 2, nil },
+		HolderCount:    50,
+		HolderTarget:   func(context.Context) (int, error) { return 2, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -165,8 +165,8 @@ func TestManagerClaimsAfterProportionalTargetIncreases(t *testing.T) {
 		ClaimInitialDivisor: 1,
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		SeedCount:           50,
-		SeedTarget:          func(context.Context) (int, error) { return target, nil },
+		HolderCount:         50,
+		HolderTarget:        func(context.Context) (int, error) { return target, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -484,7 +484,7 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 		BootstrapHealthy:    func() bool { return bootstrapHealthy },
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		SeedCount:           1,
+		HolderCount:         1,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

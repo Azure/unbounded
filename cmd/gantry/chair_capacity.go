@@ -11,27 +11,21 @@ import (
 	appsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 )
 
-func proportionalChairSeedTarget(capacity, percentage, maximum int) int {
-	target := (capacity*percentage + 99) / 100
-	if target < 1 {
-		target = 1
+func boundedChairHolderTarget(capacity, maximum int) int {
+	if capacity > maximum {
+		return maximum
 	}
 
-	if target > maximum {
-		target = maximum
-	}
-
-	return target
+	return capacity
 }
 
 type daemonSetChairCapacity struct {
 	daemonSets appsv1.DaemonSetInterface
 	name       string
-	percentage int
 	maximum    int
 }
 
-func (c daemonSetChairCapacity) SeedTarget(ctx context.Context) (int, error) {
+func (c daemonSetChairCapacity) HolderTarget(ctx context.Context) (int, error) {
 	daemonSet, err := c.daemonSets.Get(ctx, c.name, metav1.GetOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("get Gantry DaemonSet capacity: %w", err)
@@ -42,7 +36,7 @@ func (c daemonSetChairCapacity) SeedTarget(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("gantry daemonset desired capacity is %d", capacity)
 	}
 
-	return proportionalChairSeedTarget(capacity, c.percentage, c.maximum), nil
+	return boundedChairHolderTarget(capacity, c.maximum), nil
 }
 
 func chairDHTReady(clusterSizeEstimate, routingTableSize int, holdingChair bool) bool {

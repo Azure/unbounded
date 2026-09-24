@@ -13,12 +13,12 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/chairs"
 )
 
-// TestManagerReadyWithFewerHoldersThanSeedCount covers the first chair during
+// TestManagerReadyWithFewerHoldersThanTarget covers the first chair during
 // startup and the first batch of a rolling upgrade.
 //
 // Requiring the complete target before reporting ready would block the
 // remaining agents that are still converging on that target.
-func TestManagerReadyWithFewerHoldersThanSeedCount(t *testing.T) {
+func TestManagerReadyWithFewerHoldersThanTarget(t *testing.T) {
 	const ns = "gantry-system"
 
 	now := time.Unix(2_000_000, 0)
@@ -90,7 +90,7 @@ func TestManagerReadyWithOneSelectableChairHeldByPeer(t *testing.T) {
 		Self:           chairs.Holder{PeerID: "non-seed"},
 		Now:            func() time.Time { return time.Unix(0, 0) },
 		RotationPeriod: time.Hour,
-		SeedCount:      50,
+		HolderCount:    50,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

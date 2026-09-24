@@ -15,8 +15,8 @@ type SnapshotReader interface {
 }
 
 type Cache struct {
-	reader    SnapshotReader
-	seedCount int
+	reader      SnapshotReader
+	holderCount int
 
 	mu           sync.Mutex
 	snapshot     Snapshot
@@ -37,13 +37,20 @@ type chairRefresh struct {
 	err   error
 }
 
-func NewCache(reader SnapshotReader, seedCount int) *Cache {
-	return &Cache{reader: reader, seedCount: seedCount, chairRefresh: make(map[ID]*chairRefresh)}
+func NewCache(reader SnapshotReader, holderCount int) *Cache {
+	return &Cache{reader: reader, holderCount: holderCount, chairRefresh: make(map[ID]*chairRefresh)}
+}
+
+func (c *Cache) SetHolderCount(holderCount int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.holderCount = holderCount
 }
 
 func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	c.mu.Lock()
-	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCount() >= c.seedCount {
+	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCount() >= c.holderCount {
 		snapshot := cloneSnapshot(c.snapshot)
 		c.mu.Unlock()
 
@@ -60,7 +67,11 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 		case <-refresh.done:
 		}
 
-		if refresh.err != nil && refresh.snapshot.SelectableCount() < c.seedCount {
+		c.mu.Lock()
+		holderCount := c.holderCount
+		c.mu.Unlock()
+
+		if refresh.err != nil && refresh.snapshot.SelectableCount() < holderCount {
 			return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", refresh.err)
 		}
 
@@ -77,7 +88,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	if err == nil {
 		c.snapshot = cloneSnapshot(snapshot)
 		c.invalid = false
-	} else if c.snapshot.SelectableCount() >= c.seedCount {
+	} else if c.snapshot.SelectableCount() >= c.holderCount {
 		snapshot = cloneSnapshot(c.snapshot)
 		snapshot.Stale = true
 	} else {
@@ -86,11 +97,13 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 
 	refresh.snapshot = cloneSnapshot(snapshot)
 	refresh.err = err
+	holderCount := c.holderCount
+
 	close(refresh.done)
 	c.refresh = nil
 	c.mu.Unlock()
 
-	if err != nil && snapshot.SelectableCount() < c.seedCount {
+	if err != nil && snapshot.SelectableCount() < holderCount {
 		return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", err)
 	}
 
