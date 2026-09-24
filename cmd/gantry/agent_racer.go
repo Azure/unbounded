@@ -23,7 +23,6 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/discovery"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
@@ -32,9 +31,9 @@ import (
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
-// runRacerAgent deliberately has no transfer client/server, chair client/server,
-// coordinator, advertiser, or content-selection dependencies. libp2p retains a
-// separate namespace, and incompatible direct coord streams fail negotiation.
+// runRacerAgent deliberately starts no libp2p host, DHT, transfer client/server,
+// chair client/server, coordinator, advertiser, or content-selection machinery.
+// Direct coordination has no listener; Racer owns peer discovery and transport.
 func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -43,14 +42,6 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 	if err != nil {
 		return err
 	}
-
-	opts := racerDiscoveryOptions(c)
-
-	disco, err := discovery.New(ctx, opts)
-	if err != nil {
-		return err
-	}
-	defer disco.Close() //nolint:errcheck // Shutdown cleanup.
 
 	src := newContainerdImageSource(c, logger)
 	if closer, ok := src.(io.Closer); ok {
@@ -141,6 +132,8 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 		_ = stopMirror(shutdown) //nolint:errcheck // Bounded shutdown cleanup.
 	}()
 
+	// Keep the source's List/Subscribe walks: they populate the store's
+	// media-type index even without a DHT provider or presence notifier.
 	subscriber := cdsub.New(src, nil, cdsub.WithLogger(logger))
 
 	go func() {
@@ -356,11 +349,4 @@ func racerProbeSocket(ctx context.Context, socket, method, target string, ready 
 	defer response.Body.Close() //nolint:errcheck // Probe response cleanup.
 
 	return ready(response)
-}
-
-func racerDiscoveryOptions(c *config.Config) discovery.Options {
-	opts := discovery.FromConfig(c)
-	opts.ProtocolPrefix, opts.SelfTestPeriod = "/gantry/racer", 0
-
-	return opts
 }

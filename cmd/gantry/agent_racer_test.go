@@ -7,18 +7,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
-	"github.com/Azure/unbounded/internal/gantry/coord"
-	"github.com/Azure/unbounded/internal/gantry/discovery"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
@@ -299,36 +301,42 @@ func TestRacerSocketReadinessExactStatusAndTarget(t *testing.T) {
 }
 
 func TestRacerRejectsDirectCoordProtocol(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Libp2pIdentityPath = ""
-	cfg.Libp2pListen = []string{"/ip4/127.0.0.1/tcp/0"}
-
-	opts := racerDiscoveryOptions(cfg)
-	if opts.ProtocolPrefix != "/gantry/racer" || opts.SelfTestPeriod != 0 {
-		t.Fatal("direct discovery enabled")
-	}
-
-	racer, err := discovery.New(t.Context(), opts)
+	// Racer rejects direct coordination by never starting a libp2p host. Pin
+	// that startup contract, including ignoring unusable direct-mode settings.
+	dir, err := os.MkdirTemp(".", ".racer-no-libp2p-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer racer.Close()
+	defer os.RemoveAll(dir)
 
-	directOpts := discovery.FromConfig(cfg)
-	directOpts.SelfTestPeriod = 0
+	identity := filepath.Join(dir, "identity")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	direct, err := discovery.New(t.Context(), directOpts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer direct.Close()
+	for _, tc := range []struct {
+		name, identityPath, listen string
+	}{
+		{"unused valid settings", identity, "/ip4/127.0.0.1/tcp/0"},
+		{"invalid identity path", dir, "/ip4/127.0.0.1/tcp/0"},
+		{"invalid listen address", identity, "not-a-multiaddr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.NewDefault()
+			cfg.ContentBackend = "racer"
+			cfg.NodeName = "racer-test"
+			cfg.Libp2pIdentityPath = tc.identityPath
+			cfg.Libp2pListen = []string{tc.listen}
+			// Stop at a real, deterministic startup boundary without requiring
+			// a containerd daemon or creating Racer's production UDS paths.
+			cfg.ContainerdSocket = ""
 
-	direct.LibP2P().Peerstore().AddAddrs(racer.PeerID(), racer.Addrs(), time.Minute)
+			err := runRacerAgent(t.Context(), cfg, nil, nil, nil, nil, &phase9Metrics{}, nil, logger)
+			if err == nil || !strings.Contains(err.Error(), "containerd content store is unavailable") {
+				t.Fatalf("startup did not reach the containerd check independently of libp2p: %v", err)
+			}
 
-	stream, err := direct.LibP2P().NewStream(t.Context(), racer.PeerID(), coord.ProtocolID)
-	if err == nil {
-		_ = stream.Close()
-
-		t.Fatal("Racer accepted incompatible direct coord")
+			if _, err := os.Stat(identity); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Racer startup touched the libp2p identity: %v", err)
+			}
+		})
 	}
 }

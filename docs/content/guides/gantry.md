@@ -322,7 +322,9 @@ Gantry's ordinary registry fallback still checks SHA-256 in-process.
 
 Racer mode is demand-only: no direct Gantry transfer server,
 chair calls, please-pull coordination, DHT content advertising, or speculative
-layer downloads. Libp2p uses a separate `/gantry/racer` protocol namespace.
+layer downloads. Gantry starts no libp2p host or DHT in Racer mode; Racer owns
+peer discovery and transport. The containerd subscriber remains active to
+populate the local media-type index through its image walks.
 Ports 5001/5002 and service-account token mounting are omitted. Fresh Racer-mode
 installs do not create chair Leases or their Role/RoleBinding; existing chair
 resources are retained for rollback and stop being reconciled in Racer mode.
