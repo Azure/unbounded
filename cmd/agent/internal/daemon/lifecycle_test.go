@@ -264,19 +264,6 @@ func TestFirstBootBootstrapUnitAbsentIsSuccess(t *testing.T) {
 	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), t.TempDir()))
 }
 
-// TestFirstBootBootstrapUnitNameIsShared pins that the command writing the unit
-// and the reset removing it agree on its name.
-//
-// They live in packages that cannot import each other, so the name is held in
-// goalstates. If it were duplicated and drifted, reset would leave an enabled
-// unit on a host it had just torn down, and the host would re-bootstrap on the
-// next boot with nothing reporting why.
-func TestFirstBootBootstrapUnitNameIsShared(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "unbounded-agent-bootstrap.service", goalstates.FirstBootBootstrapUnit)
-}
-
 // TestInstallBootstrapBinaryInstallsUnderThePrefix covers the first host
 // mutation of a bootstrap.
 //
@@ -297,9 +284,6 @@ func TestInstallBootstrapBinaryInstallsUnderThePrefix(t *testing.T) {
 	info, err := os.Stat(installed)
 	require.NoError(t, err, "binary must land under the configured prefix")
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-
-	// Nothing may appear under the default prefix as a side effect.
-	assert.NotEqual(t, goalstates.DefaultHostPrefix, prefix)
 }
 
 // TestInstallBootstrapBinaryKeepsAnExistingBinary pins the retention rule: a

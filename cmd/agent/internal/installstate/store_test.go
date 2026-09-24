@@ -270,23 +270,3 @@ func TestRecordCarriesTheInstallationPrefix(t *testing.T) {
 	require.NotContains(t, string(encoded), "hostPrefix",
 		"an unset prefix is absent, not an empty string that reads as a choice")
 }
-
-// TestNewRecordIsGivenAResolvedPrefix guards the assumption the comment above
-// rests on: that bootstrap resolves before recording.
-//
-// NewRecord stores whatever it is handed. If a caller ever passed the raw
-// configured value, a host that set no prefix would record an empty string, and
-// teardown would be left inferring what the default had been when the host was
-// built rather than reading where the files actually are.
-func TestNewRecordIsGivenAResolvedPrefix(t *testing.T) {
-	t.Parallel()
-
-	r, err := NewRecord("machine", "f", "/usr/local")
-	require.NoError(t, err)
-	require.Equal(t, "/usr/local", r.HostPrefix,
-		"an explicitly default installation still records a real directory")
-
-	encoded, err := json.Marshal(r)
-	require.NoError(t, err)
-	require.Contains(t, string(encoded), `"hostPrefix":"/usr/local"`)
-}

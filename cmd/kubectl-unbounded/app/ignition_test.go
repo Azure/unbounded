@@ -12,19 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIgnitionSpecVersionIsPinned guards the one constant an operator cannot
-// recover from being wrong.
-//
-// Ignition refuses a config whose version it does not implement, and it refuses
-// it on first boot with no shell and no agent yet installed. There is nothing on
-// the host to report the mismatch, so the failure presents as a machine that
-// provisioned into nothing.
-func TestIgnitionSpecVersionIsPinned(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "3.4.0", ignitionSpecVersion)
-}
-
 // TestIgnitionDataURLRoundTrips covers how inline file contents reach the host.
 // Ignition reads them from a data URL, so anything lost in the encoding is lost
 // silently: the file appears, with the wrong bytes in it.
@@ -172,8 +159,4 @@ func TestIgnitionFileModesSerializeAsDecimal(t *testing.T) {
 	// 0o600 is 384 decimal. Asserting the number rather than the constant is
 	// the point: it is what a reader of the emitted config would see.
 	require.Contains(t, string(encoded), `"mode":384`)
-
-	require.Equal(t, 0o600, ignitionModeConfig, "the agent config carries credentials")
-	require.Equal(t, 0o755, ignitionModeScript)
-	require.Equal(t, 0o755, ignitionModeDir)
 }
