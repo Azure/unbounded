@@ -47,17 +47,18 @@ fn multihop(routed: bool) {
                 let wire = request(&mut socket);
                 let encoded = wire.lines().find_map(|l| l.strip_prefix("Racer-Origin-Data: ")).unwrap();
                 let data = crate::origin_data::OriginData::from_encoded(encoded).unwrap();
-                let auth = std::str::from_utf8(data.as_bytes()).unwrap();
+                let auth = data.as_bytes();
                 let method = wire.split(' ').next().unwrap();
                 let target = wire.split(' ').nth(1).unwrap();
                 let status = match auth {
-                    "Bearer deny-a" => { concurrent.wait(); 401 },
-                    "Bearer deny-b" => { concurrent.wait(); 403 },
-                    "Bearer page-denied" => if method == "HEAD" { 200 } else { 403 },
-                    value => { assert_eq!(value, "x".repeat(65536)); 200 },
+                    b"Bearer deny-a" => { concurrent.wait(); 401 },
+                    b"Bearer deny-b" => { concurrent.wait(); 403 },
+                    b"Bearer page-denied" => if method == "HEAD" { 200 } else { 403 },
+                    value => { assert!(value.iter().copied().eq((0..65536).map(|i| i as u8))); 200 },
                 };
                 assert!(!target.contains("Bearer"));
                 if status != 200 {
+                    let auth = std::str::from_utf8(auth).unwrap();
                     let framing = if status == 401 { "Content-Length: 999999" } else { "Transfer-Encoding: chunked" };
                     write!(socket, "HTTP/1.1 {status} Denied\r\n{framing}\r\nWWW-Authenticate: Bearer realm=\"registry\",scope=\"{auth}\"\r\nRetry-After: 7\r\nConnection: close\r\n\r\n5\r\nerror\r\n0\r\n\r\n").unwrap();
                 } else {
@@ -173,10 +174,10 @@ fn multihop(routed: bool) {
     let clients = thread::spawn(move || {
         let mut clients = Vec::new();
         for ((auth, _, code), target) in [
-            ("Bearer deny-a".to_owned(), "/same", 401),
-            ("Bearer deny-b".to_owned(), "/same", 403),
-            ("x".repeat(65536), "/success", 200),
-            ("Bearer page-denied".to_owned(), "/page-failure", 403),
+            (b"Bearer deny-a".to_vec(), "/same", 401),
+            (b"Bearer deny-b".to_vec(), "/same", 403),
+            ((0..65536).map(|i| i as u8).collect(), "/success", 200),
+            (b"Bearer page-denied".to_vec(), "/page-failure", 403),
         ]
         .into_iter()
         .zip(targets)
@@ -185,7 +186,7 @@ fn multihop(routed: bool) {
             clients.push(thread::spawn(move || {
                 let mut socket = UnixStream::connect(path).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-                let encoded = openssl::base64::encode_block(auth.as_bytes());
+                let encoded = openssl::base64::encode_block(&auth);
                 write!(socket, "GET {target} HTTP/1.1\r\nHost: cache\r\nRacer-Origin-Data: {encoded}\r\nConnection: close\r\n\r\n").unwrap();
                 let headers = request(&mut socket);
                 assert!(headers.starts_with(&format!("HTTP/1.1 {code} ")), "{headers}");
@@ -195,6 +196,7 @@ fn multihop(routed: bool) {
                     socket.read_exact(&mut body).unwrap();
                     assert_eq!(&body, b"abc");
                 } else {
+                    let auth = std::str::from_utf8(&auth).unwrap();
                     assert!(headers.contains(&format!("scope=\"{auth}\"")), "{headers}");
                     assert!(headers.contains("Retry-After: 7\r\n"));
                 }

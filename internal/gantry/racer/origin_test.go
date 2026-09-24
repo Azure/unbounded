@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
@@ -97,12 +99,12 @@ func TestOriginLocalFirstAndMetadata(t *testing.T) {
 	local := &localFixture{body: []byte("payload")}
 	o := &Origin{Local: local, Registries: map[string]bool{ref.Registry: true}}
 
-	meta, err := o.Stat(t.Context(), target)
+	meta, err := o.Stat(t.Context(), target, nil)
 	if err != nil || meta.Size != 7 || meta.ETag != `"`+ref.Digest.Hex()+`"` || meta.ContentType != "application/vnd.oci.image.index.v1+json" || meta.TTL == nil || *meta.TTL != MetadataTTL || local.opens != 0 {
 		t.Fatal(meta, err)
 	}
 
-	body, err := o.OpenRange(t.Context(), target, meta.ETag, 2, 3)
+	body, err := o.OpenRange(t.Context(), target, meta.ETag, 2, 3, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,21 +116,21 @@ func TestOriginLocalFirstAndMetadata(t *testing.T) {
 		t.Fatal(string(got), err)
 	}
 
-	if _, err := o.OpenRange(t.Context(), target, `"wrong"`, 0, 7); !errors.Is(err, sdk.ErrVersionChanged) {
+	if _, err := o.OpenRange(t.Context(), target, `"wrong"`, 0, 7, nil); !errors.Is(err, sdk.ErrVersionChanged) {
 		t.Fatal(err)
 	}
 
-	if _, err := o.OpenRange(t.Context(), target, meta.ETag, 6, 3); !errors.Is(err, sdk.ErrVersionChanged) {
+	if _, err := o.OpenRange(t.Context(), target, meta.ETag, 6, 3, nil); !errors.Is(err, sdk.ErrVersionChanged) {
 		t.Fatal(err)
 	}
 
-	if _, err := o.Stat(t.Context(), "/not-a-target"); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := o.Stat(t.Context(), "/not-a-target", nil); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal(err)
 	}
 
 	local.unavailable = true
 
-	if _, err := o.Stat(t.Context(), target); err == nil {
+	if _, err := o.Stat(t.Context(), target, nil); err == nil {
 		t.Fatal("unavailable local must not become registry miss")
 	}
 }
@@ -160,6 +162,76 @@ func TestQuarantineBoundAndIsolation(t *testing.T) {
 }
 
 type metadataRegistry struct{ meta ifaces.OriginMetadata }
+
+type credentialRegistry struct {
+	metadataRegistry
+	t            *testing.T
+	want         string
+	heads, opens int
+}
+
+func (r *credentialRegistry) HeadMetadata(ctx context.Context, ref ifaces.OriginRef) (ifaces.OriginMetadata, error) {
+	r.heads++
+	if registryauth.Authorization(ctx) != r.want {
+		r.t.Error("registry HEAD credential changed")
+	}
+
+	return r.metadataRegistry.HeadMetadata(ctx, ref)
+}
+
+func (r *credentialRegistry) OpenRange(ctx context.Context, ref ifaces.OriginRef, offset, length, size int64) (io.ReadCloser, error) {
+	r.opens++
+	if registryauth.Authorization(ctx) != r.want {
+		r.t.Error("registry GET credential changed")
+	}
+
+	return r.metadataRegistry.OpenRange(ctx, ref, offset, length, size)
+}
+
+func TestOriginDataRegistryCredentials(t *testing.T) {
+	ref := testRef()
+	target, _ := Target(ref)
+
+	for _, tc := range []struct {
+		name, data, want string
+		status           int
+	}{
+		{"absent", "", "", 200},
+		{"bearer", "Bearer requester", "Bearer requester", 200},
+		{"basic", "Basic dXNlcjpwYXNz", "Basic dXNlcjpwYXNz", 200},
+		{"unsupported", "Digest requester", "", 401},
+		{"binary", "Bearer \x00\xff", "", 401},
+		{"newline", "Bearer requester\r\n", "", 401},
+		{"whitespace", " Bearer requester", "", 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := &credentialRegistry{metadataRegistry: metadataRegistry{ifaces.OriginMetadata{Ref: ref, Size: 7, ContentType: "application/vnd.oci.image.manifest.v1+json"}}, t: t, want: tc.want}
+
+			o, err := sdk.NewRangeOrigin(&Origin{Registry: registry, Registries: map[string]bool{ref.Registry: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequest(http.MethodGet, target, nil)
+			r.Header.Set("Racer-Origin-Data", base64.StdEncoding.EncodeToString([]byte(tc.data)))
+
+			w := httptest.NewRecorder()
+			o.ServeHTTP(w, r)
+
+			if w.Code != tc.status {
+				t.Fatalf("status %d, want %d", w.Code, tc.status)
+			}
+
+			if tc.status == 200 && (registry.heads != 2 || registry.opens != 1 || w.Body.String() != "payload") {
+				t.Fatal("registry range request not delivered")
+			}
+
+			if tc.status != 200 && (registry.heads != 0 || registry.opens != 0) {
+				t.Fatal("invalid credential reached registry")
+			}
+		})
+	}
+}
 
 func (r metadataRegistry) HeadMetadata(context.Context, ifaces.OriginRef) (ifaces.OriginMetadata, error) {
 	return r.meta, nil
@@ -198,14 +270,14 @@ func TestOriginMixedLocalRegistryMediaType(t *testing.T) {
 			registry := metadataRegistry{ifaces.OriginMetadata{Ref: resolved, Size: 7, ContentType: tc.registryType}}
 			store := &Origin{Registry: registry, Registries: map[string]bool{ref.Registry: true}}
 
-			remote, err := store.Stat(t.Context(), target)
+			remote, err := store.Stat(t.Context(), target, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			store.Local = &localFixture{body: []byte("payload"), mediaType: tc.localType}
 
-			local, err := store.Stat(t.Context(), target)
+			local, err := store.Stat(t.Context(), target, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

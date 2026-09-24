@@ -28,15 +28,28 @@ func TestDataplaneInterop(t *testing.T) {
 	}
 
 	data := payload(int(2*PageSize + 123))
+
+	originData := make([]byte, MaxOriginDataBytes)
+	for i := range originData {
+		originData[i] = byte(i)
+	}
+
 	store := &memoryStore{data: data, meta: Metadata{Size: int64(len(data)), ETag: checksumTag(data), TTL: durationPointer(time.Hour)}}
 	origin, _ := NewOrigin(conformanceStore{sdk: store})
 
 	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI == "/sdk%2Fblob?b=2&a=1&a=3" {
+			got, status := decodeOriginData(r.Header)
+			if status != 0 || !bytes.Equal(got, originData) {
+				t.Error("binary origin data changed across dataplane")
+			}
+		}
+
 		if r.Header.Get("Accept-Encoding") != "identity" || len(r.Header.Values("X-Racer-Target")) != 0 {
 			// Direct conformance deliberately supplies a conflicting legacy header.
 			// Only the SDK object's requests exclusively originate at the dataplane.
 			if r.RequestURI == "/sdk%2Fblob?b=2&a=1&a=3" {
-				t.Error("invalid upstream headers", r.Header)
+				t.Error("invalid upstream headers")
 			}
 		}
 
@@ -186,7 +199,12 @@ func TestDataplaneInterop(t *testing.T) {
 
 	target := "/sdk%2Fblob?b=2&a=1&a=3"
 
-	object, err := c.Open(ctx, target)
+	view, err := c.WithOriginData(originData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	object, err := view.Open(ctx, target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,11 +226,22 @@ func TestDataplaneInterop(t *testing.T) {
 		t.Fatalf("cold/warm page fetches: got %d want 3", store.opens.Load())
 	}
 
+	stats := store.stats.Load()
+	// Cached metadata and pages are reusable without the miss's origin data.
+	object, err = c.Open(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	out := make([]byte, 17)
 
 	n, err := object.ReadAt(ctx, out, PageSize-5)
 	if err != nil || n != len(out) || !bytes.Equal(out, data[PageSize-5:PageSize+12]) {
 		t.Fatal("cross-page read", n, err)
+	}
+
+	if store.stats.Load() != stats || store.opens.Load() != 3 {
+		t.Fatal("origin data changed persistent cache identity")
 	}
 
 	t.Logf("verified HEAD + 3 cold pages + warm reuse + cross-page ReadAt (%d bytes)", len(data))

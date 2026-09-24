@@ -36,7 +36,7 @@ func newBlobStore(blobs map[string][]byte) *blobStore {
 	return s
 }
 
-func (s *blobStore) Stat(ctx context.Context, target string) (racer.Metadata, error) {
+func (s *blobStore) Stat(ctx context.Context, target string, _ []byte) (racer.Metadata, error) {
 	if err := ctx.Err(); err != nil {
 		return racer.Metadata{}, err
 	}
@@ -49,8 +49,8 @@ func (s *blobStore) Stat(ctx context.Context, target string) (racer.Metadata, er
 	return m, nil
 }
 
-func (s *blobStore) Open(ctx context.Context, target, etag string) (racer.Source, error) {
-	m, err := s.Stat(ctx, target)
+func (s *blobStore) Open(ctx context.Context, target, etag string, _ []byte) (racer.Source, error) {
+	m, err := s.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}

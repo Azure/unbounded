@@ -84,7 +84,7 @@ func (d *dataset) publish() {
 
 func (d *dataset) target(id int) string { return d.prefix + strconv.Itoa(id) }
 
-func (d *dataset) Stat(ctx context.Context, target string) (racer.Metadata, error) {
+func (d *dataset) Stat(ctx context.Context, target string, _ []byte) (racer.Metadata, error) {
 	if err := ctx.Err(); err != nil {
 		return racer.Metadata{}, err
 	}
@@ -159,8 +159,8 @@ func checksum(ctx context.Context, source io.ReaderAt, size int64) ([32]byte, er
 	return [32]byte(h.Sum(nil)), nil
 }
 
-func (d *dataset) Open(ctx context.Context, target, etag string) (racer.Source, error) {
-	m, err := d.Stat(ctx, target)
+func (d *dataset) Open(ctx context.Context, target, etag string, _ []byte) (racer.Source, error) {
+	m, err := d.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}

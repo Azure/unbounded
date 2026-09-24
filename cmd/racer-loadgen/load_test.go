@@ -135,7 +135,7 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 
 	origin, _ := racer.NewOrigin(d)
 
-	meta, err := d.Stat(context.Background(), d.target(1))
+	meta, err := d.Stat(context.Background(), d.target(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

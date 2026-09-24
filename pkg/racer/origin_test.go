@@ -25,12 +25,12 @@ type memoryStore struct {
 	err                  error
 }
 
-func (s *memoryStore) Stat(context.Context, string) (Metadata, error) {
+func (s *memoryStore) Stat(context.Context, string, []byte) (Metadata, error) {
 	s.stats.Add(1)
 	return s.meta, s.err
 }
 
-func (s *memoryStore) Open(_ context.Context, _, etag string) (Source, error) {
+func (s *memoryStore) Open(_ context.Context, _, etag string, _ []byte) (Source, error) {
 	s.opens.Add(1)
 
 	if s.err != nil {
@@ -242,15 +242,15 @@ type changingStore struct {
 	retain  bool
 }
 
-func (s *changingStore) Stat(ctx context.Context, target string) (Metadata, error) {
-	m, err := s.memoryStore.Stat(ctx, target)
+func (s *changingStore) Stat(ctx context.Context, target string, _ []byte) (Metadata, error) {
+	m, err := s.memoryStore.Stat(ctx, target, nil)
 	// Simulate publication after Stat resolves the old version.
 	s.meta.ETag = checksumTag([]byte("new"))
 
 	return m, err
 }
 
-func (s *changingStore) Open(ctx context.Context, target, etag string) (Source, error) {
+func (s *changingStore) Open(ctx context.Context, target, etag string, _ []byte) (Source, error) {
 	if s.openErr != nil {
 		s.opens.Add(1)
 		return &memorySource{Reader: bytes.NewReader(nil), closes: &s.closes}, s.openErr
@@ -267,7 +267,7 @@ func (s *changingStore) Open(ctx context.Context, target, etag string) (Source, 
 		return &memorySource{Reader: bytes.NewReader(s.data), closes: &s.closes}, nil
 	}
 
-	return s.memoryStore.Open(ctx, target, etag)
+	return s.memoryStore.Open(ctx, target, etag, nil)
 }
 
 func TestOriginVersionBinding(t *testing.T) {

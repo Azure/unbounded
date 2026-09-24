@@ -36,7 +36,12 @@ fn request(session: &mut TlsSession) -> Vec<u8> {
         let mut byte = [0];
         assert_eq!(complete(|| session.read(&mut byte)), 1);
         bytes.push(byte[0]);
-        assert!(bytes.len() <= SCRATCH_SIZE + 65536 + 17);
+        assert!(
+            bytes.len()
+                <= SCRATCH_SIZE
+                    + crate::origin_data::MAX_ENCODED_ORIGIN_DATA
+                    + crate::origin_data::HTTP_ORIGIN_DATA_OVERHEAD
+        );
     }
     bytes
 }

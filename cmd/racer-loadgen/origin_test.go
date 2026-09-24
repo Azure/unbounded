@@ -42,20 +42,20 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 
 	ctx := context.Background()
 
-	m, err := d.Stat(ctx, d.target(2))
+	m, err := d.Stat(ctx, d.target(2), nil)
 	if err != nil || m.Size != 257 || m.ETag == "" || m.TTL == nil || *m.TTL != c.ttl {
 		t.Fatalf("metadata = %+v, %v", m, err)
 	}
 
 	*m.TTL = 0
 
-	again, err := datasetForTest(t, c).Stat(ctx, d.target(2))
+	again, err := datasetForTest(t, c).Stat(ctx, d.target(2), nil)
 	if err != nil || again.ETag != m.ETag || again.TTL == nil || *again.TTL != c.ttl {
 		t.Fatalf("replica metadata = %+v, %v", again, err)
 	}
 
 	for _, id := range []int{0, 1} {
-		other, err := d.Stat(ctx, d.target(id))
+		other, err := d.Stat(ctx, d.target(id), nil)
 		if err != nil || other.ETag == m.ETag {
 			t.Fatalf("object %d must have its own ETag: %+v, %v", id, other, err)
 		}
@@ -66,17 +66,17 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 		d.prefix + "1?", d.prefix + "1?x=y", d.prefix + "%31", d.prefix + "../1", d.prefix + "9223372036854775808",
 		"/loadgen/v1/772/257/1", "/loadgen/v1/771/256/1",
 	} {
-		if _, err := d.Stat(ctx, target); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := d.Stat(ctx, target, nil); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("Stat(%q) = %v, want not-exist", target, err)
 		}
 
-		if _, err := d.Open(ctx, target, m.ETag); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := d.Open(ctx, target, m.ETag, nil); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("Open(%q) = %v, want not-exist", target, err)
 		}
 	}
 
 	for _, tag := range []string{"", "wrong", "W/" + m.ETag} {
-		if _, err := d.Open(ctx, d.target(2), tag); !errors.Is(err, racer.ErrVersionChanged) {
+		if _, err := d.Open(ctx, d.target(2), tag, nil); !errors.Is(err, racer.ErrVersionChanged) {
 			t.Errorf("Open with ETag %q = %v", tag, err)
 		}
 	}
@@ -84,11 +84,11 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 
-	if _, err := d.Stat(canceled, d.target(2)); !errors.Is(err, context.Canceled) {
+	if _, err := d.Stat(canceled, d.target(2), nil); !errors.Is(err, context.Canceled) {
 		t.Errorf("canceled Stat = %v", err)
 	}
 
-	if _, err := d.Open(canceled, d.target(2), m.ETag); !errors.Is(err, context.Canceled) {
+	if _, err := d.Open(canceled, d.target(2), m.ETag, nil); !errors.Is(err, context.Canceled) {
 		t.Errorf("canceled Open = %v", err)
 	}
 }
@@ -136,7 +136,7 @@ func statErrorAsync(d *dataset, ctx context.Context, id int) <-chan error {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := d.Stat(ctx, d.target(id))
+		_, err := d.Stat(ctx, d.target(id), nil)
 		done <- err
 	}()
 
@@ -180,7 +180,7 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 				liveDone := make(chan racer.Metadata, 1)
 
 				go func() {
-					m, err := d.Stat(context.Background(), target)
+					m, err := d.Stat(context.Background(), target, nil)
 					if err != nil {
 						t.Errorf("live waiter: %v", err)
 					}
@@ -226,7 +226,7 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 					t.Fatalf("live waiter metadata = %+v, want ETag %s", m, wantETag)
 				}
 
-				if _, err := d.Stat(context.Background(), target); err != nil {
+				if _, err := d.Stat(context.Background(), target, nil); err != nil {
 					t.Fatal(err)
 				}
 
@@ -273,7 +273,7 @@ func TestDatasetChecksumOutlivesRequests(t *testing.T) {
 			t.Fatalf("publication without waiters: calls=%d reads=%d", source.calls, source.reads)
 		}
 
-		m, err := d.Stat(context.Background(), target)
+		m, err := d.Stat(context.Background(), target, nil)
 		if err != nil || m.ETag != expectedETag(t, d, target) {
 			t.Fatalf("warm HEAD = %+v, %v", m, err)
 		}
@@ -311,7 +311,7 @@ func TestDatasetPublicationBoundAndShutdown(t *testing.T) {
 				for range 3 {
 					for id := range int(d.count) {
 						go func() {
-							_, err := d.Stat(context.Background(), d.target(id))
+							_, err := d.Stat(context.Background(), d.target(id), nil)
 							results <- err
 						}()
 					}
@@ -366,7 +366,7 @@ func TestDatasetPublicationBoundAndShutdown(t *testing.T) {
 					default:
 					}
 
-					if _, err := d.Stat(context.Background(), d.target(id)); !errors.Is(err, context.Canceled) {
+					if _, err := d.Stat(context.Background(), d.target(id), nil); !errors.Is(err, context.Canceled) {
 						t.Fatalf("Stat after Close = %v", err)
 					}
 				}
@@ -385,7 +385,7 @@ func TestDatasetPublicationFailure(t *testing.T) {
 		return [32]byte{}, want
 	}
 	for range 2 {
-		if _, err := d.Stat(context.Background(), d.target(0)); !errors.Is(err, want) {
+		if _, err := d.Stat(context.Background(), d.target(0), nil); !errors.Is(err, want) {
 			t.Fatalf("publication error = %v", err)
 		}
 	}
@@ -398,12 +398,12 @@ func TestDatasetPublicationFailure(t *testing.T) {
 func sourceForTest(t *testing.T, d *dataset, id int) racer.Source {
 	t.Helper()
 
-	m, err := d.Stat(context.Background(), d.target(id))
+	m, err := d.Stat(context.Background(), d.target(id), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s, err := d.Open(context.Background(), d.target(id), m.ETag)
+	s, err := d.Open(context.Background(), d.target(id), m.ETag, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestSyntheticReadAtAlignmentSplitsAndEOF(t *testing.T) {
 		t.Fatalf("full read = %d, %v", n, err)
 	}
 
-	meta, err := d.Stat(context.Background(), d.target(1))
+	meta, err := d.Stat(context.Background(), d.target(1), nil)
 	if err != nil || meta.ETag != fmt.Sprintf(`"%x"`, sha256.Sum256(whole)) {
 		t.Fatalf("ETag must be the exact content checksum: %+v, %v", meta, err)
 	}

@@ -20,9 +20,9 @@ import (
 // behind a fixture that returns the same representation for every request.
 type conformanceStore struct{ sdk *memoryStore }
 
-func (s conformanceStore) Stat(ctx context.Context, target string) (Metadata, error) {
+func (s conformanceStore) Stat(ctx context.Context, target string, _ []byte) (Metadata, error) {
 	if target == "/sdk%2Fblob?b=2&a=1&a=3" {
-		return s.sdk.Stat(ctx, target)
+		return s.sdk.Stat(ctx, target, nil)
 	}
 
 	if target == "/missing" {
@@ -34,12 +34,12 @@ func (s conformanceStore) Stat(ctx context.Context, target string) (Metadata, er
 	return Metadata{Size: int64(len(conformanceBody(target))), ETag: tag, TTL: durationPointer(0)}, nil
 }
 
-func (s conformanceStore) Open(ctx context.Context, target, etag string) (Source, error) {
+func (s conformanceStore) Open(ctx context.Context, target, etag string, _ []byte) (Source, error) {
 	if target == "/sdk%2Fblob?b=2&a=1&a=3" {
-		return s.sdk.Open(ctx, target, etag)
+		return s.sdk.Open(ctx, target, etag, nil)
 	}
 
-	m, err := s.Stat(ctx, target)
+	m, err := s.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -1,12 +1,23 @@
 # Streaming SDK integration
 
-## Request authorization and metadata
+## Request origin data and metadata
 
 Create one `Client` for the cache UDS. Derive a request-local view with
-`WithAuthorization(value) (*Client, error)`. Views share the HTTP and streaming
-connection pools. An empty value removes authorization. Nonempty values must
-be 1 through 65,536 printable ASCII bytes without boundary whitespace.
-Neither client is mutated by deriving a view.
+`WithOriginData(value []byte) (*Client, error)`. Views share the HTTP and streaming
+connection pools and copy the input. Nil or empty input removes origin data.
+Values can contain arbitrary bytes up to `MaxOriginDataBytes` (65,536 bytes).
+Neither client is mutated by deriving a view. HTTP transports use one
+`Racer-Origin-Data` header containing canonical padded standard base64; RDMA
+carries raw bytes in its encrypted request envelope and falls back to HTTP
+when that envelope is too large. `ClientOptions.Header` reserves this header.
+
+Origin data is request-scoped input forwarded on cache misses. It is isolated
+between in-flight requests but is not part of persistent cache identity. Data
+that changes the tenant or representation belongs in the namespace and target.
+Origin data is not per-read authorization: cache hits do not contact the origin.
+Treat it as sensitive and never log, persist, or echo it in diagnostics. Gantry
+uses `[]byte(registryauth.Authorization(ctx))` and interprets those bytes only
+inside its own origin adapter; other origins can define their own payloads.
 
 `view.Open(ctx, target)` performs HEAD and returns an immutable `Object`.
 `Object.Metadata()` includes `Size`, `ETag`, optional `ContentType` (256 bytes),
@@ -14,7 +25,7 @@ and TTL. GET pages must match HEAD's version and content type, including absence
 Use `errors.As(err, &status)` with `var status *racer.HTTPError` to obtain
 `StatusCode`, `WWWAuthenticate` (1,024 bytes), and `RetryAfter` (128 bytes).
 Invalid/duplicate/oversized fields produce `ErrProtocol`; values are never
-truncated. Authorization is never included in SDK error text.
+truncated. Origin data is never included in SDK error text.
 
 ## Sequential reads and explicit splice
 
@@ -106,8 +117,8 @@ closed. Streams do not automatically retry stale idle sockets or version errors.
 `NewRangeOrigin(store RangeStore)` adapts:
 
 ```go
-Stat(ctx context.Context, target string) (Metadata, error)
-OpenRange(ctx context.Context, target, etag string, offset, length int64) (io.ReadCloser, error)
+Stat(ctx context.Context, target string, originData []byte) (Metadata, error)
+OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error)
 ```
 
 `OpenRange` runs once per accepted GET after conditional/range evaluation. A
@@ -115,11 +126,16 @@ registry adapter can issue one upstream Range request and return its validated,
 version-pinned body directly. Copy-buffer reads never trigger extra registry
 requests. Honor context cancellation, return exactly length bytes, and release
 upstream resources on Close. An accepted empty GET has length zero. HEAD calls
-only Stat. Both methods receive credentials through
-`AuthorizationFromContext(ctx) string`.
+only Stat. Both methods receive decoded origin data explicitly, with no context
+values. The ordinary context carries cancellation and deadlines. Do not mutate
+or retain the request's origin data. Missing or empty data means absent.
+Malformed, duplicate, noncanonical, or decoded-oversize data returns 400 before
+calling the store; an encoded value over 87,384 bytes returns 431.
 
 Return `*HTTPError` to preserve upstream HTTP errors and bounded challenge/retry
 fields. `ErrVersionChanged`, `fs.ErrNotExist`, and `fs.ErrPermission` also map to
 412, 404, and 403. Origin aborts short streaming responses rather than completing
 them successfully. Existing local-file adapters can keep using `Store`,
-`Source` (`ReaderAt` plus `Close`), and `NewOrigin`.
+`Source` (`ReaderAt` plus `Close`), and `NewOrigin`. `Store.Stat` has the same
+signature above and `Store.Open` accepts
+`Open(ctx context.Context, target, etag string, originData []byte) (Source, error)`.

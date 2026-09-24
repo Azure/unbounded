@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,32 +25,35 @@ func TestAuthorizationViewsAndLimits(t *testing.T) {
 		w.Header().Set("ETag", checksumTag(nil))
 		w.Header().Set("Content-Length", "0")
 
-		if r.Header.Get("Authorization") != r.URL.Query().Get("auth") {
-			t.Error("credential crossed views")
+		data, status := decodeOriginData(r.Header)
+		if status != 0 || string(data) != r.URL.Query().Get("data") {
+			t.Error("origin data crossed views")
 		}
 	}), ClientOptions{})
-	for _, value := range []string{"\tbad", " bad", "bad ", "bad\n", "béar", strings.Repeat("x", MaxAuthorizationBytes+1)} {
-		if _, err := base.WithAuthorization(value); err == nil || strings.Contains(err.Error(), value) {
-			t.Fatalf("invalid authorization accepted or disclosed: length=%d", len(value))
+	for _, value := range [][]byte{bytes.Repeat([]byte{0xff}, MaxOriginDataBytes+1)} {
+		if _, err := base.WithOriginData(value); err == nil || strings.Contains(err.Error(), string(value)) {
+			t.Fatalf("invalid origin data accepted or disclosed: length=%d", len(value))
 		}
 	}
 
-	if _, err := base.WithAuthorization(strings.Repeat("x", MaxAuthorizationBytes)); err != nil {
+	if _, err := base.WithOriginData(bytes.Repeat([]byte{0xff}, MaxOriginDataBytes)); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"Authorization": {""}}}); err == nil {
-		t.Fatal("empty present auth")
+	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"Racer-Origin-Data": {""}}}); err == nil {
+		t.Fatal("protocol-owned header accepted")
 	}
 
-	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"Authorization": {"a", "b"}}}); err == nil {
-		t.Fatal("duplicate auth")
+	if _, err := NewClient("/cache", ClientOptions{Header: http.Header{"racer-origin-data": {"a", "b"}}}); err == nil {
+		t.Fatal("duplicate protocol-owned header accepted")
 	}
 
 	var wg sync.WaitGroup
 
-	for _, value := range []string{"a", "b", ""} {
-		view, err := base.WithAuthorization(value)
+	for _, value := range []string{"a", "b", "", "\x00\xff\r\n binary "} {
+		input := []byte(value)
+
+		view, err := base.WithOriginData(input)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,9 +62,16 @@ func TestAuthorizationViewsAndLimits(t *testing.T) {
 			t.Fatal("pool not shared")
 		}
 
+		clear(input)
+
+		cleared, err := view.WithOriginData(nil)
+		if err != nil || cleared.header.Get("Racer-Origin-Data") != "" {
+			t.Fatal("could not clear view")
+		}
+
 		wg.Go(func() {
 			for range 5 {
-				if _, err := view.Stat(t.Context(), "/?auth="+value); err != nil {
+				if _, err := view.Stat(t.Context(), "/?data="+url.QueryEscape(value)); err != nil {
 					t.Error(err)
 				}
 			}
@@ -68,7 +80,7 @@ func TestAuthorizationViewsAndLimits(t *testing.T) {
 
 	wg.Wait()
 
-	if base.header.Get("Authorization") != "" {
+	if base.header.Get("Racer-Origin-Data") != "" {
 		t.Fatal("base mutated")
 	}
 }
@@ -115,16 +127,16 @@ type rangeTestStore struct {
 	offset, length int64
 }
 
-func (s *rangeTestStore) Stat(ctx context.Context, _ string) (Metadata, error) {
-	s.auth = AuthorizationFromContext(ctx)
+func (s *rangeTestStore) Stat(_ context.Context, _ string, originData []byte) (Metadata, error) {
+	s.auth = string(originData)
 	return Metadata{Size: int64(len(s.data)), ETag: checksumTag(s.data), ContentType: "application/vnd.oci.image.manifest.v1+json"}, nil
 }
 
-func (s *rangeTestStore) OpenRange(ctx context.Context, _, etag string, offset, length int64) (io.ReadCloser, error) {
+func (s *rangeTestStore) OpenRange(_ context.Context, _, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {
 	s.opens++
 
 	s.offset, s.length = offset, length
-	if AuthorizationFromContext(ctx) != s.auth || etag != checksumTag(s.data) {
+	if string(originData) != s.auth || etag != checksumTag(s.data) {
 		return nil, ErrVersionChanged
 	}
 
@@ -148,7 +160,7 @@ func TestRangeOriginSingleOpenAndContentType(t *testing.T) {
 
 	c := newTestClient(t, origin, ClientOptions{})
 
-	c, err = c.WithAuthorization("Bearer request")
+	c, err = c.WithOriginData([]byte("\x00\xff\r\n request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,8 +185,8 @@ func TestRangeOriginSingleOpenAndContentType(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if store.opens != 1 || store.closed != 1 || store.offset != 7 || store.length != 100000 || store.auth != "Bearer request" {
-		t.Fatalf("store=%+v", store)
+	if store.opens != 1 || store.closed != 1 || store.offset != 7 || store.length != 100000 || store.auth != "\x00\xff\r\n request" {
+		t.Fatal("range store request changed")
 	}
 }
 
@@ -311,7 +323,7 @@ type failingRangeStore struct {
 	err error
 }
 
-func (s *failingRangeStore) OpenRange(ctx context.Context, target, etag string, offset, length int64) (io.ReadCloser, error) {
+func (s *failingRangeStore) OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -368,10 +380,14 @@ func TestRangeOriginErrorsAndShortClose(t *testing.T) {
 }
 
 func TestAuthorizationMaximumOnWire(t *testing.T) {
-	value := strings.Repeat("x", MaxAuthorizationBytes)
+	value := make([]byte, MaxOriginDataBytes)
+	for i := range value {
+		value[i] = byte(i)
+	}
+
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != value || len(r.Header.Values("Authorization")) != 1 {
-			t.Error("authorization changed")
+		if r.Header.Get("Racer-Origin-Data") != base64.StdEncoding.EncodeToString(value) || len(r.Header.Values("Racer-Origin-Data")) != 1 {
+			t.Error("origin data changed")
 		}
 
 		w.Header().Set("ETag", checksumTag(nil))
@@ -385,7 +401,7 @@ func TestAuthorizationMaximumOnWire(t *testing.T) {
 		}
 	}), ClientOptions{})
 
-	c, err := c.WithAuthorization(value)
+	c, err := c.WithOriginData(value)
 	if err != nil {
 		t.Fatal(err)
 	}

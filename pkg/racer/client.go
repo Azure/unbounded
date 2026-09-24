@@ -25,7 +25,8 @@ type ClientOptions struct {
 	// bounds the whole stream, including all page requests and downstream writes.
 	Timeout time.Duration
 	// Header supplies application headers, copied at construction. Protocol-owned
-	// headers (Range, validators, encoding and framing) cannot be overridden.
+	// headers (Range, validators, encoding, framing and Racer-Origin-Data) cannot
+	// be overridden. Use WithOriginData for request-scoped origin input.
 	Header http.Header
 }
 
@@ -62,17 +63,13 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	h := make(http.Header, len(options.Header))
 	for name, values := range options.Header {
 		switch strings.ToLower(name) {
-		case "range", "if-match", "if-none-match", "if-range", "if-modified-since", "if-unmodified-since", "accept-encoding", "content-length", "transfer-encoding", "host", "connection", "trailer", "te", "upgrade":
+		case "range", "if-match", "if-none-match", "if-range", "if-modified-since", "if-unmodified-since", "accept-encoding", "content-length", "transfer-encoding", "host", "connection", "trailer", "te", "upgrade", "racer-origin-data":
 			return nil, fmt.Errorf("racer: protocol-owned header %q", name)
 		}
 
 		for _, value := range values {
 			h.Add(name, value)
 		}
-	}
-
-	if values := h.Values("Authorization"); len(values) > 1 || len(values) == 1 && !validAuthorization(values[0]) {
-		return nil, fmt.Errorf("racer: invalid Authorization")
 	}
 
 	c := &Client{endpoint: "http://localhost", header: h, workers: workers}

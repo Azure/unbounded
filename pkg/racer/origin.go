@@ -24,9 +24,12 @@ import (
 // the same target, including after deletion and recreation.
 // Use fs.ErrNotExist and fs.ErrPermission for HTTP 404 and 403;
 // ErrVersionChanged produces 412, and other errors produce 500.
+// originData is opaque request-scoped input, absent when empty. Methods must not
+// mutate, retain, log, or persist it. Representation identity belongs in the
+// namespace and target; cache hits do not consult the origin.
 type Store interface {
-	Stat(ctx context.Context, target string) (Metadata, error)
-	Open(ctx context.Context, target, etag string) (Source, error)
+	Stat(ctx context.Context, target string, originData []byte) (Metadata, error)
+	Open(ctx context.Context, target, etag string, originData []byte) (Source, error)
 }
 
 // Source pins one representation for the lifetime of a GET request and exposes
@@ -51,11 +54,11 @@ type Origin struct {
 // RangeStore opens one sequential response for the requested byte interval.
 // OpenRange must pin etag atomically, return exactly length bytes, honor ctx,
 // and release its response on Close. It is called once per accepted GET, never
-// once per copy-buffer read. Stat must not fetch payloads. Authorization is
-// available through AuthorizationFromContext in both methods.
+// once per copy-buffer read. Stat must not fetch payloads. originData follows
+// the same contract as Store.
 type RangeStore interface {
-	Stat(ctx context.Context, target string) (Metadata, error)
-	OpenRange(ctx context.Context, target, etag string, offset, length int64) (io.ReadCloser, error)
+	Stat(ctx context.Context, target string, originData []byte) (Metadata, error)
+	OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error)
 }
 
 // NewRangeOrigin binds the protocol to a sequential, range-oriented backend.
@@ -104,20 +107,11 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Values("Authorization")
-	if len(auth) > 1 || len(auth) == 1 && !validAuthorization(auth[0]) {
-		status := http.StatusBadRequest
-		if len(auth) == 1 && len(auth[0]) > MaxAuthorizationBytes {
-			status = http.StatusRequestHeaderFieldsTooLarge
-		}
-
+	originData, status := decodeOriginData(r.Header)
+	if status != 0 {
 		emptyResponse(w, status)
 
 		return
-	}
-
-	if len(auth) == 1 {
-		r = r.WithContext(context.WithValue(r.Context(), authorizationKey{}, auth[0]))
 	}
 
 	var (
@@ -126,9 +120,9 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if o.ranges != nil {
-		m, err = o.ranges.Stat(r.Context(), target)
+		m, err = o.ranges.Stat(r.Context(), target, originData)
 	} else {
-		m, err = o.store.Stat(r.Context(), target)
+		m, err = o.store.Stat(r.Context(), target, originData)
 	}
 
 	if err != nil {
@@ -160,7 +154,7 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	source, err := o.openRange(r.Context(), target, m.ETag, start, length)
+	source, err := o.openRange(r.Context(), target, m.ETag, start, length, originData)
 	if err != nil {
 		storeError(w, err)
 		return
@@ -194,12 +188,12 @@ type sourceRange struct {
 	io.Closer
 }
 
-func (o *Origin) openRange(ctx context.Context, target, etag string, start, length int64) (io.ReadCloser, error) {
+func (o *Origin) openRange(ctx context.Context, target, etag string, start, length int64, originData []byte) (io.ReadCloser, error) {
 	if o.ranges != nil {
-		return o.ranges.OpenRange(ctx, target, etag, start, length)
+		return o.ranges.OpenRange(ctx, target, etag, start, length, originData)
 	}
 
-	source, err := o.store.Open(ctx, target, etag)
+	source, err := o.store.Open(ctx, target, etag, originData)
 	if err != nil || source == nil {
 		return nil, err
 	}

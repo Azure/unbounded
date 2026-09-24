@@ -47,14 +47,32 @@ func (o *Origin) reference(target string) (ifaces.OriginRef, error) {
 	return ref, nil
 }
 
-func originContext(ctx context.Context) context.Context {
-	return registryauth.WithAuthorization(ctx, sdk.AuthorizationFromContext(ctx))
+func originContext(ctx context.Context, originData []byte) context.Context {
+	return registryauth.WithAuthorization(ctx, string(originData))
+}
+
+// Racer carries arbitrary bytes; only this adapter interprets them as a
+// delegated registry Authorization value.
+func validOriginData(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+
+	for _, b := range data {
+		if b < 32 || b > 126 {
+			return false
+		}
+	}
+
+	auth := string(data)
+
+	return strings.TrimSpace(auth) == auth && registryauth.Normalize(auth) != ""
 }
 
 // Stat prefers local metadata, using registry HEAD when local media type is
 // unknown. It never guesses a manifest/index media type or reads payload.
-func (o *Origin) Stat(ctx context.Context, target string) (sdk.Metadata, error) {
-	if auth := sdk.AuthorizationFromContext(ctx); auth != "" && registryauth.Normalize(auth) == "" {
+func (o *Origin) Stat(ctx context.Context, target string, originData []byte) (sdk.Metadata, error) {
+	if !validOriginData(originData) {
 		return sdk.Metadata{}, &sdk.HTTPError{StatusCode: http.StatusUnauthorized}
 	}
 
@@ -78,7 +96,7 @@ func (o *Origin) Stat(ctx context.Context, target string) (sdk.Metadata, error) 
 	}
 
 	if size < 0 {
-		meta, headErr := o.Registry.HeadMetadata(originContext(ctx), ref)
+		meta, headErr := o.Registry.HeadMetadata(originContext(ctx, originData), ref)
 		if headErr != nil {
 			return sdk.Metadata{}, originError(headErr)
 		}
@@ -91,8 +109,8 @@ func (o *Origin) Stat(ctx context.Context, target string) (sdk.Metadata, error) 
 	return sdk.Metadata{Size: size, ETag: `"` + ref.Digest.Hex() + `"`, ContentType: contentType, TTL: &ttl}, nil
 }
 
-func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, length int64) (io.ReadCloser, error) {
-	if auth := sdk.AuthorizationFromContext(ctx); auth != "" && registryauth.Normalize(auth) == "" {
+func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {
+	if !validOriginData(originData) {
 		return nil, &sdk.HTTPError{StatusCode: http.StatusUnauthorized}
 	}
 
@@ -134,7 +152,7 @@ func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, len
 		}
 	}
 
-	ctx = originContext(ctx)
+	ctx = originContext(ctx, originData)
 
 	meta, err := o.Registry.HeadMetadata(ctx, ref)
 	if err != nil {

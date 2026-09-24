@@ -5,6 +5,7 @@ package mirror_test
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -78,7 +79,8 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 	cache := racerUDS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cacheRequests.Add(1)
 
-		if r.Header.Get("Authorization") != "Bearer delegated" {
+		originData, err := base64.StdEncoding.Strict().DecodeString(r.Header.Get("Racer-Origin-Data"))
+		if err != nil || string(originData) != "Bearer delegated" {
 			t.Error("lost cache authorization")
 		}
 

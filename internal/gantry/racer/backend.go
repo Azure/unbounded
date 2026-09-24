@@ -42,7 +42,7 @@ func (b *Backend) Open(ctx context.Context, ref ifaces.OriginRef) (*sdk.Object, 
 		return nil, ErrQuarantined
 	}
 
-	view, err := b.Client.WithAuthorization(registryauth.Authorization(ctx))
+	view, err := b.Client.WithOriginData([]byte(registryauth.Authorization(ctx)))
 	if err != nil {
 		return nil, err
 	}

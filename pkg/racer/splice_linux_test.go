@@ -69,7 +69,7 @@ func TestSpliceVerifiedContentAndReuse(t *testing.T) {
 					return
 				}
 
-				if r.Header.Get("Authorization") != "Bearer stream" {
+				if originData, status := decodeOriginData(r.Header); status != 0 || string(originData) != "Bearer stream" {
 					t.Error("lost authorization")
 				}
 
@@ -84,7 +84,7 @@ func TestSpliceVerifiedContentAndReuse(t *testing.T) {
 				_, _ = w.Write(data)
 			}), ClientOptions{})
 
-			c, err := c.WithAuthorization("Bearer stream")
+			c, err := c.WithOriginData([]byte("Bearer stream"))
 			if err != nil {
 				t.Fatal(err)
 			}
