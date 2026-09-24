@@ -51,10 +51,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
-	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
-	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -72,19 +70,13 @@ type AuthenticationChallenger interface {
 
 // Server is the mirror HTTP handler.
 type Server struct {
-	cfg                  *config.Config
-	store                ifaces.LocalContentStore
-	origin               ifaces.OriginPuller
-	auth                 AuthenticationChallenger
-	logger               *slog.Logger
-	metrics              metricsHooks
-	racer                *gantryracer.Backend
-	onRacerStream        func(sdk.TransferStats, bool, error)
-	onRacerFallback      func()
-	racerMu              sync.Mutex
-	racerConnections     map[net.Conn]context.CancelFunc
-	manifestObservations chan struct{}
-	racerAdmission       chan struct{}
+	cfg     *config.Config
+	store   ifaces.LocalContentStore
+	origin  ifaces.OriginPuller
+	auth    AuthenticationChallenger
+	logger  *slog.Logger
+	metrics metricsHooks
+	racer   *racerState
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -198,13 +190,9 @@ type Server struct {
 // 503 immediately. Idempotent. Safe to call from a signal handler.
 func (s *Server) Drain() {
 	s.draining.Store(true)
-	s.racerMu.Lock()
-	defer s.racerMu.Unlock()
 
-	for conn, cancel := range s.racerConnections {
-		cancel()
-
-		_ = conn.Close() //nolint:errcheck // Interrupt hijacked streams during shutdown.
+	if s.racer != nil {
+		s.racer.drain()
 	}
 }
 
@@ -369,10 +357,10 @@ func WithLiveStreamThrough() Option {
 }
 
 // WithOriginStreamMetrics wires the the live-stream-through origin
-// counters. Hooks fire only from the direct-origin stream-through path:
-// start at the moment the mirror commits to the origin path, completed
-// after the full body has been proxied and the final digest check passes,
-// and failed on any terminal error before that completion point.
+// counters, including Racer's registry fallback. Start fires when the mirror
+// commits to the origin path, completed after the full body has been proxied,
+// and failed on any terminal error before that completion point. Only the
+// direct backend checks the digest in-process; completion never implies commit.
 func WithOriginStreamMetrics(started, completed, failed func(kind string)) Option {
 	return func(s *Server) {
 		s.metrics.onOriginStreamStarted = started
@@ -383,8 +371,9 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 
 // WithLiveStreamCompletedHook registers a callback fired after any live
 // stream-through response (peer, origin, or Racer) fully completes. Direct peer
-// and origin paths also check the digest in-process; Racer forwarding leaves
-// OCI digest verification to containerd. Completion does not imply a commit.
+// and origin paths in the direct backend also check the digest in-process;
+// Racer forwarding and its registry fallback leave OCI digest verification to
+// containerd. Completion does not imply a commit.
 // Callers use this to correlate the response with a later containerd
 // inventory observation without forcing the mirror to ingest the bytes
 // itself.
@@ -652,15 +641,14 @@ func WithStartupReadinessGate() Option {
 	return func(s *Server) { s.startupGated = true }
 }
 
-// New builds a Server bound to the given local content store and origin.
+// New builds a direct-backend Server bound to the local content store and origin.
+// Use NewRacer to construct a Racer-backend Server.
 func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
-	limit := cfg.RacerMaxConcurrentTransfers
-	if limit <= 0 {
-		limit = 64
-	}
+	return newServer(cfg, store, origin, opts...)
+}
 
+func newServer(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
 	s := &Server{
-		racerAdmission:       make(chan struct{}, limit),
 		cfg:                  cfg,
 		store:                store,
 		origin:               origin,
@@ -772,7 +760,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
-	if s.cfg.ContentBackend == "racer" && r.Header.Get("Gantry-Mirrored") != "" {
+	if s.racer != nil && r.Header.Get("Gantry-Mirrored") != "" {
 		http.Error(w, "incompatible direct peer protocol", http.StatusConflict)
 		return
 	}
@@ -889,7 +877,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	s.bumpCacheMiss()
 
-	if s.cfg.ContentBackend == "racer" {
+	if s.racer != nil {
 		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
 		return
 	}
@@ -2664,11 +2652,11 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 		return
 	}
 
-	if s.manifestObservations != nil {
+	if s.racer != nil {
 		select {
-		case s.manifestObservations <- struct{}{}:
+		case s.racer.manifestObservations <- struct{}{}:
 			go func() {
-				defer func() { <-s.manifestObservations }()
+				defer func() { <-s.racer.manifestObservations }()
 
 				s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 			}()

@@ -148,7 +148,7 @@ steady-state transport speedup.
 
 ### Integrity, fallback, availability, and CPU qualifications
 
-Final Gantry uses `obj.Stream`, not `StreamVerified`
+Final Gantry uses `obj.Stream` without inline SHA-256 verification
 (`internal/gantry/mirror/racer.go:117-133`). Its `outcome="completed"` means full
 response forwarding, **not digest verification or a containerd commit**. Tee
 counters are expected to remain zero (`cmd/gantry/agent_racer.go:212-237`;
