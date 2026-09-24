@@ -124,6 +124,10 @@ type manualBootstrapHandler struct {
 	// verify it afterwards.
 	agentSHA256 string
 
+	// agentHash is agentSHA256 in Ignition's form, set by validate for the
+	// ignition variant.
+	agentHash string
+
 	// hostPrefix is the installation prefix for the agent's own host-side
 	// files. Required by the ignition variant, whose target hosts mount /usr
 	// read-only.
@@ -369,41 +373,41 @@ func parseAdditionalHostDevice(value string) (string, error) {
 	return value, nil
 }
 
-// validateIgnitionInput holds the rules that only apply to the Ignition
-// variant, in one place so the early check and the renderer cannot disagree.
-//
-// The prefix is a parameter because the two callers legitimately hold different
-// values of it. validate sees the flag, before a config exists. The renderer
-// sees the config it is about to interpolate, which is the value that actually
-// reaches the host. Checking the flag in both places would leave the renderer
-// trusting something it does not use.
+// validateIgnitionInput checks the rules that only apply to the Ignition
+// variant, and returns the agent digest in Ignition's form. It runs before any
+// cluster contact, so a mistake is reported without waiting on the cluster.
 //
 // Every input is required rather than defaulted, because this variant has no
 // shell to fall back on. Ignition declares state; it cannot resolve a version,
 // detect an architecture, or extract an archive at boot, so the artifact has to
 // be named exactly, and a host that finds out otherwise has no way to report it.
-func (h *manualBootstrapHandler) validateIgnitionInput(prefix string) error {
+func (h *manualBootstrapHandler) validateIgnitionInput() (string, error) {
 	// Ignition writes the binary itself, so an unset prefix would place it
 	// under the default /usr/local and fail at first boot on exactly the
 	// immutable hosts this variant exists to serve.
-	if isEmpty(prefix) {
-		return fmt.Errorf("--host-prefix is required with --variant %s: Ignition places the agent binary itself, and the default prefix /usr/local is read-only on immutable hosts", variantIgnition)
+	if isEmpty(h.hostPrefix) {
+		return "", fmt.Errorf("--host-prefix is required with --variant %s: Ignition places the agent binary itself, and the default prefix /usr/local is read-only on immutable hosts", variantIgnition)
 	}
 
 	source := strings.TrimSpace(h.agentURL)
 	if source == "" {
-		return fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
+		return "", fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
 	}
 
 	if !ignitionRemoteFetchable(source) {
-		return fmt.Errorf("--agent-url %q cannot be fetched by Ignition; use an http, https, tftp, s3, arn, or gs URL", source)
+		return "", fmt.Errorf("--agent-url %q cannot be fetched by Ignition; use an http, https, tftp, s3, arn, or gs URL", source)
 	}
 
 	if isEmpty(h.agentSHA256) {
-		return fmt.Errorf("--agent-sha256 is required with --variant %s; the digest for each release binary is published in checksums.txt", variantIgnition)
+		return "", fmt.Errorf("--agent-sha256 is required with --variant %s; the digest for each release binary is published in checksums.txt", variantIgnition)
 	}
 
-	return nil
+	hash, err := ignitionHashFromSHA256(strings.TrimSpace(h.agentSHA256))
+	if err != nil {
+		return "", fmt.Errorf("invalid --agent-sha256: %w", err)
+	}
+
+	return hash, nil
 }
 
 func (h *manualBootstrapHandler) validate() error {
@@ -416,9 +420,12 @@ func (h *manualBootstrapHandler) validate() error {
 	// unparseable variant is reported by parseBootstrapVariant later; this only
 	// adds rules for the one variant that has them.
 	if variant, err := parseBootstrapVariant(h.variant); err == nil && variant == variantIgnition {
-		if err := h.validateIgnitionInput(h.hostPrefix); err != nil {
+		hash, err := h.validateIgnitionInput()
+		if err != nil {
 			return err
 		}
+
+		h.agentHash = hash
 	}
 
 	// Rejected here rather than on the host. The prefix is interpolated into
@@ -923,11 +930,6 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 		return "", fmt.Errorf("marshaling agent config: %w", err)
 	}
 
-	binaryFile, err := h.ignitionAgentBinaryFile(cfg)
-	if err != nil {
-		return "", err
-	}
-
 	config := ignitionConfig{
 		Ignition: ignitionVersion{Version: ignitionSpecVersion},
 		Storage: &ignitionStorage{
@@ -942,7 +944,7 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 					Overwrite: ptr.To(true),
 					Contents:  ignitionContents{Source: ignitionDataURL(string(configJSON) + "\n")},
 				},
-				*binaryFile,
+				h.ignitionAgentBinaryFile(cfg),
 			},
 		},
 		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
@@ -964,51 +966,21 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 // derived from the configured host prefix so that a host with a read-only /usr
 // puts it somewhere writable.
 func ignitionAgentBinDir(cfg *provision.UnboundedAgentConfig) string {
-	prefix := ""
-	if cfg != nil {
-		prefix = cfg.HostPrefix
-	}
-
-	return goalstates.ResolveHostPaths(prefix).BinDir
+	return goalstates.ResolveHostPaths(cfg.HostPrefix).BinDir
 }
 
 // ignitionAgentBinaryFile fetches the agent binary straight to its final
-// location, verified against a caller-supplied digest.
-//
-// Every input here is required rather than defaulted, because this variant has
-// no shell to fall back on. Ignition declares state; it cannot resolve a
-// version, detect an architecture, or extract an archive at boot, so the
-// artifact has to be named exactly and the host has no way to report that it
-// was not.
-func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.UnboundedAgentConfig) (*ignitionFile, error) {
-	// nil is impossible from the command path but would otherwise panic below,
-	// and an empty prefix reads the same to the caller either way.
-	prefix := ""
-	if cfg != nil {
-		prefix = cfg.HostPrefix
-	}
-
-	if err := h.validateIgnitionInput(prefix); err != nil {
-		return nil, err
-	}
-
-	source := strings.TrimSpace(h.agentURL)
-	digest := strings.TrimSpace(h.agentSHA256)
-
-	hash, err := ignitionHashFromSHA256(digest)
-	if err != nil {
-		return nil, fmt.Errorf("invalid --agent-sha256: %w", err)
-	}
-
-	return &ignitionFile{
+// location, verified against the digest validate parsed.
+func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.UnboundedAgentConfig) ignitionFile {
+	return ignitionFile{
 		Path:      ignitionAgentBinDir(cfg) + "/" + ignitionAgentBinaryName,
 		Mode:      ignitionModeScript,
 		Overwrite: ptr.To(true),
 		Contents: ignitionContents{
-			Source:       source,
-			Verification: &ignitionVerification{Hash: hash},
+			Source:       strings.TrimSpace(h.agentURL),
+			Verification: &ignitionVerification{Hash: h.agentHash},
 		},
-	}, nil
+	}
 }
 
 // ignitionBootstrapUnitContents renders the oneshot unit that bootstraps the

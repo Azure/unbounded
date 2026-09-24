@@ -1240,11 +1240,13 @@ func ignitionTestConfig(prefix string) *provision.UnboundedAgentConfig {
 
 const ignitionTestDigest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
+// ignitionTestHandler returns a handler as validate leaves it.
 func ignitionTestHandler() *manualBootstrapHandler {
 	return &manualBootstrapHandler{
 		logger:      discardLogger(),
 		agentURL:    "https://example.test/unbounded-agent-linux-amd64",
 		agentSHA256: ignitionTestDigest,
+		agentHash:   "sha256-" + ignitionTestDigest,
 		hostPrefix:  "/opt/unbounded",
 	}
 }
@@ -1302,67 +1304,6 @@ func TestRenderIgnitionHonorsTheHostPrefix(t *testing.T) {
 	require.Contains(t, out, "/var/lib/unbounded-agent/bin/unbounded-agent")
 	require.NotContains(t, out, "/usr/local/bin/unbounded-agent",
 		"nothing may resolve to the default prefix once one is configured")
-}
-
-// TestRenderIgnitionRefusesRatherThanGuessing covers each input this variant
-// cannot default.
-//
-// Ignition declares state: it cannot resolve a version, detect an architecture,
-// or extract an archive at boot. Every one of these failures would otherwise
-// land on a machine with no shell and no way to say what went wrong, so they
-// are refused at render time where the message reaches a person.
-func TestRenderIgnitionRefusesRatherThanGuessing(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name    string
-		mutate  func(*manualBootstrapHandler)
-		prefix  string
-		wantErr string
-	}{
-		{
-			name:    "no host prefix",
-			prefix:  "",
-			wantErr: "--host-prefix is required",
-		},
-		{
-			name:    "no agent url",
-			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "" },
-			wantErr: "--agent-url is required",
-		},
-		{
-			name:    "agent url Ignition cannot fetch",
-			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "oci://ghcr.io/azure/unbounded-agent:v1" },
-			wantErr: "cannot be fetched by Ignition",
-		},
-		{
-			name:    "no digest",
-			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "" },
-			wantErr: "--agent-sha256 is required",
-		},
-		{
-			name:    "malformed digest",
-			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "not-a-digest" },
-			wantErr: "invalid --agent-sha256",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			h := ignitionTestHandler()
-			prefix := "/opt/unbounded"
-
-			if tc.mutate != nil {
-				tc.mutate(h)
-			} else {
-				prefix = tc.prefix
-			}
-
-			_, err := h.renderIgnition(ignitionTestConfig(prefix))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tc.wantErr)
-		})
-	}
 }
 
 // TestIgnitionBootstrapUnitRunsOnEveryBoot pins the decision not to carry a
@@ -1457,7 +1398,9 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 		return h
 	}
 
-	require.NoError(t, withKubeconfig(base()).validate(), "a complete ignition invocation must pass")
+	valid := withKubeconfig(base())
+	require.NoError(t, valid.validate(), "a complete ignition invocation must pass")
+	require.Equal(t, "sha256-"+strings.Repeat("a", 64), valid.agentHash, "the renderer uses the digest validate parsed")
 
 	for name, tc := range map[string]struct {
 		mutate  func(*manualBootstrapHandler)
@@ -1478,6 +1421,10 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 		"no digest": {
 			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "" },
 			wantErr: "--agent-sha256 is required",
+		},
+		"malformed digest": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "not-a-digest" },
+			wantErr: "invalid --agent-sha256",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
