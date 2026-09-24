@@ -33,7 +33,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1alpha1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, coordinationv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -529,17 +529,25 @@ func TestPlanGolden(t *testing.T) {
 		"ClusterRole/gantry-agent " +
 		"ConfigMap/unbounded-system/gantry-config]"
 
-	var chairPlan strings.Builder
+	var (
+		chairPlan         strings.Builder
+		chairDependencies strings.Builder
+	)
+
 	for index := range 64 {
 		fmt.Fprintf(&chairPlan, "CreateIfAbsent Lease/unbounded-system/gantry-chair-%02d%s\n", index, after)
+		fmt.Fprintf(&chairDependencies, " Lease/unbounded-system/gantry-chair-%02d", index)
 	}
+
+	workloadAfter := strings.TrimSuffix(after, "]") + chairDependencies.String() +
+		" ServiceAccount/unbounded-system/gantry Role/unbounded-system/gantry-agent RoleBinding/unbounded-system/gantry-agent]"
 
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 Delete ClusterRoleBinding/gantry-agent
 Delete ClusterRole/gantry-agent
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
-Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
+Apply DaemonSet/unbounded-system/gantry [overridable]` + workloadAfter + `
 ` + chairPlan.String() + `Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply Role/unbounded-system/gantry-agent` + after + `
 Apply RoleBinding/unbounded-system/gantry-agent` + after + `
@@ -613,5 +621,88 @@ func TestChairLeasePredicateReconcilesDeletionOnly(t *testing.T) {
 	other.Name = "gantry-chair-99"
 	if predicate.Delete(event.DeleteEvent{Object: other}) {
 		t.Fatal("out-of-range chair name triggered reconciliation")
+	}
+}
+
+func TestExistingChairLeasesAreNotCreateDependencies(t *testing.T) {
+	objects := make([]client.Object, 0, 64)
+
+	for index := range 64 {
+		holder := fmt.Sprintf("live-chair-%02d", index)
+		objects = append(objects, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("gantry-chair-%02d", index), Namespace: component.DefaultNamespace},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		})
+	}
+
+	env := testEnv(t, objects...)
+	// The live read is authoritative even if the manager cache sees no chairs.
+	env.APIReader = env.Client
+
+	env.Client = testEnv(t).Client
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			if missing {
+				if err := env.APIReader.(client.Client).Delete(t.Context(), objects[0]); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			creates, dependencies := 0, 0
+
+			for _, op := range plan.Operations {
+				if op.Object.GetKind() == "Lease" {
+					creates++
+
+					if !missing || op.Object.GetName() != "gantry-chair-00" || op.Kind != component.OpCreateIfAbsent {
+						t.Fatalf("unexpected chair operation: %+v", op)
+					}
+				}
+
+				if op.Kind != component.OpDelete && op.Object.GetKind() == "DaemonSet" {
+					for _, dependency := range op.DependsOn {
+						if dependency.GVK.Kind == "Lease" {
+							dependencies++
+						}
+					}
+				}
+			}
+
+			want := 0
+			if missing {
+				want = 1
+			}
+
+			if creates != want || dependencies != want {
+				t.Fatalf("creates=%d dependencies=%d want=%d", creates, dependencies, want)
+			}
+
+			var lease coordinationv1.Lease
+			if err := env.APIReader.Get(t.Context(), client.ObjectKeyFromObject(objects[1]), &lease); err != nil {
+				t.Fatal(err)
+			}
+
+			if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "live-chair-01" {
+				t.Fatal("existing chair holder changed")
+			}
+		})
+	}
+}
+
+func TestChairLeaseReadFailurePreservesCurrentWorkload(t *testing.T) {
+	failure := errors.New("lease list denied")
+	env := testEnv(t)
+	env.APIReader = fake.NewClientBuilder().WithScheme(testScheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error { return failure },
+	}).Build()
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if plan != nil || !errors.Is(err, failure) {
+		t.Fatalf("plan=%v err=%v", plan, err)
 	}
 }

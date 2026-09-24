@@ -317,7 +317,7 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 }
 
 func (c *campaign) createSite(site string) {
-	c.create(siteResource, map[string]any{"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Site", "metadata": map[string]any{"name": site, "labels": map[string]any{"campaign": site}}, "spec": map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}, "podCidrAssignments": []any{map[string]any{"cidrBlocks": []any{"10.1.0.0/16"}}}, "components": map[string]any{"racer": map[string]any{"enabled": true, "cacheSize": "1Gi"}}}})
+	c.create(siteResource, map[string]any{"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Site", "metadata": map[string]any{"name": site, "labels": map[string]any{"campaign": site}}, "spec": map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}, "podCidrAssignments": []any{map[string]any{"cidrBlocks": []any{"10.1.0.0/16"}}}}})
 	c.create(cacheResource, map[string]any{"apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache", "metadata": map[string]any{"name": site}, "spec": map[string]any{"siteSelector": map[string]any{"matchLabels": map[string]any{"campaign": site}}}})
 }
 

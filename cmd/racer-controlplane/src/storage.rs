@@ -113,9 +113,9 @@ pub fn parse_cache_size(value: &str) -> Result<u64> {
     Ok(bytes.div_ceil(ALIGNMENT) * ALIGNMENT)
 }
 
-/// Only absence permits inheritance; an invalid present override is an error.
-pub fn resolve_cache_size(node: Option<&str>, site: Option<&str>) -> Result<u64> {
-    match node.or(site) {
+/// Only an absent Node annotation uses 10Gi; an invalid present value is an error.
+pub fn resolve_cache_size(node: Option<&str>) -> Result<u64> {
+    match node {
         Some(value) => parse_cache_size(value),
         None => Ok(DEFAULT_BYTES),
     }
@@ -157,10 +157,10 @@ impl StoragePolicy {
 
     /// Pure in-memory last-good update. Invalid intent records diagnostics but
     /// never offers the retained capacity as a replacement authoritative policy.
-    pub fn resolve(&self, universe: &str, node: Option<&str>, site: Option<&str>) -> Result<Self> {
+    pub fn resolve(&self, universe: &str, node: Option<&str>) -> Result<Self> {
         let mut next = self.clone();
         next.universe = universe.into();
-        match resolve_cache_size(node, site) {
+        match resolve_cache_size(node) {
             Ok(bytes) => {
                 next.validation_error = None;
                 if bytes != next.desired_bytes {

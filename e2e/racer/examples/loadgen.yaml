@@ -1,4 +1,4 @@
-# Test workload only. Install the operator, enable Racer on Site racer-a, and
+# Test workload only. Install the operator, create Site racer-a, and
 # label qualified Nodes unbounded-cloud.io/site=racer-a before applying.
 apiVersion: apps/v1
 kind: DaemonSet

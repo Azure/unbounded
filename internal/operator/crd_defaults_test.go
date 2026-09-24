@@ -78,24 +78,28 @@ func TestSiteCRDDefaultsTokenRefresherEnabled(t *testing.T) {
 	}
 }
 
+// Keep the historical test name while asserting the P2PCache-driven contract:
+// Sites no longer expose a Racer component or an installation vote.
 func TestSiteCRDRacerIsOptIn(t *testing.T) {
 	crd := findSiteCRD(t)
+	checked := false
+
 	for _, version := range crd.Spec.Versions {
 		if version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
 			continue
 		}
 
-		racer := nestedSchemaProp(t, version.Schema.OpenAPIV3Schema, "spec", "components", "racer")
+		checked = true
 
-		enabled := nestedSchemaProp(t, racer, "enabled")
-		if racer.Default == nil || string(racer.Default.Raw) != `{"enabled":true}` || enabled.Default != nil || enabled.Type != "boolean" {
-			t.Fatal("Racer must default on like Gantry")
+		components := nestedSchemaProp(t, version.Schema.OpenAPIV3Schema, "spec", "components")
+		if _, exists := components.Properties["racer"]; exists {
+			t.Errorf("Site CRD version %s still exposes removed spec.components.racer", version.Name)
 		}
-
-		return
 	}
 
-	t.Fatal("Site CRD has no version schema")
+	if !checked {
+		t.Fatal("Site CRD has no version schema")
+	}
 }
 
 // nestedSchemaProp walks Properties down the given path, failing the test if any

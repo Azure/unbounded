@@ -10,8 +10,6 @@ spec:
     - cidrBlocks: [10.244.0.0/16]
   manageCniPlugin: false
   components:
-    racer:
-      enabled: true
     machina:
       enabled: false
     metalman:

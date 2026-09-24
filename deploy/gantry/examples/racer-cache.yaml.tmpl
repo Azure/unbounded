@@ -1,13 +1,13 @@
-# Optional standalone Gantry/Racer integration. The operator creates this cache
-# automatically from gantry-config; do not apply this example for other origins.
+# User-managed Gantry backing cache. Apply exactly one annotated cache to select
+# Racer for operator-managed Gantry. The operator never creates or edits it.
 apiVersion: racer.unbounded-cloud.io/v1alpha1
 kind: P2PCache
 metadata:
   name: gantry
-  labels:
-    unbounded-cloud.io/gantry-cache: "true"
+  annotations:
+    unbounded-cloud.io/gantry-backing: "true"
 spec:
-  # Every Racer-enabled Site must run Gantry on all its participating nodes.
+  # Empty is required: every live Site participates, with Gantry on every node.
   siteSelector: {}
   cacheGeneration: 1
   maxCandidateAttempts: 3

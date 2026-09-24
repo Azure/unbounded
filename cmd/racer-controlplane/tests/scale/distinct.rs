@@ -699,7 +699,7 @@ async fn queued_admission_refreshes_state_and_fails_closed() {
     headers.insert("x-racer-boot", identity.boot_id.parse().unwrap());
     headers.insert("x-racer-storage-policy", "1".parse().unwrap());
     let policy = crate::storage::StoragePolicy::for_node("queued")
-        .resolve("queued", Some("1Gi"), None)
+        .resolve("queued", Some("1Gi"))
         .unwrap();
     state.install_policy(Arc::new(policy));
     for action in ["publication", "revocation", "authority", "cancellation"] {
@@ -729,7 +729,7 @@ async fn queued_admission_refreshes_state_and_fails_closed() {
                 generation.nodes.get_mut("queued").unwrap().ip = Some("10.0.0.2".parse().unwrap());
                 state.install(Arc::new(generation.clone())).unwrap();
                 let mut policy = crate::storage::StoragePolicy::for_node("queued")
-                    .resolve("queued", Some("2Gi"), None)
+                    .resolve("queued", Some("2Gi"))
                     .unwrap();
                 policy.version = 2;
                 state.install_policy(Arc::new(policy));

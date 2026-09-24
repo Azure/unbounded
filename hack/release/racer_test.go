@@ -15,27 +15,40 @@ func TestRacerTargets(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name, sites, account, deployment, dataplane string
-		want                                        []string
-		fail                                        bool
+		name, caches, account, deployment, dataplane string
+		want                                         []string
+		fail                                         bool
 	}{
-		{name: "absent", sites: `{"items":[]}`},
-		{name: "not explicitly enabled", sites: `{"items":[{}, {"spec":{"components":{"racer":{}}}}, {"spec":{"components":{"racer":{"enabled":false}}}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
-		{name: "explicitly disabled", sites: `{"items":[{"spec":{"components":{"racer":{"enabled":false}}}}]}`},
-		{name: "retained account", sites: `{"items":[]}`, account: `{}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
-		{name: "retained deployment", sites: `{"items":[]}`, deployment: `{}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
-		{name: "retained dataplane", sites: `{"items":[]}`, dataplane: `{}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
-		{name: "enabled before creation", sites: `{"items":[{"metadata":{"name":"edge"},"spec":{"components":{"racer":{"enabled":true}}}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
-		{name: "malformed sites", sites: `{}`, fail: true},
+		{name: "absent", caches: `{"items":[]}`},
+		{name: "live and deleting caches", caches: `{"items":[{"metadata":{"name":"live"}}, {"metadata":{"name":"deleting","deletionTimestamp":"2026-09-24T00:00:00Z"}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
+		{name: "only deleting caches", caches: `{"items":[{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}]}`},
+		{name: "retained account", caches: `{"items":[]}`, account: `{}`},
+		{name: "retained deployment", caches: `{"items":[]}`, deployment: `{}`, want: []string{"deploy/racer-controlplane"}},
+		{name: "retained dataplane", caches: `{"items":[]}`, dataplane: `{}`, want: []string{"ds/racer-dataplane"}},
+		{name: "both retained workloads", caches: `{"items":[]}`, deployment: `{}`, dataplane: `{}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
+		{name: "terminating deployment", caches: `{"items":[]}`, deployment: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`},
+		{name: "terminating dataplane", caches: `{"items":[]}`, dataplane: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`},
+		{name: "live deployment and terminating dataplane", caches: `{"items":[]}`, deployment: `{"metadata":{"deletionTimestamp":null}}`, dataplane: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`, want: []string{"deploy/racer-controlplane"}},
+		{name: "terminating deployment and live dataplane", caches: `{"items":[]}`, deployment: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`, dataplane: `{"metadata":{"deletionTimestamp":null}}`, want: []string{"ds/racer-dataplane"}},
+		{name: "deleting cache and retained deployment", caches: `{"items":[{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}]}`, deployment: `{}`, want: []string{"deploy/racer-controlplane"}},
+		{name: "cache before workload creation", caches: `{"items":[{"metadata":{"name":"edge"},"spec":{"siteSelector":{"matchLabels":{"missing":"site"}}}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
+		{name: "live cache and partial installation", caches: `{"items":[{}]}`, deployment: `{}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
+		{name: "live cache and terminating workloads", caches: `{"items":[{}]}`, deployment: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`, dataplane: `{"metadata":{"deletionTimestamp":"2026-09-24T00:00:00Z"}}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane"}},
+		{name: "malformed caches", caches: `{}`, fail: true},
+		{name: "malformed deployment", caches: `{"items":[]}`, deployment: `{`, fail: true},
+		{name: "malformed dataplane", caches: `{"items":[]}`, dataplane: `{`, fail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-sites.unbounded-cloud.io", replyOf(tc.sites))
+			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(tc.caches))
 			f.set("getjson-serviceaccount_racer-controlplane", replyOf(tc.account))
 			f.set("getjson-deploy_racer-controlplane", replyOf(tc.deployment))
 			f.set("getjson-ds_racer-dataplane", replyOf(tc.dataplane))
 
 			output, code := f.runScript("racer-targets.sh", nil)
+			requireNotContains(t, f.calls(), "sites.unbounded-cloud.io")
+			requireNotContains(t, f.calls(), "serviceaccount/racer-controlplane")
+
 			if tc.fail {
 				if code == 0 {
 					t.Fatalf("unexpected success: %s", output)
@@ -68,7 +81,7 @@ func TestRacerTargetNameEncodingAndQueryFailures(t *testing.T) {
 	for _, name := range []string{"edge.a", strings.Repeat("a", 49), strings.Repeat("a", 57), strings.Repeat("a", 58), "edge-1"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-sites.unbounded-cloud.io", replyOf(fmt.Sprintf(`{"items":[{"metadata":{"name":%q},"spec":{"components":{"racer":{"enabled":true}}}}]}`, name)))
+			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(fmt.Sprintf(`{"items":[{"metadata":{"name":%q}}]}`, name)))
 			output, code := f.runScript("racer-targets.sh", nil)
 			requireCode(t, code, 0, output)
 
@@ -76,12 +89,21 @@ func TestRacerTargetNameEncodingAndQueryFailures(t *testing.T) {
 		})
 	}
 
-	for _, key := range []string{"sites.unbounded-cloud.io", "serviceaccount_racer-controlplane", "deploy_racer-controlplane", "ds_racer-dataplane"} {
+	for _, key := range []string{"p2pcaches.racer.unbounded-cloud.io", "serviceaccount_racer-controlplane", "deploy_racer-controlplane", "ds_racer-dataplane"} {
 		t.Run(key, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-sites.unbounded-cloud.io", replyOf(`{"items":[]}`))
+			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(`{"items":[]}`))
 			f.set("getjson-"+key, reply{exit: 1, stderr: "Forbidden"})
+
 			output, code := f.runScript("racer-targets.sh", nil)
+			if key == "serviceaccount_racer-controlplane" {
+				requireCode(t, code, 0, output)
+				requireContains(t, output, "no rollout targets")
+				requireNotContains(t, f.calls(), "serviceaccount/racer-controlplane")
+
+				return
+			}
+
 			requireCode(t, code, 1, output)
 			requireNotContains(t, output, "no rollout targets")
 		})
@@ -219,6 +241,7 @@ func TestRacerRolloutAndLiveProbeFailures(t *testing.T) {
 
 				requireCode(t, code, want, output)
 				requireNotContains(t, f.calls(), "rollout status")
+				requireNotContains(t, f.calls(), "ds/racer-dataplane")
 			})
 		}
 	}
@@ -269,6 +292,7 @@ func TestRacerDataplaneBootstrapVersionGate(t *testing.T) {
 	requireCode(t, code, 0, output)
 	requireContains(t, output, "does not reference :"+releaseTag+" yet")
 	requireContains(t, f.calls(), "rollout status ds/racer-dataplane")
+	requireNotContains(t, f.calls(), "deploy/racer-controlplane")
 }
 
 func TestRacerRolloutRequiresReplacementAndLeader(t *testing.T) {

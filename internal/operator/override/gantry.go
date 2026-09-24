@@ -5,7 +5,9 @@ package override
 
 import (
 	"fmt"
+	"path"
 	"reflect"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -50,17 +52,19 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 
 		found = true
 
-		if !reflect.DeepEqual(c.Command, oldContainer.Command) || !reflect.DeepEqual(configArgs(c.Args), configArgs(oldContainer.Args)) || !reflect.DeepEqual(c.EnvFrom, oldContainer.EnvFrom) {
-			return fmt.Errorf("gantry backend/config source is owned by gantry-config config.yaml; command, config/backend flags and envFrom cannot redirect it")
+		// Keep the generated prefix intact: inserting a positional argument or
+		// '--' before the flags makes Go's flag parser stop before selection.
+		if !reflect.DeepEqual(c.Command, oldContainer.Command) || len(c.Args) < len(oldContainer.Args) || !slices.Equal(c.Args[:len(oldContainer.Args)], oldContainer.Args) || !reflect.DeepEqual(configArgs(c.Args), configArgs(oldContainer.Args)) || !reflect.DeepEqual(c.EnvFrom, oldContainer.EnvFrom) {
+			return fmt.Errorf("gantry backend selection is operator-owned from P2PCache annotations; command, generated args, config/backend flags and envFrom cannot redirect it")
 		}
 
 		for _, env := range c.Env {
 			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_NAME" {
-				return fmt.Errorf("set content_backend and racer_cache_name in gantry-config config.yaml, not %s", env.Name)
+				return fmt.Errorf("gantry backend selection is operator-owned from P2PCache annotations, not %s", env.Name)
 			}
 		}
 
-		if !reflect.DeepEqual(namedMount(c.VolumeMounts, "config"), namedMount(oldContainer.VolumeMounts, "config")) {
+		if !reflect.DeepEqual(configMounts(c.VolumeMounts), configMounts(oldContainer.VolumeMounts)) {
 			return fmt.Errorf("gantry config mount is owned by gantry-config config.yaml")
 		}
 	}
@@ -70,6 +74,14 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 	}
 
 	oldPod, newPod := before.Spec.Template.Spec, after.Spec.Template.Spec
+	if !reflect.DeepEqual(oldPod.AutomountServiceAccountToken, newPod.AutomountServiceAccountToken) {
+		return fmt.Errorf("gantry service-account token selection is operator-owned")
+	}
+
+	if before.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] != after.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] {
+		return fmt.Errorf("gantry cache UID rollout annotation is operator-owned")
+	}
+
 	if !reflect.DeepEqual(namedVolume(oldPod.Volumes, "config"), namedVolume(newPod.Volumes, "config")) {
 		return fmt.Errorf("gantry config volume is owned by gantry-config config.yaml")
 	}
@@ -80,7 +92,7 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 		}
 
 		for _, c := range newPod.Containers {
-			if c.Name == "gantry" && (!reflect.DeepEqual(c.VolumeMounts, oldContainer.VolumeMounts) || !reflect.DeepEqual(c.SecurityContext, oldContainer.SecurityContext)) {
+			if c.Name == "gantry" && (!reflect.DeepEqual(c.VolumeMounts, oldContainer.VolumeMounts) || !reflect.DeepEqual(c.SecurityContext, oldContainer.SecurityContext) || !reflect.DeepEqual(c.Ports, oldContainer.Ports)) {
 				return fmt.Errorf("gantry Racer socket mounts and security context are operator-owned")
 			}
 		}
@@ -178,14 +190,19 @@ func configArgs(args []string) []string {
 	return selected
 }
 
-func namedMount(mounts []corev1.VolumeMount, name string) *corev1.VolumeMount {
+// A second volume mounted over the config file (or any parent directory) can
+// redirect the source without changing the named config mount itself.
+func configMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
+	var selected []corev1.VolumeMount
+
 	for _, mount := range mounts {
-		if mount.Name == name {
-			return &mount
+		p := path.Clean(mount.MountPath)
+		if mount.Name == "config" || p == "/" || p == "/etc" || p == "/etc/gantry" || strings.HasPrefix(p, "/etc/gantry/") {
+			selected = append(selected, mount)
 		}
 	}
 
-	return nil
+	return selected
 }
 
 func namedVolume(volumes []corev1.Volume, name string) *corev1.Volume {

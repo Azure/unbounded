@@ -1088,7 +1088,7 @@ fn seed(api: &FakeApi, state: &CaState) {
     api.put("/apis/coordination.k8s.io/v1/namespaces/system/leases/racer-controlplane", json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"racer-controlplane"},"spec":{"holderIdentity":"term-a","leaseDurationSeconds":3600,"renewTime":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()}}));
     use base64::Engine;
     api.put("/api/v1/namespaces/system/secrets/racer-ca", json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"racer-ca"},"data":{"state.json":base64::engine::general_purpose::STANDARD.encode(state.to_image().unwrap().metadata)}}));
-    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-a","uid":"site-uid","labels":{"zone":"a"}},"spec":{"components":{"racer":{"enabled":true}}}}));
+    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-a","uid":"site-uid","labels":{"zone":"a"}},"spec":{}}));
     api.put("/api/v1/nodes/node-a", json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a","uid":"node-uid","labels":{"unbounded-cloud.io/site":"site-a","kubernetes.io/os":"linux"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}));
     api.put("/api/v1/namespaces/system/pods/racer-a", json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"racer-a","namespace":"system","uid":"pod-uid","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds-uid","controller":true}]},"spec":{"nodeName":"node-a","serviceAccountName":"racer-dataplane"},"status":{"phase":"Running","podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}));
 }
@@ -1380,12 +1380,8 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     until(|| api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/cache-a"].pointer("/status/participants/ready") == Some(&json!(1))).await;
     feedback.abort();
     let _ = feedback.await;
-    // Site switches are installation votes, not runtime membership filters.
-    let mut site =
-        api.inner.lock().unwrap().objects["/apis/unbounded-cloud.io/v1alpha3/sites/site-a"].clone();
-    site["spec"]["components"]["racer"]["enabled"] = json!(false);
-    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", site);
-    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-b", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-b","uid":"site-b-uid"},"spec":{"components":{"racer":{"enabled":false}}}}));
+    // Sites define membership without any Racer component configuration.
+    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-b", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-b","uid":"site-b-uid"},"spec":{}}));
     let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
     node["metadata"]["labels"]["unbounded-cloud.io/site"] = json!("site-b");
     api.put("/api/v1/nodes/node-a", node);
@@ -1465,12 +1461,25 @@ fn old_new_scope_relist_and_process_bound_feedback() {
         .event(Kind::Node, Event::InitDone, &mut dirty, &mut storage)
         .unwrap();
     assert_eq!(dirty, BTreeSet::from(["a".into(), "b".into()]));
+    storage.clear();
+    dirty.clear();
+    let site: DynamicObject = serde_json::from_value(json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"b","uid":"site-b"},"spec":{}})).unwrap();
+    for event in [Event::Apply(site.clone()), Event::Delete(site)] {
+        index
+            .event(Kind::Site, event, &mut dirty, &mut storage)
+            .unwrap();
+        assert!(dirty.contains("b"));
+        assert!(
+            storage.is_empty(),
+            "Site changes must not drive Node capacity resolution"
+        );
+    }
     let mut headers = http::HeaderMap::new();
     headers.insert("x-racer-storage-policy", "1".parse().unwrap());
     let now = std::time::Instant::now();
     let mut report = Observation::observe(None, "pod", "boot", &headers, now);
     let policy = racer_controlplane::storage::StoragePolicy::new(identity("node", "u"), [1; 32])
-        .resolve("a", Some("512Mi"), None)
+        .resolve("a", Some("512Mi"))
         .unwrap();
     report.offer(Some(&policy));
     for (name, value) in [
@@ -1509,6 +1518,11 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
         Arc::new(move || Some(security.clone()));
     let api = FakeApi::new();
     seed(&api, &credentials.context.state);
+    // An orphan Node still receives a storage policy without any Site object.
+    api.put(
+        "/api/v1/nodes/orphan",
+        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"orphan","uid":"orphan-uid"}}),
+    );
     let (client, api_task) = api.serve().await;
     let mut options = RuntimeOptions::new("system");
     options.retry_interval = Duration::from_millis(50);
@@ -1519,6 +1533,21 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
     until(|| runtime.ready()).await;
     let good = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
     let good_policy = good.storage_policy.clone().unwrap();
+    assert_eq!(
+        good_policy.desired_bytes,
+        racer_controlplane::storage::DEFAULT_BYTES
+    );
+    until(|| {
+        api.inner.lock().unwrap().objects["/api/v1/nodes/orphan"]
+            .pointer("/metadata/annotations/racer.unbounded-cloud.io~1cache-status")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|s| {
+                s["source"] == "default"
+                    && s["effectiveBytes"] == racer_controlplane::storage::DEFAULT_BYTES
+            })
+    })
+    .await;
     assert_eq!(
         good_policy.identity,
         racer_controlplane::model::identity_bytes("storage", "node-uid")
@@ -1670,6 +1699,40 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
     assert!(policy.version > good_policy.version);
     assert_eq!(policy.desired_bytes, 512 << 20);
 
+    // Deleting the annotation restores the built-in default as a live resize.
+    let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    node["metadata"]["annotations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("racer.unbounded-cloud.io/cache-size");
+    api.put("/api/v1/nodes/node-a", node);
+    let defaulted = desired(
+        restarted.router(),
+        &credentials.peer,
+        &credentials.boot,
+        &recovered.cursor,
+    )
+    .await;
+    let default_policy = defaulted.storage_policy.unwrap();
+    assert_eq!(default_policy.identity, policy.identity);
+    assert!(default_policy.version > policy.version);
+    assert_eq!(
+        default_policy.desired_bytes,
+        racer_controlplane::storage::DEFAULT_BYTES
+    );
+    until(|| {
+        api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"]
+            .pointer("/metadata/annotations/racer.unbounded-cloud.io~1cache-status")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|s| {
+                s["source"] == "default"
+                    && s["requested"] == "10Gi"
+                    && s["effectiveBytes"] == racer_controlplane::storage::DEFAULT_BYTES
+            })
+    })
+    .await;
+
     api.inner.lock().unwrap().objects.remove(&format!(
         "/api/v1/namespaces/system/configmaps/{CHECKPOINT}"
     ));
@@ -1692,7 +1755,7 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
 fn in_memory_publication_rejects_regression_and_preserves_last_good() {
     use racer_controlplane::{publication::Publication, storage::StoragePolicy};
     let desired = StoragePolicy::for_node("uid")
-        .resolve("site-a", Some("1Gi"), None)
+        .resolve("site-a", Some("1Gi"))
         .unwrap();
     let mut publication = Publication::default();
     let first = publication.publish(desired.clone(), 10).unwrap();
@@ -1703,7 +1766,7 @@ fn in_memory_publication_rejects_regression_and_preserves_last_good() {
     assert!(publication.publish(invalid, 11).is_err());
     assert_eq!(publication.published().unwrap(), &first);
     let replacement = StoragePolicy::for_node("replacement")
-        .resolve("site-a", Some("1Gi"), None)
+        .resolve("site-a", Some("1Gi"))
         .unwrap();
     assert!(publication.publish(replacement, 11).is_err());
     let mut restarted = Publication::default();

@@ -596,25 +596,20 @@ fn exact_quantities_and_last_good_storage_versions_are_independent_of_topology()
     ] {
         assert!(parse_cache_size(value).is_err(), "{value}");
     }
-    assert_eq!(resolve_cache_size(None, None).unwrap(), DEFAULT_BYTES);
-    assert!(resolve_cache_size(Some(""), Some("10Gi")).is_err());
-    assert_eq!(
-        resolve_cache_size(Some("512Mi"), Some("invalid")).unwrap(),
-        MIN_BYTES
-    );
+    assert_eq!(resolve_cache_size(None).unwrap(), DEFAULT_BYTES);
+    assert!(resolve_cache_size(Some("")).is_err());
+    assert_eq!(resolve_cache_size(Some("512Mi")).unwrap(), MIN_BYTES);
 
     let mut publication = Publication::<StoragePolicy>::default();
     let initial = StoragePolicy::new(identity("node", "node-uid"), [9; 32]);
-    let desired = initial.resolve("site-a", None, Some("513Mi")).unwrap();
+    let desired = initial.resolve("site-a", Some("513Mi")).unwrap();
     assert!(publication.published().is_none());
     publication.publish(desired, 1).unwrap();
     let good = publication.published().unwrap().as_ref().clone();
     assert_eq!(good.version, 1);
     assert_eq!(good.desired_bytes, 576 << 20);
-    assert_eq!(good.resolve("site-a", Some("576Mi"), None).unwrap(), good);
-    let invalid = good
-        .resolve("site-b", Some("invalid"), Some("10Gi"))
-        .unwrap();
+    assert_eq!(good.resolve("site-a", Some("576Mi")).unwrap(), good);
+    let invalid = good.resolve("site-b", Some("invalid")).unwrap();
     assert_eq!(invalid.version, good.version);
     assert_eq!(invalid.desired_bytes, good.desired_bytes);
     publication.publish(invalid, 2).unwrap();
@@ -623,14 +618,15 @@ fn exact_quantities_and_last_good_storage_versions_are_independent_of_topology()
     assert!(policy.wire().is_none());
     assert_eq!(policy.universe, "site-b");
     assert!(policy.validation_error.is_some());
-    let next = policy.resolve("site-b", None, Some("10Gi")).unwrap();
+    let next = policy.resolve("site-b", None).unwrap();
+    assert_eq!(next.desired_bytes, DEFAULT_BYTES);
     assert_eq!(next.version, 2);
     assert!(next.validation_error.is_none());
     assert!(publication.publish(next.clone(), 2).is_err());
     assert_eq!(publication.published().unwrap().version, 1);
     publication.publish(next, 3).unwrap();
     assert_eq!(publication.published().unwrap().version, 2);
-    let initial_invalid = initial.resolve("site-a", Some("bad"), None).unwrap();
+    let initial_invalid = initial.resolve("site-a", Some("bad")).unwrap();
     assert!(initial_invalid.wire().is_none());
 }
 
@@ -638,7 +634,7 @@ fn exact_quantities_and_last_good_storage_versions_are_independent_of_topology()
 fn page_geometry_rejects_obsolete_capacity_without_replacing_last_good_policy() {
     let mut publication = Publication::<StoragePolicy>::default();
     let desired = StoragePolicy::new(identity("node", "node-uid"), [9; 32])
-        .resolve("site-a", Some("1Gi"), None)
+        .resolve("site-a", Some("1Gi"))
         .unwrap();
     publication.publish(desired, 1).unwrap();
     let good = publication.published().unwrap().as_ref().clone();
@@ -649,19 +645,25 @@ fn page_geometry_rejects_obsolete_capacity_without_replacing_last_good_policy() 
         assert_eq!(publication.published().unwrap().as_ref(), &good);
     }
     for quantity in ["32Mi", "64Mi", "96Mi", "511Mi"] {
-        let invalid = good.resolve("site-a", Some(quantity), Some("2Ti")).unwrap();
+        let invalid = good.resolve("site-a", Some(quantity)).unwrap();
         assert!(invalid.validation_error.is_some());
         assert_eq!(invalid.desired_bytes, good.desired_bytes);
         assert_eq!(invalid.version, good.version);
         assert!(invalid.wire().is_none());
     }
-    let resized = good.resolve("site-a", Some("1536Mi"), None).unwrap();
+    let resized = good.resolve("site-a", Some("1536Mi")).unwrap();
     assert_eq!(resized.desired_bytes, 1536 << 20);
     assert_eq!(resized.version, good.version + 1);
     assert_eq!(
-        resized.resolve("site-a", Some("1610612736"), None).unwrap(),
+        resized.resolve("site-a", Some("1610612736")).unwrap(),
         resized
     );
+    let moved = resized.resolve("missing-site", Some("1536Mi")).unwrap();
+    assert_eq!(moved.desired_bytes, resized.desired_bytes);
+    assert_eq!(moved.version, resized.version);
+    let unassigned = moved.resolve("", None).unwrap();
+    assert_eq!(unassigned.desired_bytes, DEFAULT_BYTES);
+    assert_eq!(unassigned.version, moved.version + 1);
 }
 
 #[test]

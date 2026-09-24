@@ -4,7 +4,6 @@
 package v1alpha3
 
 import (
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -125,13 +124,6 @@ type SiteComponents struct {
 	// +optional
 	Metalman *MetalmanComponentSpec `json:"metalman,omitempty"`
 
-	// Racer votes to install the cluster-wide Racer control plane and dataplane.
-	// It defaults to enabled. Explicit false opts out of initial installation;
-	// an installed Racer is retained, and all live Sites remain cache universes.
-	// +optional
-	// +kubebuilder:default={enabled: true}
-	Racer *RacerComponentSpec `json:"racer,omitempty"`
-
 	// Gantry configures the gantry peer-to-peer OCI distribution agent for this
 	// site. Gantry defaults to enabled; set
 	// gantry.enabled to false to opt a site out. The apiserver defaults an
@@ -183,22 +175,6 @@ type MetalmanComponentSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
-}
-
-// RacerComponentSpec configures Racer for a Site. The shared control plane and
-// its CA credentials and runtime state are retained after the last Site opts out.
-type RacerComponentSpec struct {
-	SiteComponentSpec `json:",inline"`
-
-	// CacheSize is the default disk cache capacity per Node, as a Kubernetes
-	// quantity. Nodes without a racer.unbounded-cloud.io/cache-size annotation
-	// inherit the current Site value; omission uses 10Gi. Defaults are not copied
-	// to Nodes. Requests must be whole bytes, at least 512Mi, and at most
-	// 8589934591.9375Gi (the largest 64Mi-aligned signed 64-bit size).
-	// The effective capacity is rounded up to a multiple of 64Mi.
-	// +optional
-	// +kubebuilder:validation:XValidation:rule="isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('512Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.9375Gi')) <= 0",message="cacheSize must be a quantity between 512Mi and 8589934591.9375Gi"
-	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
 }
 
 // GantryComponentSpec configures the gantry peer-to-peer OCI distribution agent

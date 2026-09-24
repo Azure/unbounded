@@ -378,14 +378,10 @@ impl Runtime {
         let uid = node.uid().context("Node lacks UID")?;
         let node_id = identity("node", &uid);
         let site_name = site_for_node(node);
-        let site = index.objects[&Kind::Site].get(&site_name);
         let override_value = node
             .annotations()
             .get(&format!("{PREFIX}cache-size"))
             .map(String::as_str);
-        let site_value = site
-            .and_then(|s| s.data.pointer("/spec/components/racer/cacheSize"))
-            .and_then(Value::as_str);
         let universe = universe_for_site(&site_name);
         let cached = self
             .subscriptions
@@ -398,7 +394,7 @@ impl Runtime {
             .as_deref()
             .cloned()
             .unwrap_or_else(|| StoragePolicy::for_node(&uid));
-        let mut next = base.resolve(&universe, override_value, site_value)?;
+        let mut next = base.resolve(&universe, override_value)?;
         let changed = cached.as_deref() != Some(&next);
         if changed {
             next.revision = next_revision(store, revisions, fence).await?;
@@ -423,10 +419,9 @@ impl Runtime {
             .get(&(universe_id, node_id))
             .filter(|r| selection.as_ref().is_some_and(|s| s.pod_uid == r.pod_uid))
             .cloned();
-        let (source, requested) = match (override_value, site_value) {
-            (Some(v), _) => ("node", v),
-            (_, Some(v)) => ("site", v),
-            _ => ("default", "10Gi"),
+        let (source, requested) = match override_value {
+            Some(v) => ("node", v),
+            None => ("default", "10Gi"),
         };
         let status = status::cache_status(
             &next,
@@ -773,15 +768,6 @@ impl InventoryIndex {
                     .unwrap_or_else(|_| self.universes());
                 for scope in scopes {
                     if !scope.is_empty() {
-                        if kind == Kind::Site {
-                            storage.extend(
-                                self.nodes_by_universe
-                                    .get(&scope)
-                                    .into_iter()
-                                    .flatten()
-                                    .cloned(),
-                            );
-                        }
                         dirty.insert(scope);
                     }
                 }

@@ -2,23 +2,31 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# Print singleton targets using the operator's default-on Site votes and
-# retained installation markers. An absent installation is a
+# Live P2PCaches require both singleton targets. Without caches, retain only
+# existing nonterminating workloads independently. An absent installation is a
 # valid empty result; failed discovery is never an empty result.
 set -euo pipefail
 : "${KUBECONFIG:?KUBECONFIG must be set}"
 NS="${NAMESPACE:-unbounded-system}"
 KUBECTL=(kubectl --request-timeout=30s)
 
-sites_json="$("${KUBECTL[@]}" get sites.unbounded-cloud.io -o json)"
-sites="$(jq -r '.items[] | select(.spec.components.racer.enabled != false) | "enabled"' <<<"$sites_json")"
-account="$("${KUBECTL[@]}" -n "$NS" get serviceaccount/racer-controlplane --ignore-not-found -o json)"
+caches_json="$("${KUBECTL[@]}" get p2pcaches.racer.unbounded-cloud.io -o json)"
+caches="$(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "live"' <<<"$caches_json")"
 deployment="$("${KUBECTL[@]}" -n "$NS" get deploy/racer-controlplane --ignore-not-found -o json)"
 dataplane="$("${KUBECTL[@]}" -n "$NS" get ds/racer-dataplane --ignore-not-found -o json)"
-if [[ -z "$sites" && -z "$account" && -z "$deployment" && -z "$dataplane" ]]; then
-  echo "Racer is not enabled or installed; no rollout targets" >&2
+deployment="$(jq -r 'select(.metadata.deletionTimestamp == null) | "live"' <<<"$deployment")"
+dataplane="$(jq -r 'select(.metadata.deletionTimestamp == null) | "live"' <<<"$dataplane")"
+
+targets=()
+if [[ -n "$caches" || -n "$deployment" ]]; then
+  targets+=(deploy/racer-controlplane)
+fi
+if [[ -n "$caches" || -n "$dataplane" ]]; then
+  targets+=(ds/racer-dataplane)
+fi
+if (( ${#targets[@]} == 0 )); then
+  echo "Racer has no live P2PCaches or retained workloads; no rollout targets" >&2
   exit 0
 fi
 
-echo deploy/racer-controlplane
-echo ds/racer-dataplane
+printf '%s\n' "${targets[@]}"

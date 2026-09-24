@@ -24,7 +24,7 @@ import (
 )
 
 func testSite(name string) *unboundedv1alpha3.Site {
-	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)}, Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Racer: &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)}}}}}
+	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)}}
 }
 
 func envValues(c corev1.Container) map[string]string {

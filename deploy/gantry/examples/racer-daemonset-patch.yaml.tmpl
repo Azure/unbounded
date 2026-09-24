@@ -1,5 +1,7 @@
 # Strategic merge patch, not a standalone Kubernetes resource.
-# Set content_backend: racer and racer_cache_name: gantry in gantry-config too.
+# Standalone only: select content_backend: racer and racer_cache_name: gantry
+# in gantry-config (or use equivalent flags). Operator-managed deployments use
+# the P2PCache gantry-backing annotation and generate the whole pod atomically.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

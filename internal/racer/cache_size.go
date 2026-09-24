@@ -9,8 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-
-	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // Cache capacities are disk bytes, independent of memory and shard layout.
@@ -52,13 +50,11 @@ func ParseCacheSize(value string) (int64, error) {
 	return NormalizeCacheSize(size)
 }
 
-// ResolveCacheSize returns the effective capacity from the Node annotation, then
-// the current Site default, then 10GiB. A present but invalid override errors;
-// only absence permits inheritance. Nil Node/Site values have no override.
-// The caller supplies the Node's current Site and handles lookup failures.
-// This helper neither checks membership/enabled state nor mutates either object;
-// call it again with current objects to observe live inheritance.
-func ResolveCacheSize(node *corev1.Node, site *machinav1alpha3.Site) (int64, error) {
+// ResolveCacheSize returns the Node annotation's capacity, or 10GiB when absent.
+// A present but invalid annotation errors. A nil Node has no override.
+// Resolution does not depend on Site membership and never mutates the Node;
+// call it again with the current Node to observe live size changes.
+func ResolveCacheSize(node *corev1.Node) (int64, error) {
 	if node != nil {
 		if value, present := node.Annotations[CacheSizeAnnotationKey]; present {
 			bytes, err := ParseCacheSize(value)
@@ -68,15 +64,6 @@ func ResolveCacheSize(node *corev1.Node, site *machinav1alpha3.Site) (int64, err
 
 			return bytes, nil
 		}
-	}
-
-	if site != nil && site.Spec.Components.Racer != nil && site.Spec.Components.Racer.CacheSize != nil {
-		bytes, err := NormalizeCacheSize(*site.Spec.Components.Racer.CacheSize)
-		if err != nil {
-			return 0, fmt.Errorf("site %q spec.components.racer.cacheSize: %w", site.Name, err)
-		}
-
-		return bytes, nil
 	}
 
 	return DefaultCacheSizeBytes, nil

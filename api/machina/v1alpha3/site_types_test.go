@@ -6,7 +6,6 @@ package v1alpha3
 import (
 	"testing"
 
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -79,9 +78,8 @@ func TestDeepCopySiteAndList(t *testing.T) {
 				TokenRefresher: &TokenRefresherComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
 				},
-				Racer: &RacerComponentSpec{
+				Gantry: &GantryComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
-					CacheSize:         new(resource.MustParse("2Ti")),
 				},
 			},
 		},
@@ -108,8 +106,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
 	site.Spec.Components.Metalman.Replicas = ptrInt32(5)
 	*site.Spec.Components.TokenRefresher.Enabled = false
-	*site.Spec.Components.Racer.Enabled = false
-	site.Spec.Components.Racer.CacheSize.Set(32 << 20)
+	*site.Spec.Components.Gantry.Enabled = false
 	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
@@ -132,12 +129,8 @@ func TestDeepCopySiteAndList(t *testing.T) {
 		t.Fatalf("expected deep-copied TokenRefresher enabled to be isolated")
 	}
 
-	if copied.Spec.Components.Racer.Enabled == nil || !*copied.Spec.Components.Racer.Enabled {
-		t.Fatal("expected deep-copied Racer enabled to be isolated")
-	}
-
-	if copied.Spec.Components.Racer.CacheSize == nil || copied.Spec.Components.Racer.CacheSize.Cmp(resource.MustParse("2Ti")) != 0 {
-		t.Fatal("expected deep-copied Racer cache size to be isolated")
+	if copied.Spec.Components.Gantry.Enabled == nil || !*copied.Spec.Components.Gantry.Enabled {
+		t.Fatal("expected deep-copied Gantry enabled to be isolated")
 	}
 
 	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {

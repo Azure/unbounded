@@ -829,8 +829,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("racer_metadata_timeout and racer_max_concurrent_transfers must be positive"))
 	}
 
-	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName); err != nil {
-		errs = append(errs, fmt.Errorf("racer_cache_name: %w", err))
+	// A direct selection does not use the cache name. In particular, generated
+	// operator flags must be able to override stale Racer YAML during fallback.
+	if c.ContentBackend == "racer" {
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName); err != nil {
+			errs = append(errs, fmt.Errorf("racer_cache_name: %w", err))
+		}
 	}
 
 	mustAddr := func(field, val string) {

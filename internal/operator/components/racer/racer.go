@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
@@ -35,43 +36,63 @@ func (ControlPlane) ConditionType() string        { return "RacerControlPlaneRea
 func (Dataplane) Name() string                    { return dataplaneName }
 func (Dataplane) ConditionType() string           { return "RacerDataplaneReady" }
 
-func EnabledFor(site *unboundedv1alpha3.Site) bool {
-	return site != nil && (site.Spec.Components.Racer == nil || site.Spec.Components.Racer.Enabled == nil || *site.Spec.Components.Racer.Enabled)
-}
+// installation reads live lifecycle inputs before planning any writes. Cache
+// selectors and Site membership are runtime policy, not installation votes.
+func installation(ctx context.Context, env *component.Env) (bool, map[string]*unstructured.Unstructured, error) {
+	var caches racerv1alpha1.P2PCacheList
+	if err := env.LiveReader().List(ctx, &caches); err != nil {
+		return false, nil, fmt.Errorf("list Racer P2PCaches: %w", err)
+	}
 
-// WantedOrRetained is the shared installation decision for both Racer components
-// and Gantry's optional Racer backend. Site votes do not restrict participation.
-func WantedOrRetained(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (bool, error) {
-	for i := range sites {
-		if EnabledFor(&sites[i]) {
-			return true, nil
+	for i := range caches.Items {
+		if caches.Items[i].DeletionTimestamp.IsZero() {
+			return true, nil, nil
 		}
 	}
 
-	for _, obj := range []client.Object{serviceAccount(controlPlaneName, env.Namespace), controlDeployment(env.Namespace, env.Config), dataplaneDaemonSet(env.Namespace, env.Config)} {
-		err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj)
-		if err == nil {
-			return true, nil
+	retained := map[string]*unstructured.Unstructured{}
+
+	for _, obj := range []client.Object{controlDeployment(env.Namespace, env.Config), dataplaneDaemonSet(env.Namespace, env.Config)} {
+		current := resourceObject(obj)
+
+		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(current), current)
+		if apierrors.IsNotFound(err) {
+			continue
 		}
 
-		if !apierrors.IsNotFound(err) {
-			return false, fmt.Errorf("check retained Racer installation: %w", err)
+		if err != nil {
+			return false, nil, fmt.Errorf("read retained Racer %s: %w", current.GetName(), err)
+		}
+
+		if current.GetDeletionTimestamp().IsZero() {
+			retained[current.GetName()] = current
 		}
 	}
 
-	return false, nil
+	return false, retained, nil
 }
 
-// Plan retains and repairs the shared installation after all Sites opt out or disappear.
-func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	enabled, err := WantedOrRetained(ctx, env, sites)
+func workloadOperation(obj client.Object, install bool, retained map[string]*unstructured.Unstructured) component.Operation {
+	op := component.Operation{Kind: component.OpApply, Object: resourceObject(obj), Component: obj.GetName(), Overridable: true}
+	if !install {
+		op.Kind = component.OpApplyExisting
+		op.Base = retained[obj.GetName()]
+	}
+
+	return op
+}
+
+// Plan maintains shared support while either workload survives. Without a live
+// cache, each workload is updated independently and never recreated.
+func (ControlPlane) Plan(ctx context.Context, env *component.Env, _ []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	install, retained, err := installation(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
 	plan := component.NewPlan()
-	if !enabled {
-		return plan, component.Disabled("no Site enables Racer and no retained installation exists"), nil
+	if !install && len(retained) == 0 {
+		return plan, component.Disabled("no live P2PCaches or retained Racer workloads"), nil
 	}
 
 	var dependencies []component.ObjectRef
@@ -82,21 +103,27 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboun
 		dependencies = append(dependencies, op.Ref())
 	}
 
-	plan.Add(component.Operation{Kind: component.OpApply, Object: resourceObject(controlDeployment(env.Namespace, env.Config)), Component: controlPlaneName, Overridable: true, DependsOn: dependencies})
+	if !install && retained[controlPlaneName] == nil {
+		return plan, component.Disabled("no live P2PCaches or retained Racer control plane"), nil
+	}
+
+	op := workloadOperation(controlDeployment(env.Namespace, env.Config), install, retained)
+	op.DependsOn = dependencies
+	plan.Add(op)
 
 	return plan, component.Reconciled(), nil
 }
 
-func (Dataplane) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (Dataplane) Plan(ctx context.Context, env *component.Env, _ []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
 
-	enabled, err := WantedOrRetained(ctx, env, sites)
+	install, retained, err := installation(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
-	if !enabled {
-		return plan, component.Disabled("no Site enables Racer and no retained installation exists"), nil
+	if !install && retained[dataplaneName] == nil {
+		return plan, component.Disabled("no live P2PCaches or retained Racer dataplane"), nil
 	}
 
 	var dependencies []component.ObjectRef
@@ -104,7 +131,9 @@ func (Dataplane) Plan(ctx context.Context, env *component.Env, sites []unbounded
 		dependencies = append(dependencies, component.RefOf(component.ToUnstructured(obj)))
 	}
 
-	plan.Add(component.Operation{Kind: component.OpApply, Object: resourceObject(dataplaneDaemonSet(env.Namespace, env.Config)), Component: dataplaneName, Overridable: true, DependsOn: dependencies})
+	op := workloadOperation(dataplaneDaemonSet(env.Namespace, env.Config), install, retained)
+	op.DependsOn = dependencies
+	plan.Add(op)
 
 	return plan, component.Reconciled(), nil
 }
@@ -115,6 +144,8 @@ func (Dataplane) Plan(ctx context.Context, env *component.Env, sites []unbounded
 // deliberately absent. Component conditions describe applied intent, so workload
 // status updates (including standby readiness) do not trigger writes.
 func (ControlPlane) SetupWatches(b *builder.Builder, env *component.Env) {
+	b.Watches(&racerv1alpha1.P2PCache{}, env.RequestSingleton(), builder.WithPredicates(cachePredicate()))
+
 	objects := append(sharedResources(env.Namespace), controlDeployment(env.Namespace, env.Config))
 	byKind := map[string][]client.Object{}
 
@@ -150,13 +181,19 @@ func (Dataplane) SetupWatches(b *builder.Builder, env *component.Env) {
 	})))
 }
 
+func cachePredicate() predicate.Predicate {
+	return managedPredicate(func(client.Object) bool { return true })
+}
+
 func managedPredicate(match func(client.Object) bool) predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc:  func(e event.CreateEvent) bool { return match(e.Object) },
 		DeleteFunc:  func(e event.DeleteEvent) bool { return match(e.Object) },
 		GenericFunc: func(event.GenericEvent) bool { return false },
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return (match(e.ObjectOld) || match(e.ObjectNew)) && !reflect.DeepEqual(watchedFields(e.ObjectOld), watchedFields(e.ObjectNew))
+			// Relists may fold deletion and same-name recreation into an Update.
+			// Identity changes matter even when all watched intent is identical.
+			return (match(e.ObjectOld) || match(e.ObjectNew)) && (e.ObjectOld.GetUID() != e.ObjectNew.GetUID() || !reflect.DeepEqual(watchedFields(e.ObjectOld), watchedFields(e.ObjectNew)))
 		},
 	}
 }

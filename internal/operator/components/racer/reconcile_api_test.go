@@ -11,12 +11,15 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/override"
 )
 
 type countingApplyClient struct {
@@ -36,7 +39,7 @@ func TestAPIDefaultedResourcesAreNoOp(t *testing.T) {
 		t.Skip("set KUBEBUILDER_ASSETS for real server-side apply")
 	}
 
-	environment := &envtest.Environment{}
+	environment := &envtest.Environment{CRDDirectoryPaths: []string{"../../../../deploy/racer/crd"}, ErrorIfCRDPathMissing: true}
 
 	config, err := environment.Start()
 	if err != nil {
@@ -50,7 +53,7 @@ func TestAPIDefaultedResourcesAreNoOp(t *testing.T) {
 	})
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, rbacv1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, rbacv1.AddToScheme, racerv1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}
@@ -69,6 +72,11 @@ func TestAPIDefaultedResourcesAreNoOp(t *testing.T) {
 	c := &countingApplyClient{Client: kube}
 	env := &component.Env{Client: c, Scheme: scheme, Namespace: namespace, Config: component.Config{ImageTag: "v1"}}
 	site := testSite("rack-a")
+
+	cache := testCache()
+	if err := kube.Create(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
 
 	plan := combinedPlan(t, env, site)
 	if result := execute(t, env, plan); result.Err() != nil {
@@ -115,5 +123,186 @@ func TestAPIDefaultedResourcesAreNoOp(t *testing.T) {
 
 	if ds.Spec.Template.Spec.Containers[0].Image != env.Config.Image(dataplaneName) {
 		t.Fatal("unchanged payload hash hid live workload drift")
+	}
+
+	if err := kube.Delete(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writes = 0
+	if result := execute(t, env, combinedPlan(t, env)); result.Err() != nil || c.writes != 0 {
+		t.Fatalf("retention transition must be write-free: %v, writes=%d", result.Err(), c.writes)
+	}
+
+	// An override removal must still prune fields formerly owned through SSA.
+	entries, problems, err := override.Parse(map[string]string{"racer.yaml": `apiVersion: overrides.unbounded-cloud.io/v1alpha1
+overrides:
+- component: racer-dataplane
+  kind: DaemonSet
+  patch:
+    spec:
+      template:
+        metadata:
+          annotations:
+            example.test/retained: custom
+        spec:
+          containers:
+          - name: dataplane
+            image: example.test/retained:v2
+`})
+	if err != nil || len(problems) != 0 {
+		t.Fatalf("parse overrides: %v %v", err, problems)
+	}
+
+	retained := combinedPlan(t, env)
+	if report := override.Apply(retained, entries, nil); report.Err() != nil {
+		t.Fatal(report.Err())
+	}
+
+	if result := execute(t, env, retained); result.Err() != nil || len(result.Deferred) != 0 {
+		t.Fatalf("guarded SSA update failed: %+v", result)
+	}
+
+	if err := kube.Get(t.Context(), key, &ds); err != nil {
+		t.Fatal(err)
+	}
+
+	if ds.Spec.Template.Spec.Containers[0].Image != "example.test/retained:v2" || ds.Spec.Template.Annotations["example.test/retained"] != "custom" {
+		t.Fatal("retained workload ignored overrides")
+	}
+
+	if result := execute(t, env, combinedPlan(t, env)); result.Err() != nil {
+		t.Fatal(result.Err())
+	}
+
+	if err := kube.Get(t.Context(), key, &ds); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, exists := ds.Spec.Template.Annotations["example.test/retained"]; exists {
+		t.Fatal("guarded SSA lost ownership: removed override survived")
+	}
+
+	c.writes = 0
+	if result := execute(t, env, combinedPlan(t, env)); result.Err() != nil || c.writes != 0 {
+		t.Fatalf("retained convergence wrote: %v, writes=%d", result.Err(), c.writes)
+	}
+
+	for _, kind := range []string{"Deployment", "DaemonSet"} {
+		for _, race := range []string{"deleted", "replaced", "terminating", "updated"} {
+			t.Run(kind+"/"+race, func(t *testing.T) {
+				var obj client.Object = controlDeployment(namespace, env.Config)
+				if kind == "DaemonSet" {
+					obj = dataplaneDaemonSet(namespace, env.Config)
+				}
+
+				if err := env.ApplyObject(t.Context(), resourceObject(obj)); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := kube.Get(t.Context(), client.ObjectKeyFromObject(obj), obj); err != nil {
+					t.Fatal(err)
+				}
+
+				if race == "terminating" {
+					obj.SetFinalizers([]string{"example.test/hold"})
+
+					if err := kube.Update(t.Context(), obj); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				env.Config.ImageTag = "changed"
+				plan := combinedPlan(t, env)
+				env.Config.ImageTag = "v1"
+				// Keep only the workload write to isolate server preconditions.
+				single := component.NewPlan()
+
+				for _, op := range plan.Operations {
+					if op.Object.GetKind() == kind {
+						single.Add(op)
+					}
+				}
+
+				if single.Len() != 1 || single.Operations[0].Kind != component.OpApplyExisting {
+					t.Fatal("missing guarded workload operation")
+				}
+
+				if race == "updated" {
+					obj.SetAnnotations(map[string]string{"example.test/concurrent": "keep"})
+
+					if err := kube.Update(t.Context(), obj); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := kube.Delete(t.Context(), obj); err != nil {
+						t.Fatal(err)
+					}
+
+					if race == "replaced" {
+						replacement := resourceObject(obj)
+						replacement.SetGroupVersionKind(single.Operations[0].Object.GroupVersionKind())
+						replacement.SetUID("")
+						replacement.SetResourceVersion("")
+						replacement.SetManagedFields(nil)
+
+						if err := kube.Create(t.Context(), replacement); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+
+				beforeWrite := single.Operations[0].Object.DeepCopy()
+				if race != "deleted" {
+					if err := kube.Get(t.Context(), client.ObjectKeyFromObject(obj), beforeWrite); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				result := execute(t, env, single)
+				if len(result.Deferred) != 1 || result.Err() != nil {
+					t.Fatalf("server accepted stale guarded SSA: %+v", result)
+				}
+
+				current := resourceObject(obj)
+				current.SetGroupVersionKind(single.Operations[0].Object.GroupVersionKind())
+
+				err := kube.Get(t.Context(), client.ObjectKeyFromObject(obj), current)
+				if race == "deleted" {
+					if !apierrors.IsNotFound(err) {
+						t.Fatalf("guarded SSA recreated deleted workload: %v", err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if current.GetResourceVersion() != beforeWrite.GetResourceVersion() {
+						t.Fatal("rejected guarded write modified the current workload")
+					}
+
+					if race == "replaced" {
+						// Prove UID enforcement independently of the version check.
+						single.Operations[0].Base.SetResourceVersion(current.GetResourceVersion())
+
+						if result := execute(t, env, single); !apierrors.IsInvalid(result.Err()) {
+							t.Fatalf("server accepted stale UID with current version: %+v", result)
+						}
+					}
+
+					if component.DesiredFieldsMatch(single.Operations[0].Object.Object, current.Object) {
+						t.Fatal("stale desired config reached replacement or changed workload")
+					}
+
+					if race == "terminating" {
+						current.SetFinalizers(nil)
+
+						if err := kube.Update(t.Context(), current); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			})
+		}
 	}
 }

@@ -11,18 +11,20 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/utils/ptr"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
 	racermeta "github.com/Azure/unbounded/internal/racer"
@@ -32,7 +34,7 @@ func testEnv(t *testing.T, funcs interceptor.Funcs, objects ...client.Object) *c
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, rbacv1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, policyv1.AddToScheme, rbacv1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1alpha1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}
@@ -75,36 +77,57 @@ func execute(t *testing.T, env *component.Env, plan *component.Plan) component.E
 	return result
 }
 
+func testCache() *racerv1alpha1.P2PCache {
+	return &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache"}, Spec: racerv1alpha1.P2PCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}}
+}
+
+// The fake API does not allocate UIDs. Retention deliberately requires the same
+// incarnation preconditions as the real API, so supply them in lifecycle tests.
+func assignWorkloadUIDs(t *testing.T, env *component.Env) {
+	t.Helper()
+
+	for _, obj := range []client.Object{controlDeployment(env.Namespace, env.Config), dataplaneDaemonSet(env.Namespace, env.Config)} {
+		if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj); err != nil {
+			t.Fatal(err)
+		}
+
+		obj.SetUID(types.UID(obj.GetName()))
+
+		if err := env.Client.Update(t.Context(), obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestOptInRetentionAndCleanup(t *testing.T) {
 	env := testEnv(t, interceptor.Funcs{})
 
 	site := testSite("rack-a")
-	for _, spec := range []*unboundedv1alpha3.RacerComponentSpec{nil, {}, {SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)}}} {
-		site.Spec.Components.Racer = spec
-		if !EnabledFor(site) {
-			t.Fatal("Racer must default on")
-		}
-
-		if p := combinedPlan(t, env, site); p.Len() == 0 {
-			t.Fatal("default-on fresh install planned no writes")
-		}
-	}
-
-	site.Spec.Components.Racer = &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
 	if p := combinedPlan(t, env, site); p.Len() != 0 {
-		t.Fatal("disabled fresh install planned writes")
+		t.Fatal("Site without cache planned installation")
 	}
 
 	if p := combinedPlan(t, env); p.Len() != 0 {
 		t.Fatal("empty fresh install planned writes")
 	}
 
-	site = testSite("rack-a")
-	if result := execute(t, env, combinedPlan(t, env, site)); result.Err() != nil {
+	cache := testCache()
+
+	cache.Spec.SiteSelector.MatchLabels = map[string]string{"absent": "true"}
+	if err := env.Client.Create(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	if result := execute(t, env, combinedPlan(t, env)); result.Err() != nil {
 		t.Fatal(result.Err())
 	}
 
-	site.Spec.Components.Racer.Enabled = ptr.To(false)
+	assignWorkloadUIDs(t, env)
+
+	if err := env.Client.Delete(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
 	plan := combinedPlan(t, env, site)
 	deletes := 0
 
@@ -115,7 +138,7 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 	}
 
 	if deletes != 0 {
-		t.Fatal("Site opt-out deleted retained installation")
+		t.Fatal("last cache deletion deleted retained installation")
 	}
 
 	if result := execute(t, env, plan); result.Err() != nil {
@@ -134,11 +157,11 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 	}
 
 	for _, op := range retained.Operations {
-		if op.Kind != component.OpApply || len(op.Object.GetOwnerReferences()) != 0 {
+		if (op.Kind != component.OpApply && op.Kind != component.OpApplyExisting) || len(op.Object.GetOwnerReferences()) != 0 {
 			t.Fatal("retained resources must be ownerless and applied")
 		}
 	}
-	// Removing the Deployment does not erase the installation marker.
+	// Removing one workload never causes its sibling to reinstall it.
 	if err := env.Client.Delete(t.Context(), controlDeployment(env.Namespace, env.Config)); err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +170,8 @@ func TestOptInRetentionAndCleanup(t *testing.T) {
 		t.Fatal(result.Err())
 	}
 
-	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: env.Namespace, Name: controlPlaneName}, &appsv1.Deployment{}); err != nil {
-		t.Fatal("retained deployment was not repaired", err)
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: env.Namespace, Name: controlPlaneName}, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Fatal("deleted deployment was recreated", err)
 	}
 }
 
@@ -170,8 +193,17 @@ func TestSingletonRetentionMarkers(t *testing.T) {
 					}
 				}
 
-				if !reflect.DeepEqual(workloads, map[string]int{controlPlaneName: 1, dataplaneName: 1}) {
+				want := map[string]int{}
+				if marker.GetName() == dataplaneName || reflect.TypeOf(marker) == reflect.TypeOf(&appsv1.Deployment{}) {
+					want[marker.GetName()] = 1
+				}
+
+				if !reflect.DeepEqual(workloads, want) {
 					t.Fatalf("workloads: %v", workloads)
+				}
+
+				if len(want) == 0 && plan.Len() != 0 {
+					t.Fatal("support marker reinstalled resources")
 				}
 			}
 		})
@@ -186,7 +218,7 @@ func TestNoOpWritesDriftAndControllerOwnedState(t *testing.T) {
 	env := testEnv(t, interceptor.Funcs{Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 		writes++
 		return c.Apply(ctx, obj, opts...)
-	}}, secret, state, trust)
+	}}, secret, state, trust, testCache())
 	site := testSite("rack-a")
 	first := combinedPlan(t, env, site)
 
@@ -305,7 +337,7 @@ func TestDependencyFailureAndConflict(t *testing.T) {
 				}
 
 				return c.Apply(ctx, obj, opts...)
-			}})
+			}}, testCache())
 			result := execute(t, env, combinedPlan(t, env, testSite("rack-a"), testSite("rack-b")))
 			blocked := 0
 
@@ -337,12 +369,16 @@ func TestWatchesIntentNotStatus(t *testing.T) {
 	match := func(o client.Object) bool { return o.GetNamespace() == "custom" }
 	p := managedPredicate(match)
 	base := dataplaneDaemonSet("custom", component.Config{})
+	base.UID = "original-workload-uid"
 
 	for _, tc := range []struct {
 		name   string
 		mutate func(*appsv1.DaemonSet)
 		want   bool
 	}{
+		{"identical relist", func(*appsv1.DaemonSet) {}, false},
+		{"UID-only recreation", func(d *appsv1.DaemonSet) { d.UID = "replacement-workload-uid" }, true},
+		{"resource version only", func(d *appsv1.DaemonSet) { d.ResourceVersion = "new" }, false},
 		{"status", func(d *appsv1.DaemonSet) { d.Status.NumberReady = 1 }, false},
 		{"foreign annotation", func(d *appsv1.DaemonSet) {
 			d.Annotations = map[string]string{"kubectl.kubernetes.io/last-applied-configuration": "x"}
@@ -369,6 +405,15 @@ func TestWatchesIntentNotStatus(t *testing.T) {
 		t.Fatal("bad event boundaries")
 	}
 
+	unmanaged := base.DeepCopy()
+	unmanaged.Namespace = "unmanaged"
+	replacement := unmanaged.DeepCopy()
+
+	replacement.UID = "replacement-workload-uid"
+	if p.Update(event.UpdateEvent{ObjectOld: unmanaged, ObjectNew: replacement}) {
+		t.Fatal("identity changes must still respect the managed-object filter")
+	}
+
 	role := sharedResources("custom")[3].(*rbacv1.Role)
 	changed := role.DeepCopy()
 
@@ -387,7 +432,7 @@ func TestWatchesIntentNotStatus(t *testing.T) {
 }
 
 func TestOverridesKeepSiteAndExclusionAffinity(t *testing.T) {
-	env := testEnv(t, interceptor.Funcs{})
+	env := testEnv(t, interceptor.Funcs{}, testCache())
 	site := testSite("rack-a")
 	plan := combinedPlan(t, env, site)
 
@@ -450,7 +495,7 @@ overrides:
 }
 
 func TestOverrideEmptyAffinityTermCannotEnrollNodes(t *testing.T) {
-	env := testEnv(t, interceptor.Funcs{})
+	env := testEnv(t, interceptor.Funcs{}, testCache())
 	site := testSite("rack-a")
 	plan := combinedPlan(t, env, site)
 

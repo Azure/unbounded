@@ -532,6 +532,53 @@ func TestDesiredFieldsMatchIgnoresExtraCurrentFields(t *testing.T) {
 	}
 }
 
+func TestPriorityClassOmittedFalseAndDrift(t *testing.T) {
+	desired := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+		"metadata":      map[string]any{"name": "gantry-low"},
+		"globalDefault": false, "value": int64(-1000),
+	}}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*unstructured.Unstructured, *unstructured.Unstructured)
+		match  bool
+	}{
+		{name: "omitted false", match: true},
+		{name: "explicit false", match: true, mutate: func(_, current *unstructured.Unstructured) { current.Object["globalDefault"] = false }},
+		{name: "true drift", mutate: func(_, current *unstructured.Unstructured) { current.Object["globalDefault"] = true }},
+		{name: "other missing field", mutate: func(_, current *unstructured.Unstructured) { delete(current.Object, "value") }},
+		{name: "other changed field", mutate: func(_, current *unstructured.Unstructured) { current.Object["value"] = int64(1000) }},
+		{name: "desired true", mutate: func(want, _ *unstructured.Unstructured) { want.Object["globalDefault"] = true }},
+		{name: "other kind", mutate: func(want, current *unstructured.Unstructured) { want.SetKind("Other"); current.SetKind("Other") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want, current := desired.DeepCopy(), desired.DeepCopy()
+			delete(current.Object, "globalDefault")
+
+			if tc.mutate != nil {
+				tc.mutate(want, current)
+			}
+
+			before := current.DeepCopy()
+			if appliedFieldsMatch(want, current) != tc.match {
+				t.Fatal("incorrect drift verdict")
+			}
+
+			if !reflect.DeepEqual(before.Object, current.Object) {
+				t.Fatal("comparison mutated observed object")
+			}
+		})
+	}
+
+	current := desired.DeepCopy()
+	delete(current.Object, "globalDefault")
+
+	if DesiredFieldsMatch(desired.Object, current.Object) {
+		t.Fatal("generic matching must still reject absent declared fields")
+	}
+}
+
 func TestManagedConfigPredicate(t *testing.T) {
 	env := &Env{Namespace: "target"}
 	predicate := env.ManagedConfigPredicate(env.InNamespaceNamed("machina-config", "unbounded-net-config"))
