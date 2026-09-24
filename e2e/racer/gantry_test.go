@@ -63,9 +63,17 @@ func TestGantryRacerStriped(t *testing.T) {
 
 	gantryAwait(t, "completed splice", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="completed"}`) == 1 })
 
-	if f.metric(0, "gantry_racer_splice_calls_total") == 0 || f.metric(0, "gantry_racer_splice_bytes_total") < float64(len(data)-8192) {
-		t.Fatal("real splice counters did not cover the payload")
+	// Each page GET can read ahead one SDK header buffer before splicing.
+	// Account for every page rather than depending on socket arrival timing.
+	pages := (int64(len(data)) + sdk.PageSize - 1) / sdk.PageSize
+	spliced := f.metric(0, "gantry_racer_splice_bytes_total")
+
+	buffered := f.metric(0, "gantry_racer_buffered_bytes_total")
+	if f.metric(0, "gantry_racer_splice_calls_total") == 0 || spliced <= 0 || buffered > float64(pages*8192) || spliced+buffered != float64(len(data)) {
+		t.Fatalf("Racer payload accounting: splice=%g buffered=%g pages=%d payload=%d", spliced, buffered, pages, len(data))
 	}
+
+	t.Logf("Racer payload accounting: splice=%g buffered=%g pages=%d payload=%d", spliced, buffered, pages, len(data))
 
 	gantryAssertNoTee(t, f, 0)
 
