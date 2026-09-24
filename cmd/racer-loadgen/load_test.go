@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	racer "github.com/Azure/unbounded/pkg/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // These timeouts only fail a stuck test; channel handshakes determine ordering.
@@ -42,10 +42,10 @@ func await[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-func clientForTest(t *testing.T, endpoint string, concurrency int) *racer.Client {
+func clientForTest(t *testing.T, endpoint string, concurrency int) *racersdk.Client {
 	t.Helper()
 
-	c, err := racer.NewClient(endpoint, racer.ClientOptions{Concurrency: concurrency})
+	c, err := racersdk.NewClient(endpoint, racersdk.ClientOptions{Concurrency: concurrency})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,12 +128,12 @@ func (w *memoryWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
-	d := datasetForTest(t, config{footprint: 3 * (2*racer.PageSize + 137), objectSize: 2*racer.PageSize + 137, ttl: 23 * time.Second})
+	d := datasetForTest(t, config{footprint: 3 * (2*racersdk.PageSize + 137), objectSize: 2*racersdk.PageSize + 137, ttl: 23 * time.Second})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	assertMetrics(t, reg, 0, 0, 0)
 
-	origin, _ := racer.NewOrigin(d)
+	origin, _ := racersdk.NewOrigin(d)
 
 	meta, err := d.Stat(context.Background(), d.target(1), nil)
 	if err != nil {
@@ -207,9 +207,9 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 	defer mu.Unlock()
 
 	wantRanges := []string{
-		fmt.Sprintf("bytes=0-%d", racer.PageSize-1),
-		fmt.Sprintf("bytes=%d-%d", racer.PageSize, 2*racer.PageSize-1),
-		fmt.Sprintf("bytes=%d-%d", 2*racer.PageSize, d.size-1),
+		fmt.Sprintf("bytes=0-%d", racersdk.PageSize-1),
+		fmt.Sprintf("bytes=%d-%d", racersdk.PageSize, 2*racersdk.PageSize-1),
+		fmt.Sprintf("bytes=%d-%d", 2*racersdk.PageSize, d.size-1),
 	}
 	wantRanges = append(wantRanges, wantRanges...)
 	sort.Strings(wantRanges)
@@ -221,10 +221,10 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 }
 
 func TestDownloadPartialFailureMetrics(t *testing.T) {
-	d := datasetForTest(t, config{footprint: 2*racer.PageSize + 137, objectSize: 2*racer.PageSize + 137})
+	d := datasetForTest(t, config{footprint: 2*racersdk.PageSize + 137, objectSize: 2*racersdk.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racer.NewOrigin(d)
+	origin, _ := racersdk.NewOrigin(d)
 
 	var heads, gets atomic.Int64
 
@@ -237,7 +237,7 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 			gets.Add(1)
 		}
 
-		if r.Method == http.MethodGet && r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racer.PageSize, 2*racer.PageSize-1) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racersdk.PageSize, 2*racersdk.PageSize-1) {
 			// Retain the real origin's valid framing/validator, but close the
 			// response early so bytes already consumed must count as an error.
 			recorded := httptest.NewRecorder()
@@ -265,7 +265,7 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 		t.Fatalf("truncated download = %v, want unexpected EOF", err)
 	}
 
-	assertMetrics(t, reg, float64(racer.PageSize+partialBytes), 0, 1)
+	assertMetrics(t, reg, float64(racersdk.PageSize+partialBytes), 0, 1)
 
 	if heads.Load() != 1 || gets.Load() != 2 {
 		t.Errorf("HEADs/GETs = %d/%d, want 1/2", heads.Load(), gets.Load())
@@ -273,10 +273,10 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 }
 
 func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
-	d := datasetForTest(t, config{footprint: racer.PageSize + 137, objectSize: racer.PageSize + 137})
+	d := datasetForTest(t, config{footprint: racersdk.PageSize + 137, objectSize: racersdk.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racer.NewOrigin(d)
+	origin, _ := racersdk.NewOrigin(d)
 	blocked := make(chan struct{}, 1)
 	requestCanceled := make(chan struct{}, 1)
 
@@ -289,7 +289,7 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 			gets.Add(1)
 		}
 
-		if r.Method == http.MethodGet && r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racer.PageSize, d.size-1) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racersdk.PageSize, d.size-1) {
 			blocked <- struct{}{}
 
 			<-r.Context().Done()
@@ -314,7 +314,7 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 
 	await(t, blocked)
 	// Dispatch of page two proves all of page one was consumed and counted.
-	assertMetrics(t, reg, float64(racer.PageSize), 0, 0)
+	assertMetrics(t, reg, float64(racersdk.PageSize), 0, 0)
 	cancel()
 
 	if err := await(t, done); !errors.Is(err, context.Canceled) {
@@ -322,7 +322,7 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 	}
 
 	await(t, requestCanceled)
-	assertMetrics(t, reg, float64(racer.PageSize), 0, 1)
+	assertMetrics(t, reg, float64(racersdk.PageSize), 0, 1)
 
 	if heads.Load() != 1 || gets.Load() != 2 {
 		t.Errorf("HEADs/GETs = %d/%d, want 1/2", heads.Load(), gets.Load())
@@ -333,13 +333,13 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 	const workers, pages = 3, 2
 
 	c := config{
-		footprint: 8 * racer.PageSize, objectSize: 8 * racer.PageSize,
+		footprint: 8 * racersdk.PageSize, objectSize: 8 * racersdk.PageSize,
 		concurrency: workers, pageConcurrency: pages, exponent: 1, seed: 42, timeout: time.Minute,
 	}
 	d := datasetForTest(t, c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racer.NewOrigin(d)
+	origin, _ := racersdk.NewOrigin(d)
 
 	var heads, gets, active, peak atomic.Int64
 
@@ -442,7 +442,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 
 func TestOriginRangeResponse(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 257, objectSize: 257})
-	origin, _ := racer.NewOrigin(d)
+	origin, _ := racersdk.NewOrigin(d)
 
 	for _, tc := range []struct {
 		rangeHeader  string

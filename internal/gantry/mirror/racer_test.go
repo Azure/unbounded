@@ -25,7 +25,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func (o *authorizationCapturingOrigin) PullWithMetadata(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {

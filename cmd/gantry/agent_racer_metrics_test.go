@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/metrics"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func racerMetricCounters(t *testing.T, reg *metrics.Registry) map[string]float64 {

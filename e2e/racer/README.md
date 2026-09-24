@@ -168,7 +168,7 @@ missing peer CRCs and altered metadata, rejection without cache publication,
 healthy refetch, and subsequent cache reuse. Generic HTTP and SDK consumers must
 verify their own content against an independently trusted expected digest. The
 SDK no longer performs inline SHA-256 verification; see the
-[API migration note](../../pkg/racer/STREAMING.md#migration-inline-verification-removed).
+[API migration note](../../pkg/racersdk/STREAMING.md#migration-inline-verification-removed).
 
 ### Prerequisites
 

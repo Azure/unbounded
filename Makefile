@@ -855,7 +855,7 @@ racer-bench-test: ## Check feature isolation and benchmark fixture contracts
 RACER_GO_TEST_TIMEOUT ?= 5m
 
 racer-go-test: ## Test Racer Go SDK, shared helpers, operator, and tools
-	$(RACER_TEST_HARNESS) run go-core 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./pkg/racer/... ./cmd/racer-loadgen/...
+	$(RACER_TEST_HARNESS) run go-core 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./pkg/racersdk/... ./cmd/racer-loadgen/...
 
 racer-controlplane-test: ## Run Rust control-plane all-target tests and doctests
 	$(RACER_TEST_HARNESS) test controlplane
@@ -933,7 +933,7 @@ racer-fmt-check: racer-controlplane-fmt-check racer-dataplane-fmt-check ## Check
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
 racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		$(RACER_TEST_HARNESS) run sdk-interop 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer
+		$(RACER_TEST_HARNESS) run sdk-interop 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racersdk
 
 # Requires envtest assets, private namespace privileges, ext4 TMPDIR, and a
 # workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 36 bytes.

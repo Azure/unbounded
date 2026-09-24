@@ -23,7 +23,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	registryorigin "github.com/Azure/unbounded/internal/gantry/origin"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type resolvedRegistryFixture struct {

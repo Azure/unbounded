@@ -16,7 +16,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // NewRacer builds a Racer-backend Server with an explicit registry contract.

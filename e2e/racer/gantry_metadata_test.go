@@ -29,7 +29,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // Exercise the production source, recorder wiring, and nil-DHT/nil-notifier

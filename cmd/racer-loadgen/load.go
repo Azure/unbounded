@@ -14,7 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	racer "github.com/Azure/unbounded/pkg/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // Immutable CDF shared by workers. Unlike math/rand.Zipf this also handles s<=1.
@@ -73,7 +73,7 @@ func (w discardWriter) WriteAt(p []byte, _ int64) (int, error) {
 	return len(p), nil
 }
 
-func download(ctx context.Context, client *racer.Client, target string, timeout time.Duration, m *metrics) error {
+func download(ctx context.Context, client *racersdk.Client, target string, timeout time.Duration, m *metrics) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -94,7 +94,7 @@ func download(ctx context.Context, client *racer.Client, target string, timeout 
 // One SDK client/pool per object worker keeps idle capacity sized for the total
 // page concurrency without introducing a custom transport.
 func runLoad(ctx context.Context, c config, d *dataset, m *metrics) error {
-	clients := make([]*racer.Client, 0, c.concurrency)
+	clients := make([]*racersdk.Client, 0, c.concurrency)
 
 	defer func() {
 		for _, client := range clients {
@@ -103,7 +103,7 @@ func runLoad(ctx context.Context, c config, d *dataset, m *metrics) error {
 	}()
 
 	for i := 0; i < c.concurrency; i++ {
-		client, err := racer.NewClient(c.endpoint, racer.ClientOptions{Concurrency: c.pageConcurrency})
+		client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{Concurrency: c.pageConcurrency})
 		if err != nil {
 			return err
 		}

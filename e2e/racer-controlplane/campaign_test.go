@@ -35,7 +35,7 @@ import (
 
 	originfixture "github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type dataplane struct {

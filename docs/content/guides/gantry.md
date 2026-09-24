@@ -341,7 +341,7 @@ are not rehashed on each foreground read; background scrubbing detects changes
 relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
 and SDK consumers must validate content themselves against an independently
 trusted expected digest. The SDK no longer provides inline SHA-256 verification;
-see its [API migration note](https://github.com/Azure/unbounded/blob/main/pkg/racer/STREAMING.md#migration-inline-verification-removed).
+see its [API migration note](https://github.com/Azure/unbounded/blob/main/pkg/racersdk/STREAMING.md#migration-inline-verification-removed).
 The direct backend still verifies its live registry streams in-process.
 
 Racer mode is demand-only: no direct Gantry transfer server,

@@ -21,7 +21,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // Keep the former fallback regressions, but enforce fail-closed responses.

@@ -11,7 +11,7 @@ COPY cmd/racer-loadgen/ cmd/racer-loadgen/
 COPY internal/version/ internal/version/
 COPY internal/racer/ internal/racer/
 COPY api/ api/
-COPY pkg/racer/ pkg/racer/
+COPY pkg/racersdk/ pkg/racersdk/
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev

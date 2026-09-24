@@ -11,7 +11,7 @@ on:
       - internal/operator/components/gantry/**
       - internal/operator/override/**
       - internal/racer/**
-      - pkg/racer/**
+      - pkg/racersdk/**
       - cmd/racer-dataplane/**
       - api/racer/**
       - e2e/racer/**
@@ -34,7 +34,7 @@ on:
       - internal/operator/components/gantry/**
       - internal/operator/override/**
       - internal/racer/**
-      - pkg/racer/**
+      - pkg/racersdk/**
       - cmd/racer-dataplane/**
       - api/racer/**
       - e2e/racer/**

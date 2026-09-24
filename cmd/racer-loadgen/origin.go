@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	racer "github.com/Azure/unbounded/pkg/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // All replicas serve the same immutable dataset, without materializing it.
@@ -84,16 +84,16 @@ func (d *dataset) publish() {
 
 func (d *dataset) target(id int) string { return d.prefix + strconv.Itoa(id) }
 
-func (d *dataset) Stat(ctx context.Context, target string, _ []byte) (racer.Metadata, error) {
+func (d *dataset) Stat(ctx context.Context, target string, _ []byte) (racersdk.Metadata, error) {
 	if err := ctx.Err(); err != nil {
-		return racer.Metadata{}, err
+		return racersdk.Metadata{}, err
 	}
 
 	suffix, ok := strings.CutPrefix(target, d.prefix)
 
 	id, err := strconv.ParseInt(suffix, 10, 64)
 	if !ok || err != nil || id < 0 || id >= d.count || suffix != strconv.FormatInt(id, 10) {
-		return racer.Metadata{}, fs.ErrNotExist
+		return racersdk.Metadata{}, fs.ErrNotExist
 	}
 
 	entry := &d.checksums[id]
@@ -116,20 +116,20 @@ func (d *dataset) Stat(ctx context.Context, target string, _ []byte) (racer.Meta
 	}
 
 	if err := ctx.Err(); err != nil {
-		return racer.Metadata{}, err
+		return racersdk.Metadata{}, err
 	}
 
 	if err := d.ctx.Err(); err != nil {
-		return racer.Metadata{}, err
+		return racersdk.Metadata{}, err
 	}
 
 	if entry.err != nil {
-		return racer.Metadata{}, entry.err
+		return racersdk.Metadata{}, entry.err
 	}
 
 	ttl := d.ttl
 
-	return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
+	return racersdk.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
 }
 
 func (d *dataset) checksum(ctx context.Context, target string) ([32]byte, error) {
@@ -159,14 +159,14 @@ func checksum(ctx context.Context, source io.ReaderAt, size int64) ([32]byte, er
 	return [32]byte(h.Sum(nil)), nil
 }
 
-func (d *dataset) Open(ctx context.Context, target, etag string, _ []byte) (racer.Source, error) {
+func (d *dataset) Open(ctx context.Context, target, etag string, _ []byte) (racersdk.Source, error) {
 	m, err := d.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	if etag != m.ETag {
-		return nil, racer.ErrVersionChanged
+		return nil, racersdk.ErrVersionChanged
 	}
 
 	return d.source(target), nil

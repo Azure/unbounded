@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"testing"
 
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func TestGantryRacerGeneration(t *testing.T) {

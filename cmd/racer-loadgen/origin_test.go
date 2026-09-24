@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	racer "github.com/Azure/unbounded/pkg/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func datasetForTest(t *testing.T, c config) *dataset {
@@ -76,7 +76,7 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 	}
 
 	for _, tag := range []string{"", "wrong", "W/" + m.ETag} {
-		if _, err := d.Open(ctx, d.target(2), tag, nil); !errors.Is(err, racer.ErrVersionChanged) {
+		if _, err := d.Open(ctx, d.target(2), tag, nil); !errors.Is(err, racersdk.ErrVersionChanged) {
 			t.Errorf("Open with ETag %q = %v", tag, err)
 		}
 	}
@@ -177,7 +177,7 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 				canceledDone := statErrorAsync(d, canceledCtx, 0)
 				deadlineDone := statErrorAsync(d, deadlineCtx, 0)
 
-				liveDone := make(chan racer.Metadata, 1)
+				liveDone := make(chan racersdk.Metadata, 1)
 
 				go func() {
 					m, err := d.Stat(context.Background(), target, nil)
@@ -395,7 +395,7 @@ func TestDatasetPublicationFailure(t *testing.T) {
 	}
 }
 
-func sourceForTest(t *testing.T, d *dataset, id int) racer.Source {
+func sourceForTest(t *testing.T, d *dataset, id int) racersdk.Source {
 	t.Helper()
 
 	m, err := d.Stat(context.Background(), d.target(id), nil)
@@ -504,7 +504,7 @@ func TestHandlerPreservesRawTargets(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	newMetrics(reg)
 
-	h, _ := racer.NewOrigin(d)
+	h, _ := racersdk.NewOrigin(d)
 	for target, want := range map[string]int{
 		"/healthz": 404, "/metrics": 404, d.target(0): 200,
 		d.prefix + "00": 404, d.prefix + "%30": 404, d.prefix + "./0": 404,
@@ -526,7 +526,7 @@ func TestDatasetOriginMetadataConsistency(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 4099, objectSize: 4099, ttl: 17 * time.Second})
 	target := d.target(0)
 
-	origin, err := racer.NewOrigin(d)
+	origin, err := racersdk.NewOrigin(d)
 	if err != nil {
 		t.Fatal(err)
 	}

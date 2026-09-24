@@ -46,7 +46,7 @@ unbounded-kube is organized into several directories:
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
-  - `racer/` - shared Racer metadata, Site-to-universe mapping, and protocol helpers. The public SDK and origin helpers live in `pkg/racer/`.
+  - `racer/` - shared Racer metadata, Site-to-universe mapping, and protocol helpers. The public SDK and origin helpers live in `pkg/racersdk/`.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing

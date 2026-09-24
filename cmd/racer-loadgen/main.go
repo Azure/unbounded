@@ -20,7 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Azure/unbounded/internal/version"
-	racer "github.com/Azure/unbounded/pkg/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func main() {
@@ -74,7 +74,7 @@ func serve(ctx context.Context, c config) error {
 		return serveImages(ctx, c)
 	}
 	// Validate the endpoint before opening a listener.
-	client, err := racer.NewClient(c.endpoint, racer.ClientOptions{Concurrency: c.pageConcurrency})
+	client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{Concurrency: c.pageConcurrency})
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func serve(ctx context.Context, c config) error {
 	}
 	defer originListener.Close() //nolint:errcheck // Best effort cleanup after server shutdown or setup failure.
 
-	origin, err := racer.NewOrigin(d)
+	origin, err := racersdk.NewOrigin(d)
 	if err != nil {
 		return err
 	}

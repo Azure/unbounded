@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // racerState is present only on Racer mirrors, even when the backend is nil.

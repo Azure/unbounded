@@ -295,7 +295,7 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
-          python3 hack/scripts/racer-test.py run sdk-interop 300 go test -json -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
+          python3 hack/scripts/racer-test.py run sdk-interop 300 go test -json -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racersdk
       - name: Upload production-binary campaign diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

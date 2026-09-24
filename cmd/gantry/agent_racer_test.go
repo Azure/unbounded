@@ -22,7 +22,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {

@@ -1,0 +1,14 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build !linux
+
+package racersdk
+
+import "io"
+
+type splicePipePool struct{}
+
+func (*splicePipePool) closeIdle() {}
+
+func (s *Stream) spliceTo(io.Writer) (int64, error, bool) { return 0, nil, false }

@@ -27,7 +27,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	racermeta "github.com/Azure/unbounded/internal/racer"
-	sdk "github.com/Azure/unbounded/pkg/racer"
+	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
 // runRacerAgent deliberately starts no libp2p host, DHT, transfer client/server,
