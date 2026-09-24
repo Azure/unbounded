@@ -227,7 +227,7 @@ fn invalid(message: &'static str) -> io::Error {
 fn reject_version(page: &uring::Page) -> io::Result<()> {
     if page.0[..6] == *b"RACERS" && get(page, 0) != MAGIC {
         return Err(invalid(
-            "incompatible slab format: expected RACERS06 with Content-Type metadata and 64 MiB payloads",
+            "incompatible slab format: expected RACERS06 with Content-Type metadata and 64 MiB payloads; preserve the old slab and use a new RACER_SLAB_PATH; no automatic migration/reformat",
         ));
     }
     Ok(())

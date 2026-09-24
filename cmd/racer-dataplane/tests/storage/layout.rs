@@ -578,7 +578,10 @@ fn populated_two_tib_memory_child() {
     fn metadata(n: u64, revision: u64) -> Entry {
         Entry::Metadata(
             Metadata {
-                content_type: Default::default(),
+                content_type: crate::metadata::ContentType::new(
+                    b"application/vnd.oci.image.manifest.v1+json",
+                )
+                .unwrap(),
                 checksum: crate::metadata::Checksum([revision as u8; 32]),
                 len: n,
                 expires: revision,

@@ -54,6 +54,51 @@ fn metadata(n: u64, expires: u64) -> Metadata {
 }
 
 #[test]
+fn resident_metadata_preserves_content_type_across_cow_and_encoding() {
+    for len in [0, 1, 39, 255, 256] {
+        let record = Metadata {
+            content_type: if len == 0 {
+                Default::default()
+            } else {
+                crate::metadata::ContentType::new(&vec![b'x'; len]).unwrap()
+            },
+            ..metadata(42, u64::MAX)
+        };
+        let mut root = Rc::new(Node::empty());
+        Node::insert(&mut root, key(0), Entry::Metadata(record.into()));
+        let snapshot = root.clone();
+        Node::insert(&mut root, key(1), Entry::Metadata(metadata(1, 100).into()));
+        let Entry::Metadata(old) = snapshot.get(&key(0)).unwrap() else {
+            unreachable!()
+        };
+        let Entry::Metadata(current) = root.get(&key(0)).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(old.to_metadata(), record);
+        assert_eq!(current.to_metadata(), record);
+        match (old.header_allocation(), current.header_allocation()) {
+            (Some(old), Some(current)) => {
+                assert_eq!(old.1, ResidentMetadata::header_allocation_bytes(len));
+                assert_eq!(old, current, "CoW must share immutable header bytes");
+            }
+            (None, None) => assert_eq!(len, 0),
+            _ => panic!("CoW changed Content-Type presence"),
+        }
+        let replacement = metadata(99, 200);
+        Node::insert(&mut root, key(0), Entry::Metadata(replacement.into()));
+        for (node, expected) in [(&snapshot, record), (&root, replacement)] {
+            let encoded = encode(node);
+            assert_eq!(&encoded.0[72..32 + LEAF_ENTRY], &expected.to_bytes());
+        }
+        assert!(Node::remove(&mut root, &key(0)));
+        let Entry::Metadata(old) = snapshot.get(&key(0)).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(old.to_metadata(), record);
+    }
+}
+
+#[test]
 fn content_type_checkpoint_reopen_exact_limit() {
     let (fixture, mut slab) = Fixture::new();
     let mut allocator = allocator(&mut slab);
@@ -218,6 +263,14 @@ fn incompatible_slab_versions_are_rejected_without_modification() {
         error.to_string().contains("incompatible slab format"),
         "{error}"
     );
+    assert!(error.to_string().contains("preserve the old slab"));
+    assert!(error.to_string().contains("new RACER_SLAB_PATH"));
+    assert!(
+        error
+            .to_string()
+            .contains("no automatic migration/reformat"),
+        "{error}"
+    );
     assert_eq!(read_page(&slab.file, g, 1).unwrap().0, old.0);
     drop(slab);
     let error = Slab::open_or_create_layout(&fixture.path, 64 * WIDE, 2, 1)
@@ -226,6 +279,12 @@ fn incompatible_slab_versions_are_rejected_without_modification() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(
         error.to_string().contains("incompatible slab format"),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("no automatic migration/reformat"),
         "{error}"
     );
     let file = File::open(&fixture.path).unwrap();
