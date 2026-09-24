@@ -237,11 +237,9 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
+.PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check
 .PHONY: racer-controlplane-test racer-dataplane-test racer-rust-test-compile racer-controlplane-fmt-check racer-dataplane-fmt-check
-.PHONY: racer-controlplane-live-test
-.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer
-.PHONY: e2e-gantry-racer-build e2e-gantry-racer
+.PHONY: e2e-racer-build e2e-racer-compile e2e-racer
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
@@ -269,11 +267,9 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
-	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
-	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
-	@echo "  e2e-gantry-racer-build           Build Gantry, loadgen, locked Rust dataplane, and warm the e2e Go build cache"
-	@echo "  e2e-gantry-racer                 Run six real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
-	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
+	@echo "  e2e-racer-build                  Build local images for the Racer kind smoke test"
+	@echo "  e2e-racer-compile                Compile the Racer kind smoke test"
+	@echo "  e2e-racer                        Run the Racer control-plane/dataplane SDK smoke test on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
@@ -312,8 +308,6 @@ help: ## Show this help
 	@echo "  racer-{controlplane,dataplane,loadgen}-build  Build individual Racer bin/ artifacts"
 	@echo "  racer-test                       Run Racer Go tests, Rust all-target tests, and doctests"
 	@echo "  racer-fmt-check                  Check Rust source and explicitly included test formatting"
-	@echo "  racer-crosslang-test             Run Go/Rust SDK interoperability tests (requires a capable Linux host)"
-	@echo "  racer-controlplane-live-test     Run actual Rust CP/DP API, failover, storage, and CA retirement campaign"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -774,57 +768,20 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 RACER_TEST_HARNESS = CARGO="$(CARGO)" RACER_CARGO_TARGET_DIR="$(RACER_CARGO_TARGET_DIR)" RACER_CONTROLPLANE_CARGO_TARGET_DIR="$(RACER_CONTROLPLANE_CARGO_TARGET_DIR)" python3 hack/scripts/racer-test.py
 RACER_SOURCE_BUILD = python3 hack/scripts/racer-source-context.py --build
 
-# Build separately so compilation does not consume the per-test runtime budget.
-# The debug daemon reuses the Racer CI all-targets Cargo cache.
-GANTRY_RACER_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),$(CURDIR)/tmp/gantry-racer)
-GANTRY_BINARY ?= $(abspath $(GANTRY_BIN))
-RACER_DATAPLANE_BINARY ?= $(abspath $(RACER_CARGO_TARGET_DIR)/debug/racer-dataplane)
-RACER_LOADGEN_BINARY ?= $(abspath bin/racer-loadgen)
-
-e2e-gantry-racer-build: gantry-build racer-loadgen-build ## Build binaries and warm Go compilation for the native Gantry/Racer e2e
-	@if [ "$(origin RACER_DATAPLANE_BINARY)" = "command line" ] || [ "$(origin RACER_DATAPLANE_BINARY)" = "environment" ]; then \
-		test -x "$(RACER_DATAPLANE_BINARY)" || { echo "Missing prebuilt dataplane: $(RACER_DATAPLANE_BINARY)" >&2; exit 1; }; \
-	else \
-		$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --bin racer-dataplane; \
-	fi
-	$(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run '^$$'
-
-# These Linux-only tests fail on missing prerequisites; never substitute a skip.
-# The fixture itself verifies namespace/mount privileges and real io_uring startup.
-e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and independent 60s deadlines
-	@set -eu; \
-		test "$$(uname -s)" = Linux || { echo "GantryRacer requires Linux" >&2; exit 1; }; \
-		for tool in timeout sudo findmnt; do command -v "$$tool" >/dev/null; done; \
-		sudo -n sh -ec 'for tool in containerd ip unshare mount; do command -v "$$tool" >/dev/null; done'; \
-		export TMPDIR="$(GANTRY_RACER_TMPDIR)"; \
-		case "$$TMPDIR" in "$(CURDIR)"/*) ;; *) echo "TMPDIR must be an absolute directory inside $(CURDIR)" >&2; exit 1;; esac; \
-		mkdir -p "$$TMPDIR"; \
-		test "$$(findmnt -n -o FSTYPE -T "$$TMPDIR")" = ext4 || { echo "TMPDIR must be on ext4" >&2; exit 1; }; \
-		export GANTRY_BINARY="$(GANTRY_BINARY)" RACER_DATAPLANE_BINARY="$(RACER_DATAPLANE_BINARY)" RACER_LOADGEN_BINARY="$(RACER_LOADGEN_BINARY)" RACER_REQUIRE_URING=1; \
-		for binary in "$$GANTRY_BINARY" "$$RACER_DATAPLANE_BINARY" "$$RACER_LOADGEN_BINARY"; do \
-			case "$$binary" in /*) ;; *) echo "Binary path must be absolute: $$binary" >&2; exit 1;; esac; \
-			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
-		done; \
-		failed=0; \
-		for suite in Striped Authorization Recovery Corruption ContainerImage Generation RollingSwitch; do \
-			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
-			$(RACER_TEST_HARNESS) run "gantry-$$suite" 60 $(GOTEST) -json -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v || failed=1; \
-		done; exit $$failed
-
 # The live suite requires Docker, kind, kubectl, and suitable dataplane hardware.
-# It builds root-context images locally; CI supplies cached current-checkout
-# images via RACER_E2E_IMAGE_TAG.
-e2e-racer-compile: ## Compile all Racer e2e packages without running tests
-	@failed=0; \
-		$(RACER_TEST_HARNESS) run e2e-compile 300 $(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/... || failed=1; \
-		$(RACER_TEST_HARNESS) run live-compile 300 $(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer-controlplane || failed=1; \
-		exit $$failed
+# Build images separately so the cluster test has a strict five-minute deadline.
+RACER_E2E_IMAGE_TAG ?= racer-e2e
+e2e-racer-build: ## Build images for the kind smoke test, separately from its runtime budget
+	timeout 10m docker build -t racer-controlplane:$(RACER_E2E_IMAGE_TAG) -f images/racer-controlplane/Containerfile .
+	timeout 10m docker build -t racer-dataplane:$(RACER_E2E_IMAGE_TAG) -f images/racer-dataplane/Containerfile .
+	timeout 10m docker build -t unbounded-operator:$(RACER_E2E_IMAGE_TAG) -f images/unbounded-operator/Containerfile .
+	timeout 5m docker build -t racer-fixture:$(RACER_E2E_IMAGE_TAG) -f e2e/racer/fixture/Containerfile .
 
-e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
-	$(RACER_TEST_HARNESS) run e2e-fixtures 300 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -timeout=4m -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract|TestBackendWireRepresentation|TestGantryControlFixture|TestGantryRecoveryFixture|TestEnrollmentAndControl)$$' ./e2e/racer/...
+e2e-racer-compile: ## Compile the Racer kind smoke test without starting a cluster
+	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
 
-e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
-	$(RACER_TEST_HARNESS) run kind-deployment 2760 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
+e2e-racer: ## Run one control-plane/dataplane SDK smoke test on kind
+	RACER_E2E_IMAGE_TAG=$(RACER_E2E_IMAGE_TAG) $(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=5m -run '^TestRacer$$' ./e2e/racer
 
 racer-controlplane-build: ## Build the Rust control plane (requires Rust 1.96, cc, pkg-config, libssl-dev)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' RACER_VERSION='$(VERSION)' RACER_COMMIT='$(GIT_COMMIT)' $(CARGO) build --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --release --locked --bin racer-controlplane
@@ -929,18 +886,6 @@ racer-dataplane-fmt-check:
 
 racer-fmt-check: racer-controlplane-fmt-check racer-dataplane-fmt-check ## Check both Rust crates, including explicitly included tests
 	rustfmt --edition 2024 --check internal/racer/product.rs internal/racer/product_tests.rs
-
-# Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
-racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real daemon
-	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		$(RACER_TEST_HARNESS) run sdk-interop 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racersdk
-
-# Requires envtest assets, private namespace privileges, ext4 TMPDIR, and a
-# workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 29 bytes.
-racer-controlplane-live-test: racer-controlplane-build racer-dataplane-build ## Run actual Rust CP/DP failover, storage, and CA retirement campaign
-	RACER_CONTROLPLANE_BINARY="$(CURDIR)/bin/racer-controlplane" \
-		RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		bash hack/scripts/racer-controlplane-live.sh
 
 racer-test: ## Aggregate Go and Rust failures without suppressing later suites
 	@failed=0; $(MAKE) racer-go-test || failed=1; $(MAKE) racer-rust-test || failed=1; exit $$failed

@@ -1,92 +1,156 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+// The kind smoke pod serves an SDK origin and verifies reads through Racer.
 package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"syscall"
+	"sync/atomic"
 	"time"
 
-	"github.com/Azure/unbounded/e2e/racer/fixture"
-	racermeta "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "serve" {
-		origin := fixture.NewOrigin()
-		origin.Source = os.Getenv("NODE_NAME")
+const pageSize = racersdk.PageSize
 
-		for _, name := range os.Args[2:] {
-			_, path, err := racermeta.CacheSockets(racermeta.SocketRoot, name)
-			if err != nil {
-				log.Fatal(err)
-			}
+type store struct {
+	data  []byte
+	opens atomic.Int64
+}
 
-			go func() {
-				for {
-					if err := racermeta.PrepareSocketDirectory(path); err != nil {
-						log.Fatal(err)
-					}
+func (s *store) Stat(_ context.Context, target string, _ []byte) (racersdk.Metadata, error) {
+	if target != "/smoke" {
+		return racersdk.Metadata{}, fs.ErrNotExist
+	}
 
-					listener, err := net.Listen("unix", path)
-					if errors.Is(err, syscall.ENOENT) {
-						time.Sleep(100 * time.Millisecond)
-						continue
-					}
+	ttl := time.Hour
 
-					if errors.Is(err, syscall.EADDRINUSE) {
-						conn, probeErr := net.DialTimeout("unix", path, time.Second)
-						if conn != nil {
-							if err := conn.Close(); err != nil {
-								log.Fatal(err)
-							}
-						}
+	return racersdk.Metadata{Size: int64(len(s.data)), ETag: fmt.Sprintf(`"%x"`, sha256.Sum256(s.data)), ContentType: "application/octet-stream", TTL: &ttl}, nil
+}
 
-						if errors.Is(probeErr, syscall.ECONNREFUSED) {
-							info, statErr := os.Lstat(path)
-							if statErr == nil && info.Mode()&os.ModeSocket != 0 {
-								if err := os.Remove(path); err != nil {
-									log.Fatal(err)
-								}
+func (s *store) ResolveRange(ctx context.Context, target string, data []byte) (racersdk.ResolvedRange, error) {
+	m, err := s.Stat(ctx, target, data)
+	if err != nil {
+		return nil, err
+	}
 
-								continue
-							}
-						}
-					}
+	return &resolved{store: s, meta: m}, nil
+}
 
-					if err != nil {
-						log.Fatal(err)
-					}
+type resolved struct {
+	store *store
+	meta  racersdk.Metadata
+}
 
-					if err := os.Chmod(path, 0o660); err != nil {
-						log.Fatal(err)
-					}
+func (r *resolved) Metadata() racersdk.Metadata { return r.meta }
+func (r *resolved) Close() error                { return nil }
+func (r *resolved) OpenRange(_ context.Context, offset, length int64) (io.ReadCloser, error) {
+	r.store.opens.Add(1)
+	return io.NopCloser(io.NewSectionReader(bytes.NewReader(r.store.data), offset, length)), nil
+}
 
-					log.Fatal((&http.Server{Handler: origin, ReadHeaderTimeout: 5 * time.Second}).Serve(listener))
-				}
-			}()
+func run() error {
+	s := &store{data: make([]byte, 2*pageSize+17)}
+	for i := range s.data {
+		s.data[i] = byte((i*31 + 17) % 251)
+	}
+
+	origin, err := racersdk.NewRangeOrigin(s)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll("/run/racer/smoke/origin", 0o770); err != nil {
+		return err
+	}
+
+	listener, err := net.Listen("unix", "/run/racer/smoke/origin/socket")
+	if err != nil {
+		return err
+	}
+
+	server := &http.Server{Handler: origin, ReadHeaderTimeout: 5 * time.Second}
+
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("close origin: %v", err)
+		}
+	}()
+
+	if err := os.Chmod(listener.Addr().String(), 0o660); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("serve origin: %v", err)
+		}
+	}()
+
+	client, err := racersdk.NewClient("/run/racer/smoke/client/socket", racersdk.ClientOptions{})
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	for i, span := range [][2]int64{{0, int64(len(s.data))}, {0, int64(len(s.data))}, {pageSize - 5, 17}} {
+		object, err := client.Open(ctx, "/smoke")
+		if err != nil {
+			return err
 		}
 
-		s := &http.Server{Addr: ":8080", Handler: origin, ReadHeaderTimeout: 5 * time.Second}
-		log.Fatal(s.ListenAndServe())
+		if object.Metadata().Size != int64(len(s.data)) {
+			return fmt.Errorf("wrong object size: %+v", object.Metadata())
+		}
+
+		stream, err := object.ReadRange(ctx, span[0], span[1])
+		if err != nil {
+			return err
+		}
+
+		var out bytes.Buffer
+
+		n, err := stream.WriteTo(&out)
+		closeErr := stream.Close()
+
+		if err != nil {
+			return err
+		}
+
+		if closeErr != nil {
+			return closeErr
+		}
+
+		if n != span[1] || !bytes.Equal(out.Bytes(), s.data[span[0]:span[0]+span[1]]) {
+			return fmt.Errorf("read %d: incorrect bytes (length %d)", i, n)
+		}
+
+		if got := s.opens.Load(); got != 3 {
+			return fmt.Errorf("read %d: origin payload fetches = %d, want 3", i, got)
+		}
 	}
 
-	if len(os.Args) < 5 || os.Args[1] != "request" {
-		log.Fatal("usage: fixture serve [CACHE_NAME...] | fixture request METHOD URL RANGE [HEADER...]")
-	}
+	log.Print("verified SDK cold read, warm cache reuse, and cross-page range")
 
-	r, err := fixture.Fetch(os.Args[2], os.Args[3], os.Args[4], os.Args[5:]...)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return nil
+}
 
-	if err := json.NewEncoder(os.Stdout).Encode(r); err != nil {
+func main() {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -1,5 +1,9 @@
 # Racer Go control-plane retirement
 
+> The native campaigns, SDK daemon test, and Python probes referenced below have
+> since been retired. Current e2e coverage is the [single kind smoke test](../e2e/racer/README.md).
+> The coverage and build commands below record the historical retirement milestone.
+
 > Historical pre-1.0 audit. Versioned endpoints and deprecated Site-label
 > fallback below describe that revision, not the Racer 1.0 contract.
 

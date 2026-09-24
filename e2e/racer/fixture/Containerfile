@@ -8,6 +8,7 @@ COPY go.mod go.sum ./
 COPY e2e/racer/fixture ./e2e/racer/fixture
 COPY internal/racer ./internal/racer
 COPY api ./api
+COPY pkg/racersdk ./pkg/racersdk
 RUN CGO_ENABLED=0 go build -trimpath -o /fixture ./e2e/racer/fixture/cmd
 FROM scratch
 COPY --from=build /fixture /fixture

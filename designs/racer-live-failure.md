@@ -1,5 +1,8 @@
 # Resolved Racer live-campaign traffic failure
 
+> The native campaign and its runner have been retired. This document preserves
+> historical results; current e2e coverage is the [single kind smoke test](../e2e/racer/README.md).
+
 > Historical pre-stateless campaign evidence. The signed-claim certificate,
 > revision-checkpoint, and expiry-overlap rotation changes require their own
 > verification; this record does not establish that they passed. See the current
@@ -15,8 +18,8 @@ runs below; no traffic errors are accepted or hidden by harness retries.
 
 The campaign uses two Rust control planes, three production dataplanes, real
 envtest Kubernetes, private network/mount namespaces, 120-second leaves and
-one-second skew. See `e2e/racer-controlplane/README.md` for the maintained runner
-and its prerequisites. The test is a correctness campaign, not a fleet-scale
+one-second skew. Its former runner and prerequisites are available in Git history.
+The test was a correctness campaign, not a fleet-scale
 latency or throughput measurement.
 
 ## Diagnosis retained for regression context

@@ -289,5 +289,5 @@ causes Kubernetes to restart it. Delete the example to stop the benchmark:
 kubectl delete -f e2e/racer/examples/container-image-loadgen.yaml
 ```
 
-For automated real Gantry/Racer verification, run `make e2e-gantry-racer-build`
-and `make e2e-gantry-racer` as described in the [native test guide](../../e2e/racer/README.md).
+For automated Racer control-plane/dataplane verification with the Go SDK, run
+`make e2e-racer` as described in the [kind smoke test guide](../../e2e/racer/README.md).

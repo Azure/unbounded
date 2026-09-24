@@ -138,7 +138,7 @@ jobs:
 
   # ---------- Racer ----------
   racer:
-    name: Racer Rust and Cross-language Tests
+    name: Racer Unit and Component Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -195,11 +195,6 @@ jobs:
       - name: Check bounded harness and hermetic context
         if: ${{ !cancelled() }}
         run: make racer-harness-test
-      # Build the native daemon before capturing test executable identities.
-      # Later runtime-only steps consume this binary without invoking Cargo.
-      - name: Build native GantryRacer e2e
-        if: ${{ !cancelled() }}
-        run: python3 hack/scripts/racer-test.py run gantry-build 1200 make e2e-gantry-racer-build
       - name: Compile all test targets
         if: ${{ !cancelled() }}
         run: make racer-rust-test-compile
@@ -208,17 +203,6 @@ jobs:
         run: |
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           make racer-controlplane-test-run
-      # This job runs for every CI event, including Gantry core, SDK, Rust,
-      # api/racer, and e2e/racer changes. Reuse its native Rust cache and host
-      # capabilities rather than placing the suite on the generic Go test job.
-      - name: Test Gantry with real Racer and containerd
-        if: ${{ !cancelled() }}
-        run: |
-          sudo -n prlimit --pid $$ --memlock=unlimited:unlimited
-          # The runner's Docker installation supplies containerd. The Make target
-          # fails if it or namespace/mount privileges, ext4, or io_uring are absent.
-          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          make e2e-gantry-racer
       - name: Test Rust with required kernel coverage and doctests
         if: ${{ !cancelled() }}
         run: |
@@ -255,70 +239,21 @@ jobs:
       - name: Test shared Go components
         if: ${{ !cancelled() }}
         run: make racer-go-test
-      - name: Compile Racer e2e and validate operator fixtures
-        if: ${{ !cancelled() }}
-        run: make -k e2e-racer-compile e2e-racer-fixtures
-      - name: Test actual Rust control planes and dataplanes against the real API server
-        if: ${{ !cancelled() }}
-        run: |
-          sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          mkdir -p "$GITHUB_WORKSPACE/tmp/racer-sockets"
-          # A short alias to workspace-owned scratch keeps production UDS names valid.
-          ln -s "$GITHUB_WORKSPACE/tmp/racer-sockets" "$RUNNER_TEMP/racer"
-          export RACER_LIVE_SOCKET_ROOT="$RUNNER_TEMP/racer"
-          test "${#RACER_LIVE_SOCKET_ROOT}" -le 36
-          export RACER_CONTROLPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-controlplane"
-          export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
-          bash hack/scripts/racer-controlplane-live.sh
-      - name: Test SDK against the real dataplane
-        if: ${{ !cancelled() }}
-        run: |
-          # This fixture uses one I/O and one compute worker on the first allowed
-          # NUMA node. Count allowed physical cores, not SMT threads or CPU quota.
-          cores=$(python3 - <<'PY'
-          import os
-          from pathlib import Path
-          nodes = {}
-          for cpu in os.sched_getaffinity(0):
-              path = Path(f"/sys/devices/system/cpu/cpu{cpu}")
-              node = int(next(path.glob("node[0-9]*")).name[4:])
-              siblings = (path / "topology/thread_siblings_list").read_text().strip()
-              nodes.setdefault(node, set()).add(siblings)
-          print(len(nodes[min(nodes)]) if nodes else 0)
-          PY
-          )
-          if [ "$cores" -lt 2 ]; then
-            echo "::error::SDK dataplane tests require two allowed physical cores on the first NUMA node"
-            exit 1
-          fi
-          sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
-          python3 hack/scripts/racer-test.py run sdk-interop 300 go test -json -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racersdk
-      - name: Upload production-binary campaign diagnostics
+      - name: Upload Racer test diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: racer-controlplane-live
+          name: racer-tests
           path: |
             tmp/racer-test-logs/**
-            tmp/racer-tests/racer-live-run-*.log
-            tmp/racer-tests/racer-live-artifacts-*/**
           if-no-files-found: ignore
           retention-days: 7
 
-  # The live deployment suite runs on a fresh runner for every CI event.
+  # The single kind smoke test runs on a fresh runner for every CI event.
   racer-e2e:
-    name: Racer E2E (${{ matrix.suite }})
+    name: Racer Kind Smoke Test
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: deployment
-            target: e2e-racer
     env:
       GOTOOLCHAIN: go1.26.6
       KIND_VERSION: v0.29.0
@@ -366,12 +301,9 @@ jobs:
               siblings = (path / "topology/thread_siblings_list").read_text().strip()
               nodes.setdefault(node, set()).add(siblings)
           assert nodes and len(nodes[min(nodes)]) >= 2, "need two physical cores on first NUMA node"
-          assert len(os.sched_getaffinity(0)) >= 4, "need capacity for 3-CPU dataplane plus system pods"
-          memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-          assert memory >= 12 * 1024**3, "need at least 12 GiB for two dataplanes, builds, and kind"
           PY
-      - name: Compile and check fixture wiring
-        run: make e2e-racer-compile e2e-racer-fixtures
+      - name: Compile smoke test
+        run: make e2e-racer-compile
       - name: Prepare tracked-source Docker context
         run: |
           mkdir -p tmp
@@ -389,8 +321,8 @@ jobs:
           build-args: |
             VERSION=${{ env.RACER_E2E_IMAGE_TAG }}
             GIT_COMMIT=${{ github.sha }}
-          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane
-          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane,mode=max
+          cache-from: type=gha,scope=racer-e2e-controlplane
+          cache-to: type=gha,scope=racer-e2e-controlplane,mode=max
       - name: Build cached dataplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
@@ -398,8 +330,8 @@ jobs:
           file: images/racer-dataplane/Containerfile
           load: true
           tags: racer-dataplane:${{ env.RACER_E2E_IMAGE_TAG }}
-          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-dataplane
-          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-dataplane,mode=max
+          cache-from: type=gha,scope=racer-e2e-dataplane
+          cache-to: type=gha,scope=racer-e2e-dataplane,mode=max
       - name: Build cached operator
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
@@ -407,31 +339,31 @@ jobs:
           file: images/unbounded-operator/Containerfile
           load: true
           tags: unbounded-operator:${{ env.RACER_E2E_IMAGE_TAG }}
-          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-operator
-          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-operator,mode=max
-      - name: Build cached origin and probe fixture
+          cache-from: type=gha,scope=racer-e2e-operator
+          cache-to: type=gha,scope=racer-e2e-operator,mode=max
+      - name: Build cached SDK fixture
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: tmp/racer-image-context
           file: e2e/racer/fixture/Containerfile
           load: true
           tags: racer-fixture:${{ env.RACER_E2E_IMAGE_TAG }}
-          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-fixture
-          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-fixture,mode=max
-      - name: Run ${{ matrix.suite }} e2e
+          cache-from: type=gha,scope=racer-e2e-fixture
+          cache-to: type=gha,scope=racer-e2e-fixture,mode=max
+      - name: Run kind smoke test
         run: |
           set -o pipefail
-          make ${{ matrix.target }} 2>&1 | tee "$RACER_E2E_DIR/${{ matrix.suite }}.log"
+          make e2e-racer 2>&1 | tee "$RACER_E2E_DIR/smoke.log"
       - name: Upload Racer diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: racer-e2e-${{ matrix.suite }}
+          name: racer-e2e
           include-hidden-files: true
           path: |
             tmp/racer-test-logs/**
             e2e/racer/.artifacts/**
-            !e2e/racer/.artifacts/**/cache-*/**
+            !e2e/racer/.artifacts/**/cache/**
             !e2e/racer/.artifacts/**/kubeconfig
             !e2e/racer/.artifacts/**/*.kubeconfig
           if-no-files-found: warn

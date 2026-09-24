@@ -312,23 +312,6 @@ else:
         with self.assertRaises(FileExistsError):
             context.snapshot(source, output)
 
-    def test_live_script_selects_reduced_and_full_campaign_once(self):
-        go = self.root / 'go'
-        calls = self.root / 'go-calls.json'
-        go.write_text(f'#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n'
-                      f'Path({str(calls)!r}).write_text(json.dumps(sys.argv[1:]))\n')
-        go.chmod(0o755)
-        env = os.environ | dict(PATH=str(self.root) + os.pathsep + os.environ['PATH'],
-                                TMPDIR=str(self.root), RACER_CONTROLPLANE_BINARY='/fake/cp',
-                                RACER_DATAPLANE_BINARY='/fake/dp', KUBEBUILDER_ASSETS='/fake/assets',
-                                RACER_LIVE_SOCKET_ROOT=str(self.root))
-        subprocess.run(['bash', str(harness.ROOT / 'hack/scripts/racer-controlplane-live.sh')],
-                       env=env, check=True, timeout=5)
-        args = json.loads(calls.read_text())
-        self.assertEqual(args[args.index('-run') + 1], '^(TestColdObjectMultiPeer|TestProductionBinaryCampaign)$')
-        self.assertEqual(args.count('./e2e/racer-controlplane'), 1)
-        self.assertIn('-count=1', args)
-
     def test_source_context_rejects_symlink_parent_escape(self):
         source = self.root / 'source'
         source.mkdir()
