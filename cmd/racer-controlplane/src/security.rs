@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CONTROL_AUDIENCE: &str = "racer-control";
-pub const MAX_OBJECT_BYTES: usize = 900 * 1024;
 
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -87,7 +86,7 @@ impl Identity {
         format!("{}/{}", self.pod_uid, self.boot_id)
     }
 
-    pub fn uri(&self) -> Result<String> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             process_id(&self.pod_uid) && process_id(&self.boot_id),
             "invalid process identity"
@@ -98,19 +97,15 @@ impl Identity {
                     hex_id(&self.universe) && hex_id(&self.node),
                     "invalid node identity"
                 );
-                Ok(format!(
-                    "spiffe://racer/universe/{}/node/{}/pod/{}",
-                    self.universe, self.node, self.pod_uid
-                ))
             }
             IdentityKind::ControlPlane => {
                 ensure!(
                     self.universe.is_empty() && self.node.is_empty(),
                     "invalid control-plane identity"
                 );
-                Ok("spiffe://racer/controlplane".into())
             }
         }
+        Ok(())
     }
 }
 
@@ -131,7 +126,7 @@ impl SignedClaims {
             certificates::valid_namespace(&self.namespace),
             "invalid claims namespace"
         );
-        self.identity.uri()?;
+        self.identity.validate()?;
         ensure!(hex_id(&self.identity.boot_id), "invalid signed boot nonce");
         ensure!(pod_name(&self.identity.pod_name), "invalid signed Pod name");
         ensure!(

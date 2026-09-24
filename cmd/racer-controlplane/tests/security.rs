@@ -5,6 +5,7 @@
 #[path = "../src/security.rs"]
 #[allow(dead_code)]
 mod security;
+use racer_controlplane::model;
 
 use anyhow::{Result, ensure};
 use security::*;
@@ -1176,7 +1177,7 @@ async fn signed_process_claims_are_exact_and_old_leaves_need_no_issuance_ledger(
     let claims = certificate_claims(&leaf.certificate_pem).unwrap();
     assert_eq!(claims.namespace, "system");
     assert_eq!(claims.identity, identity);
-    assert!(SignedClaims::parse(&identity.uri().unwrap()).is_err());
+    assert!(SignedClaims::parse("spiffe://racer/controlplane").is_err());
     let mut wrong = claims.clone();
     wrong.identity.boot_id.clear();
     assert!(wrong.uri().is_err());
@@ -1535,17 +1536,4 @@ async fn standby_authorization_and_pending_process_retirement_require_live_proof
     assert!(
         authorize_replica("system", &pod, &replica_set, &deployment, &identity.boot_id).is_err()
     );
-    let request = ObjectMetadata {
-        namespace: "system".into(),
-        name: "racer-replica-pod".into(),
-        owners: vec![OwnerReference {
-            api_version: "v1".into(),
-            kind: "Pod".into(),
-            name: "standby".into(),
-            uid: "pod".into(),
-            controller: true,
-        }],
-        ..Default::default()
-    };
-    assert!(replica_request_owned(&request, &pod));
 }

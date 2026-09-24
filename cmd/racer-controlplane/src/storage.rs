@@ -187,8 +187,8 @@ impl StoragePolicy {
     }
 }
 
-impl crate::publication::Versioned for StoragePolicy {
-    fn validate(&self) -> Result<()> {
+impl StoragePolicy {
+    pub fn validate(&self) -> Result<()> {
         if self.node.len() != 64
             || hex::decode(&self.node).is_err()
             || (self.version == 0) != (self.desired_bytes == 0)
@@ -199,14 +199,5 @@ impl crate::publication::Versioned for StoragePolicy {
             return Err(Error("invalid storage policy".into()));
         }
         Ok(())
-    }
-    fn revision(&self) -> u64 {
-        self.revision
-    }
-    fn set_revision(&mut self, revision: u64) {
-        self.revision = revision;
-    }
-    fn same_record(&self, other: &Self) -> bool {
-        self.node == other.node && self.identity == other.identity
     }
 }

@@ -399,8 +399,12 @@ mod tcp {
             for n in 0..16 {
                 let wire = peer_wire(c, &format!("/peer-{}-{n}", c.revision));
                 let (status, body) = request(a, Some((&wire, &peer_context)));
-                assert_eq!(status, 200);
-                assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
+                if c.revision == config.revision {
+                    assert_eq!(status, 200);
+                    assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
+                } else {
+                    assert_eq!(status, 400);
+                }
             }
         }
         // Churn the same real address again while old generations still drain.
@@ -420,7 +424,7 @@ mod tcp {
             }
         }
         eprintln!(
-            "B08 UDS/TLS: 2 I/O threads, {successes} fresh ingress 200, 48 old/current peer 200, held old peer completed, stable local and TLS listener inodes across four readds"
+            "B08 UDS/TLS: 2 I/O threads, {successes} fresh ingress 200, foreign topology rejected, current peer 200, held old peer completed, stable listener inodes"
         );
         for (id, (tx, _)) in workers.iter().enumerate() {
             let (reply, rx) = mpsc::channel();
@@ -857,7 +861,15 @@ fn local_fixture(
     v.peers.clear();
     let topology = v.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
-    topology.neighbors.clear();
+    topology.product = Some(crate::control::proto::ProductTopology {
+        left_factor: 1,
+        right_factor: 1,
+        members: vec!["02".repeat(32)],
+        roles: vec![0],
+        local_member: 0,
+        candidate_width: 1,
+        candidates: vec![0; topology.slot_count as usize],
+    });
     (trust, config)
 }
 
@@ -872,7 +884,13 @@ fn peer_fixture(
     v.cache_socket = crate::control::tests::test_socket(a, "cache");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers = vec![peer.clone()];
-    v.topology.as_mut().unwrap().neighbors[0].peer = peer;
+    v.topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = peer;
     (trust, config)
 }
 
@@ -885,7 +903,7 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
     let cursor = routing.start(&target);
     let mut bytes = b"RB01".to_vec();
     bytes.extend(5000u32.to_le_bytes());
-    bytes.extend(cursor.algorithm.magic());
+    bytes.extend(crate::routing::Cursor::MAGIC);
     bytes.extend(cursor.encode());
     bytes.extend(b"RD01\0");
     bytes.extend(target.as_bytes());

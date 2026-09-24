@@ -21,7 +21,7 @@ mod reentrant_tests {
             routing: [0; 32],
             version: 0,
             destination: 0,
-            dependency: NetworkDependency::Canonical { slot: 0 },
+            dependency: NetworkDependency::LocalShared,
         }
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,7 +290,7 @@ pub(crate) mod pool_tests {
             routing: [9; 32],
             version: 2,
             destination: 3,
-            dependency: NetworkDependency::Canonical { slot: 1 },
+            dependency: NetworkDependency::LocalShared,
         };
         let pool = buffers::io_test_pool(3);
         let mut producer = pool.network_flight(key.clone()).unwrap();
@@ -448,7 +448,7 @@ pub(crate) mod pool_tests {
                                 routing: [0; 32],
                                 version: 0,
                                 destination: 0,
-                                dependency: NetworkDependency::Canonical { slot: 0 },
+                                dependency: NetworkDependency::LocalShared,
                             })
                             .unwrap();
                         barrier.wait(); // All requests join before publication.

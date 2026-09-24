@@ -88,7 +88,7 @@ fn verify(body: &[u8], revision: u64) -> Value {
     let catalog = &response["catalog"];
     assert_eq!(catalog["revision"], revision);
     assert_eq!(catalog["schema"], 1);
-    assert_eq!(catalog["routingAlgorithm"], 2);
+    assert_eq!(catalog["routingAlgorithm"], 1);
     assert_eq!(catalog["leftFactor"], 1);
     assert_eq!(catalog["rightFactor"], 3);
     assert_eq!(catalog["members"].as_array().unwrap().len(), 3);

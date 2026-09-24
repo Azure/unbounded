@@ -583,7 +583,15 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     volume.peers.clear();
     let topology = volume.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
-    topology.neighbors.clear();
+    topology.product = Some(crate::control::proto::ProductTopology {
+        left_factor: 1,
+        right_factor: 1,
+        members: vec!["02".repeat(32)],
+        roles: vec![0],
+        local_member: 0,
+        candidate_width: 1,
+        candidates: vec![0; topology.slot_count as usize],
+    });
     f.updates
         .publish(crate::control::tests::prepare_snapshot(
             &trust,

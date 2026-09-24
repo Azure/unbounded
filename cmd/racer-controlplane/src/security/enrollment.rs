@@ -108,39 +108,7 @@ fn owned_by(
         })
 }
 
-pub fn racer_identity(domain: &str, value: &str) -> String {
-    digest(format!("racer/{domain}/v1\0{value}").as_bytes())
-}
-
-/// Exact Go UniverseForSite mapping, including long DNS-subdomain Site names.
-pub fn universe_for_site(site: &str) -> String {
-    let legal = site.is_empty()
-        || (site.len() <= 63
-            && site.as_bytes()[0].is_ascii_alphanumeric()
-            && site.as_bytes()[site.len() - 1].is_ascii_alphanumeric()
-            && site
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)));
-    if legal {
-        return site.into();
-    }
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut result = String::from("site_");
-    let mut bits = 0u32;
-    let mut count = 0;
-    for byte in Sha256::digest(site.as_bytes()) {
-        bits = (bits << 8) | u32::from(byte);
-        count += 8;
-        while count >= 5 {
-            count -= 5;
-            result.push(ALPHABET[((bits >> count) & 31) as usize] as char);
-        }
-    }
-    if count > 0 {
-        result.push(ALPHABET[((bits << (5 - count)) & 31) as usize] as char);
-    }
-    result
-}
+pub use crate::model::{identity as racer_identity, universe_for_site};
 
 /// Only the canonical Site label assigns membership.
 pub fn node_site(node: &ObjectMetadata) -> &str {
@@ -199,7 +167,7 @@ pub fn authorize_enrollment(data: &EnrollmentData<'_>) -> Result<Identity> {
         pod_name: pod.metadata.name.clone(),
         container_id: pod.running_container_id.clone(),
     };
-    identity.uri()?;
+    identity.validate()?;
     Ok(identity)
 }
 
@@ -268,28 +236,6 @@ pub fn authorize_dataplane_ownership(
     Ok(())
 }
 
-/// Historical renewal is unsupported. Call authorize_enrollment with fresh live
-/// ownership, Node and Site inputs for renewals as well as first enrollment.
-pub fn authorize_renewal(
-    _state: &CaState,
-    namespace: &str,
-    pod_name: &str,
-    pod: &PodData,
-    boot: &str,
-    review: &TokenReviewResult,
-) -> Result<Identity> {
-    let uid = reviewed_pod_uid(review)?;
-    ensure!(
-        hex_id(boot)
-            && pod.metadata.namespace == namespace
-            && pod.metadata.name == pod_name
-            && pod.metadata.uid == uid
-            && pod.service_account == DATAPLANE,
-        "renewal Pod mismatch"
-    );
-    anyhow::bail!("renewal requires live Node, Site, and ownership authorization")
-}
-
 /// CP labels alone do not authorize keys. Validate the live Pod -> ReplicaSet ->
 /// managed Deployment UID chain. Terminating replicas cannot obtain new leaves.
 pub fn authorize_replica(
@@ -353,14 +299,8 @@ pub fn authorize_replica(
         pod_name: pod.metadata.name.clone(),
         container_id: pod.running_container_id.clone(),
     };
-    identity.uri()?;
+    identity.validate()?;
     Ok(identity)
-}
-
-pub fn replica_request_owned(metadata: &ObjectMetadata, pod: &PodData) -> bool {
-    metadata.namespace == pod.metadata.namespace
-        && metadata.name == format!("racer-replica-{}", pod.metadata.uid)
-        && owned_by(metadata, &pod.metadata, "v1", "Pod", true)
 }
 
 pub fn certificate_matches_csr(certificate: &[u8], csr: &[u8]) -> Result<bool> {

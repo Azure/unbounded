@@ -168,9 +168,6 @@ pub enum CommitOutcome {
 /// Authoritative reads and resourceVersion CAS. Publication captures the public
 /// revision before checking the Secret fence, and never retries a stale write.
 pub trait CaStore: Send + Sync {
-    fn collect(&self) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
     fn read(&self) -> impl Future<Output = Result<StoreSnapshot>> + Send;
     fn commit(
         &self,

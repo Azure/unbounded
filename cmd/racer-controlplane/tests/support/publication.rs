@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use crate::model::Generation;
-use crate::topology::Topology;
-use crate::{Error, Result};
+use racer_controlplane::model::Generation;
+use racer_controlplane::topology::Topology;
+use racer_controlplane::{Error, Result};
 
 pub trait Versioned: Clone + PartialEq {
     fn validate(&self) -> Result<()>;
@@ -34,6 +34,21 @@ impl Versioned for Generation {
 
 pub struct Publication<T: Versioned> {
     published: Option<Arc<T>>,
+}
+
+impl Versioned for racer_controlplane::storage::StoragePolicy {
+    fn validate(&self) -> Result<()> {
+        self.validate()
+    }
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+    fn same_record(&self, other: &Self) -> bool {
+        self.node == other.node && self.identity == other.identity
+    }
 }
 
 impl<T: Versioned> Default for Publication<T> {

@@ -260,7 +260,6 @@ pub(crate) fn snapshot(
                 epoch: g.revision,
                 slot_count: v.slots,
                 local_slots,
-                neighbors: Vec::new(),
                 routing_algorithm: Some(PRODUCT_ROUTING_ALGORITHM),
                 product: Some(proto::ProductTopology {
                     left_factor: p.left_factor,

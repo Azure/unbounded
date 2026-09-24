@@ -34,7 +34,7 @@ path = "bench/crypto.rs"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 getrandom = "0.2"
 sha2 = "0.10"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = "1"
 blake3 = "1"
 libc = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }

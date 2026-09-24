@@ -606,9 +606,7 @@ impl Volumes {
         {
             let handler = server.handler_mut();
             for generation in std::iter::once(&handler.current).chain(&handler.draining) {
-                for handler in &generation.handlers {
-                    handler.borrow_mut().maintenance(enabled);
-                }
+                generation.handler.borrow_mut().maintenance(enabled);
             }
         }
     }

@@ -216,35 +216,6 @@ impl Provider {
                         self.reported(failure, &mut attempt)?;
                         unreachable!();
                     }
-                    if response.status() == 503
-                        && text(response.headers(), "x-racer-owner-unavailable")?.is_some()
-                    {
-                        let a = attempt
-                            .as_ref()
-                            .ok_or_else(|| invalid("unrouted owner report"))?;
-                        validate_owner_report(
-                            response.headers(),
-                            response.content_length(),
-                            &a.route,
-                        )?;
-                        let (connection, _, len) = response.recycle();
-                        if len != 0 {
-                            return Err(invalid("owner report body").into());
-                        }
-                        self.peer
-                            .as_ref()
-                            .unwrap()
-                            .borrow_mut()
-                            .http
-                            .recycle(connection);
-                        permit.take().unwrap().success();
-                        return Err(AttemptFailure {
-                            route: a.route.clone(),
-                            evidence: None,
-                            reported: true,
-                        }
-                        .into());
-                    }
                     return Err(cache::http_metadata::response_status(
                         response.status(),
                         response.headers(),

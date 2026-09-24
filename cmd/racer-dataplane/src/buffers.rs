@@ -820,9 +820,8 @@ pub struct NetworkFlightKey {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NetworkDependency {
-    Canonical {
-        slot: u32,
-    },
+    /// Generic nonrouted work shares a local producer across callers.
+    LocalShared,
     /// Relayed work must never join a flight waiting on its own request chain.
     Independent(u64),
 }

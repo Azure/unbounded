@@ -12,7 +12,7 @@ fn scope(value: u8) -> NetworkFlightKey {
         routing: [9; 32],
         version: 2,
         destination: 3,
-        dependency: NetworkDependency::Canonical { slot: 1 },
+        dependency: NetworkDependency::LocalShared,
     }
 }
 
@@ -240,9 +240,9 @@ fn network_scope_isolation_and_typed_failure_delivery() {
     keys.push(page.clone());
     page.destination += 1;
     keys.push(page.clone());
-    page.dependency = NetworkDependency::Canonical { slot: 2 };
+    page.dependency = NetworkDependency::Independent(2);
     keys.push(page.clone());
-    page.dependency = NetworkDependency::Canonical { slot: 3 };
+    page.dependency = NetworkDependency::Independent(3);
     keys.push(page.clone());
     page.version += 1;
     keys.push(page);

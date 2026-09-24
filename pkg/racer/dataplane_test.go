@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -70,11 +71,14 @@ func TestDataplaneInterop(t *testing.T) {
 		"universe": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
 		"node":     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
 		"revision": "1", "epoch": "1",
-		"memberCatalogs": []any{map[string]any{"members": []any{}}},
+		"memberCatalogs": []any{map[string]any{"members": []any{map[string]any{"node": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)), "podUid": "sdk"}}}},
 		"volumes": []any{map[string]any{
 			"id": "sdk", "cacheSocket": cacheSocket, "originSocket": server.Listener.Addr().String(), "cacheGeneration": "1",
-			"memberCatalog": 0,
-			"peerEndpoints": map[string]any{}, "topology": map[string]any{"epoch": "1", "slotCount": 1, "localSlots": []int{0}, "routingAlgorithm": 1},
+			"memberCatalog": 0, "maxCandidateAttempts": 1,
+			"peerEndpoints": map[string]any{}, "topology": map[string]any{
+				"epoch": "1", "slotCount": 1, "localSlots": []int{0}, "routingAlgorithm": 1,
+				"product": map[string]any{"leftFactor": 1, "rightFactor": 1, "members": []string{hex.EncodeToString(bytes.Repeat([]byte{2}, 32))}, "roles": []int{0}, "localMember": 0, "candidateWidth": 1, "candidates": []int{0}},
+			},
 		}},
 	}}
 

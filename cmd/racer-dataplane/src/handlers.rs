@@ -8,18 +8,15 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RD01/RR01/RR02/RB01 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RD01/RR01/RB01 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
-use crate::http_auth::failure::{
-    error_status, metric_failure, reported, validate_owner_report, validate_peer_report,
-};
+use crate::http_auth::failure::{error_status, metric_failure, reported, validate_peer_report};
 #[cfg(test)]
 use crate::outcome::semantic_failure;
 use crate::outcome::{
-    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, owner_failure,
-    peer_failure,
+    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, peer_failure,
 };
 use crate::{
     buffers::{BUFFER_SIZE, Destination},
@@ -77,7 +74,7 @@ use attempt::candidate_end;
 
 pub(crate) fn remote_deadline(bytes: &[u8], local: Instant) -> io::Result<Instant> {
     let (_, remaining) = budget_descriptor(bytes)?;
-    Ok(local.min(crate::environment::now() + remaining.unwrap_or(MAX_CANDIDATE)))
+    Ok(local.min(crate::environment::now() + remaining))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -395,15 +392,6 @@ impl Provider {
         // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
         // routed descriptors, budget accounting, or peer request headers.
         if cache::peer_wire::request_len(request, self.active.is_some(), true)?
-            + if self
-                .routing
-                .as_ref()
-                .is_some_and(|r| r.algorithm == crate::routing::Algorithm::Product)
-            {
-                crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN
-            } else {
-                0
-            }
             + cache::peer_wire::CHAIN_LEN
             > MAX_DESCRIPTOR
         {
@@ -442,7 +430,7 @@ impl Provider {
                 .unwrap()
                 .next(&state.borrow().cursor)?
                 .ok_or_else(|| invalid("no next hop"))?;
-            let mut routed = next.algorithm.magic().to_vec();
+            let mut routed = crate::routing::Cursor::MAGIC.to_vec();
             routed.extend(next.encode());
             routed.append(&mut bytes);
             bytes = routed;
@@ -536,13 +524,9 @@ impl Upstream for Provider {
         Some(crate::buffers::NetworkFlightKey {
             value,
             routing: state.cursor.identity,
-            version: state.cursor.algorithm.wire_version(),
+            version: crate::routing::Cursor::WIRE_VERSION,
             destination: routing.destination(&state.cursor),
-            dependency: if state.origin && routing.algorithm != crate::routing::Algorithm::Product {
-                routing.dependency(&state.cursor).expect("validated route")
-            } else {
-                crate::buffers::NetworkDependency::Independent(self.flight)
-            },
+            dependency: crate::buffers::NetworkDependency::Independent(self.flight),
         })
     }
     fn peer_validated(&mut self, retry: &mut Exchange, valid: bool) {
@@ -598,8 +582,8 @@ impl Upstream for Provider {
         self.peer.is_some()
     }
     fn receive_reserve(&mut self, capacity: usize) -> cache::Result<usize> {
-        // The wire hop allowance decreases even when a receiving peer rebases
-        // placement. Only a fresh local payload may shorten it to fit this pool.
+        // The wire hop allowance decreases at every forwarding hop.
+        // Only a fresh local payload may shorten it to fit this pool.
         // Received providers already have a frozen rank from peer_provider.
         let rank = *self.receive_rank.get_or_insert_with(|| {
             let mut chain = self.chain.borrow_mut();
@@ -633,8 +617,7 @@ impl Upstream for Provider {
         // A typed, initiated immediate HTTP failure can repair an intermediate.
         // RDMA first recovers over the same peer's HTTP transport. Remote reports,
         // pressure, cancellations and content failures are never local link evidence.
-        if routing.algorithm == crate::routing::Algorithm::Product
-            && let Some(failure) = failure
+        if let Some(failure) = failure
             && !failure.reported
             && !failure.route.final_hop
             && routing.compatible(&failure.route.cursor, &state.cursor)
@@ -1050,8 +1033,8 @@ impl Handler {
     fn peer_provider(&self, bytes: &[u8]) -> cache::Result<Provider> {
         let (cursor, descriptor) = routed_descriptor(bytes)?;
         let chain = cache::peer_wire::chain(bytes)?;
-        if (self.upstream.routing.is_some() || self.upstream.has_peer()) && chain.is_none() {
-            return Err(invalid("missing bounded request chain").into());
+        if chain.is_none() || cursor.is_none() {
+            return Err(invalid("missing bounded request chain or cursor").into());
         }
         if chain.is_some_and(|(namespace, _, _, _)| namespace != *self.namespace.digest()) {
             return Err(invalid("foreign cache namespace").into());
@@ -1068,7 +1051,6 @@ impl Handler {
         provider.reply_route = reply;
         if let (Some(routing), Some(state), Some((_, _, _, candidate))) =
             (&provider.routing, &provider.active, chain)
-            && routing.algorithm == crate::routing::Algorithm::Product
             && routing.destination(&state.borrow().cursor) != candidate
         {
             return Err(invalid("product chain candidate mismatch").into());
@@ -1728,12 +1710,6 @@ impl Handler {
                 task.position = 0;
                 task.end = 0;
                 task.next = 0;
-                let owner = owner_failure(&error)
-                    .filter(|_| {
-                        !task.peer
-                            || task.upstream.failure(&error).reason == PeerReason::OwnerUnavailable
-                    })
-                    .map(|s| s.to_string());
                 let failure = if task.peer {
                     task.upstream
                         .active
@@ -1753,16 +1729,7 @@ impl Handler {
                 } else {
                     None
                 };
-                let mut headers = owner
-                    .as_ref()
-                    .map(|s| {
-                        let mut headers = vec![("X-Racer-Owner-Unavailable", s.as_bytes())];
-                        if let Some(context) = &context {
-                            headers.push(("X-Racer-Attempt", context.as_bytes()));
-                        }
-                        headers
-                    })
-                    .unwrap_or_default();
+                let mut headers = Vec::new();
                 let response_metadata = error
                     .evidence()
                     .semantic
@@ -1776,9 +1743,7 @@ impl Handler {
                 }
                 if let (Some(failure), Some(context)) = (&failure, &context) {
                     headers.push(("X-Racer-Failure", failure.as_bytes()));
-                    if owner.is_none() {
-                        headers.push(("X-Racer-Attempt", context.as_bytes()));
-                    }
+                    headers.push(("X-Racer-Attempt", context.as_bytes()));
                 }
                 let status = if let Some(failure) = &failure {
                     let reported = io::Error::other(PeerFailure::decode(&unhex(failure)?)?).into();

@@ -1102,8 +1102,7 @@ impl Ring {
         }))
     }
 
-    // Keep the general API for callers without a reusable ownership bundle.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn splice(
         &mut self,
         input: File,

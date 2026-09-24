@@ -8,12 +8,12 @@ fn maximum_descriptor_http_bounds() {
     for page in [false, true] {
         let (_, config) = crate::control::tests::fixture();
         let routing = crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap();
-        let target_len = if page { 3132 } else { 3438 };
+        let target_len = MAX_DESCRIPTOR - encoded_len(0, page, true, true);
         let target = format!("/{}", "x".repeat(target_len - 1));
         let cursor = routing.start(&target);
         let mut wire = b"RB01".to_vec();
         wire.extend(1000u32.to_le_bytes());
-        wire.extend(cursor.algorithm.magic());
+        wire.extend(crate::routing::Cursor::MAGIC);
         wire.extend(cursor.encode());
         wire.extend(b"RD01");
         wire.push(u8::from(page));
@@ -85,14 +85,10 @@ fn bounded_chain_rejects_truncation_nesting_and_oversized_hops() {
     wire.push(b'x');
     assert!(routed_descriptor(&wire).is_err());
     assert!(client_fits(
-        MAX_DESCRIPTOR
-            - encoded_len(0, true, true, true)
-            - CHAIN_LEN
-            - (crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN)
+        MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN
     ));
     assert!(!client_fits(
         MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN + 1
-            - (crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN)
     ));
 }
 
@@ -146,7 +142,7 @@ fn exact_descriptor_boundaries() {
                     }
                     if routed {
                         let c = routing.start(&target);
-                        wire.extend(c.algorithm.magic());
+                        wire.extend(crate::routing::Cursor::MAGIC);
                         wire.extend(c.encode());
                     }
                     wire.extend(inner.unwrap());
@@ -161,8 +157,11 @@ fn exact_descriptor_boundaries() {
             }
         }
     }
-    assert_eq!(encoded_len(0, false, true, true), 62);
-    assert_eq!(encoded_len(0, true, true, true), 368);
+    assert_eq!(encoded_len(0, false, true, true), 88);
+    assert_eq!(encoded_len(0, true, true, true), 394);
+    assert_eq!(encoded_len(0, true, true, true) + CHAIN_LEN, 436);
+    assert!(client_fits(3064));
+    assert!(!client_fits(3065));
     assert!(!client_fits(usize::MAX));
 }
 
@@ -290,7 +289,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             let namespace = crate::cache::Namespace::new("transport-agreement").unwrap();
             let expected = decode_descriptor(inner).unwrap().key(namespace).unwrap();
             let cursor = routing.start_key(&expected);
-            let mut wire = cursor.algorithm.magic().to_vec();
+            let mut wire = crate::routing::Cursor::MAGIC.to_vec();
             wire.extend(cursor.encode());
             wire.extend(inner);
             assert!(routed_descriptor(&wire).is_err(), "budget is mandatory");
@@ -310,7 +309,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             assert!(descriptor.with_expected([0; 32], 3).key(namespace).is_err());
             assert_eq!(
                 budget_descriptor(&bounded).unwrap().1,
-                Some(Duration::from_millis(1500))
+                Duration::from_millis(1500)
             );
             // Context binds the transmitted budget as well as cursor/value.
             let digest = blake3::hash(&bounded);
@@ -323,7 +322,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             let now = crate::environment::now();
             assert_eq!(remote_deadline(&bounded, now).unwrap(), now);
             bounded[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-            assert_eq!(budget_descriptor(&bounded).unwrap().1, Some(MAX_CANDIDATE));
+            assert_eq!(budget_descriptor(&bounded).unwrap().1, MAX_CANDIDATE);
             bounded[4..8].fill(0);
             assert!(routed_descriptor(&bounded).is_err());
             bounded[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -337,7 +336,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
         }
         let mut largest = b"RB01".to_vec();
         largest.extend(1000u32.to_le_bytes());
-        largest.extend(cursor.algorithm.magic());
+        largest.extend(crate::routing::Cursor::MAGIC);
         largest.extend(cursor.encode());
         largest.extend(&meta);
         largest.resize(MAX_DESCRIPTOR, b'x');

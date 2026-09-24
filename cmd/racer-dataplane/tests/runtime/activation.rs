@@ -416,7 +416,14 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     config.peers[0].id = peer.clone();
     config.volumes[0].peers = vec![peer.clone()];
     config.volumes[0].peer_endpoints.as_mut().unwrap().peers[0].peer = peer.clone();
-    config.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = peer;
+    config.volumes[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .product
+        .as_mut()
+        .unwrap()
+        .members[1] = peer;
     let a = address();
     config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
     updates

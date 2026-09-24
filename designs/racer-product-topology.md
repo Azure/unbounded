@@ -2,18 +2,17 @@
 
 ## Decision and scope
 
-Routing algorithm 2 separates physical cache ownership from the peer graph. It
-replaces the production algorithm-1 slot graph with a Cartesian product of small
+Routing algorithm 1 separates physical cache ownership from the peer graph. It
+uses a Cartesian product of small
 diameter-two graphs. At a cold, exactly 10,000-member configuration, the selected
 graph is Hoffman-Singleton(50) x Abas(200): **23 distinct bidirectional peers per
 physical node and at most four successful forwarding edges**, including local
 repair around one failed intermediate node.
 
-This document supersedes earlier Racer slot-routing proposals for algorithm 2.
-The implemented predecessor is algorithm 1 with RR01, not the algorithm-3/RF06
-numbers in historical proposals. Algorithm 1 remains readable; the compiler emits
-algorithm 2. The control API and persistent cache format retain their existing
-versions. Deploy matching control planes and dataplanes for the new algorithm.
+This is the canonical first-release v1 contract and supersedes earlier routing
+proposals. The compiler and readers use product algorithm 1 and the 71-byte RR01
+cursor exclusively. Historical slot graphs, 45-byte RR01 cursors, and algorithm 2
+with RR02 are rejected. The Kubernetes P2PCache API remains v1alpha1.
 
 The contract counts all incident physical peers, including accepted connections.
 It does not count one initiator's outgoing table as the entire graph. Multiple
@@ -157,7 +156,7 @@ members and candidate rows, local ownership, local identity, membership binding,
 and exact adjacent-role peers. Existing work, record, and wire limits still
 bound admission.
 
-RR02 is distinct from RR01. Its fixed 71-byte body includes the topology digest,
+RR01 has a fixed 71-byte body that includes the topology digest,
 source member, placement slot, candidate ordinal, current position, up to five
 physical path indexes, failed member, and repair position. Unused path entries
 have canonical padding. The digest binds namespace, epoch, graph, members, roles,
