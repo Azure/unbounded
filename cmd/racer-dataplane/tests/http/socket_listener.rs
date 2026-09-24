@@ -19,7 +19,7 @@ impl Directory {
     }
 
     fn socket(&self) -> UnixPath {
-        UnixPath::new(self.0.join("cache").to_str().unwrap()).unwrap()
+        UnixPath::new(self.0.join("client").to_str().unwrap()).unwrap()
     }
 }
 
@@ -27,6 +27,43 @@ impl Drop for Directory {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+#[test]
+fn nested_socket_directories_inherit_group_and_reject_symlinks() {
+    let directory = Directory::new();
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o2770)).unwrap();
+    let root = std::fs::metadata(&directory.0).unwrap();
+    for kind in ["client", "origin"] {
+        let path = UnixPath::new(
+            directory
+                .0
+                .join(format!("cache/{kind}/socket"))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        SharedUnix::prepare_directory(path).unwrap();
+        SharedUnix::prepare_directory(path).unwrap();
+        for parent in [
+            directory.0.join("cache"),
+            directory.0.join(format!("cache/{kind}")),
+        ] {
+            let metadata = std::fs::metadata(parent).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o2770);
+            assert_eq!(metadata.gid(), root.gid());
+        }
+        let listener = SharedUnix::bind(path).unwrap();
+        assert_eq!(std::fs::metadata(path.as_str()).unwrap().gid(), root.gid());
+        drop(listener);
+    }
+    std::os::unix::fs::symlink(directory.0.join("cache"), directory.0.join("alias")).unwrap();
+    let alias = UnixPath::new(directory.0.join("alias/client/socket").to_str().unwrap()).unwrap();
+    assert!(SharedUnix::prepare_directory(alias).is_err());
+    std::fs::write(directory.0.join("file"), b"keep").unwrap();
+    let file = UnixPath::new(directory.0.join("file/client/socket").to_str().unwrap()).unwrap();
+    assert!(SharedUnix::prepare_directory(file).is_err());
+    assert_eq!(std::fs::read(directory.0.join("file")).unwrap(), b"keep");
 }
 
 #[test]

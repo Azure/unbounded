@@ -76,7 +76,7 @@ func TestDataplaneInterop(t *testing.T) {
 	metrics.Close()
 
 	dir := t.TempDir()
-	cacheSocket := filepath.Join(socketDirectory(t), "cache")
+	clientSocket := filepath.Join(socketDirectory(t), "client", "socket")
 
 	tlsEnv := dataplaneEnrollment(t, dir)
 
@@ -86,7 +86,7 @@ func TestDataplaneInterop(t *testing.T) {
 		"revision": "1", "epoch": "1",
 		"memberCatalogs": []any{map[string]any{"members": []any{map[string]any{"node": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)), "podUid": "sdk"}}}},
 		"volumes": []any{map[string]any{
-			"id": "sdk", "cacheSocket": cacheSocket, "originSocket": server.Listener.Addr().String(), "cacheGeneration": "1",
+			"id": "sdk", "clientSocket": clientSocket, "originSocket": server.Listener.Addr().String(), "cacheGeneration": "1",
 			"memberCatalog": 0, "maxCandidateAttempts": 1,
 			"peerEndpoints": map[string]any{}, "topology": map[string]any{
 				"epoch": "1", "slotCount": 1, "localSlots": []int{0}, "routingAlgorithm": 1,
@@ -188,7 +188,7 @@ func TestDataplaneInterop(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	c, err := NewClient(cacheSocket, ClientOptions{Concurrency: 3})
+	c, err := NewClient(clientSocket, ClientOptions{Concurrency: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestDataplaneInterop(t *testing.T) {
 
 	t.Logf("verified HEAD + 3 cold pages + warm reuse + cross-page ReadAt (%d bytes)", len(data))
 	t.Run("direct", func(t *testing.T) { runReadConformance(t, server.Listener.Addr().String()) })
-	t.Run("cached", func(t *testing.T) { runReadConformance(t, cacheSocket) })
+	t.Run("cached", func(t *testing.T) { runReadConformance(t, clientSocket) })
 
 	for _, target := range []string{"/encoded", "/duplicate-encoding", "/identity"} {
 		want := 502

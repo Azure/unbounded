@@ -697,8 +697,14 @@ mod endpoint_tests {
                 )
                 .unwrap();
                 assert_eq!(s.volumes[0].id, "cache-uid");
-                assert_eq!(s.volumes[0].origin_socket, "/run/racer/cache-uid/origin");
-                assert_eq!(s.volumes[0].cache_socket, "/run/racer/cache-uid/cache");
+                assert_eq!(
+                    s.volumes[0].origin_socket,
+                    "/run/racer/cache-a/origin/socket"
+                );
+                assert_eq!(
+                    s.volumes[0].client_socket,
+                    "/run/racer/cache-a/client/socket"
+                );
                 let trust = Trust {
                     universe: s.universe.clone().try_into().unwrap(),
                     node: s.node.clone().try_into().unwrap(),

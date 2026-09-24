@@ -21,23 +21,23 @@ const (
 	SlotCount  uint32 = 262144
 )
 
-// CacheSockets derives filesystem sockets from the exact metadata UID, never the
-// resource name. A UID must be a nonempty lowercase ASCII alphanumeric component
+// CacheSockets derives client and origin filesystem sockets from metadata.name.
+// A name must be a nonempty lowercase ASCII alphanumeric component
 // with optional interior hyphens, at most 63 bytes. Linux sockaddr_un reserves one byte
 // for the terminating NUL; abstract sockets and relative roots are not supported.
-func CacheSockets(root, uid string) (cache, origin string, err error) {
-	if !filepath.IsAbs(root) || strings.ContainsRune(root, 0) || len(validation.IsDNS1123Label(uid)) != 0 {
-		return "", "", fmt.Errorf("socket root must be absolute and cache UID must be a lowercase DNS label of at most 63 bytes")
+func CacheSockets(root, name string) (client, origin string, err error) {
+	if !filepath.IsAbs(root) || strings.ContainsRune(root, 0) || len(validation.IsDNS1123Label(name)) != 0 {
+		return "", "", fmt.Errorf("socket root must be absolute and cache name must be a lowercase DNS label of at most 63 bytes")
 	}
 
-	cache = filepath.Join(root, uid, "cache")
+	client = filepath.Join(root, name, "client", "socket")
 
-	origin = filepath.Join(root, uid, "origin")
-	if len(cache) > 107 || len(origin) > 107 {
+	origin = filepath.Join(root, name, "origin", "socket")
+	if len(client) > 107 || len(origin) > 107 {
 		return "", "", fmt.Errorf("derived socket path exceeds 107 bytes")
 	}
 
-	return cache, origin, nil
+	return client, origin, nil
 }
 
 // CacheSelectsSite evaluates Site object labels, independently of Node labels.

@@ -9,7 +9,7 @@ set -euo pipefail
 : "${RACER_DATAPLANE_BINARY:?set the absolute production dataplane executable}"
 : "${KUBEBUILDER_ASSETS:?set the envtest kube-apiserver/etcd directory}"
 : "${TMPDIR:?set workspace-local ext4 scratch space}"
-: "${RACER_LIVE_SOCKET_ROOT:?set an existing workspace directory with an absolute path at most 36 bytes}"
+: "${RACER_LIVE_SOCKET_ROOT:?set an existing workspace directory with an absolute path at most 29 bytes}"
 export RACER_REQUIRE_LIVE=1
 log=$(mktemp "$TMPDIR/racer-live-run-XXXXXX.log")
 printf 'Campaign output: %s\n' "$log"

@@ -25,25 +25,19 @@ import (
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
-func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
+func TestRacerClientSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("workspace socket via proc fd")
+		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp(".", ".racer-cache-readiness-")
+	dir, err := os.MkdirTemp("", "racer-client-readiness-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	folder, err := os.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer folder.Close()
-
-	socket := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
-	if racerCacheSocketReady(t.Context(), socket) {
+	socket := dir + "/cache/client/socket"
+	if racerClientSocketReady(t.Context(), socket) {
 		t.Fatal("missing socket reported ready")
 	}
 
@@ -86,7 +80,7 @@ func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
 			}
 			defer server.Close()
 
-			if got := racerCacheSocketReady(t.Context(), socket); got != tc.want {
+			if got := racerClientSocketReady(t.Context(), socket); got != tc.want {
 				t.Fatalf("ready=%v, want %v", got, tc.want)
 			}
 
@@ -107,7 +101,7 @@ func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
-	if racerCacheSocketReady(ctx, socket) || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if racerClientSocketReady(ctx, socket) || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatal("stalled listener did not fail at the probe deadline")
 	}
 
@@ -115,29 +109,23 @@ func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if racerCacheSocketReady(t.Context(), socket) {
+	if racerClientSocketReady(t.Context(), socket) {
 		t.Fatal("closed socket reported ready")
 	}
 }
 
 func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("workspace socket via proc fd")
+		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp(".", ".racer-origin-")
+	dir, err := os.MkdirTemp("", "racer-origin-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	folder, err := os.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer folder.Close()
-
-	socket := fmt.Sprintf("/proc/self/fd/%d/origin", folder.Fd())
+	socket := dir + "/cache/origin/socket"
 
 	target, err := racerReadinessTarget("node-a", os.Hostname)
 	if err != nil {
@@ -253,20 +241,14 @@ func TestRacerReadinessTargetHostnameFallback(t *testing.T) {
 
 func TestRacerSocketReadinessExactStatusAndTarget(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("workspace socket via proc fd")
+		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp(".", ".racer-readiness-")
+	dir, err := os.MkdirTemp("", "racer-readiness-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-
-	folder, err := os.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer folder.Close()
 
 	target, err := racerReadinessTarget("node/a?x=1&node=other#fragment +%\r\n", os.Hostname)
 	if err != nil {
@@ -275,7 +257,7 @@ func TestRacerSocketReadinessExactStatusAndTarget(t *testing.T) {
 
 	var status atomic.Int64
 
-	socket := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
+	socket := dir + "/cache/client/socket"
 
 	server, _, err := startRacerOrigin(socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead || r.RequestURI != target {

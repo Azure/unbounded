@@ -104,9 +104,9 @@ func TestClusterCacheAPISchema(t *testing.T) {
 	}
 
 	cache.Status.ObservedGeneration = cache.Generation
-	cache.Status.CacheSocket = "/run/racer/" + string(cache.UID) + "/cache"
+	cache.Status.ClientSocket = "/run/racer/" + cache.Name + "/client/socket"
 
-	cache.Status.OriginSocket = "/run/racer/" + string(cache.UID) + "/origin"
+	cache.Status.OriginSocket = "/run/racer/" + cache.Name + "/origin/socket"
 	if err := kube.Status().Update(ctx, &cache); err != nil {
 		t.Fatalf("status subresource: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestClusterCacheAPISchema(t *testing.T) {
 		t.Fatal("status was not persisted")
 	}
 
-	if cache.Status.CacheSocket != "/run/racer/"+string(cache.UID)+"/cache" || cache.Status.OriginSocket != "/run/racer/"+string(cache.UID)+"/origin" {
+	if cache.Status.ClientSocket != "/run/racer/"+cache.Name+"/client/socket" || cache.Status.OriginSocket != "/run/racer/"+cache.Name+"/origin/socket" {
 		t.Fatalf("socket status was not persisted: %+v", cache.Status)
 	}
 }

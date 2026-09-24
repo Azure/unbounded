@@ -151,7 +151,7 @@ func gantryLocalMetadataWithoutLibp2p(t *testing.T, f *gantryFixture) {
 	})
 	assertNoIdentity()
 
-	origin, err := sdk.NewClient("/run/racer/node0/origin", sdk.ClientOptions{Timeout: time.Second})
+	origin, err := sdk.NewClient("/run/racer/node0/origin/socket", sdk.ClientOptions{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -40,7 +40,7 @@ func racerConfig(payload string) *corev1.ConfigMap {
 
 func TestRacerPlan(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
-	env := testEnv(t, node, backingCache("gantry"), racerConfig("content_backend: direct\nracer_cache_uid: stale\n"))
+	env := testEnv(t, node, backingCache("gantry"), racerConfig("content_backend: direct\nracer_cache_name: stale\n"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 	if err != nil {
@@ -66,7 +66,7 @@ func TestRacerPlan(t *testing.T) {
 		}
 	}
 
-	if ds.Spec.Template.Annotations[cacheUIDAnnotation] != "cache-uid" || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--content-backend=racer") || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-uid=cache-uid") {
+	if ds.Spec.Template.Annotations[cacheUIDAnnotation] != "cache-uid" || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--content-backend=racer") || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-name=gantry") {
 		t.Fatalf("cache identity and flags missing: %#v", ds.Spec.Template)
 	}
 
@@ -100,7 +100,7 @@ func TestRacerPlan(t *testing.T) {
 	}
 
 	command := strings.Join(pod.InitContainers[0].Command, " ")
-	if !strings.Contains(command, "mkdir -p /run/racer/cache-uid") || !strings.Contains(command, "chgrp 65532 /run/racer /run/racer/cache-uid") || !strings.Contains(command, "chmod 2770 /run/racer /run/racer/cache-uid") {
+	if !strings.Contains(command, "mkdir -p /run/racer/gantry") || !strings.Contains(command, "chgrp 65532 /run/racer /run/racer/gantry") || !strings.Contains(command, "chmod 2770 /run/racer /run/racer/gantry") {
 		t.Fatalf("cache directory must be writable before either process starts: %s", command)
 	}
 
@@ -121,7 +121,7 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		direct  bool
 	}{
 		{name: "unknown backend", valid: true, payload: "content_backend: other"},
-		{name: "invalid configured cache UID overridden", valid: true, payload: "content_backend: racer\nracer_cache_uid: ../bad"},
+		{name: "invalid configured cache name overridden", valid: true, payload: "content_backend: racer\nracer_cache_name: ../bad"},
 		// Parsing remains the binary's responsibility. Invalid YAML cannot
 		// freeze a former Racer pod configuration after cache removal.
 		{name: "unknown config field", valid: true, payload: "content_backnd: racer"},
@@ -203,7 +203,7 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
 	cache := backingCache("custom")
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
-	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_uid: custom"))
+	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_name: custom"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 	if err != nil {
@@ -290,10 +290,10 @@ func TestBackingCacheSelectionMatrix(t *testing.T) {
 		invalid bool
 	}{
 		{name: "true", racer: true},
-		{name: "missing UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "" }},
-		{name: "unsafe UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "../other;id" }},
-		{name: "uppercase UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "UPPER" }},
-		{name: "name does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Name = "cache.with.dots" }},
+		{name: "missing UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "" }},
+		{name: "unsafe UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "../other;id" }},
+		{name: "uppercase UID does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "UPPER" }},
+		{name: "name determines socket", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Name = "cache.with.dots" }},
 		{name: "false", mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
 		{name: "removed", mutate: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
 		{name: "label ignored", mutate: func(c *racerv1alpha1.ClusterCache) {
@@ -338,7 +338,7 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 	cache := backingCache("gantry")
 	cache.Labels = map[string]string{"user": "preserve"}
 	cache.Annotations["user"] = "preserve"
-	cm := racerConfig("content_backend: racer\nracer_cache_uid: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")
+	cm := racerConfig("content_backend: racer\nracer_cache_name: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")
 	cm.Data["extra"] = "user data"
 	cm.Labels = map[string]string{"user": "preserve"}
 	env := testEnv(t, cache, cm)
@@ -441,14 +441,15 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 	}
 
 	for _, ds := range []*appsv1.DaemonSet{first, second} {
-		uid := ds.Spec.Template.Annotations[cacheUIDAnnotation]
-		if !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-uid="+uid) {
-			t.Fatalf("recreation did not update cache UID argument: %v", ds.Spec.Template.Spec.Containers[0].Args)
+		if !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-name="+cache.Name) {
+			t.Fatalf("recreation changed cache name argument: %v", ds.Spec.Template.Spec.Containers[0].Args)
 		}
 
 		command := strings.Join(ds.Spec.Template.Spec.InitContainers[0].Command, " ")
+
 		for _, prefix := range []string{"mkdir -p ", "chgrp 65532 /run/racer ", "chmod 2770 /run/racer "} {
-			if !strings.Contains(command, prefix+"/run/racer/"+uid+"\n") {
+			directory := "/run/racer/" + cache.Name
+			if !strings.Contains(command, prefix+directory+" "+directory+"/client "+directory+"/origin\n") {
 				t.Fatalf("recreation directory setup missing: %s", command)
 			}
 		}

@@ -49,8 +49,8 @@ def publish(path, snapshot):
     pending.replace(path)
 
 
-def cache_path(root, port):
-    return str(root / f"cache-{port}")
+def client_path(root, port):
+    return str(root / f"client-{port}")
 
 
 class UnixConnection(http.client.HTTPConnection):
@@ -83,7 +83,7 @@ def local_snapshot(root, listeners, origin_paths):
         "node": base64.b64encode(bytes([2]) * 32).decode(),
         "revision": "1", "epoch": "1",
         "volumes": [{"id": f"v{i}",
-                     "cacheSocket": cache_path(root, port),
+                     "clientSocket": client_path(root, port),
                      "originSocket": str(origin_paths[i]),
                      "cacheGeneration": "1", "peerEndpoints": {},
                      "topology": {"epoch": "1", "slotCount": 1, "localSlots": [0]}}
@@ -322,7 +322,7 @@ def idle_close(args):
 
         def request(method, target):
             start = time.monotonic()
-            status, headers, body = fetch(cache_path(args.output, ingress), method, target, timeout=5)
+            status, headers, body = fetch(client_path(args.output, ingress), method, target, timeout=5)
             assert status == 200, (method, target, status, body)
             assert headers["Content-Length"] == "65536"
             assert body == (payload if method == "GET" else b"")
@@ -451,7 +451,7 @@ def idle_pressure(args):
 
         def request(index, target, connection=None, method="HEAD"):
             owned = connection is None
-            connection = connection or UnixConnection(cache_path(args.output, listeners[index]))
+            connection = connection or UnixConnection(client_path(args.output, listeners[index]))
             start = time.monotonic()
             try:
                 connection.request(method, target)
@@ -512,7 +512,7 @@ def idle_pressure(args):
             emit(args.output, events, "retired_cleanup", **sample())
             request(63, "/after-retirement")
         elif args.scenario == "hot-cache":
-            connection = UnixConnection(cache_path(args.output, listeners[0]))
+            connection = UnixConnection(client_path(args.output, listeners[0]))
             request(0, "/hot", connection)
             request(0, "/hot", connection, "GET")
             assert len(hits) == 2, "one origin HEAD and one origin GET"
@@ -528,7 +528,7 @@ def idle_pressure(args):
                          median_ms=1000 * statistics.median(latencies),
                          p99_ms=1000 * sorted(latencies)[1979], before=before, after=sample())
         else:
-            connection = UnixConnection(cache_path(args.output, listeners[0]))
+            connection = UnixConnection(client_path(args.output, listeners[0]))
             request(0, "/warmup", connection)
             before, peers, start = sample(), set(live), time.monotonic()
             latencies = [request(0, f"/churn-{i}", connection) for i in range(2000)]
@@ -679,7 +679,7 @@ def physical_owner(args):
                     time.sleep(1.2)  # Fresh candidate evidence after the cooldown.
                 before, first = metrics(18891, host="127.0.0.3"), len(hits)
                 target, start = targets[f"{phase}-{method.lower()}"], time.monotonic()
-                status, headers, body = fetch(snapshots[1]["volumes"][0]["cacheSocket"], method, target, timeout=20)
+                status, headers, body = fetch(snapshots[1]["volumes"][0]["clientSocket"], method, target, timeout=20)
                 elapsed = time.monotonic() - start
                 assert status == (404 if phase == "semantic" else 200), (phase, method, status)
                 if phase != "semantic":
@@ -717,7 +717,7 @@ def physical_owner(args):
                 assert stream.connect_ex((host, port)) != 0, (host, port, "listener leaked")
         for snapshot in snapshots:
             for volume in snapshot["volumes"]:
-                assert not pathlib.Path(volume["cacheSocket"]).exists(), "cache socket leaked"
+                assert not pathlib.Path(volume["clientSocket"]).exists(), "client socket leaked"
                 assert not pathlib.Path(volume["originSocket"]).exists(), "origin socket leaked"
 
 

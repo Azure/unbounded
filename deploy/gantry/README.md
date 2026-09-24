@@ -82,11 +82,14 @@ dedicated cache on upgrade, explicitly annotate it with
 `unbounded-cloud.io/gantry-backing: "true"` after checking coverage. Main-config
 and backend overrides through pod env or flags are rejected for managed pods.
 
-Gantry mounts the shared **parent directory** `/dev/racer` read/write, never an
-individual socket inode. The init container prepares `/dev/racer/gantry` with
+Gantry mounts the shared **parent directory** `/run/racer` read/write, never an
+individual socket inode. The init container prepares `/run/racer/gantry` and its
+`client` and `origin` subdirectories with
 mode `2770` and group `65532`; Gantry retains UID `65532` and containerd's primary
 group `0`, with supplemental group `65532`. Gantry serves
-`/dev/racer/gantry/origin` (`0660`), and Racer serves `/dev/racer/gantry/cache`.
+`/run/racer/gantry/origin/socket` (`0660`), and Racer serves
+`/run/racer/gantry/client/socket`. Paths use the ClusterCache's metadata.name;
+recreation preserves the paths while the UID still changes cache identity.
 Racer mode omits transfer/chair ports and the service-account token. Chair
 Leases/RBAC are not created or reconciled in this mode; old resources are retained
 for rollback. The P2PCache is retained when returning to direct.

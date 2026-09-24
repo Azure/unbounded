@@ -281,12 +281,12 @@ pub fn compile_cached(
                 cache.name
             )));
         }
-        let (cache_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.uid)?;
+        let (client_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.name)?;
         g.volumes.push(Volume {
             id: cache.uid.clone(),
             name: cache.name.clone(),
             resource_generation: cache.resource_generation,
-            cache_socket,
+            client_socket,
             origin_socket,
             slots: SLOT_COUNT,
             cache_generation: cache.cache_generation as u64,
@@ -351,7 +351,7 @@ impl Topology {
                 || volume.routing_algorithm != PRODUCT_ROUTING_ALGORITHM
                 || !(1..=8).contains(&volume.max_candidate_attempts)
                 || (!volume.owners.is_empty() && volume.owners.len() != volume.slots as usize)
-                || [&volume.cache_socket, &volume.origin_socket]
+                || [&volume.client_socket, &volume.origin_socket]
                     .iter()
                     .any(|s| !s.starts_with('/') || s.len() > 107 || s.contains('\0'))
             {

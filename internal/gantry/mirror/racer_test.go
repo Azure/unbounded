@@ -116,7 +116,7 @@ func racerUDS(t *testing.T, handler http.Handler) *sdk.Client {
 		t.Fatal(err)
 	}
 
-	path := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
+	path := fmt.Sprintf("/proc/self/fd/%d/client", folder.Fd())
 
 	ln, err := net.Listen("unix", path)
 	if err != nil {

@@ -194,7 +194,7 @@ func TestRacerRefusedSocketNeverBypasses(t *testing.T) {
 			}
 			defer folder.Close()
 
-			path := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
+			path := fmt.Sprintf("/proc/self/fd/%d/client", folder.Fd())
 
 			listener, err := net.Listen("unix", path)
 			if err != nil {

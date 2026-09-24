@@ -469,13 +469,13 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 				return fmt.Errorf("cache status not converged: %+v", cache.Status)
 			}
 
-			cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID))
+			clientSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, cache.Name)
 			if err != nil {
 				return err
 			}
 
-			if cache.Status.CacheSocket != cacheSocket || cache.Status.OriginSocket != originSocket {
-				return fmt.Errorf("cache %s socket status does not match UID %s: %+v", name, cache.UID, cache.Status)
+			if cache.Status.ClientSocket != clientSocket || cache.Status.OriginSocket != originSocket {
+				return fmt.Errorf("cache %s socket status does not match name: %+v", name, cache.Status)
 			}
 			// Verify each local origin independently of activation readiness.
 			for _, probe := range []string{"probe-a", "probe-b"} {
@@ -1079,11 +1079,11 @@ func (c *cluster) fixturePod(name, node, app string, caches ...string) {
 			c.t.Fatal(err)
 		}
 
-		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, cache.Name); err != nil {
 			c.t.Fatal(err)
 		}
 
-		args = append(args, string(cache.UID))
+		args = append(args, cache.Name)
 	}
 
 	c.apply(&core.Pod{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": app}}, Spec: core.PodSpec{
@@ -1119,11 +1119,11 @@ func (c *cluster) request(probe, method, url, byteRange string, headers ...strin
 			return fixture.Response{}, err
 		}
 
-		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, cache.Name); err != nil {
 			return fixture.Response{}, err
 		}
 
-		url = serviceURL(string(cache.UID), "/"+target)
+		url = serviceURL(cache.Name, "/"+target)
 	}
 
 	b, err := c.kubectl(nil, append([]string{"exec", probe, "--", "/fixture", "request", method, url, byteRange}, headers...)...)

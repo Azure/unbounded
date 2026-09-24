@@ -131,8 +131,8 @@ spec:
             type: object
           status:
             properties:
-              cacheSocket:
-                description: CacheSocket is the configured node-local cache path,
+              clientSocket:
+                description: ClientSocket is the configured node-local client path,
                   not a readiness signal.
                 type: string
               conditions:

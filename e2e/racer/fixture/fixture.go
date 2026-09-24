@@ -45,12 +45,12 @@ func Fetch(method, url, byteRange string, headers ...string) (Response, error) {
 	transport := &http.Transport{DisableCompression: true}
 
 	if strings.HasPrefix(url, "unix://") {
-		uid, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
+		name, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
 		if !ok {
 			return Response{}, fmt.Errorf("invalid local cache URL %q", url)
 		}
 
-		socket, _, err := racermeta.CacheSockets(racermeta.SocketRoot, uid)
+		socket, _, err := racermeta.CacheSockets(racermeta.SocketRoot, name)
 		if err != nil {
 			return Response{}, err
 		}

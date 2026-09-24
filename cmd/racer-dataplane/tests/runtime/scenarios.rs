@@ -17,7 +17,7 @@ fn generation(volumes: &Volumes, address: SocketAddr) -> Rc<Generation> {
         .clone()
 }
 fn local_key(address: SocketAddr) -> Address {
-    Address::unix(&crate::control::tests::test_socket(address, "cache")).unwrap()
+    Address::unix(&crate::control::tests::test_socket(address, "client")).unwrap()
 }
 
 // Included in runtime::tests. Real TCP/io_uring, independent node caches/pools.
@@ -80,7 +80,7 @@ impl Cluster {
     fn local_address(&self, node: usize) -> crate::socket::Address {
         crate::socket::Address::unix(&crate::control::tests::test_socket(
             self.addresses[node],
-            "cache",
+            "client",
         ))
         .unwrap()
     }
@@ -607,7 +607,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let Some(mut ring) = ring() else { return };
     let (trust, mut config) = fixture();
     let first = address();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(first, "cache");
+    config.volumes[0].client_socket = crate::control::tests::test_socket(first, "client");
     let updates = Arc::new(Updates::default());
     updates.subscribe(ring.wake_handle());
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
@@ -645,7 +645,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let second = address();
     let mut extra = config.volumes[0].clone();
     extra.id = "second".into();
-    extra.cache_socket = crate::control::tests::test_socket(second, "cache");
+    extra.client_socket = crate::control::tests::test_socket(second, "client");
     extra.origin_socket = crate::control::tests::test_socket(second, "origin");
     config.volumes.push(extra);
     updates.publish(prepare(config.clone())).unwrap();
@@ -668,10 +668,10 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
         3,
         "old and both new volume handlers retain worker counters"
     );
-    let occupied_path = crate::control::tests::test_socket(address(), "cache");
+    let occupied_path = crate::control::tests::test_socket(address(), "client");
     let occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
     config.revision = 3;
-    config.volumes[1].cache_socket = occupied_path.clone();
+    config.volumes[1].client_socket = occupied_path.clone();
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert_eq!(updates.decision(3), Decision::Waiting);

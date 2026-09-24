@@ -12,10 +12,10 @@ import (
 	"testing"
 )
 
-func TestFetchRejectsUnsafeCacheUID(t *testing.T) {
-	for _, uid := range []string{"", "..", "UPPER", "-edge", "edge-", "a.b", strings.Repeat("a", 64)} {
-		if _, err := Fetch("HEAD", "unix://"+uid+"/object", ""); err == nil || !strings.Contains(err.Error(), "cache UID") {
-			t.Fatalf("unsafe UID %q was not rejected before dialing: %v", uid, err)
+func TestFetchRejectsUnsafeCacheName(t *testing.T) {
+	for _, name := range []string{"", "..", "UPPER", "-edge", "edge-", "a.b", strings.Repeat("a", 64)} {
+		if _, err := Fetch("HEAD", "unix://"+name+"/object", ""); err == nil || !strings.Contains(err.Error(), "cache name") {
+			t.Fatalf("unsafe name %q was not rejected before dialing: %v", name, err)
 		}
 	}
 }

@@ -23,11 +23,11 @@ func TestGantryBackendAuthority(t *testing.T) {
 	}{
 		{name: "resources and unrelated flags", valid: true, change: func(c *corev1.Container) { c.Args = append(c.Args, "--log-level=debug") }},
 		{name: "backend flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--content-backend=racer") }},
-		{name: "cache flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-uid", "other") }},
-		{name: "cache flag equals", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-uid=other") }},
+		{name: "cache flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-name", "other") }},
+		{name: "cache flag equals", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-name=other") }},
 		{name: "config redirect", change: func(c *corev1.Container) { c.Args = []string{"agent", "--config=/other"} }},
 		{name: "backend env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_CONTENT_BACKEND", Value: "racer"}} }},
-		{name: "cache env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_RACER_CACHE_UID", Value: "other"}} }},
+		{name: "cache env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_RACER_CACHE_NAME", Value: "other"}} }},
 		{name: "opaque envFrom", change: func(c *corev1.Container) {
 			c.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "hidden"}}}}
 		}},
@@ -63,7 +63,7 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 			SecurityContext:              &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}},
 			Volumes:                      []corev1.Volume{{Name: "racer-sockets"}},
 			InitContainers:               []corev1.Container{{Name: "chown-hostpaths", Command: []string{"sh", "-c", "mkdir -p /run/racer/selected-uid"}}},
-			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-uid=selected-uid"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/run/racer"}}}},
+			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-name=selected"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/run/racer"}}}},
 		},
 	}}}
 
@@ -79,7 +79,7 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "transfer", ContainerPort: 5001}}
 		}},
 		{name: "mount", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].VolumeMounts = nil }},
-		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-uid=other" }},
+		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-name=other" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := ds.DeepCopy()

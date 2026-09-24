@@ -78,7 +78,7 @@ func selectBackingCache(ctx context.Context, env *component.Env, sites []unbound
 		return invalid(fmt.Sprintf("Gantry backing ClusterCache %q requires an empty siteSelector", selected.Name))
 	}
 
-	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(selected.UID)); err != nil {
+	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, selected.Name); err != nil {
 		return invalid(fmt.Sprintf("Gantry backing ClusterCache %q: %v", selected.Name, err))
 	}
 
@@ -138,7 +138,7 @@ func daemonSetTolerates(taint corev1.Taint) bool {
 
 func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.ClusterCache) error {
 	if cache != nil {
-		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, cache.Name); err != nil {
 			return fmt.Errorf("gantry backing ClusterCache %q: %w", cache.Name, err)
 		}
 	}
@@ -155,7 +155,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.Cl
 			if cache == nil {
 				c.Args = append(c.Args, "--content-backend=direct")
 			} else {
-				c.Args = append(c.Args, "--content-backend=racer", "--racer-cache-uid="+string(cache.UID))
+				c.Args = append(c.Args, "--content-backend=racer", "--racer-cache-name="+cache.Name)
 			}
 		}
 	}
@@ -166,7 +166,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.Cl
 		}
 
 		ds.Spec.Template.Annotations[cacheUIDAnnotation] = string(cache.UID)
-		configureRacerPod(pod, string(cache.UID))
+		configureRacerPod(pod, cache.Name)
 	}
 
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ds)
@@ -180,7 +180,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.Cl
 	return nil
 }
 
-func configureRacerPod(pod *corev1.PodSpec, cacheUID string) {
+func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
 	pod.AutomountServiceAccountToken = ptr.To(false)
 	pod.SecurityContext = &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}}
 	pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "racer-sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
@@ -191,8 +191,9 @@ func configureRacerPod(pod *corev1.PodSpec, cacheUID string) {
 		if init.Name == "chown-hostpaths" {
 			init.VolumeMounts = append(init.VolumeMounts, mount)
 			root := racermeta.SocketRoot
-			directory := root + "/" + cacheUID
-			init.Command[len(init.Command)-1] += "\nmkdir -p " + directory + "\nchgrp 65532 " + root + " " + directory + "\nchmod 2770 " + root + " " + directory + "\n"
+			directory := root + "/" + cacheName
+			directories := directory + " " + directory + "/client " + directory + "/origin"
+			init.Command[len(init.Command)-1] += "\nmkdir -p " + directories + "\nchgrp 65532 " + root + " " + directories + "\nchmod 2770 " + root + " " + directories + "\n"
 		}
 	}
 

@@ -81,8 +81,9 @@ mod management_tests {
                     let a = tcp
                         .as_ref()
                         .map_or_else(address, |listener| listener.local_addr().unwrap());
-                    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
-                    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
+                    config.volumes[0].client_socket =
+                        crate::control::tests::test_socket(a, "client");
+                    let a = Address::unix(&config.volumes[0].client_socket).unwrap();
                     config.epoch = 111;
                     if !initial {
                         updates
@@ -99,9 +100,9 @@ mod management_tests {
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
                     let unique = address();
-                    b.cache_socket = crate::control::tests::test_socket(unique, "cache-b");
+                    b.client_socket = crate::control::tests::test_socket(unique, "client-b");
                     b.origin_socket = crate::control::tests::test_socket(unique, "origin-b");
-                    let blocker = std::os::unix::net::UnixListener::bind(&b.cache_socket).unwrap();
+                    let blocker = std::os::unix::net::UnixListener::bind(&b.client_socket).unwrap();
                     config.volumes.push(b);
                     config.epoch = 112;
                     updates
@@ -114,7 +115,7 @@ mod management_tests {
                     eprintln!(
                         "B06 real management={} B={} initial={initial}: {status}",
                         exporter.address(),
-                        config.volumes[1].cache_socket
+                        config.volumes[1].client_socket
                     );
                     assert_eq!(status["rejected"], true);
                     assert_eq!(status["activeRevision"], if initial { 0 } else { 1 });
@@ -175,8 +176,9 @@ fn desired_state_keeps_working_listener_after_failure_and_converges_independentl
     let updates = Arc::new(Updates::default());
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "desired-cache");
-    let original = Address::unix(&config.volumes[0].cache_socket).unwrap();
+    config.volumes[0].client_socket =
+        crate::control::tests::test_socket(address(), "desired-client");
+    let original = Address::unix(&config.volumes[0].client_socket).unwrap();
     updates
         .apply_desired(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -186,7 +188,7 @@ fn desired_state_keeps_working_listener_after_failure_and_converges_independentl
     let blocked = crate::control::tests::test_socket(address(), "desired-blocked");
     let blocker = std::os::unix::net::UnixListener::bind(&blocked).unwrap();
     config.revision = 3;
-    config.volumes[0].cache_socket = blocked;
+    config.volumes[0].client_socket = blocked;
     updates
         .apply_desired(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -199,7 +201,7 @@ fn desired_state_keeps_working_listener_after_failure_and_converges_independentl
     assert!(working.active.get());
     assert_eq!(updates.status()["ready"], true);
     config.revision = 20;
-    config.volumes[0].cache_socket =
+    config.volumes[0].client_socket =
         crate::control::tests::test_socket(address(), "desired-recovered");
     updates
         .apply_desired(prepare_snapshot(&trust, config))
@@ -222,8 +224,8 @@ fn independently_prepared_generation_has_no_serving_authority_until_commit() {
     };
     let (trust, mut config) = fixture();
     let address = address();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(address, "cache");
-    let address = Address::unix(&config.volumes[0].cache_socket).unwrap();
+    config.volumes[0].client_socket = crate::control::tests::test_socket(address, "client");
+    let address = Address::unix(&config.volumes[0].client_socket).unwrap();
     let updates = Arc::new(Updates::default());
     let mut volumes = volumes(&ring, &updates, 0);
     let prepare = |s| prepare_snapshot(&trust, s);
@@ -276,7 +278,7 @@ fn storage_fence_preserves_preparation_until_local_commit() {
         return;
     };
     let (trust, mut config) = fixture();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "cache");
+    config.volumes[0].client_socket = crate::control::tests::test_socket(address(), "client");
     let updates = Arc::new(Updates::default());
     let mut node = volumes(&ring, &updates, 0);
     updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
@@ -318,19 +320,19 @@ fn b04_kernel_failed_bind_same_revision() {
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
     let a = address();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
-    let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
+    config.volumes[0].client_socket = crate::control::tests::test_socket(a, "client");
+    let a = Address::unix(&config.volumes[0].client_socket).unwrap();
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
     let old = node.servers[&a.into()].handler().current.clone();
     let b = address();
-    let path = crate::control::tests::test_socket(b, "cache");
+    let path = crate::control::tests::test_socket(b, "client");
     let blocker = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.cache_socket = crate::control::tests::test_socket(b, "cache");
+    extra.client_socket = crate::control::tests::test_socket(b, "client");
     extra.origin_socket = crate::control::tests::test_socket(b, "origin");
     config.volumes.push(extra);
     config.revision = 2;
@@ -365,7 +367,7 @@ fn superseded_local_preparation_never_commits_or_leaks_listener_authority() {
     let mut node = volumes(&ring, &updates, 0);
     updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
     let (trust, mut config) = fixture();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(address(), "stale-stage");
+    config.volumes[0].client_socket = crate::control::tests::test_socket(address(), "stale-stage");
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -425,19 +427,19 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
         .unwrap()
         .members[1] = peer;
     let a = address();
-    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
+    config.volumes[0].client_socket = crate::control::tests::test_socket(a, "client");
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
     let b = address();
-    let path = crate::control::tests::test_socket(b, "cache");
+    let path = crate::control::tests::test_socket(b, "client");
     let blocker = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.cache_socket = crate::control::tests::test_socket(b, "cache");
+    extra.client_socket = crate::control::tests::test_socket(b, "client");
     extra.origin_socket = crate::control::tests::test_socket(b, "origin");
-    let b = Address::unix(&extra.cache_socket).unwrap();
+    let b = Address::unix(&extra.client_socket).unwrap();
     config.volumes.push(extra);
     config.revision = 2;
     let command_config = config.clone();

@@ -581,7 +581,7 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     let (trust, mut config) = crate::control::tests::fixture();
     config.peers.clear();
     let volume = &mut config.volumes[0];
-    volume.cache_socket = crate::control::tests::test_socket(address, "cache");
+    volume.client_socket = crate::control::tests::test_socket(address, "client");
     volume.origin_socket = crate::control::tests::test_socket(origin, "origin");
     volume.peers.clear();
     let topology = volume.topology.as_mut().unwrap();
@@ -605,7 +605,7 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     let mut client_ring = crate::conformance::ring(4, Default::default());
     let request = |ring: &uring::Ring| {
         client::Connection::new_address(
-            crate::socket::Address::unix(&crate::control::tests::test_socket(address, "cache"))
+            crate::socket::Address::unix(&crate::control::tests::test_socket(address, "client"))
                 .unwrap(),
             "localhost",
         )

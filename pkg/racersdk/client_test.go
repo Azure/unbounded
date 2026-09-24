@@ -365,7 +365,7 @@ func TestClientValidationAndRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := NewClient("/run/racer/test-uid/cache", ClientOptions{Header: http.Header{"rAnGe": {"bytes=0-1"}}}); err == nil {
+	if _, err := NewClient("/run/racer/test/client/socket", ClientOptions{Header: http.Header{"rAnGe": {"bytes=0-1"}}}); err == nil {
 		t.Fatal("accepted reserved header")
 	}
 }
@@ -403,7 +403,7 @@ func TestReadAtPartialCountWithOutOfOrderCompletion(t *testing.T) {
 	// page's successful prefix contributes to ReaderAt's count.
 	done := make(chan struct{})
 
-	cl, err := NewClient("/run/racer/test-uid/cache", ClientOptions{Concurrency: 2})
+	cl, err := NewClient("/run/racer/test/client/socket", ClientOptions{Concurrency: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestProtocolFramingAndCanceledContext(t *testing.T) {
 		{"invalid-etag", func(r *http.Response) { r.Header.Set("ETag", "unquoted") }, ErrProtocol},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := NewClient("/run/racer/test-uid/cache", ClientOptions{})
+			c, err := NewClient("/run/racer/test/client/socket", ClientOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}

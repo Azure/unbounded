@@ -833,7 +833,8 @@ mod tests {
     fn unix_server_and_client(ring: &mut Ring) {
         let directory = std::env::temp_dir().join(format!("uds-http-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
-        let path = crate::socket::UnixPath::new(directory.join("cache").to_str().unwrap()).unwrap();
+        let path =
+            crate::socket::UnixPath::new(directory.join("client").to_str().unwrap()).unwrap();
         let mut other_worker = Listener::bind_unix(path).unwrap();
         let l = Listener::bind_unix(path).unwrap();
         // Cancel a ring-local accept without shutting down the shared endpoint.

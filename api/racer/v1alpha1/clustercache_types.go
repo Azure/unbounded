@@ -48,9 +48,9 @@ type ClusterCacheSpec struct {
 
 type ClusterCacheStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-	// CacheSocket is the configured node-local cache path, not a readiness signal.
+	// ClientSocket is the configured node-local client path, not a readiness signal.
 	// +optional
-	CacheSocket string `json:"cacheSocket,omitempty"`
+	ClientSocket string `json:"clientSocket,omitempty"`
 	// OriginSocket is the configured node-local origin path, not a readiness signal.
 	// +optional
 	OriginSocket string `json:"originSocket,omitempty"`

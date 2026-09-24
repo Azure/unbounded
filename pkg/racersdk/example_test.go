@@ -74,7 +74,7 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 		log.Fatal(err)
 	}
 
-	// Supply ClusterCache.status.originSocket, for example /run/racer/<uid>/origin.
+	// Supply ClusterCache.status.originSocket, for example /run/racer/<name>/origin/socket.
 	originSocket := os.Getenv("RACER_ORIGIN_SOCKET")
 
 	listener, err := net.Listen("unix", originSocket)
@@ -92,7 +92,7 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 }
 
 func ExampleClient_Open() { //nolint:testableexamples // Requires an external cache serving application data.
-	// Supply ClusterCache.status.cacheSocket, for example /run/racer/<uid>/cache.
+	// Supply ClusterCache.status.clientSocket, for example /run/racer/<name>/client/socket.
 	client, err := racersdk.NewClient(os.Getenv("RACER_CACHE_SOCKET"), racersdk.ClientOptions{Concurrency: 8})
 	if err != nil {
 		log.Fatal(err)

@@ -82,13 +82,13 @@ fn identity_and_socket_contract_survives_the_language_cutover() {
     assert_eq!(node_site(None), "");
     assert_eq!(node_site(Some("edge")), "edge");
     assert_eq!(
-        cache_sockets("/custom//racer/../sockets/.", "cache-uid").unwrap(),
+        cache_sockets("/custom//racer/../sockets/.", "cache-name").unwrap(),
         (
-            "/custom/sockets/cache-uid/cache".into(),
-            "/custom/sockets/cache-uid/origin".into()
+            "/custom/sockets/cache-name/client/socket".into(),
+            "/custom/sockets/cache-name/origin/socket".into()
         )
     );
-    for (root, uid) in [
+    for (root, name) in [
         ("", "a"),
         ("relative", "a"),
         (SOCKET_ROOT, ""),
@@ -104,31 +104,31 @@ fn identity_and_socket_contract_survives_the_language_cutover() {
         (SOCKET_ROOT, "é"),
         ("/run/\0racer", "a"),
     ] {
-        assert!(cache_sockets(root, uid).is_err(), "{root:?} {uid:?}");
+        assert!(cache_sockets(root, name).is_err(), "{root:?} {name:?}");
     }
     assert!(cache_sockets(SOCKET_ROOT, &"a".repeat(64)).is_err());
-    for uid in [
+    for name in [
         "0",
         "a--9",
         "01234567-89ab-cdef-0123-456789abcdef",
         &"a".repeat(63),
     ] {
         for root in [SOCKET_ROOT, "/custom/sockets", ""] {
-            let (cache, origin) =
-                cache_sockets(if root.is_empty() { "/" } else { root }, uid).unwrap();
-            assert_eq!(cache, format!("{root}/{uid}/cache"));
-            assert_eq!(origin, format!("{root}/{uid}/origin"));
+            let (client, origin) =
+                cache_sockets(if root.is_empty() { "/" } else { root }, name).unwrap();
+            assert_eq!(client, format!("{root}/{name}/client/socket"));
+            assert_eq!(origin, format!("{root}/{name}/origin/socket"));
         }
     }
     assert_eq!(SOCKET_ROOT, "/run/racer");
     assert_eq!(
-        cache_sockets(&format!("/{}", "a".repeat(97)), "b")
+        cache_sockets(&format!("/{}", "a".repeat(90)), "b")
             .unwrap()
             .1
             .len(),
         107
     );
-    assert!(cache_sockets(&format!("/{}", "a".repeat(98)), "b").is_err());
+    assert!(cache_sockets(&format!("/{}", "a".repeat(91)), "b").is_err());
 }
 
 fn assert_placement(names: &[String], owners: &[String]) {
@@ -265,8 +265,8 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
         let mut second = g.volumes[0].clone();
         second.id = "other-cache-uid".into();
         second.name = "other".into();
-        second.cache_socket = "/run/racer/other/cache".into();
-        second.origin_socket = "/run/racer/other/origin".into();
+        second.client_socket = "/run/racer/other/client/socket".into();
+        second.origin_socket = "/run/racer/other/origin/socket".into();
         g.volumes.push(second);
         let topology = Topology::new(&g).unwrap();
         for (name, member) in &g.nodes {
@@ -323,7 +323,7 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
                         .collect::<BTreeSet<_>>(),
                     direct
                 );
-                assert_eq!(actual.cache_socket, v.cache_socket);
+                assert_eq!(actual.client_socket, v.client_socket);
                 assert_eq!(actual.origin_socket, v.origin_socket);
                 all_direct.extend(direct);
             }
@@ -356,8 +356,9 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
     input.caches[0].cache_generation = 9;
     let new = compile(&input, Some(&old)).unwrap();
     assert_eq!(new, compile(&input, None).unwrap());
-    assert_ne!(new.volumes[0].cache_socket, old.volumes[0].cache_socket);
-    assert_ne!(new.volumes[0].origin_socket, old.volumes[0].origin_socket);
+    assert_eq!(new.volumes[0].client_socket, old.volumes[0].client_socket);
+    assert_eq!(new.volumes[0].origin_socket, old.volumes[0].origin_socket);
+    assert_ne!(new.volumes[0].id, old.volumes[0].id);
     assert_eq!(new.volumes[0].id, "recreated-cache");
     assert_eq!(new.volumes[0].cache_generation, 9);
     input.nodes[0].ready = false;
@@ -390,25 +391,25 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
 }
 
 #[test]
-fn uid_socket_paths_are_stable_across_generations_and_empty_membership() {
+fn name_socket_paths_are_stable_across_generations_and_empty_membership() {
     for root in [SOCKET_ROOT, "/custom//racer/../sockets/."] {
         let mut input = inventory(0);
         input.socket_root = root.into();
         let old = compile(&input, None).unwrap();
-        let expected = cache_sockets(root, &input.caches[0].uid).unwrap();
+        let expected = cache_sockets(root, &input.caches[0].name).unwrap();
         assert_eq!(
-            (&old.volumes[0].cache_socket, &old.volumes[0].origin_socket),
+            (&old.volumes[0].client_socket, &old.volumes[0].origin_socket),
             (&expected.0, &expected.1)
         );
         assert!(old.volumes[0].owners.is_empty());
         input.caches[0].cache_generation += 1;
         input.caches[0].resource_generation += 1;
         let next = compile(&input, Some(&old)).unwrap();
-        assert_eq!(next.volumes[0].cache_socket, old.volumes[0].cache_socket);
+        assert_eq!(next.volumes[0].client_socket, old.volumes[0].client_socket);
         assert_eq!(next.volumes[0].origin_socket, old.volumes[0].origin_socket);
-        for uid in ["", "../cache-a", "UPPER", "a/b", "a\0b", &"a".repeat(64)] {
-            input.caches[0].uid = uid.into();
-            assert!(compile(&input, None).is_err(), "accepted UID {uid:?}");
+        for name in ["", "../cache-a", "UPPER", "a/b", "a\0b", &"a".repeat(64)] {
+            input.caches[0].name = name.into();
+            assert!(compile(&input, None).is_err(), "accepted name {name:?}");
         }
     }
 }
@@ -699,8 +700,8 @@ fn placement_independent_membership_compiler_to_dataplane() {
     for i in 1..16 {
         let mut v = new.volumes[0].clone();
         v.id = format!("cache-{i}");
-        v.cache_socket = format!("/run/racer/cache-{i}/cache");
-        v.origin_socket = format!("/run/racer/cache-{i}/origin");
+        v.client_socket = format!("/run/racer/cache-{i}/client/socket");
+        v.origin_socket = format!("/run/racer/cache-{i}/origin/socket");
         new.volumes.push(v);
     }
     let a = &old.nodes["node-00000"].id;

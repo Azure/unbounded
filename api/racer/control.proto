@@ -39,7 +39,7 @@ message Volume {
   Topology topology = 7;
   optional uint32 max_candidate_attempts = 8;
   VolumePeerEndpoints peer_endpoints = 9;
-  string cache_socket = 10;
+  string client_socket = 10;
   string origin_socket = 12;
   // Required index into Snapshot.member_catalogs, including for empty membership.
   optional uint32 member_catalog = 13;

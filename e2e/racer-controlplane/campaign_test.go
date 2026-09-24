@@ -290,16 +290,16 @@ func (c *campaign) cacheReady(name string, desired, ready int64) error {
 		return fmt.Errorf("cache %s participants desired=%d ready=%d status=%v", name, d, r, v.Object["status"])
 	}
 
-	cacheSocket, originSocket, err := racermeta.CacheSockets(c.socketRoot, string(v.GetUID()))
+	clientSocket, originSocket, err := racermeta.CacheSockets(c.socketRoot, v.GetName())
 	if err != nil {
 		return err
 	}
 
-	actualCache, _, _ := unstructured.NestedString(v.Object, "status", "cacheSocket")
+	actualClient, _, _ := unstructured.NestedString(v.Object, "status", "clientSocket")
 
 	actualOrigin, _, _ := unstructured.NestedString(v.Object, "status", "originSocket")
-	if actualCache != cacheSocket || actualOrigin != originSocket {
-		return fmt.Errorf("cache %s socket status does not match UID %s: %v", name, v.GetUID(), v.Object["status"])
+	if actualClient != clientSocket || actualOrigin != originSocket {
+		return fmt.Errorf("cache %s socket status does not match name: %v", name, v.Object["status"])
 	}
 
 	return nil
@@ -312,7 +312,7 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 		name := d.node.Labels["unbounded-cloud.io/site"]
 		cache, err := c.dynamic.Resource(cacheResource).Get(c.ctx, name, metav1.GetOptions{})
 		require(t, err)
-		cacheSocket, originSocket, err := racermeta.CacheSockets(d.sockets, string(cache.GetUID()))
+		clientSocket, originSocket, err := racermeta.CacheSockets(d.sockets, cache.GetName())
 		require(t, err)
 		require(t, os.MkdirAll(filepath.Dir(originSocket), 0o700))
 		l, err := net.Listen("unix", originSocket)
@@ -327,7 +327,7 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 		origin.Start()
 		t.Cleanup(origin.Close)
 
-		d.client, err = sdk.NewClient(cacheSocket, sdk.ClientOptions{})
+		d.client, err = sdk.NewClient(clientSocket, sdk.ClientOptions{})
 		require(t, err)
 		t.Cleanup(d.client.CloseIdleConnections)
 	}

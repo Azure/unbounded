@@ -302,7 +302,7 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 		cfg := config.NewDefault()
 		cfg.ContentBackend = "racer"
 		// Synthetic per-node UIDs isolate daemons sharing this fixture's mount namespace.
-		cfg.RacerCacheUID = fmt.Sprintf("node%d", i)
+		cfg.RacerCacheName = fmt.Sprintf("node%d", i)
 		cfg.ContainerdSocket = "/run/racer/containerd"
 		cfg.ContainerdNamespace = fmt.Sprintf("node%d", i)
 		cfg.MirrorListen = f.mirrors[i]
@@ -443,7 +443,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 	for i := 0; i < nodes; i++ {
 		node, _ := hex.DecodeString(gantryNode(i))
 		algorithm, catalog := uint32(1), uint32(0)
-		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/run/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/run/racer/node%d/origin", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
+		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, ClientSocket: fmt.Sprintf("/run/racer/node%d/client/socket", i), OriginSocket: fmt.Sprintf("/run/racer/node%d/origin/socket", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
 		s := &pb.Snapshot{Universe: bytes.Repeat([]byte{1}, 32), Node: node, Revision: 1, Epoch: 1, Volumes: []*pb.Volume{v}, MemberCatalogs: []*pb.MemberCatalog{{}}}
 
 		attempts := uint32(min(nodes, 3))

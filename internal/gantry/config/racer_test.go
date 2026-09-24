@@ -16,32 +16,32 @@ func TestRacerConfiguration(t *testing.T) {
 		t.Fatal("wrong transfer defaults")
 	}
 
-	if c.ContentBackend != "direct" || c.RacerCacheUID != "" {
+	if c.ContentBackend != "direct" || c.RacerCacheName != "" {
 		t.Fatal("wrong defaults")
 	}
 
-	if err := c.LoadYAML(strings.NewReader("content_backend: racer\nracer_cache_uid: yaml-cache\n")); err != nil {
+	if err := c.LoadYAML(strings.NewReader("content_backend: racer\nracer_cache_name: yaml-cache\n")); err != nil {
 		t.Fatal(err)
 	}
 
-	if c.ContentBackend != "racer" || c.RacerCacheUID != "yaml-cache" {
+	if c.ContentBackend != "racer" || c.RacerCacheName != "yaml-cache" {
 		t.Fatal("YAML not applied")
 	}
 
 	if err := c.LoadEnv(func(k string) string {
-		return map[string]string{"GANTRY_CONTENT_BACKEND": "direct", "GANTRY_RACER_CACHE_UID": "env-cache"}[k]
+		return map[string]string{"GANTRY_CONTENT_BACKEND": "direct", "GANTRY_RACER_CACHE_NAME": "env-cache"}[k]
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	if c.ContentBackend != "direct" || c.RacerCacheUID != "env-cache" {
+	if c.ContentBackend != "direct" || c.RacerCacheName != "env-cache" {
 		t.Fatal("environment not applied")
 	}
 
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
 	c.BindFlags(flags)
 
-	if err := flags.Parse([]string{"--content-backend=racer", "--racer-cache-uid=flag-cache"}); err != nil {
+	if err := flags.Parse([]string{"--content-backend=racer", "--racer-cache-name=flag-cache"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,7 +50,7 @@ func TestRacerConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if c.ContentBackend != "racer" || c.RacerCacheUID != "flag-cache" {
+	if c.ContentBackend != "racer" || c.RacerCacheName != "flag-cache" {
 		t.Fatal("flags not applied")
 	}
 
@@ -59,26 +59,26 @@ func TestRacerConfiguration(t *testing.T) {
 		t.Fatal("accepted unknown backend")
 	}
 
-	for _, uid := range []string{"", "../other", "a.b", "UPPER", "-edge", "edge-", "a/b", "a;id", strings.Repeat("a", 64)} {
+	for _, name := range []string{"", "../other", "a.b", "UPPER", "-edge", "edge-", "a/b", "a;id", strings.Repeat("a", 64)} {
 		c.ContentBackend = "racer"
 
-		c.RacerCacheUID = uid
-		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "racer_cache_uid") {
-			t.Fatalf("invalid cache UID %q: %v", uid, err)
+		c.RacerCacheName = name
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "racer_cache_name") {
+			t.Fatalf("invalid cache name %q: %v", name, err)
 		}
 
 		c.ContentBackend = "direct"
 		if err := c.Validate(); err != nil {
-			t.Fatalf("direct fallback must ignore cache UID %q: %v", uid, err)
+			t.Fatalf("direct fallback must ignore cache name %q: %v", name, err)
 		}
 	}
 
-	for _, uid := range []string{"a", "0", "synthetic-uid", "feee1f75-a659-46cd-a2d9-e1e7ee2c5318", strings.Repeat("a", 63)} {
+	for _, name := range []string{"a", "0", "synthetic-name", "feee1f75-a659-46cd-a2d9-e1e7ee2c5318", strings.Repeat("a", 63)} {
 		c.ContentBackend = "racer"
 
-		c.RacerCacheUID = uid
+		c.RacerCacheName = name
 		if err := c.Validate(); err != nil {
-			t.Fatalf("valid cache UID %q: %v", uid, err)
+			t.Fatalf("valid cache name %q: %v", name, err)
 		}
 	}
 }
@@ -136,12 +136,12 @@ func TestGeneratedBackendFlagsOverrideLegacyConfiguration(t *testing.T) {
 	for _, backend := range []string{"direct", "racer"} {
 		t.Run(backend, func(t *testing.T) {
 			c := NewDefault()
-			if err := c.LoadYAML(strings.NewReader("content_backend: obsolete\nracer_cache_uid: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")); err != nil {
+			if err := c.LoadYAML(strings.NewReader("content_backend: obsolete\nracer_cache_name: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")); err != nil {
 				t.Fatal(err)
 			}
 
 			if err := c.LoadEnv(func(key string) string {
-				return map[string]string{"GANTRY_CONTENT_BACKEND": "obsolete-env", "GANTRY_RACER_CACHE_UID": "../stale-env"}[key]
+				return map[string]string{"GANTRY_CONTENT_BACKEND": "obsolete-env", "GANTRY_RACER_CACHE_NAME": "../stale-env"}[key]
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -151,7 +151,7 @@ func TestGeneratedBackendFlagsOverrideLegacyConfiguration(t *testing.T) {
 
 			args := []string{"--content-backend=" + backend}
 			if backend == "racer" {
-				args = append(args, "--racer-cache-uid=selected")
+				args = append(args, "--racer-cache-name=selected")
 			}
 
 			if err := flags.Parse(args); err != nil {
@@ -162,7 +162,7 @@ func TestGeneratedBackendFlagsOverrideLegacyConfiguration(t *testing.T) {
 				t.Fatalf("generated flags did not override stale config: %v", err)
 			}
 
-			if c.ContentBackend != backend || (backend == "racer" && c.RacerCacheUID != "selected") || len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "private.example" {
+			if c.ContentBackend != backend || (backend == "racer" && c.RacerCacheName != "selected") || len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "private.example" {
 				t.Fatalf("incorrect merged config: %#v", c)
 			}
 		})
@@ -170,7 +170,7 @@ func TestGeneratedBackendFlagsOverrideLegacyConfiguration(t *testing.T) {
 }
 
 func TestBackendFlagsDoNotHideMalformedYAML(t *testing.T) {
-	for _, payload := range []string{"[not: yaml", "unknown_field: value", "racer_cache_uid: [invalid, type]"} {
+	for _, payload := range []string{"[not: yaml", "unknown_field: value", "racer_cache_name: [invalid, type]", "racer_cache_uid: old"} {
 		c := NewDefault()
 		if err := c.LoadYAML(strings.NewReader(payload)); err == nil {
 			t.Fatalf("malformed configuration must remain an error: %q", payload)

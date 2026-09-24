@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 // The persistent lock inode serializes cooperating origins across restarts.
@@ -30,6 +32,10 @@ type originListener struct {
 func listenOrigin(path string) (*originListener, error) {
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) || len(path) > 107 {
 		return nil, fmt.Errorf("origin-socket must be an absolute Unix socket path of at most 107 bytes")
+	}
+
+	if err := racermeta.PrepareSocketDirectory(path); err != nil {
+		return nil, err
 	}
 
 	fd, err := unix.Open(path+".lock", unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o660)

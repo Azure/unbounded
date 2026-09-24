@@ -1163,7 +1163,7 @@ async fn subscription_requires_storage_policy_v1_capability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cache_status_publishes_uid_sockets_before_participants_are_ready() {
+async fn cache_status_publishes_name_sockets_before_participants_are_ready() {
     use racer_controlplane::{
         model::{Cache, Inventory, SOCKET_ROOT, cache_sockets},
         topology::compile,
@@ -1200,12 +1200,12 @@ async fn cache_status_publishes_uid_sockets_before_participants_are_ready() {
                 api.put("/api/v1/nodes/node-a", node.clone());
             }
             api.put(CACHE, json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"ClusterCache","metadata":{"name":"cache-a","uid":uid,"generation":generation},"spec":{"cacheGeneration":generation,"maxCandidateAttempts":3,"siteSelector":{"matchLabels":{"zone":zone}}}}));
-            let expected = cache_sockets(root, uid).unwrap();
+            let expected = cache_sockets(root, "cache-a").unwrap();
             until(|| {
                 let data = api.inner.lock().unwrap();
                 let status = &data.objects[CACHE]["status"];
                 status["observedGeneration"] == generation
-                    && status["cacheSocket"] == expected.0
+                    && status["clientSocket"] == expected.0
                     && status["originSocket"] == expected.1
                     && status["participants"]["desired"] == participants
             })
@@ -1235,7 +1235,7 @@ async fn cache_status_publishes_uid_sockets_before_participants_are_ready() {
                 None,
             )
             .unwrap();
-            assert_eq!(status["cacheSocket"], compiled.volumes[0].cache_socket);
+            assert_eq!(status["clientSocket"], compiled.volumes[0].client_socket);
             assert_eq!(status["originSocket"], compiled.volumes[0].origin_socket);
             if participants == 1 {
                 // Compare with the actual configuration offered by this runtime,
@@ -1259,7 +1259,7 @@ async fn cache_status_publishes_uid_sockets_before_participants_are_ready() {
                 })
                 .await
                 .unwrap();
-                assert_eq!(status["cacheSocket"], offered.volumes[0].cache_socket);
+                assert_eq!(status["clientSocket"], offered.volumes[0].client_socket);
                 assert_eq!(status["originSocket"], offered.volumes[0].origin_socket);
             }
         }

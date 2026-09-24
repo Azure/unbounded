@@ -52,7 +52,7 @@ type Client struct {
 }
 
 // NewClient connects to an absolute filesystem Unix socket, such as
-// /run/racer/<uid>/cache, published in ClusterCache.status.cacheSocket.
+// /run/racer/<name>/client/socket, published in ClusterCache.status.clientSocket.
 // Targets are exact, already-escaped path/query strings.
 func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	if !filepath.IsAbs(endpoint) || len(endpoint) > 107 || strings.ContainsRune(endpoint, 0) {

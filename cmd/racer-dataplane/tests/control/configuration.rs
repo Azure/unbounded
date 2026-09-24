@@ -114,8 +114,8 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
         volumes: vec![proto::Volume {
             max_candidate_attempts: Some(3),
             id: "v1".into(),
-            cache_socket: "/run/racer/v1/cache".into(),
-            origin_socket: "/run/racer/v1/origin".into(),
+            client_socket: "/run/racer/v1/client/socket".into(),
+            origin_socket: "/run/racer/v1/origin/socket".into(),
             peers: vec!["03".repeat(32)],
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {
@@ -271,7 +271,7 @@ pub(crate) fn cluster_config(
     config.fabric = fabric.into();
     config.peers.clear();
     let volume = &mut config.volumes[0];
-    volume.cache_socket = test_socket(addresses[node], "cache");
+    volume.client_socket = test_socket(addresses[node], "client");
     volume.origin_socket = test_socket(backend, "origin");
     volume.peers.clear();
     let id = |n: usize| {
@@ -343,7 +343,7 @@ pub(crate) fn runtime_pair(
     trust.node = [node; 32];
     config.node = trust.node.to_vec();
     config.fabric = "runtime-fabric".into();
-    config.volumes[0].cache_socket = test_socket(listen, "cache");
+    config.volumes[0].client_socket = test_socket(listen, "client");
     config.peers[0].id = NodeId::from_bytes(&[if node == 2 { 3 } else { 2 }; 32])
         .unwrap()
         .to_string();
@@ -371,7 +371,7 @@ pub(crate) fn runtime_pair(
 #[test]
 fn tls_configuration_rejects_tcp_ingress_and_missing_pod_identity() {
     let (trust, mut config) = fixture();
-    config.volumes[0].cache_socket = "127.0.0.1:9443".into();
+    config.volumes[0].client_socket = "127.0.0.1:9443".into();
     assert!(trust.prepare(envelope(config)).is_err());
     let (_, mut config) = fixture();
     config.peers[0].pod_uid.clear();
@@ -991,8 +991,8 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     let mut volume = snapshot.volumes[0].clone();
     volume.id = "v2".into();
-    volume.cache_socket = "/run/racer/second/cache".into();
-    volume.origin_socket = "/run/racer/second/origin".into();
+    volume.client_socket = "/run/racer/second/client/socket".into();
+    volume.origin_socket = "/run/racer/second/origin/socket".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
         product: Some(proto::ProductTopology {
@@ -1219,15 +1219,17 @@ pub(crate) mod activation_tests {
                 "add" => {
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
-                    b.cache_socket = "/run/racer/second/cache".into();
-                    b.origin_socket = "/run/racer/second/origin".into();
+                    b.client_socket = "/run/racer/second/client/socket".into();
+                    b.origin_socket = "/run/racer/second/origin/socket".into();
                     config.volumes.push(b);
                 }
                 "same" => {
-                    config.volumes[0].origin_socket = "/run/racer/changed/origin".into();
+                    config.volumes[0].origin_socket = "/run/racer/changed/origin/socket".into();
                     config.volumes[0].topology.as_mut().unwrap().epoch = 2;
                 }
-                "address" => config.volumes[0].cache_socket = "/run/racer/moved/cache".into(),
+                "address" => {
+                    config.volumes[0].client_socket = "/run/racer/moved/client/socket".into()
+                }
                 "identity" => config.volumes[0].id = "B".into(),
                 "empty" => config.volumes.clear(),
                 "idle" | "initial-idle" => {
@@ -1510,7 +1512,7 @@ pub(crate) mod activation_tests {
 
         config.revision = 2;
         config.epoch = 42;
-        config.volumes[0].cache_socket = "/run/racer/moved/cache".into();
+        config.volumes[0].client_socket = "/run/racer/moved/client/socket".into();
         config.volumes[0].topology.as_mut().unwrap().epoch = 2;
         let next = prepare_snapshot(&trust, config);
         let publisher_updates = updates.clone();

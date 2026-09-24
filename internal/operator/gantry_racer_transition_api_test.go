@@ -166,7 +166,7 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 
 		pod := ds.Spec.Template.Spec
 		if ds.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] != string(cache.UID) ||
-			!slices.Contains(pod.Containers[0].Args, "--content-backend=racer") || !slices.Contains(pod.Containers[0].Args, "--racer-cache-uid="+string(cache.UID)) {
+			!slices.Contains(pod.Containers[0].Args, "--content-backend=racer") || !slices.Contains(pod.Containers[0].Args, "--racer-cache-name="+cache.Name) {
 			t.Fatalf("Racer selection did not reach stored pod: %+v", ds.Spec.Template)
 		}
 

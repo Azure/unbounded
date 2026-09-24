@@ -15,18 +15,18 @@ import (
 )
 
 func TestCacheSockets(t *testing.T) {
-	cache, origin, err := CacheSockets(SocketRoot, strings.Repeat("a", 63))
-	if err != nil || !strings.HasSuffix(cache, "/cache") || !strings.HasSuffix(origin, "/origin") {
-		t.Fatalf("paths: %q %q %v", cache, origin, err)
+	client, origin, err := CacheSockets(SocketRoot, strings.Repeat("a", 63))
+	if err != nil || !strings.HasSuffix(client, "/client/socket") || !strings.HasSuffix(origin, "/origin/socket") {
+		t.Fatalf("paths: %q %q %v", client, origin, err)
 	}
 
-	for _, uid := range []string{"0", "a--9", "01234567-89ab-cdef-0123-456789abcdef", strings.Repeat("a", 63)} {
+	for _, name := range []string{"0", "a--9", "01234567-89ab-cdef-0123-456789abcdef", strings.Repeat("a", 63)} {
 		for _, root := range []string{SocketRoot, "/custom//racer/../sockets/.", "/"} {
-			cache, origin, err := CacheSockets(root, uid)
+			client, origin, err := CacheSockets(root, name)
 
 			cleanRoot := map[string]string{SocketRoot: "/run/racer", "/custom//racer/../sockets/.": "/custom/sockets", "/": ""}[root]
-			if err != nil || cache != cleanRoot+"/"+uid+"/cache" || origin != cleanRoot+"/"+uid+"/origin" {
-				t.Fatalf("root %q UID %q: %q %q %v", root, uid, cache, origin, err)
+			if err != nil || client != cleanRoot+"/"+name+"/client/socket" || origin != cleanRoot+"/"+name+"/origin/socket" {
+				t.Fatalf("root %q name %q: %q %q %v", root, name, client, origin, err)
 			}
 		}
 	}
@@ -37,8 +37,8 @@ func TestCacheSockets(t *testing.T) {
 		}
 	}
 
-	// The longer origin path sets the sockaddr_un boundary, including its NUL.
-	root := "/" + strings.Repeat("x", 97)
+	// Both paths reach the sockaddr_un boundary, including its NUL.
+	root := "/" + strings.Repeat("x", 90)
 	if _, origin, err := CacheSockets(root, "a"); err != nil || len(origin) != 107 {
 		t.Fatalf("107-byte origin rejected: %q %v", origin, err)
 	}
@@ -51,7 +51,7 @@ func TestCacheSockets(t *testing.T) {
 func TestCacheSocketsResourceIdentity(t *testing.T) {
 	resource := &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "same-name", UID: types.UID("old-uid"), Generation: 1}}
 
-	cache, origin, err := CacheSockets(SocketRoot, string(resource.UID))
+	client, origin, err := CacheSockets(SocketRoot, resource.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +59,16 @@ func TestCacheSocketsResourceIdentity(t *testing.T) {
 	resource.Generation++
 	resource.Spec.CacheGeneration++
 
-	stableCache, stableOrigin, err := CacheSockets(SocketRoot, string(resource.UID))
-	if err != nil || stableCache != cache || stableOrigin != origin {
-		t.Fatalf("generation changed paths: %q %q %v", stableCache, stableOrigin, err)
+	stableClient, stableOrigin, err := CacheSockets(SocketRoot, resource.Name)
+	if err != nil || stableClient != client || stableOrigin != origin {
+		t.Fatalf("generation changed paths: %q %q %v", stableClient, stableOrigin, err)
 	}
 
 	resource.UID = types.UID("new-uid")
 
-	newCache, newOrigin, err := CacheSockets(SocketRoot, string(resource.UID))
-	if err != nil || newCache == cache || newOrigin == origin {
-		t.Fatalf("same-name recreation reused paths: %q %q %v", newCache, newOrigin, err)
+	newClient, newOrigin, err := CacheSockets(SocketRoot, resource.Name)
+	if err != nil || newClient != client || newOrigin != origin {
+		t.Fatalf("same-name recreation changed paths: %q %q %v", newClient, newOrigin, err)
 	}
 }
 

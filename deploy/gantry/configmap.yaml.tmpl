@@ -88,7 +88,7 @@ data:
     # a user-managed ClusterCache annotated unbounded-cloud.io/gantry-backing: "true".
     # Generated pod flags override these keys and environment values.
     content_backend: "direct"
-    racer_cache_uid: {{ .RacerCacheUID | quote }}
+    racer_cache_name: {{ .RacerCacheName | quote }}
 
     # ---------- Storage backend (Plan §Phase 8) ----------
     # Containerd is the only supported backend; the legacy hostPath

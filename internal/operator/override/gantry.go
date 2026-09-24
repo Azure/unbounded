@@ -60,7 +60,7 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 		}
 
 		for _, env := range c.Env {
-			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_UID" {
+			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_NAME" {
 				return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache annotations, not %s", env.Name)
 			}
 		}
@@ -218,7 +218,7 @@ func configArgs(args []string) []string {
 
 	for i, arg := range args {
 		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
-		if name == "config" || name == "content-backend" || name == "racer-cache-uid" {
+		if name == "config" || name == "content-backend" || name == "racer-cache-name" {
 			selected = append(selected, arg)
 			if !strings.Contains(arg, "=") && i+1 < len(args) {
 				selected = append(selected, args[i+1])

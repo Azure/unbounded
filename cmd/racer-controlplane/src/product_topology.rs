@@ -197,7 +197,7 @@ pub(crate) fn budget(p: &ProductPlacement, v: &Volume, direct: u64) -> Result<(u
         + 5 * candidates
         + 2048 * direct
         + 5 * u64::from(v.slots)
-        + (v.cache_socket.len() + v.origin_socket.len() + v.id.len()) as u64
+        + (v.client_socket.len() + v.origin_socket.len() + v.id.len()) as u64
         + 1024;
     // Top-k entries are bounded separately by wire/heap admission, rather than
     // charged as legacy per-slot routing search work.
@@ -243,7 +243,7 @@ pub(crate) fn snapshot(
             id: v.id.clone(),
             cache_generation: v.cache_generation,
             peers: peers.keys().cloned().collect(),
-            cache_socket: v.cache_socket.clone(),
+            client_socket: v.client_socket.clone(),
             origin_socket: v.origin_socket.clone(),
             max_candidate_attempts: Some(v.max_candidate_attempts),
             member_catalog: Some(0),

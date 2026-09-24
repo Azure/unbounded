@@ -23,7 +23,7 @@ process health. Shutdown logs include byte and download totals.
 
 ## Use with a cache
 
-Point `-endpoint` at an existing Racer cache socket and `-origin-socket` at the
+Point `-endpoint` at an existing Racer client socket and `-origin-socket` at the
 origin socket configured for that cache. The origin socket's parent directory
 must exist and be writable. Keep `-footprint` and `-object-size` identical across
 origins sharing the dataset; footprint must be an exact multiple of object size.

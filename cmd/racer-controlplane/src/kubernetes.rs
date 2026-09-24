@@ -450,8 +450,8 @@ impl Runtime {
                 continue;
             }
             let uid = cache.uid().context("cache lacks UID")?;
-            let (cache_socket, origin_socket) =
-                model::cache_sockets(&self.options.socket_root, &uid)?;
+            let (client_socket, origin_socket) =
+                model::cache_sockets(&self.options.socket_root, &cache.name_any())?;
             let mut desired = 0;
             let mut ready = 0;
             let mut accepted = true;
@@ -545,7 +545,7 @@ impl Runtime {
                     });
                 conditions.push(json!({ "type": kind, "status": state, "reason": reason, "message": reason, "observedGeneration": generation, "lastTransitionTime": transition }));
             }
-            let status = json!({ "observedGeneration": generation, "cacheSocket": cache_socket, "originSocket": origin_socket, "participants": { "desired": desired, "ready": ready }, "conditions": conditions });
+            let status = json!({ "observedGeneration": generation, "clientSocket": client_socket, "originSocket": origin_socket, "participants": { "desired": desired, "ready": ready }, "conditions": conditions });
             if cache.data.get("status") != Some(&status) {
                 ensure!(
                     (self.subscriptions.security)().is_some_and(|s| s.fence == fence),

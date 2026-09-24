@@ -22,14 +22,18 @@ func main() {
 		origin := fixture.NewOrigin()
 		origin.Source = os.Getenv("NODE_NAME")
 
-		for _, uid := range os.Args[2:] {
-			_, path, err := racermeta.CacheSockets(racermeta.SocketRoot, uid)
+		for _, name := range os.Args[2:] {
+			_, path, err := racermeta.CacheSockets(racermeta.SocketRoot, name)
 			if err != nil {
 				log.Fatal(err)
 			}
 
 			go func() {
 				for {
+					if err := racermeta.PrepareSocketDirectory(path); err != nil {
+						log.Fatal(err)
+					}
+
 					listener, err := net.Listen("unix", path)
 					if errors.Is(err, syscall.ENOENT) {
 						time.Sleep(100 * time.Millisecond)
@@ -74,7 +78,7 @@ func main() {
 	}
 
 	if len(os.Args) < 5 || os.Args[1] != "request" {
-		log.Fatal("usage: fixture serve [CACHE_UID...] | fixture request METHOD URL RANGE [HEADER...]")
+		log.Fatal("usage: fixture serve [CACHE_NAME...] | fixture request METHOD URL RANGE [HEADER...]")
 	}
 
 	r, err := fixture.Fetch(os.Args[2], os.Args[3], os.Args[4], os.Args[5:]...)

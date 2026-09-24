@@ -2,7 +2,7 @@
 
 ## Request origin data and metadata
 
-Create one `Client` for the cache UDS. Derive a request-local view with
+Create one `Client` for the client UDS. Derive a request-local view with
 `WithOriginData(value []byte) (*Client, error)`. Views share the HTTP and streaming
 connection pools, active request admission, and Linux splice-pipe cache and copy
 the input. Nil or empty input removes origin data.

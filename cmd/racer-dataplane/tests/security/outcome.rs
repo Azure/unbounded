@@ -148,7 +148,7 @@ fn typed_evidence_preserves_semantic_precedence_and_candidate_scope() {
     assert!(facts.neutral_for_health());
 
     let unix = Failure {
-        endpoint: crate::socket::Address::unix("/cache").unwrap(),
+        endpoint: crate::socket::Address::unix("/client").unwrap(),
         ..direct
     };
     assert!(!unix.owner_evidence());

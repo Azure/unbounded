@@ -95,7 +95,7 @@ mod tcp {
             stream.drive(|s| s.handshake()).unwrap();
             Box::new(stream)
         } else {
-            let path = crate::control::tests::test_socket(a, "cache");
+            let path = crate::control::tests::test_socket(a, "client");
             let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -335,8 +335,8 @@ mod tcp {
         let original = listener_inodes(peer_address);
         assert_eq!(original.len(), 2);
         assert!(original.is_disjoint(&unrelated_inodes));
-        let cache_path = config.volumes[0].cache_socket.clone();
-        let unix_original = unix_listener_inodes(&cache_path);
+        let client_path = config.volumes[0].client_socket.clone();
+        let unix_original = unix_listener_inodes(&client_path);
         assert_eq!(
             unix_original.len(),
             1,
@@ -417,7 +417,7 @@ mod tcp {
             config.volumes.push(volume);
             activate(config.clone());
             assert_eq!(listener_inodes(peer_address), original);
-            assert_eq!(unix_listener_inodes(&cache_path), unix_original);
+            assert_eq!(unix_listener_inodes(&client_path), unix_original);
             for _ in 0..128 {
                 assert_eq!(request(a, None).0, 200);
                 successes += 1;
@@ -444,7 +444,7 @@ mod tcp {
         let (tx, worker) = workers.pop().unwrap();
         tx.send(Command::Stop).unwrap();
         worker.join().unwrap();
-        assert_eq!(unix_listener_inodes(&cache_path), unix_original);
+        assert_eq!(unix_listener_inodes(&client_path), unix_original);
         for _ in 0..32 {
             assert_eq!(
                 request(a, None).0,
@@ -463,8 +463,8 @@ mod tcp {
         assert!(listener_inodes(a).is_empty());
         assert!(listener_inodes(peer_address).is_empty());
         assert_eq!(listener_inodes(unrelated_address), unrelated_inodes);
-        assert!(unix_listener_inodes(&cache_path).is_empty());
-        assert!(!std::path::Path::new(&cache_path).exists());
+        assert!(unix_listener_inodes(&client_path).is_empty());
+        assert!(!std::path::Path::new(&client_path).exists());
         // Worker/listener retirement must not disturb the independent exporter.
         probe_management();
     }
@@ -497,20 +497,20 @@ mod overlap {
     fn audit20_production_snapshot_socket_duplicates_and_negative_controls() {
         for collision in [
             "none",
-            "cache-cache",
-            "cache-origin",
-            "origin-cache",
+            "client-client",
+            "client-origin",
+            "origin-client",
             "origin-origin",
         ] {
             let (trust, mut config) = fixture();
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();
-            extra.cache_socket = "/run/racer/b/cache".into();
-            extra.origin_socket = "/run/racer/b/origin".into();
+            extra.client_socket = "/run/racer/b/client/socket".into();
+            extra.origin_socket = "/run/racer/b/origin/socket".into();
             match collision {
-                "cache-cache" => extra.cache_socket = config.volumes[0].cache_socket.clone(),
-                "cache-origin" => extra.cache_socket = config.volumes[0].origin_socket.clone(),
-                "origin-cache" => extra.origin_socket = config.volumes[0].cache_socket.clone(),
+                "client-client" => extra.client_socket = config.volumes[0].client_socket.clone(),
+                "client-origin" => extra.client_socket = config.volumes[0].origin_socket.clone(),
+                "origin-client" => extra.origin_socket = config.volumes[0].client_socket.clone(),
                 "origin-origin" => extra.origin_socket = config.volumes[0].origin_socket.clone(),
                 _ => {}
             }
@@ -526,7 +526,7 @@ mod overlap {
                 assert!(
                     error
                         .to_string()
-                        .contains("duplicate cache or origin socket")
+                        .contains("duplicate client or origin socket")
                 );
             }
         }
@@ -576,10 +576,10 @@ mod overlap {
             ._config
             .volumes()
             .iter()
-            .find(|v| Address::Unix(v.cache_socket()) == local_key(address))
+            .find(|v| Address::Unix(v.client_socket()) == local_key(address))
             .unwrap()
             .config()
-            .cache_socket
+            .client_socket
             .clone();
         head_path(workers, path)
     }
@@ -626,6 +626,15 @@ mod overlap {
 
     #[test]
     fn recreated_uid_retires_old_path_and_never_uses_old_origin() {
+        recreated_uid_socket_transition(false);
+    }
+
+    #[test]
+    fn recreated_uid_reuses_name_paths_without_reusing_cached_metadata() {
+        recreated_uid_socket_transition(true);
+    }
+
+    fn recreated_uid_socket_transition(same_name: bool) {
         use std::{
             io::{Read, Write},
             os::unix::net::{UnixListener, UnixStream},
@@ -636,14 +645,24 @@ mod overlap {
             std::process::id(),
             address().port()
         ));
-        for uid in ["old-uid", "new-uid"] {
-            std::fs::create_dir_all(root.join(uid)).unwrap();
+        for name in ["old-name", "new-name"] {
+            for kind in ["client", "origin"] {
+                std::fs::create_dir_all(root.join(name).join(kind)).unwrap();
+            }
         }
-        let path = |uid: &str, kind: &str| root.join(uid).join(kind).to_str().unwrap().to_owned();
-        let old_cache = path("old-uid", "cache");
-        let old_origin = path("old-uid", "origin");
-        let new_cache = path("new-uid", "cache");
-        let new_origin = path("new-uid", "origin");
+        let path = |name: &str, kind: &str| {
+            root.join(name)
+                .join(kind)
+                .join("socket")
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        let old_client = path("old-name", "client");
+        let old_origin = path("old-name", "origin");
+        let new_name = if same_name { "old-name" } else { "new-name" };
+        let new_client = path(new_name, "client");
+        let new_origin = path(new_name, "origin");
         let stop = Arc::new(AtomicBool::new(false));
         let serve_origin = |path: &str, hits: Arc<AtomicUsize>| {
             let listener = UnixListener::bind(path).unwrap();
@@ -680,7 +699,7 @@ mod overlap {
         let old_server = serve_origin(&old_origin, old_hits.clone());
         let (trust, mut config) = local_fixture(address(), address());
         config.volumes[0].id = "old-uid".into();
-        config.volumes[0].cache_socket = old_cache.clone();
+        config.volumes[0].client_socket = old_client.clone();
         config.volumes[0].origin_socket = old_origin.clone();
         let updates = Arc::new(Updates::default());
         let mut workers: Vec<_> = (0..2)
@@ -699,19 +718,36 @@ mod overlap {
             assert_eq!(updates.status()["ready"], true);
         };
         activate(&mut workers, config.clone());
-        assert_eq!(head_path(&mut workers, old_cache.clone()), 200);
+        assert_eq!(head_path(&mut workers, old_client.clone()), 200);
         let before = old_hits.load(Ordering::Acquire);
         assert!(before > 0);
-        // The wire uses UID identity rather than the Kubernetes display name.
-        // Recreate with a new UID and both new paths while the old origin is live.
+        let original_inodes = tcp::unix_listener_inodes(&old_client);
+        assert_eq!(original_inodes.len(), 1);
+        // UID identity changes even when the name and its socket paths are stable.
         config.revision += 1;
         config.volumes[0].id = "new-uid".into();
-        config.volumes[0].cache_socket = new_cache.clone();
+        config.volumes[0].client_socket = new_client.clone();
         config.volumes[0].origin_socket = new_origin.clone();
         activate(&mut workers, config);
-        assert_eq!(head_path(&mut workers, old_cache.clone()), 409);
+        if same_name {
+            assert_eq!(tcp::unix_listener_inodes(&new_client), original_inodes);
+            assert_eq!(head_path(&mut workers, new_client.clone()), 200);
+            assert!(
+                old_hits.load(Ordering::Acquire) > before,
+                "recreated UID reused old cached metadata"
+            );
+            for (node, ring) in &mut workers {
+                assert!(node.retired.is_empty(), "stable path must not be retired");
+                node.shutdown(ring).unwrap();
+            }
+            stop.store(true, Ordering::Release);
+            old_server.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        assert_eq!(head_path(&mut workers, old_client.clone()), 409);
         assert_eq!(
-            head_path(&mut workers, new_cache.clone()),
+            head_path(&mut workers, new_client.clone()),
             502,
             "new cache used an old origin or cached response"
         );
@@ -722,10 +758,10 @@ mod overlap {
         // breaker. Let its one-second cooldown expire before either worker can
         // accept the recovery request from their shared listener.
         std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(head_path(&mut workers, new_cache.clone()), 200);
+        assert_eq!(head_path(&mut workers, new_client.clone()), 200);
         assert!(new_hits.load(Ordering::Acquire) > 0);
         assert_eq!(
-            head_path(&mut workers, old_cache.clone()),
+            head_path(&mut workers, old_client.clone()),
             409,
             "old path redirected to recreated cache"
         );
@@ -737,9 +773,9 @@ mod overlap {
             node.poll_listeners(ring, 64).unwrap();
             assert!(node.retired.is_empty());
         }
-        assert!(!std::path::Path::new(&old_cache).exists());
-        assert!(UnixStream::connect(&old_cache).is_err());
-        assert_eq!(head_path(&mut workers, new_cache), 200);
+        assert!(!std::path::Path::new(&old_client).exists());
+        assert!(UnixStream::connect(&old_client).is_err());
+        assert_eq!(head_path(&mut workers, new_client), 200);
         for (node, ring) in &mut workers {
             node.shutdown(ring).unwrap();
         }
@@ -770,7 +806,7 @@ mod overlap {
                 let (trust, mut config) = local_fixture(a, backend);
                 let mut extra = config.volumes[0].clone();
                 extra.id = "unrelated".into();
-                extra.cache_socket = crate::control::tests::test_socket(other, "cache");
+                extra.client_socket = crate::control::tests::test_socket(other, "client");
                 extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
                 config.volumes.push(extra);
                 config.epoch = 101;
@@ -787,16 +823,16 @@ mod overlap {
                 poll(&mut workers);
                 poll(&mut workers);
                 assert_eq!(updates.status()["ready"], true);
-                let original = tcp::unix_listener_inodes(&config.volumes[0].cache_socket);
+                let original = tcp::unix_listener_inodes(&config.volumes[0].client_socket);
                 assert_eq!(original.len(), 1);
                 assert!(inodes(port).is_empty());
                 assert_eq!(head(&mut workers, destination(a)), 200);
                 let active = config.clone();
                 config.revision = 2;
                 config.epoch = 102;
-                config.volumes[0].cache_socket = local_key(b).to_string();
+                config.volumes[0].client_socket = local_key(b).to_string();
                 let blocker =
-                    std::os::unix::net::UnixListener::bind(&config.volumes[0].cache_socket)
+                    std::os::unix::net::UnixListener::bind(&config.volumes[0].client_socket)
                         .unwrap();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
@@ -806,7 +842,7 @@ mod overlap {
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(updates.applied_epoch(), 101);
                 assert_eq!(
-                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    tcp::unix_listener_inodes(&active.volumes[0].client_socket),
                     original,
                     "staging diverted kernel traffic"
                 );
@@ -826,7 +862,7 @@ mod overlap {
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(head(&mut workers, destination(a)), 409);
                 let mut moved = active.volumes[0].clone();
-                moved.cache_socket = local_key(b).to_string();
+                moved.client_socket = local_key(b).to_string();
                 config.volumes.insert(0, moved);
                 config.revision = 4;
                 updates
@@ -837,14 +873,14 @@ mod overlap {
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(updates.status()["activeRevision"], 3);
                 assert_eq!(
-                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    tcp::unix_listener_inodes(&active.volumes[0].client_socket),
                     original,
                     "retired socket shadowed candidate"
                 );
                 assert_eq!(head(&mut workers, other), 200);
                 // Exact-path reuse reclaims both workers' shared listener handles.
                 config.revision = 5;
-                config.volumes[0].cache_socket = local_key(a).to_string();
+                config.volumes[0].client_socket = local_key(a).to_string();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
@@ -852,7 +888,7 @@ mod overlap {
                 poll(&mut workers);
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(
-                    tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
+                    tcp::unix_listener_inodes(&active.volumes[0].client_socket),
                     original
                 );
                 for _ in 0..8 {
@@ -874,7 +910,7 @@ mod overlap {
                     node.poll_listeners(ring, 64).unwrap();
                     assert!(node.retired.is_empty());
                 }
-                let retired_path = &active.volumes[0].cache_socket;
+                let retired_path = &active.volumes[0].client_socket;
                 assert!(
                     !std::path::Path::new(retired_path).exists(),
                     "retirement must unlink the shared filesystem endpoint"
@@ -896,7 +932,7 @@ mod overlap {
                     );
                     std::thread::yield_now();
                 }
-                moved.cache_socket = local_key(b).to_string();
+                moved.client_socket = local_key(b).to_string();
                 drop(blocker);
                 config.volumes.insert(0, moved);
                 config.revision = 7;
@@ -948,7 +984,7 @@ mod overlap {
             let (trust, mut config) = local_fixture(a, backend);
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();
-            extra.cache_socket = crate::control::tests::test_socket(b, "cache");
+            extra.client_socket = crate::control::tests::test_socket(b, "client");
             extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
             config.volumes.push(extra);
             let updates = Arc::new(Updates::default());
@@ -985,7 +1021,7 @@ fn local_fixture(
     let (trust, mut config) = fixture();
     config.peers.clear();
     let v = &mut config.volumes[0];
-    v.cache_socket = crate::control::tests::test_socket(a, "cache");
+    v.client_socket = crate::control::tests::test_socket(a, "client");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers.clear();
     let topology = v.topology.as_mut().unwrap();
@@ -1010,7 +1046,7 @@ fn peer_fixture(
     let peer = "03".repeat(32);
     config.peers[0].id = peer.clone();
     let v = &mut config.volumes[0];
-    v.cache_socket = crate::control::tests::test_socket(a, "cache");
+    v.client_socket = crate::control::tests::test_socket(a, "client");
     v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers = vec![peer.clone()];
     v.topology
@@ -1108,5 +1144,5 @@ fn owned(node: &Volumes, address: impl Into<Address>) -> usize {
 }
 
 fn local_key(address: SocketAddr) -> Address {
-    Address::unix(&crate::control::tests::test_socket(address, "cache")).unwrap()
+    Address::unix(&crate::control::tests::test_socket(address, "client")).unwrap()
 }

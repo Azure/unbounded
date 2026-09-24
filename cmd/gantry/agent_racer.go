@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -52,12 +51,12 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		return err
 	}
 
-	cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheUID)
+	clientSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName)
 	if err != nil {
 		return err
 	}
 
-	client, err := sdk.NewClient(cacheSocket, sdk.ClientOptions{Timeout: c.PeerFetchTimeout})
+	client, err := sdk.NewClient(clientSocket, sdk.ClientOptions{Timeout: c.PeerFetchTimeout})
 	if err != nil {
 		return err
 	}
@@ -81,7 +80,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 
 	onRacerStream := newRacerStreamMetrics(reg)
 	reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_fallback_total", Help: "Deprecated compatibility counter; always zero because Racer requests never bypass Racer."})
-	available := reg.NewGauge("racer", prometheus.GaugeOpts{Name: "gantry_racer_available", Help: "Cache and origin UDS and containerd readiness."})
+	available := reg.NewGauge("racer", prometheus.GaugeOpts{Name: "gantry_racer_available", Help: "Client and origin UDS and containerd readiness."})
 	tracker := newStreamCommitTracker(store, logger,
 		func(n int) { p9.containerdCommitObserved.Add(float64(n)) },
 		func(d time.Duration) { p9.containerdCommitObserveDur.Observe(d.Seconds()) },
@@ -146,7 +145,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 			return false
 		}
 
-		return racerSocketReady(probeCtx, originSocket, readinessTarget) && racerCacheSocketReady(probeCtx, cacheSocket)
+		return racerSocketReady(probeCtx, originSocket, readinessTarget) && racerClientSocketReady(probeCtx, clientSocket)
 	}
 
 	go func() {
@@ -172,7 +171,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		}
 	}()
 
-	opsHTTP, opsErrors := startOpsEndpoint(c.MetricsListen, reg, func() (string, bool) { return "Racer cache/origin UDS or containerd unavailable", ready.Load() }, logger)
+	opsHTTP, opsErrors := startOpsEndpoint(c.MetricsListen, reg, func() (string, bool) { return "Racer client/origin UDS or containerd unavailable", ready.Load() }, logger)
 	defer opsHTTP.Close() //nolint:errcheck // Shutdown cleanup.
 
 	if c.PprofListen != "" {
@@ -184,7 +183,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		}
 	}
 
-	logger.Info("Racer backend listening", slog.String("cache_socket", cacheSocket), slog.String("origin_socket", originSocket), slog.String("prefetch", "demand-only"))
+	logger.Info("Racer backend listening", slog.String("client_socket", clientSocket), slog.String("origin_socket", originSocket), slog.String("prefetch", "demand-only"))
 
 	select {
 	case <-ctx.Done():
@@ -223,7 +222,7 @@ func newRacerStreamMetrics(reg *metrics.Registry) func(sdk.TransferStats, bool, 
 }
 
 func startRacerOrigin(socket string, handler http.Handler) (*http.Server, <-chan error, error) {
-	if err := os.MkdirAll(filepath.Dir(socket), 0o750); err != nil {
+	if err := racermeta.PrepareSocketDirectory(socket); err != nil {
 		return nil, nil, err
 	}
 
@@ -307,12 +306,12 @@ func racerSocketReady(ctx context.Context, socket, target string) bool {
 }
 
 // Racer rejects OPTIONS in its worker-local HTTP parser before cache admission
-// or origin/peer routing. This proves the selected cache UDS can accept, parse
+// or origin/peer routing. This proves the selected client UDS can accept, parse
 // and respond, without making rollout readiness depend on other Gantry origins.
 // Require the parser's exact response rather than accepting arbitrary errors.
 // Cache data availability is still enforced per request, without bypassing Racer;
 // this probe does not claim storage health or fleet-wide origin availability.
-func racerCacheSocketReady(ctx context.Context, socket string) bool {
+func racerClientSocketReady(ctx context.Context, socket string) bool {
 	return racerProbeSocket(ctx, socket, http.MethodOptions, "/", func(response *http.Response) bool {
 		return response.StatusCode == http.StatusMethodNotAllowed &&
 			response.Header.Get("Allow") == "GET, HEAD" && response.ContentLength == 0

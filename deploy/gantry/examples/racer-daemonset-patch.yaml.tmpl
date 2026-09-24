@@ -1,10 +1,10 @@
 # Strategic merge patch, not a standalone Kubernetes resource.
-# Standalone only: render with --set RacerCacheUID=$(kubectl get clustercache gantry -o jsonpath='{.metadata.uid}').
-# Without a UID this optional patch is empty. Operator-managed deployments use
+# Standalone only: render with --set RacerCacheName=gantry.
+# Without a name this optional patch is empty. Operator-managed deployments use
 # the ClusterCache gantry-backing annotation and generate the whole pod atomically.
-{{ if .RacerCacheUID -}}
-{{ if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" .RacerCacheUID) -}}
-{{ fail "RacerCacheUID must be the selected ClusterCache metadata.uid (1..63 lowercase alphanumeric/hyphen characters, alphanumeric edges)" }}
+{{ if .RacerCacheName -}}
+{{ if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" .RacerCacheName) -}}
+{{ fail "RacerCacheName must be the selected ClusterCache metadata.name (1..63 lowercase alphanumeric/hyphen characters, alphanumeric edges)" }}
 {{ end -}}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       annotations:
-        unbounded-cloud.io/gantry-cache-uid: {{ .RacerCacheUID | quote }}
+        unbounded-cloud.io/gantry-cache-name: {{ .RacerCacheName | quote }}
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -28,9 +28,9 @@ spec:
             - |
               chown -R 65532:65532 /var/lib/gantry/libp2p
               chmod 0700 /var/lib/gantry/libp2p
-              mkdir -p /run/racer/{{ .RacerCacheUID }}
-              chgrp 65532 /run/racer /run/racer/{{ .RacerCacheUID }}
-              chmod 2770 /run/racer /run/racer/{{ .RacerCacheUID }}
+              mkdir -p /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
+              chgrp 65532 /run/racer /run/racer/{{ .RacerCacheName }} /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
+              chmod 2770 /run/racer /run/racer/{{ .RacerCacheName }} /run/racer/{{ .RacerCacheName }}/client /run/racer/{{ .RacerCacheName }}/origin
           volumeMounts:
             - name: racer-sockets
               mountPath: /run/racer
@@ -40,7 +40,7 @@ spec:
             - agent
             - --config=/etc/gantry/config.yaml
             - --content-backend=racer
-            - --racer-cache-uid={{ .RacerCacheUID }}
+            - --racer-cache-name={{ .RacerCacheName }}
           ports:
             - containerPort: 5001
               $patch: delete

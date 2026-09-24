@@ -24,10 +24,10 @@ import (
 )
 
 func TestRacerStandalonePatch(t *testing.T) {
-	const uid = "feee1f75-a659-46cd-a2d9-e1e7ee2c5318"
+	const name = "gantry"
 
 	output := t.TempDir()
-	if err := render.Render(filepath.Dir(sourceFile(t)), output, map[string]string{"RacerCacheUID": uid}); err != nil {
+	if err := render.Render(filepath.Dir(sourceFile(t)), output, map[string]string{"RacerCacheName": name}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,12 +66,12 @@ func TestRacerStandalonePatch(t *testing.T) {
 		t.Fatal("Racer origin group/token configuration missing")
 	}
 
-	if !strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "chmod 2770 /run/racer /run/racer/"+uid) {
+	if !strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "chmod 2770 /run/racer /run/racer/"+name+" /run/racer/"+name+"/client /run/racer/"+name+"/origin") {
 		t.Fatal("cache parent permissions missing")
 	}
 
-	if ds.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] != uid || !slices.Contains(pod.Containers[0].Args, "--racer-cache-uid="+uid) || !slices.Contains(pod.Containers[0].Args, "--content-backend=racer") {
-		t.Fatal("standalone patch must select the supplied UID and trigger recreation rollout")
+	if ds.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-name"] != name || !slices.Contains(pod.Containers[0].Args, "--racer-cache-name="+name) || !slices.Contains(pod.Containers[0].Args, "--content-backend=racer") {
+		t.Fatal("standalone patch must select the supplied cache name")
 	}
 
 	for _, c := range pod.Containers {
@@ -95,18 +95,18 @@ func TestRacerStandalonePatch(t *testing.T) {
 	}
 }
 
-func TestRacerStandaloneUIDParameter(t *testing.T) {
-	for _, uid := range []string{"", "a", strings.Repeat("a", 63), "../unsafe", "a;id", "UPPER", "-edge", "edge-", strings.Repeat("a", 64)} {
-		t.Run("uid="+uid, func(t *testing.T) {
+func TestRacerStandaloneNameParameter(t *testing.T) {
+	for _, name := range []string{"", "a", strings.Repeat("a", 63), "../unsafe", "a;id", "UPPER", "-edge", "edge-", strings.Repeat("a", 64)} {
+		t.Run("name="+name, func(t *testing.T) {
 			output := t.TempDir()
-			err := render.Render(filepath.Dir(sourceFile(t)), output, map[string]string{"RacerCacheUID": uid})
+			err := render.Render(filepath.Dir(sourceFile(t)), output, map[string]string{"RacerCacheName": name})
 
-			valid := uid == "" || uid == "a" || uid == strings.Repeat("a", 63)
+			valid := name == "" || name == "a" || name == strings.Repeat("a", 63)
 			if (err == nil) != valid {
-				t.Fatalf("UID %q: %v", uid, err)
+				t.Fatalf("name %q: %v", name, err)
 			}
 
-			if uid == "" {
+			if name == "" {
 				raw, err := os.ReadFile(filepath.Join(output, "examples/racer-daemonset-patch.yaml"))
 				if err != nil {
 					t.Fatal(err)
@@ -114,7 +114,7 @@ func TestRacerStandaloneUIDParameter(t *testing.T) {
 
 				var patch any
 				if err := yaml.Unmarshal(raw, &patch); err != nil || patch != nil {
-					t.Fatalf("default direct render must not invent a cache UID: %s, %v", raw, err)
+					t.Fatalf("default direct render must not invent a cache name: %s, %v", raw, err)
 				}
 			}
 		})

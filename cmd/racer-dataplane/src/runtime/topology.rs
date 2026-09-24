@@ -83,9 +83,9 @@ impl Volumes {
         let mut generations = BTreeMap::new();
         let mut listeners = BTreeMap::new();
         for volume in config.volumes() {
-            let address = Address::Unix(volume.cache_socket());
+            let address = Address::Unix(volume.client_socket());
             if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
-                let path = volume.cache_socket();
+                let path = volume.client_socket();
                 crate::socket_listener::SharedUnix::prepare_directory(path)?;
                 listeners.insert(address, http::Listener::bind_unix(path)?);
             }

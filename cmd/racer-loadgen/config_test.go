@@ -12,14 +12,14 @@ import (
 )
 
 func TestConfigDefaults(t *testing.T) {
-	got, err := parseConfig([]string{"-seed", "42", "-cache-uid=loadgen-uid"}, io.Discard)
+	got, err := parseConfig([]string{"-seed", "42", "-cache-name=loadgen"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	want := config{
 		mode: "racer", registryListen: ":8081", gantryEndpoint: "http://127.0.0.1:5000", layersPerImage: 4, layerConcurrency: 3,
-		endpoint: "/run/racer/loadgen-uid/cache", originSocket: "/run/racer/loadgen-uid/origin", listen: ":8080",
+		endpoint: "/run/racer/loadgen/client/socket", originSocket: "/run/racer/loadgen/origin/socket", listen: ":8080",
 		footprint: 512_000_000_000, objectSize: 1_000_000_000, seed: 42, exponent: 1,
 		concurrency: 4, pageConcurrency: 8, timeout: 5 * time.Minute, ttl: time.Hour,
 		gantryReadyTimeout: 10 * time.Minute,
@@ -80,7 +80,7 @@ func TestConfigValidation(t *testing.T) {
 		{"-unknown"},
 	} {
 		t.Run("invalid_"+args[0]+"_"+args[len(args)-1], func(t *testing.T) {
-			if _, err := parseConfig(append([]string{"-cache-uid=loadgen-uid"}, args...), io.Discard); err == nil {
+			if _, err := parseConfig(append([]string{"-cache-name=loadgen"}, args...), io.Discard); err == nil {
 				t.Fatalf("parseConfig(%q) succeeded", args)
 			}
 		})
@@ -93,7 +93,7 @@ func TestConfigValidation(t *testing.T) {
 		{"-seed", "-9223372036854775808"},
 		{"-seed", "9223372036854775807"},
 	} {
-		if _, err := parseConfig(append([]string{"-cache-uid=loadgen-uid"}, args...), io.Discard); err != nil {
+		if _, err := parseConfig(append([]string{"-cache-name=loadgen"}, args...), io.Discard); err != nil {
 			t.Errorf("parseConfig(%q): %v", args, err)
 		}
 	}
@@ -102,20 +102,21 @@ func TestConfigValidation(t *testing.T) {
 func TestConfigCacheIdentity(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
-		{"-cache-uid="},
-		{"-cache-uid=../unsafe"},
-		{"-cache-uid=UPPER"},
-		{"-endpoint=/run/racer/uid/cache"},
-		{"-origin-socket=/run/racer/uid/origin"},
-		{"-cache-uid=uid", "-endpoint=/run/racer/other/cache"},
+		{"-cache-name="},
+		{"-cache-name=../unsafe"},
+		{"-cache-name=UPPER"},
+		{"-endpoint=/run/racer/test/client/socket"},
+		{"-origin-socket=/run/racer/test/origin/socket"},
+		{"-cache-uid=legacy"},
+		{"-cache-name=example", "-endpoint=/run/racer/other/client/socket"},
 	} {
 		if _, err := parseConfig(args, io.Discard); err == nil {
 			t.Fatalf("accepted missing or ambiguous identity: %v", args)
 		}
 	}
 
-	c, err := parseConfig([]string{"-endpoint=/run/racer/actual-uid/cache", "-origin-socket=/run/racer/actual-uid/origin"}, io.Discard)
-	if err != nil || c.endpoint != "/run/racer/actual-uid/cache" || c.originSocket != "/run/racer/actual-uid/origin" {
+	c, err := parseConfig([]string{"-endpoint=/run/racer/actual/client/socket", "-origin-socket=/run/racer/actual/origin/socket"}, io.Discard)
+	if err != nil || c.endpoint != "/run/racer/actual/client/socket" || c.originSocket != "/run/racer/actual/origin/socket" {
 		t.Fatalf("explicit status endpoints: %+v, %v", c, err)
 	}
 }

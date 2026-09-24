@@ -310,7 +310,7 @@ type Volume struct {
 	Topology             *Topology              `protobuf:"bytes,7,opt,name=topology,proto3" json:"topology,omitempty"`
 	MaxCandidateAttempts *uint32                `protobuf:"varint,8,opt,name=max_candidate_attempts,json=maxCandidateAttempts,proto3,oneof" json:"max_candidate_attempts,omitempty"`
 	PeerEndpoints        *VolumePeerEndpoints   `protobuf:"bytes,9,opt,name=peer_endpoints,json=peerEndpoints,proto3" json:"peer_endpoints,omitempty"`
-	CacheSocket          string                 `protobuf:"bytes,10,opt,name=cache_socket,json=cacheSocket,proto3" json:"cache_socket,omitempty"`
+	ClientSocket         string                 `protobuf:"bytes,10,opt,name=client_socket,json=clientSocket,proto3" json:"client_socket,omitempty"`
 	OriginSocket         string                 `protobuf:"bytes,12,opt,name=origin_socket,json=originSocket,proto3" json:"origin_socket,omitempty"`
 	// Required index into Snapshot.member_catalogs, including for empty membership.
 	MemberCatalog *uint32 `protobuf:"varint,13,opt,name=member_catalog,json=memberCatalog,proto3,oneof" json:"member_catalog,omitempty"`
@@ -390,9 +390,9 @@ func (x *Volume) GetPeerEndpoints() *VolumePeerEndpoints {
 	return nil
 }
 
-func (x *Volume) GetCacheSocket() string {
+func (x *Volume) GetClientSocket() string {
 	if x != nil {
-		return x.CacheSocket
+		return x.ClientSocket
 	}
 	return ""
 }
@@ -946,16 +946,16 @@ const file_control_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06fabric\x18\x02 \x01(\tR\x06fabric\x12!\n" +
 	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\x12\x17\n" +
-	"\apod_uid\x18\x04 \x01(\tR\x06podUid\"\xbc\x03\n" +
+	"\apod_uid\x18\x04 \x01(\tR\x06podUid\"\xbe\x03\n" +
 	"\x06Volume\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12)\n" +
 	"\x10cache_generation\x18\x05 \x01(\x04R\x0fcacheGeneration\x12\x14\n" +
 	"\x05peers\x18\x06 \x03(\tR\x05peers\x126\n" +
 	"\btopology\x18\a \x01(\v2\x1a.racer.control.v1.TopologyR\btopology\x129\n" +
 	"\x16max_candidate_attempts\x18\b \x01(\rH\x00R\x14maxCandidateAttempts\x88\x01\x01\x12L\n" +
-	"\x0epeer_endpoints\x18\t \x01(\v2%.racer.control.v1.VolumePeerEndpointsR\rpeerEndpoints\x12!\n" +
-	"\fcache_socket\x18\n" +
-	" \x01(\tR\vcacheSocket\x12#\n" +
+	"\x0epeer_endpoints\x18\t \x01(\v2%.racer.control.v1.VolumePeerEndpointsR\rpeerEndpoints\x12#\n" +
+	"\rclient_socket\x18\n" +
+	" \x01(\tR\fclientSocket\x12#\n" +
 	"\rorigin_socket\x18\f \x01(\tR\foriginSocket\x12*\n" +
 	"\x0emember_catalog\x18\r \x01(\rH\x01R\rmemberCatalog\x88\x01\x01B\x19\n" +
 	"\x17_max_candidate_attemptsB\x11\n" +

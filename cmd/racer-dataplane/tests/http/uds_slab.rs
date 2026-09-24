@@ -126,7 +126,7 @@ mod uds_slab {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("cache.slab");
         let candidate = dir.join("cache.slab.resize");
-        let socket = dir.join("cache");
+        let socket = dir.join("client");
         let io = Io::testing(8 * 1024 * 1024, BUFFER_SIZE as u64, true);
         let mut old_slab = io.scope(|| Slab::create(&path, 512 << 20, 1)).unwrap();
         let old_inode = std::fs::metadata(&path).unwrap().ino();

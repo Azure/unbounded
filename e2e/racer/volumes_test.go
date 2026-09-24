@@ -85,7 +85,7 @@ func TestFixtureCacheSiteSelectors(t *testing.T) {
 					}
 
 					container := ds.Spec.Template.Spec.Containers[0]
-					if container.Args[0] != "-cache-uid=$(RACER_CACHE_UID)" || container.Env[0].Name != "RACER_CACHE_UID" || container.Env[0].ValueFrom == nil || container.Env[0].ValueFrom.ConfigMapKeyRef == nil || container.Env[0].ValueFrom.ConfigMapKeyRef.Name != "racer-loadgen-cache" || container.Env[0].ValueFrom.ConfigMapKeyRef.Key != "uid" {
+					if container.Args[0] != "-cache-name=$(RACER_CACHE_NAME)" || container.Env[0].Name != "RACER_CACHE_NAME" || container.Env[0].ValueFrom == nil || container.Env[0].ValueFrom.ConfigMapKeyRef == nil || container.Env[0].ValueFrom.ConfigMapKeyRef.Name != "racer-loadgen-cache" || container.Env[0].ValueFrom.ConfigMapKeyRef.Key != "name" {
 						t.Fatal("loadgen must use an externally supplied API-assigned UID")
 					}
 

@@ -55,7 +55,7 @@ func TestImageConfig(t *testing.T) {
 		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-layers-per-image=3"},
 		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-registry-url=http://registry"},
 		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-gantry-ready-timeout=0"},
-		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-gantry-endpoint=unix:///cache"},
+		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-gantry-endpoint=unix:///client"},
 		{"-mode=container-image", "-role=registry", "-layers-per-image=0"},
 		{"-mode=container-image", "-role=registry", "-layers-per-image=1025"},
 		{"-mode=container-image", "-role=registry", "-layer-concurrency=0"},
@@ -69,7 +69,7 @@ func TestImageConfig(t *testing.T) {
 	}
 
 	for _, field := range []string{"registry-url", "gantry-endpoint"} {
-		for _, value := range []string{"", "unix:///cache", "http://", "http://user:pass@host", "http://host/path", "http://host/?ns=x", "http://host/#x"} {
+		for _, value := range []string{"", "unix:///client", "http://", "http://user:pass@host", "http://host/path", "http://host/?ns=x", "http://host/#x"} {
 			args := []string{"-mode=container-image", "-role=load", "-registry-url=http://registry:8081", "-registry-namespace=fixture.test", "-" + field + "=" + value}
 			if _, err := parseConfig(args, io.Discard); err == nil {
 				t.Errorf("accepted %v", args)

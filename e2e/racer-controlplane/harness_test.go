@@ -140,8 +140,8 @@ func newCampaign(t *testing.T) *campaign {
 		}
 	}
 
-	if !filepath.IsAbs(root) || len(root)+71 > 107 {
-		t.Fatal("RACER_LIVE_SOCKET_ROOT must be an existing workspace directory with an absolute path of at most 36 bytes")
+	if !filepath.IsAbs(root) || len(root)+78 > 107 {
+		t.Fatal("RACER_LIVE_SOCKET_ROOT must be an existing workspace directory with an absolute path of at most 29 bytes")
 	}
 
 	info, err := os.Stat(root)

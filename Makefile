@@ -732,7 +732,7 @@ gantry: test gantry-build ## Build gantry (implies test)
 gantry-integration-test: gantry-manifests unbounded-operator-manifests ## Check Gantry backend/operator/template integration without live control-plane tests
 	timeout 60s $(GOTEST) -timeout 50s ./internal/operator/components/gantry ./internal/operator/override ./deploy/gantry ./internal/gantry/config
 
-GANTRY_RACER_CACHE_UID ?=
+GANTRY_RACER_CACHE_NAME ?=
 
 gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rendered
 	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
@@ -742,7 +742,7 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(GANTRY_NAMESPACE) \
 		--set Image=$(GANTRY_IMAGE) \
-		--set 'RacerCacheUID=$(GANTRY_RACER_CACHE_UID)'
+		--set 'RacerCacheName=$(GANTRY_RACER_CACHE_NAME)'
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
 
 # Inventory render knobs. SSLMode/Password feed the database config and
@@ -936,7 +936,7 @@ racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real
 		$(RACER_TEST_HARNESS) run sdk-interop 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racersdk
 
 # Requires envtest assets, private namespace privileges, ext4 TMPDIR, and a
-# workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 36 bytes.
+# workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 29 bytes.
 racer-controlplane-live-test: racer-controlplane-build racer-dataplane-build ## Run actual Rust CP/DP failover, storage, and CA retirement campaign
 	RACER_CONTROLPLANE_BINARY="$(CURDIR)/bin/racer-controlplane" \
 		RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \

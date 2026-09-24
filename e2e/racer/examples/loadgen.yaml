@@ -1,7 +1,7 @@
 # Test workload only. Install the operator, create Site racer-a, and
 # label qualified Nodes unbounded-cloud.io/site=racer-a before applying.
 # After applying, configure the actual API-assigned UID (repeat after recreation):
-# kubectl -n unbounded-system create configmap racer-loadgen-cache --from-literal=uid="$(kubectl get clustercache racer-loadgen-volume -o jsonpath='{.metadata.uid}')" --dry-run=client -o yaml | kubectl apply -f -
+# kubectl -n unbounded-system create configmap racer-loadgen-cache --from-literal=name=racer-loadgen-volume --dry-run=client -o yaml | kubectl apply -f -
 # kubectl -n unbounded-system rollout restart daemonset/racer-loadgen
 apiVersion: apps/v1
 kind: DaemonSet
@@ -52,7 +52,7 @@ spec:
           image: racer-loadgen:local
           imagePullPolicy: IfNotPresent
           args:
-            - -cache-uid=$(RACER_CACHE_UID)
+            - -cache-name=$(RACER_CACHE_NAME)
             - -listen=:8080
             - -footprint=512GB
             - -object-size=1GB
@@ -63,11 +63,11 @@ spec:
             - -ttl=1h
             - -duration=0
           env:
-            - name: RACER_CACHE_UID
+            - name: RACER_CACHE_NAME
               valueFrom:
                 configMapKeyRef:
                   name: racer-loadgen-cache
-                  key: uid
+                  key: name
             - name: GOMAXPROCS
               value: "2"
           ports:

@@ -9,10 +9,10 @@ impl Volumes {
     // kernel traffic, so rollback after a conflicting bind would be too late.
     pub(super) fn validate_listeners(&self, config: &Prepared) -> io::Result<()> {
         for (index, volume) in config.volumes().iter().enumerate() {
-            let address = Address::Unix(volume.cache_socket());
+            let address = Address::Unix(volume.client_socket());
             let conflict = config.volumes()[..index]
                 .iter()
-                .map(|v| (Address::Unix(v.cache_socket()), "candidate"))
+                .map(|v| (Address::Unix(v.client_socket()), "candidate"))
                 .chain(
                     self.staged
                         .iter()

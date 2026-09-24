@@ -167,10 +167,10 @@ impl Trust {
             {
                 return Err(invalid("max_candidate_attempts must be in 1..=8"));
             }
-            let cache_socket = crate::socket::UnixPath::new(&volume.cache_socket)?;
+            let client_socket = crate::socket::UnixPath::new(&volume.client_socket)?;
             let origin_socket = crate::socket::UnixPath::new(&volume.origin_socket)?;
-            if !sockets.insert(cache_socket) || !sockets.insert(origin_socket) {
-                return Err(invalid("duplicate cache or origin socket"));
+            if !sockets.insert(client_socket) || !sockets.insert(origin_socket) {
+                return Err(invalid("duplicate client or origin socket"));
             }
             if volume.id.is_empty() || !ids.insert(&volume.id) {
                 return Err(invalid("duplicate or empty volume ID"));
@@ -225,7 +225,7 @@ impl Trust {
             volumes.push(PreparedVolume {
                 routing: Arc::new(crate::routing::Routing::new(&config.universe, volume)?),
                 config: volume.clone(),
-                cache_socket,
+                client_socket,
                 backend: Backend::unix(&volume.origin_socket, &volume.id)?,
                 peers: endpoints,
                 effective,
@@ -248,7 +248,7 @@ impl Trust {
 pub struct PreparedVolume {
     routing: Arc<crate::routing::Routing>,
     config: proto::Volume,
-    cache_socket: crate::socket::UnixPath,
+    client_socket: crate::socket::UnixPath,
     backend: Backend,
     peers: BTreeMap<String, http::Endpoint>,
     effective: BTreeMap<String, (String, String)>,
@@ -261,8 +261,8 @@ impl PreparedVolume {
     pub fn routing(&self) -> &Arc<crate::routing::Routing> {
         &self.routing
     }
-    pub fn cache_socket(&self) -> crate::socket::UnixPath {
-        self.cache_socket
+    pub fn client_socket(&self) -> crate::socket::UnixPath {
+        self.client_socket
     }
     pub fn backend(&self) -> &Backend {
         &self.backend
