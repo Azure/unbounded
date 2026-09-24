@@ -669,22 +669,11 @@ func runAgent(args []string) error {
 	if c.ArtifactStreamingEnabled {
 		urlPolicy := streamingapi.URLPolicy{AllowedHostSuffixes: c.ArtifactStreamingAllowedHostSuffixes}
 
-		streamingOrigin, originErr := streamingapi.NewOriginClient(
-			urlPolicy,
-			c.ArtifactStreamingMaxConcurrentOriginReads,
-			c.ArtifactStreamingOriginResponseHeaderTimeout,
-		)
-		if originErr != nil {
-			return fmt.Errorf("artifact streaming origin client: %w", originErr)
-		}
-
-		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingOrigin, streamingapi.Options{
-			URLPolicy:         urlPolicy,
-			PeerLookupTimeout: c.ArtifactStreamingPeerLookupTimeout,
-			MaxPeerAttempts:   c.ArtifactStreamingMaxPeerAttempts,
-			SelfPeerID:        ifaces.NodeID(disco.PeerID().String()),
-			StartupGated:      true,
-			Logger:            logger,
+		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingapi.Options{
+			URLPolicy:    urlPolicy,
+			SelfPeerID:   ifaces.NodeID(disco.PeerID().String()),
+			StartupGated: true,
+			Logger:       logger,
 			Metrics: streamingapi.MetricsHooks{
 				OnRequest: func(source, outcome string, duration time.Duration, bytes int64) {
 					streamingMetrics.requests.WithLabelValues(source, outcome).Inc()

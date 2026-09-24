@@ -31,7 +31,6 @@ nodeConfig:
 overlaybdConfig:
   enabled: false
   address: http://localhost:5000/blobs
-  logLevel: 0
   image:
     reference: ""
     repository: ghcr.io/azure/gantry-node-config
@@ -84,10 +83,6 @@ gantry:
       - .azurecr.io
       - .data.mcr.microsoft.com
       - .blob.core.windows.net
-    peerLookupTimeout: 250ms
-    maxPeerAttempts: 3
-    maxConcurrentOriginReads: 32
-    originResponseHeaderTimeout: 30s
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com

@@ -64,9 +64,6 @@ p2pConfig.enable)
 p2pConfig.address)
   jq --arg value "$value" '.p2pConfig.address=$value' "$TEST_HOST_CONFIG" > "$tmp"
   ;;
-logConfig.logLevel)
-  jq --argjson value "$value" '.logConfig.logLevel=$value' "$TEST_HOST_CONFIG" > "$tmp"
-  ;;
 *) exit 2 ;;
 esac
 mv "$tmp" "$TEST_HOST_CONFIG"
@@ -80,7 +77,6 @@ mv "$tmp" "$TEST_HOST_CONFIG"
 		env: append(os.Environ(),
 			"HOST_ROOT="+hostRoot,
 			"OVERLAYBD_P2P_ADDRESS=http://localhost:5000/blobs",
-			"OVERLAYBD_LOG_LEVEL=0",
 			"OVERLAYBD_CONFIG_TOOL="+configTool,
 			"GANTRY_OVERLAYBD_ONESHOT=true",
 			"NSENTER_BIN="+nsenter,
@@ -244,10 +240,12 @@ func writeExecutable(t *testing.T, directory, name, content string) string {
 	return path
 }
 
+// assertDesiredConfig also pins that settings Gantry does not own are left
+// exactly as the host had them.
 func assertDesiredConfig(t *testing.T, path string) {
 	t.Helper()
 
-	command := exec.Command("jq", "-e", `.p2pConfig.enable == true and .p2pConfig.address == "http://localhost:5000/blobs" and .logConfig.logLevel == 0`, path)
+	command := exec.Command("jq", "-e", `.p2pConfig.enable == true and .p2pConfig.address == "http://localhost:5000/blobs" and .logConfig.logLevel == 1 and .other.preserve == true`, path)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("desired config check: %v\n%s", err, output)
 	}

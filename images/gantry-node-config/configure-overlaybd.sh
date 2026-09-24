@@ -5,7 +5,6 @@
 set -eu
 
 : "${OVERLAYBD_P2P_ADDRESS:?OVERLAYBD_P2P_ADDRESS is required}"
-: "${OVERLAYBD_LOG_LEVEL:=0}"
 : "${HOST_ROOT:=/host}"
 : "${OVERLAYBD_CONFIG_TOOL:=/opt/acr/tools/overlaybd/config.sh}"
 : "${GANTRY_STREAMING_READYZ:=http://localhost:5000/artifact-streaming/readyz}"
@@ -62,8 +61,7 @@ read_value() {
 
 verify_desired() {
 	[ "$(read_value '.p2pConfig.enable // false')" = true ] &&
-		[ "$(read_value '.p2pConfig.address // ""')" = "$OVERLAYBD_P2P_ADDRESS" ] &&
-		[ "$(read_value '.logConfig.logLevel // -1')" = "$OVERLAYBD_LOG_LEVEL" ]
+		[ "$(read_value '.p2pConfig.address // ""')" = "$OVERLAYBD_P2P_ADDRESS" ]
 }
 
 apply_config() {
@@ -85,7 +83,6 @@ apply_config() {
 	else
 		host_exec "$OVERLAYBD_CONFIG_TOOL" p2pConfig.enable true
 		host_exec "$OVERLAYBD_CONFIG_TOOL" p2pConfig.address "$OVERLAYBD_P2P_ADDRESS"
-		host_exec "$OVERLAYBD_CONFIG_TOOL" logConfig.logLevel "$OVERLAYBD_LOG_LEVEL"
 		verify_desired || { echo "OverlayBD config did not converge" >&2; return 1; }
 		cp "$HOST_CONFIG" "$MANAGED_CONFIG"
 		restart_services

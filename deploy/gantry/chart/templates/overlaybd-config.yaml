@@ -24,7 +24,6 @@ spec:
         app.kubernetes.io/component: overlaybd-config
       annotations:
         gantry.unbounded-cloud.io/overlaybd-address: {{ .Values.overlaybdConfig.address | quote }}
-        gantry.unbounded-cloud.io/overlaybd-log-level: {{ .Values.overlaybdConfig.logLevel | quote }}
     spec:
       automountServiceAccountToken: false
       hostNetwork: true
@@ -43,8 +42,6 @@ spec:
           env:
             - name: OVERLAYBD_P2P_ADDRESS
               value: {{ .Values.overlaybdConfig.address | quote }}
-            - name: OVERLAYBD_LOG_LEVEL
-              value: {{ .Values.overlaybdConfig.logLevel | quote }}
           resources:
             {{- toYaml .Values.resources.overlaybdConfig | nindent 12 }}
           lifecycle:

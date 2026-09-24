@@ -121,9 +121,6 @@ func TestArtifactStreamingDefaultsRenderDisabled(t *testing.T) {
 	config := configMap.Data["config.yaml"]
 	for _, expected := range []string{
 		"artifact_streaming_enabled: false",
-		"artifact_streaming_peer_lookup_timeout: \"250ms\"",
-		"artifact_streaming_max_peer_attempts: 3",
-		"artifact_streaming_max_concurrent_origin_reads: 32",
 		".data.mcr.microsoft.com",
 		".blob.core.windows.net",
 	} {
