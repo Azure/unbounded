@@ -45,6 +45,12 @@ waiters directly, with reserved capacity for downstream peer requests. Buffer
 pressure does not allocate extra page buffers or consume a timer-based retry
 budget.
 
+Misses also reserve bounded coordination slots shared by the I/O workers on a
+NUMA node. Forwarding requests leave slots available for downstream ranks before
+waiting for page buffers, so buffer waiters cannot consume the capacity needed
+by an origin fetch. Waiting for these protected slots retains the original
+request deadline and does not restart its forwarding budget.
+
 The control plane publishes committed desired configurations. Each cache agent
 applies updates independently and can skip intermediate revisions. A slow or
 disconnected agent does not hold up publication to other agents. Agents keep

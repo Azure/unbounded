@@ -231,6 +231,87 @@ fn typed_terminals_and_default_flight_bound_are_independent_of_slots() {
 }
 
 #[test]
+fn reserved_flights_share_capacity_across_workers_and_reclaim_detached_terminals() {
+    let pool = io_test_pool_config(Config {
+        network_flights: NonZeroUsize::new(4).unwrap(),
+        ..Config::new(NonZeroUsize::new(1).unwrap())
+    });
+    let worker = pool.test_other_worker();
+    assert!(pool.network_flight_reserved(scope(0), 4).is_err());
+    let mut flights = Vec::new();
+    for (index, reserve) in [3, 2, 1, 0].into_iter().enumerate() {
+        let mut flight = worker
+            .network_flight_reserved(scope(index as u8), reserve)
+            .unwrap();
+        assert!(matches!(
+            flight.poll(Waker::noop()),
+            NetworkProgress::Produce
+        ));
+        assert!(pool.network_flight_reserved(scope(99), reserve).is_err());
+        flights.push(flight);
+    }
+    // Joining an existing producer costs no state; a terminal replacement does.
+    let joined = pool.network_flight_reserved(scope(0), 3).unwrap();
+    flights[0].finish(Err(Arc::new(crate::cache::Error::Unavailable)));
+    drop(flights.remove(0));
+    assert_eq!(pool.invariant_snapshot().flights, 4);
+    assert!(pool.network_flight_reserved(scope(0), 0).is_err());
+    drop(joined);
+    assert_eq!(pool.invariant_snapshot().flights, 3);
+    assert!(pool.network_flight_reserved(scope(0), 1).is_err());
+    let owner = pool.network_flight_reserved(scope(0), 0).unwrap();
+    drop((owner, flights));
+    pool.assert_recovered();
+}
+
+#[test]
+fn concurrent_ranked_admission_cannot_spend_another_workers_downstream_reserve() {
+    let pool = io_test_pool_config(Config::new(NonZeroUsize::new(1).unwrap()));
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..2)
+        .map(|worker| {
+            let link = pool.test_link();
+            let barrier = barrier.clone();
+            let admitted = admitted.clone();
+            std::thread::spawn(move || {
+                let pool = link.for_worker();
+                let mut held = Vec::new();
+                barrier.wait();
+                for id in 0..128 {
+                    let mut key = scope(0);
+                    key.dependency = NetworkDependency::Independent(worker * 128 + id);
+                    if let Ok(flight) = pool.network_flight_reserved(key, 8) {
+                        held.push(flight);
+                    }
+                }
+                admitted.fetch_add(held.len(), Ordering::Relaxed);
+                barrier.wait();
+                barrier.wait();
+                drop(held);
+            })
+        })
+        .collect();
+    barrier.wait();
+    barrier.wait();
+    assert_eq!(admitted.load(Ordering::Relaxed), 120);
+    let lower: Vec<_> = (0..8)
+        .rev()
+        .map(|rank| {
+            pool.network_flight_reserved(scope(rank as u8 + 1), rank)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(pool.invariant_snapshot().flights, 128);
+    drop(lower);
+    barrier.wait();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    pool.assert_recovered();
+}
+
+#[test]
 fn network_scope_isolation_and_typed_failure_delivery() {
     let pool = io_test_pool(8);
     let mut keys = vec![scope(1)];

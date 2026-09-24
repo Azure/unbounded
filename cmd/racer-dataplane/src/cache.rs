@@ -869,6 +869,17 @@ pub trait Upstream {
     fn network_scope(&self, _value: [u8; 32]) -> Option<crate::buffers::NetworkFlightKey> {
         None
     }
+    /// Coordination slots reserved for downstream work. Called before joining
+    /// a flight, including metadata (which needs no payload buffer). Routed
+    /// adapters must freeze a decreasing dependency rank across retries; a
+    /// payload must fit both capacities before granting any child authority.
+    fn flight_reserve(
+        &mut self,
+        _capacity: usize,
+        _payload_capacity: Option<usize>,
+    ) -> Result<usize> {
+        Ok(0)
+    }
     /// Report semantic validation of a ReadyPeer completion before its retry
     /// continuation is dropped or resumed. Health authority stays in the adapter.
     fn peer_validated(&mut self, _retry: &mut Self::Exchange, _valid: bool) {}
@@ -993,6 +1004,7 @@ pub struct Fault<U: Upstream> {
     resource_retries: usize,
     resource_polls: usize,
     resource_retry_at: Instant,
+    flight_retry_at: Instant,
     buffer_wait: Option<crate::buffers::Acquisition>,
 
     network: Option<crate::buffers::NetworkFlight>,
@@ -1453,6 +1465,7 @@ impl Cache {
             resource_retries: 0,
             resource_polls: 0,
             resource_retry_at: crate::environment::now(),
+            flight_retry_at: crate::environment::now(),
             buffer_wait: None,
 
             network: None,
@@ -1749,13 +1762,41 @@ impl Cache {
             && !fault.network_done
         {
             if fault.network.is_none() {
-                match ring.pool().network_flight(scope.clone()) {
+                // Protected capacity is backpressure, not failed upstream work.
+                // Keep this wait inside the original candidate deadline, without
+                // allocating a NUMA-wide waiter registry or spinning on unrelated IO.
+                if crate::environment::now() < fault.flight_retry_at
+                    && crate::environment::now() < candidate_end
+                {
+                    let deadline = fault.flight_retry_at.min(candidate_end);
+                    return Ok(Progress::Pending {
+                        fault,
+                        work: Work {
+                            runnable: false,
+                            deadline: Some(deadline),
+                        },
+                    });
+                }
+                let reserve = upstream.flight_reserve(
+                    ring.pool().flight_capacity(),
+                    matches!(fault.spec, Spec::Page(_)).then(|| ring.pool().capacity()),
+                )?;
+                match ring.pool().network_flight_reserved(scope.clone(), reserve) {
                     Ok(lease) => fault.network = Some(lease),
                     Err(_) => {
-                        let mut work = self.resource_wait(
-                            &mut fault,
-                            crate::metrics::ResourceWaitSite::NetworkFlight,
-                        )?;
+                        let mut work = if reserve == 0 {
+                            self.resource_wait(
+                                &mut fault,
+                                crate::metrics::ResourceWaitSite::NetworkFlight,
+                            )?
+                        } else {
+                            fault.flight_retry_at =
+                                crate::environment::now() + Duration::from_millis(10);
+                            Work {
+                                runnable: false,
+                                deadline: Some(fault.flight_retry_at),
+                            }
+                        };
                         work.deadline = Some(work.deadline.unwrap().min(candidate_end));
                         if crate::environment::now() >= candidate_end {
                             return Err(Error::Timeout);
@@ -2015,6 +2056,7 @@ impl Cache {
             fault.candidate_deadline = None;
         }
         fault.buffer_wait = None;
+        fault.flight_retry_at = crate::environment::now();
         fault.network_done = false;
         fault.state = Loading::Acquire;
         Ok(Progress::Pending {
@@ -2447,3 +2489,7 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/storage/cache.rs"
 ));
+
+#[cfg(test)]
+#[path = "../tests/storage/flight_admission.rs"]
+mod flight_admission_tests;
