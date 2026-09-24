@@ -58,7 +58,6 @@ spec:
             - -object-size=1GB
             - -exponent=1
             - -concurrency=4
-            - -page-concurrency=8
             - -timeout=5m
             - -ttl=1h
             - -duration=0

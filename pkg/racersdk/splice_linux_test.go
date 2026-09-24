@@ -84,7 +84,7 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				w.Header().Set("Content-Range", contentRange(0, int64(len(data))-1, int64(len(data))))
 				w.WriteHeader(206)
 				_, _ = w.Write(data)
-			}), ClientOptions{Concurrency: 1, MaxIdleConnections: 2, MaxActiveRequests: 1})
+			}), ClientOptions{})
 
 			c, err := c.WithOriginData([]byte("Bearer stream"))
 			if err != nil {
@@ -109,7 +109,7 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			c.streamPool.pipes.put(pipe, true, c.workers)
+			c.streamPool.pipes.put(pipe, true, c.streamPool.limit)
 
 			var previous *streamConn
 
@@ -130,8 +130,6 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				body := <-result
 				stats := s.Stats()
 				_ = s.Close()
-
-				assertAdmissionFree(t, c)
 
 				if err != nil || n != int64(len(data)) || !bytes.Equal(body, data) {
 					t.Fatal(n, err, len(body))
@@ -353,8 +351,13 @@ func TestSpliceAcrossPagesAndBufferedPrefix(t *testing.T) {
 	}
 
 	prefix := make([]byte, 13)
-	if _, err := io.ReadFull(s, prefix); err != nil {
-		t.Fatal(err)
+	for off := 0; off < len(prefix); {
+		n, err := s.read(prefix[off:])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		off += n
 	}
 
 	dst, receiver := downstreamPair(t, "unix")

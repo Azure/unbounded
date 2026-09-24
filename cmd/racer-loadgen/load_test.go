@@ -42,10 +42,10 @@ func await[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-func clientForTest(t *testing.T, endpoint string, concurrency int) *racersdk.Client {
+func clientForTest(t *testing.T, endpoint string) *racersdk.Client {
 	t.Helper()
 
-	c, err := racersdk.NewClient(endpoint, racersdk.ClientOptions{Concurrency: concurrency})
+	c, err := racersdk.NewClient(endpoint, racersdk.ClientOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,29 +111,13 @@ func assertMetrics(t *testing.T, reg *prometheus.Registry, wantBytes float64, wa
 	}
 }
 
-type memoryWriterAt struct {
-	mu   sync.Mutex
-	data []byte
-}
-
-func (w *memoryWriterAt) WriteAt(p []byte, off int64) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if off < 0 || off > int64(len(w.data)) || int64(len(p)) > int64(len(w.data))-off {
-		return 0, fmt.Errorf("out-of-bounds write at %d, length %d", off, len(p))
-	}
-
-	return copy(w.data[off:], p), nil
-}
-
 func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 3 * (2*racersdk.PageSize + 137), objectSize: 2*racersdk.PageSize + 137, ttl: 23 * time.Second})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	assertMetrics(t, reg, 0, 0, 0)
 
-	origin, _ := racersdk.NewOrigin(d)
+	origin, _ := racersdk.NewRangeOrigin(d)
 
 	meta, err := d.Stat(context.Background(), d.target(1), nil)
 	if err != nil {
@@ -173,17 +157,28 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := clientForTest(t, server.URL, 3)
+	client := clientForTest(t, server.URL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testWatchdog)
 	defer cancel()
 
-	dst := &memoryWriterAt{data: make([]byte, d.size)}
-
-	gotMeta, err := client.Download(ctx, d.target(1), dst)
+	object, err := client.Open(ctx, d.target(1))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	stream, err := object.Stream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	var dst bytes.Buffer
+	if _, err := stream.WriteTo(&dst); err != nil {
+		t.Fatal(err)
+	}
+
+	gotMeta := object.Metadata()
 
 	if gotMeta.Size != meta.Size || gotMeta.ETag != meta.ETag || gotMeta.TTL == nil || *gotMeta.TTL != *meta.TTL {
 		t.Fatalf("SDK metadata = %+v, want %+v", gotMeta, meta)
@@ -194,7 +189,7 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 		t.Fatalf("reference read = %d, %v", n, err)
 	}
 
-	if !bytes.Equal(dst.data, expected) {
+	if !bytes.Equal(dst.Bytes(), expected) {
 		t.Fatal("SDK multipage payload differs from the source")
 	}
 
@@ -224,7 +219,7 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 2*racersdk.PageSize + 137, objectSize: 2*racersdk.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racersdk.NewOrigin(d)
+	origin, _ := racersdk.NewRangeOrigin(d)
 
 	var heads, gets atomic.Int64
 
@@ -256,9 +251,8 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 		origin.ServeHTTP(w, r)
 	}))
 	defer server.Close()
-	// One page worker makes the complete first page and truncated second page
-	// deterministic; no later page can race the failure.
-	client := clientForTest(t, server.URL, 1)
+	// Sequential streaming completes the first page before the truncated second.
+	client := clientForTest(t, server.URL)
 
 	err := download(context.Background(), client, d.target(0), testWatchdog, m)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -276,7 +270,7 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 	d := datasetForTest(t, config{footprint: racersdk.PageSize + 137, objectSize: racersdk.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racersdk.NewOrigin(d)
+	origin, _ := racersdk.NewRangeOrigin(d)
 	blocked := make(chan struct{}, 1)
 	requestCanceled := make(chan struct{}, 1)
 
@@ -303,7 +297,7 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := clientForTest(t, server.URL, 1)
+	client := clientForTest(t, server.URL)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -330,22 +324,22 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 }
 
 func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
-	const workers, pages = 3, 2
+	const workers = 3
 
 	c := config{
 		footprint: 8 * racersdk.PageSize, objectSize: 8 * racersdk.PageSize,
-		concurrency: workers, pageConcurrency: pages, exponent: 1, seed: 42, timeout: time.Minute,
+		concurrency: workers, exponent: 1, seed: 42, timeout: time.Minute,
 	}
 	d := datasetForTest(t, c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin, _ := racersdk.NewOrigin(d)
+	origin, _ := racersdk.NewRangeOrigin(d)
 
 	var heads, gets, active, peak atomic.Int64
 
 	entered := make(chan struct{}, 64)
 	exited := make(chan struct{}, 64)
-	// All pages are held until cancellation. This saturates both worker bounds
+	// All pages are held until cancellation. This saturates the worker bound
 	// without depending on server speed or sleeps to create overlap.
 	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -382,7 +376,7 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 
 	go func() { done <- runLoad(ctx, c, d, m) }()
 
-	for i := 0; i < workers*pages; i++ {
+	for i := 0; i < workers; i++ {
 		await(t, entered)
 	}
 
@@ -392,15 +386,15 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < workers*pages; i++ {
+	for i := 0; i < workers; i++ {
 		await(t, exited)
 	}
 
 	server.Close()
 
-	if heads.Load() != workers || gets.Load() != workers*pages || peak.Load() != workers*pages || active.Load() != 0 {
+	if heads.Load() != workers || gets.Load() != workers || peak.Load() != workers || active.Load() != 0 {
 		t.Fatalf("HEADs=%d GETs=%d peak=%d active=%d; want %d/%d/%d/0",
-			heads.Load(), gets.Load(), peak.Load(), active.Load(), workers, workers*pages, workers*pages)
+			heads.Load(), gets.Load(), peak.Load(), active.Load(), workers, workers, workers)
 	}
 
 	assertMetrics(t, reg, 0, 0, workers)
@@ -415,7 +409,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := config{endpoint: server.URL, footprint: 1, objectSize: 1, concurrency: 3, pageConcurrency: 2, timeout: time.Minute}
+	c := config{endpoint: server.URL, footprint: 1, objectSize: 1, concurrency: 3, timeout: time.Minute}
 	d := datasetForTest(t, c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
@@ -442,7 +436,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 
 func TestOriginRangeResponse(t *testing.T) {
 	d := datasetForTest(t, config{footprint: 257, objectSize: 257})
-	origin, _ := racersdk.NewOrigin(d)
+	origin, _ := racersdk.NewRangeOrigin(d)
 
 	for _, tc := range []struct {
 		rangeHeader  string

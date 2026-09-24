@@ -150,42 +150,42 @@ func TestSplicePipePoolBoundsAndCleanup(t *testing.T) {
 	}
 }
 
-func TestSplicePipeIndependentIdleCapacity(t *testing.T) {
-	for _, idle := range []int{2, maxIdleSplicePipes + 1} {
-		c, err := NewClient("/unused", ClientOptions{Concurrency: 1, MaxIdleConnections: idle})
+func TestSplicePipeDefaultIdleCapacity(t *testing.T) {
+	const idle = 8
+
+	c, err := NewClient("/unused", ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.CloseIdleConnections)
+
+	var pipes []*splicePipe
+	for range idle + 1 {
+		p, err := c.streamPool.pipes.get()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		t.Cleanup(c.CloseIdleConnections)
+		pipes = append(pipes, p)
+	}
 
-		var pipes []*splicePipe
-		for range idle + 1 {
-			p, err := c.streamPool.pipes.get()
-			if err != nil {
-				t.Fatal(err)
-			}
+	for _, p := range pipes {
+		c.streamPool.pipes.put(p, true, c.streamPool.limit)
+	}
 
-			pipes = append(pipes, p)
-		}
+	if len(c.streamPool.pipes.idle) != min(idle, maxIdleSplicePipes) {
+		t.Fatal("unexpected pipe cache capacity", len(c.streamPool.pipes.idle))
+	}
 
-		for _, p := range pipes {
-			c.streamPool.pipes.put(p, true, c.streamPool.limit)
-		}
+	for _, p := range pipes[min(idle, maxIdleSplicePipes):] {
+		assertPipeClosed(t, p.fd)
+	}
 
-		if len(c.streamPool.pipes.idle) != min(idle, maxIdleSplicePipes) {
-			t.Fatal("pipe cache still tied to workers", len(c.streamPool.pipes.idle))
-		}
+	c.CloseIdleConnections()
 
-		for _, p := range pipes[min(idle, maxIdleSplicePipes):] {
-			assertPipeClosed(t, p.fd)
-		}
-
-		c.CloseIdleConnections()
-
-		for _, p := range pipes {
-			assertPipeClosed(t, p.fd)
-		}
+	for _, p := range pipes {
+		assertPipeClosed(t, p.fd)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestSplicePipePoolRejectsNonemptyAndFailed(t *testing.T) {
 }
 
 func TestSplicePipePoolSharedCleanup(t *testing.T) {
-	c, err := NewClient("/unused", ClientOptions{Concurrency: 1})
+	c, err := NewClient("/unused", ClientOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestSpliceFailureClosesCheckedOutPipe(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			c.streamPool.pipes.put(p, true, c.workers)
+			c.streamPool.pipes.put(p, true, c.streamPool.limit)
 
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -530,7 +530,7 @@ func TestSplicePartialRangeAndActiveCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c.streamPool.pipes.put(p, true, c.workers)
+	c.streamPool.pipes.put(p, true, c.streamPool.limit)
 
 	s, err := o.ReadRange(t.Context(), offset, length)
 	if err != nil {
@@ -609,7 +609,7 @@ func TestSpliceTruncatedSourceClosesPipe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c.streamPool.pipes.put(p, true, c.workers)
+	c.streamPool.pipes.put(p, true, c.streamPool.limit)
 
 	s, err := o.Stream(t.Context())
 	if err != nil {

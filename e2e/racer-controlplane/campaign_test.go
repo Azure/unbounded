@@ -7,6 +7,7 @@ package controlplane_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -377,11 +378,9 @@ func TestColdObjectMultiPeer(t *testing.T) {
 
 			meta := object.Metadata()
 
-			data := make([]byte, originfixture.ObjectSize)
-
-			n, err := object.ReadAt(c.ctx, data, 0)
-			if err != nil || n != len(data) || !bytes.Equal(data, originfixture.Body(1)) {
-				t.Fatalf("%s GET %s HEAD=%+v: bytes=%d error=%v", d.node.Name, target, meta, n, err)
+			data, err := readObject(c.ctx, object)
+			if err != nil || !bytes.Equal(data, originfixture.Body(1)) {
+				t.Fatalf("%s GET %s HEAD=%+v: bytes=%d error=%v", d.node.Name, target, meta, len(data), err)
 			}
 
 			if meta.ETag != originfixture.ETag(1) || meta.ContentType != "application/octet-stream" {
@@ -407,6 +406,20 @@ func TestColdObjectMultiPeer(t *testing.T) {
 	if peerRequests == 0 {
 		t.Fatal("cold-object regression did not exercise peer HTTP")
 	}
+}
+
+func readObject(ctx context.Context, object *sdk.Object) ([]byte, error) {
+	stream, err := object.Stream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	var data bytes.Buffer
+
+	_, err = stream.WriteTo(&data)
+
+	return data.Bytes(), err
 }
 
 func TestProductionBinaryCampaign(t *testing.T) {
@@ -736,12 +749,10 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 				}
 
 				if err == nil {
-					data := make([]byte, originfixture.ObjectSize)
+					var data []byte
 
-					var n int
-
-					n, err = object.ReadAt(c.ctx, data, 0)
-					if err == nil && (n != len(data) || !bytes.Equal(data, originfixture.Body(1))) {
+					data, err = readObject(c.ctx, object)
+					if err == nil && !bytes.Equal(data, originfixture.Body(1)) {
 						err = fmt.Errorf("SDK payload mismatch")
 					}
 				}
@@ -906,11 +917,10 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 		object, err := d.client.Open(c.ctx, "/post-retirement")
 		require(t, err)
 
-		data := make([]byte, originfixture.ObjectSize)
-		n, err := object.ReadAt(c.ctx, data, 0)
+		data, err := readObject(c.ctx, object)
 		require(t, err)
 
-		if n != len(data) || !bytes.Equal(data, originfixture.Body(1)) {
+		if !bytes.Equal(data, originfixture.Body(1)) {
 			t.Fatal("post-retirement SDK data mismatch")
 		}
 	}

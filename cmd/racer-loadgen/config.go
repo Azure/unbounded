@@ -24,7 +24,7 @@ type config struct {
 	endpoint, originSocket, listen                                             string
 	footprint, objectSize, seed                                                int64
 	exponent                                                                   float64
-	concurrency, pageConcurrency                                               int
+	concurrency                                                                int
 	timeout, ttl, duration                                                     time.Duration
 	gantryReadyTimeout                                                         time.Duration
 }
@@ -65,7 +65,6 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return err
 	})
 	f.IntVar(&c.concurrency, "concurrency", 4, "simultaneous object downloads or image pulls")
-	f.IntVar(&c.pageConcurrency, "page-concurrency", 8, "parallel page requests per object")
 	f.DurationVar(&c.timeout, "timeout", 5*time.Minute, "deadline for each object download, image pull, or catalog request")
 	f.DurationVar(&c.ttl, "ttl", time.Hour, "origin metadata TTL")
 	f.DurationVar(&c.duration, "duration", 0, "run duration (0 runs until interrupted)")
@@ -122,8 +121,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return c, fmt.Errorf("exponent must be finite and nonnegative")
 	}
 
-	if c.concurrency < 1 || c.pageConcurrency < 1 {
-		return c, fmt.Errorf("concurrency and page-concurrency must be positive")
+	if c.concurrency < 1 {
+		return c, fmt.Errorf("concurrency must be positive")
 	}
 
 	if c.timeout <= 0 || c.ttl < 0 || c.duration < 0 {

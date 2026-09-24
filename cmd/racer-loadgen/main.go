@@ -74,7 +74,7 @@ func serve(ctx context.Context, c config) error {
 		return serveImages(ctx, c)
 	}
 	// Validate the endpoint before opening a listener.
-	client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{Concurrency: c.pageConcurrency})
+	client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{})
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func serve(ctx context.Context, c config) error {
 	}
 	defer originListener.Close() //nolint:errcheck // Best effort cleanup after server shutdown or setup failure.
 
-	origin, err := racersdk.NewOrigin(d)
+	origin, err := racersdk.NewRangeOrigin(d)
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,7 @@ func serve(ctx context.Context, c config) error {
 	slog.Info("loadgen started", "endpoint", c.endpoint, "origin_socket", c.originSocket, "listen", listener.Addr().String(),
 		"footprint_bytes", c.footprint, "object_bytes", c.objectSize, "objects", d.count,
 		"exponent", c.exponent, "seed", c.seed, "concurrency", c.concurrency,
-		"page_concurrency", c.pageConcurrency, "timeout", c.timeout.String(), "ttl", c.ttl.String(), "duration", c.duration.String())
+		"timeout", c.timeout.String(), "ttl", c.ttl.String(), "duration", c.duration.String())
 	loadErr := runLoad(ctx, c, d, m)
 
 	cancel()

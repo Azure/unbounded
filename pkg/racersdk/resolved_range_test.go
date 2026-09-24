@@ -17,13 +17,12 @@ import (
 )
 
 type resolvedTestStore struct {
-	RangeStore // Legacy methods must not be called when resolution is available.
-	handle     *resolvedTestHandle
-	err        error
-	resolves   int
-	target     string
-	data       string
-	ctx        context.Context
+	handle   *resolvedTestHandle
+	err      error
+	resolves int
+	target   string
+	data     string
+	ctx      context.Context
 }
 
 func (s *resolvedTestStore) ResolveRange(ctx context.Context, target string, data []byte) (ResolvedRange, error) {

@@ -102,7 +102,7 @@ func TestOriginTTL(t *testing.T) {
 		{"negative", durationPointer(-time.Nanosecond), "", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			o, _ := NewOrigin(&memoryStore{meta: Metadata{ETag: checksumTag(nil), TTL: tc.ttl}})
+			o, _ := NewRangeOrigin(&memoryStore{meta: Metadata{ETag: checksumTag(nil), TTL: tc.ttl}})
 			r := httptest.NewRequest("HEAD", "/metadata", nil)
 			r.Header.Set("X-Racer-Target", "/object")
 

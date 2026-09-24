@@ -21,7 +21,7 @@ func TestConfigDefaults(t *testing.T) {
 		mode: "racer", registryListen: ":8081", gantryEndpoint: "http://127.0.0.1:5000", layersPerImage: 4, layerConcurrency: 3,
 		endpoint: "/run/racer/loadgen/client/socket", originSocket: "/run/racer/loadgen/origin/socket", listen: ":8080",
 		footprint: 512_000_000_000, objectSize: 1_000_000_000, seed: 42, exponent: 1,
-		concurrency: 4, pageConcurrency: 8, timeout: 5 * time.Minute, ttl: time.Hour,
+		concurrency: 4, timeout: 5 * time.Minute, ttl: time.Hour,
 		gantryReadyTimeout: 10 * time.Minute,
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -67,8 +67,6 @@ func TestConfigValidation(t *testing.T) {
 		{"-object-size", "0"},
 		{"-concurrency", "0"},
 		{"-concurrency", "-1"},
-		{"-page-concurrency", "0"},
-		{"-page-concurrency", "-1"},
 		{"-timeout", "0"},
 		{"-timeout", "-1s"},
 		{"-ttl", "-1s"},
@@ -89,7 +87,7 @@ func TestConfigValidation(t *testing.T) {
 	for _, args := range [][]string{
 		{"-footprint", "1000000", "-object-size", "1", "-exponent", "0"},
 		{"-footprint", "1GiB", "-object-size", "1GiB", "-exponent", "1.7976931348623157e308"},
-		{"-ttl", "0", "-duration", "0", "-timeout", "1ns", "-concurrency", "1", "-page-concurrency", "1"},
+		{"-ttl", "0", "-duration", "0", "-timeout", "1ns", "-concurrency", "1"},
 		{"-seed", "-9223372036854775808"},
 		{"-seed", "9223372036854775807"},
 	} {

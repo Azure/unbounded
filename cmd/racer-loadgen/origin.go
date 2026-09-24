@@ -159,17 +159,41 @@ func checksum(ctx context.Context, source io.ReaderAt, size int64) ([32]byte, er
 	return [32]byte(h.Sum(nil)), nil
 }
 
-func (d *dataset) Open(ctx context.Context, target, etag string, _ []byte) (racersdk.Source, error) {
+func (d *dataset) ResolveRange(ctx context.Context, target string, _ []byte) (racersdk.ResolvedRange, error) {
 	m, err := d.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if etag != m.ETag {
-		return nil, racersdk.ErrVersionChanged
+	return &datasetRange{meta: m, source: d.source(target)}, nil
+}
+
+type datasetRange struct {
+	meta   racersdk.Metadata
+	source syntheticSource
+}
+
+func (r *datasetRange) Metadata() racersdk.Metadata { return r.meta }
+func (r *datasetRange) Close() error                { return nil }
+func (r *datasetRange) OpenRange(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	return d.source(target), nil
+	return io.NopCloser(&datasetReader{ctx: ctx, reader: io.NewSectionReader(r.source, off, length)}), nil
+}
+
+type datasetReader struct {
+	ctx    context.Context
+	reader *io.SectionReader
+}
+
+func (r *datasetReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return r.reader.Read(p)
 }
 
 func (d *dataset) source(target string) syntheticSource {

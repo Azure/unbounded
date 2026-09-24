@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -19,7 +20,7 @@ import (
 )
 
 // An immutable in-memory example. A production store can return a pinned file
-// descriptor or storage version and release it with Source.Close.
+// descriptor or storage version and release it with ResolvedRange.Close.
 type blobStore struct {
 	blobs    map[string][]byte
 	metadata map[string]racersdk.Metadata
@@ -49,27 +50,34 @@ func (s *blobStore) Stat(ctx context.Context, target string, _ []byte) (racersdk
 	return m, nil
 }
 
-func (s *blobStore) Open(ctx context.Context, target, etag string, _ []byte) (racersdk.Source, error) {
+func (s *blobStore) ResolveRange(ctx context.Context, target string, _ []byte) (racersdk.ResolvedRange, error) {
 	m, err := s.Stat(ctx, target, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if m.ETag != etag {
-		return nil, racersdk.ErrVersionChanged
-	}
-
-	return blobSource{bytes.NewReader(s.blobs[target])}, nil
+	return &blobRange{meta: m, data: s.blobs[target]}, nil
 }
 
-type blobSource struct{ *bytes.Reader }
+type blobRange struct {
+	meta racersdk.Metadata
+	data []byte
+}
 
-func (blobSource) Close() error { return nil }
+func (b *blobRange) Metadata() racersdk.Metadata { return b.meta }
+func (b *blobRange) Close() error                { return nil }
+func (b *blobRange) OpenRange(ctx context.Context, off, length int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-running server, not a finite output example.
+	return io.NopCloser(io.NewSectionReader(bytes.NewReader(b.data), off, length)), nil
+}
+
+func ExampleNewRangeOrigin() { //nolint:testableexamples // Illustrates a long-running server, not a finite output example.
 	store := newBlobStore(map[string][]byte{"/hello": []byte("hello, Racer")})
 
-	origin, err := racersdk.NewOrigin(store)
+	origin, err := racersdk.NewRangeOrigin(store)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -93,7 +101,7 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 
 func ExampleClient_Open() { //nolint:testableexamples // Requires an external cache serving application data.
 	// Supply ClusterCache.status.clientSocket, for example /run/racer/<name>/client/socket.
-	client, err := racersdk.NewClient(os.Getenv("RACER_CACHE_SOCKET"), racersdk.ClientOptions{Concurrency: 8})
+	client, err := racersdk.NewClient(os.Getenv("RACER_CLIENT_SOCKET"), racersdk.ClientOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -107,7 +115,12 @@ func ExampleClient_Open() { //nolint:testableexamples // Requires an external ca
 		log.Fatal(err)
 	}
 
-	p := make([]byte, 8192)
-	n, err := object.ReadAt(ctx, p, 4096)
+	stream, err := object.ReadRange(ctx, 4096, 8192)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stream.Close()
+
+	n, err := stream.WriteTo(io.Discard)
 	fmt.Println(object.Metadata().Size, n, err)
 }

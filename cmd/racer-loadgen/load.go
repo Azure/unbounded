@@ -68,7 +68,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 type discardWriter struct{ bytes prometheus.Counter }
 
-func (w discardWriter) WriteAt(p []byte, _ int64) (int, error) {
+func (w discardWriter) Write(p []byte) (int, error) {
 	w.bytes.Add(float64(len(p)))
 	return len(p), nil
 }
@@ -78,7 +78,17 @@ func download(ctx context.Context, client *racersdk.Client, target string, timeo
 	defer cancel()
 
 	start := time.Now()
-	_, err := client.Download(ctx, target, discardWriter{m.bytes})
+
+	object, err := client.Open(ctx, target)
+	if err == nil {
+		var stream *racersdk.Stream
+
+		stream, err = object.Stream(ctx)
+		if err == nil {
+			_, err = stream.WriteTo(discardWriter{m.bytes})
+			_ = stream.Close() //nolint:errcheck // Preserve the transfer error.
+		}
+	}
 
 	result := "success"
 	if err != nil {
@@ -91,8 +101,7 @@ func download(ctx context.Context, client *racersdk.Client, target string, timeo
 	return err
 }
 
-// One SDK client/pool per object worker keeps idle capacity sized for the total
-// page concurrency without introducing a custom transport.
+// Each object worker reuses its client and sequential stream connections.
 func runLoad(ctx context.Context, c config, d *dataset, m *metrics) error {
 	clients := make([]*racersdk.Client, 0, c.concurrency)
 
@@ -103,7 +112,7 @@ func runLoad(ctx context.Context, c config, d *dataset, m *metrics) error {
 	}()
 
 	for i := 0; i < c.concurrency; i++ {
-		client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{Concurrency: c.pageConcurrency})
+		client, err := racersdk.NewClient(c.endpoint, racersdk.ClientOptions{})
 		if err != nil {
 			return err
 		}
