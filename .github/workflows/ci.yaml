@@ -161,17 +161,20 @@ jobs:
           test -x "$assets/etcd"
           echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
       - name: Test operator against the real API server
+        if: ${{ !cancelled() }}
         run: |
           test -n "$KUBEBUILDER_ASSETS"
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          timeout --signal=KILL 10m go test -mod=readonly -race -count=1 -timeout=9m -v \
+          python3 hack/scripts/racer-test.py run operator-api 600 go test -json -mod=readonly -race -count=1 -timeout=9m -v \
             ./internal/operator/components/racer \
             -run '^(TestSiteWorkloadAdmission|TestAPIDefaultedResourcesAreNoOp)$'
       - name: Install native dependencies
+        if: ${{ !cancelled() }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq iproute2 util-linux
       - name: Set up Rust
+        if: ${{ !cancelled() }}
         run: |
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt
           rustup default 1.96.0
@@ -187,19 +190,29 @@ jobs:
             racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-controlplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.lock') }}-
             racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-
       - name: Check Rust formatting including attached tests
+        if: ${{ !cancelled() }}
         run: make racer-fmt-check
+      - name: Check bounded harness and hermetic context
+        if: ${{ !cancelled() }}
+        run: make racer-harness-test
+      # Build the native daemon before capturing test executable identities.
+      # Later runtime-only steps consume this binary without invoking Cargo.
+      - name: Build native GantryRacer e2e
+        if: ${{ !cancelled() }}
+        run: python3 hack/scripts/racer-test.py run gantry-build 1200 make e2e-gantry-racer-build
       - name: Compile all test targets
+        if: ${{ !cancelled() }}
         run: make racer-rust-test-compile
       - name: Test Rust control plane and doctests
+        if: ${{ !cancelled() }}
         run: |
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          timeout --signal=KILL 10m make racer-controlplane-test
+          make racer-controlplane-test-run
       # This job runs for every CI event, including Gantry core, SDK, Rust,
       # api/racer, and e2e/racer changes. Reuse its native Rust cache and host
       # capabilities rather than placing the suite on the generic Go test job.
-      - name: Build native GantryRacer e2e
-        run: make e2e-gantry-racer-build
       - name: Test Gantry with real Racer and containerd
+        if: ${{ !cancelled() }}
         run: |
           sudo -n prlimit --pid $$ --memlock=unlimited:unlimited
           # The runner's Docker installation supplies containerd. The Make target
@@ -207,20 +220,46 @@ jobs:
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           make e2e-gantry-racer
       - name: Test Rust with required kernel coverage and doctests
+        if: ${{ !cancelled() }}
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           mkdir -p tmp/racer-tests
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          timeout --signal=KILL 10m make racer-dataplane-test
+          make racer-dataplane-test-run
+      - name: Require real TX and RX kTLS offload
+        if: ${{ !cancelled() }}
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          # Linux >= 6.14 and the vendored kTLS OpenSSL are required.
+          # A missing capability fails this step instead of becoming a skip.
+          uname -a
+          python3 - <<'PY'
+          import platform
+          release = tuple(map(int, platform.release().split('-')[0].split('.')[:2]))
+          assert release >= (6, 14), f"required kTLS lane needs Linux >= 6.14, got {platform.release()}"
+          PY
+          make racer-ktls-test RACER_TEST_TIMEOUT_SECONDS=90
+      - name: Test full production-duration timing contracts
+        if: ${{ !cancelled() }}
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          make racer-timing-test
       - name: Test opt-in Rust benchmark contracts
-        run: timeout --signal=KILL 5m make racer-bench-test
-      - name: Build Rust control plane, Go tools, and test shared Go components
-        run: make racer-controlplane-build racer-loadgen-build racer-go-test
+        if: ${{ !cancelled() }}
+        run: make racer-bench-test
+      - name: Build Rust control plane and Go tools
+        if: ${{ !cancelled() }}
+        run: python3 hack/scripts/racer-test.py run production-build 1200 make -k racer-controlplane-build racer-loadgen-build racer-dataplane-build
+      - name: Test shared Go components
+        if: ${{ !cancelled() }}
+        run: make racer-go-test
       - name: Compile Racer e2e and validate operator fixtures
-        run: make e2e-racer-compile e2e-racer-fixtures
-      - name: Build the dataplane for cross-language tests
-        run: make racer-dataplane-build
+        if: ${{ !cancelled() }}
+        run: make -k e2e-racer-compile e2e-racer-fixtures
       - name: Test actual Rust control planes and dataplanes against the real API server
+        if: ${{ !cancelled() }}
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
@@ -233,6 +272,7 @@ jobs:
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
           bash hack/scripts/racer-controlplane-live.sh
       - name: Test SDK against the real dataplane
+        if: ${{ !cancelled() }}
         run: |
           # This fixture uses one I/O and one compute worker on the first allowed
           # NUMA node. Count allowed physical cores, not SMT threads or CPU quota.
@@ -255,13 +295,14 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
-          timeout --signal=KILL 5m go test -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
+          python3 hack/scripts/racer-test.py run sdk-interop 300 go test -json -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
       - name: Upload production-binary campaign diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: racer-controlplane-live
           path: |
+            tmp/racer-test-logs/**
             tmp/racer-tests/racer-live-run-*.log
             tmp/racer-tests/racer-live-artifacts-*/**
           if-no-files-found: ignore
@@ -331,13 +372,17 @@ jobs:
           PY
       - name: Compile and check fixture wiring
         run: make e2e-racer-compile e2e-racer-fixtures
+      - name: Prepare tracked-source Docker context
+        run: |
+          mkdir -p tmp
+          python3 hack/scripts/racer-source-context.py tmp/racer-image-context
       # Preload the exact images the suite consumes. GHA layer caches survive
       # fresh runners.
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Build cached controlplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/racer-controlplane/Containerfile
           load: true
           tags: racer-controlplane:${{ env.RACER_E2E_IMAGE_TAG }}
@@ -349,7 +394,7 @@ jobs:
       - name: Build cached dataplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/racer-dataplane/Containerfile
           load: true
           tags: racer-dataplane:${{ env.RACER_E2E_IMAGE_TAG }}
@@ -358,7 +403,7 @@ jobs:
       - name: Build cached operator
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/unbounded-operator/Containerfile
           load: true
           tags: unbounded-operator:${{ env.RACER_E2E_IMAGE_TAG }}
@@ -367,7 +412,7 @@ jobs:
       - name: Build cached origin and probe fixture
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: e2e/racer/fixture/Containerfile
           load: true
           tags: racer-fixture:${{ env.RACER_E2E_IMAGE_TAG }}
@@ -384,6 +429,7 @@ jobs:
           name: racer-e2e-${{ matrix.suite }}
           include-hidden-files: true
           path: |
+            tmp/racer-test-logs/**
             e2e/racer/.artifacts/**
             !e2e/racer/.artifacts/**/cache-*/**
             !e2e/racer/.artifacts/**/kubeconfig
@@ -406,10 +452,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Prepare tracked-source Docker context
+        run: |
+          mkdir -p tmp
+          python3 hack/scripts/racer-source-context.py tmp/racer-image-context
       - name: Build controlplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/racer-controlplane/Containerfile
           platforms: linux/${{ matrix.arch }}
           load: true
@@ -435,7 +485,7 @@ jobs:
       - name: Build dataplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/racer-dataplane/Containerfile
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=racer-dataplane-${{ matrix.arch }}
@@ -443,7 +493,7 @@ jobs:
       - name: Build test-only loadgen
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
+          context: tmp/racer-image-context
           file: images/racer-loadgen/Containerfile
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=racer-loadgen-${{ matrix.arch }}

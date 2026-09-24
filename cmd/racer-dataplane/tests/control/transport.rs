@@ -3,7 +3,9 @@
 
 fn persistent_request(socket: &mut credentials::Stream) -> String {
     let mut request = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
     while !request.ends_with(b"\r\n\r\n") {
+        assert!(Instant::now() < end, "persistent request header deadline");
         let mut byte = [0];
         socket.read_exact(&mut byte).unwrap();
         request.push(byte[0]);
@@ -109,8 +111,24 @@ fn persistent_subscriber_rotation_drains_before_next_trust_claim() {
 
 #[test]
 fn persistent_subscriber_rejects_extra_bytes_and_times_out_reused_socket() {
+    subscriber_reused_socket_timeout(Duration::from_secs(1));
+}
+
+#[test]
+#[ignore = "full production-duration control timeout; run explicitly in the timing lane"]
+fn persistent_subscriber_rejects_extra_bytes_and_times_out_reused_socket_full_duration() {
+    subscriber_reused_socket_timeout(CONTROL_FIRST_BYTE_TIMEOUT);
+}
+
+#[test]
+fn production_control_first_byte_timeout() {
+    assert_eq!(CONTROL_FIRST_BYTE_TIMEOUT, Duration::from_secs(35));
+}
+
+fn subscriber_reused_socket_timeout(first_byte_timeout: Duration) {
     let server = Server::new();
-    let (subscriber, updates, trust, config) = server.start();
+    let (subscriber, updates, trust, config) =
+        server.start_with_first_byte_timeout(first_byte_timeout);
     let (mut socket, _, _) = server.next();
     persistent_reply(&mut socket, &signed(&trust, config), "\"one\"");
     persistent_request(&mut socket);
@@ -127,18 +145,23 @@ fn persistent_subscriber_rejects_extra_bytes_and_times_out_reused_socket() {
             .unwrap()
             .contains("unsolicited")
     );
+    // Age the connection before reusing it, so a creation-time deadline fails.
+    held(
+        &mut socket,
+        (first_byte_timeout * 3 / 4).min(Duration::from_secs(1)),
+    );
+    let start = Instant::now();
     socket
         .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
         .unwrap();
     persistent_request(&mut socket);
-    let start = Instant::now();
     // A reused connection gets a fresh first-byte deadline, not its creation time.
     let (mut retry, request, _) = server
         .requests
-        .recv_timeout(Duration::from_secs(38))
+        .recv_timeout(first_byte_timeout + Duration::from_secs(3))
         .unwrap();
-    assert!(start.elapsed() >= Duration::from_secs(35));
-    assert!(start.elapsed() < Duration::from_secs(38));
+    assert!(start.elapsed() >= first_byte_timeout);
+    assert!(start.elapsed() < first_byte_timeout + Duration::from_secs(3));
     assert!(request.contains("If-None-Match: \"one\""));
     assert!(
         updates.status()["lastError"]
@@ -207,9 +230,20 @@ fn control_transport_amortizes_1500_requests_over_one_handshake() {
     let provider = fixture.provider(0);
     let context = fixture.context("spiffe://racer/controlplane", Some("localhost"));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let (socket, _) = listener.accept().unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        let (socket, _) = loop {
+            assert!(Instant::now() < end, "persistent transport accept deadline");
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("persistent transport accept: {error}"),
+            }
+        };
         socket.set_nodelay(true).unwrap();
         let mut socket = credentials::tests::server(socket, &context);
         for _ in 0..1500 {

@@ -754,7 +754,8 @@ fn placement_independent_membership_compiler_to_dataplane() {
     assert!(after.volumes.iter().all(|v| v.member_catalog == Some(0)));
     assert_eq!(before.member_catalogs, after.member_catalogs);
     if let Some(binary) = std::env::var_os("RACER_MEMBERSHIP_DATAPLANE_TEST") {
-        let output = std::process::Command::new(binary)
+        let mut command = membership_command(&binary, std::time::Duration::from_secs(60));
+        command
             .args([
                 "runtime::tests::membership::compiler_snapshots_http_and_rdma",
                 "--exact",
@@ -762,15 +763,87 @@ fn placement_independent_membership_compiler_to_dataplane() {
                 "--nocapture",
             ])
             .env("RACER_MEMBERSHIP_OLD", hex::encode(before.encode_to_vec()))
-            .env("RACER_MEMBERSHIP_NEW", hex::encode(after.encode_to_vec()))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "dataplane integration failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            .env("RACER_MEMBERSHIP_NEW", hex::encode(after.encode_to_vec()));
+        membership_status(&mut command, std::time::Duration::from_secs(65)).unwrap();
+    }
+}
+
+// GNU timeout owns the child process group, including descendants. Inherit the
+// suite's output instead of waiting on pipes that a descendant can keep open.
+fn membership_command(
+    binary: &std::ffi::OsStr,
+    limit: std::time::Duration,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("timeout");
+    command
+        .args(["--signal=TERM", "--kill-after=2s"])
+        .arg(format!("{}s", limit.as_secs_f64()))
+        .arg(binary)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    command
+}
+
+fn membership_status(
+    command: &mut std::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::time::{Duration, Instant};
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "dataplane integration failed: {status}"
+                )))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < reap_deadline {
+                if child.try_wait()?.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "membership supervisor timed out",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "membership supervisor PID {} remains unreaped after KILL",
+                    child.id()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn membership_subprocess_success_failure_and_timeout() {
+    use std::time::{Duration, Instant};
+    for (script, success) in [
+        ("exit 0", true),
+        ("exit 7", false),
+        ("trap '' TERM; sleep 30 & wait", false),
+    ] {
+        let mut command =
+            membership_command(std::ffi::OsStr::new("sh"), Duration::from_millis(100));
+        command.args(["-c", script]);
+        let started = Instant::now();
+        assert_eq!(
+            membership_status(&mut command, Duration::from_secs(4)).is_ok(),
+            success
         );
-        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            started.elapsed() < Duration::from_secs(7),
+            "unbounded membership child: {script}"
+        );
     }
 }

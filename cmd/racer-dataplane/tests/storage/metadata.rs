@@ -73,3 +73,42 @@ fn content_type_exact_bound_and_canonical_disk_padding() {
         None
     );
 }
+
+#[test]
+fn resident_metadata_preserves_encoding_and_shares_only_header_storage() {
+    assert!(std::mem::size_of::<ResidentMetadata>() <= 64);
+    for len in [0, 1, 31, 255, 256] {
+        let original = Metadata {
+            checksum: Checksum([0xab; 32]),
+            len: u64::MAX,
+            expires: 1234,
+            content_type: if len == 0 {
+                ContentType::default()
+            } else {
+                ContentType::new(&vec![b'x'; len]).unwrap()
+            },
+        };
+        let resident = ResidentMetadata::from(original);
+        assert_eq!(resident.to_metadata(), original);
+        assert_eq!(resident.to_bytes(), original.to_bytes());
+        assert_eq!(
+            Metadata::from_bytes(&resident.to_bytes()).unwrap(),
+            original
+        );
+        let mut newer = resident.clone();
+        assert_eq!(resident.header_allocation(), newer.header_allocation());
+        match resident.header_allocation() {
+            None => assert_eq!(len, 0),
+            Some((_, bytes)) => {
+                assert_ne!(len, 0);
+                assert_eq!(bytes, ResidentMetadata::header_allocation_bytes(len));
+                assert!(bytes >= (len + 2 * std::mem::size_of::<usize>()) as u64);
+            }
+        }
+        newer.expires += 1;
+        assert_eq!(resident.to_metadata(), original);
+        drop(resident);
+        assert_eq!(newer.to_metadata().content_type, original.content_type);
+        assert_eq!(newer.to_metadata().expires, original.expires + 1);
+    }
+}

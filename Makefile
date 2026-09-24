@@ -765,6 +765,12 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 
 ##@ Racer
 
+# Each executable and doctest gets an independent runtime budget. JSON records
+# and complete logs survive failures under tmp/racer-test-logs. Stable Cargo
+# cannot precompile doctests, so their compilation is timed with their execution.
+RACER_TEST_HARNESS = CARGO="$(CARGO)" RACER_CARGO_TARGET_DIR="$(RACER_CARGO_TARGET_DIR)" RACER_CONTROLPLANE_CARGO_TARGET_DIR="$(RACER_CONTROLPLANE_CARGO_TARGET_DIR)" python3 hack/scripts/racer-test.py
+RACER_SOURCE_BUILD = python3 hack/scripts/racer-source-context.py --build
+
 # Build separately so compilation does not consume the per-test runtime budget.
 # The debug daemon reuses the Racer CI all-targets Cargo cache.
 GANTRY_RACER_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),$(CURDIR)/tmp/gantry-racer)
@@ -773,7 +779,11 @@ RACER_DATAPLANE_BINARY ?= $(abspath $(RACER_CARGO_TARGET_DIR)/debug/racer-datapl
 RACER_LOADGEN_BINARY ?= $(abspath bin/racer-loadgen)
 
 e2e-gantry-racer-build: gantry-build racer-loadgen-build ## Build binaries and warm Go compilation for the native Gantry/Racer e2e
-	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --bin racer-dataplane
+	@if [ "$(origin RACER_DATAPLANE_BINARY)" = "command line" ] || [ "$(origin RACER_DATAPLANE_BINARY)" = "environment" ]; then \
+		test -x "$(RACER_DATAPLANE_BINARY)" || { echo "Missing prebuilt dataplane: $(RACER_DATAPLANE_BINARY)" >&2; exit 1; }; \
+	else \
+		$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --bin racer-dataplane; \
+	fi
 	$(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run '^$$'
 
 # These Linux-only tests fail on missing prerequisites; never substitute a skip.
@@ -792,23 +802,26 @@ e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and inde
 			case "$$binary" in /*) ;; *) echo "Binary path must be absolute: $$binary" >&2; exit 1;; esac; \
 			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
 		done; \
+		failed=0; \
 		for suite in Striped Authorization Recovery Corruption ContainerImage; do \
 			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
-			timeout --signal=KILL 60s $(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v; \
-		done
+			$(RACER_TEST_HARNESS) run "gantry-$$suite" 60 $(GOTEST) -json -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v || failed=1; \
+		done; exit $$failed
 
 # The live suite requires Docker, kind, kubectl, and suitable dataplane hardware.
 # It builds root-context images locally; CI supplies cached current-checkout
 # images via RACER_E2E_IMAGE_TAG.
 e2e-racer-compile: ## Compile all Racer e2e packages without running tests
-	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
-	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer-controlplane
+	@failed=0; \
+		$(RACER_TEST_HARNESS) run e2e-compile 300 $(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/... || failed=1; \
+		$(RACER_TEST_HARNESS) run live-compile 300 $(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer-controlplane || failed=1; \
+		exit $$failed
 
 e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
-	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract)$$' ./e2e/racer/...
+	$(RACER_TEST_HARNESS) run e2e-fixtures 300 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -timeout=4m -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract|TestBackendWireRepresentation|TestGantryControlFixture|TestEnrollmentAndControl)$$' ./e2e/racer/...
 
 e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
-	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
+	$(RACER_TEST_HARNESS) run kind-deployment 2760 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
 
 racer-controlplane-build: ## Build the Rust control plane (requires Rust 1.96, cc, pkg-config, libssl-dev)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' RACER_VERSION='$(VERSION)' RACER_COMMIT='$(GIT_COMMIT)' $(CARGO) build --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --release --locked --bin racer-controlplane
@@ -830,28 +843,77 @@ racer-bench-build: ## Build opt-in two-node transport benchmarks (ephemeral TLS,
 	cp $(addprefix $(RACER_CARGO_TARGET_DIR)/release/,metadata-bench tcp-page-bench rdma-bench) bin/
 
 racer-bench-test: ## Check feature isolation and benchmark fixture contracts
-	$(CARGO) check --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --no-default-features --bin racer-dataplane
-	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --features dev-bench --lib dev_bench::
+	@failed=0; \
+		$(RACER_TEST_HARNESS) run bench-feature-check 300 $(CARGO) check --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --no-default-features --bin racer-dataplane || failed=1; \
+		$(RACER_TEST_HARNESS) run bench-contracts 300 $(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --features dev-bench --lib dev_bench:: || failed=1; \
+		exit $$failed
 
 # Shared Go suites fail promptly if an integration fixture stops progressing.
 RACER_GO_TEST_TIMEOUT ?= 5m
 
 racer-go-test: ## Test Racer Go SDK, shared helpers, operator, and tools
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./pkg/racer/... ./cmd/racer-loadgen/...
+	$(RACER_TEST_HARNESS) run go-core 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./pkg/racer/... ./cmd/racer-loadgen/...
 
 racer-controlplane-test: ## Run Rust control-plane all-target tests and doctests
-	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --all-targets
-	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --doc
+	$(RACER_TEST_HARNESS) test controlplane
 
 racer-dataplane-test: ## Run dataplane all-target tests and compile-fail doctests
-	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
-	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --doc
+	$(RACER_TEST_HARNESS) test dataplane
 
-racer-rust-test: racer-controlplane-test racer-dataplane-test
+racer-rust-test: ## Build then independently execute both crates, aggregating failures
+	$(RACER_TEST_HARNESS) test controlplane dataplane
 
 racer-rust-test-compile: ## Compile both crates' all-target test suites without running them
-	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --all-targets --no-run
-	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets --no-run
+	$(RACER_TEST_HARNESS) compile controlplane dataplane
+
+.PHONY: racer-rust-test-run racer-controlplane-test-run racer-dataplane-test-run racer-ktls-test
+racer-rust-test-run: ## Execute precompiled tests and doctests; requires racer-rust-test-compile
+	$(RACER_TEST_HARNESS) execute controlplane dataplane
+
+racer-controlplane-test-run:
+	$(RACER_TEST_HARNESS) execute controlplane
+
+racer-dataplane-test-run:
+	$(RACER_TEST_HARNESS) execute dataplane
+
+# Explicit capability lane: Linux >= 6.14, working io_uring, and kTLS-enabled
+# OpenSSL >= 3.5. Missing prerequisites are failures, never successful skips.
+racer-ktls-test: ## Require real TX/RX kTLS offload (precompiled dataplane tests)
+	RACER_REQUIRE_URING=1 RACER_REQUIRE_KTLS=1 $(RACER_TEST_HARNESS) selected dataplane http_server::tests::tls_transport::encrypted_http_kernel_integration
+
+.PHONY: racer-timing-test racer-resource-test racer-rdma-test racer-soft-roce-test racer-harness-test
+racer-harness-test: ## Check failure aggregation, deadlines, compiler receipts, and source context without builds
+	PYTHONDONTWRITEBYTECODE=1 python3 hack/scripts/racer_harness_test.py
+
+racer-timing-test: ## Preserve full production-duration coverage outside the routine suite
+	@failed=0; for test in \
+		handlers::tests::mixed_version::peer_rotation_preserves_head_and_object_reads_full_duration \
+		control::tests::subscriber_tests::persistent_subscriber_rejects_extra_bytes_and_times_out_reused_socket_full_duration \
+		control::tests::subscriber_tests::b16_production_subscriber_full_server_wait_full_duration; do \
+		RACER_REQUIRE_URING=1 $(RACER_TEST_HARNESS) --test-timeout 120 selected dataplane "$$test" --ignored || failed=1; \
+		done; exit $$failed
+
+racer-resource-test: ## Explicit full 2 TiB memory contract (also retained in the default suite)
+	$(RACER_TEST_HARNESS) --test-timeout 120 selected dataplane allocator::layout::tests::populated_two_tib_memory
+
+# These opt-in lanes fail when the named RNIC/Soft-RoCE prerequisite is absent.
+# Run Soft-RoCE in a private network namespace with loopback up and CAP_NET_ADMIN.
+racer-rdma-test:
+	$(RACER_TEST_HARNESS) --test-timeout 90 selected dataplane rdma::tests::loopback_tests::verbs_loopback --ignored
+
+racer-soft-roce-test:
+	$(RACER_TEST_HARNESS) --test-timeout 90 selected dataplane rdma::tests::loopback_tests::soft_roce_loopback --ignored
+
+.PHONY: racer-scale-build racer-scale-test
+RACER_SCALE_ARTIFACT_DIR ?= tmp/racer-scale-artifacts
+racer-scale-build: ## Precompile release scale tests, separate from the runtime deadline
+	$(RACER_TEST_HARNESS) --artifacts "$(RACER_SCALE_ARTIFACT_DIR)" --release compile controlplane
+
+# See designs/racer-controlplane-scale-testing.md. The test requires an explicit
+# RACER_SCALE_CAPACITY_QUALIFIED=1 attestation; this target never supplies it.
+# selected executes the recorded release binary directly; it does not invoke Cargo.
+racer-scale-test: ## Run the opt-in 10,000-node TLS capacity contract
+	$(RACER_TEST_HARNESS) --artifacts "$(RACER_SCALE_ARTIFACT_DIR)" --test-timeout 300 selected controlplane subscription::distinct_scale::distinct_tls_fanout --ignored
 
 racer-controlplane-fmt-check:
 	$(CARGO) fmt --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --all -- --check
@@ -867,7 +929,7 @@ racer-fmt-check: racer-controlplane-fmt-check racer-dataplane-fmt-check ## Check
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
 racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer
+		$(RACER_TEST_HARNESS) run sdk-interop 420 $(GOTEST) -json -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer
 
 # Requires envtest assets, private namespace privileges, ext4 TMPDIR, and a
 # workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 36 bytes.
@@ -876,7 +938,8 @@ racer-controlplane-live-test: racer-controlplane-build racer-dataplane-build ## 
 		RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
 		bash hack/scripts/racer-controlplane-live.sh
 
-racer-test: racer-go-test racer-rust-test
+racer-test: ## Aggregate Go and Rust failures without suppressing later suites
+	@failed=0; $(MAKE) racer-go-test || failed=1; $(MAKE) racer-rust-test || failed=1; exit $$failed
 racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build
 racer: racer-test racer-build
 racer-controlplane: racer-controlplane-test racer-controlplane-build
@@ -884,15 +947,15 @@ racer-loadgen: racer-go-test racer-loadgen-build
 racer-dataplane: racer-dataplane-test racer-dataplane-build
 
 image-racer-controlplane-local:
-	$(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME) -t $(RACER_CONTROLPLANE_IMAGE) .
+	$(RACER_SOURCE_BUILD) $(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME) -t $(RACER_CONTROLPLANE_IMAGE)
 	$(call trivy-maybe,$(RACER_CONTROLPLANE_IMAGE))
 
 image-racer-dataplane-local:
-	$(CONTAINER_ENGINE) build -f images/racer-dataplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_DATAPLANE_IMAGE) .
+	$(RACER_SOURCE_BUILD) $(CONTAINER_ENGINE) build -f images/racer-dataplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_DATAPLANE_IMAGE)
 	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
 
 image-racer-loadgen-local:
-	$(CONTAINER_ENGINE) build -f images/racer-loadgen/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_LOADGEN_IMAGE) .
+	$(RACER_SOURCE_BUILD) $(CONTAINER_ENGINE) build -f images/racer-loadgen/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_LOADGEN_IMAGE)
 	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
 
 image-racer-controlplane-push: image-racer-controlplane-local

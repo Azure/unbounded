@@ -162,7 +162,12 @@ impl ResourceEstimate {
         let node = rc_bytes::<Node>()
             + allocation
             + 2 * FANOUT as u64 * std::mem::size_of::<(Key, Entry)>() as u64;
-        let tree = nodes * node + payload * (rc_bytes::<PayloadExtent>() + allocation);
+        // Resident headers are out of line. Charge every metadata entry its
+        // maximum accepted header, independently in each retained tree version.
+        // Actual CoW sharing and absent/short headers reduce this upper bound.
+        let tree = nodes * node
+            + payload * (rc_bytes::<PayloadExtent>() + allocation)
+            + metadata * ResidentMetadata::header_allocation_bytes(256);
         // Vec doubling and at most 4 buckets/entry including hash control bytes.
         let heat = entries
             * (2 * std::mem::size_of::<Heat>() as u64

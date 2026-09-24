@@ -43,6 +43,7 @@ type dataplane struct {
 	ip, dir, sockets, metrics string
 	process                   *process
 	client                    *sdk.Client
+	origin                    *originfixture.Origin
 }
 
 type localStatus struct {
@@ -287,17 +288,9 @@ func (c *campaign) cacheReady(name string, desired, ready int64) error {
 	return nil
 }
 
-func TestProductionBinaryCampaign(t *testing.T) {
-	c := newCampaign(t)
-	for _, site := range []string{"edge", "independent"} {
-		c.create(siteResource, map[string]any{"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Site", "metadata": map[string]any{"name": site, "labels": map[string]any{"campaign": site}}, "spec": map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}, "podCidrAssignments": []any{map[string]any{"cidrBlocks": []any{"10.1.0.0/16"}}}, "components": map[string]any{"racer": map[string]any{"enabled": true, "cacheSize": "1Gi"}}}})
-		c.create(cacheResource, map[string]any{"apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache", "metadata": map[string]any{"name": site}, "spec": map[string]any{"siteSelector": map[string]any{"matchLabels": map[string]any{"campaign": site}}}})
-	}
+func (c *campaign) startOrigins(workers []*dataplane) {
+	t := c.t
 
-	a, b := c.worker(0, "edge"), c.worker(1, "edge")
-	independent := c.worker(2, "independent")
-
-	workers := []*dataplane{a, b, independent}
 	for _, d := range workers {
 		name := d.node.Labels["unbounded-cloud.io/site"]
 		require(t, os.MkdirAll(filepath.Join(d.sockets, name), 0o700))
@@ -306,6 +299,7 @@ func TestProductionBinaryCampaign(t *testing.T) {
 
 		backend := originfixture.NewOrigin()
 		backend.Source = d.node.Name
+		d.origin = backend
 		origin := httptest.NewUnstartedServer(backend)
 		_ = origin.Listener.Close()
 		origin.Listener = l
@@ -316,6 +310,95 @@ func TestProductionBinaryCampaign(t *testing.T) {
 		require(t, err)
 		t.Cleanup(d.client.CloseIdleConnections)
 	}
+}
+
+func (c *campaign) createSite(site string) {
+	c.create(siteResource, map[string]any{"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Site", "metadata": map[string]any{"name": site, "labels": map[string]any{"campaign": site}}, "spec": map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}, "podCidrAssignments": []any{map[string]any{"cidrBlocks": []any{"10.1.0.0/16"}}}, "components": map[string]any{"racer": map[string]any{"enabled": true, "cacheSize": "1Gi"}}}})
+	c.create(cacheResource, map[string]any{"apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache", "metadata": map[string]any{"name": site}, "spec": map[string]any{"siteSelector": map[string]any{"matchLabels": map[string]any{"campaign": site}}}})
+}
+
+// Isolate cold HEAD -> conditional GET through real peers from storage changes,
+// control-plane failover, and CA rotation. Every failed read is terminal.
+func TestColdObjectMultiPeer(t *testing.T) {
+	c := newCampaign(t)
+	c.createSite("edge")
+	workers := []*dataplane{c.worker(0, "edge"), c.worker(1, "edge")}
+	c.startOrigins(workers)
+
+	for _, r := range c.replicas {
+		c.startReplica(r)
+	}
+
+	var leader *replica
+
+	c.await("leader", 60*time.Second, func() error { var err error; leader, err = c.leader(); return err })
+
+	stopProjection := c.projectTrust(workers...)
+	defer stopProjection()
+
+	for _, d := range workers {
+		c.await(d.node.Name+" trust projection", 5*time.Second, func() error { _, err := os.Stat(filepath.Join(d.dir, "bundle.json")); return err })
+		c.startDataplane(d, leader.control, leader.enroll, leader.trust, "1073741824")
+		c.storage(d, "applied", 1<<30)
+	}
+
+	c.await("two ready peers", 60*time.Second, func() error { return c.cacheReady("edge", 2, 2) })
+
+	record, stopDiagnostics := c.diagnostics(workers)
+	defer stopDiagnostics()
+	defer record("cold-object-final")
+
+	for count := 0; count < 8; count++ {
+		for _, d := range workers {
+			target := fmt.Sprintf("/live-payload-%d", count)
+			object, err := d.client.Open(c.ctx, target)
+			require(t, err)
+
+			meta := object.Metadata()
+
+			data := make([]byte, originfixture.ObjectSize)
+
+			n, err := object.ReadAt(c.ctx, data, 0)
+			if err != nil || n != len(data) || !bytes.Equal(data, originfixture.Body(1)) {
+				t.Fatalf("%s GET %s HEAD=%+v: bytes=%d error=%v", d.node.Name, target, meta, n, err)
+			}
+
+			if meta.ETag != originfixture.ETag(1) || meta.ContentType != "application/octet-stream" {
+				t.Fatalf("%s HEAD %s: %+v", d.node.Name, target, meta)
+			}
+		}
+	}
+
+	var peerRequests float64
+
+	for _, d := range workers {
+		for _, line := range strings.Split(c.metrics(d.metrics), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && strings.HasPrefix(fields[0], `racer_dataplane_upstream_requests_total{destination="peer",transport="http"`) {
+				value, err := strconv.ParseFloat(fields[1], 64)
+				require(t, err)
+
+				peerRequests += value
+			}
+		}
+	}
+
+	if peerRequests == 0 {
+		t.Fatal("cold-object regression did not exercise peer HTTP")
+	}
+}
+
+func TestProductionBinaryCampaign(t *testing.T) {
+	c := newCampaign(t)
+	for _, site := range []string{"edge", "independent"} {
+		c.createSite(site)
+	}
+
+	a, b := c.worker(0, "edge"), c.worker(1, "edge")
+	independent := c.worker(2, "independent")
+
+	workers := []*dataplane{a, b, independent}
+	c.startOrigins(workers)
 
 	for _, r := range c.replicas {
 		c.startReplica(r)
@@ -660,6 +743,10 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 				if err != nil {
 					record("traffic-error:" + d.node.Name)
 
+					if object != nil {
+						err = fmt.Errorf("HEAD metadata=%+v: %w", object.Metadata(), err)
+					}
+
 					done <- fmt.Errorf("%s worker=%s iteration=%d: %w", time.Now().UTC().Format(time.RFC3339Nano), d.node.Name, count, err)
 
 					return
@@ -808,8 +895,9 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 	t.Logf("%d verified SDK reads across CA generations %d..%d", reads.Load(), initial.Generation, final.Generation)
 }
 
-// Capture only public trust and management endpoints. Credentials and private
-// CA state stay in Go's temporary directory and are removed during cleanup.
+// Capture public trust, management endpoints, and synthetic origin requests.
+// Credentials and private CA state stay in Go's temporary directory and are
+// removed during cleanup.
 func (c *campaign) diagnostics(workers []*dataplane) (func(string), func()) {
 	c.t.Helper()
 	file, err := os.Create(filepath.Join(c.artifacts, "observations.jsonl"))
@@ -835,6 +923,10 @@ func (c *campaign) diagnostics(workers []*dataplane) (func(string), func()) {
 			err := c.getJSON("http://"+d.metrics+"/status", &status)
 
 			observation := map[string]any{"status": status}
+			if event != "sample" && d.origin != nil {
+				observation["originHits"] = d.origin.Hits()
+			}
+
 			if err != nil {
 				observation["error"] = err.Error()
 			}

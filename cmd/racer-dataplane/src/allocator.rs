@@ -41,7 +41,7 @@
 //! Metadata has no allocation class, value write, read lease, or buffer ownership.
 
 use crate::buffers::{BUFFER_SIZE, Buffer, Fill};
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, ResidentMetadata};
 use crate::uring::{self, BufferRange, FileOffset, Ring, Work};
 use crate::workers::ShardId;
 use std::cell::{Cell, RefCell};
@@ -128,14 +128,14 @@ impl Allocator {
             .saturating_mul(geometry.count)
             .saturating_add(HEADROOM);
         let required = headroom.saturating_add(*pending).saturating_add(bytes);
-        if !self
-            .space
-            ._file
-            .available_bytes()
-            .is_ok_and(|free| free >= required)
-        {
-            return Err(busy());
+        let admission = check_disk_headroom(self.space._file.available_bytes(), required);
+        // Cache retries intentionally replace the underlying error with a
+        // bounded retry-limit error. Preserve the original evidence in tests.
+        #[cfg(test)]
+        if let Err(error) = &admission {
+            eprintln!("{error}");
         }
+        admission?;
         *pending += bytes;
         self.charged += bytes;
         Ok(())
@@ -234,6 +234,22 @@ fn reject_version(page: &uring::Page) -> io::Result<()> {
 }
 fn busy() -> io::Error {
     io::ErrorKind::WouldBlock.into()
+}
+
+fn check_disk_headroom(available: io::Result<u64>, required: u64) -> io::Result<()> {
+    match available {
+        Ok(available) if available >= required => Ok(()),
+        Ok(available) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "slab filesystem admission: available={available} bytes, required={required} bytes including index reserve, filesystem margin, and pending/new writes"
+            ),
+        )),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("slab filesystem admission: cannot query available bytes: {error}"),
+        )),
+    }
 }
 
 /// Digest of namespace, object, version and page identity, matching the buffer
@@ -485,7 +501,7 @@ struct PayloadExtent {
 
 #[derive(Clone)]
 enum Entry {
-    Metadata(Metadata),
+    Metadata(ResidentMetadata),
     Payload(Rc<PayloadExtent>),
 }
 impl Entry {
@@ -995,7 +1011,7 @@ impl Allocator {
         self.space.geometry.metadata_limit()
     }
 
-    /// Copy inline metadata from the resident tree. No I/O or pool allocation.
+    /// Copy metadata from the resident tree. No I/O or pool allocation.
     /// Expiry is strict: zero and expires <= now are never reusable.
     pub fn lookup_metadata(&mut self, key: &Key, now: u64) -> Option<Metadata> {
         if self.failed {
@@ -1005,11 +1021,11 @@ impl Allocator {
         let Entry::Metadata(metadata) = self.root.get(key)? else {
             return None;
         };
-        let metadata = *metadata;
         if metadata.expires <= now {
             self.remove(key);
             return None;
         }
+        let metadata = metadata.to_metadata();
         self.record_hit(key);
         Some(metadata)
     }
@@ -1033,7 +1049,7 @@ impl Allocator {
         }
         self.retire_key(&key);
         self.metadata_count += 1;
-        self.put_entry(key, Entry::Metadata(metadata));
+        self.put_entry(key, Entry::Metadata(metadata.into()));
         Ok(true)
     }
 

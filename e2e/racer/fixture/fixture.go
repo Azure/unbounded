@@ -86,10 +86,15 @@ func Fetch(method, url, byteRange string, headers ...string) (Response, error) {
 }
 
 type Hit struct {
-	Method  string
-	Target  string
-	Source  string
-	Version int
+	Method      string
+	Target      string
+	Source      string
+	Version     int
+	IfMatch     string
+	Range       string
+	ETag        string
+	ContentType string
+	Status      int
 }
 
 type Origin struct {
@@ -101,6 +106,14 @@ type Origin struct {
 }
 
 func NewOrigin() *Origin { return &Origin{version: 1} }
+
+// Hits returns a snapshot without exposing the ledger to concurrent mutation.
+func (o *Origin) Hits() []Hit {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return append([]Hit(nil), o.hits...)
+}
 
 func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
@@ -143,8 +156,17 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	o.hits = append(o.hits, Hit{r.Method, target, source, o.version})
+	hit := Hit{Method: r.Method, Target: target, Source: source, Version: o.version, IfMatch: r.Header.Get("If-Match"), Range: r.Header.Get("Range")}
+
+	defer func() {
+		hit.ETag = w.Header().Get("ETag")
+		hit.ContentType = w.Header().Get("Content-Type")
+		o.hits = append(o.hits, hit)
+	}()
+
 	if strings.HasPrefix(target, "/missing") {
+		hit.Status = http.StatusNotFound
+
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(http.StatusNotFound)
 
@@ -156,14 +178,22 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "max-age=3600")
 	w.Header().Set("Accept-Ranges", "bytes")
+	// HEAD and every page describe the same representation. Without an explicit
+	// type, net/http sniffs GET bodies but leaves this bodyless HEAD untyped.
+	w.Header().Set("Content-Type", "application/octet-stream")
 
 	if r.Method == "HEAD" {
+		hit.Status = http.StatusOK
+
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+
 		return
 	}
 
 	if r.Header.Get("If-Match") != etag {
+		hit.Status = http.StatusPreconditionFailed
 		w.WriteHeader(http.StatusPreconditionFailed)
+
 		return
 	}
 
@@ -171,12 +201,16 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	value := r.Header.Get("Range")
 	if n, err := fmt.Sscanf(value, "bytes=%d-%d", &start, &end); err != nil || n != 2 || start < 0 || end < start || end >= len(body) || value != fmt.Sprintf("bytes=%d-%d", start, end) {
+		hit.Status = http.StatusRequestedRangeNotSatisfiable
 		http.Error(w, "invalid page range", http.StatusRequestedRangeNotSatisfiable)
+
 		return
 	}
 
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
 	w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+
+	hit.Status = http.StatusPartialContent
 	w.WriteHeader(http.StatusPartialContent)
 
 	if _, err := w.Write(body[start : end+1]); err != nil {

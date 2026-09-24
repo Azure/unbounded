@@ -2,39 +2,166 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod conformance {
-    /// Run the actual Rust compiler once per test process, without linking cmd
-    /// crates together. Export failures are test failures, never optional skips.
+    /// Consume this run's production-compiler export, prepared before test execution.
+    /// The harness runs controlplane's placement_export test into a fresh directory
+    /// with RACER_PLACEMENT_EXPORT set, then writes export-receipt.json only after
+    /// success: {"producer":"racer-controlplane/placement_export::export_dataplane_placement",
+    /// "run_id":"<unique run token>"}. Pass that directory and the same token as
+    /// RACER_PLACEMENT_EXPORT and RACER_PLACEMENT_EXPORT_RUN_ID to these tests.
+    /// Missing, incomplete, or stale artifacts fail; no nested Cargo or skip fallback.
     pub(crate) fn compiler_snapshots() -> &'static std::path::Path {
-        static EXPORT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        EXPORT.get_or_init(|| {
-            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(format!("compiler-placement-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../racer-controlplane/Cargo.toml");
-            let status = std::process::Command::new("timeout")
-                .args(["180s", "cargo", "test", "--locked", "--manifest-path"])
-                .arg(manifest)
-                .args([
-                    "--test",
-                    "placement_export",
-                    "export_dataplane_placement",
-                    "--",
-                    "--exact",
-                ])
-                .env("RACER_PLACEMENT_EXPORT", &dir)
-                // Do not contend with the invoking dataplane Cargo target lock.
-                .env(
-                    "CARGO_TARGET_DIR",
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../racer-controlplane/target"),
+        static EXPORT: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
+            std::sync::OnceLock::new();
+        let result = EXPORT.get_or_init(|| {
+            let dir = std::env::var_os("RACER_PLACEMENT_EXPORT")
+                .map(std::path::PathBuf::from)
+                .ok_or(
+                    "RACER_PLACEMENT_EXPORT must name this run's preexported compiler artifacts",
+                )?;
+            let run_id = std::env::var("RACER_PLACEMENT_EXPORT_RUN_ID")
+                .map_err(|_| "RACER_PLACEMENT_EXPORT_RUN_ID must identify this preparation run")?;
+            validate_compiler_export(&dir, &run_id).map_err(|error| {
+                format!(
+                    "compiler artifact preparation failed at {}: {error}",
+                    dir.display()
                 )
-                .status()
-                .unwrap();
-            assert!(status.success(), "Rust compiler snapshot export failed");
-            dir
-        })
+            })?;
+            Ok(dir)
+        });
+        result
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .as_path()
+    }
+
+    const COMPILER_PRODUCER: &str =
+        "racer-controlplane/placement_export::export_dataplane_placement";
+
+    fn validate_compiler_export(dir: &std::path::Path, run_id: &str) -> io::Result<()> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        if !dir.is_absolute() || run_id.is_empty() {
+            return Err(invalid(
+                "compiler export requires an absolute path and nonempty run ID",
+            ));
+        }
+        let read_json = |name: &str| -> io::Result<Vec<u8>> {
+            let path = dir.join(name);
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_file() || meta.len() > 65536 {
+                return Err(invalid(
+                    "compiler export JSON must be a regular file within 64 KiB",
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(65537)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 65536 {
+                return Err(invalid("compiler export JSON exceeds 64 KiB"));
+            }
+            Ok(bytes)
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            producer: String,
+            run_id: String,
+        }
+        let receipt: Receipt = serde_json::from_slice(&read_json("export-receipt.json")?)?;
+        if receipt.producer != COMPILER_PRODUCER || receipt.run_id != run_id {
+            return Err(invalid(
+                "compiler export producer or run ID mismatch; regenerate artifacts",
+            ));
+        }
+        let files: Vec<String> = serde_json::from_slice(&read_json("files.json")?)?;
+        // All recipients for 2, 3, and 7 nodes at four slot geometries.
+        let expected: std::collections::BTreeSet<_> = [2, 3, 7]
+            .into_iter()
+            .flat_map(|nodes| {
+                [8, 17, 64, 262_144].into_iter().flat_map(move |slots| {
+                    (0..nodes).map(move |node| format!("p{slots}-n{nodes}-fresh-{node}.pb"))
+                })
+            })
+            .collect();
+        if files.len() != expected.len()
+            || files
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                != expected
+        {
+            return Err(invalid(
+                "compiler export manifest is incomplete or unexpected",
+            ));
+        }
+        let mut required = expected;
+        required.extend(["default.pb".into(), "historical.pb".into()]);
+        for file in &files {
+            let (prefix, _) = file.rsplit_once('-').unwrap();
+            required.insert(format!("{prefix}-ids.json"));
+            required.insert(format!("{prefix}-owners.json"));
+        }
+        for file in required {
+            let path = dir.join(file);
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_file() || meta.len() == 0 || meta.len() > 64 * 1024 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid compiler artifact: {}", path.display()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_export_requires_complete_current_run_artifacts() {
+        let dir =
+            std::env::temp_dir().join(format!("racer-export-validation-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        assert!(validate_compiler_export(&dir, "run").is_err());
+        let receipt = serde_json::json!({"producer": COMPILER_PRODUCER, "run_id": "run"});
+        std::fs::write(dir.join("export-receipt.json"), receipt.to_string()).unwrap();
+        assert!(validate_compiler_export(&dir, "stale").is_err());
+        std::fs::write(dir.join("files.json"), b"[]").unwrap();
+        assert!(validate_compiler_export(&dir, "run").is_err());
+        let mut files = Vec::new();
+        for nodes in [2, 3, 7] {
+            for slots in [8, 17, 64, 262_144] {
+                let prefix = format!("p{slots}-n{nodes}-fresh");
+                for node in 0..nodes {
+                    let file = format!("{prefix}-{node}.pb");
+                    std::fs::write(dir.join(&file), b"fixture").unwrap();
+                    files.push(file);
+                }
+                for suffix in ["ids.json", "owners.json"] {
+                    std::fs::write(dir.join(format!("{prefix}-{suffix}")), b"{}").unwrap();
+                }
+            }
+        }
+        std::fs::write(dir.join("files.json"), serde_json::to_vec(&files).unwrap()).unwrap();
+        for file in ["default.pb", "historical.pb"] {
+            std::fs::write(dir.join(file), b"fixture").unwrap();
+        }
+        validate_compiler_export(&dir, "run").unwrap();
+        let wrong_producer = serde_json::json!({"producer": "fixture", "run_id": "run"});
+        std::fs::write(dir.join("export-receipt.json"), wrong_producer.to_string()).unwrap();
+        assert!(validate_compiler_export(&dir, "run").is_err());
+        std::fs::write(dir.join("export-receipt.json"), receipt.to_string()).unwrap();
+        files.push(files[0].clone());
+        std::fs::write(dir.join("files.json"), serde_json::to_vec(&files).unwrap()).unwrap();
+        assert!(validate_compiler_export(&dir, "run").is_err());
+        files.pop();
+        std::fs::write(dir.join("files.json"), serde_json::to_vec(&files).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("historical.pb")).unwrap();
+        assert!(validate_compiler_export(&dir, "run").is_err());
     }
     pub(crate) fn etag(body: &[u8]) -> String {
         crate::metadata::Checksum(*blake3::hash(body).as_bytes())

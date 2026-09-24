@@ -1492,7 +1492,7 @@ mod subscriber_tests {
     //! Production Subscriber over real TCP. Server actions, not sleeps, gate progress.
     use super::*;
     use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::sync::mpsc;
     thread_local! { static BOOT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
@@ -1506,6 +1506,7 @@ mod subscriber_tests {
     impl Server {
         fn new() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let fixture = credentials::tests::Fixture::new();
             let provider = fixture.provider(0);
@@ -1514,16 +1515,26 @@ mod subscriber_tests {
             let stopping = stop.clone();
             let (tx, requests) = mpsc::channel();
             let thread = std::thread::spawn(move || {
-                while let Ok((socket, _)) = listener.accept() {
-                    if stopping.load(Ordering::Relaxed) {
-                        break;
-                    }
+                while !stopping.load(Ordering::Relaxed) {
+                    let (socket, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("subscriber fixture accept: {error}"),
+                    };
                     let mut socket = credentials::tests::server(socket, &context);
                     socket
                         .set_read_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
                     let mut request = Vec::new();
+                    let request_deadline = Instant::now() + Duration::from_secs(5);
                     while !request.ends_with(b"\r\n\r\n") {
+                        assert!(
+                            Instant::now() < request_deadline,
+                            "subscriber fixture request deadline"
+                        );
                         let mut byte = [0];
                         socket.read_exact(&mut byte).unwrap();
                         request.push(byte[0]);
@@ -1564,16 +1575,23 @@ mod subscriber_tests {
             result
         }
         fn start(&self) -> (Subscriber, Arc<Updates>, Trust, proto::Snapshot) {
+            self.start_with_first_byte_timeout(CONTROL_FIRST_BYTE_TIMEOUT)
+        }
+        fn start_with_first_byte_timeout(
+            &self,
+            timeout: Duration,
+        ) -> (Subscriber, Arc<Updates>, Trust, proto::Snapshot) {
             let (trust, config) = fixture();
             let updates = Arc::new(Updates::default());
             updates.set_credentials(self.provider.clone());
-            let subscriber = Subscriber::start(
+            let subscriber = Subscriber::start_with_first_byte_timeout(
                 Source::parse(&format!("https://{}/v4/config", self.address)).unwrap(),
                 Arc::new(Trust {
                     universe: trust.universe,
                     node: trust.node,
                 }),
                 updates.clone(),
+                timeout,
             )
             .unwrap();
             (subscriber, updates, trust, config)
@@ -1582,8 +1600,10 @@ mod subscriber_tests {
     impl Drop for Server {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
-            let _ = TcpStream::connect(self.address);
-            self.thread.take().unwrap().join().unwrap();
+            let result = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
         }
     }
     fn signed(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
@@ -1710,15 +1730,26 @@ mod subscriber_tests {
 
     #[test]
     fn b16_production_subscriber_full_server_wait() {
+        subscriber_server_wait(Duration::from_millis(280), Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore = "full production-duration control hold; run explicitly in the timing lane"]
+    fn b16_production_subscriber_full_server_wait_full_duration() {
+        subscriber_server_wait(Duration::from_secs(28), CONTROL_FIRST_BYTE_TIMEOUT);
+    }
+
+    fn subscriber_server_wait(hold: Duration, first_byte_timeout: Duration) {
         let server = Server::new();
-        let (subscriber, updates, trust, config) = server.start();
+        let (subscriber, updates, trust, config) =
+            server.start_with_first_byte_timeout(first_byte_timeout);
         let (mut socket, _, _) = server.next();
         reply(&mut socket, &signed(&trust, config), "\"one\"");
         let (mut socket, request, _) = server.next();
         assert!(request.contains("Prefer: wait=28\r\n"));
         // A full server hold preserves the current ETag and
         // revision without opening another subscription request.
-        held(&mut socket, Duration::from_secs(28));
+        held(&mut socket, hold);
         assert!(server.requests.try_recv().is_err());
         socket
             .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")

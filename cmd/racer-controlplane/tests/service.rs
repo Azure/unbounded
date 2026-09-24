@@ -19,7 +19,7 @@ use racer_controlplane::{
         kubernetes::{KubernetesCaStore, LEASE},
         *,
     },
-    service::{self, Options},
+    service::{self, LeaseTiming, Options},
 };
 use serde_json::{Value, json};
 use std::{
@@ -457,6 +457,9 @@ fn cli_accepts_operator_flags_and_rejects_invalid_values() {
     assert_eq!(options.listen, ":9443");
     assert_eq!(options.namespace, "system");
     assert_eq!(options.rotation_interval, Duration::from_secs(30 * 86400));
+    assert_eq!(options.lease_timing.duration_seconds, 15);
+    assert_eq!(options.lease_timing.renew_deadline, Duration::from_secs(10));
+    assert_eq!(options.lease_timing.retry_period, Duration::from_secs(2));
     assert!(Options::parse(["-ca-rotation-interval=0s".into()]).is_err());
     assert!(Options::parse(["-token-review-qps=NaN".into()]).is_err());
     assert!(Options::parse(["-invented=true".into()]).is_err());
@@ -634,6 +637,7 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
         "POST /v3/enroll HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {boot}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    let mut attempts = Vec::new();
     let response = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let response = request(
@@ -642,35 +646,71 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
                 Some(tls_config(&bundle, None)),
             )
             .await?;
+            attempts.push((
+                String::from_utf8_lossy(&response)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                fixture.objects.lock().unwrap().reviews,
+            ));
             if response.starts_with(b"HTTP/1.1 200") {
                 break Ok::<_, anyhow::Error>(response);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await??;
-    pause.resume.notify_one();
-    // Let the withheld sweep and a subsequent live observation finish before
-    // checking durable boot authorization through the actual mTLS v4 handler.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    .await
+    .with_context(|| {
+        format!("enrollment readiness deadline; status/review counts: {attempts:?}")
+    })??;
     ensure!(
         response.starts_with(b"HTTP/1.1 200"),
         "enrollment failed: {}",
         String::from_utf8_lossy(&response)
     );
     let start = response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+    // Readiness retries may have authenticated long before issuance succeeds.
+    // Prime a distinct credential after readiness, then measure only its
+    // immediate repeat, independently of retirement sweeps and prior reviews.
+    let cached_enrollment = enrollment.replace(&token, &token.replace("signature", "cache-check"));
+    let before = fixture.objects.lock().unwrap().reviews;
+    let primed = request(
+        &options.enroll_listen,
+        &cached_enrollment,
+        Some(tls_config(&bundle, None)),
+    )
+    .await?;
+    assert!(primed.starts_with(b"HTTP/1.1 200"));
+    let after_prime = fixture.objects.lock().unwrap().reviews;
+    assert_eq!(after_prime - before, 1, "fresh credential must be reviewed");
     let renewed = request(
         &options.enroll_listen,
-        &enrollment,
+        &cached_enrollment,
         Some(tls_config(&bundle, None)),
     )
     .await?;
     assert!(renewed.starts_with(b"HTTP/1.1 200"));
     assert_eq!(
-        fixture.objects.lock().unwrap().reviews,
-        1,
-        "successful Pod TokenReview should be cached"
+        fixture.objects.lock().unwrap().reviews - after_prime,
+        0,
+        "immediate repeat must use the successful TokenReview cache"
     );
+    // Each capture is at the next unfiltered Pod list in the serial participant
+    // reconciler. Two more captures prove both the withheld stale sweep and a
+    // subsequent live sweep finished, including refreshing authorization state.
+    let live_sweep = Arc::new(ListPause::default());
+    *fixture.pod_list_pause.lock().unwrap() = Some(live_sweep.clone());
+    pause.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), live_sweep.captured.notified())
+        .await
+        .context("stale retirement sweep completion deadline")?;
+    let next_sweep = Arc::new(ListPause::default());
+    *fixture.pod_list_pause.lock().unwrap() = Some(next_sweep.clone());
+    live_sweep.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), next_sweep.captured.notified())
+        .await
+        .context("live retirement sweep completion deadline")?;
     let response: Value = serde_json::from_slice(&response[start..])?;
     let config = tls_config(
         &bundle,
@@ -682,6 +722,7 @@ async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Re
         "control failed: {}",
         String::from_utf8_lossy(&control)
     );
+    next_sweep.resume.notify_one();
     let proof = request(&options.trust_proof_listen, &format!("POST /v3/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", bundle.generation, bundle.digest(), response["issuer"].as_str().unwrap()), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
     ensure!(
         proof.starts_with(b"HTTP/1.1 204"),
@@ -888,6 +929,13 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     fixture.seed();
     let proof_address = free_address().await;
     let port = proof_address.rsplit(':').next().unwrap();
+    // Exercise real Lease CAS/expiry and TLS takeover with shorter timing.
+    // The production-binary live campaign retains the default 15/10/2 seconds.
+    let lease_timing = LeaseTiming {
+        duration_seconds: 3,
+        renew_deadline: Duration::from_secs(2),
+        retry_period: Duration::from_millis(200),
+    };
     let first = Options {
         namespace: "system".into(),
         pod_name: "controller".into(),
@@ -897,6 +945,7 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
         health_listen: free_address().await,
         replica_proof_listen: proof_address.clone(),
         trust_proof_listen: free_address().await,
+        lease_timing,
         ..Default::default()
     };
     let first_stop = CancellationToken::new();
@@ -949,6 +998,7 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
         health_listen: free_address().await,
         replica_proof_listen: format!("127.0.0.2:{port}"),
         trust_proof_listen: free_address().await,
+        lease_timing,
         ..Default::default()
     };
     let second_stop = CancellationToken::new();
@@ -985,11 +1035,14 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
         rejected.starts_with(b"HTTP/1.1 503"),
         "warm follower must reject enrollment"
     );
+    let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+    let original_lease = fixture.get(&lease_path).unwrap();
+    assert_eq!(original_lease["spec"]["leaseDurationSeconds"], 3);
     first_stop.cancel();
     first_run.await??;
     fixture.remove("/api/v1/namespaces/system/pods/controller");
     let before_takeover = fixture.objects.lock().unwrap().immutable_metadata_updates;
-    tokio::time::timeout(Duration::from_secs(35), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while !fixture
             .get("/api/v1/namespaces/system/pods/standby")
             .is_some_and(|p| {
@@ -1006,6 +1059,17 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     })
     .await
     .context("standby takeover route deadline")??;
+    let successor_lease = fixture.get(&lease_path).unwrap();
+    assert_ne!(
+        original_lease["spec"]["holderIdentity"],
+        successor_lease["spec"]["holderIdentity"]
+    );
+    assert_eq!(
+        successor_lease["spec"]["leaseTransitions"]
+            .as_i64()
+            .unwrap(),
+        original_lease["spec"]["leaseTransitions"].as_i64().unwrap() + 1
+    );
     assert!(
         fixture.objects.lock().unwrap().immutable_metadata_updates > before_takeover,
         "takeover must reclaim existing immutable chunks through metadata fencing"

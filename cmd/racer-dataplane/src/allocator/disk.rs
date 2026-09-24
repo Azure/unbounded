@@ -197,7 +197,7 @@ fn load_node(
                         if metadata.expires == 0 {
                             return Err(invalid("request-scoped metadata in checkpoint"));
                         }
-                        Entry::Metadata(metadata)
+                        Entry::Metadata(metadata.into())
                     }
                     1 => {
                         if bytes.0[at + 64..at + LEAF_ENTRY].iter().any(|b| *b != 0) {

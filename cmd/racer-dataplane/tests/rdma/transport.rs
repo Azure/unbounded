@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "process.rs"]
+mod process;
+
 #[test]
 fn early_reply_waits_for_request_send_and_slot_generation_never_wraps() {
     let now = Instant::now();
@@ -513,35 +516,57 @@ mod loopback_tests {
     #[test]
     #[ignore = "requires RDMA hardware"]
     fn verbs_loopback() {
+        let test = concat!(module_path!(), "::verbs_loopback");
+        if !process::is_child(test) {
+            process::run(&mut process::test_command(test), Duration::from_secs(30)).unwrap();
+            return;
+        }
         let rail = discover().unwrap().into_iter().next().expect("no RNIC");
         loopback(rail);
     }
     #[test]
     #[ignore = "requires root and Soft-RoCE"]
     fn soft_roce_loopback() {
+        const DEVICE_ENV: &str = "RACER_RDMA_TEST_DEVICE";
+        let test = concat!(module_path!(), "::soft_roce_loopback");
+        if process::is_child(test) {
+            let device = std::env::var(DEVICE_ENV).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let rail = loop {
+                if let Some(rail) = discover().unwrap().into_iter().find(|r| r.name == device) {
+                    break rail;
+                }
+                assert!(Instant::now() < until, "{device} lacks type-2B support");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            loopback(rail);
+            return;
+        }
         fn command(line: &str) -> io::Result<()> {
             let mut words = line.split_whitespace();
-            let output = std::process::Command::new(words.next().unwrap())
-                .args(words)
-                .output()?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!("{line}: {output:?}")))
-            }
+            process::run(
+                std::process::Command::new(words.next().unwrap()).args(words),
+                process::COMMAND_TIMEOUT,
+            )
         }
         struct SoftRoce(Vec<String>);
         impl SoftRoce {
             fn cleanup(&mut self) -> io::Result<()> {
-                while let Some(line) = self.0.last() {
-                    command(line)?;
-                    self.0.pop();
+                let mut errors = Vec::new();
+                while let Some(line) = self.0.pop() {
+                    if let Err(error) = command(&line) {
+                        errors.push(error.to_string());
+                    }
+                }
+                if !errors.is_empty() {
+                    return Err(io::Error::other(errors.join("; ")));
                 }
                 Ok(())
             }
             fn add(&mut self, command_line: String, undo: String) {
-                command(&command_line).unwrap();
+                // A timed-out setup command may already have created its device.
                 self.0.push(undo);
+                command(&command_line).unwrap();
             }
         }
         impl Drop for SoftRoce {
@@ -565,16 +590,17 @@ mod loopback_tests {
             format!("rdma link add {device} type rxe netdev {netdev}"),
             format!("rdma link delete {device}"),
         );
-        let until = Instant::now() + Duration::from_secs(5);
-        let rail = loop {
-            if let Some(rail) = discover().unwrap().into_iter().find(|r| r.name == device) {
-                break rail;
-            }
-            assert!(Instant::now() < until, "{device} lacks type-2B support");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        loopback(rail);
-        setup.cleanup().unwrap();
+        // Only the child opens the provider. Its exit releases even resources
+        // deliberately retained by Owner::drop when quiescence is unproven.
+        let result = process::run(
+            process::test_command(test).env(DEVICE_ENV, &device),
+            Duration::from_secs(30),
+        );
+        let cleanup = setup.cleanup();
+        assert!(
+            result.is_ok() && cleanup.is_ok(),
+            "transport: {result:?}; cleanup: {cleanup:?}"
+        );
     }
     fn loopback(rail: Rail) {
         let a_pool = buffers::io_test_pool(2);
@@ -606,50 +632,141 @@ mod loopback_tests {
             bc,
         };
         let source = p.source(BUFFER_SIZE);
-        let mut request = p.request(BUFFER_SIZE);
-        // No request-send retirement has run. Capacity retries cannot invoke the
-        // builder that spends a caller's resolution-chain authority.
+        let request = p.request(BUFFER_SIZE);
+        // Inject queued-send pressure while below depth. No polling occurs
+        // while this flag is injected, so restore it before driving the wire.
+        {
+            let mut owner = p.a.owner.borrow_mut();
+            let core = owner.core().unwrap();
+            assert_eq!(core.config.depth, 2);
+            assert_eq!(
+                core.slots
+                    .iter()
+                    .filter(|s| s.conn == p.ac.index && s.phase.outgoing())
+                    .count(),
+                1
+            );
+            assert!(!core.slots[request.index].send_pending);
+            core.slots[request.index].send_pending = true;
+        }
+        assert_capacity_rejects_builder(&p.ac);
+        p.a.owner.borrow_mut().core().unwrap().slots[request.index].send_pending = false;
+        // Successful enqueue is not send pressure. Fill the actual configured
+        // depth and retain both tickets before testing capacity retries.
+        let requests = [request, p.request(BUFFER_SIZE)];
+        {
+            let mut owner = p.a.owner.borrow_mut();
+            let core = owner.core().unwrap();
+            assert!(
+                !core
+                    .slots
+                    .iter()
+                    .any(|s| s.conn == p.ac.index && s.send_pending)
+            );
+            assert_eq!(
+                core.slots
+                    .iter()
+                    .filter(|s| s.conn == p.ac.index && s.phase.outgoing())
+                    .count(),
+                core.config.depth
+            );
+        }
         for _ in 0..16 {
-            let invoked = std::cell::Cell::new(false);
-            let error =
-                p.ac.request_with_metadata([9; 32], BUFFER_SIZE, || {
-                    invoked.set(true);
-                    Ok(b"not admitted")
-                })
-                .err()
-                .expect("request-send capacity must reject");
-            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-            assert!(!invoked.get());
+            assert_capacity_rejects_builder(&p.ac);
         }
         let until = Instant::now() + Duration::from_secs(5);
-        let (mut read, mut served) = (None, false);
+        let mut served = 0;
+        for mut request in requests {
+            let mut read = None;
+            loop {
+                assert!(Instant::now() < until, "loopback timed out");
+                a_ring.progress().unwrap();
+                b_ring.progress().unwrap();
+                uring::CompletionSource::poll(&mut a_source, &mut a_ring, 32).unwrap();
+                uring::CompletionSource::poll(&mut b_source, &mut b_ring, 32).unwrap();
+                if let Some(r) = p.bc.next_request().unwrap() {
+                    assert_request(&r, BUFFER_SIZE);
+                    p.bc.respond(r, source.clone()).unwrap();
+                    served += 1;
+                }
+                if read.is_none()
+                    && let Some(g) = p.ac.take_grant(&mut request).unwrap()
+                {
+                    assert_eq!(g.checksum(), source.checksum());
+                    read = Some(p.ac.read(g, fill(&p.ap, [9; 32])).unwrap());
+                }
+                if let Some(r) = &mut read
+                    && let Some((mut received, len)) = p.ac.take_read_unpublished(r).unwrap()
+                {
+                    assert_eq!(&received.as_mut_slice()[..len], source.as_slice());
+                    break;
+                }
+            }
+        }
+        assert_eq!(served, 2);
+        // Client completion proves the ACK was written, not that the server
+        // consumed it and retired its memory window. Keep driving both ends
+        // through invalidation before asking the provider to destroy the QPs.
+        let until = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(Instant::now() < until, "loopback timed out");
+            let retired = [&p.a, &p.b].into_iter().all(|transport| {
+                transport
+                    .owner
+                    .borrow_mut()
+                    .core()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .all(|slot| slot.phase == Phase::Free)
+            });
+            if retired {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "loopback window retirement timed out"
+            );
             a_ring.progress().unwrap();
             b_ring.progress().unwrap();
             uring::CompletionSource::poll(&mut a_source, &mut a_ring, 32).unwrap();
             uring::CompletionSource::poll(&mut b_source, &mut b_ring, 32).unwrap();
-            if !served && let Some(r) = p.bc.next_request().unwrap() {
-                assert_request(&r, BUFFER_SIZE);
-                p.bc.respond(r, source.clone()).unwrap();
-                served = true;
-            }
-            if read.is_none()
-                && let Some(g) = p.ac.take_grant(&mut request).unwrap()
-            {
-                assert_eq!(g.checksum(), source.checksum());
-                read = Some(p.ac.read(g, fill(&p.ap, [9; 32])).unwrap());
-            }
-            if let Some(r) = &mut read
-                && let Some((mut received, len)) = p.ac.take_read_unpublished(r).unwrap()
-            {
-                assert_eq!(&received.as_mut_slice()[..len], source.as_slice());
-                break;
-            }
         }
         p.ac.close().unwrap();
         p.bc.close().unwrap();
-        p.a.shutdown().unwrap();
-        p.b.shutdown().unwrap();
+        // This fixture only polls its sources; it never arms their event fds.
+        // Release its duplicated provider descriptors before device close.
+        drop(a_source);
+        drop(b_source);
+        let until = Instant::now() + Duration::from_secs(5);
+        for transport in [&p.a, &p.b] {
+            loop {
+                match transport.shutdown() {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < until,
+                            "loopback shutdown timed out: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback shutdown failed: {error}"),
+                }
+            }
+        }
+    }
+    fn assert_capacity_rejects_builder(connection: &Connection) {
+        let invoked = std::cell::Cell::new(false);
+        let error = connection
+            .request_with_metadata([9; 32], BUFFER_SIZE, || {
+                invoked.set(true);
+                Ok(b"not admitted")
+            })
+            .err()
+            .expect("request capacity must reject");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !invoked.get(),
+            "capacity retry spent metadata-builder authority"
+        );
     }
 }

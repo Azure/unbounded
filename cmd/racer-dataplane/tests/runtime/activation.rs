@@ -56,23 +56,31 @@ mod management_tests {
 
     #[test]
     fn b06_real_exporter_socket_default_custom_and_family_independence() {
-        // Fixed default verifies deployment behavior; :0 verifies the actual assigned
-        // Exporter.address(), not the requested port or a hard-coded 9090 check.
-        for management in ["0.0.0.0:9090", "127.0.0.1:0", "[::1]:0", "[::]:0"] {
+        // Exercise default/custom bind IPs on kernel-assigned ports in the shared
+        // test namespace. tests/bin/dataplane.rs asserts the default address;
+        // e2e/racer/deployment_test.go's TestDeployment probes real daemons on 9090
+        // in isolated Pod network namespaces, without a metrics-address override.
+        for management in ["0.0.0.0:0", "127.0.0.1:0", "[::1]:0", "[::]:0"] {
+            let management: SocketAddr = management.parse().unwrap();
             for initial in [false, true] {
                 for occupied_tcp in [false, true] {
                     let updates = Arc::new(Updates::default());
                     let registry = Arc::new(crate::metrics::Registry::new(1, updates.clone()));
-                    let exporter =
-                        crate::metrics::Exporter::start(management.parse().unwrap(), registry)
-                            .unwrap();
+                    let exporter = crate::metrics::Exporter::start(management, registry).unwrap();
+                    assert_eq!(exporter.address().ip(), management.ip());
+                    assert_ne!(exporter.address().port(), 0);
                     let Some(mut ring) = crate::control::tests::ring() else {
                         return;
                     };
                     let mut node = volumes(&ring, &updates, 0);
                     let (trust, mut config) = fixture();
-                    let a = address();
-                    let _tcp = occupied_tcp.then(|| std::net::TcpListener::bind(a).unwrap());
+                    // Retain ownership from allocation through activation; reserving
+                    // a port with address() and rebinding it would introduce a race.
+                    let tcp =
+                        occupied_tcp.then(|| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+                    let a = tcp
+                        .as_ref()
+                        .map_or_else(address, |listener| listener.local_addr().unwrap());
                     config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
                     let a = Address::unix(&config.volumes[0].cache_socket).unwrap();
                     config.epoch = 111;

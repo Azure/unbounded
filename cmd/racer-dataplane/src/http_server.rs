@@ -1792,9 +1792,19 @@ impl<H: Handler> Server<H> {
         revision: u64,
         expiry: u64,
     ) {
+        self.install_tls_with_grace(context, expected, revision, expiry, Duration::from_secs(30));
+    }
+    pub(crate) fn install_tls_with_grace(
+        &mut self,
+        context: crate::tls::TlsContext,
+        expected: crate::tls::ExpectedPeer,
+        revision: u64,
+        expiry: u64,
+        grace: Duration,
+    ) {
         if let Some(listener) = &mut self.listener {
             if listener.tls_revision != revision {
-                let retire = crate::environment::now() + Duration::from_secs(30);
+                let retire = crate::environment::now() + grace;
                 for slot in &mut self.slots {
                     // Bound old-context admission even when the remote peer has
                     // not renewed its own leaf. Later rotations cannot extend it.

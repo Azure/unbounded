@@ -4,6 +4,7 @@
 //! Representation identity shared by storage and transport. Payload CRCs are
 //! independent of this origin-supplied checksum; the dataplane does not hash objects.
 use std::io;
+use std::rc::Rc;
 
 /// Raw origin-supplied representation version. All 256-bit values are valid;
 /// parsing validates the HTTP encoding, not the object contents.
@@ -58,7 +59,7 @@ impl ETag {
 
 pub type ContentType = crate::header_value::HeaderValue<256>;
 
-/// Fixed 306-byte record: checksum, LE length/expiry, LE u16 Content-Type
+/// Fixed 306-byte encoding: checksum, LE length/expiry, LE u16 Content-Type
 /// length and 256 zero-padded bytes. Zero expiry is never reusable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -92,6 +93,64 @@ impl Metadata {
             len: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
             expires: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
             content_type: ContentType::decode(&bytes[48..])?,
+        })
+    }
+}
+
+/// Worker-local tree representation. Keep the bounded, Copy transport record
+/// above at API boundaries, but do not reserve 256 header bytes in every leaf
+/// slot (including spare capacity and payload slots). Missing headers allocate
+/// nothing; present headers retain only their bytes and share them on CoW clone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentMetadata {
+    pub checksum: Checksum,
+    pub len: u64,
+    pub expires: u64,
+    content_type: Option<Rc<[u8]>>,
+}
+
+impl From<Metadata> for ResidentMetadata {
+    fn from(value: Metadata) -> Self {
+        Self {
+            checksum: value.checksum,
+            len: value.len,
+            expires: value.expires,
+            content_type: value.content_type.as_bytes().map(Rc::from),
+        }
+    }
+}
+
+impl ResidentMetadata {
+    pub(crate) fn to_metadata(&self) -> Metadata {
+        Metadata {
+            checksum: self.checksum,
+            len: self.len,
+            expires: self.expires,
+            content_type: self
+                .content_type
+                .as_deref()
+                .map(|bytes| ContentType::new(bytes).expect("validated resident Content-Type"))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn to_bytes(&self) -> [u8; Metadata::SIZE] {
+        self.to_metadata().to_bytes()
+    }
+
+    /// Rc allocation layout includes two reference counts and alignment padding.
+    pub(crate) fn header_allocation_bytes(len: usize) -> u64 {
+        let word = std::mem::size_of::<usize>();
+        (2 * word + len.next_multiple_of(word)) as u64
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_allocation(&self) -> Option<(usize, u64)> {
+        self.content_type.as_ref().map(|value| {
+            (
+                value.as_ptr() as usize,
+                Self::header_allocation_bytes(value.len()),
+            )
         })
     }
 }

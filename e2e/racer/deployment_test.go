@@ -578,7 +578,7 @@ func (c *cluster) readsAndCaching() {
 
 	hits := c.hits()
 	// Exactly one metadata and one page origin fetch per target, despite reads
-	// through both nodes. Both fetches must come from the same physical owner.
+	// through both nodes. Metadata and page keys have independent physical owners.
 	for _, target := range targets {
 		methods := map[string]int{}
 		sources := map[string]bool{}
@@ -590,7 +590,7 @@ func (c *cluster) readsAndCaching() {
 			}
 		}
 
-		if methods["HEAD"] != 1 || methods["GET"] != 1 || len(sources) != 1 {
+		if methods["HEAD"] != 1 || methods["GET"] != 1 || sources[""] || len(sources) == 0 || len(sources) > 2 {
 			c.t.Fatalf("origin fetches for %s: methods=%v sources=%v", target, methods, sources)
 		}
 	}
@@ -651,7 +651,9 @@ func (c *cluster) leader() core.Pod {
 	var leader core.Pod
 
 	c.await("exactly one serving leader", func() error {
-		pods, err := c.pods(controlSelector)
+		// Ready standbys retain TLS identity; only the Service's routing label
+		// identifies the replica currently serving leader-only requests.
+		pods, err := c.pods(controlSelector + "," + racermeta.MetadataPrefix + "serving-leader=true")
 		if err != nil {
 			return err
 		}
@@ -666,7 +668,7 @@ func (c *cluster) leader() core.Pod {
 		}
 
 		if count != 1 {
-			return fmt.Errorf("%d Ready controller pods", count)
+			return fmt.Errorf("%d Ready serving-leader pods", count)
 		}
 
 		return nil
@@ -729,6 +731,8 @@ func command(timeout time.Duration, input []byte, name string, args ...string) (
 func commandContext(ctx context.Context, input []byte, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = bytes.NewReader(input)
+	// A descendant holding the output pipe must not defeat the command deadline.
+	cmd.WaitDelay = 2 * time.Second
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -745,7 +749,7 @@ func commandContext(ctx context.Context, input []byte, name string, args ...stri
 func buildImages(t *testing.T, root string) images {
 	t.Helper()
 
-	for _, tool := range []string{"docker", "kind", "kubectl"} {
+	for _, tool := range []string{"docker", "kind", "kubectl", "python3", "git"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Fatalf("e2e requires %s: %v", tool, err)
 		}
@@ -780,6 +784,13 @@ func buildImages(t *testing.T, root string) images {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
+	// Snapshot tracked working-tree bytes without traversing unrelated worktrees
+	// or root-owned scratch. New source files must be added to the Git index.
+	buildContext := filepath.Join(t.TempDir(), "source")
+	if _, err := commandContext(ctx, nil, "python3", filepath.Join(root, "hack/scripts/racer-source-context.py"), buildContext); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, build := range []struct{ image, containerfile string }{
 		{im.control, "images/racer-controlplane/Containerfile"},
 		{im.data, "images/racer-dataplane/Containerfile"},
@@ -788,10 +799,13 @@ func buildImages(t *testing.T, root string) images {
 	} {
 		t.Logf("building %s", build.image)
 
-		if _, err := commandContext(ctx, nil, "docker", "build", "-t", build.image, "-f", filepath.Join(root, build.containerfile), root); err != nil {
+		started := time.Now()
+
+		if _, err := commandContext(ctx, nil, "docker", "build", "-t", build.image, "-f", filepath.Join(buildContext, build.containerfile), buildContext); err != nil {
 			t.Fatal(err)
 		}
 
+		t.Logf("built %s in %s", build.image, time.Since(started))
 		built = append(built, build.image)
 	}
 

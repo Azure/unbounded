@@ -88,51 +88,58 @@ fn buffer(pool: &WorkerPool, n: u64, len: usize, byte: u8) -> Buffer {
 
 #[test]
 fn crc64_lengths_and_alignment() {
+    // Independent, non-reflected ECMA-182 division with zero initial/final XOR.
+    fn bitwise(input: &[u8]) -> u64 {
+        let mut crc = 0u64;
+        for &byte in input {
+            crc ^= u64::from(byte) << 56;
+            for _ in 0..8 {
+                crc = (crc << 1)
+                    ^ if crc >> 63 != 0 {
+                        0x42f0e1eba9ea3693
+                    } else {
+                        0
+                    };
+            }
+        }
+        crc
+    }
+    assert_eq!(bitwise(b"123456789"), 0x6c40df5f0b497347);
+    // Derive one-byte remainders from the independent bitwise oracle, never
+    // from crc_fast. Use them for full buffers to avoid eight steps per byte.
+    let table: [u64; 256] = std::array::from_fn(|byte| bitwise(&[byte as u8]));
+    let reference = |input: &[u8]| {
+        let mut crc = 0u64;
+        for &byte in input {
+            crc = (crc << 8) ^ table[((crc >> 56) as u8 ^ byte) as usize];
+        }
+        crc
+    };
     let bytes: Vec<u8> = (0..buffers::BUFFER_SIZE + 15)
         .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
         .collect();
     for offset in [0, 1, 7, 15] {
         for len in [
-            0,
-            1,
-            7,
-            8,
-            15,
-            16,
-            17,
-            31,
-            32,
-            33,
-            63,
-            64,
-            65,
-            127,
-            128,
-            129,
-            255,
-            256,
-            257,
-            4095,
-            4096,
-            4097,
-            buffers::BUFFER_SIZE,
+            0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4095,
+            4096, 4097,
         ] {
             let input = &bytes[offset..offset + len];
-            // Independent bitwise ECMA-182 reference exercises SIMD blocks and tails.
-            let mut expected = 0u64;
-            for &byte in input {
-                expected ^= u64::from(byte) << 56;
-                for _ in 0..8 {
-                    expected = (expected << 1)
-                        ^ if expected >> 63 != 0 {
-                            0x42f0e1eba9ea3693
-                        } else {
-                            0
-                        };
-                }
-            }
+            // Keep the bitwise oracle for every short SIMD block/tail boundary,
+            // and cross-check the full-buffer reference on those same inputs.
+            let expected = bitwise(input);
+            assert_eq!(
+                reference(input),
+                expected,
+                "reference offset={offset} len={len}"
+            );
             assert_eq!(crc64(input), expected, "offset={offset} len={len}");
         }
+        let input = &bytes[offset..offset + buffers::BUFFER_SIZE];
+        assert_eq!(
+            crc64(input),
+            reference(input),
+            "full buffer offset={offset}"
+        );
     }
 }
 
@@ -206,16 +213,20 @@ fn incompatible_slab_versions_are_rejected_without_modification() {
     )
     .err()
     .unwrap();
-    assert!(error.to_string().contains("incompatible slab format"));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("incompatible slab format"),
+        "{error}"
+    );
     assert_eq!(read_page(&slab.file, g, 1).unwrap().0, old.0);
     drop(slab);
     let error = Slab::open_or_create_layout(&fixture.path, 64 * WIDE, 2, 1)
         .err()
         .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(
-        error
-            .to_string()
-            .contains("no automatic migration/reformat")
+        error.to_string().contains("incompatible slab format"),
+        "{error}"
     );
     let file = File::open(&fixture.path).unwrap();
     let mut after = [0; PAGE_SIZE];
@@ -249,7 +260,7 @@ fn tree_splits_merges_and_snapshot_versions_match_ordered_map() {
     // allocating payload buffers or metadata extents.
     for n in 0..1800 {
         let n = (n * 997) % 1800;
-        let value = Entry::Metadata(metadata(n, 100));
+        let value = Entry::Metadata(metadata(n, 100).into());
         if let Some(right) = Node::insert(&mut root, key(n), value.clone()) {
             root = Rc::new(Node {
                 body: Body::Branch(vec![root, right]),

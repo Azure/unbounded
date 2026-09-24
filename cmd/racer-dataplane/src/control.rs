@@ -36,6 +36,7 @@ mod storage_policy;
 pub use activation::Decision;
 pub use storage_policy::{StoragePolicyStatus, StorageRequest, StorageResult};
 const LIMIT: usize = 64 * 1024 * 1024;
+const CONTROL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(35);
 pub const MAX_SLOTS: u32 = 262144;
 const MAX_CONFIG_WORK: u64 = 64 * 1024 * 1024;
 fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
@@ -885,6 +886,14 @@ fn desired_headers(
 
 impl Subscriber {
     pub fn start(source: Source, trust: Arc<Trust>, updates: Arc<Updates>) -> io::Result<Self> {
+        Self::start_with_first_byte_timeout(source, trust, updates, CONTROL_FIRST_BYTE_TIMEOUT)
+    }
+    fn start_with_first_byte_timeout(
+        source: Source,
+        trust: Arc<Trust>,
+        updates: Arc<Updates>,
+        first_byte_timeout: Duration,
+    ) -> io::Result<Self> {
         if let Source::Http { target, .. } = &source
             && target.split('?').next() != Some("/v4/config")
         {
@@ -971,11 +980,13 @@ impl Subscriber {
                                     }
                                     Ok(())
                                 };
-                                let (body, next_etag) = transport.as_mut().unwrap().fetch(
-                                    etag.as_deref(),
-                                    &headers,
-                                    &mut checkpoint,
-                                )?;
+                                let (body, next_etag) =
+                                    transport.as_mut().unwrap().fetch_with_first_byte_timeout(
+                                        etag.as_deref(),
+                                        &headers,
+                                        &mut checkpoint,
+                                        first_byte_timeout,
+                                    )?;
                                 let envelope = match body {
                                     None => None,
                                     Some(body) => {
@@ -1281,11 +1292,21 @@ struct ControlTransport {
     lifetime: Duration,
 }
 impl ControlTransport {
+    #[cfg(test)]
     fn fetch(
         &mut self,
         etag: Option<&str>,
         headers: &[(&str, String)],
         checkpoint: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
+        self.fetch_with_first_byte_timeout(etag, headers, checkpoint, CONTROL_FIRST_BYTE_TIMEOUT)
+    }
+    fn fetch_with_first_byte_timeout(
+        &mut self,
+        etag: Option<&str>,
+        headers: &[(&str, String)],
+        checkpoint: &mut dyn FnMut() -> io::Result<()>,
+        first_byte_timeout: Duration,
     ) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
         let idle = self
             .idle
@@ -1350,7 +1371,7 @@ impl ControlTransport {
             socket: &mut socket,
             checkpoint,
             end,
-            first: start + Duration::from_secs(35),
+            first: start + first_byte_timeout,
             transfer: None,
             idle: start,
         });

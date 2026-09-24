@@ -60,8 +60,37 @@ const COMPONENT: &str = "racer-controlplane";
 const COMPONENT_LABEL: &str = "racer.unbounded-cloud.io/component";
 const SERVING_LABEL: &str = "racer.unbounded-cloud.io/serving-leader";
 const ROUTING_BOOT: &str = "racer.unbounded-cloud.io/routing-boot";
-const LEASE_SECONDS: i32 = 15;
-const RENEW_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Programmatic election timing; the production CLI always uses these defaults.
+#[derive(Clone, Copy, Debug)]
+pub struct LeaseTiming {
+    pub duration_seconds: i32,
+    pub renew_deadline: Duration,
+    pub retry_period: Duration,
+}
+
+impl Default for LeaseTiming {
+    fn default() -> Self {
+        Self {
+            duration_seconds: 15,
+            renew_deadline: Duration::from_secs(10),
+            retry_period: Duration::from_secs(2),
+        }
+    }
+}
+
+impl LeaseTiming {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            self.duration_seconds > 0
+                && self.retry_period > Duration::ZERO
+                && self.retry_period < self.renew_deadline
+                && self.renew_deadline < Duration::from_secs(self.duration_seconds as u64),
+            "require 0 < lease retry period < renewal deadline < lease duration"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -77,6 +106,7 @@ pub struct Options {
     pub rotation_interval: Duration,
     pub leaf_lifetime: Duration,
     pub clock_skew: Duration,
+    pub lease_timing: LeaseTiming,
     pub pod_name: String,
     pub pod_uid: String,
     pub bootstrap_node: String,
@@ -102,6 +132,7 @@ impl Default for Options {
             rotation_interval: Duration::from_secs(30 * 86400),
             leaf_lifetime: Duration::from_secs(86400),
             clock_skew: Duration::from_secs(300),
+            lease_timing: LeaseTiming::default(),
             pod_name: std::env::var("RACER_POD_NAME").unwrap_or_default(),
             pod_uid: std::env::var("RACER_POD_UID").unwrap_or_default(),
             bootstrap_node: String::new(),
@@ -452,7 +483,7 @@ impl Shared {
             .as_ref()
             .filter(|a| {
                 a.term.is_active()
-                    && a.last_renewal.elapsed() < RENEW_DEADLINE
+                    && a.last_renewal.elapsed() < self.options.lease_timing.renew_deadline
                     && !self.stop.is_cancelled()
             })
             .cloned()
@@ -517,6 +548,18 @@ impl ReviewCache {
         }
     }
     async fn authenticate(&self, client: Client, token: &str) -> Result<TokenReviewResult> {
+        self.authenticate_with_clock(client, token, || (Instant::now(), unix_now()))
+            .await
+    }
+
+    // Only cache validity uses this clock. Network deadlines and rate limiting
+    // continue to use real elapsed time, including in clock-controlled tests.
+    async fn authenticate_with_clock(
+        &self,
+        client: Client,
+        token: &str,
+        now: impl Fn() -> (Instant, i64),
+    ) -> Result<TokenReviewResult> {
         ensure!(
             !token.is_empty() && token.len() <= 16384,
             "invalid bearer token size"
@@ -526,9 +569,10 @@ impl ReviewCache {
         let _flight = self.flights[bucket].lock().await;
         {
             let entries = self.entries.lock().await;
+            let (instant, unix) = now();
             if let Some(entry) = entries
                 .get(&key)
-                .filter(|e| e.until > Instant::now() && e.expiry > unix_now())
+                .filter(|e| e.until > instant && e.expiry > unix)
             {
                 return Ok(entry.review.clone());
             }
@@ -589,9 +633,10 @@ impl ReviewCache {
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|v| v["exp"].as_i64())
         {
-            ensure!(expiry > unix_now(), "expired credential");
+            let (instant, unix) = now();
+            ensure!(expiry > unix, "expired credential");
             let mut entries = self.entries.lock().await;
-            entries.retain(|_, e| e.until > Instant::now() && e.expiry > unix_now());
+            entries.retain(|_, e| e.until > instant && e.expiry > unix);
             if entries.len() >= 32768
                 && let Some(old) = entries.keys().next().cloned()
             {
@@ -601,7 +646,7 @@ impl ReviewCache {
                 key,
                 ReviewEntry {
                     review: result.clone(),
-                    until: Instant::now() + Duration::from_secs(5),
+                    until: instant + Duration::from_secs(5),
                     expiry,
                 },
             );
@@ -1495,8 +1540,9 @@ async fn leader_reconcile(shared: &Shared, runtime: &Runtime, active: &Active) -
 /// for the full lease duration before takeover, avoiding reliance on clock skew.
 async fn election_loop(shared: Arc<Shared>) -> Result<()> {
     let leases = Api::<Lease>::namespaced(shared.client.clone(), &shared.options.namespace);
+    let timing = shared.options.lease_timing;
     let mut observed: Option<(String, Instant)> = None;
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut ticker = tokio::time::interval(timing.retry_period);
     loop {
         tokio::select! { _ = shared.stop.cancelled() => break, _ = ticker.tick() => () }
         let attempt = tokio::time::timeout(Duration::from_secs(60), async {
@@ -1518,15 +1564,15 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
             let token = format!("{}-{}", shared.boot, uuid::Uuid::new_v4().simple());
             let mut lease = if let Some(mut lease) = old {
                 let rv = lease.resource_version().context("Lease lacks revision")?;
-                let duration = lease.spec.as_ref().and_then(|s| s.lease_duration_seconds).unwrap_or(LEASE_SECONDS).max(1) as u64;
+                let duration = lease.spec.as_ref().and_then(|s| s.lease_duration_seconds).unwrap_or(timing.duration_seconds).max(1) as u64;
                 let empty = lease.spec.as_ref().and_then(|s| s.holder_identity.as_deref()).is_none_or(str::is_empty);
                 let elapsed = match &observed { Some((version, at)) if version == &rv => at.elapsed(), _ => { observed = Some((rv, Instant::now())); Duration::ZERO } };
                 if !empty && elapsed < Duration::from_secs(duration) { return Ok(()); }
                 let transitions = lease.spec.as_ref().and_then(|s| s.lease_transitions).unwrap_or(0).saturating_add(1);
-                lease.spec = Some(LeaseSpec { holder_identity: Some(token.clone()), lease_duration_seconds: Some(LEASE_SECONDS), acquire_time: Some(now_micro()?), renew_time: Some(now_micro()?), lease_transitions: Some(transitions), ..Default::default() });
+                lease.spec = Some(LeaseSpec { holder_identity: Some(token.clone()), lease_duration_seconds: Some(timing.duration_seconds), acquire_time: Some(now_micro()?), renew_time: Some(now_micro()?), lease_transitions: Some(transitions), ..Default::default() });
                 leases.replace(LEASE, &PostParams::default(), &lease).await?
             } else {
-                let lease = Lease { metadata: ObjectMeta { name: Some(LEASE.into()), namespace: Some(shared.options.namespace.clone()), ..Default::default() }, spec: Some(LeaseSpec { holder_identity: Some(token.clone()), lease_duration_seconds: Some(LEASE_SECONDS), acquire_time: Some(now_micro()?), renew_time: Some(now_micro()?), lease_transitions: Some(0), ..Default::default() }) };
+                let lease = Lease { metadata: ObjectMeta { name: Some(LEASE.into()), namespace: Some(shared.options.namespace.clone()), ..Default::default() }, spec: Some(LeaseSpec { holder_identity: Some(token.clone()), lease_duration_seconds: Some(timing.duration_seconds), acquire_time: Some(now_micro()?), renew_time: Some(now_micro()?), lease_transitions: Some(0), ..Default::default() }) };
                 leases.create(&PostParams::default(), &lease).await?
             };
             // Initial CA/shard load may exceed a renewal tick. Renew separately
@@ -1547,7 +1593,7 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
                 tokio::select! {
                     _ = shared.stop.cancelled() => { term.cancel(); bail!("shutdown during CA acquisition"); },
                     result = &mut acquisition => break result?,
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    _ = tokio::time::sleep(timing.retry_period) => {
                         lease.spec.as_mut().unwrap().renew_time = Some(now_micro()?);
                         match leases.replace(LEASE, &PostParams::default(), &lease).await {
                             Ok(next) => lease = next,
@@ -1569,7 +1615,7 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
                 .read()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|a| a.last_renewal.elapsed() >= RENEW_DEADLINE)
+                .is_some_and(|a| a.last_renewal.elapsed() >= timing.renew_deadline)
             {
                 shared.lose_leadership();
             }
@@ -1581,6 +1627,7 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
 }
 
 pub async fn run(client: Client, options: Options, shutdown: CancellationToken) -> Result<()> {
+    options.lease_timing.validate()?;
     ensure!(
         !options.pod_name.is_empty() && !options.pod_uid.is_empty(),
         "RACER_POD_NAME and RACER_POD_UID required"
@@ -1668,7 +1715,7 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
             loop {
                 tokio::select! { _ = shared.stop.cancelled() => return Ok(()), _ = ticker.tick() => () }
-                let expired = shared.active.read().unwrap().as_ref().is_some_and(|a| a.last_renewal.elapsed() >= RENEW_DEADLINE);
+                let expired = shared.active.read().unwrap().as_ref().is_some_and(|a| a.last_renewal.elapsed() >= shared.options.lease_timing.renew_deadline);
                 if expired { shared.lose_leadership(); }
             }
         });
@@ -1725,4 +1772,131 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn lease_timing_requires_ordered_positive_durations() {
+        assert!(LeaseTiming::default().validate().is_ok());
+        for timing in [
+            LeaseTiming {
+                duration_seconds: 0,
+                ..Default::default()
+            },
+            LeaseTiming {
+                duration_seconds: -1,
+                ..Default::default()
+            },
+            LeaseTiming {
+                retry_period: Duration::ZERO,
+                ..Default::default()
+            },
+            LeaseTiming {
+                retry_period: Duration::from_secs(10),
+                ..Default::default()
+            },
+            LeaseTiming {
+                renew_deadline: Duration::from_secs(15),
+                ..Default::default()
+            },
+        ] {
+            assert!(timing.validate().is_err(), "accepted {timing:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_cache_expiry_and_failed_authentication() -> Result<()> {
+        let reviews = Arc::new(AtomicUsize::new(0));
+        let authenticated = Arc::new(AtomicBool::new(true));
+        let router = Router::new().route("/apis/authentication.k8s.io/v1/tokenreviews", post({
+            let reviews = reviews.clone();
+            let authenticated = authenticated.clone();
+            move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let reviews = reviews.clone();
+                let authenticated = authenticated.clone();
+                async move {
+                    reviews.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request["spec"]["audiences"], serde_json::json!([CONTROL_AUDIENCE]));
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview",
+                        "metadata": {},
+                        "spec": request["spec"],
+                        "status": {
+                            "authenticated": authenticated.load(Ordering::SeqCst),
+                            "audiences": [CONTROL_AUDIENCE],
+                            "user": {"extra": {"authentication.kubernetes.io/pod-uid": ["worker-pod"]}}
+                        }
+                    }))
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let client = Client::try_from(kube::Config::new(
+            format!("http://{}", listener.local_addr()?).parse()?,
+        ))?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let cache = ReviewCache::new(100., 100);
+        let base = Instant::now();
+        let unix = unix_now();
+        let token = |expiry| {
+            format!(
+                "fixture.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!("{{\"exp\":{expiry}}}"))
+            )
+        };
+        let credential = token(unix + 100);
+        for (elapsed, expected) in [(0, 1), (0, 1), (4999, 1), (5000, 2), (5000, 2)] {
+            let result = cache
+                .authenticate_with_clock(client.clone(), &credential, || {
+                    (base + Duration::from_millis(elapsed), unix)
+                })
+                .await?;
+            assert_eq!(reviewed_pod_uid(&result)?, "worker-pod");
+            assert_eq!(reviews.load(Ordering::SeqCst), expected);
+        }
+        // JWT expiry independently shortens the five-second monotonic TTL.
+        let short = token(unix + 1);
+        cache
+            .authenticate_with_clock(client.clone(), &short, || (base, unix))
+            .await?;
+        assert_eq!(reviews.load(Ordering::SeqCst), 3);
+        for expected in [4, 5] {
+            assert!(
+                cache
+                    .authenticate_with_clock(client.clone(), &short, || (base, unix + 1))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(reviews.load(Ordering::SeqCst), expected);
+        }
+        // An exp claim must never turn a rejected TokenReview into a cache hit.
+        authenticated.store(false, Ordering::SeqCst);
+        let rejected = token(unix + 200);
+        for expected in [6, 7] {
+            assert!(
+                cache
+                    .authenticate_with_clock(client.clone(), &rejected, || (base, unix))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(reviews.load(Ordering::SeqCst), expected);
+        }
+        authenticated.store(true, Ordering::SeqCst);
+        for expected in [8, 9] {
+            cache
+                .authenticate_with_clock(client.clone(), "fixture.no-exp.signature", || {
+                    (base, unix)
+                })
+                .await?;
+            assert_eq!(reviews.load(Ordering::SeqCst), expected);
+        }
+        server.abort();
+        let _ = server.await;
+        Ok(())
+    }
 }

@@ -20,6 +20,8 @@
 //! ephemeral ports, and RAM beyond the observed ~1.3GiB process peak (including
 //! kernel socket buffers). A 24-node / 3-universe / 512-slot default scenario
 //! covers the protocol without claiming full-geometry throughput.
+//! See designs/racer-controlplane-scale-testing.md for capacity qualification,
+//! bounded reproductions, and the shared-host first-byte deadline failure.
 
 use super::*;
 use crate::{
@@ -40,11 +42,182 @@ use openssl::{
     },
 };
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
+
+const CLIENT_STAGES: [&str; 11] = [
+    "not_started",
+    "connection_admission",
+    "tcp_connect",
+    "tls_handshake",
+    "request_write",
+    "response_status_line",
+    "response_headers",
+    "response_body",
+    "response_validation",
+    "reconnect_admission",
+    "finished",
+];
+const CLIENT_PHASES: [&str; 3] = ["initial", "publication", "reconnect"];
+
+struct Progress {
+    started: Instant,
+    stage: Mutex<&'static str>,
+    clients: Vec<AtomicUsize>,
+    phases: Vec<AtomicUsize>,
+    credentials: AtomicUsize,
+    // Initial deliveries, revision-2 deliveries, and reconnect request writes.
+    completed: [AtomicUsize; 3],
+    bytes: AtomicUsize,
+    subscriptions: Mutex<Option<Arc<Subscriptions>>>,
+}
+
+impl Progress {
+    fn new(nodes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            started: Instant::now(),
+            stage: Mutex::new("setup"),
+            clients: (0..nodes).map(|_| AtomicUsize::new(0)).collect(),
+            phases: (0..nodes).map(|_| AtomicUsize::new(0)).collect(),
+            credentials: AtomicUsize::new(0),
+            completed: std::array::from_fn(|_| AtomicUsize::new(0)),
+            bytes: AtomicUsize::new(0),
+            subscriptions: Mutex::new(None),
+        })
+    }
+
+    fn enter(&self, stage: &'static str) {
+        *self.stage.lock().unwrap() = stage;
+        self.report("stage");
+    }
+
+    fn report(&self, reason: &str) {
+        let mut clients = [[0usize; CLIENT_STAGES.len()]; CLIENT_PHASES.len()];
+        for (state, phase) in self.clients.iter().zip(&self.phases) {
+            clients[phase.load(Ordering::Relaxed)][state.load(Ordering::Relaxed)] += 1;
+        }
+        let states: BTreeMap<_, _> = CLIENT_PHASES
+            .into_iter()
+            .zip(clients.map(|counts| {
+                CLIENT_STAGES
+                    .into_iter()
+                    .zip(counts)
+                    .collect::<BTreeMap<_, _>>()
+            }))
+            .collect();
+        // Failure reporting must not wait behind the very server locks whose
+        // contention we are diagnosing, or panic again on a poisoned lock.
+        let server = self
+            .subscriptions
+            .try_lock()
+            .ok()
+            .and_then(|subscriptions| {
+                subscriptions.as_ref().map(|s| {
+                    let waiters = s.universes.try_read().ok().map(|universes| {
+                        universes
+                            .values()
+                            .map(|p| p.changes.receiver_count())
+                            .sum::<usize>()
+                    });
+                    let cache = s
+                        .cache
+                        .try_lock()
+                        .ok()
+                        .map(|cache| (cache.bytes, cache.digests.len()));
+                    json!({"waiters":waiters,"responses":s.response_count(),
+                    "builder_permits_available":s.builders.available_permits(),"cache":cache})
+                })
+            });
+        let stage = self.stage.try_lock().ok().map(|stage| *stage);
+        eprintln!(
+            "SCALE_PROGRESS {}",
+            json!({"reason":reason,"stage":stage,
+                "elapsed_seconds":self.started.elapsed().as_secs_f64(),
+                "nodes":self.clients.len(),"credentials":self.credentials.load(Ordering::Relaxed),
+                "initial_delivered":self.completed[0].load(Ordering::Relaxed),
+                "published_delivered":self.completed[1].load(Ordering::Relaxed),
+                "reconnect_requests_written":self.completed[2].load(Ordering::Relaxed),
+                "validated_bytes":self.bytes.load(Ordering::Relaxed),
+                "clients":states,"server":server,"resources":sample()})
+        );
+    }
+}
+
+// Independent of Tokio scheduling, so executor starvation still leaves evidence.
+struct Reporter(std::sync::mpsc::Sender<()>, Arc<Progress>);
+impl Reporter {
+    fn start(progress: Arc<Progress>) -> Self {
+        let (send, receive) = std::sync::mpsc::channel();
+        let observer = progress.clone();
+        std::thread::spawn(move || {
+            while matches!(
+                receive.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                observer.report("heartbeat");
+            }
+        });
+        Self(send, progress)
+    }
+}
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+        self.1.report(if std::thread::panicking() {
+            "unwinding"
+        } else {
+            "scenario_stopped"
+        });
+    }
+}
+
+struct ClientProgress {
+    fleet: Arc<Progress>,
+    index: usize,
+}
+impl ClientProgress {
+    fn enter(&self, stage: usize) {
+        self.fleet.clients[self.index].store(stage, Ordering::Relaxed);
+    }
+
+    async fn event(
+        &self,
+        events: &mpsc::Sender<(u32, usize, f64)>,
+        event: (u32, usize, f64),
+    ) -> bool {
+        if events.send(event).await.is_err() {
+            // The coordinator has already failed or canceled the scenario.
+            return false;
+        }
+        self.fleet.completed[event.0 as usize].fetch_add(1, Ordering::Relaxed);
+        self.fleet.bytes.fetch_add(event.1, Ordering::Relaxed);
+        true
+    }
+
+    async fn bounded<T>(
+        &self,
+        seconds: u64,
+        stage: usize,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        self.enter(stage);
+        tokio::time::timeout(Duration::from_secs(seconds), future)
+            .await
+            .unwrap_or_else(|_| {
+                self.fleet.report("client_deadline");
+                panic!(
+                    "distinct TLS deadline: client={} phase={} operation={} ({seconds}s)",
+                    self.index,
+                    CLIENT_PHASES[self.fleet.phases[self.index].load(Ordering::Relaxed)],
+                    CLIENT_STAGES[stage]
+                )
+            })
+    }
+}
 
 // A real thread still fires if the executor or a blocking task deadlocks. The
 // parent test process is terminated only after its own explicitly bounded test.
@@ -80,19 +253,28 @@ async fn bounded<T>(
 }
 
 fn run_bounded(nodes: usize, universes: usize, slots: u32, stress: bool) {
+    assert!(
+        universes > 0 && nodes >= universes && nodes <= 16000 && nodes.is_multiple_of(universes),
+        "scale geometry requires 1 <= universes <= nodes <= 16000 and evenly divided universes"
+    );
     let _watchdog = Watchdog::start(if stress { 150 } else { 20 });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(if stress { 16 } else { 4 })
         .enable_all()
         .build()
         .unwrap();
+    let progress = Progress::new(nodes);
+    let _reporter = Reporter::start(progress.clone());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(bounded(
             if stress { 140 } else { 12 },
             "whole scenario",
-            scenario(nodes, universes, slots, stress),
+            scenario(nodes, universes, slots, stress, progress.clone()),
         ))
     }));
+    if result.is_err() {
+        progress.report("failure");
+    }
     runtime.shutdown_timeout(Duration::from_secs(2));
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -105,12 +287,25 @@ async fn next_event(
     deadline: tokio::time::Instant,
     stage: &str,
     completed: usize,
+    progress: &Progress,
 ) -> (u32, usize, f64) {
-    tokio::select! {
-        event = receiver.recv() => event.unwrap_or_else(|| panic!("{stage}: event channel closed after {completed}")),
-        result = workers.join_next() => panic!("{stage}: worker ended before stage completion ({completed}): {result:?}"),
-        _ = tokio::time::sleep_until(deadline) => panic!("{stage}: stage deadline after {completed} completions"),
-    }
+    let failure = tokio::select! {
+        biased;
+        result = workers.join_next() => format!("{stage}: worker ended before stage completion ({completed}): {result:?}"),
+        _ = tokio::time::sleep_until(deadline) => format!("{stage}: stage deadline after {completed} completions"),
+        event = receiver.recv() => match event {
+            Some(event) => return event,
+            None => format!("{stage}: event channel closed after {completed}"),
+        },
+    };
+    progress.report("stage_failure");
+    // Abort and reap siblings while the receiver is still alive. A failed stage
+    // remains a failure even if cancellation itself cannot finish promptly.
+    let cleanup = tokio::time::timeout(Duration::from_secs(2), workers.shutdown()).await;
+    panic!(
+        "{failure}; worker cancellation completed={}",
+        cleanup.is_ok()
+    );
 }
 
 async fn await_waiters(state: &Subscriptions, count: usize, seconds: u64, stage: &str) {
@@ -191,55 +386,79 @@ fn leaf(authority: &Authority, identity: &Identity, serial: usize) -> (Vec<u8>, 
 }
 
 fn sample() -> Value {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    // Diagnostics must not replace the original failure if procfs is unavailable.
+    let read = |path| std::fs::read_to_string(path).ok();
+    let status = read("/proc/self/status").unwrap_or_default();
     let kb = |key: &str| {
         status
             .lines()
             .find_map(|line| line.strip_prefix(key))
             .and_then(|v| v.split_whitespace().next())
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
     };
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let stat = read("/proc/self/stat").unwrap_or_default();
     let fields: Vec<_> = stat
         .rsplit_once(')')
-        .unwrap()
-        .1
+        .map(|(_, fields)| fields)
+        .unwrap_or_default()
         .split_whitespace()
         .collect();
-    // Linux USER_HZ is 100 on the supported x86_64 Linux benchmark host.
-    let cpu =
-        (fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()) as f64 / 100.;
-    json!({"cpu_seconds":cpu,"rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:")})
+    let ticks = |index| fields.get(index).and_then(|s: &&str| s.parse::<u64>().ok());
+    // Raw ticks avoid assuming USER_HZ for CPU-time diagnostics.
+    json!({"cpu_user_ticks":ticks(11),"cpu_system_ticks":ticks(12),
+        "rss_kib":kb("VmRSS:"),"peak_rss_kib":kb("VmHWM:"),"threads":kb("Threads:"),
+        "cpu_affinity":status.lines().find(|line| line.starts_with("Cpus_allowed_list:")),
+        "available_parallelism":std::thread::available_parallelism().ok().map(|n| n.get()),
+        "open_fds":std::fs::read_dir("/proc/self/fd").ok().map(|entries| entries.count()),
+        "loadavg":read("/proc/loadavg"),
+        "mem_available":read("/proc/meminfo").and_then(|s| s.lines().find(|l| l.starts_with("MemAvailable:")).map(str::to_owned)),
+        "cpu_pressure":read("/proc/pressure/cpu"),"memory_pressure":read("/proc/pressure/memory"),
+        "cgroup":read("/proc/self/cgroup"),
+        "cgroup_cpu_max":read("/sys/fs/cgroup/cpu.max"),
+        "cgroup_cpu_stat":read("/sys/fs/cgroup/cpu.stat"),
+        "cgroup_memory_max":read("/sys/fs/cgroup/memory.max"),
+        "cgroup_memory_current":read("/sys/fs/cgroup/memory.current")})
 }
 
 type TlsClient = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;
-async fn connect(address: std::net::SocketAddr, config: Arc<rustls::ClientConfig>) -> TlsClient {
-    let raw = bounded(3, "TCP connect", TcpStream::connect(address))
+async fn connect(
+    address: std::net::SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+    progress: &ClientProgress,
+) -> TlsClient {
+    let raw = progress
+        .bounded(3, 2, TcpStream::connect(address))
         .await
         .unwrap();
     raw.set_nodelay(true).unwrap();
     BufReader::new(
-        bounded(
-            3,
-            "TLS handshake",
-            tokio_rustls::TlsConnector::from(config).connect(
-                rustls::pki_types::ServerName::try_from("racer-controlplane.system.svc").unwrap(),
-                raw,
-            ),
-        )
-        .await
-        .unwrap(),
+        progress
+            .bounded(
+                3,
+                3,
+                tokio_rustls::TlsConnector::from(config).connect(
+                    rustls::pki_types::ServerName::try_from("racer-controlplane.system.svc")
+                        .unwrap(),
+                    raw,
+                ),
+            )
+            .await
+            .unwrap(),
     )
 }
-async fn send(stream: &mut TlsClient, boot: &str, cursor: &str) {
-    bounded(3,"request write",stream.write_all(format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nContent-Length: 0\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nX-Racer-Cursor: {cursor}\r\nX-Racer-Applied-Revision: 0\r\nX-Racer-Local-State: failed\r\n\r\n").as_bytes())).await.unwrap();
+async fn send(stream: &mut TlsClient, boot: &str, cursor: &str, progress: &ClientProgress) {
+    progress.bounded(3,4,stream.write_all(format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nContent-Length: 0\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nX-Racer-Cursor: {cursor}\r\nX-Racer-Applied-Revision: 0\r\nX-Racer-Local-State: failed\r\n\r\n").as_bytes())).await.unwrap();
 }
-async fn receive(stream: &mut TlsClient, node: &str) -> Option<(String, u64, usize, f64)> {
+async fn receive(
+    stream: &mut TlsClient,
+    node: &str,
+    progress: &ClientProgress,
+) -> Option<(String, u64, usize, f64)> {
     let started = Instant::now();
     let mut line = String::new();
     assert!(
-        bounded(35, "response first byte", stream.read_line(&mut line))
+        progress
+            .bounded(35, 5, stream.read_line(&mut line))
             .await
             .unwrap()
             > 0,
@@ -255,7 +474,8 @@ async fn receive(stream: &mut TlsClient, node: &str) -> Option<(String, u64, usi
     for _ in 0..64 {
         line.clear();
         assert!(
-            bounded(2, "response header", stream.read_line(&mut line))
+            progress
+                .bounded(2, 6, stream.read_line(&mut line))
                 .await
                 .unwrap()
                 > 0,
@@ -276,9 +496,11 @@ async fn receive(stream: &mut TlsClient, node: &str) -> Option<(String, u64, usi
     let length = length.expect("200 requires content length");
     assert!(length <= 64 * 1024 * 1024);
     let mut body = vec![0; length];
-    bounded(5, "response body", stream.read_exact(&mut body))
+    progress
+        .bounded(5, 7, stream.read_exact(&mut body))
         .await
         .unwrap();
+    progress.enter(8);
     let desired = proto::DesiredState::decode(body.as_slice()).unwrap();
     assert_eq!(hex::encode(&desired.node), node);
     let proto::configuration::Contents::Snapshot(snapshot) =
@@ -291,11 +513,20 @@ async fn receive(stream: &mut TlsClient, node: &str) -> Option<(String, u64, usi
 }
 
 /// Run separately for each geometry for meaningful process peak-RSS readings:
-/// RACER_SCALE_NODES=10000 RACER_SCALE_UNIVERSES=1 cargo test --release --lib
+/// RACER_SCALE_CAPACITY_QUALIFIED=1 RACER_SCALE_NODES=10000 RACER_SCALE_UNIVERSES=1 cargo test --release --lib
 /// distinct_tls_fanout -- --ignored --nocapture
 #[test]
-#[ignore = "opt-in distinct-node TLS load measurement"]
+#[ignore = "capacity-qualified release TLS load; see designs/racer-controlplane-scale-testing.md"]
 fn distinct_tls_fanout() {
+    assert!(
+        !cfg!(debug_assertions),
+        "distinct TLS scale measurement requires a release build; use distinct_tls_representative for routine coverage"
+    );
+    assert_eq!(
+        std::env::var("RACER_SCALE_CAPACITY_QUALIFIED").as_deref(),
+        Ok("1"),
+        "explicit scale run requires RACER_SCALE_CAPACITY_QUALIFIED=1; see designs/racer-controlplane-scale-testing.md"
+    );
     let nodes: usize = std::env::var("RACER_SCALE_NODES")
         .unwrap_or("10000".into())
         .parse()
@@ -312,8 +543,113 @@ fn distinct_tls_representative() {
     run_bounded(24, 3, 512, false);
 }
 
-async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
-    assert!(nodes >= universes && nodes <= 16000 && nodes.is_multiple_of(universes));
+#[tokio::test]
+async fn scale_coordinator_cancels_siblings_on_failure() {
+    use futures::FutureExt;
+
+    let progress = Progress::new(2);
+    let (_events, mut receiver) = mpsc::channel(2);
+    let mut workers = tokio::task::JoinSet::new();
+    let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+    workers.spawn(async move {
+        let _alive = alive;
+        std::future::pending::<()>().await;
+    });
+    // A worker returning before completion is as fatal as a panic, without an
+    // extra panic hook obscuring the coordinator's diagnostic in this regression.
+    workers.spawn(async {});
+    let result = std::panic::AssertUnwindSafe(next_event(
+        &mut receiver,
+        &mut workers,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        "injected worker exit",
+        0,
+        &progress,
+    ))
+    .catch_unwind()
+    .await;
+    assert!(result.is_err(), "worker loss must remain a failure");
+    assert!(
+        workers.is_empty(),
+        "siblings must be reaped before unwinding"
+    );
+    assert!(
+        stopped.await.is_err(),
+        "cancellation must drop worker resources"
+    );
+}
+
+#[tokio::test]
+async fn scale_events_handle_success_and_receiver_cancellation() {
+    let progress = ClientProgress {
+        fleet: Progress::new(1),
+        index: 0,
+    };
+    let (events, mut receiver) = mpsc::channel(1);
+    assert!(progress.event(&events, (1, 42, 0.5)).await);
+    assert_eq!(receiver.recv().await, Some((1, 42, 0.5)));
+    assert_eq!(progress.fleet.completed[1].load(Ordering::Relaxed), 1);
+    drop(receiver);
+    assert!(!progress.event(&events, (2, 0, 0.)).await);
+    assert_eq!(progress.fleet.completed[2].load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn scale_diagnostics_do_not_wait_for_server_locks() {
+    let progress = Progress::new(1);
+    let subscriptions = Subscriptions::new(Arc::new(|| None), 1024, Duration::from_secs(1));
+    *progress.subscriptions.lock().unwrap() = Some(subscriptions.clone());
+    let _universes = subscriptions.universes.write().unwrap();
+    let _cache = subscriptions.cache.lock().unwrap();
+    let _stage = progress.stage.lock().unwrap();
+    // Calling a blocking getter here would deadlock on this thread's own locks.
+    progress.report("injected busy server locks");
+}
+
+#[tokio::test]
+async fn scale_expired_stage_cancels_pending_worker() {
+    use futures::FutureExt;
+
+    let progress = Progress::new(1);
+    let (_events, mut receiver) = mpsc::channel(1);
+    let mut workers = tokio::task::JoinSet::new();
+    workers.spawn(std::future::pending::<()>());
+    let result = std::panic::AssertUnwindSafe(next_event(
+        &mut receiver,
+        &mut workers,
+        tokio::time::Instant::now(),
+        "injected expired stage",
+        0,
+        &progress,
+    ))
+    .catch_unwind()
+    .await;
+    let failure = result.expect_err("stage expiry must remain a failure");
+    assert!(
+        failure
+            .downcast_ref::<String>()
+            .unwrap()
+            .contains("stage deadline"),
+        "failure must identify the expired stage"
+    );
+    assert!(workers.is_empty(), "expired stages must reap their workers");
+}
+
+async fn scenario(
+    nodes: usize,
+    universes: usize,
+    slots: u32,
+    stress: bool,
+    progress: Arc<Progress>,
+) {
+    progress.report("start");
+    eprintln!(
+        "SCALE_GEOMETRY {}",
+        json!({"nodes":nodes,"universes":universes,
+        "slots":slots,"stress":stress,"runtime_workers":if stress {16} else {4},
+        "limits":std::fs::read_to_string("/proc/self/limits").ok(),
+        "ephemeral_port_range":std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()})
+    );
     let start = Instant::now();
     let baseline = sample();
     let mut ca = Authority::generate(unix_now(), 86400, 60).unwrap();
@@ -407,6 +743,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
                 pod_name: format!("pod-{i}"),
             },
         );
+        progress.credentials.store(i + 1, Ordering::Relaxed);
     }
     let mut shards = BTreeMap::new();
     let mut references = BTreeMap::new();
@@ -435,6 +772,8 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
         },
     );
     subscriptions.set_fence(Some("scale".into()));
+    *progress.subscriptions.lock().unwrap() = Some(subscriptions.clone());
+    progress.enter("initial topology install");
     for generation in &mut generations {
         generation.revision = 1;
         let owners = place(
@@ -463,15 +802,33 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
     let router = subscriptions.router();
     let accepts = Arc::new(Semaphore::new(128));
     let accept_task = tokio::spawn(async move {
+        // Owning the connection tasks ensures aborting the listener also aborts
+        // its children, including TLS handshakes queued behind admission.
+        let mut servers = tokio::task::JoinSet::new();
         loop {
-            let (raw, _) = listener.accept().await.unwrap();
+            let accepted = tokio::select! {
+                result = servers.join_next(), if !servers.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        eprintln!("SCALE_SERVER task failed: {error}");
+                    }
+                    continue;
+                },
+                accepted = listener.accept() => accepted,
+            };
+            let (raw, _) = accepted.unwrap();
             raw.set_nodelay(true).unwrap();
             let server = server.clone();
             let router = router.clone();
             let permits = accepts.clone();
-            tokio::spawn(async move {
+            servers.spawn(async move {
                 let permit = permits.acquire_owned().await.unwrap();
-                let (tls, peer) = server.accept(raw, true).await.unwrap();
+                let (tls, peer) = match server.accept(raw, true).await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("SCALE_SERVER TLS accept failed: {error}");
+                        return;
+                    }
+                };
                 drop(permit);
                 let _ = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
@@ -497,32 +854,73 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
     let (finish, finished) = watch::channel(false);
     let connections = Arc::new(Semaphore::new(128));
     let mut workers = tokio::task::JoinSet::new();
+    progress.enter("initial fanout");
     let phase_start = Instant::now();
     let cpu_start = sample();
-    for (node, boot, config) in clients {
+    for (index, (node, boot, config)) in clients.into_iter().enumerate() {
         let events = events.clone();
         let mut finished = finished.clone();
         let connections = connections.clone();
+        let progress = ClientProgress {
+            fleet: progress.clone(),
+            index,
+        };
         workers.spawn(async move {
-            let permit=bounded(10,"connection admission",connections.acquire()).await.unwrap(); let mut stream=connect(address,config.clone()).await; drop(permit);
-            send(&mut stream,&boot,"").await;
-            let (mut cursor,revision,bytes,latency)=receive(&mut stream,&node).await.unwrap(); assert_eq!(revision,1);
-            events.send((0,bytes,latency)).await.unwrap();
-            loop { send(&mut stream,&boot,&cursor).await; if let Some((next,revision,bytes,latency))=receive(&mut stream,&node).await { assert_eq!(revision,2);cursor=next;events.send((1,bytes,latency)).await.unwrap();break; } }
-            drop(stream);
-            let permit=bounded(10,"reconnect admission",connections.acquire()).await.unwrap(); let mut stream=connect(address,config).await; drop(permit);
-            send(&mut stream,&boot,&cursor).await;
-            events.send((2,0,0.)).await.unwrap();
-            loop {
-                tokio::select! {
-                    _ = finished.changed() => break,
-                    response = receive(&mut stream,&node) => { assert!(response.is_none()); send(&mut stream,&boot,&cursor).await; }
+            let work = async {
+                let permit = progress
+                    .bounded(10, 1, connections.acquire())
+                    .await
+                    .unwrap();
+                let mut stream = connect(address, config.clone(), &progress).await;
+                drop(permit);
+                send(&mut stream, &boot, "", &progress).await;
+                let (mut cursor, revision, bytes, latency) =
+                    receive(&mut stream, &node, &progress).await.unwrap();
+                assert_eq!(revision, 1);
+                if !progress.event(&events, (0, bytes, latency)).await {
+                    return;
                 }
+                progress.fleet.phases[index].store(1, Ordering::Relaxed);
+                loop {
+                    send(&mut stream, &boot, &cursor, &progress).await;
+                    if let Some((next, revision, bytes, latency)) =
+                        receive(&mut stream, &node, &progress).await
+                    {
+                        assert_eq!(revision, 2);
+                        cursor = next;
+                        if !progress.event(&events, (1, bytes, latency)).await {
+                            return;
+                        }
+                        break;
+                    }
+                }
+                drop(stream);
+                progress.fleet.phases[index].store(2, Ordering::Relaxed);
+                let permit = progress
+                    .bounded(10, 9, connections.acquire())
+                    .await
+                    .unwrap();
+                let mut stream = connect(address, config, &progress).await;
+                drop(permit);
+                send(&mut stream, &boot, &cursor, &progress).await;
+                if !progress.event(&events, (2, 0, 0.)).await {
+                    return;
+                }
+                loop {
+                    assert!(receive(&mut stream, &node, &progress).await.is_none());
+                    send(&mut stream, &boot, &cursor, &progress).await;
+                }
+            };
+            // Sender drop cancels every phase, not just the final unchanged poll.
+            tokio::select! {
+                biased;
+                _ = finished.changed() => {},
+                _ = work => {},
             }
-            // Cancellation closes the TLS stream with the unchanged poll pending.
-            drop(stream);
+            progress.enter(10);
         });
     }
+    drop(events);
     let latencies = |mut values: Vec<f64>| {
         values.sort_by(f64::total_cmp);
         json!({"p50_seconds":values[values.len()/2],"p99_seconds":values[values.len()*99/100],"max_seconds":values[values.len()-1],"over_35_seconds":values.iter().filter(|v| **v>35.).count()})
@@ -538,6 +936,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
             stage_deadline,
             "initial fanout",
             completed,
+            &progress,
         )
         .await;
         assert_eq!(phase, 0);
@@ -545,6 +944,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
         initial_latency.push(latency);
     }
     let initial = json!({"wall_seconds":phase_start.elapsed().as_secs_f64(),"cpu_start":cpu_start,"resources":sample(),"bytes":initial_bytes,"qps":nodes as f64/phase_start.elapsed().as_secs_f64(),"first_byte":latencies(initial_latency)});
+    progress.enter("initial held requests");
     await_waiters(&subscriptions, nodes, 3, "initial held requests").await;
     let held_start = sample();
     tokio::time::sleep(Duration::from_millis(if stress { 1000 } else { 100 })).await;
@@ -554,6 +954,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
     let held = json!({"before":held_start,"after":sample(),"waiters":subscriptions.waiter_count(),"cache":subscriptions.cache_usage()});
     let fanout_start = Instant::now();
     let fanout_cpu = sample();
+    progress.enter("publish/reconnect");
     for generation in &mut generations {
         generation.revision = 2;
         generation.volumes[0].cache_generation = 2;
@@ -572,6 +973,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
             stage_deadline,
             "publish/reconnect",
             delivered + reconnected,
+            &progress,
         )
         .await;
         match phase {
@@ -585,11 +987,13 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
         };
     }
     let fanout = json!({"wall_seconds":fanout_start.elapsed().as_secs_f64(),"cpu_start":fanout_cpu,"resources":sample(),"bytes":fanout_bytes,"qps":nodes as f64/fanout_start.elapsed().as_secs_f64(),"first_byte_including_held_time":latencies(fanout_latency)});
+    progress.enter("reconnected held requests");
     await_waiters(&subscriptions, nodes, 3, "reconnected held requests").await;
     assert!(subscriptions.cache_usage().0 <= 64 * 1024 * 1024);
     assert_eq!(subscriptions.cache_usage().1, nodes);
     let reconnect = sample();
     tokio::time::sleep(Duration::from_millis(if stress { 1000 } else { 100 })).await;
+    progress.enter("teardown");
     finish.send(true).unwrap();
     bounded(2, "client teardown", async {
         while let Some(result) = workers.join_next().await {
@@ -598,6 +1002,7 @@ async fn scenario(nodes: usize, universes: usize, slots: u32, stress: bool) {
     })
     .await;
     await_waiters(&subscriptions, 0, 2, "server teardown").await;
+    progress.enter("complete");
     println!(
         "SCALE_RESULT {}",
         json!({"nodes":nodes,"universes":universes,"geometry_slots":slots,"transport":"real TLS1.3 HTTP1 loopback","runtime_workers":if stress {16} else {4},"baseline":baseline,"setup":setup,"initial":initial,"held":held,"fanout_and_reconnect":fanout,"reconnect_held":reconnect,"final":sample(),"cache":subscriptions.cache_usage()})

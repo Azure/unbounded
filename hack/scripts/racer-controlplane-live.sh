@@ -13,5 +13,7 @@ set -euo pipefail
 export RACER_REQUIRE_LIVE=1
 log=$(mktemp "$TMPDIR/racer-live-run-XXXXXX.log")
 printf 'Campaign output: %s\n' "$log"
+# Select both tests once; a reduced-regression failure must not suppress the
+# independent production campaign or require rerunning that campaign twice.
 timeout --signal=INT --kill-after=30s 15m \
-    go test -mod=readonly -tags=e2e ./e2e/racer-controlplane -run '^TestProductionBinaryCampaign$' -count=1 -v -timeout=12m "$@" 2>&1 | tee "$log"
+    go test -mod=readonly -tags=e2e ./e2e/racer-controlplane -run '^(TestColdObjectMultiPeer|TestProductionBinaryCampaign)$' -count=1 -v -timeout=12m "$@" 2>&1 | tee "$log"

@@ -44,6 +44,45 @@ The harness enables `RACER_HTTP_DIAGNOSTICS=1` on dataplanes to log typed
 transport failures. See `designs/racer-live-failure.md` for the resolved
 peer-connection retirement regression and diagnostic context.
 
+## Cold-object HTTP 412 regression
+
+The subsequent test audit failed at the first `/live-payload-0` read before CA
+rotation. The origin fixture omitted `Content-Type`: a bodyless HEAD had no type,
+but Go's HTTP server sniffed `application/octet-stream` on GET. The dataplane's
+`PageRequest::validate_backend` rejects changed representation metadata with
+`MetadataChanged`, which the HTTP boundary maps to 412 even when ETags match.
+The fixture now explicitly sends the same content type on HEAD and every page.
+Its SHA-256-shaped ETag remains an opaque representation identity.
+
+`TestBackendWireRepresentation` checks the actual HTTP wire headers, full and
+partial pages, and rejection of stale validators. `TestColdObjectMultiPeer`
+isolates cold SDK HEAD/GET requests through two production dataplanes, asserts
+verified bytes and actual peer HTTP traffic, and omits the larger campaign's
+storage transitions, failover, and CA rotation. With the prerequisites above,
+run these checks serially before the full campaign:
+
+```sh
+go test -mod=readonly -race ./e2e/racer/fixture -count=1
+RACER_REQUIRE_LIVE=1 timeout --signal=INT --kill-after=30s 5m \
+  go test -mod=readonly -tags=e2e ./e2e/racer-controlplane \
+  -run '^TestColdObjectMultiPeer$' -count=1 -v -timeout=4m
+bash hack/scripts/racer-controlplane-live.sh
+```
+
+Non-periodic observations include each node-local origin's hit ledger: method,
+target, version, If-Match, range, response ETag/content type, and status. SDK
+payload failures also report the HEAD snapshot. These diagnostics distinguish
+an origin rejection from a downstream metadata rejection without retrying a
+failed payload request.
+
+The corrected fixture passed both live tests on September 23, 2026 with rebuilt
+release binaries: the cold-object regression passed in 23.96 seconds, and the
+full campaign passed in 216.36 seconds with 3,078 verified SDK reads across CA
+generations 1 through 4, old-root retirement, and dataplane restart. The preserved
+log is `tmp/racer-test-audit/implementation/live-campaign.log`; its corresponding
+artifact directories are `racer-live-artifacts-390167374` (cold-object) and
+`racer-live-artifacts-3983950886` (full campaign) in that same directory.
+
 ## Exercised contract
 
 Two Rust control-plane subprocesses compete for the actual API Lease. Three

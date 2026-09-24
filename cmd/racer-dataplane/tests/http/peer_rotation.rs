@@ -3,8 +3,18 @@
 
 #[test]
 fn peer_rotation_preserves_head_and_object_reads() {
+    run_peer_rotation(false);
+}
+
+#[test]
+#[ignore = "full production-duration TLS rotation; run explicitly in the timing lane"]
+fn peer_rotation_preserves_head_and_object_reads_full_duration() {
+    run_peer_rotation(true);
+}
+
+fn run_peer_rotation(full_duration: bool) {
     let status = std::process::Command::new("timeout")
-        .args(["--signal=KILL", "90s"])
+        .args(["--signal=KILL", if full_duration { "90s" } else { "30s" }])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -12,18 +22,28 @@ fn peer_rotation_preserves_head_and_object_reads() {
             "--ignored",
             "--nocapture",
         ])
-        .env("RACER_PEER_ROTATION_CHILD", "1")
+        .env(
+            "RACER_PEER_ROTATION_CHILD",
+            if full_duration { "full" } else { "fast" },
+        )
         .status()
         .unwrap();
-    assert!(status.success());
+    assert!(status.success(), "peer rotation child failed: {status}");
 }
 
 #[test]
 #[ignore = "bounded real TLS rotation subprocess"]
 fn peer_rotation_child() {
-    if std::env::var_os("RACER_PEER_ROTATION_CHILD").is_none() {
-        return;
-    }
+    let full_duration = match std::env::var("RACER_PEER_ROTATION_CHILD").as_deref() {
+        Ok("full") => true,
+        Ok("fast") => false,
+        _ => panic!("invoke the bounded peer_rotation_preserves_head_and_object_reads parent"),
+    };
+    let grace = if full_duration {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(1)
+    };
     let Some(mut ring) = crate::conformance::kernel_ring(16, uring::Config::default()) else {
         return;
     };
@@ -32,10 +52,32 @@ fn peer_rotation_child() {
         Backend::new(&origin.local_addr().unwrap().to_string(), "rotation-origin").unwrap();
     let body = b"rotation object bytes";
     let etag = crate::conformance::etag(body);
+    origin.set_nonblocking(true).unwrap();
     let origin_thread = thread::spawn(move || {
+        let end = Instant::now()
+            + if full_duration {
+                Duration::from_secs(80)
+            } else {
+                Duration::from_secs(20)
+            };
         // Five distinct metadata keys and one page miss.
         for _ in 0..6 {
-            let (mut socket, _) = origin.accept().unwrap();
+            let (mut socket, _) = loop {
+                assert!(Instant::now() < end, "rotation origin accept deadline");
+                match origin.accept() {
+                    Ok(pair) => break pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("rotation origin accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let headers = request(&mut socket);
             if headers.starts_with("HEAD ") {
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", body.len()).unwrap();
@@ -79,7 +121,7 @@ fn peer_rotation_child() {
         provider,
         &BTreeMap::from([(bid.node.clone(), bid.clone())]),
     );
-    let objects: Vec<_> = (0..)
+    let objects: Vec<_> = (0..10000)
         .map(|i| format!("/rotation-{i}"))
         .filter(|t| {
             let key = cache::PeerDescriptor::metadata(t)
@@ -96,6 +138,7 @@ fn peer_rotation_child() {
         })
         .take(5)
         .collect();
+    assert_eq!(objects.len(), 5, "could not find five remote-owned keys");
     let mut owner = Handler::new(cache(&backend, 4), backend);
     owner.set_authentication(peer_policy(3, 2));
     config.volumes[0].peers = vec![aid.node.clone()];
@@ -170,23 +213,38 @@ fn peer_rotation_child() {
         }
         assert_eq!(owner.connections(), 1);
         let handshakes = crate::tls::global_counters().handshakes;
-        owner.install_tls(
-            ca.context(&bid, false),
-            ExpectedPeer::Identity(aid.clone()),
-            revision,
-            u64::MAX,
-        );
+        if full_duration {
+            owner.install_tls(
+                ca.context(&bid, false),
+                ExpectedPeer::Identity(aid.clone()),
+                revision,
+                u64::MAX,
+            );
+        } else {
+            owner.install_tls_with_grace(
+                ca.context(&bid, false),
+                ExpectedPeer::Identity(aid.clone()),
+                revision,
+                u64::MAX,
+                grace,
+            );
+        }
         // Keep the client pool young while only the remote credential changes.
-        // Refresh via a real peer request halfway through the production 30s grace.
-        thread::sleep(Duration::from_secs(15));
+        // Refresh via a real peer request halfway through the selected grace.
+        thread::sleep(grace / 2);
         read(&mut ring, &mut ingress, &mut owner, &objects[index], true);
         assert_eq!(
             crate::tls::global_counters().handshakes,
             handshakes,
             "must reuse actual peer TLS connection"
         );
-        thread::sleep(Duration::from_millis(15100));
-        for _ in 0..32 {
+        thread::sleep(grace / 2 + Duration::from_millis(100));
+        let retired_by = Instant::now() + Duration::from_secs(2);
+        while owner.connections() != 0 {
+            assert!(
+                Instant::now() < retired_by,
+                "old credential connection did not retire"
+            );
             ring.progress().unwrap();
             owner.poll(&mut ring, 64).unwrap();
         }

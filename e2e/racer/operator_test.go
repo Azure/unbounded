@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -171,7 +172,8 @@ func (c *cluster) overrideDocument() string {
 	// Keep kind's CNI: net is an unconditional cluster component, so park its
 	// workloads using supported overrides. Other components are disabled on Site.
 	// The Racer main container keeps shipping startup, Unconfined, capabilities,
-	// Guaranteed CPU/memory, and memlock policy. Only its sparse slab is smaller.
+	// Guaranteed CPU/memory, and memlock policy. Its one shard uses the minimum
+	// supported 512 MiB sparse slab, leaving capacity for the full read campaign.
 	return fmt.Sprintf(`apiVersion: %s
 overrides:
   - component: net
@@ -227,7 +229,7 @@ overrides:
                   - name: RACER_SLAB_PATH
                     value: /e2e-cache/cache.slab
                   - name: RACER_SLAB_SIZE
-                    value: "134217728"
+                    value: "536870912"
 `, override.APIVersion, c.images.control, c.images.control, c.images.data)
 }
 
@@ -266,6 +268,34 @@ func TestOperatorFixturePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Snapshot before applying overrides. TestShippingDataplaneProfile owns the
+	// exact startup policy; this fixture must preserve the entire shipping script.
+	var shipping *core.Container
+
+	for _, op := range data.Operations {
+		if op.Object.GetKind() != "DaemonSet" {
+			continue
+		}
+
+		b, err := json.Marshal(op.Object)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var ds apps.DaemonSet
+		decode(t, b, &ds)
+
+		if shipping != nil || len(ds.Spec.Template.Spec.Containers) != 1 {
+			t.Fatal("expected one shipping dataplane DaemonSet with one main container")
+		}
+
+		shipping = ds.Spec.Template.Spec.Containers[0].DeepCopy()
+	}
+
+	if shipping == nil {
+		t.Fatal("shipping dataplane DaemonSet missing")
+	}
+
 	control.Operations = append(control.Operations, data.Operations...)
 
 	netPlan, _, err := operatornet.New().Plan(t.Context(), env, []machina.Site{*site})
@@ -279,6 +309,8 @@ func TestOperatorFixturePlan(t *testing.T) {
 	if report.Failed() || len(report.Workloads) != 4 {
 		t.Fatalf("apply fixture overrides: %+v", report)
 	}
+
+	dataplaneChecked := false
 
 	for _, op := range control.Operations {
 		if op.Component == "net" {
@@ -319,18 +351,26 @@ func TestOperatorFixturePlan(t *testing.T) {
 		var ds apps.DaemonSet
 		decode(t, b, &ds)
 
+		if dataplaneChecked || len(ds.Spec.Template.Spec.Containers) != 1 || len(ds.Spec.Template.Spec.InitContainers) != 1 {
+			t.Fatal("expected one fixture dataplane DaemonSet with main and bootstrap containers")
+		}
+
+		dataplaneChecked = true
 		main := ds.Spec.Template.Spec.Containers[0]
 
-		wantCommand := strings.Join([]string{
-			"ulimit -l 262144",
-			". /bootstrap/identity",
-			"chgrp 65532 /dev/racer",
-			"chmod 2770 /dev/racer",
-			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v4/config"`,
-			"exec /usr/local/bin/racer-dataplane",
-		}, "\n")
-		if main.Image != c.images.data || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined || strings.Join(main.Command, " ") != "/bin/sh -ec" || len(main.Args) != 1 || main.Args[0] != wantCommand {
-			t.Fatal("fixture lost the shipping runtime startup")
+		if main.Image != c.images.data || main.SecurityContext == nil || main.SecurityContext.SeccompProfile == nil || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined {
+			t.Fatal("fixture lost the shipping runtime image or seccomp profile")
+		}
+
+		if !slices.Equal(main.Command, shipping.Command) || !slices.Equal(main.Args, shipping.Args) {
+			t.Fatalf("fixture changed shipping startup: command = %q, want %q; args = %q, want %q", main.Command, shipping.Command, main.Args, shipping.Args)
+		}
+
+		for name, value := range map[string]string{"RACER_SLAB_SIZE": "536870912", "RACER_SHARDS": "1"} {
+			index := slices.IndexFunc(main.Env, func(env core.EnvVar) bool { return env.Name == name })
+			if index < 0 || main.Env[index].Value != value || main.Env[index].ValueFrom != nil {
+				t.Fatalf("fixture needs one supported 512 MiB shard: %s must be %s", name, value)
+			}
 		}
 
 		for _, container := range []core.Container{main, ds.Spec.Template.Spec.InitContainers[0]} {
@@ -338,6 +378,10 @@ func TestOperatorFixturePlan(t *testing.T) {
 				t.Fatal("fixture changed shipping Guaranteed CPU/memory resources")
 			}
 		}
+	}
+
+	if !dataplaneChecked {
+		t.Fatal("fixture dataplane DaemonSet missing")
 	}
 }
 
