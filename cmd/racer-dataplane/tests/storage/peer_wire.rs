@@ -170,8 +170,8 @@ fn authorization_and_content_type_do_not_change_content_identity_or_placement() 
     use super::{Object, Record};
     let mut a = Object::new(&[3; 32], "/same").unwrap();
     let mut b = a.clone();
-    a.authorization = crate::authorization::Authorization::new("Bearer a").unwrap();
-    b.authorization = crate::authorization::Authorization::new("Bearer b").unwrap();
+    a.origin_data = crate::origin_data::OriginData::new(b"Bearer a").unwrap();
+    b.origin_data = crate::origin_data::OriginData::new(b"Bearer b").unwrap();
     assert_eq!(a.metadata_key().0, b.metadata_key().0);
     let record = std::rc::Rc::new(Record {
         checksum: Checksum([7; 32]),
@@ -190,7 +190,7 @@ fn authorization_and_content_type_do_not_change_content_identity_or_placement() 
         panic!("page")
     };
     assert_eq!(page.content_type(), record.content_type);
-    assert_eq!(page.authorization().as_str(), None);
+    assert_eq!(page.origin_data().as_bytes(), b"");
     assert_eq!(page.key(), record.page(&a, 0).unwrap().key());
 }
 

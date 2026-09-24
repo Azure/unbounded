@@ -471,7 +471,7 @@ struct PageKey([u8; 32]);
 struct Object {
     key: ObjectKey,
     target: Rc<str>,
-    authorization: crate::authorization::Authorization,
+    origin_data: crate::origin_data::OriginData,
 }
 impl Object {
     fn new(namespace: &[u8; 32], target: &str) -> Result<Self> {
@@ -483,7 +483,7 @@ impl Object {
         Ok(Self {
             key: ObjectKey(digest(b"object", &[namespace, path.as_bytes()])),
             target: target.into(),
-            authorization: Default::default(),
+            origin_data: Default::default(),
         })
     }
     fn metadata_key(&self) -> MetadataKey {
@@ -573,8 +573,8 @@ impl PageRequest {
     pub fn content_type(&self) -> crate::metadata::ContentType {
         self.metadata.content_type
     }
-    pub fn authorization(&self) -> &crate::authorization::Authorization {
-        &self.object.authorization
+    pub fn origin_data(&self) -> &crate::origin_data::OriginData {
+        &self.object.origin_data
     }
     pub fn target(&self) -> &str {
         &self.object.target
@@ -647,8 +647,8 @@ pub(crate) fn benchmark_request(metadata: bool, record: Record) -> UpstreamReque
     }
 }
 impl MetadataRequest {
-    pub fn authorization(&self) -> &crate::authorization::Authorization {
-        &self.object.authorization
+    pub fn origin_data(&self) -> &crate::origin_data::OriginData {
+        &self.object.origin_data
     }
     pub fn target(&self) -> &str {
         &self.object.target
@@ -779,10 +779,10 @@ pub enum UpstreamRequest {
     PeerPage(PageRequest),
 }
 impl UpstreamRequest {
-    pub fn authorization(&self) -> &crate::authorization::Authorization {
+    pub fn origin_data(&self) -> &crate::origin_data::OriginData {
         match self {
-            Self::BackendMetadata(m) | Self::PeerMetadata(m) => m.authorization(),
-            Self::BackendPage(p) | Self::PeerPage(p) => p.authorization(),
+            Self::BackendMetadata(m) | Self::PeerMetadata(m) => m.origin_data(),
+            Self::BackendPage(p) | Self::PeerPage(p) => p.origin_data(),
         }
     }
 }
@@ -1429,8 +1429,8 @@ impl Cache {
         context: &Context,
     ) -> Result<Fault<U>> {
         match &mut spec {
-            Spec::Metadata(object) => object.authorization = context.authorization.clone(),
-            Spec::Page(page) => page.object.authorization = context.authorization.clone(),
+            Spec::Metadata(object) => object.origin_data = context.origin_data.clone(),
+            Spec::Page(page) => page.object.origin_data = context.origin_data.clone(),
         }
         let limit = self.limits.active_faults
             - if internal {
@@ -1740,7 +1740,7 @@ impl Cache {
                 b"credential-flight",
                 &[
                     &scope.value,
-                    &fault.context.authorization.fingerprint(),
+                    &fault.context.origin_data.fingerprint(),
                     content_type.as_bytes().unwrap_or_default(),
                 ],
             );

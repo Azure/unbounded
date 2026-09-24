@@ -10,7 +10,7 @@ use std::{cell::RefCell, rc::Rc};
 #[derive(Clone)]
 pub struct Context {
     namespace: Namespace,
-    pub(super) authorization: crate::authorization::Authorization,
+    pub(super) origin_data: crate::origin_data::OriginData,
     pub(super) crypto: Option<Rc<RefCell<crate::crypto::Worker>>>,
 }
 
@@ -18,7 +18,7 @@ impl Context {
     pub fn new(namespace: Namespace) -> Self {
         Self {
             namespace,
-            authorization: Default::default(),
+            origin_data: Default::default(),
             crypto: None,
         }
     }
@@ -31,11 +31,8 @@ impl Context {
     pub fn namespace(&self) -> Namespace {
         self.namespace
     }
-    pub fn with_authorization(
-        mut self,
-        authorization: crate::authorization::Authorization,
-    ) -> Self {
-        self.authorization = authorization;
+    pub fn with_origin_data(mut self, origin_data: crate::origin_data::OriginData) -> Self {
+        self.origin_data = origin_data;
         self
     }
 }

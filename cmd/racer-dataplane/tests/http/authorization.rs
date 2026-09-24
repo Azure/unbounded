@@ -45,7 +45,9 @@ fn multihop(routed: bool) {
             let concurrent = concurrent.clone();
             workers.push(thread::spawn(move || {
                 let wire = request(&mut socket);
-                let auth = wire.lines().find_map(|l| l.strip_prefix("Authorization: ")).unwrap();
+                let encoded = wire.lines().find_map(|l| l.strip_prefix("Racer-Origin-Data: ")).unwrap();
+                let data = crate::origin_data::OriginData::from_encoded(encoded).unwrap();
+                let auth = std::str::from_utf8(data.as_bytes()).unwrap();
                 let method = wire.split(' ').next().unwrap();
                 let target = wire.split(' ').nth(1).unwrap();
                 let status = match auth {
@@ -183,7 +185,8 @@ fn multihop(routed: bool) {
             clients.push(thread::spawn(move || {
                 let mut socket = UnixStream::connect(path).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-                write!(socket, "GET {target} HTTP/1.1\r\nHost: cache\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n").unwrap();
+                let encoded = openssl::base64::encode_block(auth.as_bytes());
+                write!(socket, "GET {target} HTTP/1.1\r\nHost: cache\r\nRacer-Origin-Data: {encoded}\r\nConnection: close\r\n\r\n").unwrap();
                 let headers = request(&mut socket);
                 assert!(headers.starts_with(&format!("HTTP/1.1 {code} ")), "{headers}");
                 if code == 200 {

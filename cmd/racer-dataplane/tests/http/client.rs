@@ -1628,10 +1628,10 @@ mod idle_close {
         }
         fn head(&mut self) -> io::Result<()> {
             let (c, permit) = self.origin.connection()?;
-            let auth = crate::authorization::Authorization::new(&"h".repeat(65536)).unwrap();
+            let auth = crate::origin_data::OriginData::new(&vec![b'h'; 65536]).unwrap();
             let mut e = c
                 .head(
-                    Request::new("/value", &[])?.with_authorization(&auth),
+                    Request::new("/value", &[])?.with_origin_data(&auth),
                     crate::environment::now() + Duration::from_secs(2),
                 )?
                 .retry_idle_backend(&Default::default());
@@ -1668,14 +1668,14 @@ mod idle_close {
         }
         fn get(&mut self) -> io::Result<()> {
             let (c, permit) = self.origin.connection()?;
-            let auth = crate::authorization::Authorization::new(&"g".repeat(65536)).unwrap();
+            let auth = crate::origin_data::OriginData::new(&vec![b'g'; 65536]).unwrap();
             let fill = self.local.pool().private_fill().unwrap();
             let (authority, destination) = fill.split_destination();
             let address = destination.region().region.address;
             let mut e = c
                 .get(
                     Request::new("/value", &[("Range", "bytes=0-2"), ("If-Match", "\"v1\"")])?
-                        .with_authorization(&auth),
+                        .with_origin_data(&auth),
                     destination,
                     crate::environment::now() + Duration::from_secs(2),
                 )?
@@ -1806,7 +1806,7 @@ mod idle_close {
             assert_eq!(f.origin.breaker.active(), 0);
             for request in &f.requests[requests..] {
                 if get {
-                    assert_eq!(request, format!("GET /value HTTP/1.1\r\nHost: origin\r\nAuthorization: {}\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n", "g".repeat(65536)).as_bytes());
+                    assert_eq!(request, format!("GET /value HTTP/1.1\r\nHost: origin\r\nRacer-Origin-Data: {}\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n", openssl::base64::encode_block(&vec![b'g'; 65536])).as_bytes());
                 } else {
                     assert_eq!(request, &f.requests[0]);
                 }
@@ -1818,10 +1818,10 @@ mod idle_close {
 #[test]
 fn authorization_request_buffers_are_on_demand_and_separately_bounded() {
     let connection = || Connection::new("127.0.0.1:80".parse().unwrap(), "origin").unwrap();
-    let auth = crate::authorization::Authorization::new(&"x".repeat(65536)).unwrap();
+    let auth = crate::origin_data::OriginData::new(&vec![b'x'; 65536]).unwrap();
     let exchange = connection()
         .head(
-            Request::new("/", &[]).unwrap().with_authorization(&auth),
+            Request::new("/", &[]).unwrap().with_origin_data(&auth),
             deadline(),
         )
         .unwrap();
@@ -1829,20 +1829,28 @@ fn authorization_request_buffers_are_on_demand_and_separately_bounded() {
         panic!("expected new connection")
     };
     let bytes = &payload.scratch[..exchange.0.request_len];
-    assert!(bytes.windows(15).any(|p| p == b"Authorization: "));
-    assert!(payload.scratch.len() <= SCRATCH_SIZE + 65536 + 17);
+    assert!(bytes.windows(19).any(|p| p == b"Racer-Origin-Data: "));
+    assert!(
+        payload.scratch.len() <= SCRATCH_SIZE + crate::origin_data::MAX_ENCODED_ORIGIN_DATA + 21
+    );
     let normal = "n".repeat(8192);
     assert!(
         connection()
             .head(
                 Request::new("/", &[("X-Normal", &normal)])
                     .unwrap()
-                    .with_authorization(&auth),
+                    .with_origin_data(&auth),
                 deadline()
             )
             .is_err()
     );
-    assert!(Request::new("/", &[("Authorization", "a"), ("authorization", "b")]).is_err());
+    assert!(
+        Request::new(
+            "/",
+            &[("Racer-Origin-Data", "YQ=="), ("racer-origin-data", "Yg==")]
+        )
+        .is_err()
+    );
     let exchange = connection()
         .head(Request::new("/", &[]).unwrap(), deadline())
         .unwrap();

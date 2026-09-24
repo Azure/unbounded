@@ -147,10 +147,10 @@ pub(crate) fn field(bytes: &[u8], start: usize, stop: usize) -> io::Result<Heade
 }
 
 /// Account partial request headers before growing receive storage. Only one
-/// Authorization field has a separate budget; all other bytes remain at 8 KiB.
+/// Racer-Origin-Data field has a separate budget; all other bytes remain at 8 KiB.
 pub(crate) fn request_budget(bytes: &[u8]) -> Result<(), u16> {
     let mut normal = 0;
-    let mut auth = false;
+    let mut data = false;
     let mut start = 0;
     let mut first = true;
     while start < bytes.len() {
@@ -160,38 +160,35 @@ pub(crate) fn request_budget(bytes: &[u8]) -> Result<(), u16> {
             .map(|n| start + n);
         let stop = end.unwrap_or(bytes.len());
         let line = &bytes[start..stop];
-        let authorization =
-            !first && line.len() >= 14 && line[..14].eq_ignore_ascii_case(b"authorization:");
+        let origin_data =
+            !first && line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"racer-origin-data:");
         // A split field name must not consume the normal budget before we can
         // identify its independently bounded value.
         if !first
             && end.is_none()
-            && line.len() < 14
-            && b"authorization:"[..line.len()].eq_ignore_ascii_case(line)
+            && line.len() < 18
+            && b"racer-origin-data:"[..line.len()].eq_ignore_ascii_case(line)
         {
             break;
         }
-        if authorization {
-            if auth {
+        if origin_data {
+            if data {
                 return Err(400);
             }
-            auth = true;
-            let raw = &line[14..];
+            data = true;
+            let raw = &line[18..];
             let value = raw.strip_prefix(b" ").unwrap_or(raw);
             let value = if end.is_none() {
                 value.strip_suffix(b"\r").unwrap_or(value)
             } else {
                 value
             };
-            if value.len() > crate::authorization::MAX_AUTHORIZATION {
+            if value.len() > crate::origin_data::MAX_ENCODED_ORIGIN_DATA {
                 return Err(431);
             }
-            if end.is_some()
-                && (value.is_empty()
-                    || !value.iter().all(|b| (32..=126).contains(b))
-                    || trim(value) != value)
-            {
-                return Err(400);
+            if end.is_some() {
+                let encoded = std::str::from_utf8(value).map_err(|_| 400u16)?;
+                crate::origin_data::OriginData::from_encoded(encoded).map_err(|_| 400u16)?;
             }
         } else {
             normal += line.len() + usize::from(end.is_some()) * 2;

@@ -1,4 +1,4 @@
-# Racer authorization and representation contract
+# Racer origin data and representation contract
 
 Racer 1.0 is a clean break. Deploy matching control-plane, SDK, origin adapter,
 and dataplane versions with fresh CA state and slabs. There is no migration or
@@ -23,23 +23,23 @@ generation, epoch, and storage-policy counters retain their operational meanings
 
 ## Local SDK and origin HTTP
 
-- Send at most one `Authorization` field. Its value is optional, opaque, and
+- Send at most one `Racer-Origin-Data` field. Its value is optional, opaque, and
   immutable for the request, including all metadata/page requests and retries.
-  A present value must contain 1 through 65,536 ASCII bytes in `0x20..0x7e`,
-  with no leading/trailing whitespace. There is no scheme parsing. The wire
-  accepts either no space or one space after the colon. Duplicate fields,
-  empty values, tabs, control bytes, and non-ASCII values are rejected with 400;
-  oversized values are rejected with 431.
-- All request bytes other than the Authorization field line have a separate
-  8,192-byte budget. The field line has at most 17 framing bytes in addition
+  It is canonical padded standard base64 of at most 65,536 arbitrary bytes.
+  Empty means absent. There is no application schema parsing. The wire accepts
+  either no space or one space after the colon. Duplicate fields and malformed
+  or noncanonical base64 are rejected with 400; encoded values exceeding
+  87,384 bytes are rejected with 431. Decoded overflow is rejected with 400.
+- All request bytes other than the origin data field line have a separate
+  8,192-byte budget. The field line has at most 21 framing bytes in addition
   to its value. There are at most 64 fields. Receive buffers start at 8 KiB,
-  grow on demand, and cannot exceed 73,745 bytes. Responses remain bounded
+  grow on demand, and cannot exceed 95,597 bytes. Responses remain bounded
   to 8 KiB of headers.
-- Authorization travels in the normal HTTP header, never the target. Only
+- Origin data travels in the dedicated HTTP header, never the target. Only
   explicitly supported metadata is forwarded; this is not a header proxy.
 - Backend HEAD must supply Content-Length and a canonical strong ETag consisting
   of a quoted 64-character lowercase hexadecimal checksum. Backend range GET
-  receives Authorization, Range, If-Match, and Accept-Encoding: identity.
+  receives Racer-Origin-Data, Range, If-Match, and Accept-Encoding: identity.
   HEAD and GET Content-Type must agree, including absence.
 - Optional `Content-Type` is a singleton with at most 256 value bytes. Optional
   `WWW-Authenticate` and `Retry-After` are singletons with at most 1,024 and 128
@@ -52,11 +52,13 @@ generation, epoch, and storage-policy counters retain their operational meanings
   outcomes never trigger owner reselection or unavailable-peer classification.
   A failure before response headers is emitted with zero body; a later streaming
   failure closes the stream because HTTP headers have already been sent.
-- Cache hits are content-addressed and credential-independent. Racer is an
-  authorization pass-through, not an authorization decision cache. Network
-  flights are isolated by process-keyed BLAKE3 credential fingerprints and
+- Cache hits are content-addressed and origin-data-independent. Origin data is
+  input to origin fetches, not per-read authorization. Tenant or representation
+  identity belongs in the namespace/target. Network flights are isolated by
+  process-keyed BLAKE3 origin data fingerprints and
   expected Content-Type. Slab
-  keys, checksums, page placement, and routing remain credential-independent.
+  keys, checksums, page placement, and routing remain origin-data-independent.
+  Origin data may contain secrets; never log, persist, or echo it in diagnostics.
 
 ## Metadata record and slab
 
@@ -159,25 +161,25 @@ degree expansion: each physical node has 23 peers.
 `X-Racer-Attempt` is 96 hexadecimal characters: a 32-byte BLAKE3 digest followed
 by a random 16-byte nonce. Hash input is the concatenation of:
 
-1. ASCII `racer/request-binding/v1` (no terminator).
+1. ASCII `racer/request-binding/origin-data/v1` (no terminator).
 2. LE u32 descriptor length, then the complete decoded descriptor, including
    its outer RC01 chain when present.
-3. LE u32 Authorization value length, then its bytes (zero length if absent).
+3. LE u32 decoded origin data length, then its raw bytes (zero length if absent).
 
-Ingress verifies the digest against the descriptor and normal Authorization
+Ingress verifies the digest against the descriptor and decoded Racer-Origin-Data
 header after authenticating the TLS peer. Failure reports echo this attempt.
 
 ## RDMA control request
 
-Application metadata is an **RA01** envelope inside encrypted TLS control,
+Application metadata is an **RO01** envelope inside encrypted TLS control,
 never DMA-exposed memory:
 
-`RA01 | descriptor_len:LE-u16 | auth_len:LE-u16 | descriptor | auth`
+`RO01 | descriptor_len:LE-u16 | data_len:LE-u16 | descriptor | raw_origin_data`
 
-The descriptor includes the RC01 chain and RB01/RR01/RD01 framing. Zero auth length means absent.
+The descriptor includes the RC01 chain and RB01/RR01/RD01 framing. Zero data length means absent.
 The 4,096-byte control frame has a 112-byte transport header, leaving **3,984
 bytes** for this envelope. RDMA is selected only when
-`8 + descriptor_len + auth_len <= 3984`; otherwise HTTP is selected before
+`8 + descriptor_len + data_len <= 3984`; otherwise HTTP is selected before
 creating an RDMA attempt or acquiring its breaker. This is intentional transport
 selection, not a failed RDMA attempt. Metadata fetches use HTTP.
 

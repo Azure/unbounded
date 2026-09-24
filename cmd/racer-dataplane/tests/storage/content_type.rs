@@ -8,7 +8,7 @@ fn typed(cache: &Cache, name: &[u8]) -> Metadata {
     Rc::make_mut(&mut meta.record).content_type = crate::metadata::ContentType::new(name).unwrap();
     meta.context = meta
         .context
-        .with_authorization(crate::authorization::Authorization::new("Bearer same").unwrap());
+        .with_origin_data(crate::origin_data::OriginData::new(b"Bearer same").unwrap());
     meta
 }
 
@@ -77,7 +77,7 @@ fn content_type_transition_rejects_only_exact_metadata_with_old_fault_alive() {
     let context = a
         .context
         .clone()
-        .with_authorization(crate::authorization::Authorization::new("Bearer late-head").unwrap());
+        .with_origin_data(crate::origin_data::OriginData::new(b"Bearer late-head").unwrap());
     let late = cache.metadata_in(&context, a.target(), deadline()).unwrap();
     let (late, _) = pending(
         cache

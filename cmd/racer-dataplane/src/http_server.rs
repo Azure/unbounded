@@ -704,8 +704,8 @@ impl ReceivingRequest {
             let bytes = c.input.as_ref().unwrap();
             let end = header_end(&bytes[..c.used], &mut self.scan);
             let limit = SCRATCH_SIZE
-                + crate::authorization::MAX_AUTHORIZATION
-                + crate::authorization::HTTP_AUTH_OVERHEAD;
+                + crate::origin_data::MAX_ENCODED_ORIGIN_DATA
+                + crate::origin_data::HTTP_ORIGIN_DATA_OVERHEAD;
             let parsed = match crate::http::request_budget(&bytes[..end.unwrap_or(c.used)]) {
                 Err(status) => Some(Err(status)),
                 Ok(()) => match end {

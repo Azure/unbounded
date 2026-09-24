@@ -935,7 +935,7 @@ fn peer_headers(wire: &str) -> Vec<(String, String)> {
             format!(
                 "{}{}",
                 crate::cache::peer_wire::hex(
-                    crate::authorization::binding(
+                    crate::origin_data::binding(
                         &crate::cache::peer_wire::unhex(wire).unwrap(),
                         &Default::default()
                     )

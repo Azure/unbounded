@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod allocator;
-pub mod authorization;
 pub mod breaker;
 pub mod buffers;
 pub mod cache;
@@ -21,6 +20,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod metrics;
 pub mod negotiation;
+pub mod origin_data;
 pub mod outcome;
 pub mod rdma;
 pub mod runtime;

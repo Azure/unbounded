@@ -401,7 +401,7 @@ impl ControlChannel {
             reason: PeerReason::Unavailable,
             evidence: None,
         };
-        match crate::authorization::rdma_decode(metadata)
+        match crate::origin_data::rdma_decode(metadata)
             .map_err(crate::cache::Error::from)
             .and_then(|(wire, _)| {
                 crate::cache::peer_wire::routed_descriptor(wire)

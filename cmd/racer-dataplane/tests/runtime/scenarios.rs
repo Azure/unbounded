@@ -193,7 +193,7 @@ impl Cluster {
                     format!(
                         "{}{}",
                         crate::cache::peer_wire::hex(
-                            crate::authorization::binding(&bytes, &Default::default()).as_bytes()
+                            crate::origin_data::binding(&bytes, &Default::default()).as_bytes()
                         ),
                         "a".repeat(32)
                     )

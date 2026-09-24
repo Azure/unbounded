@@ -455,20 +455,20 @@ pub(crate) mod owner_health {
 pub struct Request<'a> {
     target: &'a str,
     headers: &'a [(&'a str, &'a str)],
-    authorization: Option<&'a str>,
+    origin_data: Option<&'a str>,
 }
 impl<'a> Request<'a> {
     pub fn new(target: &'a str, headers: &'a [(&'a str, &'a str)]) -> io::Result<Self> {
         if !crate::http::target(target.as_bytes()) {
             return Err(invalid("invalid origin-form request target"));
         }
-        let mut authorization = None;
+        let mut origin_data = None;
         for &(name, v) in headers {
-            if name.eq_ignore_ascii_case("authorization") {
-                if authorization.replace(v).is_some() {
-                    return Err(invalid("duplicate Authorization"));
+            if name.eq_ignore_ascii_case("racer-origin-data") {
+                if origin_data.replace(v).is_some() {
+                    return Err(invalid("duplicate Racer-Origin-Data"));
                 }
-                crate::authorization::Authorization::new(v)?;
+                crate::origin_data::OriginData::from_encoded(v)?;
             }
             if name.is_empty() || !name.bytes().all(token) || !value(v.as_bytes()) {
                 return Err(invalid("invalid request header"));
@@ -494,25 +494,22 @@ impl<'a> Request<'a> {
         Ok(Self {
             target,
             headers,
-            authorization: None,
+            origin_data: None,
         })
     }
 
-    pub(crate) fn with_authorization(
-        mut self,
-        auth: &'a crate::authorization::Authorization,
-    ) -> Self {
-        self.authorization = auth.as_str();
+    pub(crate) fn with_origin_data(mut self, data: &'a crate::origin_data::OriginData) -> Self {
+        self.origin_data = data.encoded();
         self
     }
 
     fn capacity(&self, head: bool, host: &str) -> io::Result<usize> {
         let mut normal = (if head { 5 } else { 4 }) + self.target.len() + 17 + host.len() + 4;
-        let mut auth = self.authorization;
+        let mut data = self.origin_data;
         for &(name, value) in self.headers {
-            if name.eq_ignore_ascii_case("authorization") {
-                if auth.replace(value).is_some() {
-                    return Err(invalid("duplicate Authorization"));
+            if name.eq_ignore_ascii_case("racer-origin-data") {
+                if data.replace(value).is_some() {
+                    return Err(invalid("duplicate Racer-Origin-Data"));
                 }
             } else {
                 normal += name.len() + value.len() + 4;
@@ -521,10 +518,11 @@ impl<'a> Request<'a> {
         if normal > SCRATCH_SIZE {
             return Err(invalid("normal request headers exceed 8 KiB"));
         }
-        Ok(
-            (normal + auth.map_or(0, |v| v.len() + crate::authorization::HTTP_AUTH_OVERHEAD))
-                .max(SCRATCH_SIZE),
-        )
+        Ok((normal
+            + data.map_or(0, |v| {
+                v.len() + crate::origin_data::HTTP_ORIGIN_DATA_OVERHEAD
+            }))
+        .max(SCRATCH_SIZE))
     }
 
     fn encode(self, head: bool, host: &str, mut out: &mut [u8]) -> io::Result<usize> {
@@ -536,9 +534,9 @@ impl<'a> Request<'a> {
             out.write_all(b" HTTP/1.1\r\nHost: ")?;
             out.write_all(host.as_bytes())?;
             out.write_all(b"\r\n")?;
-            if let Some(auth) = self.authorization {
-                out.write_all(b"Authorization: ")?;
-                out.write_all(auth.as_bytes())?;
+            if let Some(data) = self.origin_data {
+                out.write_all(b"Racer-Origin-Data: ")?;
+                out.write_all(data.as_bytes())?;
                 out.write_all(b"\r\n")?;
             }
             for &(name, value) in self.headers {

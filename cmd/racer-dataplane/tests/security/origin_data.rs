@@ -4,27 +4,38 @@ use super::*;
 
 #[test]
 fn exact_limit_opaque_credentials_and_keyed_isolation() {
-    let value = "x".repeat(MAX_AUTHORIZATION);
-    let auth = Authorization::new(&value).unwrap();
-    assert_eq!(auth.as_str(), Some(value.as_str()));
-    assert!(Authorization::new(&(value + "x")).is_err());
+    let value: Vec<u8> = (0..MAX_ORIGIN_DATA).map(|n| n as u8).collect();
+    let data = OriginData::new(&value).unwrap();
+    assert_eq!(data.as_bytes(), value);
+    assert_eq!(
+        OriginData::from_encoded(data.encoded().unwrap())
+            .unwrap()
+            .as_bytes(),
+        value
+    );
+    assert!(OriginData::new(&vec![0; MAX_ORIGIN_DATA + 1]).is_err());
+    assert!(
+        OriginData::from_encoded(&openssl::base64::encode_block(&vec![
+            0;
+            MAX_ORIGIN_DATA + 1
+        ]))
+        .is_err()
+    );
     for bad in [
-        "",
-        " leading",
-        "trailing ",
-        "Bearer\tvalue",
-        "a\r\nb",
-        "a\0b",
-        "a\u{7f}",
-        "é",
+        " eA==", "eA== ", "eA==\r\n", "eA", "eB==", "eA===", "____", "é",
     ] {
-        assert!(Authorization::new(bad).is_err());
+        assert!(
+            OriginData::from_encoded(bad).is_err(),
+            "accepted malformed encoding"
+        );
     }
-    let a = Authorization::new("Bearer credential-a").unwrap();
-    let b = Authorization::new("Bearer credential-b").unwrap();
+    assert!(OriginData::new(b"").unwrap().encoded().is_none());
+    assert!(OriginData::from_encoded("").unwrap().as_bytes().is_empty());
+    let a = OriginData::new(b"\0\xff credential-a").unwrap();
+    let b = OriginData::new(b"\0\xff credential-b").unwrap();
     assert_eq!(a.fingerprint(), a.clone().fingerprint());
     assert_ne!(a.fingerprint(), b.fingerprint());
-    assert_ne!(a.fingerprint(), Authorization::default().fingerprint());
+    assert_ne!(a.fingerprint(), OriginData::default().fingerprint());
     assert_ne!(binding(b"descriptor", &a), binding(b"descriptor", &b));
     assert_ne!(binding(b"descriptor", &a), binding(b"changed", &a));
     let expected = a.fingerprint();
@@ -38,11 +49,11 @@ fn exact_limit_opaque_credentials_and_keyed_isolation() {
 fn rdma_exact_envelope_threshold_and_multihop_forwarding() {
     let descriptor = b"RB01\xe8\x03\0\0RD01\0/object";
     let max = crate::rdma::MAX_METADATA - 8 - descriptor.len();
-    for n in [0, 1, max - 1, max, max + 1, MAX_AUTHORIZATION] {
+    for n in [0, 1, max - 1, max, max + 1, MAX_ORIGIN_DATA] {
         let auth = if n == 0 {
-            Authorization::default()
+            OriginData::default()
         } else {
-            Authorization::new(&"x".repeat(n)).unwrap()
+            OriginData::new(&vec![0xff; n]).unwrap()
         };
         let envelope = rdma_envelope(descriptor, &auth);
         assert_eq!(envelope.is_some(), n <= max);
@@ -51,7 +62,7 @@ fn rdma_exact_envelope_threshold_and_multihop_forwarding() {
             for _ in 0..4 {
                 let (wire, forwarded) = rdma_decode(&envelope).unwrap();
                 assert_eq!(wire, descriptor);
-                assert_eq!(forwarded.as_str(), auth.as_str());
+                assert_eq!(forwarded.as_bytes(), auth.as_bytes());
                 envelope = rdma_envelope(wire, &forwarded).unwrap();
             }
             envelope.push(0);

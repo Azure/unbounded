@@ -166,7 +166,7 @@ fn request(stream: &mut (impl std::io::Read + ?Sized)) -> String {
         stream.read_exact(&mut byte).unwrap();
         bytes.push(byte[0]);
         assert!(
-            bytes.len() <= 8192 + 65536 + 17,
+            bytes.len() <= 8192 + crate::origin_data::MAX_ENCODED_ORIGIN_DATA + 21,
             "HTTP fixture header budget exceeded"
         );
     }
@@ -766,7 +766,7 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
             if peer {
                 fields.push(("X-Racer-Fault".to_owned(), hex(&peer_wire).into_bytes()));
                 fields.push(("X-Racer-Volume".to_owned(), b"test-volume".to_vec()));
-                let binding = crate::authorization::binding(&peer_wire, &Default::default());
+                let binding = crate::origin_data::binding(&peer_wire, &Default::default());
                 fields.push((
                     "X-Racer-Attempt".into(),
                     format!("{}{}", hex(binding.as_bytes()), "0".repeat(32)).into_bytes(),

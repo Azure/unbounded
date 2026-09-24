@@ -1286,11 +1286,14 @@ mod tests {
 fn authorization_limit_duplicates_and_wide_spans() {
     let prefix = "GET / HTTP/1.1\r\nHost: cache\r\nX-Normal: ";
     let wire = format!(
-        "{prefix}{}\r\nAuthorization: {}\r\n\r\n",
+        "{prefix}{}\r\nRacer-Origin-Data: {}\r\n\r\n",
         "x".repeat(8192 - prefix.len() - 4),
-        "a".repeat(65536)
+        openssl::base64::encode_block(&vec![0xff; 65536])
     );
-    assert_eq!(wire.len(), 8192 + 65536 + 17);
+    assert_eq!(
+        wire.len(),
+        8192 + crate::origin_data::MAX_ENCODED_ORIGIN_DATA + 21
+    );
     assert!(parse(wire.as_bytes(), wire.len()).is_ok());
     for n in 8175..8220 {
         assert!(
@@ -1299,22 +1302,26 @@ fn authorization_limit_duplicates_and_wide_spans() {
         );
     }
     for size in [65535, 65536] {
-        let credential = "a".repeat(size);
+        let raw = vec![0xff; size];
+        let credential = openssl::base64::encode_block(&raw);
         let wire = format!(
-            "GET / HTTP/1.1\r\nHost: cache\r\nAuthorization: {credential}\r\nRange: bytes=0-2\r\n\r\n"
+            "GET / HTTP/1.1\r\nHost: cache\r\nRacer-Origin-Data: {credential}\r\nRange: bytes=0-2\r\n\r\n"
         );
         let metadata = parse(wire.as_bytes(), wire.len()).unwrap();
         let headers = Headers {
             bytes: wire.as_bytes(),
             headers: &metadata.headers[..metadata.count],
         };
-        assert_eq!(headers.get("authorization").unwrap().len(), size);
+        assert_eq!(
+            headers.get("racer-origin-data").unwrap().len(),
+            credential.len()
+        );
         assert_eq!(headers.get("range"), Some(b"bytes=0-2".as_slice()));
         assert_eq!(
-            crate::authorization::Authorization::from_headers(headers)
+            crate::origin_data::OriginData::from_headers(headers)
                 .unwrap()
-                .as_str(),
-            Some(credential.as_str())
+                .as_bytes(),
+            raw
         );
         // Every possible CRLF fragmentation near the exact limit is admitted.
         for n in wire.len() - 26..wire.len() {
@@ -1322,10 +1329,19 @@ fn authorization_limit_duplicates_and_wide_spans() {
         }
     }
     for (field, status) in [
-        (format!("Authorization: {}\r\n", "x".repeat(65537)), 431),
-        ("Authorization: a\r\nauthorization: b\r\n".into(), 400),
-        ("Authorization: \r\n".into(), 400),
-        ("Authorization: a\tb\r\n".into(), 400),
+        (
+            format!(
+                "Racer-Origin-Data: {}\r\n",
+                "x".repeat(crate::origin_data::MAX_ENCODED_ORIGIN_DATA + 1)
+            ),
+            431,
+        ),
+        (
+            "Racer-Origin-Data: YQ==\r\nracer-origin-data: Yg==\r\n".into(),
+            400,
+        ),
+        ("Racer-Origin-Data: YR==\r\n".into(), 400),
+        ("Racer-Origin-Data: a\tb\r\n".into(), 400),
         (format!("X-Normal: {}\r\n", "x".repeat(8192)), 431),
     ] {
         let wire = format!("GET / HTTP/1.1\r\nHost: cache\r\n{field}\r\n");

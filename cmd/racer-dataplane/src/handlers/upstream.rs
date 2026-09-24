@@ -362,8 +362,8 @@ impl Provider {
         let (bytes, spent) = self.prepare_budget_wire(&request, service_end)?;
         let wire = hex(&bytes);
         let mut headers = vec![("X-Racer-Fault".to_owned(), wire.as_bytes().to_vec())];
-        if let Some(auth) = request.authorization().as_str() {
-            headers.push(("Authorization".into(), auth.as_bytes().to_vec()));
+        if let Some(data) = request.origin_data().encoded() {
+            headers.push(("Racer-Origin-Data".into(), data.as_bytes().to_vec()));
         }
         if let Some(volume) = &self.volume {
             headers.push(("X-Racer-Volume".into(), volume.as_bytes().to_vec()));
@@ -372,7 +372,7 @@ impl Provider {
         crate::environment::random(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
         let context = format!(
             "{}{}",
-            hex(crate::authorization::binding(&bytes, request.authorization()).as_bytes()),
+            hex(crate::origin_data::binding(&bytes, request.origin_data()).as_bytes()),
             hex(&nonce)
         );
         headers.push(("X-Racer-Attempt".to_owned(), context.as_bytes().to_vec()));

@@ -15,7 +15,7 @@ impl Handler {
         request.set_metric_traffic(traffic);
         let shared_cache = self.cache.clone();
         let mut cache = shared_cache.borrow_mut();
-        let authorization = crate::authorization::Authorization::from_headers(request.headers());
+        let origin_data = crate::origin_data::OriginData::from_headers(request.headers());
         let deadline = request.deadline().min(crate::environment::now() + TIMEOUT);
         let response_deadline = request.response_deadline();
         let mut task = Task {
@@ -46,10 +46,10 @@ impl Handler {
             unreachable!()
         };
         let parsed: cache::Result<Initial> = (|| {
-            let authorization = authorization?;
+            let origin_data = origin_data?;
             let context = cache::Context::new(self.namespace)
                 .with_crypto(self.crypto.clone())
-                .with_authorization(authorization.clone());
+                .with_origin_data(origin_data.clone());
             if let Some(wire) = text(request.headers(), "x-racer-fault")? {
                 if !matches!(request, http::Request::Get(_)) {
                     return Err(invalid("peer faults require GET").into());
@@ -65,7 +65,7 @@ impl Handler {
                     None => return Err(invalid("peer request requires mutual TLS").into()),
                 }
                 let bytes = unhex(wire)?;
-                let binding = hex(crate::authorization::binding(&bytes, &authorization).as_bytes());
+                let binding = hex(crate::origin_data::binding(&bytes, &origin_data).as_bytes());
                 let attempt = text(request.headers(), "x-racer-attempt")?
                     .ok_or_else(|| invalid("missing request binding"))?;
                 if attempt.len() != 96

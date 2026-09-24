@@ -196,12 +196,12 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         crate::negotiation::tests::tls_channels(&ao, &bo, &mut ring, false);
     let end = Instant::now() + Duration::from_secs(5);
     let mut last_deadline = end;
-    let authorization = crate::authorization::Authorization::new("Bearer cyclic-page").unwrap();
+    let data = crate::origin_data::OriginData::new(b"Bearer cyclic-page").unwrap();
     for hop in 0..1 {
         let wire = provider.budget_wire(&request, last_deadline).unwrap();
         let (_, remaining, _, _) = cache::peer_wire::chain(&wire).unwrap().unwrap();
         assert_eq!(remaining, 7 - hop);
-        let wire = crate::authorization::rdma_envelope(&wire, &authorization).unwrap();
+        let wire = crate::origin_data::rdma_envelope(&wire, &data).unwrap();
         let frame = crate::negotiation::control_wire::Frame {
             kind: 1,
             session: [7; 16],
@@ -233,8 +233,8 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         assert_eq!(decoded.value, *page.key());
         assert_eq!(decoded.len, page.len() as u32);
         let metadata = &received[crate::negotiation::control_wire::HEADER..];
-        let (metadata, forwarded) = crate::authorization::rdma_decode(metadata).unwrap();
-        assert_eq!(forwarded.as_str(), authorization.as_str());
+        let (metadata, forwarded) = crate::origin_data::rdma_decode(metadata).unwrap();
+        assert_eq!(forwarded.as_bytes(), data.as_bytes());
         let receiver = if hop % 2 == 0 { &b } else { &a };
         provider = receiver.peer_provider(metadata).unwrap();
         let next_deadline = remote_deadline(metadata, end).unwrap();
@@ -246,7 +246,7 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
             .cache
             .borrow_mut()
             .peer_fault_in::<Provider>(
-                &cache::Context::new(receiver.namespace).with_authorization(forwarded),
+                &cache::Context::new(receiver.namespace).with_origin_data(forwarded),
                 descriptor.with_expected(decoded.value, decoded.len as usize),
                 next_deadline,
             )

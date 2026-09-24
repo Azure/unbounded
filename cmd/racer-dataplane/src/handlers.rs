@@ -487,7 +487,7 @@ impl Upstream for Provider {
         let exchange = connection
             .head(
                 client::Request::new(meta.target(), &[("Accept-Encoding", "identity")])?
-                    .with_authorization(meta.authorization()),
+                    .with_origin_data(meta.origin_data()),
                 service_end,
             )?
             .service_deadline(self.private_service_deadline(service_end, deadline))
@@ -703,8 +703,7 @@ impl Upstream for Provider {
             let rdma_wire = if peer.borrow().rdma.is_some() {
                 let (wire, spent) =
                     self.prepare_budget_wire(&request, self.service_end(deadline))?;
-                let Some(wire) =
-                    crate::authorization::rdma_envelope(&wire, request.authorization())
+                let Some(wire) = crate::origin_data::rdma_envelope(&wire, request.origin_data())
                 else {
                     return self.http_peer_attempt(request, Some(destination), deadline, None);
                 };
@@ -791,7 +790,7 @@ impl Upstream for Provider {
                         connection
                             .get(
                                 client::Request::new(page.target(), &headers)?
-                                    .with_authorization(page.authorization()),
+                                    .with_origin_data(page.origin_data()),
                                 destination,
                                 service_end,
                             )?
@@ -1344,8 +1343,7 @@ impl Handler {
                 self.upstream
                     .metrics
                     .request(crate::metrics::Traffic::PeerRdma);
-                if let Ok((wire, authorization)) =
-                    crate::authorization::rdma_decode(&request.metadata)
+                if let Ok((wire, origin_data)) = crate::origin_data::rdma_decode(&request.metadata)
                     && let Ok((_, descriptor)) = routed_descriptor(wire)
                     && let descriptor = descriptor.with_expected(request.value, request.len)
                     && let Ok(upstream) = self.peer_provider(wire)
@@ -1359,7 +1357,7 @@ impl Handler {
                         cache.peer_fault_in(
                             &cache::Context::new(self.namespace)
                                 .with_crypto(self.crypto.clone())
-                                .with_authorization(authorization),
+                                .with_origin_data(origin_data),
                             descriptor,
                             deadline,
                         )

@@ -516,11 +516,11 @@ fn product_wire_binds_candidate_and_authentication_across_repair() {
     handler.upstream = provider(1);
     let received = handler.peer_provider(&wire).unwrap();
     assert_eq!(received.active.as_ref().unwrap().borrow().cursor, cursor);
-    let authorization = crate::authorization::Authorization::new("Bearer product-wire").unwrap();
-    let envelope = crate::authorization::rdma_envelope(&wire, &authorization).unwrap();
-    let (decoded, auth) = crate::authorization::rdma_decode(&envelope).unwrap();
+    let data = crate::origin_data::OriginData::new(b"Bearer product-wire").unwrap();
+    let envelope = crate::origin_data::rdma_envelope(&wire, &data).unwrap();
+    let (decoded, forwarded) = crate::origin_data::rdma_decode(&envelope).unwrap();
     assert_eq!(decoded, wire);
-    assert_eq!(auth.as_str(), authorization.as_str());
+    assert_eq!(forwarded.as_bytes(), data.as_bytes());
     let mut foreign = wire.clone();
     foreign[38..42].copy_from_slice(&0u32.to_le_bytes());
     assert!(handler.peer_provider(&foreign).is_err());
