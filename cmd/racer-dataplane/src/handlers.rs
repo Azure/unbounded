@@ -8,7 +8,7 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RD01/RR01/RR02/RB01 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RD01/RR01/RB01 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
@@ -582,8 +582,8 @@ impl Upstream for Provider {
         self.peer.is_some()
     }
     fn receive_reserve(&mut self, capacity: usize) -> cache::Result<usize> {
-        // The wire hop allowance decreases even when a receiving peer rebases
-        // placement. Only a fresh local payload may shorten it to fit this pool.
+        // The wire hop allowance decreases at every forwarding hop.
+        // Only a fresh local payload may shorten it to fit this pool.
         // Received providers already have a frozen rank from peer_provider.
         let rank = *self.receive_rank.get_or_insert_with(|| {
             let mut chain = self.chain.borrow_mut();

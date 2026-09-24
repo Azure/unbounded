@@ -144,7 +144,7 @@ fn production_compiler_product_snapshots() {
         let snapshots: Vec<_> = (0..count)
             .map(|i| {
                 proto::Snapshot::decode(
-                    std::fs::read(export.join(format!("product-n{count}-{i}.pb")))
+                    std::fs::read(export.join(format!("p262144-n{count}-fresh-{i}.pb")))
                         .unwrap()
                         .as_slice(),
                 )

@@ -22,13 +22,16 @@ fn compiler_snapshots_http_and_rdma() {
     let old = decode("RACER_MEMBERSHIP_OLD");
     let new = decode("RACER_MEMBERSHIP_NEW");
     let prepare = |s: proto::Snapshot| {
-        Arc::new(prepare_snapshot(
-            &crate::control::Trust {
+        Arc::new(
+            crate::control::Trust {
                 universe: s.universe.as_slice().try_into().unwrap(),
                 node: s.node.as_slice().try_into().unwrap(),
-            },
-            s,
-        ))
+            }
+            .prepare(proto::Configuration {
+                contents: Some(proto::configuration::Contents::Snapshot(s)),
+            })
+            .unwrap(),
+        )
     };
     let a = prepare(old.clone());
     let b = prepare(new.clone());
@@ -71,11 +74,14 @@ fn compiler_snapshots_http_and_rdma() {
     let bid = tls::PeerIdentity::new(
         &peer_wire::hex(&new.universe),
         &peer_wire::hex(&new.node),
-        "pod-2",
+        &new.member_catalogs[0]
+            .members
+            .iter()
+            .find(|m| m.node == new.node)
+            .unwrap()
+            .pod_uid,
     )
     .unwrap();
-    assert!(!b.peers().contains_key(&aid.node));
-    assert!(!b.volumes()[0].peers().contains_key(&aid.node));
     assert!(b.authorize_member(volume, &aid).is_ok());
     assert!(b.rdma_member(volume, a.local_node()));
     let context = Rc::new(negotiation::Context::new(b.clone(), volume, 0, ROUTING).unwrap());
@@ -105,9 +111,13 @@ fn compiler_snapshots_http_and_rdma() {
     subset.members.retain(|m| m.node != old.node);
     removed.member_catalogs.push(subset);
     removed.volumes[0].member_catalog = Some(1);
-    let removed = prepare(removed);
-    assert!(removed.authorize_member(volume, &aid).is_err());
-    assert!(removed.authorize_member(&new.volumes[1].id, &aid).is_ok());
+    assert!(
+        trust
+            .prepare(proto::Configuration {
+                contents: Some(proto::configuration::Contents::Snapshot(removed))
+            })
+            .is_err()
+    );
     // Indexing is shared across all sixteen volume policies.
     let policy = b.authentication(volume).unwrap();
     for v in b.volumes() {
@@ -122,9 +132,9 @@ fn compiler_snapshots_http_and_rdma() {
         .find_map(|n| {
             let target = format!("/membership-{n}");
             let (peer, cursor) = ar.next(&ar.start(&target)).ok()??;
-            (peer == bid.node && br.start(&target).owner == 2).then_some((target, cursor))
+            (peer == bid.node).then_some((target, cursor))
         })
-        .expect("old A routes to B and new B owns target");
+        .expect("old A routes to B");
     assert_ne!(cursor.identity, br.identity);
     let namespace = crate::cache::Namespace::volume(
         &old.universe,
@@ -135,8 +145,7 @@ fn compiler_snapshots_http_and_rdma() {
     let key = crate::cache::PeerDescriptor::metadata(&target)
         .key(namespace)
         .unwrap();
-    let rebased = br.receive(cursor.clone(), &key).unwrap();
-    assert!(br.next(&rebased).unwrap().is_none());
+    assert!(br.receive(cursor.clone(), &key).is_err());
     let mut inner = cursor.algorithm.magic().to_vec();
     inner.extend(cursor.encode());
     inner.extend(b"RD01\0");
@@ -158,35 +167,6 @@ fn compiler_snapshots_http_and_rdma() {
     let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     origin.set_nonblocking(true).unwrap();
     let backend = Backend::new(&origin.local_addr().unwrap().to_string(), volume).unwrap();
-    let origin_task = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let end = Instant::now() + Duration::from_secs(5);
-        let mut socket = loop {
-            match origin.accept() {
-                Ok((socket, _)) => break socket,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < end);
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => panic!("{e}"),
-            }
-        };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            let mut b = [0];
-            socket.read_exact(&mut b).unwrap();
-            request.push(b[0]);
-        }
-        assert!(
-            String::from_utf8(request)
-                .unwrap()
-                .starts_with(&format!("HEAD {target} HTTP/1.1"))
-        );
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", crate::conformance::etag(b"abc")).unwrap();
-    });
     let mut handler = Handler::shared(
         Rc::new(RefCell::new(crate::cache::tests::cache(1))),
         backend,
@@ -228,9 +208,9 @@ fn compiler_snapshots_http_and_rdma() {
         },
         http::Config::default(),
     );
-    // Successful origin metadata proves admission and local-placement rebasing.
+    // Membership authorization does not authorize a foreign topology cursor.
     for (which, expected) in [
-        (0, Some(200)),
+        (0, Some(400)),
         (1, None),
         (2, Some(400)),
         (3, None),
@@ -306,7 +286,10 @@ fn compiler_snapshots_http_and_rdma() {
         };
         assert_eq!(actual, expected, "HTTP membership case {which}");
     }
-    origin_task.join().unwrap();
+    assert_eq!(
+        origin.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     crate::negotiation::tests::compiler_membership(&mut ring, a, b, &aid, &bid, &ca, ROUTING);
     server.shutdown(&mut ring).unwrap();
     generation.handler.borrow_mut().shutdown(&mut ring).unwrap();

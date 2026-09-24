@@ -13,6 +13,11 @@ mod tests {
         assert_eq!(c.algorithm.magic(), b"RR01");
         assert_eq!(Cursor::decode(&c.encode()).unwrap(), c);
         assert!(Cursor::decode(&c.encode()[..45]).is_err());
+        let mut old = b"RR02".to_vec();
+        old.extend(c.encode());
+        old.extend(b"RD01\0/object");
+        let old = crate::cache::peer_wire::with_budget(old, std::time::Duration::from_secs(1)).unwrap();
+        assert!(crate::cache::peer_wire::routed_descriptor(&old).is_err());
         for algorithm in [None, Some(0), Some(2)] {
             v.topology.as_mut().unwrap().routing_algorithm = algorithm;
             assert!(Routing::new(&[1; 32], &v).is_err());

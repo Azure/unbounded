@@ -564,8 +564,7 @@ impl http::Handler for VolumeHandler {
             return self.negotiation(request);
         }
         let generation = match crate::handlers::routing_identity(request.headers()) {
-            // Handler checks the immutable RC01 namespace before rebasing the
-            // sender's placement hint onto current local routing.
+            // Handler checks both the immutable namespace and exact topology identity.
             Ok(Some(_)) if !self.local => {
                 (!self.current.expired.get()).then(|| self.current.clone())
             }

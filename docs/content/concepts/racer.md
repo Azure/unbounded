@@ -31,8 +31,8 @@ Each Site universe has 262,144 placement slots, shared by its caches. Stateless
 highest-random-weight (HRW) hashing chooses owners using the universe and Node
 UID-derived identity. An unchanged membership set produces the same ownership
 after a control-plane restart or Pod replacement. Balance is statistical;
-adjacent slots can have the same owner. Fallback attempts advance through slots,
-so they do not promise a different physical peer on every attempt.
+adjacent slots can have the same owner. Fallback attempts advance through distinct
+ranked physical peers, so each candidate attempt selects a different owner.
 
 Cache capacity is rounded up to a 64 MiB boundary, with a minimum of 512 MiB
 per storage shard. The managed agent uses eight page buffers (512 MiB total)

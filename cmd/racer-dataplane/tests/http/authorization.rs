@@ -78,7 +78,6 @@ fn multihop(routed: bool) {
         .collect();
     let mut servers = Vec::new();
     let mut next = None;
-    let (_, mut config) = crate::control::tests::fixture();
     let mut client_routing = None;
     let path = std::env::temp_dir().join(format!("racer-auth-{}.sock", std::process::id()));
     for node in (1..=3).rev() {
@@ -101,28 +100,17 @@ fn multihop(routed: bool) {
                 );
             }
         }
-        if routed {
-            let volume = &mut config.volumes[0];
-            volume.peers = (1..=3)
-                .filter(|n| *n != node)
-                .map(|n| format!("{n:02x}").repeat(32))
-                .collect();
-            volume.topology = Some(crate::control::proto::Topology {
-                product: Some(crate::control::proto::ProductTopology {
-                    left_factor: 1,
-                    right_factor: 3,
-                    members: (1..=3).map(|n| format!("{n:02x}").repeat(32)).collect(),
-                    roles: vec![0, 1, 2],
-                    local_member: u32::from(node - 1),
-                    candidate_width: 1,
-                    candidates: vec![2; 8],
-                }),
-                routing_algorithm: Some(1),
-                epoch: 1,
-                slot_count: 8,
-                local_slots: if node == 3 { (0..8).collect() } else { vec![] },
-            });
-            let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
+        {
+            let routing = chain_routing(node as usize - 1, 3, 1);
+            if !routed {
+                if let Some(peer) = handler.upstream.peer.take() {
+                    handler
+                        .upstream
+                        .peers
+                        .borrow_mut()
+                        .insert(format!("{:02x}", node + 1).repeat(32), peer);
+                }
+            }
             if node == 1 {
                 client_routing = Some(routing.clone());
             }
@@ -171,7 +159,8 @@ fn multihop(routed: bool) {
                         )
                         .key(backend.namespace())
                         .unwrap();
-                        routing.start_key(&key).owner == 3 && routing.start_key(&page).owner == 3
+                        routing.destination(&routing.start_key(&key)) == 2
+                            && routing.destination(&routing.start_key(&page)) == 2
                     })
                     .unwrap()
             } else {

@@ -1685,7 +1685,6 @@ pub mod routing {
     }
     impl Cursor {
         pub const LEN: usize = 71;
-        pub const PRODUCT_LEN: usize = 71;
         /// Encode the cursor body. The enclosing RR01 magic must
         /// be selected from `algorithm`; the body alone is not a wire descriptor.
         pub fn encode(&self) -> Vec<u8> {

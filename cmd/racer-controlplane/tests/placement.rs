@@ -171,7 +171,7 @@ fn compiler_ignores_history_and_volatile_fields_and_shares_universe_placement() 
 }
 
 #[test]
-fn zero_slot_live_nodes_are_idle_and_remain_in_membership_catalog() {
+fn zero_slot_live_nodes_forward_and_remain_in_membership_catalog() {
     let mut generation = compile(&input(4), None).unwrap();
     generation.product.as_mut().unwrap().candidates.truncate(3);
     let by_id: BTreeMap<_, _> = generation

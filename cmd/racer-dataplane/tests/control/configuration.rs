@@ -60,11 +60,11 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     assert_eq!(
         c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&current_cursor))])
             .0,
-        200
+        502
     );
     let unknown = wire(&cursor).replacen("52443031", "52443032", 1);
     assert_eq!(c.get_headers(1, "/", &[("X-Racer-Fault", &unknown)]).0, 409);
-    for (field, status) in [("position", 400), ("identity", 400), ("attempt", 400)] {
+    for (field, status) in [("position", 409), ("identity", 400), ("attempt", 400)] {
         let mut bad = current_cursor.clone();
         match field {
             "position" => bad.position = 3,
@@ -76,7 +76,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
             status
         );
     }
-    assert_eq!(c.hits.lock().unwrap().len(), 1);
+    assert_eq!(c.hits.lock().unwrap().len(), 0);
     c.expire_previous(1);
     let mut expired = cursor;
     expired.attempt = 0;
@@ -215,7 +215,11 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
     }];
     snapshot.member_catalogs[0].members.push(proto::Member {
         node: snapshot.node.clone(),
-        pod_uid: "test-pod".into(),
+        pod_uid: if snapshot.node.first().is_some_and(|n| *n >= 10 && *n < 18) {
+            format!("pod-{}", snapshot.node[0] - 10)
+        } else {
+            "test-pod".into()
+        },
         fabric: snapshot.fabric.clone(),
     });
     for volume in &mut snapshot.volumes {
@@ -232,6 +236,7 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
             peers: snapshot
                 .peers
                 .iter()
+                .filter(|peer| volume.peers.contains(&peer.id))
                 .map(|peer| proto::VolumePeerEndpoint {
                     peer: peer.id.clone(),
                     http_address: peer.http_address.clone(),
@@ -306,6 +311,17 @@ pub(crate) fn cluster_config(
             });
         }
     }
+    for source in 0..8 {
+        if source != node && !config.peers.iter().any(|p| p.id == id(source)) {
+            config.peers.push(proto::Peer {
+                id: id(source),
+                pod_uid: format!("pod-{source}"),
+                http_address: addresses[source].to_string(),
+                fabric: fabric.into(),
+            });
+        }
+    }
+    config.volumes[0].peer_endpoints = None;
     config
 }
 pub(crate) fn runtime_pair(

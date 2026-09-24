@@ -55,16 +55,6 @@ fn export_dataplane_placement() {
         let persisted = generation.canonical_bytes();
         let restored = serde_json::from_slice(&persisted).unwrap();
         assert_eq!(compile(&input, Some(&restored)).unwrap(), generation);
-        // Canonical product-v1 snapshots from the production compiler.
-        let product_topology = Topology::new(&generation).unwrap();
-        for (i, member) in generation.nodes.values().enumerate() {
-            let snapshot = product_topology.snapshot(&member.id).unwrap();
-            std::fs::write(
-                dir.join(format!("product-n{count}-{i}.pb")),
-                snapshot.encode_to_vec(),
-            )
-            .unwrap();
-        }
         // Default production geometry plus cube/noncube boundaries exercise the
         // same snapshot serializer with deterministic universe/Node identities.
         for slots in [1, 8, 17, 64, SLOT_COUNT] {
@@ -97,9 +87,6 @@ fn export_dataplane_placement() {
                 let file = format!("{prefix}-{i}.pb");
                 std::fs::write(dir.join(&file), snapshot.encode_to_vec()).unwrap();
                 files.push(file);
-                if count == 2 && slots == SLOT_COUNT && i == 0 {
-                    std::fs::write(dir.join("default.pb"), snapshot.encode_to_vec()).unwrap();
-                }
             }
         }
     }

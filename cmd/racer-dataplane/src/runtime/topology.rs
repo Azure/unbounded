@@ -99,7 +99,12 @@ impl Volumes {
                 Handler::shared(self.cache.clone(), volume.backend().clone(), namespace);
             handler.set_crypto(crypto.clone());
             handler.set_authentication(config.authentication(&volume.config().id)?);
-            handler.set_attempt_policy(volume.config().max_candidate_attempts.unwrap_or(3))?;
+            handler.set_attempt_policy(
+                volume
+                    .config()
+                    .max_candidate_attempts
+                    .expect("validated attempt policy"),
+            )?;
             handler.set_routing(
                 volume.routing().clone(),
                 volume

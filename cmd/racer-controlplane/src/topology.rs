@@ -12,14 +12,6 @@ use crate::{Error, Result, proto};
 #[path = "placement_candidates.rs"]
 mod placement_candidates;
 
-pub fn degree(slots: u32) -> u32 {
-    let mut d = 1u32;
-    while u64::from(d).pow(3) < u64::from(slots) {
-        d += 1;
-    }
-    d
-}
-
 /// Stateless highest-random-weight rendezvous. Each slot chooses the maximum
 /// unsigned 64-bit score; ties choose the lexically smallest Node identity.
 /// Balance is statistical. Adjacent slots may have the same owner, and live

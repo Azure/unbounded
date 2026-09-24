@@ -8,7 +8,7 @@ fn maximum_descriptor_http_bounds() {
     for page in [false, true] {
         let (_, config) = crate::control::tests::fixture();
         let routing = crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap();
-        let target_len = if page { 3132 } else { 3438 };
+        let target_len = MAX_DESCRIPTOR - encoded_len(0, page, true, true);
         let target = format!("/{}", "x".repeat(target_len - 1));
         let cursor = routing.start(&target);
         let mut wire = b"RB01".to_vec();
@@ -88,11 +88,9 @@ fn bounded_chain_rejects_truncation_nesting_and_oversized_hops() {
         MAX_DESCRIPTOR
             - encoded_len(0, true, true, true)
             - CHAIN_LEN
-            - (crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN)
     ));
     assert!(!client_fits(
         MAX_DESCRIPTOR - encoded_len(0, true, true, true) - CHAIN_LEN + 1
-            - (crate::routing::Cursor::PRODUCT_LEN - crate::routing::Cursor::LEN)
     ));
 }
 
@@ -161,8 +159,11 @@ fn exact_descriptor_boundaries() {
             }
         }
     }
-    assert_eq!(encoded_len(0, false, true, true), 62);
-    assert_eq!(encoded_len(0, true, true, true), 368);
+    assert_eq!(encoded_len(0, false, true, true), 88);
+    assert_eq!(encoded_len(0, true, true, true), 394);
+    assert_eq!(encoded_len(0, true, true, true) + CHAIN_LEN, 436);
+    assert!(client_fits(3064));
+    assert!(!client_fits(3065));
     assert!(!client_fits(usize::MAX));
 }
 

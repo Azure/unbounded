@@ -327,9 +327,8 @@ fn multiple_pages_stripe_and_refill_on_independent_owner_failure() {
         .map(|n| c.target(7, &format!("multipage-{n}")))
         .find(|target| {
             let owners = owners(target);
-            // Losing slot 4 leaves the routes to metadata slot 7 and
-            // successor slot 5 intact. Do not depend on a lucky hash domain.
-            owners[1] == 4
+            // Losing member 1 leaves metadata member 7 and candidate 2 reachable.
+            owners[1] == 1
                 && owners.iter().all(|&o| o > 0 && o < 6)
                 && owners
                     .iter()
@@ -628,7 +627,15 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     config.revision = 2;
     config.volumes[0].peers.clear();
     config.volumes[0].topology = Some(proto::Topology {
-        product: None,
+        product: Some(proto::ProductTopology {
+            left_factor: 1,
+            right_factor: 1,
+            members: vec!["02".repeat(32)],
+            roles: vec![0],
+            local_member: 0,
+            candidate_width: 1,
+            candidates: vec![0, 0],
+        }),
         routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,
