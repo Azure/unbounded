@@ -206,7 +206,7 @@ func (c *campaign) footprint() {
 	decoder := json.NewDecoder(strings.NewReader(string(data["state.json"])))
 	decoder.DisallowUnknownFields()
 
-	if decoder.Decode(&state) != nil || state.Version != 5 || len(state.Authorities) < 1 || len(state.Authorities) > 2 {
+	if decoder.Decode(&state) != nil || state.Version != 1 || len(state.Authorities) < 1 || len(state.Authorities) > 2 {
 		c.t.Fatal("CA state contains unsupported fields or authorities")
 	}
 

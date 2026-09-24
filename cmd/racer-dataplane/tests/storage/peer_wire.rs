@@ -228,6 +228,10 @@ fn peer_wire_bounds_and_untrusted_facts() {
         b"RF01\x02/",
         b"RF01\x01/",
         b"RF01\0/legacy",
+        b"RF04\0\0\0\0RD01\0/legacy",
+        b"RF06\0/legacy",
+        b"RF07\0/legacy",
+        b"RF08\0/legacy",
         b"RD01\x01/",
     ] {
         assert!(decode_descriptor(bytes).is_err());

@@ -244,7 +244,7 @@ fn incompatible_slab_versions_are_rejected_without_modification() {
     // Reject even a mixed-version pair rather than zeroing the old root as
     // ordinary corruption. The check precedes any recovery mutation.
     let mut old = magic(g, 2, 0, &[]);
-    put(&mut old, 0, u64::from_le_bytes(*b"RACERS04"));
+    put(&mut old, 0, u64::from_le_bytes(*b"RACERS06"));
     seal(&mut old);
     slab.file.write_all_at(&old.0, g.offset(1)).unwrap();
     slab.file.sync_data().unwrap();
