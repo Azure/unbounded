@@ -1,5 +1,9 @@
 # Racer stateless dev/test cutover
 
+> Historical pre-1.0 procedure. Do not use this migration procedure for Racer
+> 1.0. The inventory script has been removed; 1.0 requires fresh CA state and
+> slabs. See `cmd/racer-dataplane/CONTRACT.md` for the current format contract.
+
 This is a **coordinated fresh trust-domain cutover**, not a rolling upgrade or a
 backward-compatibility migration. Deploy matching CP and DP binaries together.
 Placement changes to Node-UID HRW with 262,144 slots per universe; certificates

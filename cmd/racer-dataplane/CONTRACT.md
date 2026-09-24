@@ -1,7 +1,24 @@
 # Racer authorization and representation contract
 
-This is a direct format cutover. Deploy matching SDK, origin adapter, and
-dataplane versions. No earlier descriptor, metadata, or slab format is accepted.
+Racer 1.0 is a clean break. Deploy matching control-plane, SDK, origin adapter,
+and dataplane versions with fresh CA state and slabs. There is no migration or
+mixed-version support. Historical pre-release formats numbered 1 are not the
+1.0 contract.
+
+## Version identifiers
+
+Control subscriptions, enrollment, proof, and replica proof use `/v1/config`,
+`/v1/enroll`, `/v1/proof`, and `/v1/replica-proof`. The protobuf package remains
+`racer.control.v1` and the subscription profile is 1. Every volume references
+an explicit member catalog, including volumes with no remote members. A supplied
+topology must explicitly select routing algorithm 1.
+
+RDMA negotiation and offers use version 1, with `RCR1` transport frames. CA
+state, trust bundles, identity claims, generation records, and revision checkpoint
+formats are version 1. Cache namespaces use `racer-volume-v1`.
+
+The Kubernetes API remains `racer.unbounded-cloud.io/v1alpha1`. Revision,
+generation, epoch, and storage-policy counters retain their operational meanings.
 
 ## Local SDK and origin HTTP
 
@@ -52,24 +69,26 @@ The metadata body is exactly **306 bytes**, with no version prefix:
 | 48 | 2 | Content-Type byte length, little-endian u16; zero means absent |
 | 50 | 256 | Content-Type bytes followed by mandatory zero padding |
 
-The slab magic is `RACERS06`, tree magic `RACERN06`, and leaf entries are
+The slab magic is `RACERS01`, tree magic `RACERN01`, and leaf entries are
 346 bytes (32-byte key, 8-byte kind, 306-byte record). Tree fanout is 11.
-Payload extents remain independent 64 MiB pages. Use a fresh slab for this format.
+Payload extents are independent 64 MiB pages. Bitmap and layout markers are
+`RACERB01` and `RACERL01`. The managed path is `/cache/cache-v1.slab`.
+Use a fresh slab for this format.
 
 ## Peer HTTP descriptor and request binding
 
 `X-Racer-Fault` is hexadecimal encoding of a descriptor bounded to 3,500 decoded
-bytes. RF04 budget and RF06 cursor framing retain their existing layouts. The
-inner descriptor is now **RF08**:
+bytes. Distinct four-byte tags identify version 1 of each layer: `RB01` budget,
+`RR01` cursor, and `RD01` descriptor:
 
-- Metadata: `RF08`, byte 0, then target bytes.
-- Page: `RF08`, byte 1, LE u64 offset, LE u64 object length, 32 checksum bytes,
+- Metadata: `RD01`, byte 0, then target bytes.
+- Page: `RD01`, byte 1, LE u64 offset, LE u64 object length, 32 checksum bytes,
   the 258-byte Content-Type length/padding field above, then target bytes.
   The page target starts at offset 311.
 
-An outer RF06 chain wraps the RF04 budget and binds the immutable namespace
-and forwarding allowances: `RF06 | namespace:32 | hops:u8 | work:u8 |
-candidate:LE-u32 | RF04...`. The inner RF06 cursor remains placement-specific.
+An outer RC01 chain wraps the RB01 budget and binds the immutable namespace
+and forwarding allowances: `RC01 | namespace:32 | hops:u8 | work:u8 |
+candidate:LE-u32 | RB01...`. The inner RR01 cursor is placement-specific.
 Each new metadata or page resolution receives at most eight hops and 255 units
 of work. Forwarding splits work between the child and local recovery; admission
 retries do not spend it. Placement rebasing and transport retries never renew it.
@@ -80,9 +99,9 @@ cursor, budget, and chain framing, allowing **3,090 target bytes**.
 `X-Racer-Attempt` is 96 hexadecimal characters: a 32-byte BLAKE3 digest followed
 by a random 16-byte nonce. Hash input is the concatenation of:
 
-1. ASCII `racer/request-binding/v2` (no terminator).
+1. ASCII `racer/request-binding/v1` (no terminator).
 2. LE u32 descriptor length, then the complete decoded descriptor, including
-   its outer RF06 chain when present.
+   its outer RC01 chain when present.
 3. LE u32 Authorization value length, then its bytes (zero length if absent).
 
 Ingress verifies the digest against the descriptor and normal Authorization
@@ -90,12 +109,12 @@ header after authenticating the TLS peer. Failure reports echo this attempt.
 
 ## RDMA control request
 
-Application metadata is an **RF07** envelope inside encrypted TLS control,
+Application metadata is an **RA01** envelope inside encrypted TLS control,
 never DMA-exposed memory:
 
-`RF07 | descriptor_len:LE-u16 | auth_len:LE-u16 | descriptor | auth`
+`RA01 | descriptor_len:LE-u16 | auth_len:LE-u16 | descriptor | auth`
 
-The descriptor includes the RF06 chain and RF04/RF06/RF08 framing. Zero auth length means absent.
+The descriptor includes the RC01 chain and RB01/RR01/RD01 framing. Zero auth length means absent.
 The 4,096-byte control frame has a 112-byte transport header, leaving **3,984
 bytes** for this envelope. RDMA is selected only when
 `8 + descriptor_len + auth_len <= 3984`; otherwise HTTP is selected before

@@ -1,5 +1,8 @@
 # Racer control-plane availability
 
+> Historical pre-1.0 design. Racer 1.0 removes the legacy Service/readiness
+> migration described below and requires a clean deployment.
+
 The current [stateless contract](racer-rust-controlplane.md) replaces replica
 ConfigMaps and durable participant/proof barriers. CP replicas exchange the
 current CSR and certificate response through bounded annotations on their

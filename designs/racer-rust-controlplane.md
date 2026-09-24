@@ -1,5 +1,9 @@
 # Rust control plane implementation
 
+> Version note: Racer 1.0 uses `/v1/config` and CA state format 1, requires
+> canonical Site labels, and removes pre-release migration paths. See
+> `cmd/racer-dataplane/CONTRACT.md` for the current version inventory.
+
 ## Accepted scope
 
 The control plane is a standalone async Rust crate using Tokio, Axum/Hyper,

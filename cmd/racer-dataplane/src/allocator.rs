@@ -757,7 +757,7 @@ impl Allocator {
         Self::open_inner(shard, config)
     }
     /// Consume a generation assignment without changing the pinned execution
-    /// context. The legacy `open` remains restricted to startup geometry.
+    /// context. `open` is restricted to startup geometry.
     pub fn open_assigned(
         context: &crate::sharding::WorkerContext,
         assignment: crate::sharding::Assignment,

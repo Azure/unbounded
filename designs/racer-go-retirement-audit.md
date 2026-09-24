@@ -1,5 +1,8 @@
 # Racer Go control-plane retirement
 
+> Historical pre-1.0 audit. Versioned endpoints and deprecated Site-label
+> fallback below describe that revision, not the Racer 1.0 contract.
+
 > Historical audit of the Go-to-Rust retirement. Its placement-history, durable
 > chunk/GC, version-4 CA, same-Pod ambiguity, and fleet-proof claims describe the
 > implementation validated at that milestone, not the current stateless runtime.

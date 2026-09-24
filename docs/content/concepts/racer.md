@@ -49,7 +49,7 @@ applies updates independently and can skip intermediate revisions. A slow or
 disconnected agent does not hold up publication to other agents. Agents keep
 their last working configuration if local preparation of an update fails.
 
-Control subscriptions use mutually authenticated TLS at `/v4/config`. An agent
+Control subscriptions use mutually authenticated TLS at `/v1/config`. An agent
 reports the configuration it has applied separately from the update it has
 received. Cache capacity policies converge independently of topology; certificate
 issuance and CA rotation have their own security checks.
@@ -181,4 +181,11 @@ make image-racer-controlplane-local image-racer-dataplane-local
 ```
 
 Use matching control-plane and dataplane versions. The operator's cache agents
-subscribe to `/v4/config`; enrollment remains at `/v3/enroll`.
+subscribe to `/v1/config` and enroll at `/v1/enroll`.
+
+Racer 1.0 requires fresh CA state and cache storage. It does not migrate
+pre-release state or support mixed-version deployments. The managed slab path
+is `/cache/cache-v1.slab`. Racer consumers require the canonical
+`unbounded-cloud.io/site` Node label; the deprecated `net.unbounded-cloud.io/site`
+label does not establish Racer membership. The Kubernetes API remains
+`racer.unbounded-cloud.io/v1alpha1`.

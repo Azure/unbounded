@@ -4,10 +4,12 @@
 #[cfg(test)]
 pub(crate) mod failure_tests {
     use super::failure::*;
+    use crate::outcome::{
+        AttemptFailure, AttemptRoute, PeerFailure, PeerReason, attempt_evidence, failure_reason,
+        owner_failure, peer_failure,
+    };
     use crate::{cache, http_client as client};
     use cache::{http_metadata::headers, peer_wire::hex};
-    use crate::outcome::{AttemptFailure, AttemptRoute, PeerFailure, PeerReason, attempt_evidence,
-        failure_reason, owner_failure, peer_failure};
     use std::{io, sync::Arc};
 
     include!(concat!(
@@ -171,8 +173,7 @@ pub(crate) mod failure_tests {
                         kind,
                         message: "classification regression".into(),
                     };
-                    let expected =
-                        crate::outcome::PeerEvidence::from_failure(&evidence).unwrap();
+                    let expected = crate::outcome::PeerEvidence::from_failure(&evidence).unwrap();
                     let error = if routed {
                         io::Error::other(AttemptFailure {
                             route: route.clone(),
@@ -198,9 +199,7 @@ pub(crate) mod failure_tests {
                     assert_eq!(report.reason, reason, "{error:?}");
                     assert_eq!(report.evidence, Some(expected));
                     assert_eq!(owner_failure(&error), None);
-                    assert!(
-                        !error.attempt_failure().is_some_and(|f| f.owner_evidence())
-                    );
+                    assert!(!error.attempt_failure().is_some_and(|f| f.owner_evidence()));
                     if matches!(
                         cause,
                         Cause::LocalPressure
@@ -306,7 +305,12 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
-            members: Arc::new([[2; 32], [0xab; 32]].into_iter().map(|node| (node, ("pod-123".into(), String::new()))).collect()),
+            members: Arc::new(
+                [[2; 32], [0xab; 32]]
+                    .into_iter()
+                    .map(|node| (node, ("pod-123".into(), String::new())))
+                    .collect(),
+            ),
             universe: [8; 32],
             node: [1; 32],
         }
@@ -345,7 +349,10 @@ mod tests {
         let policy = policy();
         let mut replaced = identity(8, 2);
         replaced.pod_uid = "replaced-pod".into();
-        assert_eq!(policy.authorize(&replaced).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            policy.authorize(&replaced).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         for malformed in [
             String::new(),
             "ab".repeat(31),

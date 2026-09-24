@@ -1,5 +1,9 @@
 # Rust runtime wiring contract
 
+> Version note: Racer 1.0 replaces `/v4/config` below with `/v1/config` and
+> uses `/v1/enroll`, `/v1/proof`, and `/v1/replica-proof`. See
+> `cmd/racer-dataplane/CONTRACT.md` for the current wire and state formats.
+
 The Rust runtime exports `kubernetes`, `subscription`, and `status`. Main/service
 own TLS and leadership acquisition; the runtime owns inventory watches,
 process-local topology/storage publication, and the `/v4/config` Router.

@@ -1,5 +1,9 @@
 # Racer v4 subscription contract
 
+> Historical pre-1.0 contract. Racer 1.0 uses `/v1/config`, `/v1/enroll`, and
+> `/v1/proof`, requires explicit member catalogs and routing algorithm 1, and
+> does not accept the old endpoints. See `cmd/racer-dataplane/CONTRACT.md`.
+
 The dataplane uses mutually authenticated `GET /v4/config`, with any deployment
 query parameters preserved. Enrollment and diagnostic fresh TLS proofs remain
 `/v3/enroll` and `/v3/proof`. The control endpoint must not emit legacy

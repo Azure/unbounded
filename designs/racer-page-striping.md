@@ -1,5 +1,8 @@
 # Racer page striping and 64 MiB cutover
 
+> Historical pre-1.0 cutover record. Its version numbers and storage paths are
+> superseded by `cmd/racer-dataplane/CONTRACT.md`. Racer 1.0 requires fresh slabs.
+
 Metadata and payloads use their cache keys as routing keys. Metadata is
 version-independent. A page key includes the namespace/object identity,
 object version, object length, aligned offset, and page size. The first eight
