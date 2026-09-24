@@ -188,6 +188,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		return 0, nil, false
 	}
 
+	s.operation = "downstream_socket"
 	if err != nil {
 		return 0, s.fail(err), true
 	}
@@ -264,6 +265,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 				return total, err, true
 			}
 
+			s.operation = "downstream_write"
 			written, writeErr := conn.Write((*buf)[:n])
 
 			total += int64(written)
@@ -278,6 +280,8 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 			continue
 		}
 
+		s.operation = "page_socket"
+
 		source, ok := s.conn.Conn.(*net.UnixConn)
 		if !ok {
 			return total, s.fail(ErrProtocol), true
@@ -289,12 +293,15 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		if p == nil {
+			s.operation = "splice_pipe"
+
 			p, err = pool.pipes.get()
 			if err != nil {
 				return total, s.fail(err), true
 			}
 		}
 
+		s.operation = "page_body"
 		n, err := spliceReady(r, false, p.fd[1], int(min(remaining, int64(p.capacity), splicePipeSize)), &s.stats)
 		p.buffered += n
 
@@ -307,6 +314,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		for p.buffered > 0 {
+			s.operation = "downstream_write"
 			written, err := spliceReady(raw, true, p.fd[0], int(p.buffered), &s.stats)
 			total += written
 			s.offset += written

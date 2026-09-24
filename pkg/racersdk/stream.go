@@ -142,6 +142,10 @@ type Stream struct {
 	err                  error
 	closed               bool
 	stats                TransferStats
+	operation            string
+	pageOffset           int64
+	statusCode           int
+	failure              *StreamFailure
 }
 
 // TransferStats distinguishes actual kernel splice traffic from buffered
@@ -222,7 +226,7 @@ func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, 
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
-	return &Stream{object: o, ctx: ctx, cancel: cancel, offset: offset, end: offset + length}, nil
+	return &Stream{object: o, ctx: ctx, cancel: cancel, offset: offset, end: offset + length, pageOffset: offset}, nil
 }
 
 func (s *Stream) release(reuse bool) {
@@ -262,10 +266,14 @@ func (s *Stream) nextPage() error {
 		s.release(false)
 	}
 
-	return s.preparePage()
+	return s.preparePageWithRetry()
 }
 
 func (s *Stream) preparePage() error {
+	s.operation = "page_connect"
+	s.pageOffset = s.offset
+	s.statusCode = 0
+
 	if err := s.ctx.Err(); err != nil {
 		return err
 	}
@@ -302,13 +310,26 @@ func (s *Stream) preparePage() error {
 	r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", s.offset, s.pageEnd-1))
 	r.Header.Set("If-Match", s.object.meta.ETag)
 
+	s.operation = "page_request"
 	if err := r.Write(s.conn); err != nil {
 		return err
 	}
 
+	s.operation = "page_headers"
+
 	resp, err := s.conn.response(r)
 	if err != nil {
 		return err
+	}
+
+	s.statusCode = resp.StatusCode
+
+	s.operation = "page_validate"
+
+	if resp.StatusCode == 429 || resp.StatusCode == 503 || resp.StatusCode == 504 {
+		if err := identityResponse(resp); err != nil {
+			return err
+		}
 	}
 
 	if err := s.object.validatePage(resp, s.offset, s.pageEnd-1); err != nil {
@@ -316,6 +337,7 @@ func (s *Stream) preparePage() error {
 	}
 
 	s.responseClose = resp.Close
+	s.operation = "page_body"
 
 	return nil
 }
@@ -327,6 +349,10 @@ func (s *Stream) finish() error {
 }
 
 func (s *Stream) fail(err error) error {
+	if s.failure == nil {
+		s.failure = &StreamFailure{Operation: s.operation, PageOffset: s.pageOffset, Offset: s.offset, StatusCode: s.statusCode, Err: err, ContextErr: s.ctx.Err()}
+	}
+
 	if cause := s.ctx.Err(); cause != nil {
 		err = cause
 	}
@@ -362,6 +388,7 @@ func (s *Stream) read(p []byte) (int, error) {
 		return 0, s.fail(err)
 	}
 
+	s.operation = "page_body"
 	n, err := s.conn.reader.Read(p[:min(int64(len(p)), s.pageEnd-s.offset)])
 	s.offset += int64(n)
 
@@ -428,6 +455,7 @@ func (s *Stream) WriteTo(dst io.Writer) (int64, error) {
 		}
 
 		if n > 0 {
+			s.operation = "downstream_write"
 			written, writeErr := dst.Write((*buf)[:n])
 
 			total += int64(written)

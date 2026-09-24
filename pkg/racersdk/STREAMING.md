@@ -47,6 +47,22 @@ Each stream issues one page request at a time, without speculative prefetch.
   before the caller commits downstream HTTP headers. It consumes no payload.
 - `stream.WriteTo`, `stream.Close`, and `stream.Stats` expose
   consumption, cancellation, and observed syscall traffic.
+- `stream.Failure()` returns the first failed operation, its requested page
+  offset, current object offset, response status, original error, and context
+  error at failure time. The snapshot survives Close and does not change error
+  return semantics. It is diagnostic evidence, not a safe retry offset: bytes
+  may already have been forwarded. Do not log the original error verbatim; it
+  can contain a target or socket path.
+
+Gantry samples Racer failures separately for admission, HEAD, Prepare, and
+forwarding, at most once per phase per 30 seconds per mirror. Samples contain
+the digest, operation, offsets, bytes forwarded, finite error class, original
+Racer HTTP status, context state, and suppressed count. They omit request
+targets, registry/repository names, origin data, raw errors, and response bodies.
+Cancellation without an observed HTTP error does not consume a sample. A
+later-page HTTP failure remains visible even after forwarding cleanup cancels
+the stream. Client-facing Racer 503 responses do not expose peer breaker history;
+these samples cannot establish the failure that originally opened a breaker.
 
 Streams fetch aligned 64 MiB pages sequentially with `If-Match`. Payload scratch
 space is bounded independently of page/object size: a pooled 32 KiB buffer,
@@ -131,6 +147,34 @@ write deadline to the present; close the downstream after failure. Arbitrary
 non-socket writers must provide their own cancellation for a blocked Write.
 Only fully consumed valid responses are pooled. Failed/abandoned responses are
 closed. Streams do not automatically retry stale idle sockets or version errors.
+
+### Bounded transient page recovery
+
+Prepare and subsequent page requests retry only HTTP 429, 503, and 504 received
+before consuming any body of that page. Each attempt uses the same immutable
+HEAD snapshot, target, exact Range, and If-Match; HEAD is not repeated. Earlier
+pages already forwarded are never replayed. Successful pages must still pass
+all version, content-type, length, and Content-Range checks. Authorization,
+version, framing, transport, body truncation, and downstream errors are terminal.
+Encoded/chunked transient error responses and malformed Retry-After fields are
+also terminal. A rejected response's connection and read-ahead are discarded
+without draining its body or returning it to the idle pool.
+
+There are at most four retries per page, one active attempt at a time, with
+exponential backoff bases of 100, 200, 400, and 800 milliseconds plus uniform
+jitter in [0, base). Retry-After accepts delay seconds or an HTTP date and is a
+minimum delay, with jitter added. Invalid hints or delays that exceed the
+five-second cumulative per-page wait budget or remaining stream deadline cause
+the original HTTP error to be returned; hints are never shortened. All attempts
+retain the original stream context/deadline, including ClientOptions.Timeout.
+Close and context cancellation interrupt retry waits and dispose of active
+sockets/pipes. No retry refreshes the total budget or adds parallel fanout.
+
+Recovered transient statuses do not populate Failure(); it describes the first
+terminal failure. Exhaustion still returns an error and records its final page
+status/offset. This bounded recovery tolerates brief rejection; it does not fix
+sustained overload or guarantee full-image completion. End-to-end digest
+verification remains the consumer's responsibility.
 
 Successful socket transfers return only drained pipes to an explicit shared
 cache holding at most eight pipes. Each pipe owns two FDs and its kernel-reported
