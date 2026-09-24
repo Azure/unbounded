@@ -4642,10 +4642,11 @@ def reset_agent() -> None:
 def validate_reset_cleanup() -> None:
     """Assert reset removed the agent's own files from the host.
 
-    A reset that reports success while leaving an installation on disk fails in
-    two directions at once. The files are orphaned, and the existing-deployment
-    preflight reads the same list, so the next bootstrap refuses a host the
-    operator was just told is clean.
+    A reset that reports success while leaving an installation on disk orphans
+    the files, and some of them, such as the recovery script, make the next
+    bootstrap's existing-deployment preflight refuse a host the operator was
+    just told is clean. Preflight checks only that subset, since Ignition places
+    the agent binary before it runs; this checks everything reset should remove.
 
     Both the configured prefix and the default are checked. A host is only ever
     installed under one of them, so the other is trivially absent, but that is

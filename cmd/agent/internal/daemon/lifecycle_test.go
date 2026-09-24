@@ -338,10 +338,9 @@ func TestInstallBootstrapBinaryReplacesAnUnusableBinary(t *testing.T) {
 // temporary tree and checks it removes the agent's files from both the
 // configured prefix and the default.
 //
-// Sweeping only one of them is not a cosmetic miss. The existing-deployment
-// preflight reads the same list, so a file teardown leaves behind is a file
-// that refuses the next bootstrap, on a host the operator was just told is
-// clean.
+// Sweeping only one of them orphans the files under the other, and a recovery
+// script left behind there refuses the next bootstrap, on a host the operator
+// was just told is clean.
 func TestRemoveAgentArtifactsSweepsEveryPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -439,7 +438,7 @@ func TestRemoveOwnedFileReportsAFailedUnlink(t *testing.T) {
 //
 // A dangling link is exactly what a partial install leaves behind, and it is
 // still a file the agent owns. Stat would follow it, find nothing, and leave it
-// on the host for the next bootstrap's existing-deployment check to trip over.
+// on the host.
 func TestRemoveOwnedFileRemovesADanglingSymlink(t *testing.T) {
 	t.Parallel()
 

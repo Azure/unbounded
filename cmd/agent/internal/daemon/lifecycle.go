@@ -365,8 +365,8 @@ type removeAgentArtifacts struct {
 // The prefix is the one the host recorded. Files are removed from every prefix
 // the host might hold them under, not only that one, because a host that was
 // reprovisioned with a different prefix still has the earlier layout on disk.
-// Leaving it behind would both orphan the files and make the next bootstrap's
-// existing-deployment check refuse a host that is otherwise clean.
+// Leaving it behind would orphan the files, and a recovery script left there
+// makes the next bootstrap's existing-deployment check refuse the host.
 func RemoveAgentArtifacts(log *slog.Logger, prefix string) phases.Task {
 	return &removeAgentArtifacts{
 		log:   log,

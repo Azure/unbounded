@@ -149,8 +149,7 @@ func TestMergeHostPrefixesOrdering(t *testing.T) {
 	assert.Len(t, merged, 3)
 }
 
-// TestOwnedHostFilesFollowThePrefix pins the layout teardown removes and the
-// existing-deployment check looks for.
+// TestOwnedHostFilesFollowThePrefix pins the layout teardown removes.
 func TestOwnedHostFilesFollowThePrefix(t *testing.T) {
 	t.Parallel()
 
@@ -179,9 +178,7 @@ func TestOwnedHostFilesFollowThePrefix(t *testing.T) {
 //
 // A host that was installed under one prefix and reprovisioned under another
 // still has the first layout on disk. Teardown that swept only the current
-// prefix would orphan those files, and because the existing-deployment check
-// reads the same list, the orphans would then refuse the next bootstrap on a
-// host the operator believes is clean.
+// prefix would orphan those files.
 func TestOwnedHostFilesAcrossCoversTheAbandonedLayout(t *testing.T) {
 	t.Parallel()
 

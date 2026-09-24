@@ -203,13 +203,13 @@ const (
 	agentUninstallScriptName = "unbounded-agent-uninstall.sh"
 )
 
-// OwnedHostFiles returns every file the agent installs under a single prefix.
+// OwnedHostFiles returns every file the agent installs under a single prefix,
+// which is what teardown removes.
 //
-// Teardown and the existing-deployment preflight both need this list, and they
-// have to agree: a file teardown does not remove is one preflight will later
-// refuse to provision over, and a file preflight does not look for is one that
-// can be silently provisioned on top of. Defining it once is what keeps those
-// two from drifting.
+// The existing-deployment preflight deliberately checks only a subset: the
+// daemon units and the recovery script. The install script and Ignition both
+// put <prefix>/bin/unbounded-agent in place before preflight runs, so a
+// preflight that checked this whole list would refuse every fresh host.
 //
 // Environment overrides are deliberately not applied. These are the paths the
 // agent installs to as a matter of layout, and teardown needs to find them on a

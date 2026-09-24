@@ -36,7 +36,6 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 host's installation prefix, applies environment overrides, and stores the
 resolved `CurrentPath` target in `CurrentTargetPath`. If `CurrentPath` does not
 exist, the compatibility `BinaryPath` is used as the current target.
-`NextTargetPath()` then chooses the inactive slot:
 
 An empty prefix selects `/usr/local`, so a host that configures none resolves
 exactly the paths this design originally described. Environment overrides name
@@ -45,6 +44,8 @@ that to pin a binary across an upgrade.
 
 `goalstates.ResolvedAgentUpgradePaths()` is the prefix-less form and is
 deprecated.
+
+`NextTargetPath()` chooses the inactive slot:
 
 ```text
 current target == BluePath  -> next target = GreenPath

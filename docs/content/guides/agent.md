@@ -207,11 +207,12 @@ For these hosts, generate an Ignition config and choose a prefix on a writable
 filesystem:
 
 ```bash
+curl -fsSLO https://github.com/Azure/unbounded/releases/download/v0.8.1/checksums.txt
 kubectl unbounded machine manual-bootstrap my-node --site mysite \
     --variant ignition \
     --host-prefix /opt/unbounded \
     --agent-url https://github.com/Azure/unbounded/releases/download/v0.8.1/unbounded-agent-linux-amd64 \
-    --agent-sha256 "$(cat unbounded-agent-linux-amd64.sha256)" \
+    --agent-sha256 "$(grep ' unbounded-agent-linux-amd64$' checksums.txt)" \
     > config.ign
 ```
 
