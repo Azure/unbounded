@@ -77,6 +77,8 @@ operator-vm-check:
 	grep -Fq '"$$repo_root/bin/helm" upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
 	! grep -Fq '"$$repo_root/bin/helm" template gantry' deploy.sh
 	! grep -Fq 'ensure_chair_leases' deploy.sh
+	grep -Fq 'git archive "$$source_revision" | tar -x -C "$$source_context"' deploy.sh
+	! grep -Fq '"$$repo_root" --only-show-errors -o none >"$$build_log"' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"

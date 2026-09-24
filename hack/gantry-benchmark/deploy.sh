@@ -423,6 +423,12 @@ build_source_image() {
   log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
 
+  local source_context
+  source_context=$(mktemp -d "$DEPLOY_STATE_DIR/source-context.XXXXXX")
+  trap 'rm -rf -- "$source_context"' RETURN
+  git archive "$source_revision" | tar -x -C "$source_context"
+  log "prepared committed source context ($(du -sb "$source_context" | cut -f1) bytes)"
+
   public_restore_needed=true
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
     --default-action Allow --public-network-enabled true --only-show-errors -o none
@@ -436,9 +442,9 @@ build_source_image() {
     if az acr build \
       --registry "$GANTRY_ACR_NAME" \
       --image "gantry-benchmark-source:$source_revision" \
-      --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+      --file images/gantry-benchmark-source/Containerfile \
       --build-arg "SOURCE_REVISION=$source_revision" \
-      "$repo_root" --only-show-errors -o none >"$build_log" 2>&1; then
+      "$source_context" --only-show-errors -o none >"$build_log" 2>&1; then
       built=true
       break
     fi
