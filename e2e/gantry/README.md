@@ -38,7 +38,14 @@ peer fetch.
    serves a subsequent image pull without restarting.
 - ✅ ACR Artifact Streaming contract - serves the first exact range from a
    cluster-local signed TLS origin, commits and advertises a complete blob on
-   another node, then serves the next range from that peer.
+   another node, then serves the next range from that peer. The origin rejects
+   any request whose URI did not arrive byte-for-byte, so this also pins raw
+   signed-URL preservation through the real listener, and the test asserts the
+   SAS value never appears in any agent's logs or metrics.
+- ✅ Stale provider fallback - removes the blob from the provider's containerd
+   while its DHT record survives, then asserts the next range fails over to the
+   signed origin inside one request and the peer serves nothing further.
+   Busy peers (429 with `Retry-After`) remain covered by unit tests only.
 
 Additional scenarios listed below should each land as their own commit.
 

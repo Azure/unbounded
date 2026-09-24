@@ -179,6 +179,91 @@ another owner after Gantry configured it, rollback deliberately leaves that
 new value in place; inspect the configurator logs and resolve ownership before
 removing the saved state.
 
+### Artifact Streaming metrics
+
+Labels are bounded: `source` is `local`, `peer`, or `origin`; `outcome` is
+`success` or `error`; `reason` is `range` or `origin_url`.
+
+| Metric | Use |
+| --- | --- |
+| `gantry_streaming_requests_total{source,outcome}` | Which source served each range, and whether it succeeded. |
+| `gantry_streaming_bytes_total{source}` | Bytes per source; `origin` is ACR data-plane egress. |
+| `gantry_streaming_time_to_first_byte_seconds{source}` | Latency before the range body starts. |
+| `gantry_streaming_request_duration_seconds{source,outcome}` | End-to-end range duration. |
+| `gantry_streaming_rejected_total{reason}` | Requests refused before a source was chosen. |
+| `gantry_streaming_inflight{source}` | Range bodies currently streaming. |
+
+`/artifact-streaming/readyz` on the node-local mirror port reports endpoint
+readiness. It is loopback-only, so probe it from the node rather than Prometheus.
+
+### Artifact Streaming alerts
+
+These separate the failure domains that need different responses. Tune the
+thresholds against a real workload before paging on them.
+
+```yaml
+- alert: GantryStreamingErrors
+  expr: |
+    sum by (instance) (rate(gantry_streaming_requests_total{outcome="error"}[5m]))
+      / sum by (instance) (rate(gantry_streaming_requests_total[5m])) > 0.05
+  for: 10m
+  annotations:
+    summary: Gantry is failing OverlayBD range requests on {{ $labels.instance }}.
+
+- alert: GantryStreamingOriginFailing
+  expr: sum(rate(gantry_streaming_requests_total{source="origin",outcome="error"}[5m])) > 0
+  for: 10m
+  annotations:
+    summary: Signed-origin range reads are failing; suspect ACR or the host allowlist.
+
+- alert: GantryStreamingNoPeerReuse
+  expr: |
+    sum(rate(gantry_streaming_requests_total{source="peer",outcome="success"}[30m])) == 0
+      and sum(rate(gantry_streaming_requests_total{source="origin",outcome="success"}[30m])) > 0
+  for: 30m
+  annotations:
+    summary: Every range is coming from ACR; peer reuse is not happening.
+
+- alert: GantryStreamingRejectingOriginURLs
+  expr: sum(rate(gantry_streaming_rejected_total{reason="origin_url"}[5m])) > 0
+  for: 5m
+  annotations:
+    summary: Gantry refuses the OverlayBD origin URL; check the host suffix allowlist.
+```
+
+Origin reads are capped at 32 in flight per node. A sustained
+`gantry_streaming_inflight{source="origin"}` at that ceiling means ranges are
+queueing behind ACR rather than failing.
+
+### Artifact Streaming incident response
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| Pods on streaming nodes stall on first read | Gantry agent unavailable on that node | OverlayBD has no second path while `p2pConfig` targets Gantry. Cordon the node, drain streaming workloads, then set `overlaybdConfig.enabled=false` so new devices use ACR directly. |
+| `GantryStreamingOriginFailing` while peers still serve | ACR data plane, or an expired SAS | Ranges backed by a complete peer keep working, so do not disable Gantry; it is the only thing still serving. Escalate to ACR. |
+| `GantryStreamingRejectingOriginURLs` | Allowlist does not cover the registry data endpoint | Add it to `gantry.artifactStreaming.allowedHostSuffixes` and roll the agent. |
+| Ranges return to `source="origin"` after a peer had served them | Provider record outlived the blob (containerd GC or eviction) | Expected. Gantry fails over within the same request and suppresses that provider for 3m. Investigate only if it persists, which points at containerd GC pressure. |
+| `/artifact-streaming/readyz` returns 503 | Agent still starting, or draining | The gate is sticky until startup completes. If it persists, check the containerd socket; containerd is Gantry's only content store. |
+| OverlayBD device errors while Gantry is healthy | OverlayBD daemon or TCMU backend | Outside Gantry. Restore direct origin with `overlaybdConfig.enabled=false` and engage AKS support. |
+
+### Artifact Streaming compatibility
+
+Gantry configures an existing AKS Artifact Streaming installation. It does not
+install, version, or upgrade OverlayBD.
+
+| Component | Requirement | Owner |
+| --- | --- | --- |
+| Node pool | Created with Artifact Streaming enabled | AKS |
+| Registry | Premium ACR serving streaming artifacts | ACR |
+| OverlayBD runtime | `overlaybd-tcmu` and `overlaybd-snapshotter` units present and active | AKS |
+| OverlayBD config tool | `/opt/acr/tools/overlaybd/config.sh` | AKS |
+| Kernel backend | TCMU, as provisioned by the node image | AKS |
+| containerd | Reads `/etc/containerd/certs.d`; Unbounded-managed nodes pin 2.1.8 | Unbounded / AKS |
+| Host config keys written | `p2pConfig.enable` and `p2pConfig.address` only | Gantry |
+
+Every other key in `/etc/overlaybd/overlaybd.json` is left exactly as the node
+image shipped it, and rollback restores the original file.
+
 ## What to verify after rollout
 
 | Check | How |
