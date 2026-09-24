@@ -11,7 +11,7 @@ make e2e-gantry-racer
 
 The build target builds `bin/gantry` and `bin/racer-loadgen`, builds the real
 Rust `racer-dataplane` with `cargo build --locked` (debug profile), and warms the Go e2e build cache.
-The test target uses those binaries and runs `TestGantryRacerStriped`,
+The test target uses those binaries and runs six suites: `TestGantryRacerStriped`,
 `TestGantryRacerAuthorization`, `TestGantryRacerRecovery`,
 `TestGantryRacerCorruption`, `TestGantryRacerContainerImage`, and
 `TestGantryRacerGeneration` separately, each
@@ -95,10 +95,21 @@ existing P2PCache, for example when its current generation is 1:
 kubectl patch p2pcache gantry --type=json -p='[{"op":"test","path":"/spec/cacheGeneration","value":1},{"op":"replace","path":"/spec/cacheGeneration","value":2}]'
 ```
 
-Use the actual current and next values. Repair the origin before advancing the
-generation, and wait for every serving dataplane to activate the resulting
-configuration. Generation recovery is explicit; there is no automatic corruption
-feedback or new invalidation protocol.
+Use the actual current and monotonically increasing next values. If the JSON
+Patch test fails, reread rather than overwriting a concurrent update. Repair the
+origin before advancing the generation. Wait for P2PCache `Ready=True`, with
+`status.observedGeneration` and the Ready condition's `observedGeneration`
+matching the new `metadata.generation`, and all desired participants ready
+(nonzero desired count). Every serving dataplane must activate the resulting
+configuration. Kubernetes resource generation, `spec.cacheGeneration`, and
+dataplane configuration revision are different values. The native fixture checks
+activation directly; it does not run a Kubernetes P2PCache controller.
+
+This is cache-wide logical invalidation for the P2PCache, not immediate physical
+deletion of old slab data or removal of containerd ingests. Generation recovery
+is explicit; a missing commit observation is not proof of corruption and does
+not trigger automatic global eviction. See the
+[operator recovery guide](../../docs/content/guides/gantry.md#recover-from-known-incorrect-cached-content).
 
 Containerd recovery also needs attention to its retained failed ingest. In the
 native campaign (containerd daemon 2.2.1, Go client 2.3.5), a normal pull leaves
@@ -107,15 +118,27 @@ generation activation recommits those bytes and fails with the same bad digest,
 without issuing another layer GET. The test asserts that behavior rather than
 hiding it behind a fresh `content.WriteBlob` reference. Its lease keeps the
 campaign's content and ingest available across the sequential attempts.
+These are tested runtime/client observations, not a universal cleanup or retry
+contract for every containerd version or consumer.
 
 For operator recovery, finish the failed pull and ensure there is no active writer
 before explicitly aborting only the known failed ingest in its original containerd
-namespace. In the test, acquiring and closing that exact writer confirms it is idle;
-after abort, the same image/ingest reference fetches the repaired layer and commits
-successfully. The consumer namespace is separate from Gantry's local stores, and
+namespace, keeping concurrent retries stopped. In the test, acquiring and closing
+that exact writer confirms it is idle; after abort, the same image/ingest reference
+fetches the repaired layer and commits successfully. The consumer namespace is
+separate from Gantry's local stores, and
 subsequent offline reads must increment Racer's `completed` counter. Drain/finish
 pre-bump requests before asserting post-bump reads: activation does not
 retroactively change an already-started stream.
+
+The corruption is injected at origin before CRC admission; this test does not
+claim peer transfer or disk CRC validation was removed. Racer retains peer CRC64
+validation and background disk scrubbing, while file-backed foreground hits are
+not rehashed. A self-consistent admission CRC is not an OCI digest proof.
+`cmd/racer-dataplane/tests/http/peer_recovery.rs` separately checks malformed or
+missing peer CRCs and altered metadata, rejection without cache publication,
+healthy refetch, and subsequent cache reuse. Generic HTTP consumers must verify
+their own content; the SDK's `StreamVerified` remains available.
 
 ### Prerequisites
 
