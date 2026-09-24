@@ -83,35 +83,86 @@ data-intensive workloads such as machine learning and analytics.
 
 ## Cluster-wide installation
 
-With the Unbounded operator installed, Racer defaults on when a Site exists.
-The operator creates one `Deployment/racer-controlplane` and one ownerless
-`DaemonSet/racer-dataplane`. To explicitly vote for installation on an existing
-Site, replace `my-site` with your Site's name:
+With the Unbounded operator installed, any live (nonterminating) `P2PCache`
+installs both `Deployment/racer-controlplane` and the ownerless
+`DaemonSet/racer-dataplane`. This applies even with zero Sites or a cache selector
+that currently matches none. Sites determine cache universes and participation;
+they do not enable or disable Racer installation.
 
-```bash
-kubectl patch sites.unbounded-cloud.io my-site --type=merge \
-  -p '{"spec":{"components":{"racer":{"enabled":true}}}}'
+Create a cache for your application, for example:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
+metadata:
+  name: application-cache
+spec:
+  siteSelector: {}
+  cacheGeneration: 1
+  maxCandidateAttempts: 3
 ```
 
-An omitted Racer block or `enabled` field means true. Explicit false opts a Site
-out of initial installation voting. If every Site opts out, a fresh installation
-is absent; once installed, both components are retained and repaired even after
-all Sites opt out or disappear. With no Sites and no existing installation,
-Racer is not installed.
+Save this as `application-cache.yaml` and run `kubectl apply -f application-cache.yaml`.
+An empty `siteSelector` selects all live Sites, each with an independent cache
+universe. Applications serve their node-local origin at
+`/dev/racer/application-cache/origin` and access the cache at
+`/dev/racer/application-cache/cache`. For container images, use the dedicated
+[Gantry backing cache](../../guides/gantry/#operator-managed-enablement) instead.
+
+After the last live P2PCache is removed, each existing Racer workload is retained
+and updated independently, including image upgrades. A missing or deleting
+workload is not recreated just because its sibling still exists. Shared support
+resources are maintained while either workload survives, but ServiceAccounts,
+RBAC, Services, ConfigMaps, Secrets, and Leases are not reinstall markers.
 
 Agents run on eligible Linux nodes with nonempty Site membership, honoring the
-existing Racer exclusion label and taint restrictions. Canonical
-`unbounded-cloud.io/site` membership takes precedence over the deprecated label,
-including when its value is empty. Every existing, nonterminating Site remains
-an independent cache universe regardless of its installation vote. P2PCache
-Site selectors and cache capacity inheritance (Node annotation, Site setting,
-then 10 GiB) continue to apply.
+`racer.unbounded-cloud.io/exclude: "true"` label and taint restrictions. Membership
+requires the canonical `unbounded-cloud.io/site` Node label naming a live Site;
+the deprecated `net.unbounded-cloud.io/site` label does not establish membership.
 
 Bootstrap derives each process's identity from its Node UID and Site. Enrollment
 verifies the live Pod-to-singleton-DaemonSet ownership chain. When Node identity
 or Site membership changes, the old process is deconfigured and its Pod is
 gracefully replaced; it cannot join the new universe using its old identity.
 Both Racer workload override components are cluster-wide and reject `sites`.
+
+### Cache capacity and upgrade
+
+Cache capacity comes only from the Node annotation
+`racer.unbounded-cloud.io/cache-size`, or **10Gi** when that annotation is absent.
+There is no Site-level capacity setting. For example:
+
+```bash
+kubectl annotate node worker-1 racer.unbounded-cloud.io/cache-size=100Gi --overwrite
+```
+
+Use a Kubernetes quantity representing whole bytes, at least `512Mi`; capacity
+is rounded up to a `64Mi` boundary. An empty or invalid annotation reports an
+error rather than falling back to the default. Removing the annotation restores
+the `10Gi` desired capacity.
+
+Before upgrading from Site-based configuration, copy each desired
+`spec.components.racer.cacheSize` value to the Nodes that previously inherited
+it, preserving any intentional per-Node overrides. Otherwise those Nodes use
+`10Gi` after upgrade. Remove the obsolete `spec.components.racer` block from your
+Site manifests: both `enabled` and `cacheSize` have been removed. Creating a Site
+alone no longer installs Racer; create the P2PCaches your applications need.
+
+### Manual uninstall
+
+Remove all P2PCaches first, then delete both workloads in either order:
+
+```bash
+kubectl delete p2pcaches.racer.unbounded-cloud.io --all
+kubectl -n unbounded-system delete deployment/racer-controlplane
+kubectl -n unbounded-system delete daemonset/racer-dataplane
+```
+
+Use your installation namespace if different. A remaining live P2PCache causes
+the operator to recreate either deleted workload. With no caches, deleting one
+workload leaves the other update-only until you delete it too. Leftover support
+resources do not reinstall either workload. This procedure removes the running
+workloads; it does not erase node-local slabs or retained support resources.
 
 ### Certificates and rotation
 
@@ -142,16 +193,14 @@ Successor leaders retain or increase persisted safety margins; reducing the
 flag does not shorten an existing domain's recorded overlap delay. The default
 leaf lifetime is 24 hours and clock skew is five minutes.
 
-### Stateless-version cutover
+### Historical stateless-version cutover
 
-This version requires a coordinated fresh dev/test cutover with matching control
-plane and dataplane images. Earlier CA formats and certificates are not migrated
-automatically. Stop all old processes before restarting in a new trust domain;
-removing obsolete runtime ConfigMaps does not reset or migrate the CA. CA reset
-must be a separate explicit decision. Preserve compatible cache slabs and the
-P2PCache identities that isolate their contents. The repository's
-`designs/racer-stateless-cutover.md` contains the scoped cleanup/reset workflow;
-`hack/scripts/racer-obsolete-runtime.sh` only inventories obsolete objects.
+The pre-1.0 stateless version required a coordinated fresh dev/test cutover with
+matching control-plane and dataplane images. The repository's
+`designs/racer-stateless-cutover.md` records that historical cleanup/reset workflow.
+This is not the Racer 1.0 upgrade procedure; see the fresh-state requirements
+below. Changing installation or Gantry backend selection does not itself migrate
+cached data or reset CA state.
 
 ## Build from Source
 

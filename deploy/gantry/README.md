@@ -26,7 +26,7 @@ The install namespace defaults to `unbounded-system`. Render them with
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
 
-## Apply order
+## Standalone direct-backend apply order
 
 ```sh
 # Render the templates into deploy/gantry/rendered/ first (defaults to the
@@ -47,25 +47,40 @@ kubectl apply -f deploy/gantry/rendered/daemonset.yaml
 
 ## Optional Racer content backend
 
-`content_backend: direct` remains the default and `storage_mode: containerd`
-remains required. For operator-managed deployments, ensure the default-on or
-retained Racer installation is ready, then edit the existing
-`gantry-config` ConfigMap's `data.config.yaml`:
+Direct distribution remains the default and `storage_mode: containerd` remains
+required. For operator-managed deployments, create a user-managed P2PCache with
+the backing annotation. The rendered example supplies this resource:
 
-```yaml
-content_backend: racer
-racer_cache_name: gantry
+```sh
+kubectl apply -f deploy/gantry/rendered/examples/racer-cache.yaml
 ```
 
-The singleton operator validates all serving nodes, provisions the dedicated
-cluster-scoped `P2PCache/gantry`, and rolls the Gantry pod template. Its empty
-`siteSelector` selects every live Site, each with its own universe. Racer and
-Gantry Site installation votes need not match. Racer uses one cluster-wide
-`racer-dataplane` DaemonSet and retains its existing scheduling restrictions.
-All participating nodes must have the local Gantry origin. Mixed per-Site
-backends, Racer-excluded/unassigned nodes, and unsupported scheduling overrides
-are rejected. Main-config/backend overrides through pod env or flags are rejected
-because the operator must see the effective backend.
+Any live P2PCache installs both Racer workloads, even with zero Sites. Gantry
+selection requires exactly one live P2PCache with
+`unbounded-cloud.io/gantry-backing: "true"`, an empty `siteSelector`, at least one
+live Site enabling Gantry, and full node coverage. Every nonterminating Node
+must be Linux, have canonical `unbounded-cloud.io/site` membership in a live
+Site, lack Racer exclusion, and have no taints unsupported by the managed Racer
+dataplane. Each Site is an independent universe. The operator starts Gantry's
+local origin without waiting for Racer readiness and rolls the Gantry pod
+template with the selected cache name and UID.
+
+The cache is user-owned: the operator never creates, adopts, edits, or deletes
+it. A missing/removed annotation, `"false"`, or deletion of the selected cache
+returns Gantry to direct when no other cache is selected. Invalid values,
+multiple selections, or invalid selector/coverage/live-Site checks produce a
+direct rollout plus an `InvalidGantryBacking` diagnostic. Same-name cache
+recreation changes cache identity and triggers a rollout through its new UID.
+Rolling transitions can temporarily mix backends, cause retries, and lose warm
+cache reuse; they do not migrate cached content.
+
+There is no operator backend toggle in `gantry-config`. Its existing payload and
+registry settings are preserved, but generated backend arguments override old
+`content_backend`/`racer_cache_name` values. The old
+`unbounded-cloud.io/gantry-cache` label does not select a cache. To keep an old
+dedicated cache on upgrade, explicitly annotate it with
+`unbounded-cloud.io/gantry-backing: "true"` after checking coverage. Main-config
+and backend overrides through pod env or flags are rejected for managed pods.
 
 Gantry mounts the shared **parent directory** `/dev/racer` read/write, never an
 individual socket inode. The init container prepares `/dev/racer/gantry` with
@@ -76,12 +91,31 @@ Racer mode omits transfer/chair ports and the service-account token. Chair
 Leases/RBAC are not created or reconciled in this mode; old resources are retained
 for rollback. The P2PCache is retained when returning to direct.
 
-For standalone deployments, enforce coverage yourself, apply the rendered
-`examples/racer-cache.yaml`, set the same ConfigMap fields, then use
-`kubectl patch --type=strategic --patch-file` with the rendered
+For standalone deployments, deploy Racer, enforce coverage yourself, apply the
+rendered `examples/racer-cache.yaml`, and set these Gantry ConfigMap fields (or
+equivalent standalone flags):
+
+```yaml
+content_backend: racer
+racer_cache_name: gantry
+```
+
+Standalone Gantry does not use the backing annotation to choose its backend.
+Then use `kubectl patch --type=strategic --patch-file` with the rendered
 `examples/racer-daemonset-patch.yaml`. Restart Gantry after changing its ConfigMap.
 The patch is **not** a standalone manifest and assumes cache name `gantry`.
 These examples are excluded from the operator's top-level manifest applies.
+
+For operator-managed rollback, remove the backing annotation or set it to
+`"false"` and wait for the Gantry rollout. Returning to direct retains the cache
+unless you delete it explicitly. Racer retains each existing workload
+independently after the last P2PCache is removed, updating but not recreating it.
+To uninstall Racer, remove all P2PCaches, then delete
+`deployment/racer-controlplane` and `daemonset/racer-dataplane` in either order.
+Support resources alone do not reinstall them. Before upgrading, copy desired
+Site cache sizes to Node `racer.unbounded-cloud.io/cache-size` annotations;
+absent Node annotations now use `10Gi`, with no Site fallback. See
+[Racer installation and capacity](../../docs/content/concepts/racer.md#cluster-wide-installation).
 
 See [the public Gantry guide](../../docs/content/guides/gantry.md#optional-racer-backend)
 for rollout, authentication trust boundaries, 64 MiB stripes, fallback limits,
@@ -123,7 +157,7 @@ derived from `hosts.toml.template` (substitute `${REGISTRY_SERVER}`
 with the registry's `https://...` URL). containerd reloads `certs.d`
 on its own; no restart needed.
 
-## What to verify after rollout
+## What to verify after a direct-backend rollout
 
 | Check | How |
 | --- | --- |

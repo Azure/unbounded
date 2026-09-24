@@ -4,20 +4,48 @@
 
 The original proposal below is historical. Gantry is now an enabled-by-default,
 version-matched cluster singleton managed by `internal/operator/components/gantry`.
-The existing `gantry-config` ConfigMap is preserved and is the authoritative
-deployment-wide configuration. `content_backend: direct` is the default;
-`content_backend: racer` provisions a dedicated P2PCache, validates a wanted or
-retained Racer installation and all-node coverage, and installs restart-safe
-parent-directory socket mounts. No Site API fields are needed for backend
-selection. The unbounded agent owns containerd mirror wiring.
+The existing `gantry-config` ConfigMap is preserved for registry and runtime
+configuration, but it does not select the managed backend. Direct is the default.
+Exactly one live user-managed P2PCache annotated
+`unbounded-cloud.io/gantry-backing: "true"` selects Racer if its selector is empty,
+all nonterminating Nodes have managed Racer coverage, and at least one live Site
+enables Gantry. The operator never creates, adopts, changes, or deletes this
+cache. Missing/false/removed annotations and selected-cache deletion return to
+direct; invalid intent returns to direct with an `InvalidGantryBacking`
+diagnostic. Failed API reads instead preserve the deployed configuration and
+retry (`internal/operator/components/gantry/racer.go:37`).
+
+Generated backend arguments override legacy ConfigMap backend settings. Gantry
+starts its origin without a Racer-readiness gate; parent-directory socket mounts
+survive socket replacement. The selected cache UID is stamped on the pod
+template, so same-name cache recreation rolls Gantry
+(`internal/operator/components/gantry/racer.go:122`, `:139`). Standalone processes
+still support backend flags, environment variables, and YAML. The unbounded
+agent owns containerd mirror wiring.
+
+Any live P2PCache installs both Racer workloads, including with zero Sites or no
+selector matches. Without live caches, each existing workload is maintained
+independently with update-only operations. Removing all caches and then deleting
+the Deployment and DaemonSet in either order uninstalls the workloads; support
+resources alone never reinstall them
+(`internal/operator/components/racer/racer.go:41`, `:73`, `:85`, `:115`).
+
+The Site Racer `enabled` and `cacheSize` fields have been removed. Capacity is
+the Node `racer.unbounded-cloud.io/cache-size` annotation, then `10Gi` when absent
+(`internal/racer/cache_size.go:53`). Before upgrade, copy desired inherited Site
+sizes to Node annotations. There is no automatic cache migration or automatic
+selection of an old operator-created cache: annotate that cache explicitly to
+keep using it. The old `unbounded-cloud.io/gantry-cache` label is ignored.
 
 The supported rollout and limitations are documented in
 [the public Gantry guide](../docs/content/guides/gantry.md#optional-racer-backend).
 The implementation does not promise atomic fleet-wide cutover, mixed per-Site
 backends, or cache-hit authorization isolation between tenants. Racer owns the
 64 MiB page cache; containerd remains the committed image store.
+Backend switches use normal rolling updates, with transient retries and loss of
+warm cache reuse acceptable during convergence.
 
-## Background
+## Historical proposal: background
 
 Gantry is a P2P OCI image distribution agent that runs as a Kubernetes DaemonSet. Today it
 is deployed independently of the unbounded stack. Operators manage two separate install and
