@@ -18,6 +18,15 @@ from unittest.mock import patch
 import e2e
 
 
+def clear_image_pin(test: unittest.TestCase) -> None:
+    """Resolve from the manifest regardless of the environment. CI exports a
+    pinned build for the job, which these tests must not inherit."""
+    for name in ("ACL_IMAGE_URL", "ACL_IMAGE_SHA256", "ACL_IMAGE_BUILD_ID"):
+        patcher = patch.object(e2e, name, "")
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
 class TestHostImageSelection(unittest.TestCase):
     """The per-OS differences that the rest of the harness reads."""
 
@@ -25,6 +34,7 @@ class TestHostImageSelection(unittest.TestCase):
         # The manifest lookup is cached so a real run fetches it once. These
         # feed it different manifests, so each starts from a clear cache.
         e2e.acl_image_from_manifest.cache_clear()
+        clear_image_pin(self)
 
     def test_conventional_hosts_use_cloud_init_and_the_default_prefix(self):
         """Every pre-existing host must keep the behavior it had.
@@ -113,6 +123,7 @@ class TestACLImageResolution(unittest.TestCase):
 
     def setUp(self):
         e2e.acl_image_from_manifest.cache_clear()
+        clear_image_pin(self)
 
     MANIFEST = {
         "build_id": "2026091817",
