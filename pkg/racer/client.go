@@ -282,6 +282,7 @@ func (w *offsetWriter) Write(p []byte) (int, error) {
 // ReadAt reads into p using concurrent GETs split at page boundaries. It follows
 // io.ReaderAt's EOF/count rules but accepts an explicit context. On other errors
 // the count is the contiguous completed prefix; later portions may be modified.
+// It requests only the requested bytes, with no caching or speculative reads.
 func (o *Object) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("racer: negative offset")
@@ -350,6 +351,19 @@ func (o *Object) pages(ctx context.Context, off, length int64, fn func(context.C
 	first := off / PageSize
 	last := (off + length - 1) / PageSize
 	count := last - first + 1
+
+	if count == 1 {
+		err := fn(ctx, off, off+length-1)
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+
+		if err != nil {
+			return fmt.Errorf("racer: page at %d: %w", off, err)
+		}
+
+		return nil
+	}
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)

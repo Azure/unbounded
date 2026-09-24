@@ -64,11 +64,64 @@ globally; callers still control the number of concurrent operations. Concurrent
 socket `WriteTo` calls can each own a pipe even while waiting for their next page.
 The pipe bounds below apply independently of request admission.
 
-There is no prefetch option yet. The internal admission control provides a
-nonblocking `tryAcquire` for future one-page speculation: skip prefetch when no
+There is no background stream prefetch option yet. The internal admission control
+provides a nonblocking `tryAcquire` for future one-page speculation: skip prefetch when no
 permit is immediately available, and transfer the acquired permit to the request
 without acquiring again. Speculation must never wait for capacity while holding
 a foreground response's permit.
+
+## Opt-in bounded random-access read-ahead
+
+`Object.ReadAt(ctx, p, off)` remains exact: it fetches only requested bytes,
+splits GETs at 64 MiB page boundaries, and retains no payload. A single-page
+operation executes synchronously without creating a page worker.
+
+For nearby small reads, explicitly create an independent adapter:
+
+```go
+reader, err := object.ReadAhead(256 * 1024) // Maximum retained payload bytes.
+if err != nil {
+    return err
+}
+n, err := reader.ReadAt(ctx, p, offset)
+```
+
+`Object.ReadAhead(maxBytes int) (*ReadAhead, error)` requires a positive limit.
+On a miss, a read whose in-bounds length fits the limit fetches a forward window
+starting at the requested offset, clipped at the snapshot's EOF. Subsequent reads
+fully within that window use memory, including overlapping or backward reads.
+A miss replaces the window; distant/random reads can waste up to the window's
+unused bytes per fill. Windows may cross page boundaries, issuing one GET per
+intersected page. Reads larger than the limit bypass the window and fetch exactly
+their requested interval, preserving the previous valid window.
+
+The adapter lazily allocates one payload buffer of at most
+`min(maxBytes, object size)` bytes and reuses it for every fill. Caller output,
+transport buffers, and bounded page-worker metadata are additional. Each adapter
+has its own limit; creating multiple adapters multiplies retained memory. It has
+no background goroutine, holds no response between calls, and needs no Close;
+drop the adapter to release its payload storage to garbage collection.
+
+`ReadAhead.ReadAt(ctx, p, off)` uses an explicit per-call context rather than
+implementing `io.ReaderAt`. Concurrent calls on one adapter are serialized;
+waiting for access, request admission, and GET I/O are cancellable. There is no
+lifetime context or background speculation. All expanded GETs are foreground
+work covered by the calling context and the client's existing active-request
+limit. Cancellation or failure does not permanently poison the adapter.
+
+The adapter is tied to the original immutable Object and its origin-data view.
+Every fill uses the existing `If-Match`, version, content-type, range, and framing
+checks. Only a fully successful window is retained. Failed or canceled fills
+invalidate the window, including any previously retained bytes overwritten by
+the fill. Errors in speculative bytes are reported even when the requested
+prefix was completed; returned counts cover only the contiguous requested prefix.
+EOF and offset rules match `Object.ReadAt`, including zero-length reads and short
+reads at EOF. In-flight cancellation causes and wrapped page errors are preserved.
+Cached hits serve the pinned version without revalidation; a miss never refreshes
+HEAD or retries a changed version. Open a new Object and adapter for a new version.
+As with exact reads, partial ranges cannot verify a full-object digest: protocol
+validation rejects detected errors, but cannot detect arbitrary incorrect payload
+bytes supplied with valid framing and the pinned ETag.
 
 ## Sequential reads and explicit splice
 
