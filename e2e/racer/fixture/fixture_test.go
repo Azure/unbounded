@@ -90,6 +90,10 @@ func TestBackendContract(t *testing.T) {
 		t.Fatalf("page: %+v", p)
 	}
 
+	if h.Header().Get("Content-Type") != "application/octet-stream" || p.Header().Get("Content-Type") != h.Header().Get("Content-Type") {
+		t.Fatal("HEAD and GET must describe the same representation Content-Type")
+	}
+
 	if w := request("POST", "/version?value=2", "", ""); w.Code != 200 {
 		t.Fatal(w.Code)
 	}

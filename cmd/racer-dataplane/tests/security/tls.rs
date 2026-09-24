@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+const CONTROL_PLANE_URI: &str = "spiffe://racer/controlplane";
 use openssl::{
     bn::BigNum,
     pkey::Private,
@@ -19,6 +20,37 @@ use std::{
 pub(crate) struct Authority {
     pub(crate) cert: X509,
     pub(crate) key: PKey<Private>,
+}
+
+/// Fixture conversion only: production TLS rejects every pre-cutover URI.
+pub(crate) fn signed_uri(uri: &str) -> String {
+    let (kind, universe, node, pod_uid) = if uri == "spiffe://racer/controlplane" {
+        (
+            "controlplane",
+            String::new(),
+            String::new(),
+            "test-cp".into(),
+        )
+    } else if let Ok(peer) = PeerIdentity::parse(uri) {
+        ("node", peer.universe, peer.node, peer.pod_uid)
+    } else {
+        return uri.into();
+    };
+    SignedClaims {
+        version: 1,
+        namespace: "test-namespace".into(),
+        identity: ProcessIdentity {
+            kind: kind.into(),
+            universe,
+            node,
+            pod_uid,
+            boot_id: "03".repeat(32),
+            pod_name: "test-name".into(),
+            container_id: String::new(),
+        },
+    }
+    .uri()
+    .unwrap()
 }
 
 fn key() -> PKey<Private> {
@@ -104,22 +136,27 @@ impl Authority {
                 .unwrap(),
         )
         .unwrap();
-        cert.append_extension(
-            ExtendedKeyUsage::new()
-                .server_auth()
-                .client_auth()
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
+        let cp = uris.iter().any(|u| {
+            *u == CONTROL_PLANE_URI
+                || SignedClaims::parse(u).is_ok_and(|c| c.identity.kind == "controlplane")
+        });
+        let mut eku = ExtendedKeyUsage::new();
+        eku.server_auth();
+        if !cp {
+            eku.client_auth();
+        }
+        cert.append_extension(eku.build().unwrap()).unwrap();
         let aki = AuthorityKeyIdentifier::new()
             .keyid(true)
             .build(&cert.x509v3_context(Some(&self.cert), None))
             .unwrap();
         cert.append_extension(aki).unwrap();
         let mut san = SubjectAlternativeName::new();
+        if cp {
+            san.dns("racer-controlplane.test-namespace.svc");
+        }
         for uri in uris {
-            san.uri(uri);
+            san.uri(&signed_uri(uri));
         }
         if let Some(dns) = dns {
             san.dns(dns);
@@ -550,11 +587,8 @@ fn certificate_lifetime_bounds_admission_without_aborting_transfers() {
     server.peer_expiry_unix = client.local_expiry_unix;
     assert!(!client.admits_new_request(now() as u64));
     assert!(!server.admits_new_request(now() as u64));
-    assert_eq!(
-        client.write(b"still draining").unwrap(),
-        TlsProgress::Complete(14)
-    );
-    read_exact(&mut server, b"still draining");
+    assert!(client.write(b"expired transfer").is_err());
+    assert!(server.read(&mut [0; 16]).is_err());
     client.failed = true;
     assert_eq!(client.valid_until(), None);
 }
@@ -562,6 +596,37 @@ fn certificate_lifetime_bounds_admission_without_aborting_transfers() {
 unsafe extern "C" {
     fn SSL_key_update(ssl: *mut c_void, update_type: i32) -> i32;
     fn SSL_set_options(ssl: *mut c_void, options: u64) -> u64;
+}
+
+#[test]
+fn signed_claims_reject_legacy_malformed_and_unknown_versions() {
+    let uri = signed_uri(&identity('b').uri());
+    let claims = SignedClaims::parse(&uri).unwrap();
+    assert_eq!(claims.identity.boot_id, "03".repeat(32));
+    assert_eq!(claims.identity.pod_name, "test-name");
+    assert_eq!(claims.namespace, "test-namespace");
+    assert!(SignedClaims::parse(&identity('b').uri()).is_err());
+    assert!(SignedClaims::parse(CONTROL_PLANE_URI).is_err());
+    for field in ["version", "boot", "role", "namespace", "pod"] {
+        let mut invalid = claims.clone();
+        match field {
+            "version" => invalid.version = 2,
+            "boot" => invalid.identity.boot_id.clear(),
+            "role" => invalid.identity.kind = "admin".into(),
+            "namespace" => invalid.namespace = "../system".into(),
+            "pod" => invalid.identity.pod_name.clear(),
+            _ => unreachable!(),
+        }
+        assert!(
+            SignedClaims::parse(&invalid.uri().unwrap()).is_err(),
+            "{field}"
+        );
+    }
+    let ca = Authority::new();
+    let claims = SignedClaims::parse(&signed_uri(CONTROL_PLANE_URI)).unwrap();
+    let (leaf, _) = ca.leaf(&[&claims.uri().unwrap()], None, now() - 1, now() + 60);
+    let leaf = X509::from_pem(&leaf).unwrap();
+    assert!(certificate_claims(&leaf).is_ok());
 }
 
 #[test]

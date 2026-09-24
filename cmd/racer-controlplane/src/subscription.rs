@@ -54,6 +54,7 @@ struct Cache {
 pub struct Subscriptions {
     pub(crate) universes: RwLock<BTreeMap<String, Arc<Published>>>,
     pub(crate) policies: RwLock<BTreeMap<String, Arc<StoragePolicy>>>,
+    live_selections: RwLock<Option<BTreeMap<(String, String), Selection>>>,
     pub(crate) reports: Mutex<Reports>,
     cache: Mutex<Cache>,
     builders: Arc<Semaphore>,
@@ -61,6 +62,9 @@ pub struct Subscriptions {
     responses: Arc<Semaphore>,
     pub(crate) security: SecurityGetter,
     pub(crate) fence: RwLock<Option<String>>,
+    // Runtime enables a deadline before starting. It expires synchronously on
+    // request/readiness checks even if the reconcile future or API I/O stalls.
+    authority_deadline: RwLock<Option<Instant>>,
     wait: Duration,
 }
 
@@ -69,6 +73,7 @@ impl Subscriptions {
         Arc::new(Self {
             universes: RwLock::new(BTreeMap::new()),
             policies: RwLock::new(BTreeMap::new()),
+            live_selections: RwLock::new(None),
             reports: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(Cache {
                 values: BTreeMap::new(),
@@ -82,6 +87,7 @@ impl Subscriptions {
             responses: Arc::new(Semaphore::new(16)),
             security,
             fence: RwLock::new(None),
+            authority_deadline: RwLock::new(None),
             wait,
         })
     }
@@ -93,20 +99,71 @@ impl Subscriptions {
     }
 
     pub fn selection(&self, universe: &str, node: &str) -> Option<Selection> {
-        self.universes
+        let selected = self
+            .universes
             .read()
             .unwrap()
             .get(universe)?
             .selections
             .get(node)
-            .cloned()
+            .cloned()?;
+        self.live_selections
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|live| live.get(&(universe.into(), node.into())) == Some(&selected))
+            .then_some(selected)
     }
 
-    pub(crate) fn set_fence(&self, fence: Option<String>) {
-        *self.fence.write().unwrap() = fence;
+    pub(crate) fn set_live_selections(&self, next: BTreeMap<(String, String), Selection>) {
+        let mut live = self.live_selections.write().unwrap();
+        if live.as_ref() == Some(&next) {
+            return;
+        }
+        let old = live.replace(next);
+        let mut cache = self.cache.lock().unwrap();
+        cache.digests.retain(|key, _| {
+            old.as_ref().and_then(|prior| prior.get(key))
+                == live.as_ref().and_then(|next| next.get(key))
+        });
+        drop(cache);
+        drop(live);
         for publication in self.universes.read().unwrap().values() {
             publication.changes.send_modify(|n| *n = n.wrapping_add(1));
         }
+    }
+
+    pub(crate) fn authority_until(&self, deadline: Instant) {
+        *self.authority_deadline.write().unwrap() = Some(deadline);
+    }
+
+    pub(crate) fn authority_current(&self) -> bool {
+        self.authority_deadline
+            .read()
+            .unwrap()
+            .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    pub(crate) fn set_fence(&self, fence: Option<String>) {
+        let mut current = self.fence.write().unwrap();
+        if *current == fence {
+            return;
+        }
+        *current = fence;
+        for publication in self.universes.read().unwrap().values() {
+            publication.changes.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.universes.write().unwrap().clear();
+        self.policies.write().unwrap().clear();
+        self.reports.lock().unwrap().clear();
+        let mut cache = self.cache.lock().unwrap();
+        cache.values.clear();
+        cache.order.clear();
+        cache.digests.clear();
+        cache.bytes = 0;
     }
 
     pub(crate) fn install(&self, generation: Arc<Generation>) -> anyhow::Result<()> {
@@ -205,22 +262,44 @@ impl Subscriptions {
         let context = (self.security)().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if self.fence.read().unwrap().as_deref() != Some(context.fence.as_str())
             || context.state.fence() != context.fence
+            || !self.authority_current()
         {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        let parts: Vec<_> = peer.uri().split('/').collect();
-        if parts.len() != 9 || parts[3] != "universe" || parts[5] != "node" || parts[7] != "pod" {
+        let claims = context
+            .state
+            .verify_peer(peer, unix_now())
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        if claims.kind != crate::security::IdentityKind::Node || claims.boot_id != boot {
             return Err(StatusCode::FORBIDDEN);
         }
-        let (universe, node) = (parts[4], parts[6]);
+        let (universe, node) = (claims.universe.as_str(), claims.node.as_str());
         let pod = peer
             .node_pod(universe, node, unix_now())
             .map_err(|_| StatusCode::FORBIDDEN)?;
-        let member = context
-            .state
-            .verify_member(&format!("{pod}/{boot}"), peer, unix_now())
-            .map_err(|_| StatusCode::FORBIDDEN)?;
-        if member.identity.boot_id != boot {
+        if pod != claims.pod_uid {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // A rejected cache configuration can retain old topology, but cannot
+        // authorize a Pod whose live Node binding or selection has disappeared.
+        let previously_selected =
+            self.universes
+                .read()
+                .unwrap()
+                .get(universe)
+                .is_some_and(|published| {
+                    published
+                        .selections
+                        .get(node)
+                        .is_some_and(|s| s.pod_uid == pod)
+                });
+        if previously_selected && self.selection(universe, node).is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if self
+            .selection(universe, node)
+            .is_some_and(|selected| selected.pod_uid == pod && selected.pod_name != claims.pod_name)
+        {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok((universe.into(), node.into(), pod.into()))
@@ -246,9 +325,8 @@ impl Subscriptions {
             .get(universe)
             .cloned()
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let selected = publication
-            .selections
-            .get(node)
+        let selected = self
+            .selection(universe, node)
             .is_some_and(|s| s.pod_uid == pod);
         let key = (
             universe.to_owned(),
@@ -256,8 +334,27 @@ impl Subscriptions {
             publication.topology.generation().revision,
             selected,
         );
-        if let Some(cached) = self.cache.lock().unwrap().values.get(&key).cloned() {
-            return Ok((cached, publication, selected));
+        {
+            // Match install's lock order and never resurrect a replaced
+            // generation's digest. Live reselection may keep the payload cached
+            // while invalidating its convergence metadata.
+            let universes = self.universes.read().unwrap();
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.values.get(&key).cloned() {
+                if selected
+                    && universes
+                        .get(universe)
+                        .is_some_and(|p| Arc::ptr_eq(p, &publication))
+                    && (cache.digests.len() < 100_000
+                        || cache.digests.contains_key(&(universe.into(), node.into())))
+                {
+                    cache.digests.insert(
+                        (universe.into(), node.into()),
+                        (key.2, cached.digest.clone()),
+                    );
+                }
+                return Ok((cached, publication, selected));
+            }
         }
         let topology = publication.topology.clone();
         let node = node.to_string();
@@ -381,19 +478,16 @@ async fn config_inner(
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
             .changes
             .subscribe();
-        let (revision, selected) = {
+        let revision = {
             let universes = state.universes.read().unwrap();
             let publication = universes
                 .get(&universe)
                 .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            (
-                publication.topology.generation().revision,
-                publication
-                    .selections
-                    .get(&node)
-                    .is_some_and(|s| s.pod_uid == pod),
-            )
+            publication.topology.generation().revision
         };
+        let selected = state
+            .selection(&universe, &node)
+            .is_some_and(|s| s.pod_uid == pod);
         let policy = state
             .policies
             .read()
@@ -438,8 +532,14 @@ async fn config_inner(
                 .acquire_owned()
                 .await
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            let (snapshot, publication, _) = state.snapshot(&universe, &node, &pod).await?;
+            let (snapshot, publication, snapshot_selected) =
+                state.snapshot(&universe, &node, &pod).await?;
             if snapshot.value.revision != revision
+                || snapshot_selected != selected
+                || state
+                    .selection(&universe, &node)
+                    .is_some_and(|s| s.pod_uid == pod)
+                    != selected
                 || !state
                     .universes
                     .read()
@@ -511,3 +611,7 @@ async fn config_inner(
 #[cfg(test)]
 #[path = "../tests/scale/distinct.rs"]
 mod distinct_scale;
+
+#[cfg(test)]
+#[path = "../tests/runtime/subscription.rs"]
+mod runtime_tests;

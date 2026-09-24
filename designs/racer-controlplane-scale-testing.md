@@ -26,6 +26,35 @@ Use separate processes for geometries to keep peak RSS meaningful. Select the
 exact test rather than every ignored test. Keep an external deadline. Serialize
 builds and execution through the verification owner, especially with limited disk.
 
+## Stateless fixture contract
+
+The fixture uses versioned signed process claims (`SignedClaims` in the Rust
+security API), role-specific EKUs, and the current Pod namespace/name/UID and boot
+identity. It loads a version-5 CA image with no participant shards and checks that
+fleet certificate creation leaves its bounded metadata and issuer expiry watermark
+unchanged. Leaf expiry is bounded by the preallocated watermark. This is synthetic
+credential setup, not an enrollment persistence or rotation throughput measurement
+(`cmd/racer-controlplane/tests/scale/distinct.rs:342-406,719-791`).
+
+Topology uses universe/Node-UID highest-random-weight placement, with statistical
+balance, adjacent repeats, and valid zero-slot idle members. Per-universe
+`Publication::publish` calls use distinct synthetic reserved revisions and a
+range-sized gap before the successor publication. The clients check the exact
+expected revisions and snapshot/envelope agreement; they do not assume a fresh
+process starts at revision 1 or that updates are consecutive. No old RecordStore,
+store gate, participant ledger, or historical topology payload is part of this
+router fixture. Revision checkpoint CAS and leadership authority remain runtime
+test responsibilities (`cmd/racer-controlplane/src/publication.rs:50-68`,
+`cmd/racer-controlplane/tests/scale/distinct.rs:72-79,809-842,1003-1010`).
+
+Rotation in the production security manager is gated by confirmed publication
+overlap plus skew, then the old issuer's maximum issued expiry plus skew. Fleet
+acknowledgments do not gate progress (`cmd/racer-controlplane/src/security/state.rs:522-583`).
+The scale fixture holds one root throughout; expiry/rotation scenarios remain in
+the security, service, and native campaign suites. Historical measurements below
+predate the stateless HRW and signed-claims cutover and are not current capacity
+evidence.
+
 ## Structural diagnosis and evidence
 
 The original `tmp/racer-test-audit/controlplane-scale-release.log:7-18` records a
@@ -41,12 +70,13 @@ The harness deliberately overlaps work:
 2. The 35-second read deadline starts before the response status line, so measured
    publication latency includes existing held-request time. The field called
    `first_byte` actually waits for the complete HTTP status line.
-3. Each revision-2 recipient immediately reconnects while others await revision 2.
+3. Each successor-publication recipient immediately reconnects while others await
+   that publication.
    Previously both event types shared a completion count: 4,120 events does not
    mean 4,120 updated nodes.
 4. Production permits four snapshot builders and sixteen responses
-   (`cmd/racer-controlplane/src/subscription.rs:80-82`). Response permits precede
-   snapshot work (`:435-441`) and remain in the body (`:477-486`). The 28-second
+   (`cmd/racer-controlplane/src/subscription.rs:85-87`). Response permits precede
+   snapshot work (`:526-536`) and remain in the body (`:575-586`). The 28-second
    unchanged-poll hold does not cap changed-snapshot admission/build time.
 5. Both TLS endpoints, client protobuf decoding/digest verification, and server
    snapshot work share one process and CPU budget. Large fleet bytes and
@@ -65,7 +95,7 @@ audit failure.
 `SCALE_PROGRESS` appears at stage changes, every five seconds on a separate thread,
 at client deadlines, and at failure/exit. It records:
 
-- Separate initial deliveries, revision-2 deliveries and reconnect request writes.
+- Separate initial deliveries, successor deliveries and reconnect request writes.
   The latter is not server registration; the waiter barrier checks that.
 - Client counts in admission, TCP, TLS, write, status-line read, headers, body,
   validation and finished states, split by initial/publication/reconnect phase;
@@ -96,6 +126,8 @@ Run from the repository root. Compile separately when the verification owner has
 disk capacity, using the selected existing `CARGO_TARGET_DIR`.
 
 ```sh
+export CARGO_INCREMENTAL=0
+
 # Schedule compilation separately from execution.
 cargo test --locked --manifest-path cmd/racer-controlplane/Cargo.toml --lib --no-run
 

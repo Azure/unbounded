@@ -131,7 +131,7 @@ impl Observation {
     }
 
     pub fn offer(&mut self, policy: Option<&StoragePolicy>) {
-        if let Some(policy) = policy.filter(|p| self.storage_supported && p.version != 0) {
+        if let Some(policy) = policy.filter(|p| self.storage_supported && p.wire().is_some()) {
             let offered = Some((policy.identity, policy.version));
             if self.offered != offered {
                 self.storage_state = "pending".into();
@@ -143,6 +143,8 @@ impl Observation {
                 self.applied_version = 0;
             }
             self.offered = offered;
+        } else {
+            self.offered = None;
         }
     }
 

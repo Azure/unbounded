@@ -20,7 +20,7 @@ use k8s_openapi::{
         coordination::v1::{Lease, LeaseSpec},
         core::v1::{ConfigMap, Node, Pod, Service},
     },
-    apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, OwnerReference},
+    apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta},
 };
 use kube::{
     Api, Client, ResourceExt,
@@ -31,17 +31,17 @@ use kube::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
@@ -107,6 +107,7 @@ pub struct Options {
     pub leaf_lifetime: Duration,
     pub clock_skew: Duration,
     pub lease_timing: LeaseTiming,
+    pub overlap_delay: Duration,
     pub pod_name: String,
     pub pod_uid: String,
     pub bootstrap_node: String,
@@ -132,6 +133,7 @@ impl Default for Options {
             leaf_lifetime: Duration::from_secs(86400),
             clock_skew: Duration::from_secs(300),
             lease_timing: LeaseTiming::default(),
+            overlap_delay: Duration::from_secs(300),
             pod_name: std::env::var("RACER_POD_NAME").unwrap_or_default(),
             pod_uid: std::env::var("RACER_POD_UID").unwrap_or_default(),
             bootstrap_node: String::new(),
@@ -176,6 +178,7 @@ impl Options {
                 "ca-rotation-interval" => options.rotation_interval = parse_duration(&value)?,
                 "leaf-lifetime" => options.leaf_lifetime = parse_duration(&value)?,
                 "clock-skew" => options.clock_skew = parse_duration(&value)?,
+                "ca-overlap-delay" => options.overlap_delay = parse_duration(&value)?,
                 "bootstrap-node" => options.bootstrap_node = value,
                 "bootstrap-namespace" => options.bootstrap_namespace = value,
                 "bootstrap-service" => options.bootstrap_service = value,
@@ -209,6 +212,10 @@ impl Options {
                 && options.clock_skew.as_secs() >= 1
                 && options.clock_skew.as_secs() <= 86400,
             "invalid leaf lifetime or clock skew"
+        );
+        ensure!(
+            options.overlap_delay.as_secs() >= 1 && options.overlap_delay.as_secs() <= 86400,
+            "invalid CA overlap delay"
         );
         Ok(options)
     }
@@ -468,7 +475,6 @@ struct Shared {
     enrollment_capacity: Arc<Semaphore>,
     reviews: ReviewCache,
     refresh: Mutex<()>,
-    replacement_cursor: AtomicUsize,
     stop: CancellationToken,
 }
 
@@ -750,18 +756,7 @@ async fn enroll_inner(state: &HttpState, request: Request<Body>) -> Result<Enrol
         .await?;
     let pod = state.shared.pods().get(&body.pod_name).await?;
     let pod_data = pod_data(&pod);
-    let retained = authorize_renewal(
-        &active.state,
-        &body.pod_namespace,
-        &body.pod_name,
-        &pod_data,
-        &boot,
-        &review,
-    );
-    let renewal = retained.is_ok();
-    let identity = if let Ok(id) = retained {
-        id
-    } else {
+    let identity = {
         let owner = pod
             .metadata
             .owner_references
@@ -822,37 +817,22 @@ async fn enroll_inner(state: &HttpState, request: Request<Body>) -> Result<Enrol
                 return Err(error);
             }
         };
-        let current = active.manager.state().await?;
-        if body.expected_universe != identity.universe
-            || body.expected_node != identity.node
-            || current.members().any(|m| {
-                m.identity.pod_uid == identity.pod_uid
-                    && (m.identity.universe != identity.universe
-                        || m.identity.node != identity.node)
-            })
-        {
+        if body.expected_universe != identity.universe || body.expected_node != identity.node {
             delete_managed_pod(&state.shared, &active, &pod).await?;
             anyhow::bail!("bootstrap identity changed; replacing Pod");
         }
         identity
     };
-    // A current selection authorizes a new boot. An existing durable boot may
-    // renew its historical identity while the v4 runtime delivers a synthetic
-    // empty configuration; neither exclusion nor Node replacement retires it.
-    // Renewal still requires a live, exact Pod-bound credential and durable boot.
+    // Every issuance, including renewal, requires current live selection.
     if let Some(selected) = state.runtime.selection(&identity.universe, &identity.node) {
         ensure!(
-            renewal
-                || (selected.pod_uid == identity.pod_uid
-                    && selected.pod_name == identity.pod_name
-                    && selected.pod_namespace == body.pod_namespace),
+            selected.pod_uid == identity.pod_uid
+                && selected.pod_name == identity.pod_name
+                && selected.pod_namespace == body.pod_namespace,
             "committed Pod identity mismatch"
         );
     } else {
-        ensure!(
-            renewal && state.runtime.ready(),
-            "identity not selected by committed topology"
-        );
+        bail!("identity not selected by committed topology");
     }
     let issued = active
         .manager
@@ -958,13 +938,17 @@ async fn tls_listener(
                     let tls = if replica { &snapshot.proof } else { &snapshot.production };
                     let Ok((stream, peer)) = tls.accept(raw, mutual).await else { return; };
                     let serving_at_start = shared.active().map(|a| a.term.token().to_owned());
+                    let connection_peer = peer.clone();
                     let request_shared = shared.clone();
                     let accepted = Instant::now();
                     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
                         let router = router.clone(); let peer = peer.clone(); let shared = request_shared.clone();
                         async move {
                             if !replica && !shared.serving() { return Ok::<_, std::convert::Infallible>(StatusCode::SERVICE_UNAVAILABLE.into_response()); }
-                            if let Some(peer) = peer { req.extensions_mut().insert(peer); }
+                            if let Some(peer) = peer {
+                                if peer.valid_at(unix_now()).is_err() { return Ok(StatusCode::FORBIDDEN.into_response()); }
+                                req.extensions_mut().insert(peer);
+                            }
                             let req = req.map(Body::new);
                             use tower::Service;
                             let mut router = router;
@@ -986,7 +970,8 @@ async fn tls_listener(
                             },
                             _ = ticker.tick() => {
                                 if replica && accepted.elapsed() > Duration::from_secs(10) { break; }
-                                if !tls.ready(unix_now()) || !shared.hot.is_current_epoch(&snapshot) { break; }
+                                 if !tls.ready(unix_now()) || !shared.hot.is_current_epoch(&snapshot) { break; }
+                                 if connection_peer.as_ref().is_some_and(|p| p.valid_at(unix_now()).is_err()) { break; }
                                 if !replica && serving_at_start.is_some() && (!shared.serving() || shared.active().map(|a| a.term.token().to_owned()) != serving_at_start) { break; }
                                 if !replica && serving_at_start.is_none() && accepted.elapsed() > Duration::from_secs(5) { break; }
                             }
@@ -1132,8 +1117,51 @@ async fn reconcile_route(shared: &Shared, active: &Active) -> Result<()> {
     Ok(())
 }
 
-fn replica_map_name(uid: &str) -> String {
-    format!("racer-replica-{uid}")
+const REPLICA_REQUEST: &str = "racer.unbounded-cloud.io/pki-request";
+const REPLICA_RESPONSE: &str = "racer.unbounded-cloud.io/pki-response";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaRequest {
+    pod_uid: String,
+    boot: String,
+    csr: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaResponse {
+    pod_uid: String,
+    boot: String,
+    csr_digest: String,
+    certificate: String,
+    proof_certificate: String,
+}
+
+async fn patch_replica_annotation(
+    shared: &Shared,
+    pod: &Pod,
+    key: &str,
+    value: String,
+    active: Option<&Active>,
+) -> Result<()> {
+    ensure!(value.len() <= 16384, "replica annotation too large");
+    let rv = pod.resource_version().context("Pod missing revision")?;
+    let uid = pod.uid().context("Pod missing UID")?;
+    if let Some(active) = active {
+        active.store.check_fence().await?;
+    }
+    shared
+        .pods()
+        .patch(
+            &pod.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "resourceVersion": rv, "uid": uid, "annotations": { key: value } }
+            })),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn reconcile_local(shared: &Shared) -> Result<()> {
@@ -1142,68 +1170,57 @@ async fn reconcile_local(shared: &Shared) -> Result<()> {
         pod.uid().as_deref() == Some(&shared.options.pod_uid),
         "local Pod UID changed"
     );
-    replica_identity(
+    let identity = replica_identity(
         shared.client.clone(),
         &shared.options.namespace,
         &pod,
         &shared.boot,
     )
     .await?;
-    let name = replica_map_name(&shared.options.pod_uid);
-    let maps = shared.maps();
-    let mut cm = match maps.get_opt(&name).await? {
-        Some(cm) => {
-            ensure!(
-                replica_request_owned(&object_metadata(&cm.metadata), &pod_data(&pod)),
-                "replica ConfigMap not owned by Pod"
-            );
-            cm
-        }
-        None => {
-            let cm = ConfigMap {
-                metadata: ObjectMeta {
-                    namespace: Some(shared.options.namespace.clone()),
-                    name: Some(name.clone()),
-                    owner_references: Some(vec![OwnerReference {
-                        api_version: "v1".into(),
-                        kind: "Pod".into(),
-                        name: shared.options.pod_name.clone(),
-                        uid: shared.options.pod_uid.clone(),
-                        controller: Some(true),
-                        block_owner_deletion: Some(true),
-                    }]),
-                    ..Default::default()
-                },
-                data: Some(BTreeMap::new()),
-                ..Default::default()
-            };
-            maps.create(&PostParams::default(), &cm).await?
-        }
-    };
     let csr = String::from_utf8(shared.local_key.csr_pem.clone())?;
-    let data = cm.data.get_or_insert_with(BTreeMap::new);
-    if data.get("boot") != Some(&shared.boot) || data.get("csr") != Some(&csr) {
-        *data = [("boot".into(), shared.boot.clone()), ("csr".into(), csr)].into();
-        maps.replace(&name, &PostParams::default(), &cm).await?;
+    let request = serde_json::to_string(&ReplicaRequest {
+        pod_uid: shared.options.pod_uid.clone(),
+        boot: shared.boot.clone(),
+        csr,
+    })?;
+    if pod.annotations().get(REPLICA_REQUEST) != Some(&request) {
+        patch_replica_annotation(shared, &pod, REPLICA_REQUEST, request, None).await?;
         bail!("waiting for replica certificate issuance");
     }
+    let response = pod
+        .annotations()
+        .get(REPLICA_RESPONSE)
+        .context("waiting for replica response")?;
+    ensure!(response.len() <= 16384, "replica response too large");
+    let response: ReplicaResponse = serde_json::from_str(response)?;
     ensure!(
-        data.get("certificate-boot") == Some(&shared.boot)
-            && data.get("certificate-csr") == Some(&digest(&shared.local_key.csr_pem)),
+        response.pod_uid == shared.options.pod_uid
+            && response.boot == shared.boot
+            && response.csr_digest == digest(&shared.local_key.csr_pem),
         "waiting for boot-bound replica certificates"
     );
-    let production = data
-        .get("certificate")
-        .context("missing production certificate")?;
-    let proof = data
-        .get("proof-certificate")
-        .context("missing proof certificate")?;
+    let production = &response.certificate;
+    let proof = &response.proof_certificate;
     ensure!(
         certificate_matches_csr(production.as_bytes(), &shared.local_key.csr_pem)?
             && certificate_matches_csr(proof.as_bytes(), &shared.local_key.csr_pem)?,
         "replica certificate key mismatch"
     );
-    let trust = maps.get(TRUST_MAP).await?;
+    for pem in [production, proof] {
+        let leaf = openssl::x509::X509::from_pem(pem.as_bytes())?;
+        let sans = leaf.subject_alt_names().context("missing SAN")?;
+        let uri = sans
+            .iter()
+            .find_map(|s| s.uri())
+            .context("missing claims")?;
+        let claims = SignedClaims::parse(uri)?;
+        ensure!(
+            claims.identity == identity && claims.namespace == shared.options.namespace,
+            "replica signed identity mismatch"
+        );
+        validate_replica_leaf(pem.as_bytes(), &shared.options.namespace)?;
+    }
+    let trust = shared.maps().get(TRUST_MAP).await?;
     let bundle = trust
         .data
         .as_ref()
@@ -1216,10 +1233,6 @@ async fn reconcile_local(shared: &Shared) -> Result<()> {
         &shared.local_key.key_pem,
     )?;
     let proof = TlsSnapshot::new(&bundle.json(), proof.as_bytes(), &shared.local_key.key_pem)?;
-    // Every local snapshot must retain the restricted CP identity and DNS/EKU.
-    for key in ["certificate", "proof-certificate"] {
-        validate_replica_leaf(data.get(key).unwrap().as_bytes(), &shared.options.namespace)?;
-    }
     let changed = shared.hot.snapshot().is_ok_and(|old| {
         old.production.bundle() != &bundle || old.production.issuer() != production.issuer()
     });
@@ -1236,12 +1249,6 @@ async fn reconcile_local(shared: &Shared) -> Result<()> {
         old_connections_drained: shared.hot.drained(),
     };
     *shared.installed_ack.write().unwrap() = Some(ack.clone());
-    let encoded = serde_json::to_string(&ack)?;
-    if data.get("ack") != Some(&encoded) {
-        data.insert("ack".into(), encoded);
-        // Original response RV prevents acknowledging a concurrently replaced key.
-        maps.replace(&name, &PostParams::default(), &cm).await?;
-    }
     Ok(())
 }
 
@@ -1264,8 +1271,11 @@ fn validate_replica_leaf(pem: &[u8], namespace: &str) -> Result<i64> {
         "CP leaf must be server-auth only"
     );
     let sans = cert.subject_alt_names().context("missing CP SAN")?;
+    let uris: Vec<_> = sans.iter().filter_map(|s| s.uri()).collect();
+    ensure!(uris.len() == 1, "CP requires one signed identity");
+    let claims = SignedClaims::parse(uris[0])?;
     ensure!(
-        sans.iter().filter_map(|s| s.uri()).collect::<Vec<_>>() == ["spiffe://racer/controlplane"],
+        claims.identity.kind == IdentityKind::ControlPlane && claims.namespace == namespace,
         "CP URI mismatch"
     );
     ensure!(
@@ -1281,17 +1291,17 @@ async fn issue_replica(
     active: &Active,
     pod: &Pod,
     identity: Identity,
-) -> Result<ConfigMap> {
+) -> Result<()> {
     let uid = pod.uid().context("missing Pod UID")?;
-    let name = replica_map_name(&uid);
-    let mut cm = shared.maps().get(&name).await?;
-    ensure!(
-        replica_request_owned(&object_metadata(&cm.metadata), &pod_data(pod)),
-        "replica request ownership mismatch"
-    );
-    let data = cm.data.get_or_insert_with(BTreeMap::new);
-    let boot = data.get("boot").context("replica boot missing")?.clone();
-    let csr = data.get("csr").context("replica CSR missing")?.clone();
+    let request = pod
+        .annotations()
+        .get(REPLICA_REQUEST)
+        .context("replica request missing")?;
+    ensure!(request.len() <= 16384, "replica request too large");
+    let request: ReplicaRequest = serde_json::from_str(request)?;
+    ensure!(request.pod_uid == uid, "replica request UID mismatch");
+    let boot = request.boot;
+    let csr = request.csr;
     ensure!(
         boot == identity.boot_id && boot != "pending",
         "replica boot changed"
@@ -1299,18 +1309,41 @@ async fn issue_replica(
     let csr_digest = digest(csr.as_bytes());
     let state = active.manager.state().await?;
     let bundle = state.bundle();
-    let bound = data.get("certificate-boot") == Some(&boot)
-        && data.get("certificate-csr") == Some(&csr_digest);
+    let old = pod
+        .annotations()
+        .get(REPLICA_RESPONSE)
+        .filter(|s| s.len() <= 16384)
+        .and_then(|s| serde_json::from_str::<ReplicaResponse>(s).ok());
+    let bound = old
+        .as_ref()
+        .is_some_and(|r| r.pod_uid == uid && r.boot == boot && r.csr_digest == csr_digest);
+    let mut response = ReplicaResponse {
+        pod_uid: uid,
+        boot,
+        csr_digest,
+        certificate: String::new(),
+        proof_certificate: String::new(),
+    };
     let mut changed = false;
-    for (field, root, probe) in [
-        ("certificate", bundle.active.clone(), false),
-        ("proof-certificate", state.proof_root().to_owned(), true),
+    for (root, probe) in [
+        (bundle.active.clone(), false),
+        (state.proof_root().to_owned(), true),
     ] {
-        let current = data.get(field);
+        let current = old.as_ref().map(|r| {
+            if probe {
+                &r.proof_certificate
+            } else {
+                &r.certificate
+            }
+        });
         let valid = bound
-            && data.get(&format!("{field}-root")) == Some(&root)
             && current.is_some_and(|pem| {
                 certificate_matches_csr(pem.as_bytes(), csr.as_bytes()).unwrap_or(false)
+                    && certificate_claims(pem.as_bytes()).is_ok_and(|claims| {
+                        claims.identity == identity && claims.namespace == shared.options.namespace
+                    })
+                    && certificate_issuer(pem.as_bytes(), &bundle)
+                        .is_ok_and(|issuer| issuer == root)
                     && validate_replica_leaf(pem.as_bytes(), &shared.options.namespace).is_ok_and(
                         |expiry| {
                             expiry
@@ -1324,154 +1357,59 @@ async fn issue_replica(
                 .manager
                 .issue(csr.as_bytes(), identity.clone(), probe, unix_now())
                 .await?;
-            data.insert(field.into(), String::from_utf8(issued.certificate_pem)?);
-            data.insert(format!("{field}-root"), issued.root_digest);
+            if probe {
+                response.proof_certificate = String::from_utf8(issued.certificate_pem)?;
+            } else {
+                response.certificate = String::from_utf8(issued.certificate_pem)?;
+            }
             changed = true;
+        } else if probe {
+            response.proof_certificate = current.unwrap().clone();
+        } else {
+            response.certificate = current.unwrap().clone();
         }
     }
     if changed {
-        data.insert("certificate-boot".into(), boot);
-        data.insert("certificate-csr".into(), csr_digest);
-        data.remove("ack");
-        active.store.check_fence().await?;
-        cm = shared
-            .maps()
-            .replace(&name, &PostParams::default(), &cm)
-            .await?;
+        patch_replica_annotation(
+            shared,
+            pod,
+            REPLICA_RESPONSE,
+            serde_json::to_string(&response)?,
+            Some(active),
+        )
+        .await?;
     }
-    Ok(cm)
+    Ok(())
 }
 
 async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> {
-    // Never retire from watch disappearance, filtered lists, API failures or
-    // deletion timestamps. A complete namespace snapshot is the absence proof.
-    let retirement = active.manager.retirement_candidates().await?;
+    active.manager.publish().await?;
     let pods = shared.pods().list(&ListParams::default()).await?;
-    let live: BTreeSet<_> = pods.items.iter().filter_map(ResourceExt::uid).collect();
-    let mut state = active.manager.state().await?;
-    let known: BTreeSet<_> = state
-        .members()
-        .filter(|m| m.identity.kind == IdentityKind::ControlPlane)
-        .map(|m| m.identity.pod_uid.clone())
-        .collect();
-    let mut eligible = Vec::new();
-    let mut failures = Vec::new();
     for pod in &pods.items {
-        if pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.service_account_name.as_deref())
-            != Some(COMPONENT)
-            || pod.labels().get(COMPONENT_LABEL).map(String::as_str) != Some(COMPONENT)
-        {
+        if pod.labels().get(COMPONENT_LABEL).map(String::as_str) != Some(COMPONENT) {
             continue;
         }
         let result: Result<()> = async {
-            let placeholder = replica_identity(
+            let Some(request) = pod.annotations().get(REPLICA_REQUEST) else {
+                return Ok(());
+            };
+            ensure!(request.len() <= 16384, "replica request too large");
+            let request: ReplicaRequest = serde_json::from_str(request)?;
+            let identity = replica_identity(
                 shared.client.clone(),
                 &shared.options.namespace,
                 pod,
-                "pending",
+                &request.boot,
             )
             .await?;
-            if !known.contains(&placeholder.pod_uid) {
-                active.manager.admit(placeholder).await?;
-            }
-            Ok(())
+            issue_replica(shared, active, pod, identity).await
         }
         .await;
         if let Err(error) = result {
-            // An invalid owner or failed lookup must not starve healthy replicas.
-            // Do not admit an unverified identity; report the incomplete sweep
-            // below so the leader cannot begin or advance rotation.
-            failures.push(format!("{}: {error:#}", pod.name_any()));
-            continue;
-        }
-        eligible.push(pod);
-    }
-    active.manager.retire_absent_pods(retirement, &live).await?;
-    active.manager.publish().await?;
-    for pod in eligible {
-        let result: Result<()> = async {
-            let uid = pod.uid().context("missing Pod UID")?;
-            let Some(cm) = shared.maps().get_opt(&replica_map_name(&uid)).await? else {
-                return Ok(());
-            };
-            let Some(boot) = cm.data.as_ref().and_then(|d| d.get("boot")) else {
-                return Ok(());
-            };
-            if boot == "pending" {
-                return Ok(());
-            }
-            let mut identity =
-                replica_identity(shared.client.clone(), &shared.options.namespace, pod, boot)
-                    .await?;
-            if let Some(member) = active.manager.state().await?.member(&identity.key()) {
-                identity = member.identity.clone();
-            }
-            active.manager.admit(identity.clone()).await?;
-            let cm = issue_replica(shared, active, pod, identity.clone()).await?;
-            let Some(ack) = cm
-                .data
-                .as_ref()
-                .and_then(|d| d.get("ack"))
-                .and_then(|v| serde_json::from_str::<ReplicaAcknowledgment>(v).ok())
-            else {
-                return Ok(());
-            };
-            let bundle = active.manager.state().await?.bundle();
-            ensure!(
-                ack.pod_uid == uid
-                    && ack.boot_id == identity.boot_id
-                    && cm
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("csr"))
-                        .is_some_and(|csr| digest(csr.as_bytes()) == ack.csr_digest)
-                    && ack.generation == bundle.generation
-                    && ack.digest == bundle.digest(),
-                "stale replica acknowledgment"
-            );
-            let ip: IpAddr = pod
-                .status
-                .as_ref()
-                .and_then(|s| s.pod_ip.as_ref())
-                .context("replica has no IP")?
-                .parse()?;
-            let port: SocketAddr = address(&shared.options.replica_proof_listen).parse()?;
-            let raw = tokio::time::timeout(
-                Duration::from_secs(5),
-                TcpStream::connect(SocketAddr::new(ip, port.port())),
-            )
-            .await??;
-            let snapshot = shared.hot.snapshot()?;
-            let proof = snapshot
-                .proof
-                .probe_replica(raw, &shared.options.namespace, &ack, &active.term)
-                .await?;
-            active
-                .manager
-                .record_proof(&identity.key(), proof, unix_now())
-                .await?;
-            active
-                .manager
-                .retire_pending(&identity.key(), unix_now())
-                .await?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            failures.push(format!("{}: {error:#}", pod.name_any()));
+            tracing::debug!(pod = pod.name_any(), %error, "replica issuance pending");
         }
     }
-    state = active.manager.state().await?;
-    replace_multiple_boots(shared, active, &pods.items, &state).await?;
     shared.refresh_state(active).await?;
-    ensure!(
-        failures.is_empty(),
-        "replica reconciliation pending: {}",
-        failures.join("; ")
-    );
     Ok(())
 }
 
@@ -1485,156 +1423,7 @@ fn site_resource() -> ApiResource {
     }
 }
 
-async fn replace_multiple_boots(
-    shared: &Shared,
-    active: &Active,
-    pods: &[Pod],
-    state: &CaState,
-) -> Result<()> {
-    let mut identities = BTreeMap::<&str, Vec<&Identity>>::new();
-    for member in state.members() {
-        identities
-            .entry(&member.identity.pod_uid)
-            .or_default()
-            .push(&member.identity);
-    }
-    let mut failure = None;
-    let start = shared.replacement_cursor.load(Ordering::Relaxed);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    // Resume after the last inspected Pod so slow API reads cannot starve later
-    // workers. Keep this sweep bounded independently of the leader deadline.
-    for offset in 0..pods.len() {
-        let index = start.wrapping_add(offset) % pods.len();
-        shared
-            .replacement_cursor
-            .store(index + 1, Ordering::Relaxed);
-        let pod = &pods[index];
-        let members = identities.get(pod.metadata.uid.as_deref().unwrap_or_default());
-        let Some(members) = members else { continue };
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            replace_stale_pod(shared, active, pod, members),
-        )
-        .await
-        {
-            Ok(Ok(true)) => return Ok(()),
-            Ok(Ok(false)) => (),
-            Ok(Err(error)) => {
-                failure = Some(error);
-            }
-            Err(error) => {
-                failure = Some(error.into());
-            }
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-    }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-async fn replace_stale_pod(
-    shared: &Shared,
-    active: &Active,
-    pod: &Pod,
-    members: &[&Identity],
-) -> Result<bool> {
-    if pod.metadata.uid.is_none() {
-        return Ok(false);
-    }
-    if pod.metadata.deletion_timestamp.is_some() {
-        return Ok(false);
-    }
-    let multiple = members.iter().filter(|m| m.boot_id != "pending").count() >= 2;
-    let data = pod_data(pod);
-    if data.service_account == COMPONENT {
-        if !multiple {
-            return Ok(false);
-        }
-        replica_identity(
-            shared.client.clone(),
-            &shared.options.namespace,
-            pod,
-            "pending",
-        )
-        .await?;
-    } else if data.service_account == "racer-dataplane" {
-        if members.is_empty() {
-            return Ok(false);
-        }
-        let Some(owner) = pod
-            .metadata
-            .owner_references
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|o| {
-                o.controller == Some(true)
-                    && o.kind == "DaemonSet"
-                    && o.api_version == "apps/v1"
-                    && o.name == "racer-dataplane"
-            })
-        else {
-            return Ok(false);
-        };
-        let daemon = Api::<DaemonSet>::namespaced(shared.client.clone(), &shared.options.namespace)
-            .get(&owner.name)
-            .await?;
-        let daemon = daemon_data(&daemon);
-        if security::authorize_dataplane_ownership(&shared.options.namespace, &data, &daemon)
-            .is_err()
-        {
-            return Ok(false);
-        }
-        if !multiple {
-            let node = Api::<Node>::all(shared.client.clone())
-                .get_opt(&data.node_name)
-                .await?;
-            let current = node.as_ref().map(|n| object_metadata(&n.metadata));
-            let matches = if let Some(node) = current.as_ref() {
-                let site_name = security::node_site(node);
-                let site = if site_name.is_empty() {
-                    None
-                } else {
-                    Api::<DynamicObject>::all_with(shared.client.clone(), &site_resource())
-                        .get_opt(site_name)
-                        .await?
-                };
-                !node.deleting
-                    && node.labels.get("kubernetes.io/os").map(String::as_str) == Some("linux")
-                    && node
-                        .labels
-                        .get("racer.unbounded-cloud.io/exclude")
-                        .map(String::as_str)
-                        != Some("true")
-                    && site.is_some_and(|s| s.metadata.deletion_timestamp.is_none())
-                    && members.iter().all(|m| {
-                        m.node == racer_identity("node", &node.uid)
-                            && m.universe
-                                == racer_identity(
-                                    "universe",
-                                    &security::universe_for_site(site_name),
-                                )
-                    })
-            } else {
-                false
-            };
-            if matches {
-                return Ok(false);
-            }
-        }
-    } else {
-        return Ok(false);
-    }
-    delete_managed_pod(shared, active, pod).await?;
-    Ok(true)
-}
-
-// Callers must first authorize live managed ownership. Admissions survive until
-// a later complete namespace list proves actual UID absence.
+// Callers must first authorize live managed ownership.
 async fn delete_managed_pod(shared: &Shared, active: &Active, pod: &Pod) -> Result<()> {
     let uid = pod
         .metadata
@@ -1688,18 +1477,8 @@ async fn rotation_due(shared: &Shared, active: &Active) -> Result<bool> {
 }
 
 async fn leader_reconcile(shared: &Shared, runtime: &Runtime, active: &Active) -> Result<()> {
-    let reconciled = reconcile_participants(shared, active).await;
-    shared.refresh_state(active).await?;
-    if runtime.ready()
-        && shared.hot.ready(
-            unix_now(),
-            shared.listeners_ready.load(Ordering::Acquire),
-            true,
-        )
-    {
-        reconcile_route(shared, active).await?;
-    }
-    reconciled?;
+    // Rotation is independent of replica reachability and issuance success.
+    active.manager.publish().await?;
     let trust = shared.maps().get(TRUST_MAP).await?;
     if let Some(nonce) = trust
         .annotations()
@@ -1716,6 +1495,16 @@ async fn leader_reconcile(shared: &Shared, runtime: &Runtime, active: &Active) -
     }
     active.manager.advance_rotation(unix_now()).await?;
     shared.refresh_state(active).await?;
+    reconcile_participants(shared, active).await?;
+    if runtime.ready()
+        && shared.hot.ready(
+            unix_now(),
+            shared.listeners_ready.load(Ordering::Acquire),
+            true,
+        )
+    {
+        reconcile_route(shared, active).await?;
+    }
     Ok(())
 }
 
@@ -1758,7 +1547,7 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
                 let lease = Lease { metadata: ObjectMeta { name: Some(LEASE.into()), namespace: Some(shared.options.namespace.clone()), ..Default::default() }, spec: Some(LeaseSpec { holder_identity: Some(token.clone()), lease_duration_seconds: Some(timing.duration_seconds), acquire_time: Some(now_micro()?), renew_time: Some(now_micro()?), lease_transitions: Some(0), ..Default::default() }) };
                 leases.create(&PostParams::default(), &lease).await?
             };
-            // Initial CA/shard load may exceed a renewal tick. Renew separately
+            // Initial CA load may exceed a renewal tick. Renew separately
             // while acquisition executes; activation happens only after both
             // Secret and trust fences are durable.
             let term = Leadership::new(token.clone())?;
@@ -1770,6 +1559,7 @@ async fn election_loop(shared: Arc<Shared>) -> Result<()> {
             options.ca_lifetime = 365 * 86400;
             options.leaf_lifetime = shared.options.leaf_lifetime.as_secs() as i64;
             options.clock_skew = shared.options.clock_skew.as_secs() as i64;
+            options.proof_lifetime = shared.options.overlap_delay.as_secs() as i64;
             let acquisition = CaManager::acquire(store.clone(), term.clone(), options, unix_now());
             tokio::pin!(acquisition);
             let manager = loop {
@@ -1828,7 +1618,6 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
         enrollment_capacity: Arc::new(Semaphore::new(8)),
         reviews: ReviewCache::new(options.review_qps, options.review_burst),
         refresh: Mutex::new(()),
-        replacement_cursor: AtomicUsize::new(0),
         options,
         stop: shutdown.child_token(),
     });
@@ -1926,21 +1715,14 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
         let runtime = runtime.clone();
         tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
-            let mut last_collection = Instant::now();
             loop {
                 tokio::select! { _ = shared.stop.cancelled() => return Ok(()), _ = tick.tick() => () }
                 let Some(active) = shared.active() else { continue; };
-                if last_collection.elapsed() >= Duration::from_secs(60) {
-                    match tokio::time::timeout(Duration::from_secs(30), active.manager.collect()).await {
-                        Ok(Ok(())) => last_collection = Instant::now(),
-                        other => tracing::debug!(?other, "PKI shard collection pending"),
-                    }
-                }
                 match tokio::time::timeout(Duration::from_secs(60), leader_reconcile(&shared, &runtime, &active)).await {
                     Ok(Ok(())) => (), other => tracing::debug!(?other, "leader reconciliation pending"),
                 }
-                // Admission and issuance preceding a failed proof still need to
-                // be visible to request authentication and desired publication.
+                // Publish the latest confirmed trust state even after a failed
+                // replica response CAS.
                 let _ = shared.refresh_state(&active).await;
             }
         });

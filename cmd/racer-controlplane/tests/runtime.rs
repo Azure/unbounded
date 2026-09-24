@@ -13,7 +13,10 @@ use futures::stream;
 use kube::{Client, Config, api::DynamicObject, runtime::watcher::Event};
 use prost::Message;
 use racer_controlplane::{
-    kubernetes::{InventoryIndex, Kind, RecordStore, Runtime, RuntimeOptions, SecurityContext},
+    kubernetes::{
+        CHECKPOINT, InventoryIndex, Kind, RANGE_SIZE, RevisionStore, Runtime, RuntimeOptions,
+        SecurityContext,
+    },
     model::identity,
     proto::DesiredState,
     security::*,
@@ -196,21 +199,17 @@ struct ApiData {
     objects: BTreeMap<String, Value>,
     revision: u64,
     writes: usize,
-    fail_after_pointer: bool,
-    fail_delete_after: Option<usize>,
-    list_pages: usize,
-    fail_after_chunk: bool,
-    pause_chunk: Option<Arc<tokio::sync::Notify>>,
-    fail_gate_release: bool,
-    gate_release_attempts: usize,
-    gate_read_failures: usize,
-    fail_after_gate_acquire: bool,
-    fail_after_gate_release: bool,
-    pause_before_gate_acquire: Option<Arc<tokio::sync::Notify>>,
-    pause_after_gate_acquire: Option<Arc<tokio::sync::Notify>>,
-    pause_before_gate_release: Option<Arc<tokio::sync::Notify>>,
-    gate_acquire_requests: usize,
-    gate_acquire_completed: usize,
+    fail_after_reservation: bool,
+    fail_before_reservation: bool,
+    pause_reservation: Option<Arc<tokio::sync::Notify>>,
+    pause_before_reservation: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    fail_checkpoint_reads: usize,
+    reservation_requests: usize,
+    reservation_completed: usize,
+    fail_reservation_readback: bool,
+    stall_checkpoint_get: Option<CancellationToken>,
+    stall_status_patch: Option<CancellationToken>,
+    stalled_requests: usize,
 }
 impl FakeApi {
     fn new() -> Self {
@@ -269,6 +268,23 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or_default().to_string();
     let method = request.method().clone();
+    let stall = {
+        let mut data = api.inner.lock().unwrap();
+        let stall = if method == "GET" && path.ends_with(CHECKPOINT) {
+            data.stall_checkpoint_get.clone()
+        } else if method == "PATCH" {
+            data.stall_status_patch.clone()
+        } else {
+            None
+        };
+        if stall.is_some() {
+            data.stalled_requests += 1;
+        }
+        stall
+    };
+    if let Some(stall) = stall {
+        stall.cancelled().await;
+    }
     if method == "GET" && query.contains("watch=true") {
         let receiver = api.events.subscribe();
         let initial = if query.contains("sendInitialEvents=true") {
@@ -311,8 +327,8 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
     }
     if method == "GET" {
         let mut data = api.inner.lock().unwrap();
-        if path.ends_with("/racer-v4-store-gate") && data.gate_read_failures > 0 {
-            data.gate_read_failures -= 1;
+        if path.ends_with(CHECKPOINT) && data.fail_checkpoint_reads > 0 {
+            data.fail_checkpoint_reads -= 1;
             return api_error(StatusCode::GATEWAY_TIMEOUT);
         }
         if let Some(object) = data.objects.get(&path) {
@@ -328,17 +344,6 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
                 .filter(|(p, _)| p.rsplit_once('/').unwrap().0 == path)
                 .map(|(_, o)| o.clone())
                 .collect();
-            if query.contains("labelSelector=") {
-                let label = if query.contains("chunk") {
-                    "chunk"
-                } else {
-                    "pointer"
-                };
-                items.retain(|o| {
-                    o.pointer("/metadata/labels/racer.unbounded-cloud.io~1rust-state")
-                        == Some(&json!(label))
-                });
-            }
             let parameter = |name: &str| {
                 query
                     .split('&')
@@ -354,7 +359,6 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
                 String::new()
             };
             items = items.into_iter().skip(start).take(limit).collect();
-            data.list_pages += 1;
             return reply(
                 StatusCode::OK,
                 json!({"apiVersion":"v1", "kind":"List", "metadata":{"resourceVersion":data.revision.to_string(),"continue":continuation}, "items":items}),
@@ -366,40 +370,23 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
         .await
         .unwrap();
     let mut object: Value = serde_json::from_slice(&bytes).unwrap();
-    let gate_write = matches!(method.as_str(), "POST" | "PUT")
-        && object["metadata"]["name"] == "racer-v4-store-gate";
-    let gate_acquire = gate_write && object["data"]["operation"] != "";
-    let pause = {
+    let pause_before = if path.ends_with(CHECKPOINT) {
         let mut data = api.inner.lock().unwrap();
-        if gate_acquire {
-            data.gate_acquire_requests += 1;
-            data.pause_before_gate_acquire.take()
-        } else if gate_write {
-            data.gate_release_attempts += 1;
-            if data.fail_gate_release {
-                return api_error(StatusCode::GATEWAY_TIMEOUT);
-            }
-            data.pause_before_gate_release.take()
-        } else {
-            None
-        }
+        data.reservation_requests += 1;
+        data.pause_before_reservation.take()
+    } else {
+        None
     };
-    if let Some(pause) = pause {
-        pause.notified().await;
+    if let Some((entered, release)) = pause_before {
+        entered.notify_one();
+        release.notified().await;
     }
     let (key, object, fail, pause) = {
         let mut data = api.inner.lock().unwrap();
-        if gate_acquire {
-            data.gate_acquire_completed += 1;
+        if path.ends_with(CHECKPOINT) {
+            data.reservation_completed += 1;
         }
         if method == "DELETE" {
-            if data.fail_delete_after == Some(0) {
-                data.fail_delete_after = None;
-                return api_error(StatusCode::GATEWAY_TIMEOUT);
-            }
-            if let Some(remaining) = data.fail_delete_after.as_mut() {
-                *remaining -= 1;
-            }
             let Some(old) = data.objects.get(&path) else {
                 return api_error(StatusCode::NOT_FOUND);
             };
@@ -446,40 +433,30 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
             }
             object = old;
         }
+        if key.ends_with(CHECKPOINT) && data.fail_before_reservation {
+            data.fail_before_reservation = false;
+            return api_error(StatusCode::GATEWAY_TIMEOUT);
+        }
+        if object["metadata"]["uid"].is_null() {
+            object["metadata"]["uid"] = json!(uuid::Uuid::new_v4().to_string());
+        }
         data.revision += 1;
         data.writes += 1;
         object["metadata"]["resourceVersion"] = json!(data.revision.to_string());
         data.objects.insert(key.clone(), object.clone());
-        if gate_acquire && data.fail_after_gate_acquire {
-            data.fail_after_gate_acquire = false;
-            data.gate_read_failures += 1;
+        if key.ends_with(CHECKPOINT) && data.fail_reservation_readback {
+            data.fail_reservation_readback = false;
+            data.fail_checkpoint_reads += 1;
             return api_error(StatusCode::GATEWAY_TIMEOUT);
         }
-        if gate_write && !gate_acquire && data.fail_after_gate_release {
-            data.fail_after_gate_release = false;
-            data.gate_read_failures += 1;
-            return api_error(StatusCode::GATEWAY_TIMEOUT);
-        }
-        let fail = data.fail_after_pointer
-            && key.contains("racer-v4-topology-")
-            && object
-                .pointer("/data/pointer")
-                .and_then(Value::as_str)
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .is_some_and(|p| p["proposed"] == json!([]));
-        if key.contains("racer-v4-chunk-") && data.fail_after_chunk {
-            data.fail_after_chunk = false;
-            return api_error(StatusCode::GATEWAY_TIMEOUT);
-        }
-        let pause = if key.contains("racer-v4-chunk-") {
-            data.pause_chunk.take()
-        } else if gate_acquire {
-            data.pause_after_gate_acquire.take()
+        let fail = data.fail_after_reservation && key.ends_with(CHECKPOINT);
+        let pause = if key.ends_with(CHECKPOINT) {
+            data.pause_reservation.take()
         } else {
             None
         };
         if fail {
-            data.fail_after_pointer = false;
+            data.fail_after_reservation = false;
         }
         (key, object, fail, pause)
     };
@@ -497,167 +474,100 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
     }
 }
 
-const GATE_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-v4-store-gate";
+const CHECKPOINT_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-runtime-revisions";
 
-async fn gate_fixture() -> (FakeApi, RecordStore, tokio::task::JoinHandle<()>) {
+async fn gate_fixture() -> (FakeApi, RevisionStore, tokio::task::JoinHandle<()>) {
     let context = credentials().await.context;
     let api = FakeApi::new();
-    seed(&api);
+    seed(&api, &context.state);
     let (client, task) = api.serve().await;
-    let store = RecordStore::new(client, "system", Arc::new(move || Some(context.clone())));
+    let store = RevisionStore::new(client, "system", Arc::new(move || Some(context.clone())));
     (api, store, task)
 }
 
-fn gate_idle(api: &FakeApi) -> bool {
-    api.inner
-        .lock()
+fn high_water(api: &FakeApi) -> u64 {
+    api.inner.lock().unwrap().objects[CHECKPOINT_PATH]["data"]["high-water"]
+        .as_str()
         .unwrap()
-        .objects
-        .get(GATE_PATH)
-        .is_some_and(|o| o["data"]["operation"] == "")
+        .parse()
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gate_release_recovers_outage_and_resource_version_conflict() {
     let (api, store, task) = gate_fixture().await;
-    api.inner.lock().unwrap().fail_gate_release = true;
-    let record = store
-        .commit(
-            "racer-v4-topology-release",
-            "topology",
-            None,
-            b"durable",
-            "term-a",
-        )
-        .await
-        .unwrap();
-    until(|| api.inner.lock().unwrap().gate_release_attempts >= 3).await;
-    assert!(!gate_idle(&api), "failed release must remain recoverable");
-    let pause = Arc::new(tokio::sync::Notify::new());
-    {
-        let mut data = api.inner.lock().unwrap();
-        data.fail_gate_release = false;
-        data.pause_before_gate_release = Some(pause.clone());
-    }
-    until(|| {
-        api.inner
-            .lock()
-            .unwrap()
-            .pause_before_gate_release
-            .is_none()
-    })
-    .await;
-    let mut gate = api.inner.lock().unwrap().objects[GATE_PATH].clone();
-    gate["metadata"]["annotations"] = json!({"external-update":"1"});
-    api.put(GATE_PATH, gate);
-    pause.notify_one();
-    until(|| gate_idle(&api)).await;
-    let loaded = tokio::time::timeout(
-        Duration::from_secs(5),
-        store.load("racer-v4-topology-release"),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
-    assert_eq!(loaded.bytes, record.bytes);
-    assert_eq!(store.collect_garbage("term-a").await.unwrap(), 0);
-    until(|| gate_idle(&api)).await;
-    api.inner.lock().unwrap().fail_after_gate_release = true;
-    assert!(store.load("missing").await.unwrap().is_none());
-    until(|| !api.inner.lock().unwrap().fail_after_gate_release).await;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
+    api.inner.lock().unwrap().fail_before_reservation = true;
+    assert!(store.reserve("term-a").await.is_err());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    api.inner.lock().unwrap().pause_before_reservation = Some((entered.clone(), release.clone()));
+    let pending = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reserve("term-a").await })
+    };
+    entered.notified().await;
+    let mut object = api.inner.lock().unwrap().objects[CHECKPOINT_PATH].clone();
+    object["metadata"]["annotations"] = json!({"external-update":"1"});
+    api.put(CHECKPOINT_PATH, object);
+    release.notify_one();
+    assert_eq!(pending.await.unwrap().unwrap().take().unwrap(), 1);
+    api.inner.lock().unwrap().fail_after_reservation = true;
+    assert_eq!(
+        store.reserve("term-a").await.unwrap().take().unwrap(),
+        RANGE_SIZE + 1
     );
+    store.verify("term-a").await.unwrap();
     task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gate_release_retry_exhaustion_is_recoverable_on_next_call() {
     let (api, store, task) = gate_fixture().await;
-    api.inner.lock().unwrap().fail_gate_release = true;
-    assert!(store.load("missing").await.unwrap().is_none());
-    until(|| api.inner.lock().unwrap().gate_release_attempts > 0).await;
-    // Outlast the bounded background cleanup, then prove it stopped issuing I/O.
-    tokio::time::sleep(Duration::from_secs(31)).await;
-    let attempts = api.inner.lock().unwrap().gate_release_attempts;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(api.inner.lock().unwrap().gate_release_attempts, attempts);
-    assert!(!gate_idle(&api));
-    api.inner.lock().unwrap().fail_gate_release = false;
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), store.clone().load("missing"))
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
+    api.inner.lock().unwrap().fail_reservation_readback = true;
+    assert!(store.reserve("term-a").await.is_err());
+    assert!(store.verify("term-a").await.is_err());
+    let writes = api.inner.lock().unwrap().writes;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        api.inner.lock().unwrap().writes,
+        writes,
+        "no orphan cleanup writer"
     );
-    until(|| gate_idle(&api)).await;
+    assert_eq!(
+        store.reserve("term-a").await.unwrap().take().unwrap(),
+        RANGE_SIZE + 1
+    );
     task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gate_canceled_acquisition_fences_delayed_create_and_replace() {
     let (api, store, task) = gate_fixture().await;
-    for existing in [false, true] {
-        assert_eq!(
-            api.inner.lock().unwrap().objects.contains_key(GATE_PATH),
-            existing
-        );
-        let pause = Arc::new(tokio::sync::Notify::new());
-        let completed = api.inner.lock().unwrap().gate_acquire_completed;
-        let previous_version = api
-            .inner
-            .lock()
-            .unwrap()
-            .objects
-            .get(GATE_PATH)
-            .map(|o| o["metadata"]["resourceVersion"].clone());
-        api.inner.lock().unwrap().pause_before_gate_acquire = Some(pause.clone());
+    // The first reservation and subsequent replacements both use CAS against
+    // the bootstrap checkpoint. Runtime never creates a missing checkpoint.
+    for _ in [false, true] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = api.inner.lock().unwrap().reservation_completed;
+        api.inner.lock().unwrap().pause_before_reservation =
+            Some((entered.clone(), release.clone()));
         let acquiring = {
             let store = store.clone();
-            tokio::spawn(async move { store.load("missing").await })
+            tokio::spawn(async move { store.reserve("term-a").await })
         };
-        until(|| {
-            api.inner
-                .lock()
-                .unwrap()
-                .pause_before_gate_acquire
-                .is_none()
-        })
-        .await;
+        entered.notified().await;
         acquiring.abort();
         assert!(acquiring.await.is_err_and(|error| error.is_cancelled()));
-        until(|| gate_idle(&api)).await;
-        until(|| {
-            api.inner
-                .lock()
-                .unwrap()
-                .objects
-                .get(GATE_PATH)
-                .map(|o| o["metadata"]["resourceVersion"].clone())
-                != previous_version
-        })
-        .await;
-        // Cleanup has finished before the original write reaches its CAS.
-        pause.notify_one();
-        until(|| api.inner.lock().unwrap().gate_acquire_completed > completed).await;
-        assert!(
-            gate_idle(&api),
-            "late acquisition must not resurrect ownership"
+        assert!(store.verify("term-a").await.is_err());
+        store.reserve("term-a").await.unwrap();
+        let successor = api.inner.lock().unwrap().objects[CHECKPOINT_PATH].clone();
+        release.notify_one();
+        until(|| api.inner.lock().unwrap().reservation_completed > completed + 1).await;
+        assert_eq!(
+            api.inner.lock().unwrap().objects[CHECKPOINT_PATH],
+            successor
         );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
-                .await
-                .unwrap()
-                .unwrap()
-                .is_none()
-        );
-        until(|| gate_idle(&api)).await;
+        store.verify("term-a").await.unwrap();
     }
     task.abort();
 }
@@ -667,28 +577,29 @@ async fn gate_canceled_persisted_acquisition_and_failed_readback_recover() {
     let (api, store, task) = gate_fixture().await;
     for _ in 0..2 {
         let pause = Arc::new(tokio::sync::Notify::new());
-        api.inner.lock().unwrap().pause_after_gate_acquire = Some(pause.clone());
+        api.inner.lock().unwrap().pause_reservation = Some(pause.clone());
         let acquiring = {
             let store = store.clone();
-            tokio::spawn(async move { store.load("missing").await })
+            tokio::spawn(async move { store.reserve("term-a").await })
         };
-        until(|| api.inner.lock().unwrap().pause_after_gate_acquire.is_none()).await;
-        assert!(!gate_idle(&api));
+        until(|| api.inner.lock().unwrap().pause_reservation.is_none()).await;
+        let burned = high_water(&api);
         acquiring.abort();
         assert!(acquiring.await.is_err_and(|error| error.is_cancelled()));
-        until(|| gate_idle(&api)).await;
+        assert!(store.verify("term-a").await.is_err());
+        assert_eq!(
+            store.reserve("term-a").await.unwrap().take().unwrap(),
+            burned + 1
+        );
         pause.notify_one();
     }
-    api.inner.lock().unwrap().fail_after_gate_acquire = true;
-    assert!(store.load("missing").await.is_err());
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
+    api.inner.lock().unwrap().fail_reservation_readback = true;
+    assert!(store.reserve("term-a").await.is_err());
+    let burned = high_water(&api);
+    assert_eq!(
+        store.reserve("term-a").await.unwrap().take().unwrap(),
+        burned + 1
     );
-    until(|| gate_idle(&api)).await;
     task.abort();
 }
 
@@ -697,33 +608,29 @@ async fn gate_release_never_unlocks_successor_operation_or_fence() {
     for change_fence in [false, true] {
         let (api, store, task) = gate_fixture().await;
         let pause = Arc::new(tokio::sync::Notify::new());
-        api.inner.lock().unwrap().pause_before_gate_release = Some(pause.clone());
-        assert!(store.load("missing").await.unwrap().is_none());
-        until(|| {
-            api.inner
-                .lock()
-                .unwrap()
-                .pause_before_gate_release
-                .is_none()
-        })
-        .await;
-        let mut successor = api.inner.lock().unwrap().objects[GATE_PATH].clone();
-        successor["data"][if change_fence { "fence" } else { "operation" }] = json!("successor");
-        api.put(GATE_PATH, successor);
-        let successor = api.inner.lock().unwrap().objects[GATE_PATH].clone();
+        api.inner.lock().unwrap().pause_reservation = Some(pause.clone());
+        let pending = {
+            let store = store.clone();
+            tokio::spawn(async move { store.reserve("term-a").await })
+        };
+        until(|| api.inner.lock().unwrap().pause_reservation.is_none()).await;
+        let mut successor = api.inner.lock().unwrap().objects[CHECKPOINT_PATH].clone();
+        successor["data"]["fence"] = json!(if change_fence {
+            "term-b/successor"
+        } else {
+            "term-a/successor"
+        });
+        successor["data"]["high-water"] = json!((2 * RANGE_SIZE).to_string());
+        api.put(CHECKPOINT_PATH, successor);
+        let successor = api.inner.lock().unwrap().objects[CHECKPOINT_PATH].clone();
         pause.notify_one();
-        // A stale release conflicts, then rereads the successor and stops.
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        assert_eq!(api.inner.lock().unwrap().objects[GATE_PATH], successor);
-        assert_eq!(api.inner.lock().unwrap().gate_release_attempts, 1);
-        if !change_fence {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(150), store.load("missing"))
-                    .await
-                    .is_err()
-            );
-            assert_eq!(api.inner.lock().unwrap().objects[GATE_PATH], successor);
-        }
+        assert!(pending.await.unwrap().is_err());
+        assert!(store.verify("term-a").await.is_err());
+        assert_eq!(
+            api.inner.lock().unwrap().objects[CHECKPOINT_PATH],
+            successor
+        );
+        assert_eq!(api.inner.lock().unwrap().reservation_requests, 1);
         task.abort();
     }
 }
@@ -732,50 +639,32 @@ async fn gate_release_never_unlocks_successor_operation_or_fence() {
 async fn gate_canceled_holder_recovers_without_overlapping_live_critical_sections() {
     let (api, store, task) = gate_fixture().await;
     let pause = Arc::new(tokio::sync::Notify::new());
-    api.inner.lock().unwrap().pause_chunk = Some(pause.clone());
+    api.inner.lock().unwrap().pause_reservation = Some(pause.clone());
     let writer = {
         let store = store.clone();
-        tokio::spawn(async move {
-            store
-                .commit(
-                    "racer-v4-topology-canceled",
-                    "topology",
-                    None,
-                    b"staged",
-                    "term-a",
-                )
-                .await
-        })
+        tokio::spawn(async move { store.reserve("term-a").await })
     };
-    until(|| api.inner.lock().unwrap().pause_chunk.is_none()).await;
-    let acquisitions = api.inner.lock().unwrap().gate_acquire_requests;
+    until(|| api.inner.lock().unwrap().pause_reservation.is_none()).await;
+    let acquisitions = api.inner.lock().unwrap().reservation_requests;
     assert!(
-        tokio::time::timeout(Duration::from_millis(150), store.collect_garbage("term-a"))
+        tokio::time::timeout(Duration::from_millis(150), store.reserve("term-a"))
             .await
             .is_err()
     );
-    assert_eq!(
-        api.inner.lock().unwrap().gate_acquire_requests,
-        acquisitions
-    );
-    assert!(!gate_idle(&api), "a live holder must not be reclaimed");
+    assert_eq!(api.inner.lock().unwrap().reservation_requests, acquisitions);
     writer.abort();
     assert!(writer.await.is_err_and(|error| error.is_cancelled()));
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), store.collect_garbage("term-a"))
+        tokio::time::timeout(Duration::from_secs(5), store.reserve("term-a"))
             .await
             .unwrap()
+            .unwrap()
+            .take()
             .unwrap(),
-        1
+        RANGE_SIZE + 1
     );
     pause.notify_one();
-    assert!(
-        store
-            .load("racer-v4-topology-canceled")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    store.verify("term-a").await.unwrap();
     task.abort();
 }
 
@@ -788,97 +677,39 @@ async fn chunk_gc_preserves_staging_recovers_interruption_and_fences_takeover() 
         Arc::new(move || shared.read().unwrap().clone())
     };
     let api = FakeApi::new();
-    seed(&api);
+    seed(&api, &credentials.context.state);
     let (client, task) = api.serve().await;
-    let store = RecordStore::new(client.clone(), "system", getter.clone());
-    let record = store
-        .commit(
-            "racer-v4-topology-gc",
-            "topology",
-            None,
-            b"committed",
-            "term-a",
-        )
-        .await
-        .unwrap();
+    let store = RevisionStore::new(client.clone(), "system", getter.clone());
+    api.inner.lock().unwrap().fail_after_reservation = true;
+    let mut first = store.reserve("term-a").await.unwrap();
+    assert_eq!(
+        first.take().unwrap(),
+        1,
+        "committed unknown outcome recovered by readback"
+    );
+    api.inner.lock().unwrap().fail_before_reservation = true;
+    assert!(store.reserve("term-a").await.is_err());
+    let mut second = store.reserve("term-a").await.unwrap();
+    assert_eq!(second.take().unwrap(), RANGE_SIZE + 1);
+    for _ in 1..RANGE_SIZE {
+        second.take().unwrap();
+    }
+    assert!(second.exhausted());
+    assert!(second.take().is_err());
     let pause = Arc::new(tokio::sync::Notify::new());
-    api.inner.lock().unwrap().pause_chunk = Some(pause.clone());
+    api.inner.lock().unwrap().pause_reservation = Some(pause.clone());
     let writer = {
         let store = store.clone();
-        let record = record.clone();
-        tokio::spawn(async move {
-            store
-                .commit(
-                    "racer-v4-topology-gc",
-                    "topology",
-                    Some(&record),
-                    b"proposed",
-                    "term-a",
-                )
-                .await
-        })
+        tokio::spawn(async move { store.reserve("term-a").await })
     };
     until(|| {
-        api.inner.lock().unwrap().objects.values().any(|o| {
-            o.get("binaryData")
-                .is_some_and(|d| d.to_string().contains("cHJvcG9zZWQ="))
-        })
+        api.inner.lock().unwrap().objects
+            [&format!("/api/v1/namespaces/system/configmaps/{CHECKPOINT}")]["data"]["high-water"]
+            == json!((3 * RANGE_SIZE).to_string())
     })
     .await;
-    let gc = {
-        let store = store.clone();
-        tokio::spawn(async move { store.collect_garbage("term-a").await })
-    };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!gc.is_finished(), "GC must wait for proposed chunk staging");
-    pause.notify_one();
-    writer.await.unwrap().unwrap();
-    gc.await.unwrap().unwrap();
-    assert_eq!(
-        store
-            .load("racer-v4-topology-gc")
-            .await
-            .unwrap()
-            .unwrap()
-            .bytes,
-        b"proposed"
-    );
-
-    // Crash after chunk persistence leaves an abandoned reservation. Clearing it
-    // fences late completion; the last committed content survives collection.
-    api.inner.lock().unwrap().fail_after_chunk = true;
-    let old = store.load("racer-v4-topology-gc").await.unwrap().unwrap();
-    assert!(
-        store
-            .commit(
-                "racer-v4-topology-gc",
-                "topology",
-                Some(&old),
-                b"abandoned",
-                "term-a"
-            )
-            .await
-            .is_err()
-    );
-    for i in 0..140 {
-        let bytes = format!("orphan-{i}").into_bytes();
-        use base64::Engine;
-        use sha2::Digest;
-        let digest = hex::encode(sha2::Sha256::digest(&bytes));
-        api.put(&format!("/api/v1/namespaces/system/configmaps/racer-v4-chunk-{digest}"), json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("racer-v4-chunk-{digest}"),"labels":{"racer.unbounded-cloud.io/rust-state":"chunk"}},"immutable":true,"binaryData":{"content":base64::engine::general_purpose::STANDARD.encode(bytes)}}));
-    }
-    api.inner.lock().unwrap().fail_delete_after = Some(3);
-    assert!(store.collect_garbage("term-a").await.is_err());
-    assert_eq!(
-        store
-            .load("racer-v4-topology-gc")
-            .await
-            .unwrap()
-            .unwrap()
-            .bytes,
-        b"proposed"
-    );
-    // New leader can claim a gate left by a crashed predecessor.
+    // A new leader fences the delayed reservation response. No payload or
+    // historical object survives, and the successor reserves above its numbers.
     let image = credentials.context.state.to_image().unwrap();
     let mut metadata: Value = serde_json::from_slice(&image.metadata).unwrap();
     metadata["fence"] = json!("term-b");
@@ -889,7 +720,7 @@ async fn chunk_gc_preserves_staging_recovers_interruption_and_fences_takeover() 
     .unwrap();
     *shared.write().unwrap() = Some(SecurityContext {
         fence: "term-b".into(),
-        state: Arc::new(state),
+        state: Arc::new(state.clone()),
     });
     let mut lease = api.inner.lock().unwrap().objects["/apis/coordination.k8s.io/v1/namespaces/system/leases/racer-controlplane"].clone();
     lease["spec"]["holderIdentity"] = json!("term-b");
@@ -901,47 +732,106 @@ async fn chunk_gc_preserves_staging_recovers_interruption_and_fences_takeover() 
     let mut secret =
         api.inner.lock().unwrap().objects["/api/v1/namespaces/system/secrets/racer-ca"].clone();
     secret["data"]["state.json"] =
-        json!(base64::engine::general_purpose::STANDARD.encode(br#"{"fence":"term-b"}"#));
+        json!(base64::engine::general_purpose::STANDARD.encode(state.to_image().unwrap().metadata));
     api.put("/api/v1/namespaces/system/secrets/racer-ca", secret);
-    api.put("/api/v1/namespaces/system/configmaps/racer-v4-store-gate", json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"racer-v4-store-gate","labels":{"racer.unbounded-cloud.io/rust-state":"gate"}},"data":{"fence":"term-a","operation":"crashed"}}));
-    assert!(store.collect_garbage("term-a").await.is_err());
-    // Fake pagination uses offsets, so retry from a fresh list after deletion.
-    for _ in 0..4 {
-        store.collect_garbage("term-b").await.unwrap();
+    let successor = RevisionStore::new(client.clone(), "system", getter.clone());
+    let mut current = successor.reserve("term-b").await.unwrap();
+    assert_eq!(current.take().unwrap(), 3 * RANGE_SIZE + 1);
+    pause.notify_one();
+    assert!(writer.await.unwrap().is_err());
+    assert!(store.reserve("term-a").await.is_err());
+
+    // Delay a request before CAS, let another process reserve, then resume. The
+    // stale RV conflicts and retry must use a disjoint, newly read range.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    api.inner.lock().unwrap().pause_before_reservation = Some((entered.clone(), release.clone()));
+    let contender = RevisionStore::new(client.clone(), "system", getter.clone());
+    let pending = tokio::spawn(async move { contender.reserve("term-b").await });
+    entered.notified().await;
+    let mut winner = successor.reserve("term-b").await.unwrap();
+    let winner_start = winner.take().unwrap();
+    release.notify_one();
+    let mut retried = pending.await.unwrap().unwrap();
+    assert!(retried.take().unwrap() >= winner_start + RANGE_SIZE);
+    assert!(successor.verify("term-b").await.is_err());
+
+    // A persisted reservation with unreadable outcome cannot expose numbers.
+    let pause = Arc::new(tokio::sync::Notify::new());
+    api.inner.lock().unwrap().pause_reservation = Some(pause.clone());
+    let uncertain = RevisionStore::new(client.clone(), "system", getter.clone());
+    let unresolved = {
+        let uncertain = uncertain.clone();
+        tokio::spawn(async move { uncertain.reserve("term-b").await })
+    };
+    until(|| api.inner.lock().unwrap().pause_reservation.is_none()).await;
+    api.inner.lock().unwrap().fail_checkpoint_reads = 1;
+    pause.notify_one();
+    assert!(unresolved.await.unwrap().is_err());
+    assert!(uncertain.verify("term-b").await.is_err());
+    for _ in 0..140 {
+        successor.reserve("term-b").await.unwrap();
     }
-    let current = store.load("racer-v4-topology-gc").await.unwrap().unwrap();
-    assert_eq!(current.bytes, b"proposed");
-    assert!(
-        store
-            .commit(
-                "racer-v4-topology-gc",
-                "topology",
-                Some(&old),
-                b"late",
-                "term-a"
-            )
-            .await
-            .is_err()
-    );
     let data = api.inner.lock().unwrap();
     assert_eq!(
         data.objects
             .keys()
-            .filter(|k| k.contains("racer-v4-chunk-"))
+            .filter(|k| k.contains("/configmaps/"))
             .count(),
         1
     );
-    assert!(data.list_pages > 4);
+    let checkpoint =
+        data.objects[&format!("/api/v1/namespaces/system/configmaps/{CHECKPOINT}")].clone();
+    assert_eq!(checkpoint["data"].as_object().unwrap().len(), 3);
+    assert!(checkpoint["data"].to_string().len() < 512);
     drop(data);
+    let path = format!("/api/v1/namespaces/system/configmaps/{CHECKPOINT}");
+    api.inner.lock().unwrap().objects.remove(&path);
+    assert!(successor.reserve("term-b").await.is_err());
+    let restarted = RevisionStore::new(client, "system", getter);
+    assert!(
+        restarted.reserve("term-b").await.is_err(),
+        "restart must not recreate missing checkpoint"
+    );
+    let mut exhausted = checkpoint;
+    exhausted["data"]["high-water"] = json!(u64::MAX.to_string());
+    api.put(&path, exhausted);
+    assert!(
+        restarted
+            .reserve("term-b")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exhausted")
+    );
+    let mut corrupted = api.inner.lock().unwrap().objects[&path].clone();
+    corrupted["data"]["unexpected"] = json!("not-fixed-schema");
+    api.put(&path, corrupted);
+    assert!(restarted.reserve("term-b").await.is_err());
+    let mut replaced = api.inner.lock().unwrap().objects[&path].clone();
+    replaced["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unexpected");
+    replaced["metadata"]["uid"] = json!("replacement-checkpoint");
+    api.put(&path, replaced);
+    assert!(
+        successor
+            .reserve("term-b")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("replaced")
+    );
     task.abort();
 }
 
-/// RecordStore-only real API seam; the separate binary harness owns full service
+/// Revision checkpoint real API seam; the separate binary harness owns full service
 /// startup. Opt in with assets and keep all API files under the crate target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_store_real_kubernetes_api() {
     let Ok(assets) = std::env::var("KUBEBUILDER_ASSETS") else {
-        eprintln!("KUBEBUILDER_ASSETS unavailable; real RecordStore API scenario not run");
+        eprintln!("KUBEBUILDER_ASSETS unavailable; real revision API scenario not run");
         return;
     };
     fn port() -> u16 {
@@ -1065,7 +955,8 @@ async fn record_store_real_kubernetes_api() {
         .await
         .unwrap();
     let fixture = FakeApi::new();
-    seed(&fixture);
+    let context = credentials().await.context;
+    seed(&fixture, &context.state);
     let objects = fixture.inner.lock().unwrap().objects.clone();
     let lease: Lease = serde_json::from_value(
         objects["/apis/coordination.k8s.io/v1/namespaces/system/leases/racer-controlplane"].clone(),
@@ -1085,64 +976,92 @@ async fn record_store_real_kubernetes_api() {
         .create(&PostParams::default(), &secret)
         .await
         .unwrap();
-    let context = credentials().await.context;
-    let getter: racer_controlplane::subscription::SecurityGetter =
-        Arc::new(move || Some(context.clone()));
-    let store = RecordStore::new(client.clone(), "system", getter);
-    let first = store
-        .commit(
-            "racer-v4-topology-real",
-            "topology",
-            None,
-            &vec![1; 600_000],
-            "term-a",
-        )
+    let shared = Arc::new(RwLock::new(context.clone()));
+    let getter: racer_controlplane::subscription::SecurityGetter = {
+        let shared = shared.clone();
+        Arc::new(move || Some(shared.read().unwrap().clone()))
+    };
+    RevisionStore::initialize(client.clone(), "system")
         .await
         .unwrap();
-    let second = store
-        .commit(
-            "racer-v4-topology-real",
-            "topology",
-            Some(&first),
-            &vec![2; 700_000],
-            "term-a",
-        )
-        .await
-        .unwrap();
+    let store = RevisionStore::new(client.clone(), "system", getter.clone());
+    let mut first = store.reserve("term-a").await.unwrap();
+    assert_eq!(first.take().unwrap(), 1);
+    let maps = Api::<ConfigMap>::namespaced(client.clone(), "system");
+    let stale = maps.get(CHECKPOINT).await.unwrap();
+    let restarted = RevisionStore::new(client.clone(), "system", getter);
+    let mut second = restarted.reserve("term-a").await.unwrap();
+    assert_eq!(second.take().unwrap(), RANGE_SIZE + 1);
     assert!(
-        store
-            .commit(
-                "racer-v4-topology-real",
-                "topology",
-                Some(&first),
-                b"stale",
-                "term-a"
-            )
+        maps.replace(CHECKPOINT, &PostParams::default(), &stale)
             .await
             .is_err()
     );
-    assert_eq!(store.collect_garbage("term-a").await.unwrap(), 2);
-    assert_eq!(
-        store
-            .load("racer-v4-topology-real")
-            .await
+    assert!(store.verify("term-a").await.is_err());
+    for _ in 0..16 {
+        restarted.reserve("term-a").await.unwrap();
+    }
+    let checkpoints = maps.list(&kube::api::ListParams::default()).await.unwrap();
+    assert_eq!(checkpoints.items.len(), 1);
+    assert!(
+        serde_json::to_vec(&checkpoints.items[0].data)
             .unwrap()
-            .unwrap()
-            .bytes,
-        second.bytes
+            .len()
+            < 512
     );
-    let chunks = Api::<ConfigMap>::namespaced(client, "system")
-        .list(&kube::api::ListParams::default().labels("racer.unbounded-cloud.io/rust-state=chunk"))
+    let leases = Api::<Lease>::namespaced(client.clone(), "system");
+    let mut lease = leases.get("racer-controlplane").await.unwrap();
+    lease.spec.as_mut().unwrap().holder_identity = Some("term-b".into());
+    leases
+        .replace("racer-controlplane", &PostParams::default(), &lease)
         .await
         .unwrap();
-    assert_eq!(chunks.items.len(), 2);
+    assert!(
+        restarted.reserve("term-a").await.is_err(),
+        "stale local context cannot override live lease"
+    );
+    let mut image = context.state.to_image().unwrap();
+    let mut metadata: Value = serde_json::from_slice(&image.metadata).unwrap();
+    metadata["fence"] = json!("term-b");
+    image.metadata = serde_json::to_vec(&metadata).unwrap();
+    let state = CaState::from_image(&image).unwrap();
+    let secrets = Api::<Secret>::namespaced(client.clone(), "system");
+    let mut secret = secrets.get("racer-ca").await.unwrap();
+    secret
+        .data
+        .as_mut()
+        .unwrap()
+        .insert("state.json".into(), k8s_openapi::ByteString(image.metadata));
+    secrets
+        .replace("racer-ca", &PostParams::default(), &secret)
+        .await
+        .unwrap();
+    *shared.write().unwrap() = SecurityContext {
+        fence: "term-b".into(),
+        state: Arc::new(state),
+    };
+    let mut takeover = restarted.reserve("term-b").await.unwrap();
+    assert!(takeover.take().unwrap() > second.take().unwrap());
+    assert_eq!(
+        maps.list(&kube::api::ListParams::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    maps.delete(CHECKPOINT, &kube::api::DeleteParams::default())
+        .await
+        .unwrap();
+    assert!(restarted.reserve("term-b").await.is_err());
     drop(processes);
 }
 
-fn seed(api: &FakeApi) {
+fn seed(api: &FakeApi, state: &CaState) {
+    api.put(&format!("/api/v1/namespaces/system/configmaps/{CHECKPOINT}"), json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":CHECKPOINT,"uid":"checkpoint-uid"},"data":{"format":"1","fence":"","high-water":"0"}}));
     api.put("/apis/coordination.k8s.io/v1/namespaces/system/leases/racer-controlplane", json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"racer-controlplane"},"spec":{"holderIdentity":"term-a","leaseDurationSeconds":3600,"renewTime":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()}}));
     use base64::Engine;
-    api.put("/api/v1/namespaces/system/secrets/racer-ca", json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"racer-ca"},"data":{"state.json":base64::engine::general_purpose::STANDARD.encode(br#"{"fence":"term-a"}"#)}}));
+    api.put("/api/v1/namespaces/system/secrets/racer-ca", json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"racer-ca"},"data":{"state.json":base64::engine::general_purpose::STANDARD.encode(state.to_image().unwrap().metadata)}}));
     api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-a","uid":"site-uid","labels":{"zone":"a"}},"spec":{"components":{"racer":{"enabled":true}}}}));
     api.put("/api/v1/nodes/node-a", json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a","uid":"node-uid","labels":{"unbounded-cloud.io/site":"site-a","kubernetes.io/os":"linux"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}));
     api.put("/api/v1/namespaces/system/pods/racer-a", json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"racer-a","namespace":"system","uid":"pod-uid","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds-uid","controller":true}]},"spec":{"nodeName":"node-a","serviceAccountName":"racer-dataplane"},"status":{"phase":"Running","podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}));
@@ -1208,8 +1127,8 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
         Arc::new(move || context.read().unwrap().clone())
     };
     let api = FakeApi::new();
-    seed(&api);
-    api.inner.lock().unwrap().fail_after_pointer = true;
+    seed(&api, &credentials.context.state);
+    api.inner.lock().unwrap().fail_after_reservation = true;
     let (client, api_task) = api.serve().await;
     let mut options = RuntimeOptions::new("system");
     options.retry_interval = Duration::from_millis(100);
@@ -1228,8 +1147,8 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
             .is_some()
     );
     let first = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
-    // The storage ConfigMap exists as a reservation before its policy is
-    // committed and installed. Observe publication through the actual handler.
+    // Observe in-memory policy publication through the actual handler rather
+    // than treating checkpoint or status writes as proof that it is installed.
     let current = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let current = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
@@ -1241,14 +1160,18 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     })
     .await
     .expect("storage policy was not installed in the config handler");
-    assert!(
+    until(|| {
         api.inner
             .lock()
             .unwrap()
             .objects
-            .keys()
-            .any(|k| k.contains("racer-v4-storage-"))
-    );
+            .get("/api/v1/nodes/node-a")
+            .is_some_and(|n| {
+                n.pointer("/metadata/annotations/racer.unbounded-cloud.io~1cache-status")
+                    .is_some()
+            })
+    })
+    .await;
     assert_eq!(first.revision, current.revision);
     assert!(current.storage_policy.is_some());
 
@@ -1349,8 +1272,16 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     let task2 = tokio::spawn(restarted.clone().run(client.clone(), stop2.clone()));
     until(|| restarted.ready()).await;
     let loaded = desired(restarted.router(), &credentials.peer, &credentials.boot, "").await;
-    assert_eq!(loaded.revision, changed.revision);
-    assert_eq!(loaded.cursor, changed.cursor);
+    assert!(loaded.revision > changed.revision);
+    assert_ne!(loaded.cursor, changed.cursor);
+    assert_eq!(
+        loaded.storage_policy.as_ref().unwrap().identity,
+        changed.storage_policy.as_ref().unwrap().identity
+    );
+    assert!(
+        loaded.storage_policy.as_ref().unwrap().version
+            > changed.storage_policy.as_ref().unwrap().version
+    );
     let unchanged = restarted
         .router()
         .oneshot(request(
@@ -1363,19 +1294,15 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     assert_eq!(unchanged.status(), StatusCode::NO_CONTENT);
     assert_eq!(unchanged.headers()["content-length"], "0");
 
-    // CAS uses the captured RV. A stale writer cannot overwrite a later pointer.
-    let store = RecordStore::new(client, "system", getter);
-    let name = format!("racer-v4-topology-{}", identity("universe", "site-a"));
-    let old = store.load(&name).await.unwrap().unwrap();
-    store
-        .commit(&name, "topology", Some(&old), &old.bytes, "term-a")
-        .await
-        .unwrap();
-    assert!(
-        store
-            .commit(&name, "topology", Some(&old), &old.bytes, "term-a")
-            .await
-            .is_err()
+    assert_eq!(
+        api.inner
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .filter(|k| k.contains("/configmaps/"))
+            .count(),
+        1
     );
 
     // Removing selection sends deconfiguration to the enrolled process without a ledger.
@@ -1446,7 +1373,8 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     let racer_controlplane::proto::configuration::Contents::Snapshot(snapshot) =
         moved.configuration.unwrap().contents.unwrap();
     assert!(snapshot.volumes.is_empty());
-    // The same historical Pod must never be selected into the destination universe.
+    // Live inventory selects the Pod in its new universe. Its old signed
+    // identity still only authorizes deconfiguration in the old universe.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         restarted
@@ -1454,7 +1382,7 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
                 &identity("universe", "site-b"),
                 &identity("node", "node-uid")
             )
-            .is_none()
+            .is_some()
     );
     *context.write().unwrap() = None;
     assert_eq!(
@@ -1545,4 +1473,351 @@ fn old_new_scope_relist_and_process_bound_feedback() {
         assert_eq!(retained.applied_bytes, accepted.applied_bytes);
         assert_eq!(retained.storage_state, "applied");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
+    let credentials = credentials().await;
+    let security = credentials.context.clone();
+    let getter: racer_controlplane::subscription::SecurityGetter =
+        Arc::new(move || Some(security.clone()));
+    let api = FakeApi::new();
+    seed(&api, &credentials.context.state);
+    let (client, api_task) = api.serve().await;
+    let mut options = RuntimeOptions::new("system");
+    options.retry_interval = Duration::from_millis(50);
+    options.long_poll = Duration::from_millis(50);
+    let runtime = Runtime::new(options.clone(), getter.clone());
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.clone().run(client.clone(), stop.clone()));
+    until(|| runtime.ready()).await;
+    let good = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
+    let good_policy = good.storage_policy.clone().unwrap();
+    assert_eq!(
+        good_policy.identity,
+        racer_controlplane::model::identity_bytes("storage", "node-uid")
+    );
+    assert_ne!(
+        good_policy.identity,
+        racer_controlplane::storage::StoragePolicy::for_node("replacement-uid").identity
+    );
+
+    let mut wrong_boot = request(&credentials.peer, &"e".repeat(64), "");
+    wrong_boot
+        .headers_mut()
+        .insert("x-racer-boot", "e".repeat(64).parse().unwrap());
+    assert_eq!(
+        runtime.router().oneshot(wrong_boot).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    node["metadata"]["annotations"]["racer.unbounded-cloud.io/cache-size"] = json!("bad");
+    api.put("/api/v1/nodes/node-a", node);
+    let invalid = desired(
+        runtime.router(),
+        &credentials.peer,
+        &credentials.boot,
+        &good.cursor,
+    )
+    .await;
+    assert_eq!(invalid.revision, good.revision);
+    assert!(
+        invalid.storage_policy.is_none(),
+        "invalid intent must omit replacement policy"
+    );
+    until(|| {
+        api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"]
+            .pointer("/metadata/annotations/racer.unbounded-cloud.io~1cache-status")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|s| {
+                s["phase"] == "invalid" && s["effectiveBytes"] == good_policy.desired_bytes
+            })
+    })
+    .await;
+
+    api.put("/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad", json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"P2PCache","metadata":{"name":"bad","uid":"bad-uid"},"spec":{"cacheGeneration":-1}}));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let retained = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
+    assert_eq!(retained.revision, good.revision);
+    assert_eq!(retained.snapshot_digest, good.snapshot_digest);
+    let mut malformed = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    malformed["metadata"]["annotations"]["racer.unbounded-cloud.io/fabric"] =
+        json!("invalid fabric");
+    api.put("/api/v1/nodes/node-a", malformed);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        runtime
+            .selection(
+                &identity("universe", "site-a"),
+                &identity("node", "node-uid")
+            )
+            .is_some()
+    );
+    let retained = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
+    assert_eq!(retained.snapshot_digest, good.snapshot_digest);
+    let mut replaced = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    replaced["metadata"]["uid"] = json!("replacement-uid");
+    api.put("/api/v1/nodes/node-a", replaced.clone());
+    until(|| {
+        runtime
+            .selection(
+                &identity("universe", "site-a"),
+                &identity("node", "node-uid"),
+            )
+            .is_none()
+    })
+    .await;
+    assert_eq!(
+        runtime
+            .router()
+            .oneshot(request(&credentials.peer, &credentials.boot, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "last-good topology cannot authorize a stale Node UID binding"
+    );
+    replaced["metadata"]["uid"] = json!("node-uid");
+    replaced["metadata"]["annotations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("racer.unbounded-cloud.io/fabric");
+    api.put("/api/v1/nodes/node-a", replaced);
+    stop.cancel();
+    task.await.unwrap().unwrap();
+
+    let restarted = Runtime::new(options, getter);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(restarted.clone().run(client, stop.clone()));
+    until(|| {
+        api.inner.lock().unwrap().objects
+            [&format!("/api/v1/namespaces/system/configmaps/{CHECKPOINT}")]["data"]["high-water"]
+            == json!((2 * RANGE_SIZE).to_string())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!restarted.ready());
+    assert_eq!(
+        restarted
+            .router()
+            .oneshot(request(&credentials.peer, &credentials.boot, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut cache =
+        api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad"]
+            .clone();
+    cache["spec"]["cacheGeneration"] = json!(1);
+    api.put(
+        "/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad",
+        cache,
+    );
+    until(|| restarted.ready()).await;
+    let fresh = desired(restarted.router(), &credentials.peer, &credentials.boot, "").await;
+    assert!(fresh.revision > good.revision);
+    assert!(fresh.storage_policy.is_none());
+    until(|| {
+        api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"]
+            .pointer("/metadata/annotations/racer.unbounded-cloud.io~1cache-status")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|s| s["phase"] == "invalid" && s["effectiveBytes"] == 0)
+    })
+    .await;
+
+    let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    node["metadata"]["annotations"]["racer.unbounded-cloud.io/cache-size"] = json!("512Mi");
+    api.put("/api/v1/nodes/node-a", node);
+    let recovered = desired(
+        restarted.router(),
+        &credentials.peer,
+        &credentials.boot,
+        &fresh.cursor,
+    )
+    .await;
+    let policy = recovered.storage_policy.unwrap();
+    assert_eq!(policy.identity, good_policy.identity);
+    assert!(policy.version > good_policy.version);
+    assert_eq!(policy.desired_bytes, 512 << 20);
+
+    api.inner.lock().unwrap().objects.remove(&format!(
+        "/api/v1/namespaces/system/configmaps/{CHECKPOINT}"
+    ));
+    until(|| !restarted.ready()).await;
+    assert_eq!(
+        restarted
+            .router()
+            .oneshot(request(&credentials.peer, &credentials.boot, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    api_task.abort();
+}
+
+#[test]
+fn in_memory_publication_rejects_regression_and_preserves_last_good() {
+    use racer_controlplane::{publication::Publication, storage::StoragePolicy};
+    let desired = StoragePolicy::for_node("uid")
+        .resolve("site-a", Some("1Gi"), None)
+        .unwrap();
+    let mut publication = Publication::default();
+    let first = publication.publish(desired.clone(), 10).unwrap();
+    assert!(publication.publish(desired.clone(), 10).is_err());
+    assert!(publication.publish(desired.clone(), 9).is_err());
+    let mut invalid = desired.clone();
+    invalid.desired_bytes = 1;
+    assert!(publication.publish(invalid, 11).is_err());
+    assert_eq!(publication.published().unwrap(), &first);
+    let replacement = StoragePolicy::for_node("replacement")
+        .resolve("site-a", Some("1Gi"), None)
+        .unwrap();
+    assert!(publication.publish(replacement, 11).is_err());
+    let mut restarted = Publication::default();
+    assert!(restarted.published().is_none());
+    let fresh = restarted.publish(desired, RANGE_SIZE + 1).unwrap();
+    assert!(fresh.revision > first.revision);
+    assert_eq!(fresh.identity, first.identity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_expires_during_checkpoint_or_status_stalls_with_healthy_lease() {
+    for checkpoint in [true, false] {
+        let credentials = credentials().await;
+        let context = credentials.context.clone();
+        let api = FakeApi::new();
+        seed(&api, &context.state);
+        let (client, api_task) = api.serve().await;
+        let mut options = RuntimeOptions::new("system");
+        options.retry_interval = Duration::from_millis(30);
+        options.authority_timeout = Duration::from_millis(600);
+        options.long_poll = Duration::from_secs(10);
+        let runtime = Runtime::new(options, Arc::new(move || Some(context.clone())));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.clone().run(client.clone(), stop.clone()));
+        until(|| runtime.ready()).await;
+        let current = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
+        let waiter = tokio::spawn(runtime.router().oneshot(request(
+            &credentials.peer,
+            &credentials.boot,
+            &current.cursor,
+        )));
+        until(|| runtime.subscriptions.waiter_count() == 1).await;
+        let release = CancellationToken::new();
+        if checkpoint {
+            api.inner.lock().unwrap().stall_checkpoint_get = Some(release.clone());
+        } else {
+            api.inner.lock().unwrap().stall_status_patch = Some(release.clone());
+            // Change only controller status, forcing a PATCH without publishing
+            // different content or waking the unchanged subscription.
+            let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+            node["metadata"]["annotations"]["racer.unbounded-cloud.io/cache-status"] = json!("{}");
+            api.put("/api/v1/nodes/node-a", node);
+        }
+        until(|| api.inner.lock().unwrap().stalled_requests > 0).await;
+        let ca = racer_controlplane::security::kubernetes::KubernetesCaStore::new(
+            client,
+            "system".into(),
+            Leadership::new("term-a".into()).unwrap(),
+        );
+        ca.check_fence().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), until(|| !runtime.ready()))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .router()
+                .oneshot(request(&credentials.peer, &credentials.boot, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!task.is_finished(), "the reconcile I/O is still stalled");
+        {
+            let mut data = api.inner.lock().unwrap();
+            data.stall_checkpoint_get = None;
+            data.stall_status_patch = None;
+        }
+        release.cancel();
+        until(|| runtime.ready()).await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        api_task.abort();
+    }
+}
+
+#[test]
+fn live_selection_ignores_invalid_fabric_and_isolates_node_identity_changes() {
+    let api = FakeApi::new();
+    // Populate the membership inventory directly, without certificate state.
+    let mut index = InventoryIndex::default();
+    let mut dirty = BTreeSet::new();
+    let mut storage = BTreeSet::new();
+    let site = json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"a","uid":"site"}});
+    index
+        .event(
+            Kind::Site,
+            Event::Apply(serde_json::from_value(site).unwrap()),
+            &mut dirty,
+            &mut storage,
+        )
+        .unwrap();
+    for i in 0..2 {
+        let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":format!("n{i}"),"uid":format!("uid{i}"),"labels":{"unbounded-cloud.io/site":"a","kubernetes.io/os":"linux"},"annotations":{"racer.unbounded-cloud.io/fabric":"invalid fabric"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}});
+        let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":format!("p{i}"),"namespace":"system","uid":format!("pod{i}"),"labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds","controller":true}]},"spec":{"nodeName":format!("n{i}"),"serviceAccountName":"racer-dataplane"},"status":{"phase":"Running","podIP":format!("10.0.0.{}",i+1)}});
+        api.put(&format!("/nodes/n{i}"), node.clone());
+        index
+            .event(
+                Kind::Node,
+                Event::Apply(serde_json::from_value(node).unwrap()),
+                &mut dirty,
+                &mut storage,
+            )
+            .unwrap();
+        index
+            .event(
+                Kind::Pod,
+                Event::Apply(serde_json::from_value(pod).unwrap()),
+                &mut dirty,
+                &mut storage,
+            )
+            .unwrap();
+    }
+    let original = index.live_selections();
+    assert_eq!(original.len(), 2);
+    assert!(
+        racer_controlplane::topology::compile(&index.inventory("a", "/run/racer").unwrap(), None)
+            .is_err()
+    );
+    let mut replaced = api.inner.lock().unwrap().objects["/nodes/n0"].clone();
+    replaced["metadata"]["uid"] = json!("replacement");
+    index
+        .event(
+            Kind::Node,
+            Event::Apply(serde_json::from_value(replaced).unwrap()),
+            &mut dirty,
+            &mut storage,
+        )
+        .unwrap();
+    let next = index.live_selections();
+    assert!(!next.contains_key(&(identity("universe", "a"), identity("node", "uid0"))));
+    let healthy = (identity("universe", "a"), identity("node", "uid1"));
+    assert_eq!(next[&healthy], original[&healthy]);
 }

@@ -48,6 +48,8 @@ struct Objects {
     get_errors: BTreeMap<String, StatusCode>,
     requests: u64,
     in_flight: BTreeMap<u64, (String, Instant)>,
+    write_fault: Option<(String, Method, bool, bool)>,
+    secret_read_pause: Option<(usize, Arc<RoutePause>)>,
 }
 #[derive(Clone)]
 struct Fixture {
@@ -151,6 +153,42 @@ async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap();
     let patch: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let pause = if parts.method == Method::GET && parts.uri.path().ends_with("/secrets/racer-ca") {
+        let mut objects = fixture.objects.lock().unwrap();
+        if let Some((remaining, _)) = objects.secret_read_pause.as_mut() {
+            if *remaining == 0 {
+                objects.secret_read_pause.take().map(|(_, p)| p)
+            } else {
+                *remaining -= 1;
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(pause) = pause {
+        pause.captured.notify_one();
+        pause.resume.notified().await;
+    }
+    let write_fault = {
+        let mut objects = fixture.objects.lock().unwrap();
+        if objects
+            .write_fault
+            .as_ref()
+            .is_some_and(|(name, method, _, _)| {
+                *method == parts.method && patch["metadata"]["name"] == name.as_str()
+            })
+        {
+            objects.write_fault.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, _, false, _)) = write_fault {
+        return status(StatusCode::GATEWAY_TIMEOUT, "InjectedBeforeWrite");
+    }
     let route_patch = parts.method == Method::PATCH
         && parts.uri.path().contains("/pods/")
         && patch["metadata"]["labels"]
@@ -188,7 +226,22 @@ async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response
         .await
         .unwrap();
     }
-    api_inner(State(fixture), request).await
+    let response = api_inner(State(fixture.clone()), request).await;
+    if let Some((name, _, true, fail_readback)) = write_fault {
+        if fail_readback {
+            let kind = if name == "racer-ca" {
+                "secrets"
+            } else {
+                "configmaps"
+            };
+            fixture.objects.lock().unwrap().get_errors.insert(
+                format!("/api/v1/namespaces/system/{kind}/{name}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+        return status(StatusCode::GATEWAY_TIMEOUT, "InjectedAfterWrite");
+    }
+    response
 }
 
 async fn paused_route(
@@ -617,7 +670,13 @@ async fn actual_kube_store_cas_uncertain_write_and_takeover() -> Result<()> {
     let issued = manager
         .issue(&key.csr_pem, identity.clone(), false, unix_now())
         .await?;
-    assert!(manager.state().await?.member(&identity.key()).is_some());
+    assert!(
+        manager
+            .state()
+            .await?
+            .expiry_watermarks()
+            .any(|(_, expiry)| expiry == issued.not_after)
+    );
     let old_snapshot = store.read().await?;
     let mut lease = fixture.get(&lease_path).unwrap();
     lease["spec"]["holderIdentity"] = "second".into();
@@ -645,29 +704,27 @@ async fn actual_kube_store_cas_uncertain_write_and_takeover() -> Result<()> {
             .is_err()
     );
     let old_image = old_snapshot.image.as_ref().unwrap();
-    for id in old_image.shards.keys() {
-        let name = racer_controlplane::security::kubernetes::participant_object_name("first", id);
-        let path = format!("/api/v1/namespaces/system/configmaps/{name}");
-        let mut object = fixture.get(&path).unwrap();
-        object["metadata"]["creationTimestamp"] = "2026-01-01T00:00:00Z".into();
-        fixture.put(&path, object);
-    }
+    assert!(old_image.shards.is_empty());
     second.collect().await?;
-    for id in old_image.shards.keys() {
-        let name = racer_controlplane::security::kubernetes::participant_object_name("first", id);
-        assert!(
-            fixture
-                .get(&format!("/api/v1/namespaces/system/configmaps/{name}"))
-                .is_none()
-        );
-    }
+    assert_eq!(
+        fixture
+            .objects
+            .lock()
+            .unwrap()
+            .values
+            .keys()
+            .filter(|p| p.contains("/configmaps/"))
+            .count(),
+        2
+    );
+    assert!(second.state().await?.to_image()?.metadata.len() < 16384);
+    // Established state never authorizes recreating a lost revision checkpoint.
+    fixture.remove("/api/v1/namespaces/system/configmaps/racer-runtime-revisions");
+    second.publish().await?;
     assert!(
-        second
-            .state()
-            .await?
-            .member(&format!("pod/{}", "c".repeat(64)))
-            .is_some(),
-        "collection must retain successor shards"
+        fixture
+            .get("/api/v1/namespaces/system/configmaps/racer-runtime-revisions")
+            .is_none()
     );
     stop.cancel();
     Ok(())
@@ -676,6 +733,162 @@ async fn actual_kube_store_cas_uncertain_write_and_takeover() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runnable_service_bootstraps_enrolls_and_serves_authenticated_v4() -> Result<()> {
     service_replacement_scenario("boot").await
+}
+
+#[tokio::test]
+async fn uncertain_bootstrap_resumes_checkpoint_trust_and_pending_marker_without_reset()
+-> Result<()> {
+    for (name, method) in [
+        ("racer-runtime-revisions", Method::POST),
+        ("racer-trust", Method::POST),
+        ("racer-ca", Method::PUT),
+    ] {
+        for (committed, fail_readback) in [(false, false), (true, false), (true, true)] {
+            let (fixture, client, stop) = Fixture::start().await?;
+            let lease_path =
+                format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+            let renew = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)?;
+            fixture.put(&lease_path, json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":LEASE,"namespace":"system","uid":"lease"},"spec":{"holderIdentity":"first","renewTime":renew,"leaseDurationSeconds":15}}));
+            fixture.objects.lock().unwrap().write_fault =
+                Some((name.into(), method.clone(), committed, fail_readback));
+            let term = Leadership::new("first".into())?;
+            let result = CaManager::acquire(
+                KubernetesCaStore::new(client.clone(), "system".into(), term.clone()),
+                term,
+                SecurityOptions::new("system"),
+                unix_now(),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                committed && !fail_readback,
+                "{name}: committed={committed} readback={fail_readback}"
+            );
+            let secret_path = "/api/v1/namespaces/system/secrets/racer-ca";
+            let secret = fixture
+                .get(secret_path)
+                .context("durable bootstrap Secret missing")?;
+            let checkpoint =
+                fixture.get("/api/v1/namespaces/system/configmaps/racer-runtime-revisions");
+            fixture.objects.lock().unwrap().get_errors.clear();
+            let original = participant_state(&client).await?.bundle();
+            let mut lease = fixture.get(&lease_path).unwrap();
+            lease["spec"]["holderIdentity"] = "second".into();
+            fixture.put(&lease_path, lease);
+            let term = Leadership::new("second".into())?;
+            let next = CaManager::acquire(
+                KubernetesCaStore::new(client, "system".into(), term.clone()),
+                term,
+                SecurityOptions::new("system"),
+                unix_now(),
+            )
+            .await?;
+            assert_eq!(next.state().await?.bundle(), original);
+            let completed = fixture.get(secret_path).unwrap();
+            assert_eq!(completed["metadata"]["uid"], secret["metadata"]["uid"]);
+            assert!(
+                completed["metadata"]["annotations"]["racer.unbounded.cloud/pki-bootstrap-pending"]
+                    .is_null()
+            );
+            let current = fixture
+                .get("/api/v1/namespaces/system/configmaps/racer-runtime-revisions")
+                .unwrap();
+            assert_eq!(current["data"]["high-water"], "0");
+            if let Some(checkpoint) = checkpoint {
+                assert_eq!(checkpoint["metadata"]["uid"], current["metadata"]["uid"]);
+            }
+            assert_eq!(
+                fixture
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .values
+                    .keys()
+                    .filter(|p| p.contains("/configmaps/"))
+                    .count(),
+                2
+            );
+            stop.cancel();
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_op_issuance_commit_is_fenced_during_takeover_and_retirement() -> Result<()> {
+    let (fixture, client, stop) = Fixture::start().await?;
+    let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+    let renew =
+        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    fixture.put(&lease_path, json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":LEASE,"namespace":"system","uid":"lease"},"spec":{"holderIdentity":"first","renewTime":renew,"leaseDurationSeconds":15}}));
+    let options = SecurityOptions {
+        leaf_lifetime: 100,
+        clock_skew: 1,
+        proof_lifetime: 1,
+        ..SecurityOptions::new("system")
+    };
+    let term = Leadership::new("first".into())?;
+    let store = KubernetesCaStore::new(client.clone(), "system".into(), term.clone());
+    let first =
+        Arc::new(CaManager::acquire(store.clone(), term, options.clone(), unix_now()).await?);
+    let key = generate_local_key()?;
+    let identity = Identity {
+        kind: IdentityKind::Node,
+        universe: "a".repeat(64),
+        node: "b".repeat(64),
+        pod_uid: "pod".into(),
+        boot_id: "c".repeat(64),
+        pod_name: "pod".into(),
+        container_id: String::new(),
+    };
+    let now = unix_now();
+    let issued = first
+        .issue(&key.csr_pem, identity.clone(), false, now)
+        .await?;
+    let rv = store.read().await?.resource_version;
+    first
+        .issue(&key.csr_pem, identity.clone(), false, now)
+        .await?;
+    assert_eq!(
+        store.read().await?.resource_version,
+        rv,
+        "unchanged watermark must exercise no-op commit"
+    );
+    let pause = Arc::new(RoutePause::default());
+    // load, base read, then the no-op branch's fence check.
+    fixture.objects.lock().unwrap().secret_read_pause = Some((2, pause.clone()));
+    let task = tokio::spawn(async move { first.issue(&key.csr_pem, identity, false, now).await });
+    tokio::time::timeout(Duration::from_secs(5), pause.captured.notified()).await?;
+    let mut lease = fixture.get(&lease_path).unwrap();
+    lease["spec"]["holderIdentity"] = "second".into();
+    fixture.put(&lease_path, lease);
+    let term = Leadership::new("second".into())?;
+    let second = CaManager::acquire(
+        KubernetesCaStore::new(client, "system".into(), term.clone()),
+        term,
+        options,
+        now,
+    )
+    .await?;
+    second.begin_rotation(now).await?;
+    let at = second.state().await?.published_at().unwrap();
+    assert_eq!(second.advance_rotation(at + 2).await?, Phase::Switched);
+    assert_eq!(
+        second.advance_rotation(issued.not_after).await?,
+        Phase::Switched
+    );
+    assert_eq!(
+        second.advance_rotation(issued.not_after + 1).await?,
+        Phase::Stable
+    );
+    pause.resume.notify_one();
+    assert!(
+        task.await?.is_err(),
+        "no-op commit cannot skip the durable fence"
+    );
+    stop.cancel();
+    Ok(())
 }
 
 #[tokio::test]
@@ -704,6 +917,8 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         health_listen: free_address().await,
         replica_proof_listen: free_address().await,
         trust_proof_listen: free_address().await,
+        overlap_delay: Duration::from_secs(2),
+        clock_skew: Duration::from_secs(1),
         ..Default::default()
     };
     let stop = CancellationToken::new();
@@ -741,16 +956,15 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
     )
     .await?;
     assert!(health.starts_with(b"HTTP/1.1 200"));
-    // Withhold an old authoritative list that does not contain a not-yet-admitted
-    // Pod. Its creation/watch publication and real HTTPS enrollment finish while
-    // the retirement sweep is suspended. Completing that sweep must not revoke it.
-    let worker_path = "/api/v1/namespaces/system/pods/worker";
-    let worker = fixture.get(worker_path).unwrap();
-    fixture.remove(worker_path);
+    // Admission uses direct live authorization; no participant census is needed.
+    // Hold replica discovery while enrollment completes, then explicitly observe
+    // subsequent passes before checking signed-claim request authorization.
     let pause = Arc::new(ListPause::default());
     *fixture.pod_list_pause.lock().unwrap() = Some(pause.clone());
-    tokio::time::timeout(Duration::from_secs(10), pause.captured.notified()).await?;
-    fixture.put(worker_path, worker);
+    tokio::time::timeout(Duration::from_secs(10), pause.captured.notified())
+        .await
+        .context("replica discovery capture deadline")?;
+    let worker_path = "/api/v1/namespaces/system/pods/worker";
     let key = generate_local_key()?;
     let body = serde_json::to_string(
         &json!({"csr":String::from_utf8(key.csr_pem.clone())?,"pod_namespace":"system","pod_name":"worker", "expected_universe":racer_identity("universe", "edge"), "expected_node":racer_identity("node", "node")}),
@@ -825,7 +1039,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
     let start = response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
     // Readiness retries may have authenticated long before issuance succeeds.
     // Prime a distinct credential after readiness, then measure only its
-    // immediate repeat, independently of retirement sweeps and prior reviews.
+    // immediate repeat, independently of discovery sweeps and prior reviews.
     let cached_enrollment = enrollment.replace(&token, &token.replace("signature", "cache-check"));
     let before = fixture.objects.lock().unwrap().reviews;
     let primed = request(
@@ -849,21 +1063,21 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         0,
         "immediate repeat must use the successful TokenReview cache"
     );
-    // Each capture is at the next unfiltered Pod list in the serial participant
-    // reconciler. Two more captures prove both the withheld stale sweep and a
-    // subsequent live sweep finished, including refreshing authorization state.
+    // Each capture is at the next unfiltered Pod list in replica reconciliation.
+    // Two more captures prove the withheld and subsequent live passes finished.
+    // Neither can revoke a valid signed identity through participant history.
     let live_sweep = Arc::new(ListPause::default());
     *fixture.pod_list_pause.lock().unwrap() = Some(live_sweep.clone());
     pause.resume.notify_one();
     tokio::time::timeout(Duration::from_secs(10), live_sweep.captured.notified())
         .await
-        .context("stale retirement sweep completion deadline")?;
+        .context("withheld discovery sweep completion deadline")?;
     let next_sweep = Arc::new(ListPause::default());
     *fixture.pod_list_pause.lock().unwrap() = Some(next_sweep.clone());
     live_sweep.resume.notify_one();
     tokio::time::timeout(Duration::from_secs(10), next_sweep.captured.notified())
         .await
-        .context("live retirement sweep completion deadline")?;
+        .context("live discovery sweep completion deadline")?;
     let response: Value = serde_json::from_slice(&response[start..])?;
     let config = tls_config(
         &bundle,
@@ -876,6 +1090,11 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         String::from_utf8_lossy(&control)
     );
     next_sweep.resume.notify_one();
+    let wrong_boot = request(&options.listen, &format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n", "f".repeat(64)), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
+    assert!(
+        wrong_boot.starts_with(b"HTTP/1.1 403"),
+        "header cannot replace signed boot"
+    );
     let proof = request(&options.trust_proof_listen, &format!("POST /v3/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", bundle.generation, bundle.digest(), response["issuer"].as_str().unwrap()), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
     ensure!(
         proof.starts_with(b"HTTP/1.1 204"),
@@ -971,8 +1190,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         "TokenReview work exceeded pipeline bound"
     );
     fixture.objects.lock().unwrap().review_delay = Duration::ZERO;
-    // A second boot of the same Pod cannot identify which process is dead.
-    // The service replaces the managed Pod, then retires only after UID absence.
+    // A second boot is independently signed. No boot history replaces live Pods.
     let second_boot = "b".repeat(64);
     if change == "boot" {
         let second_enrollment = enrollment.replace(&boot, &second_boot);
@@ -987,6 +1205,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
             "second boot enrollment failed: {}",
             String::from_utf8_lossy(&admitted)
         );
+        assert!(fixture.get(worker_path).is_some());
     } else {
         let mut node = fixture.get("/api/v1/nodes/worker").unwrap();
         if change == "site" {
@@ -996,72 +1215,54 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
             node["metadata"]["uid"] = json!("replacement-node");
         }
         fixture.put("/api/v1/nodes/worker", node);
+        let denied = request(
+            &options.enroll_listen,
+            &enrollment,
+            Some(tls_config(&switched, None)),
+        )
+        .await?;
+        assert!(
+            !denied.starts_with(b"HTTP/1.1 200"),
+            "historical identities cannot renew"
+        );
+        assert!(
+            fixture.get(worker_path).is_none(),
+            "stale bootstrap Pod replaced at live authorization"
+        );
     }
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while fixture
-            .get("/api/v1/namespaces/system/pods/worker")
-            .is_some()
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+    let secret = fixture
+        .get("/api/v1/namespaces/system/secrets/racer-ca")
+        .unwrap();
+    let metadata = base64::engine::general_purpose::STANDARD
+        .decode(secret["data"]["state.json"].as_str().unwrap())
+        .unwrap();
+    assert!(metadata.len() < 16384);
+    let state = CaState::from_image(&StateImage {
+        metadata,
+        shards: BTreeMap::new(),
     })
-    .await?;
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let secret = fixture
-                .get("/api/v1/namespaces/system/secrets/racer-ca")
-                .unwrap();
-            let metadata = base64::engine::general_purpose::STANDARD
-                .decode(secret["data"]["state.json"].as_str().unwrap())
-                .unwrap();
-            let value: Value = serde_json::from_slice(&metadata).unwrap();
-            let mut shards = BTreeMap::new();
-            for id in value["shards"]
-                .as_object()
-                .unwrap()
-                .values()
-                .filter_map(Value::as_str)
-            {
-                let shard = fixture
-                    .get(&format!(
-                        "/api/v1/namespaces/system/configmaps/{}",
-                        racer_controlplane::security::kubernetes::participant_object_name(
-                            value["fence"].as_str().unwrap(),
-                            id
-                        )
-                    ))
-                    .unwrap();
-                shards.insert(
-                    id.into(),
-                    shard["data"]["state.json"]
-                        .as_str()
-                        .unwrap()
-                        .as_bytes()
-                        .to_vec(),
-                );
-            }
-            let state = CaState::from_image(&StateImage { metadata, shards }).unwrap();
-            if state.member(&format!("worker-pod/{boot}")).is_none()
-                && state.member(&format!("worker-pod/{second_boot}")).is_none()
-            {
-                let certificate = openssl::x509::X509::from_pem(
-                    response["certificate"].as_str().unwrap().as_bytes(),
-                )
-                .unwrap();
-                let der = certificate.to_der().unwrap();
-                let (_, certificate) = x509_parser::parse_x509_certificate(&der).unwrap();
-                assert!(
-                    state.expiry_watermarks().any(|(issuer, expiry)| issuer
-                        == response["issuer"].as_str().unwrap()
-                        && expiry >= certificate.validity().not_after.timestamp()),
-                    "retirement must preserve issued expiry watermark"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await?;
+    .unwrap();
+    let certificate =
+        openssl::x509::X509::from_pem(response["certificate"].as_str().unwrap().as_bytes())
+            .unwrap();
+    let der = certificate.to_der().unwrap();
+    let (_, certificate) = x509_parser::parse_x509_certificate(&der).unwrap();
+    assert!(
+        state.expiry_watermarks().any(|(issuer, expiry)| issuer
+            == response["issuer"].as_str().unwrap()
+            && expiry >= certificate.validity().not_after.timestamp()),
+        "retirement must preserve issued expiry watermark"
+    );
+    assert!(
+        !fixture
+            .objects
+            .lock()
+            .unwrap()
+            .values
+            .keys()
+            .any(|p| p.contains("/configmaps/racer-pki-")
+                || p.contains("/configmaps/racer-replica-"))
+    );
     stop.cancel();
     run.await??;
     api_stop.cancel();
@@ -1090,8 +1291,22 @@ fn bail_service(fixture: &Fixture) -> ! {
 const CONTROLLER_PATH: &str = "/api/v1/namespaces/system/pods/controller";
 const SERVING_LABEL: &str = "racer.unbounded-cloud.io/serving-leader";
 const ROUTING_BOOT: &str = "racer.unbounded-cloud.io/routing-boot";
-const REPLICA_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-replica-controller-pod";
+const PKI_REQUEST: &str = "racer.unbounded-cloud.io/pki-request";
+const PKI_RESPONSE: &str = "racer.unbounded-cloud.io/pki-response";
 const TRUST_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-trust";
+
+fn replica_response(fixture: &Fixture, path: &str) -> Option<Value> {
+    serde_json::from_str(fixture.get(path)?["metadata"]["annotations"][PKI_RESPONSE].as_str()?).ok()
+}
+
+fn attach_replica_request(pod: &mut Value, key: &LocalKey) {
+    pod["metadata"]["annotations"][PKI_REQUEST] = serde_json::to_string(&json!({
+        "pod_uid": pod["metadata"]["uid"], "boot": "a".repeat(64),
+        "csr": String::from_utf8(key.csr_pem.clone()).unwrap()
+    }))
+    .unwrap()
+    .into();
+}
 
 async fn participant_state(client: &Client) -> Result<CaState> {
     let store = KubernetesCaStore::new(
@@ -1147,34 +1362,30 @@ async fn bad_replica_owners_do_not_block_healthy_startup_or_renewal() -> Result<
                 pod["metadata"]["ownerReferences"][0]["name"] = (*name).into();
             }
         }
+        attach_replica_request(&mut pod, &key);
         fixture.put(&format!("/api/v1/namespaces/system/pods/{name}"), pod);
-        // Even a valid CSR and Pod-owned request cannot bypass owner validation.
-        fixture.put(
-            &format!("/api/v1/namespaces/system/configmaps/racer-replica-{name}-pod"),
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("racer-replica-{name}-pod"),"namespace":"system","uid":format!("request-{name}"),"ownerReferences":[{"apiVersion":"v1","kind":"Pod","name":name,"uid":format!("{name}-pod"),"controller":true}]},"data":{"boot":"a".repeat(64),"csr":String::from_utf8(key.csr_pem.clone())?}}),
-        );
     }
     let options = Options {
         leaf_lifetime: Duration::from_secs(60),
         clock_skew: Duration::from_secs(1),
+        overlap_delay: Duration::from_secs(1),
         ..route_options().await
     };
     let stop = CancellationToken::new();
     let run = tokio::spawn(service::run(client.clone(), options.clone(), stop.clone()));
     wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
-    let original = fixture.get(REPLICA_PATH).unwrap();
+    let original = replica_response(&fixture, CONTROLLER_PATH).unwrap();
     let initial = participant_state(&client).await?.bundle();
     request_rotation(&fixture);
     // Exercise the actual expiry-based renewal window, with all bad Pods present.
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let current = fixture.get(REPLICA_PATH).unwrap();
-            if current["data"]["certificate"] != original["data"]["certificate"]
-                && current["data"]["proof-certificate"] != original["data"]["proof-certificate"]
-                && current["data"]["ack"].is_string()
+            let current = replica_response(&fixture, CONTROLLER_PATH).unwrap();
+            if current["certificate"] != original["certificate"]
+                && current["proof_certificate"] != original["proof_certificate"]
             {
-                assert_eq!(current["data"]["boot"], original["data"]["boot"]);
-                assert_eq!(current["data"]["csr"], original["data"]["csr"]);
+                assert_eq!(current["boot"], original["boot"]);
+                assert_eq!(current["csr_digest"], original["csr_digest"]);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1183,25 +1394,16 @@ async fn bad_replica_owners_do_not_block_healthy_startup_or_renewal() -> Result<
     .await
     .context("healthy replica renewal stalled behind bad owners")?;
     let state = participant_state(&client).await?;
-    assert_eq!(state.phase(), Phase::Stable);
-    assert_eq!(
-        state.bundle(),
-        initial,
-        "incomplete discovery must block rotation"
+    assert_ne!(
+        state.bundle().active,
+        initial.active,
+        "bad owners cannot block timed rotation"
     );
+    assert!(state.to_image()?.shards.is_empty());
     for name in bad_names {
         assert!(
-            state
-                .members()
-                .all(|m| m.identity.pod_uid != format!("{name}-pod"))
+            replica_response(&fixture, &format!("/api/v1/namespaces/system/pods/{name}")).is_none()
         );
-        let request = fixture
-            .get(&format!(
-                "/api/v1/namespaces/system/configmaps/racer-replica-{name}-pod"
-            ))
-            .unwrap();
-        assert!(request["data"]["certificate"].is_null());
-        assert!(request["data"]["proof-certificate"].is_null());
     }
     wait_for_route(&fixture, &options, Duration::from_secs(5)).await?;
     stop.cancel();
@@ -1221,19 +1423,20 @@ async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation(
     rs["metadata"]["name"] = "standbys".into();
     fixture.put(rs_path, rs);
     let mut pending = replica_pod(&fixture, "a-pending");
+    let key = generate_local_key()?;
+    attach_replica_request(&mut pending, &key);
     pending["metadata"]["ownerReferences"][0]["name"] = "standbys".into();
     let pending_path = "/api/v1/namespaces/system/pods/a-pending";
     fixture.put(pending_path, pending);
-    let options = route_options().await;
+    let options = Options {
+        overlap_delay: Duration::from_secs(1),
+        clock_skew: Duration::from_secs(1),
+        ..route_options().await
+    };
     let stop = CancellationToken::new();
     let run = tokio::spawn(service::run(client.clone(), options.clone(), stop.clone()));
     wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
-    assert!(
-        participant_state(&client)
-            .await?
-            .member("a-pending-pod/pending")
-            .is_some()
-    );
+    let original = replica_response(&fixture, pending_path).context("standby not issued")?;
 
     // The pending Pod remains live but its ownership cannot currently be read.
     // A second Pod using that owner has never been authorized at all.
@@ -1244,23 +1447,22 @@ async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation(
         .get_errors
         .insert(rs_path.into(), StatusCode::SERVICE_UNAVAILABLE);
     let mut unknown = replica_pod(&fixture, "b-unknown");
+    attach_replica_request(&mut unknown, &key);
     unknown["metadata"]["ownerReferences"][0]["name"] = "standbys".into();
     let unknown_path = "/api/v1/namespaces/system/pods/b-unknown";
     fixture.put(unknown_path, unknown);
     request_rotation(&fixture);
     let initial = participant_state(&client).await?.bundle();
     // Force reissuance of the healthy replica while the lookup failure persists.
-    let mut request = fixture.get(REPLICA_PATH).unwrap();
-    request["data"]
+    let mut request = fixture.get(CONTROLLER_PATH).unwrap();
+    request["metadata"]["annotations"]
         .as_object_mut()
         .unwrap()
-        .remove("certificate");
-    request["data"].as_object_mut().unwrap().remove("ack");
-    fixture.put(REPLICA_PATH, request);
+        .remove(PKI_RESPONSE);
+    fixture.put(CONTROLLER_PATH, request);
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let request = fixture.get(REPLICA_PATH).unwrap();
-            if request["data"]["certificate"].is_string() && request["data"]["ack"].is_string() {
+            if replica_response(&fixture, CONTROLLER_PATH).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1268,25 +1470,26 @@ async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation(
     })
     .await
     .context("healthy issuance stalled behind unavailable owner")?;
-    let state = participant_state(&client).await?;
-    assert_eq!(state.phase(), Phase::Stable);
-    assert_eq!(state.bundle(), initial);
-    assert!(
-        state.member("a-pending-pod/pending").is_some(),
-        "lookup failure is not absence or proof"
-    );
-    assert!(
-        state
-            .members()
-            .all(|m| m.identity.pod_uid != "b-unknown-pod")
-    );
-
-    fixture.objects.lock().unwrap().get_errors.remove(rs_path);
+    assert_eq!(replica_response(&fixture, pending_path).unwrap(), original);
+    assert!(replica_response(&fixture, unknown_path).is_none());
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let state = participant_state(&client).await?;
-            if state.member("b-unknown-pod/pending").is_some() && state.phase() == Phase::Overlap {
-                assert!(state.member("a-pending-pod/pending").is_some());
+            if state.bundle().active != initial.active {
+                assert!(state.to_image()?.shards.is_empty());
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("lookup failure blocked timed rotation")??;
+    fixture.objects.lock().unwrap().get_errors.remove(rs_path);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if replica_response(&fixture, unknown_path).is_some()
+                && replica_response(&fixture, pending_path).is_some_and(|r| r != original)
+            {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1294,25 +1497,6 @@ async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation(
     })
     .await
     .context("ownership lookup did not recover")??;
-    // A successful sweep can begin overlap, but pending members cannot authorize
-    // switching roots. Only a later complete list proving absence retires them.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(participant_state(&client).await?.phase(), Phase::Overlap);
-    fixture.remove(pending_path);
-    fixture.remove(unknown_path);
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let state = participant_state(&client).await?;
-            if state.phase() == Phase::Switched {
-                assert!(state.member("a-pending-pod/pending").is_none());
-                assert!(state.member("b-unknown-pod/pending").is_none());
-                break Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .context("rotation did not resume after authoritative absence")??;
     stop.cancel();
     run.await??;
     api_stop.cancel();
@@ -1331,6 +1515,68 @@ async fn route_options() -> Options {
         trust_proof_listen: free_address().await,
         ..Default::default()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_controlplane_leaf_recovers_from_pod_csr_without_tls_bootstrap() -> Result<()> {
+    let (fixture, client, api_stop) = Fixture::start().await?;
+    fixture.seed();
+    let options = Options {
+        leaf_lifetime: Duration::from_secs(4),
+        clock_skew: Duration::from_secs(1),
+        ..route_options().await
+    };
+    let stop = CancellationToken::new();
+    let run = tokio::spawn(service::run(client, options.clone(), stop.clone()));
+    wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
+    let old = replica_response(&fixture, CONTROLLER_PATH).unwrap();
+    let rs = "/apis/apps/v1/namespaces/system/replicasets/controllers";
+    fixture
+        .objects
+        .lock()
+        .unwrap()
+        .get_errors
+        .insert(rs.into(), StatusCode::SERVICE_UNAVAILABLE);
+    let cert = openssl::x509::X509::from_pem(old["certificate"].as_str().unwrap().as_bytes())?;
+    let der = cert.to_der()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
+    let expiry = parsed.validity().not_after.timestamp();
+    while unix_now() <= expiry {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let health = request(
+        &options.health_listen,
+        "GET /readyz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        None,
+    )
+    .await?;
+    assert!(health.starts_with(b"HTTP/1.1 503"));
+    fixture.objects.lock().unwrap().get_errors.remove(rs);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if replica_response(&fixture, CONTROLLER_PATH)
+                .is_some_and(|r| r["certificate"] != old["certificate"])
+                && request(
+                    &options.health_listen,
+                    "GET /readyz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    None,
+                )
+                .await?
+                .starts_with(b"HTTP/1.1 200")
+            {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await??;
+    let current = replica_response(&fixture, CONTROLLER_PATH).unwrap();
+    assert_eq!(current["boot"], old["boot"]);
+    assert_eq!(current["csr_digest"], old["csr_digest"]);
+    stop.cancel();
+    run.await??;
+    api_stop.cancel();
+    Ok(())
 }
 
 async fn enrollment_status(fixture: &Fixture, options: &Options) -> Result<Vec<u8>> {
@@ -1636,7 +1882,6 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     first_stop.cancel();
     first_run.await??;
     fixture.remove("/api/v1/namespaces/system/pods/controller");
-    let before_takeover = fixture.objects.lock().unwrap().immutable_metadata_updates;
     tokio::time::timeout(Duration::from_secs(15), async {
         while !fixture
             .get("/api/v1/namespaces/system/pods/standby")
@@ -1666,8 +1911,14 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
         original_lease["spec"]["leaseTransitions"].as_i64().unwrap() + 1
     );
     assert!(
-        fixture.objects.lock().unwrap().immutable_metadata_updates > before_takeover,
-        "takeover must reclaim existing immutable chunks through metadata fencing"
+        !fixture
+            .objects
+            .lock()
+            .unwrap()
+            .values
+            .keys()
+            .any(|p| p.contains("/configmaps/racer-pki-")
+                || p.contains("/configmaps/racer-replica-"))
     );
     let current = fixture
         .get("/api/v1/namespaces/system/configmaps/racer-trust")

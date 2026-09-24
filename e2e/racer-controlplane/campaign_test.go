@@ -47,8 +47,9 @@ type dataplane struct {
 }
 
 type localStatus struct {
-	Ready bool
-	TLS   struct {
+	Ready          bool
+	ActiveRevision uint64
+	TLS            struct {
 		Generation                uint64
 		Issuer                    string
 		InstalledWorkers, Workers int
@@ -465,11 +466,13 @@ func TestProductionBinaryCampaign(t *testing.T) {
 	c.storage(b, "applied", 1<<30)
 	c.await("all edge participants converged", 60*time.Second, func() error { return c.cacheReady("edge", 2, 2) })
 
-	topologyKey := "racer-v4-topology-" + identity("universe", "edge")
-	topology, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, topologyKey, metav1.GetOptions{})
-	require(t, err)
-
 	first, policy := c.storage(a, "applied", 1<<30)
+	if policy.PolicyIdentity != identity("storage", string(a.node.UID)) {
+		t.Fatalf("storage identity is not derived from Node UID: %s", policy.PolicyIdentity)
+	}
+
+	c.footprint()
+
 	stat := func() os.FileInfo {
 		t.Helper()
 
@@ -528,48 +531,19 @@ func TestProductionBinaryCampaign(t *testing.T) {
 		t.Fatal("equivalent storage quantity reset policy or inode")
 	}
 
-	current, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, topologyKey, metav1.GetOptions{})
-	require(t, err)
+	var current localStatus
+	require(t, c.getJSON("http://"+a.metrics+"/status", &current))
 
-	if current.Data["pointer"] != topology.Data["pointer"] {
+	if current.ActiveRevision != first.ActiveRevision {
 		t.Fatal("storage-only changes mutated topology")
 	}
-	// CAS evidence uses the actual API: preserve an old pointer, change topology
-	// through a watch, then prove the old resourceVersion cannot overwrite it.
+	// Desired payloads are disposable. Verify real watch publication through the
+	// installed dataplane revision instead of reading a persisted topology record.
 	c.patch(cacheResource, "edge", `{"spec":{"cacheGeneration":2}}`)
-	c.await("real watch publishes changed topology", 60*time.Second, func() error {
-		v, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, topologyKey, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-
-		if v.Data["pointer"] == topology.Data["pointer"] {
-			return fmt.Errorf("pointer unchanged")
-		}
-
-		var volumes []struct {
-			CacheGeneration int64 `json:"cache_generation"`
-		}
-		if err := json.Unmarshal(c.record(v)["volumes"], &volumes); err != nil {
-			return err
-		}
-
-		if len(volumes) != 1 || volumes[0].CacheGeneration != 2 {
-			return fmt.Errorf("watched cache generation not yet committed: %+v", volumes)
-		}
-
-		return c.cacheReady("edge", 2, 2)
-	})
-
-	_, err = c.kube.CoreV1().ConfigMaps(namespace).Update(c.ctx, topology, metav1.UpdateOptions{})
-	if !apierrors.IsConflict(err) {
-		t.Fatalf("stale topology CAS: %v", err)
-	}
-
-	before, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, topologyKey, metav1.GetOptions{})
-	require(t, err)
+	beforeRevision := c.convergedRevision(first.ActiveRevision, a, b)
+	before := c.checkpoint()
 	// Kill the elected process without releasing its Lease. The warm replica must
-	// wait out the real Lease, claim durable state, and re-observe daemon feedback.
+	// wait out the real Lease, rebuild desired state, and re-observe daemon feedback.
 	leader.process.stop(true)
 	c.await("crash failover via Lease expiry", 75*time.Second, func() error {
 		r, err := c.leader()
@@ -585,44 +559,15 @@ func TestProductionBinaryCampaign(t *testing.T) {
 
 		return nil
 	})
-	c.await("failover reacknowledges topology", 60*time.Second, func() error { return c.cacheReady("edge", 2, 2) })
-	after, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, topologyKey, metav1.GetOptions{})
-	require(t, err)
+	beforeRevision = c.convergedRevision(beforeRevision, a, b)
+	c.checkNewReservation(before)
 
-	var oldPointer, newPointer struct{ Digest, Fence string }
-	require(t, json.Unmarshal([]byte(before.Data["pointer"]), &oldPointer))
-	require(t, json.Unmarshal([]byte(after.Data["pointer"]), &newPointer))
-
-	if oldPointer.Digest != newPointer.Digest || oldPointer.Fence == newPointer.Fence {
-		oldRecord, newRecord := c.record(before), c.record(after)
-		for key, value := range oldRecord {
-			if string(value) != string(newRecord[key]) {
-				t.Logf("changed persisted field %s: before=%s after=%s", key, summary(value), summary(newRecord[key]))
-			}
-		}
-
-		t.Errorf("failover changed durable content or failed to fence: %+v %+v", oldPointer, newPointer)
+	_, afterFailover := c.storage(a, "applied", 1536<<20)
+	if afterFailover.PolicyIdentity != applied.PolicyIdentity || afterFailover.PolicyVersion <= applied.PolicyVersion || !os.SameFile(inode, stat()) {
+		t.Fatal("failover must rebuild a newer storage policy without replacing the slab")
 	}
-
-	c.startReplica(leader)
-	c.await("restarted CP requests Pod replacement for old boot", 30*time.Second, func() error {
-		_, err := c.kube.CoreV1().Pods(namespace).Get(c.ctx, leader.pod.Name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-
-		return fmt.Errorf("old Pod still present: %v", err)
-	})
-	leader.process.stop(false)
-	// Envtest has no ReplicaSet controller. Supply its replacement Pod, with a
-	// fresh API-assigned UID, only after the production CP deletes the old boot.
-	oldPod := leader.pod
-	pod, err := c.kube.CoreV1().Pods(namespace).Create(c.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: oldPod.Name, Labels: oldPod.Labels, OwnerReferences: oldPod.OwnerReferences}, Spec: oldPod.Spec}, metav1.CreateOptions{})
-	require(t, err)
-
-	pod.Status = oldPod.Status
-	leader.pod, err = c.kube.CoreV1().Pods(namespace).UpdateStatus(c.ctx, pod, metav1.UpdateOptions{})
-	require(t, err)
+	// A process restart in the same Pod is valid: no durable boot registry forces
+	// Pod deletion. The replacement process obtains a new signed boot identity.
 	c.startReplica(leader)
 	c.await("restarted CP installs fresh replica key", 45*time.Second, func() error {
 		r, err := c.http.Get("http://" + leader.health + "/readyz")
@@ -637,6 +582,68 @@ func TestProductionBinaryCampaign(t *testing.T) {
 
 		return nil
 	})
+	pod, err := c.kube.CoreV1().Pods(namespace).Get(c.ctx, leader.pod.Name, metav1.GetOptions{})
+	require(t, err)
+
+	if pod.UID != leader.pod.UID {
+		t.Fatal("same-Pod controller restart changed Pod UID")
+	}
+
+	c.replicaClaims(leader)
+
+	before = c.checkpoint()
+	for _, r := range c.replicas {
+		r.process.stop(true)
+	}
+
+	for _, r := range c.replicas {
+		c.startReplica(r)
+	}
+
+	c.await("all controllers restart", 75*time.Second, func() error {
+		r, err := c.leader()
+		if err != nil {
+			return err
+		}
+
+		target.Store(r)
+
+		return nil
+	})
+	beforeRevision = c.convergedRevision(beforeRevision, a, b)
+	c.checkNewReservation(before)
+
+	_, beforeReplacement := c.storage(a, "applied", 1536<<20)
+	if beforeReplacement.PolicyIdentity != applied.PolicyIdentity || beforeReplacement.PolicyVersion <= afterFailover.PolicyVersion || !os.SameFile(inode, stat()) {
+		t.Fatal("full CP restart lost deterministic storage identity, newer version, or slab inode")
+	}
+	// Envtest has no ReplicaSet controller. Replace the follower Pod explicitly
+	// and verify the new UID receives its own signed process-local certificate.
+	for _, r := range c.replicas {
+		if r == target.Load() {
+			continue
+		}
+
+		r.process.stop(false)
+		old := r.pod
+		zero := int64(0)
+		require(t, c.kube.CoreV1().Pods(namespace).Delete(c.ctx, old.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero}))
+		replacement, err := c.kube.CoreV1().Pods(namespace).Create(c.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: old.Name, Labels: map[string]string{prefix + "component": "racer-controlplane"}, OwnerReferences: old.OwnerReferences}, Spec: old.Spec}, metav1.CreateOptions{})
+		require(t, err)
+
+		replacement.Status = old.Status
+		r.pod, err = c.kube.CoreV1().Pods(namespace).UpdateStatus(c.ctx, replacement, metav1.UpdateOptions{})
+		require(t, err)
+
+		if r.pod.UID == old.UID {
+			t.Fatal("controller Pod replacement reused UID")
+		}
+
+		c.startReplica(r)
+		c.replicaClaims(r)
+	}
+
+	c.footprint()
 	retained, _, err := c.trust()
 	require(t, err)
 
@@ -644,7 +651,12 @@ func TestProductionBinaryCampaign(t *testing.T) {
 		t.Fatal("restart regenerated CA")
 	}
 
-	c.rotationTraffic(workers, initial)
+	// A selected, previously enrolled daemon can remain offline throughout root
+	// retirement. Timed overlap and issuer expiry do not wait for its proofs.
+	independent.process.stop(false)
+	c.rotationTraffic(workers[:2], initial)
+	c.startDataplane(independent, control, enroll, proof, "1073741824")
+	c.storage(independent, "applied", 1<<30)
 	// A fresh Kubernetes Pod UID represents the restarted daemon. Retain the
 	// actual slab inode and deliberately invalid creation-size environment.
 	a.process.stop(false)
@@ -660,38 +672,12 @@ func TestProductionBinaryCampaign(t *testing.T) {
 	c.startDataplane(a, control, enroll, proof, "not-a-size")
 
 	restarted, reack := c.storage(a, "applied", 1536<<20)
-	if restarted.Storage.Boot == first.Storage.Boot || reack.PolicyIdentity != applied.PolicyIdentity || reack.PolicyVersion != applied.PolicyVersion || !os.SameFile(inode, stat()) {
+	if restarted.Storage.Boot == first.Storage.Boot || reack.PolicyIdentity != applied.PolicyIdentity || reack.PolicyVersion != beforeReplacement.PolicyVersion || !os.SameFile(inode, stat()) {
 		t.Fatalf("daemon restart lost inode or durable policy: %+v", reack)
 	}
-}
 
-func summary(raw json.RawMessage) string {
-	if len(raw) > 512 {
-		return fmt.Sprintf("%d bytes digest=%s", len(raw), identity("diagnostic", string(raw)))
-	}
-
-	return string(raw)
-}
-
-func (c *campaign) record(cm *corev1.ConfigMap) map[string]json.RawMessage {
-	c.t.Helper()
-
-	var pointer struct{ Chunks []string }
-	require(c.t, json.Unmarshal([]byte(cm.Data["pointer"]), &pointer))
-
-	var raw []byte
-
-	for _, chunk := range pointer.Chunks {
-		v, err := c.kube.CoreV1().ConfigMaps(namespace).Get(c.ctx, "racer-v4-chunk-"+chunk, metav1.GetOptions{})
-		require(c.t, err)
-
-		raw = append(raw, v.BinaryData["content"]...)
-	}
-
-	var result map[string]json.RawMessage
-	require(c.t, json.Unmarshal(raw, &result))
-
-	return result
+	c.convergedRevision(beforeRevision, a, b)
+	c.scaleFootprint(independent)
 }
 
 func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
@@ -799,6 +785,12 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 	require(t, err)
 
 	seen := map[uint64]bool{}
+	requestedAt := time.Now()
+
+	var (
+		switchedAt time.Time
+		oldExpiry  int64
+	)
 
 	var final bundle
 
@@ -822,6 +814,43 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 		}
 
 		seen[b.Generation] = true
+		if b.Generation == initial.Generation+1 && (b.Active != initial.Active || strings.Count(b.Certificates, "BEGIN CERTIFICATE") != 2) {
+			t.Fatal("overlap must retain the old issuer and publish both roots")
+		}
+
+		if b.Generation == initial.Generation+2 {
+			if time.Since(requestedAt) < overlapDelay || b.Active == initial.Active || strings.Count(b.Certificates, "BEGIN CERTIFICATE") != 2 {
+				t.Fatal("issuer switched before timed overlap or dropped the old root")
+			}
+
+			if switchedAt.IsZero() {
+				switchedAt = time.Now()
+
+				secret, err := c.kube.CoreV1().Secrets(namespace).Get(c.ctx, "racer-ca", metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+
+				var state struct {
+					Authorities []struct {
+						Digest string `json:"digest"`
+						Expiry int64  `json:"last_issued_expiry"`
+					} `json:"authorities"`
+				}
+				require(t, json.Unmarshal(secret.Data["state.json"], &state))
+
+				for _, ca := range state.Authorities {
+					if ca.Digest == initial.Active {
+						oldExpiry = ca.Expiry
+					}
+				}
+
+				if oldExpiry <= switchedAt.Unix() {
+					t.Fatal("missing durable old-issuer expiry watermark")
+				}
+			}
+		}
+
 		if b.Generation < initial.Generation+3 {
 			return fmt.Errorf("generation=%d reads=%d", b.Generation, reads.Load())
 		}
@@ -829,6 +858,12 @@ func (c *campaign) rotationTraffic(workers []*dataplane, initial bundle) {
 		if b.Active == initial.Active || strings.Count(b.Certificates, "BEGIN CERTIFICATE") != 1 {
 			return fmt.Errorf("old CA not retired")
 		}
+
+		if oldExpiry == 0 || time.Now().Unix() < oldExpiry+1 {
+			t.Fatal("old root retired before durable leaf expiry plus skew")
+		}
+
+		c.footprint()
 
 		final = b
 

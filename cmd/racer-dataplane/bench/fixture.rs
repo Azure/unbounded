@@ -27,6 +27,21 @@ pub fn identity(server: bool) -> tls::PeerIdentity {
     .unwrap()
 }
 pub fn tls(server: bool) -> io::Result<tls::TlsContext> {
+    let peer = identity(server);
+    let claims = tls::SignedClaims {
+        version: 1,
+        namespace: "benchmark".into(),
+        identity: tls::ProcessIdentity {
+            kind: "node".into(),
+            universe: peer.universe,
+            node: peer.node,
+            pod_uid: peer.pod_uid,
+            boot_id: "04".repeat(32),
+            pod_name: "benchmark".into(),
+            container_id: String::new(),
+        },
+    }
+    .uri()?;
     let generate = || -> Result<_, openssl::error::ErrorStack> {
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let key = PKey::from_ec_key(EcKey::generate(&group)?)?;
@@ -47,9 +62,15 @@ pub fn tls(server: bool) -> io::Result<tls::TlsContext> {
         cert.set_not_before(&before)?;
         cert.set_not_after(&after)?;
         let san = SubjectAlternativeName::new()
-            .uri(&identity(server).uri())
+            .uri(&claims)
             .build(&cert.x509v3_context(None, None))?;
         cert.append_extension(san)?;
+        cert.append_extension(
+            openssl::x509::extension::ExtendedKeyUsage::new()
+                .server_auth()
+                .client_auth()
+                .build()?,
+        )?;
         cert.sign(&key, MessageDigest::sha256())?;
         Ok((cert.build().to_pem()?, key.private_key_to_pem_pkcs8()?))
     };

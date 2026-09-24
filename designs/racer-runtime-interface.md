@@ -1,110 +1,124 @@
 # Rust runtime wiring contract
 
-The Rust runtime exports `kubernetes`, `subscription`, and `status` from the
-library. Main/service own TLS and leadership acquisition. The runtime owns the
-Kubernetes watches, topology/storage persistence, and `/v4/config` Router.
+The Rust runtime exports `kubernetes`, `subscription`, and `status`. Main/service
+own TLS and leadership acquisition; the runtime owns inventory watches,
+process-local topology/storage publication, and the `/v4/config` Router.
+The [stateless control-plane contract](racer-rust-controlplane.md) supersedes
+the former RecordStore pointers, immutable chunks, store gate, and collection.
 
-## Interface
+## Interface and authorization
 
 ```rust
 use racer_controlplane::kubernetes::{Runtime, RuntimeOptions, SecurityContext};
-// Called synchronously on every request and immediately before publication.
 // None on election loss, cancellation, or incomplete security initialization.
-// state is an immutable, indexed, current CaState snapshot refreshed by service
-// after enrollment/issuance/retirement. Never perform a full CA read per request.
+// The immutable CaState snapshot contains bounded root/expiry state, not members.
 let security: Arc<dyn Fn() -> Option<SecurityContext> + Send + Sync> = ...;
 // SecurityContext { fence: String, state: Arc<security::CaState> }
 let runtime = Runtime::new(RuntimeOptions::new(namespace), security);
-let router = runtime.router(); // merge into service Router; no TLS listener here
-// Every accepted TLS request must contain Extension<security::VerifiedPeer>.
+let router = runtime.router(); // TLS is owned by service.
+// Every accepted TLS request carries Extension<security::VerifiedPeer>.
 // spawn runtime.clone().run(client, shutdown_token)
 ```
 
-`runtime.selection(universe_hex, node_hex)` returns a selected process binding
-(`Selection { node_name, pod_namespace, pod_name, pod_uid, universe }`) or None.
-`runtime.ready()` is false until complete watch initialization and authoritative
-restart load/fence acquisition. Selection is indexed, with no request-time Node
-list. Enrollment may use selection but must still perform its own authoritative
-Pod/Node/workload authorization. `/v4/config` calls `VerifiedPeer::node_pod` and
-`CaState::verify_member` using the process boot header on each request, including
-after long-poll wakeup. The returned durable member must not be tombstoned.
+`runtime.selection(universe_hex, node_hex)` returns the currently selected
+process binding (`Selection { node_name, pod_namespace, pod_name, pod_uid,
+universe }`) or None. Selection is indexed, with no request-time Node list.
+`CaState::verify_peer` checks certificate validity, signed namespace/identity,
+and retained issuer. `/v4/config` additionally binds the process boot header,
+node role, Pod identity, and current selection, including after long-poll wakeup
+(`cmd/racer-controlplane/src/subscription.rs:257`). There is no durable member
+or tombstone lookup. Enrollment and renewal separately perform direct live
+Kubernetes authorization (`cmd/racer-controlplane/src/service.rs:730`).
 
-The runtime is reusable across leadership changes. Security getter fence changes
-force an authoritative reload and pointer-fence claim before publishing. Set the
-getter to None immediately on election loss. Store writes use captured pointer
-resourceVersions, never freshly fetched versions on a stale write retry.
+The security getter becomes None immediately on election loss. A changed fence
+requires a fresh revision reservation and full inventory rebuild before serving.
+The getter and authoritative Lease/CA/checkpoint checks gate publication; stale
+leadership cannot claim new revisions using a freshly fetched resourceVersion.
 
-The handler implements DesiredState, never ControlCommand. It accepts identity
-from the trusted certificate URI and the boot header, not query identity claims.
-Storage feedback is bound to the exact offered Pod/boot/identity/version and
-operational freshness is 75 seconds. It does not constitute a fresh TLS proof.
+Live selection is computed directly from indexed Node/Pod eligibility and
+deterministic Pod selection, independently of fabric, cache, socket, or placement
+configuration validation. Rejected intent therefore cannot revoke unrelated
+healthy members of the retained last-good publication. Conversely, retaining
+that publication cannot authorize a binding that disappeared from live inventory
+(`cmd/racer-controlplane/src/kubernetes.rs:850`,
+`cmd/racer-controlplane/src/subscription.rs:101`).
 
-Status/API error retries and work queues are runtime concerns. No remote phases,
-rollout ledger, idle-subscriber persistence, or per-request all-node scans exist.
+An independent monotonic authority deadline gates `runtime.ready()`, enrollment
+selection, and subscription authorization even if reconciliation or Kubernetes
+I/O stalls. The production runtime starts expired; a successfully verified round
+refreshes the deadline using its start time, not delayed I/O completion. The
+default authority timeout is 15 seconds and must exceed the retry interval
+(default five seconds). Held subscriptions recheck authorization every 250 ms;
+expiry does not depend on the stalled runtime loop clearing its fence. This
+deadline suspends serving, never authorizes checkpoint reset or takeover
+(`cmd/racer-controlplane/src/kubernetes.rs:62`, `:101`, `:220`, `:275`;
+`cmd/racer-controlplane/src/subscription.rs:595`).
 
-## Implemented persistence and checks
+## Fixed revision checkpoint
 
-`RecordStore` uses `racer-v4-topology-<universe hex>` and
-`racer-v4-storage-<node hex>` ConfigMap pointers, labeled
-`racer.unbounded-cloud.io/rust-state=pointer`. Content lives in immutable
-`racer-v4-chunk-<sha256>` ConfigMaps with binaryData `content`. The security
-bootstrap artifact check must recognize these prefixes/labels so losing the CA
-Secret cannot regenerate an authority over existing topology.
+`RevisionStore` owns `ConfigMap/racer-runtime-revisions`. Its three data fields
+are `format=1`, `high-water`, and `fence`; it contains no runtime payload or
+per-node entries. A leader reserves ranges of 1,048,576 revision numbers using
+resourceVersion CAS and authoritative readback. Unused numbers may be skipped
+after restart. Missing/corrupt state, exhaustion, or observed replacement/regression
+fails closed (`cmd/racer-controlplane/src/revision.rs:18`, `:160`).
 
-Before each pointer write, RecordStore invokes
-`security::kubernetes::KubernetesCaStore::check_fence()` after capturing the target
-resourceVersion. It uses the existing `racer-controlplane` Lease and `racer-ca`
-Secret names. The synchronous SecurityContext getter also gates completion and
-every held subscription. Runtime reload claims all pointer fences before serving.
+Reservation captures the checkpoint resourceVersion before checking Lease/CA
+authority and uses a unique reservation token. Before issuing the write it
+invalidates the locally recorded prior reservation. Even a successful write
+requires exact authoritative readback and another authority check before the
+range can be returned. Cancellation or an uncertain outcome can burn revision
+numbers, but cannot authorize their use. A retry reserves a fresh disjoint range
+from the observed high-water mark; a delayed predecessor CAS conflicts once a
+successor changes the resourceVersion. There is no durable operation lock to
+release, no gate cleanup task, and no 30-second store-gate recovery protocol
+(`cmd/racer-controlplane/src/revision.rs:178`).
 
-The runtime's concrete signature is `async fn run(self, Client,
-CancellationToken) -> anyhow::Result<()>`. Runtime is Clone; `router()` returns
-`axum::Router`. Public `subscriptions.cache_usage()` and `waiter_count()` expose
-bounded-memory/receiver metrics. The default hold is 28 seconds.
+Fresh CA bootstrap alone creates the initial checkpoint. Absence during restart
+does not prove freshness (`cmd/racer-controlplane/src/security/kubernetes.rs:247`).
+Acquisition discards predecessor payloads and reconstructs from complete live
+inventory (`cmd/racer-controlplane/src/kubernetes.rs:184`). Operational status
+annotations are output, not restart input (`cmd/racer-controlplane/src/status.rs:4`).
 
-Verification uses real kube HTTP requests against a resourceVersion-enforcing
-test API, plus real rustls HTTP cancellation, restart, uncertain pointer commit,
-storage-only wakeup and 10,000 simultaneous held handler requests. RecordStore
-also runs against a real kube-apiserver/etcd using KUBEBUILDER_ASSETS. The separate
-production-binary harness owns full service/cluster integration.
+Topology and storage policy are independent in-memory publications using reserved
+revisions. Invalid intent retains last-good state only within the current
+process. Without prior valid storage intent, no valid new offer is published;
+compatible persisted dataplane capacity is retained. Feedback is bound to the
+exact offered Pod/boot/identity/version and is fresh for 75 seconds. It grants
+neither publication permission nor CA rotation credit.
 
-The default distinct-client TLS scenario covers 24 nodes in three universes with
-a 12-second deadline and 20-second watchdog. The full 10,000-client TLS stress
-scenario is ignored by default. Historical loopback completion measurements do
-not verify 10,000-node first-byte tails; that measurement was canceled. See
-`designs/racer-go-retirement-audit.md` for exact results and boundaries.
+The only other durable runtime objects are the public trust ConfigMap, bounded
+version-5 CA Secret, and leader Lease. CP CSR/responses overwrite bounded
+annotations on existing Pods. There are no participant or replica ConfigMaps,
+runtime history, chunk collector, or automatic obsolete-object cleanup. Use the
+[explicit cutover workflow](racer-stateless-cutover.md).
 
-## Chunk collection and bounded work
+## Independent subscriptions and bounded work
 
-RecordStore serializes authoritative reads, staging and collection with a
-resourceVersion-CAS `racer-v4-store-gate` ConfigMap. A new leadership fence may
-replace a crashed predecessor's gate. Staging reserves the target pointer before
-writing chunks: `proposed` references never authorize serving. Collection first
-CAS-clears abandoned proposals while holding the gate, fencing delayed pointer
-completion. Committed references remain protected. Reused immutable chunks get
-a metadata RV update; collection deletes with UID/RV preconditions, so a paused
-old collector cannot delete a newly reused chunk. A local guard registers each
-acquisition before sending I/O and retains the operation, fence, and pre-write
-resourceVersion across cancellation. Release retries authoritative read/CAS for
-up to 30 seconds while holding the local lock; failed cleanup remains pending for
-the next call on the same RecordStore or its clones. Cleanup only clears its own
-operation and fence. It also invalidates a still-pending acquisition by touching
-its pre-write resourceVersion, or creating an empty gate to fence a delayed first
-create. A successor's changed resourceVersion ends cleanup without unlocking it.
-Losing pending local state (a process crash, runtime shutdown, or dropping all
-store clones after failed cleanup) requires takeover. No wall-clock grace period
-establishes safety or permits stealing a live same-fence operation.
+The handler emits DesiredState. Received cursor and locally applied state are
+separate; no remote rollout phases exist. The default hold is 28 seconds.
+`run(self, Client, CancellationToken) -> anyhow::Result<()>` drives the runtime;
+`router()` returns `axum::Router`. `subscriptions.cache_usage()` and
+`waiter_count()` expose process-local memory/receiver observations.
 
-Collection runs every five minutes without recompiling universes. Lists use
-64-object pages and chunk lists request metadata only. The reference set has a
-one-million-entry ceiling; exceeding it aborts before deletion. Failed scans or
-conditional deletes are retried from authoritative state. Empty reservation
-pointers are retained as CAS targets, not served as committed generations.
+Per-universe placement has 262,144 slots shared by all caches. HRW balances
+statistically and permits adjacent repeated owners; slot candidate retries are
+unchanged. Snapshot construction uses sparse edge indexes and a dense fallback
+for high local ownership. Builder and response admission bound concurrent work;
+idle subscribers hold no durable state. See `cmd/racer-controlplane/src/topology.rs:34`
+and `cmd/racer-controlplane/src/subscription.rs:62`.
 
-Snapshot construction uses sparse edge indexes at 10,000-member geometry and a
-dense fallback for high local ownership. Four builders and 16,384 admitted
-requests bound concurrency; queued builders retain no topology Arc. Payload
-accounting includes conservative allocation overhead. Digest metadata is capped
-at 100,000 recipients and invalidated on publication. No CA-state copies or
-Node-list scans occur per request. Storage I/O remains a bounded 16-operation
-queue; the store gate intentionally serializes durable mutations and GC.
+Digest metadata survives snapshot payload eviction, so unchanged reconnects can
+avoid rebuilding per-recipient content. Publication changes invalidate affected
+digests; live selection changes also invalidate affected convergence metadata
+and wake subscribers. A selected snapshot cache hit restores its digest metadata
+only while its publication is still current, under the same lock order as
+installation. This permits convergence after live reselection without resurrecting
+a superseded generation's digest. Metadata remains capped at 100,000 recipients
+(`cmd/racer-controlplane/src/subscription.rs:118`, `:337`, `:519`).
+
+Runtime tests exercise the Kubernetes API seam, revision uncertainty, restart,
+loss/replacement, and independent subscriptions. Real API and production-binary
+campaigns remain separate gates. The historical scale/GC numbers in
+`racer-go-retirement-audit.md` describe the retired implementation and must not
+be cited as validation of this checkpoint or placement implementation.

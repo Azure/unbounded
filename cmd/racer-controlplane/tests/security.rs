@@ -8,10 +8,7 @@ mod security;
 
 use anyhow::{Result, ensure};
 use security::*;
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -25,6 +22,7 @@ enum Fault {
     After,
     Readback,
     PublicationAfter,
+    PublicationBefore,
 }
 
 #[derive(Default)]
@@ -93,6 +91,10 @@ impl CaStore for Store {
         }
         let state = CaState::from_image(memory.snapshot.image.as_ref().unwrap())?;
         ensure!(state.fence() == fence, "publication fenced");
+        if matches!(memory.fault, Fault::PublicationBefore) {
+            memory.fault = Fault::None;
+            return Ok(CommitOutcome::Uncertain);
+        }
         memory.revision += 1;
         memory.snapshot.publication = Some(Publication {
             resource_version: memory.revision.to_string(),
@@ -144,6 +146,168 @@ async fn manager(store: &Store, token: &str) -> CaManager<Store> {
     .unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum IssuancePause {
+    BeforeCommit,
+    AfterCommit,
+    Readback,
+}
+
+struct PausedStore {
+    inner: Store,
+    armed: Mutex<Option<IssuancePause>>,
+    readback: std::sync::atomic::AtomicBool,
+    captured: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+impl PausedStore {
+    async fn pause(&self) {
+        self.captured.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+impl CaStore for Arc<PausedStore> {
+    async fn read(&self) -> Result<StoreSnapshot> {
+        let snapshot = self.inner.read().await?;
+        if self
+            .readback
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.pause().await;
+        }
+        Ok(snapshot)
+    }
+    async fn commit(&self, expected: &StoreSnapshot, next: &StateImage) -> Result<CommitOutcome> {
+        let pause = self.armed.lock().unwrap().take();
+        if matches!(pause, Some(IssuancePause::BeforeCommit)) {
+            self.pause().await;
+        }
+        let result = self.inner.commit(expected, next).await?;
+        if matches!(pause, Some(IssuancePause::AfterCommit)) {
+            self.pause().await;
+        }
+        if matches!(pause, Some(IssuancePause::Readback)) {
+            self.readback
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+    async fn publish(
+        &self,
+        expected: &StoreSnapshot,
+        fence: &str,
+        bytes: &[u8],
+    ) -> Result<CommitOutcome> {
+        self.inner.publish(expected, fence, bytes).await
+    }
+}
+
+#[tokio::test]
+async fn delayed_issuance_cannot_extend_retired_root_authorization() {
+    for pause in [
+        IssuancePause::BeforeCommit,
+        IssuancePause::AfterCommit,
+        IssuancePause::Readback,
+    ] {
+        for unchanged_watermark in [false, true] {
+            let store = Store::default();
+            let gated = Arc::new(PausedStore {
+                inner: store.clone(),
+                armed: Mutex::new(None),
+                readback: false.into(),
+                captured: Default::default(),
+                resume: Default::default(),
+            });
+            let now = unix_now();
+            let options = SecurityOptions {
+                leaf_lifetime: 100,
+                clock_skew: 2,
+                proof_lifetime: 1,
+                ..SecurityOptions::new("system")
+            };
+            let first = Arc::new(
+                CaManager::acquire(
+                    gated.clone(),
+                    Leadership::new("first".into()).unwrap(),
+                    options.clone(),
+                    now,
+                )
+                .await
+                .unwrap(),
+            );
+            let key = generate_local_key().unwrap();
+            let seed = first
+                .issue(&key.csr_pem, node("seed"), false, now)
+                .await
+                .unwrap();
+            let issue_at = now + if unchanged_watermark { 0 } else { 1 };
+            *gated.armed.lock().unwrap() = Some(pause);
+            let task = {
+                let first = first.clone();
+                tokio::spawn(async move {
+                    first
+                        .issue(&key.csr_pem, node("delayed"), false, issue_at)
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), gated.captured.notified())
+                .await
+                .unwrap();
+            // Do not cancel the predecessor's local term: durable fencing must
+            // protect even a paused process that has not observed election loss.
+            let second = CaManager::acquire(
+                store.clone(),
+                Leadership::new("second".into()).unwrap(),
+                options,
+                now + 2,
+            )
+            .await
+            .unwrap();
+            let bound = second
+                .state()
+                .await
+                .unwrap()
+                .expiry_watermarks()
+                .next()
+                .unwrap()
+                .1;
+            assert!(bound >= seed.not_after);
+            if !matches!(pause, IssuancePause::BeforeCommit) {
+                assert!(bound >= issue_at + 100);
+            }
+            second.begin_rotation(now).await.unwrap();
+            let at = second.state().await.unwrap().published_at().unwrap();
+            assert_eq!(
+                second.advance_rotation(at + 3).await.unwrap(),
+                Phase::Switched
+            );
+            assert_eq!(
+                second.advance_rotation(bound + 1).await.unwrap(),
+                Phase::Switched
+            );
+            assert_eq!(
+                second.advance_rotation(bound + 2).await.unwrap(),
+                Phase::Stable
+            );
+            gated.resume.notify_one();
+            let result = task.await.unwrap();
+            if matches!(pause, IssuancePause::Readback) {
+                // A readback already captured before takeover may be delivered
+                // late. Its leaf is still bounded and expired before retirement.
+                assert!(result.unwrap().not_after <= bound);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_ne!(
+                second.state().await.unwrap().bundle().active,
+                seed.root_digest
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn durable_admission_prevents_rebinding_a_live_pod() {
     let store = Store::default();
@@ -158,7 +322,8 @@ async fn durable_admission_prevents_rebinding_a_live_pod() {
         } else {
             next.universe = "f".repeat(64);
         }
-        assert!(manager.admit(next).await.is_err());
+        // Live authorization, not issuance history, chooses a new identity.
+        manager.admit(next).await.unwrap();
     }
     let mut same_identity = original.clone();
     same_identity.boot_id = "e".repeat(64);
@@ -168,7 +333,13 @@ async fn durable_admission_prevents_rebinding_a_live_pod() {
     replacement.pod_uid = "replacement".into();
     replacement.universe = "f".repeat(64);
     manager.admit(replacement).await.unwrap();
-    assert_eq!(manager.state().await.unwrap().members().count(), 3);
+    let image = manager.state().await.unwrap().to_image().unwrap();
+    assert!(image.shards.is_empty());
+    assert!(
+        !String::from_utf8(image.metadata)
+            .unwrap()
+            .contains("worker")
+    );
 }
 
 async fn issue(
@@ -343,13 +514,16 @@ async fn issuance_uncertain_commit_restart_and_fencing() {
             .await
             .is_err()
     );
-    assert!(
+    assert_eq!(
         first
             .state()
             .await
             .unwrap()
-            .member(&node("before").key())
-            .is_none()
+            .expiry_watermarks()
+            .next()
+            .unwrap()
+            .1,
+        0
     );
 
     store.fault(Fault::After);
@@ -376,11 +550,14 @@ async fn issuance_uncertain_commit_restart_and_fencing() {
             .is_err()
     );
     // Write may have committed despite no certificate being returned. Restart
-    // retains both admission and watermark rather than regenerating a CA.
+    // retains the watermark rather than regenerating a CA.
     let second = manager(&store, "second").await;
     let state = second.state().await.unwrap();
-    assert_eq!(state.members().count(), 2);
-    assert!(state.member(&node("unknown").key()).is_some());
+    assert!(
+        state
+            .expiry_watermarks()
+            .any(|(_, expiry)| expiry >= issued.not_after)
+    );
     assert_eq!(state.bundle().active, issued.root_digest);
     assert!(
         first
@@ -403,46 +580,44 @@ async fn retirement_candidates_bind_the_observation_term_and_original_identity()
     let first = manager(&store, "first").await;
     let identity = node("existing");
     let (issued, _) = issue(&first, identity.clone(), false).await;
-    let candidates = first.retirement_candidates().await.unwrap();
-    let mut enriched = identity.clone();
-    enriched.container_id = "containerd://observed".into();
-    first.admit(enriched.clone()).await.unwrap();
-    first
-        .retire_absent_pods(candidates, &BTreeSet::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        first
-            .state()
-            .await
-            .unwrap()
-            .member(&identity.key())
-            .unwrap()
-            .identity,
-        enriched,
-        "changed admission must wait for a new observation"
-    );
-    let old_term = first.retirement_candidates().await.unwrap();
+    first.begin_rotation(unix_now()).await.unwrap();
+    let published = first.state().await.unwrap().published_at().unwrap();
     let second = manager(&store, "second").await;
     assert!(
-        second
-            .retire_absent_pods(old_term, &BTreeSet::new())
+        first
+            .advance_rotation(issued.not_after + 300)
             .await
             .is_err()
     );
-    let current = second.retirement_candidates().await.unwrap();
-    second
-        .retire_absent_pods(current, &BTreeSet::new())
-        .await
-        .unwrap();
     let state = second.state().await.unwrap();
-    assert!(state.member(&identity.key()).is_none());
+    assert_eq!(state.published_at(), Some(published));
     assert!(
         state
             .expiry_watermarks()
             .any(|(root, expiry)| root == issued.root_digest && expiry == issued.not_after)
     );
-    assert!(second.admit(enriched).await.is_err());
+    assert_eq!(
+        second.advance_rotation(published + 599).await.unwrap(),
+        Phase::Overlap
+    );
+    assert_eq!(
+        second.advance_rotation(published + 600).await.unwrap(),
+        Phase::Switched
+    );
+    assert_eq!(
+        second
+            .advance_rotation(issued.not_after + 299)
+            .await
+            .unwrap(),
+        Phase::Switched
+    );
+    assert_eq!(
+        second
+            .advance_rotation(issued.not_after + 300)
+            .await
+            .unwrap(),
+        Phase::Stable
+    );
 }
 
 #[tokio::test]
@@ -451,7 +626,7 @@ async fn lost_private_state_and_corrupt_shards_never_bootstrap() {
     let first = manager(&store, "first").await;
     issue(&first, node("member"), false).await;
     let mut image = store.read().await.unwrap().image.unwrap();
-    image.shards.values_mut().next().unwrap().push(b' ');
+    image.shards.insert("unsupported".into(), vec![]);
     assert!(CaState::from_image(&image).is_err());
     {
         let mut memory = store.0.lock().unwrap();
@@ -518,7 +693,7 @@ async fn real_tls_rotation_requires_every_boot_fresh_term_and_expiry() {
     assert_eq!(
         first.advance_rotation(unix_now()).await.unwrap(),
         Phase::Overlap,
-        "unproven standby must block"
+        "publication overlap delay must elapse"
     );
     let proof = replica_proof(
         snapshot(&bundle, &probe_cp, &cp_key),
@@ -571,13 +746,16 @@ async fn real_tls_rotation_requires_every_boot_fresh_term_and_expiry() {
         .await
         .unwrap();
     assert_eq!(
-        second.advance_rotation(unix_now()).await.unwrap(),
+        second
+            .advance_rotation(second.state().await.unwrap().published_at().unwrap() + 600)
+            .await
+            .unwrap(),
         Phase::Switched
     );
     let bundle = second.state().await.unwrap().bundle();
     assert_ne!(bundle.active, old_root);
-    // Old-root node TLS still authenticates in overlap trust but cannot prove
-    // the switched phase, regardless of its self-reported installed digest.
+    // Old-root node TLS remains locally authenticated until expiry. Proofs are
+    // diagnostics and cannot block or accelerate rotation.
     let proof = node_proof(
         snapshot(&bundle, &probe_cp, &cp_key),
         &bundle,
@@ -589,12 +767,10 @@ async fn real_tls_rotation_requires_every_boot_fresh_term_and_expiry() {
     )
     .await
     .unwrap();
-    assert!(
-        second
-            .record_proof(&node_id.key(), proof, unix_now())
-            .await
-            .is_err()
-    );
+    second
+        .record_proof(&node_id.key(), proof, unix_now())
+        .await
+        .unwrap();
 
     let (new_node, new_key) = issue(&second, node_id.clone(), false).await;
     let proof = node_proof(
@@ -633,25 +809,20 @@ async fn real_tls_rotation_requires_every_boot_fresh_term_and_expiry() {
     let later = old_node.not_after + 301;
     assert_eq!(
         second.advance_rotation(later).await.unwrap(),
-        Phase::Switched,
-        "time never evicts participants or renews proof"
-    );
-    assert_eq!(second.state().await.unwrap().members().count(), 2);
-    let retirement = second.retirement_candidates().await.unwrap();
-    second
-        .retire_absent_pods(retirement, &BTreeSet::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        second.advance_rotation(unix_now()).await.unwrap(),
-        Phase::Switched,
-        "retiring members preserves issuer watermark"
+        Phase::Stable,
+        "offline participants never block expiry-based retirement"
     );
     assert_eq!(second.advance_rotation(later).await.unwrap(), Phase::Stable);
     assert_eq!(second.state().await.unwrap().expiry_watermarks().count(), 1);
     assert!(
-        second.admit(node_id).await.is_err(),
-        "retired boot cannot return"
+        second
+            .state()
+            .await
+            .unwrap()
+            .to_image()
+            .unwrap()
+            .shards
+            .is_empty()
     );
 }
 
@@ -675,13 +846,10 @@ async fn tls_proof_cannot_cross_boot_or_forge_issuer() {
         &leaf.root_digest,
         manager.leadership(),
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
-        manager
-            .record_proof(&other.key(), proof, unix_now())
-            .await
-            .is_err()
+        proof.is_err(),
+        "boot header must match signed claims at transport boundary"
     );
     assert!(
         node_proof(
@@ -819,6 +987,7 @@ async fn old_root_retires_with_live_processes_only_after_fresh_switched_tls() {
     let mut options = SecurityOptions::new("system");
     options.leaf_lifetime = 3;
     options.clock_skew = 0;
+    options.proof_lifetime = 1;
     let manager = CaManager::acquire(
         store.clone(),
         Leadership::new("term".into()).unwrap(),
@@ -862,16 +1031,19 @@ async fn old_root_retires_with_live_processes_only_after_fresh_switched_tls() {
         .await
         .unwrap();
     assert_eq!(
-        manager.advance_rotation(unix_now()).await.unwrap(),
+        manager
+            .advance_rotation(manager.state().await.unwrap().published_at().unwrap() + 1)
+            .await
+            .unwrap(),
         Phase::Switched
     );
     while unix_now() <= old.not_after {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // Old generation proofs never grant retirement even after the expiry floor.
+    // No proof or online fleet census is required after the expiry floor.
     assert_eq!(
         manager.advance_rotation(unix_now()).await.unwrap(),
-        Phase::Switched
+        Phase::Stable
     );
     let (new, key) = issue(&manager, node_id.clone(), false).await;
     let (probe, probe_key) = issue(&manager, cp_id.clone(), true).await;
@@ -908,7 +1080,16 @@ async fn old_root_retires_with_live_processes_only_after_fresh_switched_tls() {
         manager.advance_rotation(unix_now()).await.unwrap(),
         Phase::Stable
     );
-    assert_eq!(manager.state().await.unwrap().members().count(), 2);
+    assert!(
+        manager
+            .state()
+            .await
+            .unwrap()
+            .to_image()
+            .unwrap()
+            .shards
+            .is_empty()
+    );
     assert_ne!(
         manager.state().await.unwrap().bundle().active,
         old.root_digest
@@ -942,6 +1123,83 @@ async fn persisted_overlap_repairs_publication_after_restart() {
         second.advance_rotation(unix_now()).await.unwrap(),
         Phase::Overlap
     );
+}
+
+#[tokio::test]
+async fn overlap_delay_starts_only_after_confirmed_publication_and_survives_takeover() {
+    let store = Store::default();
+    let first = manager(&store, "first").await;
+    first.begin_rotation(unix_now()).await.unwrap();
+    // Model a crash between the overlap Secret CAS and public CAS. Neither a
+    // failed publication nor time alone can authorize the issuer switch.
+    {
+        let mut memory = store.0.lock().unwrap();
+        let image = memory.snapshot.image.as_mut().unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_slice(&image.metadata).unwrap();
+        metadata["published_at"] = serde_json::Value::Null;
+        image.metadata = serde_json::to_vec(&metadata).unwrap();
+        memory.snapshot.publication = None;
+    }
+    store.fault(Fault::PublicationBefore);
+    assert!(first.publish().await.is_err());
+    assert_eq!(first.state().await.unwrap().published_at(), None);
+    assert!(
+        first
+            .advance_rotation(unix_now() + 1_000_000)
+            .await
+            .is_err()
+    );
+    let second = manager(&store, "second").await;
+    let at = second.state().await.unwrap().published_at().unwrap();
+    assert_eq!(
+        second.advance_rotation(at + 599).await.unwrap(),
+        Phase::Overlap
+    );
+    let third = manager(&store, "third").await;
+    assert_eq!(third.state().await.unwrap().published_at(), Some(at));
+    assert_eq!(
+        third.advance_rotation(at + 600).await.unwrap(),
+        Phase::Switched
+    );
+}
+
+#[tokio::test]
+async fn signed_process_claims_are_exact_and_old_leaves_need_no_issuance_ledger() {
+    let store = Store::default();
+    let manager = manager(&store, "term").await;
+    let identity = node("worker");
+    let (leaf, key) = issue(&manager, identity.clone(), false).await;
+    let claims = certificate_claims(&leaf.certificate_pem).unwrap();
+    assert_eq!(claims.namespace, "system");
+    assert_eq!(claims.identity, identity);
+    assert!(SignedClaims::parse(&identity.uri().unwrap()).is_err());
+    let mut wrong = claims.clone();
+    wrong.identity.boot_id.clear();
+    assert!(wrong.uri().is_err());
+    let (server, server_key) = issue(&manager, cp("cp"), false).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let tls = snapshot(&leaf.bundle, &server, &server_key);
+    let task = tokio::spawn(async move {
+        tls.accept(listener.accept().await.unwrap().0, true)
+            .await
+            .unwrap()
+            .1
+            .unwrap()
+    });
+    let stream = tokio_rustls::TlsConnector::from(client_config(&leaf.bundle, Some((&leaf, &key))))
+        .connect(
+            rustls::pki_types::ServerName::try_from("racer-controlplane.system.svc").unwrap(),
+            TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = task.await.unwrap();
+    let state = manager.state().await.unwrap();
+    assert_eq!(state.verify_peer(&peer, unix_now()).unwrap(), &identity);
+    assert!(state.verify_peer(&peer, leaf.not_after).is_err());
+    assert!(state.to_image().unwrap().shards.is_empty());
+    drop(stream);
 }
 
 #[tokio::test]
@@ -1016,7 +1274,15 @@ async fn csr_algorithms_signature_validation_and_hostile_extensions() {
             let sans = cert.subject_alt_names().unwrap();
             assert_eq!(
                 sans.iter().filter_map(|s| s.uri()).collect::<Vec<_>>(),
-                vec![identity.uri().unwrap()]
+                vec![
+                    SignedClaims {
+                        version: 1,
+                        namespace: "system".into(),
+                        identity: identity.clone()
+                    }
+                    .uri()
+                    .unwrap()
+                ]
             );
             let dns: Vec<_> = sans.iter().filter_map(|s| s.dnsname()).collect();
             assert_eq!(
@@ -1046,57 +1312,30 @@ async fn csr_algorithms_signature_validation_and_hostile_extensions() {
 
 #[tokio::test]
 async fn ten_thousand_idle_participants_round_trip_sharded_state() {
-    // Build a durable image through the public format to exercise full state
-    // validation without 10,000 O(n) fake API copies/commits.
+    // The old sharded-state scale scenario now enforces zero fleet persistence.
     let store = Store::default();
     let manager = manager(&store, "term").await;
-    manager.admit(node("seed")).await.unwrap();
     let image = store.read().await.unwrap().image.unwrap();
-    let mut metadata: serde_json::Value = serde_json::from_slice(&image.metadata).unwrap();
-    let seed: serde_json::Value =
-        serde_json::from_slice(image.shards.values().next().unwrap()).unwrap();
-    let template = seed["members"]
-        .as_object()
-        .unwrap()
-        .values()
-        .next()
-        .unwrap()
-        .clone();
-    let mut buckets =
-        std::collections::BTreeMap::<String, serde_json::Map<String, serde_json::Value>>::new();
     for n in 0..10_000 {
-        use sha2::Digest;
         let identity = node(&format!("pod-{n}"));
-        let key = identity.key();
-        let hash = sha2::Sha256::digest(key.as_bytes());
-        let bucket = format!("{:03x}", u16::from_be_bytes([hash[0], hash[1]]) & 1023);
-        let mut member = template.clone();
-        member["identity"] = serde_json::to_value(identity).unwrap();
-        buckets.entry(bucket).or_default().insert(key, member);
+        manager.admit(identity).await.unwrap();
     }
-    let mut shards = std::collections::BTreeMap::new();
-    let mut refs = serde_json::Map::new();
-    for (bucket, members) in buckets {
-        let bytes =
-            serde_json::to_vec(&serde_json::json!({"members": members, "retired": []})).unwrap();
-        assert!(bytes.len() < MAX_OBJECT_BYTES);
-        let id = digest(&bytes);
-        refs.insert(bucket, id.clone().into());
-        shards.insert(id, bytes);
+    assert!(store.read().await.unwrap().image.unwrap() == image);
+    // Actual issuance also changes only a fixed-size expiry watermark, never a
+    // fingerprint ledger or Pod/boot history.
+    let key = generate_local_key().unwrap();
+    let now = unix_now();
+    for n in 0..100 {
+        manager
+            .issue(&key.csr_pem, node(&format!("issued-{n}")), false, now)
+            .await
+            .unwrap();
     }
-    metadata["shards"] = refs.into();
-    let image = StateImage {
-        metadata: serde_json::to_vec(&metadata).unwrap(),
-        shards,
-    };
-    let state = CaState::from_image(&image).unwrap();
-    assert_eq!(state.members().count(), 10_000);
+    let state = manager.state().await.unwrap();
     let encoded = state.to_image().unwrap();
-    assert!(encoded.metadata.len() < MAX_OBJECT_BYTES);
-    assert_eq!(
-        CaState::from_image(&encoded).unwrap().members().count(),
-        10_000
-    );
+    assert!(encoded.metadata.len() < 16384 && encoded.shards.is_empty());
+    assert!(encoded.metadata.len() <= image.metadata.len() + 10);
+    assert!(CaState::from_image(&encoded).unwrap().to_image().unwrap() == encoded);
 }
 
 #[test]
@@ -1267,14 +1506,9 @@ async fn standby_authorization_and_pending_process_retirement_require_live_proof
     let manager = manager(&store, "term").await;
     let mut pending = identity.clone();
     pending.boot_id = "pending".into();
-    manager.admit(pending.clone()).await.unwrap();
+    assert!(manager.admit(pending.clone()).await.is_err());
     let (leaf, key) = issue(&manager, identity.clone(), false).await;
-    assert!(
-        manager
-            .retire_pending(&identity.key(), unix_now())
-            .await
-            .is_err()
-    );
+    let before = manager.state().await.unwrap().to_image().unwrap();
     let bundle = leaf.bundle.clone();
     let proof = replica_proof(
         snapshot(&bundle, &leaf, &key),
@@ -1289,12 +1523,12 @@ async fn standby_authorization_and_pending_process_retirement_require_live_proof
         .record_proof(&identity.key(), proof, unix_now())
         .await
         .unwrap();
-    manager
-        .retire_pending(&identity.key(), unix_now())
-        .await
-        .unwrap();
     assert!(manager.admit(pending).await.is_err());
-    assert_eq!(manager.state().await.unwrap().members().count(), 1);
+    assert!(manager.state().await.unwrap().to_image().unwrap() == before);
+    pod.metadata.deleting = true;
+    assert!(
+        authorize_replica("system", &pod, &replica_set, &deployment, &identity.boot_id).is_err()
+    );
     let request = ObjectMetadata {
         namespace: "system".into(),
         name: "racer-replica-pod".into(),

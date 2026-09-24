@@ -1,5 +1,13 @@
 # Racer control-plane availability
 
+The current [stateless contract](racer-rust-controlplane.md) replaces replica
+ConfigMaps and durable participant/proof barriers. CP replicas exchange the
+current CSR and certificate response through bounded annotations on their
+existing Pods (`cmd/racer-controlplane/src/service.rs:1075`). Warm TLS readiness
+still applies, but proof readiness is not fleet rotation credit. The initial
+stateless-version cutover requires stopping old CP/DP processes together; the
+rolling-update behavior below describes compatible versions within a trust domain.
+
 The managed two-replica Deployment distinguishes a warm replica from the active
 Service backend. `/readyz` requires production listeners, the replica-proof
 listener, and installed, unexpired production and proof certificates. Standbys
@@ -19,7 +27,20 @@ Request serving starts only after publication completes in the current leadershi
 term. Failed or canceled publication remains retryable, including an API write
 whose response was lost. Subsequent reconciliations read the local Pod's hint and
 boot annotation; an intact route requires no Pod writes or predecessor sweep.
-Missing or changed hints trigger a fenced sweep and republication.
+Missing or changed hints trigger a fenced sweep and republication. Activation
+after publication is serialized with leadership loss, so a late PATCH response
+cannot reenable an expired term or a successor still initializing
+(`cmd/racer-controlplane/src/service.rs:1038`, `:472`).
+
+Replica reconciliation isolates per-Pod request, ownership lookup, and issuance
+failures so an invalid or unavailable replica does not prevent healthy replicas
+from receiving certificates. An unverified identity is never issued a leaf. A
+failed Pod list still aborts that issuance pass; it is not evidence of absence.
+This retains upstream's failure isolation, not its former rule that an incomplete
+participant sweep blocks rotation: stateless rotation depends on confirmed trust
+publication, overlap delay, and issued-expiry watermarks, independently of replica
+reachability or issuance success (`cmd/racer-controlplane/src/service.rs:1340`,
+`:1434`).
 
 Rolling updates use one surge and one unavailable replica, with ten seconds of
 continuous readiness before availability credit. Healthy standbys let updates

@@ -27,6 +27,13 @@ use different nodes, although hash collisions can place them on the same node.
 Each page starts its own bounded fallback chain when an owner is unavailable.
 HTTP and RDMA use the same placement rules.
 
+Each Site universe has 262,144 placement slots, shared by its caches. Stateless
+highest-random-weight (HRW) hashing chooses owners using the universe and Node
+UID-derived identity. An unchanged membership set produces the same ownership
+after a control-plane restart or Pod replacement. Balance is statistical;
+adjacent slots can have the same owner. Fallback attempts advance through slots,
+so they do not promise a different physical peer on every attempt.
+
 Cache capacity is rounded up to a 64 MiB boundary, with a minimum of 512 MiB
 per storage shard. The managed agent uses eight page buffers (512 MiB total)
 on one NUMA node and requests 4 GiB of memory.
@@ -46,6 +53,14 @@ Control subscriptions use mutually authenticated TLS at `/v4/config`. An agent
 reports the configuration it has applied separately from the update it has
 received. Cache capacity policies converge independently of topology; certificate
 issuance and CA rotation have their own security checks.
+
+The control plane rebuilds desired state from live Kubernetes objects. Its
+durable runtime state is one revision checkpoint ConfigMap, one public trust
+ConfigMap, one CA Secret containing at most two roots, and one leader Lease.
+Existing control-plane Pods carry bounded current CSR/certificate response
+annotations. There is no persistent participant list or topology history.
+Last-good control-plane intent is process-local; agents retain compatible
+persisted cache storage across restart.
 
 ## Built for Performance
 
@@ -97,6 +112,46 @@ verifies the live Pod-to-singleton-DaemonSet ownership chain. When Node identity
 or Site membership changes, the old process is deconfigured and its Pod is
 gracefully replaced; it cannot join the new universe using its old identity.
 Both Racer workload override components are cluster-wide and reject `sites`.
+
+### Certificates and rotation
+
+Certificates contain signed Pod, Node, universe, boot, and role claims. Enrollment
+and renewal both check live workload ownership and current selection; a process
+that is no longer eligible cannot renew its old identity. The CA records the
+maximum expiry of every issued root's leaves before returning a certificate.
+
+Rotation first publishes both roots, then waits the configured overlap delay
+plus clock skew before switching the issuer. The old root is retired only after
+its maximum issued leaf expiry plus skew. Offline participants do not block
+rotation. Fresh TLS proof endpoints are diagnostic, not a fleet acknowledgment
+barrier.
+
+`--ca-overlap-delay` defaults to `5m` and accepts durations from `1s` to `24h`.
+Use a cluster-wide [workload override]({{< relref "reference/workload-overrides" >}})
+to append it to the `controller` container, for example as an entry in the
+override document:
+
+```yaml
+- component: racer-controlplane
+  kind: Deployment
+  extraArgs:
+    controller: ["--ca-overlap-delay=10m"]
+```
+
+Successor leaders retain or increase persisted safety margins; reducing the
+flag does not shorten an existing domain's recorded overlap delay. The default
+leaf lifetime is 24 hours and clock skew is five minutes.
+
+### Stateless-version cutover
+
+This version requires a coordinated fresh dev/test cutover with matching control
+plane and dataplane images. Earlier CA formats and certificates are not migrated
+automatically. Stop all old processes before restarting in a new trust domain;
+removing obsolete runtime ConfigMaps does not reset or migrate the CA. CA reset
+must be a separate explicit decision. Preserve compatible cache slabs and the
+P2PCache identities that isolate their contents. The repository's
+`designs/racer-stateless-cutover.md` contains the scoped cleanup/reset workflow;
+`hack/scripts/racer-obsolete-runtime.sh` only inventories obsolete objects.
 
 ## Build from Source
 

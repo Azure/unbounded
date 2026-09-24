@@ -325,6 +325,12 @@ impl Leaf {
         if info.issuer != reply.issuer {
             return Err(invalid("enrollment issuer proof mismatch"));
         }
+        if info.claims.namespace != settings.namespace
+            || info.claims.identity.pod_name != settings.pod
+            || info.claims.identity.boot_id != settings.boot
+        {
+            return Err(invalid("enrollment signed process identity mismatch"));
+        }
         let mut random = [0u8; 8];
         crate::environment::random(&mut random).map_err(|e| invalid(e.to_string()))?;
         let now = unix();

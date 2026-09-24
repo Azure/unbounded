@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Opt-in measured TLS fanout against the production Router. The enrollment
-//! fixture restores validated durable shards; it does not benchmark issuance.
+//! fixture uses signed claims and bounded CA state; it does not benchmark issuance.
 //!
-//! Earlier completed release runs (before the short-deadline hardening):
+//! Historical pre-stateless release runs (before the short-deadline hardening):
 //! - 10,000 nodes / 1 universe: 12,375,143,725 bytes per fleet publication,
 //!   initial 33.964s, publish plus TLS reconnect 34.502s, process peak 1,062,880KiB.
 //! - 10,000 nodes / 10 universes: 15,149,268,618 bytes per publication,
@@ -25,9 +25,14 @@
 
 use super::*;
 use crate::{
+    kubernetes::RANGE_SIZE,
     model::{Member, SLOT_COUNT, Volume},
-    security::{Authority, CaState, Identity, IdentityKind, StateImage, TlsSnapshot},
-    topology::place,
+    publication::Publication,
+    security::{
+        Authority, CaState, Identity, IdentityKind, SignedClaims, StateImage, TlsSnapshot,
+        certificate_claims,
+    },
+    topology::place_in_universe,
 };
 use openssl::{
     asn1::Asn1Time,
@@ -64,13 +69,22 @@ const CLIENT_STAGES: [&str; 11] = [
 ];
 const CLIENT_PHASES: [&str; 3] = ["initial", "publication", "reconnect"];
 
+// Synthetic reserved revisions are distinct across universes and skip a range
+// between publications. This router fixture does not exercise checkpoint CAS.
+fn revisions(universe: usize) -> (u64, u64) {
+    (
+        RANGE_SIZE + universe as u64 + 1,
+        2 * RANGE_SIZE + universe as u64 + 1,
+    )
+}
+
 struct Progress {
     started: Instant,
     stage: Mutex<&'static str>,
     clients: Vec<AtomicUsize>,
     phases: Vec<AtomicUsize>,
     credentials: AtomicUsize,
-    // Initial deliveries, revision-2 deliveries, and reconnect request writes.
+    // Initial deliveries, successor deliveries, and reconnect request writes.
     completed: [AtomicUsize; 3],
     bytes: AtomicUsize,
     subscriptions: Mutex<Option<Arc<Subscriptions>>>,
@@ -348,7 +362,11 @@ fn leaf(authority: &Authority, identity: &Identity, serial: usize) -> (Vec<u8>, 
     cert.set_pubkey(&key).unwrap();
     cert.set_not_before(&Asn1Time::from_unix(unix_now() - 60).unwrap())
         .unwrap();
-    cert.set_not_after(&Asn1Time::from_unix(unix_now() + 3600).unwrap())
+    // The fixture reserves one issuer expiry watermark for the entire fleet.
+    // Every signed leaf is bounded by it, independent of credential count.
+    let expiry = authority.last_issued_expiry - 3600;
+    assert!(expiry > unix_now());
+    cert.set_not_after(&Asn1Time::from_unix(expiry).unwrap())
         .unwrap();
     cert.append_extension(BasicConstraints::new().critical().build().unwrap())
         .unwrap();
@@ -360,29 +378,32 @@ fn leaf(authority: &Authority, identity: &Identity, serial: usize) -> (Vec<u8>, 
             .unwrap(),
     )
     .unwrap();
-    cert.append_extension(
-        ExtendedKeyUsage::new()
-            .server_auth()
-            .client_auth()
-            .build()
-            .unwrap(),
-    )
-    .unwrap();
+    let mut eku = ExtendedKeyUsage::new();
+    eku.server_auth();
+    if identity.kind == IdentityKind::Node {
+        eku.client_auth();
+    }
+    cert.append_extension(eku.build().unwrap()).unwrap();
     let mut san = SubjectAlternativeName::new();
-    san.uri(&identity.uri().unwrap());
+    let claims = SignedClaims {
+        version: 1,
+        namespace: "system".into(),
+        identity: identity.clone(),
+    };
+    san.uri(&claims.uri().unwrap());
     if identity.kind == IdentityKind::ControlPlane {
         san.dns("racer-controlplane.system.svc");
     }
     cert.append_extension(
-        san.build(&cert.x509v3_context(Some(&parent), None))
+        san.critical()
+            .build(&cert.x509v3_context(Some(&parent), None))
             .unwrap(),
     )
     .unwrap();
     cert.sign(&signer, MessageDigest::sha256()).unwrap();
-    (
-        cert.build().to_der().unwrap(),
-        key.private_key_to_pkcs8().unwrap(),
-    )
+    let cert = cert.build();
+    assert_eq!(certificate_claims(&cert.to_pem().unwrap()).unwrap(), claims);
+    (cert.to_der().unwrap(), key.private_key_to_pkcs8().unwrap())
 }
 
 fn sample() -> Value {
@@ -505,6 +526,9 @@ async fn receive(
     assert_eq!(hex::encode(&desired.node), node);
     let proto::configuration::Contents::Snapshot(snapshot) =
         desired.configuration.unwrap().contents.unwrap();
+    assert_eq!(snapshot.node, desired.node);
+    assert_eq!(snapshot.revision, desired.revision);
+    assert_eq!(snapshot.epoch, desired.revision);
     assert_eq!(
         Sha256::digest(snapshot.encode_to_vec()).as_slice(),
         desired.snapshot_digest
@@ -692,7 +716,18 @@ async fn scenario(
         )
         .unwrap();
     let roots = Arc::new(roots);
-    let mut buckets: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
+    let image = StateImage {
+        metadata: serde_json::to_vec(&json!({
+            "version": 5, "namespace": "system", "fence": "scale", "generation": 1,
+            "active": ca.digest, "phase": "stable", "authorities": [ca],
+            "rotation_nonce": "", "published_at": null, "overlap_delay": 60,
+            "retirement_skew": 60
+        }))
+        .unwrap(),
+        shards: BTreeMap::new(),
+    };
+    let ca_state = Arc::new(CaState::from_image(&image).unwrap());
+    let before_leaves = ca_state.to_image().unwrap();
     let mut clients = Vec::with_capacity(nodes);
     let mut generations: Vec<_> = (0..universes)
         .map(|i| Generation::empty(format!("scale-{i}")))
@@ -712,9 +747,6 @@ async fn scenario(
             container_id: String::new(),
         };
         let (cert, key) = leaf(&ca, &id, i);
-        let hash = Sha256::digest(id.key().as_bytes());
-        let bucket = format!("{:03x}", u16::from_be_bytes([hash[0], hash[1]]) & 1023);
-        buckets.entry(bucket).or_default().insert(id.key(), json!({"identity":id,"leaves":{hex::encode(Sha256::digest(&cert)):{"root":ca.digest,"expiry":unix_now()+3600}}}));
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -745,17 +777,17 @@ async fn scenario(
         );
         progress.credentials.store(i + 1, Ordering::Relaxed);
     }
-    let mut shards = BTreeMap::new();
-    let mut references = BTreeMap::new();
-    for (bucket, members) in buckets {
-        let bytes = serde_json::to_vec(&json!({"members":members,"retired":[]})).unwrap();
-        let digest = hex::encode(Sha256::digest(&bytes));
-        references.insert(bucket, digest.clone());
-        shards.insert(digest, bytes);
-    }
-    let image = StateImage { metadata: serde_json::to_vec(&json!({"version":4,"fence":"scale","fence_at":unix_now(),"generation":1,"active":ca.digest,"phase":"stable","authorities":[ca],"shards":references})).unwrap(), shards };
-    let ca_state = Arc::new(CaState::from_image(&image).unwrap());
-    assert_eq!(ca_state.members().count(), nodes);
+    let after_leaves = ca_state.to_image().unwrap();
+    assert!(
+        after_leaves.metadata == before_leaves.metadata,
+        "leaf count must not grow CA state"
+    );
+    assert!(after_leaves.shards.is_empty());
+    assert!(after_leaves.metadata.len() <= 16 * 1024);
+    assert_eq!(
+        ca_state.expiry_watermarks().collect::<Vec<_>>(),
+        vec![(ca.digest.as_str(), ca.last_issued_expiry)]
+    );
     drop(image);
     let subscriptions = Subscriptions::new(
         Arc::new(move || {
@@ -774,14 +806,23 @@ async fn scenario(
     subscriptions.set_fence(Some("scale".into()));
     *progress.subscriptions.lock().unwrap() = Some(subscriptions.clone());
     progress.enter("initial topology install");
-    for generation in &mut generations {
-        generation.revision = 1;
-        let owners = place(
+    let mut publications: Vec<Publication<Generation>> =
+        (0..universes).map(|_| Publication::default()).collect();
+    for (universe, generation) in generations.iter_mut().enumerate() {
+        let names: BTreeMap<_, _> = generation
+            .nodes
+            .iter()
+            .map(|(name, member)| (member.id.clone(), name.clone()))
+            .collect();
+        let owners = place_in_universe(
             slots,
-            &generation.nodes.keys().cloned().collect::<Vec<_>>(),
-            &[],
+            &generation.universe,
+            &names.keys().cloned().collect::<Vec<_>>(),
         )
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|id| names[&id].clone())
+        .collect();
         generation.volumes.push(Volume {
             id: "cache-uid".into(),
             name: "cache-a".into(),
@@ -794,7 +835,10 @@ async fn scenario(
             max_candidate_attempts: 3,
             owners,
         });
-        subscriptions.install(Arc::new(generation.clone())).unwrap();
+        let published = publications[universe]
+            .publish(generation.clone(), revisions(universe).0)
+            .unwrap();
+        subscriptions.install(published).unwrap();
     }
     let setup = json!({"wall_seconds":start.elapsed().as_secs_f64(),"resources":sample()});
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -865,6 +909,7 @@ async fn scenario(
             fleet: progress.clone(),
             index,
         };
+        let (initial_revision, successor_revision) = revisions(index % universes);
         workers.spawn(async move {
             let work = async {
                 let permit = progress
@@ -876,7 +921,7 @@ async fn scenario(
                 send(&mut stream, &boot, "", &progress).await;
                 let (mut cursor, revision, bytes, latency) =
                     receive(&mut stream, &node, &progress).await.unwrap();
-                assert_eq!(revision, 1);
+                assert_eq!(revision, initial_revision);
                 if !progress.event(&events, (0, bytes, latency)).await {
                     return;
                 }
@@ -886,7 +931,7 @@ async fn scenario(
                     if let Some((next, revision, bytes, latency)) =
                         receive(&mut stream, &node, &progress).await
                     {
-                        assert_eq!(revision, 2);
+                        assert_eq!(revision, successor_revision);
                         cursor = next;
                         if !progress.event(&events, (1, bytes, latency)).await {
                             return;
@@ -948,17 +993,19 @@ async fn scenario(
     await_waiters(&subscriptions, nodes, 3, "initial held requests").await;
     let held_start = sample();
     tokio::time::sleep(Duration::from_millis(if stress { 1000 } else { 100 })).await;
-    // A delayed persistence completion must not publish intent. This delay models
-    // the runtime's commit seam; actual slow RecordStore behavior has its own test.
+    // Desired state is invisible until the runtime installs a publication after
+    // reserving its revision and verifying authority.
     assert!(receiver.try_recv().is_err());
     let held = json!({"before":held_start,"after":sample(),"waiters":subscriptions.waiter_count(),"cache":subscriptions.cache_usage()});
     let fanout_start = Instant::now();
     let fanout_cpu = sample();
     progress.enter("publish/reconnect");
-    for generation in &mut generations {
-        generation.revision = 2;
+    for (universe, generation) in generations.iter_mut().enumerate() {
         generation.volumes[0].cache_generation = 2;
-        subscriptions.install(Arc::new(generation.clone())).unwrap();
+        let published = publications[universe]
+            .publish(generation.clone(), revisions(universe).1)
+            .unwrap();
+        subscriptions.install(published).unwrap();
     }
     let mut fanout_bytes = 0usize;
     let mut delivered = 0;

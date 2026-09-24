@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use crate::model::*;
 use crate::{Error, Result, proto};
 
@@ -16,156 +18,184 @@ pub fn degree(slots: u32) -> u32 {
     d
 }
 
-/// Retention-first balanced placement, including Go-compatible pair phase and
-/// bounded diversity repair. Input list order never affects the result.
-pub fn place(slots: u32, names: &[String], previous: &[String]) -> Result<Vec<String>> {
-    let p = slots as usize;
-    let mut names = names.to_vec();
-    names.sort();
-    let n = names.len();
-    if slots == 0
-        || slots > SLOT_COUNT
-        || n == 0
-        || n > p
-        || n > 100_000
-        || names.iter().any(String::is_empty)
-        || names.windows(2).any(|w| w[0] == w[1])
-    {
-        return Err(Error(
-            "invalid placement capacity or duplicate participant".into(),
-        ));
+/// Compatibility helper for synthetic name-only fixtures. Production placement
+/// uses `place_in_universe` with the existing Node UID-derived identities.
+/// Previous ownership is deliberately ignored.
+pub fn place(slots: u32, names: &[String], _previous: &[String]) -> Result<Vec<String>> {
+    if names.iter().any(String::is_empty) {
+        return Err(Error("empty placement participant".into()));
     }
-    let indices: BTreeMap<_, _> = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name, i))
-        .collect();
-    let prior: Vec<usize> = previous
-        .iter()
-        .take(p)
-        .map(|s| indices.get(s).copied().unwrap_or(n))
-        .collect();
-    if n == 2 {
-        let matches = |slot: usize, owner: usize| i64::from(prior.get(slot) == Some(&owner));
-        let mut score: i64 = (0..p).map(|i| matches(i, i % 2)).sum();
-        let mut best = score;
-        let mut seam = 0;
-        if p.is_multiple_of(2) {
-            let other: i64 = (0..p).map(|i| matches(i, 1 - i % 2)).sum();
-            if other > best {
-                seam = 1;
-            }
-        } else {
-            let mut k = 0;
-            for _ in 1..p {
-                let j = (k + 1) % p;
-                score += matches(k, 1) + matches(j, 0) - matches(k, 0) - matches(j, 1);
-                k = (k + 2) % p;
-                if score > best {
-                    best = score;
-                    seam = k;
+    let ids: Vec<_> = names.iter().map(|n| identity("node", n)).collect();
+    let by_id: BTreeMap<_, _> = ids.iter().zip(names).collect();
+    place_in_universe(slots, "placement-fixture", &ids)
+        .map(|owners| owners.iter().map(|id| by_id[id].clone()).collect())
+}
+
+/// Stateless highest-random-weight rendezvous. Each slot chooses the maximum
+/// unsigned 64-bit score; ties choose the lexically smallest Node identity.
+/// Balance is statistical. Adjacent slots may have the same owner, and live
+/// participants may own zero slots, including when participants exceed slots.
+pub fn place_in_universe(slots: u32, universe: &str, ids: &[String]) -> Result<Vec<String>> {
+    PlacementCache::default().place(slots, universe, ids)
+}
+
+// XXH64 from https://github.com/Cyan4973/xxHash/blob/v0.8.3/doc/xxhash_spec.md,
+// seed zero, specialized to a 36-byte message. The score is
+// XXH64(SHA256(domain || universe_id[32] || node_id[32]) || LE32(slot), 0).
+// domain is the exact bytes b"racer/placement/hrw/v1\0"; universe_id and node_id
+// are the existing binary SHA-256 identities, not their hexadecimal text.
+// This fixed-width encoding has no ambiguous concatenations. SHA-256 includes
+// all identity bits; XXH64 cheaply avalanches each slot without new dependencies.
+// Pod identity, IP, cache identity/generation, revision and fence are not inputs.
+const P1: u64 = 11_400_714_785_074_694_791;
+const P2: u64 = 14_029_467_366_897_019_727;
+const P3: u64 = 1_609_587_929_392_839_161;
+const P4: u64 = 9_650_029_242_287_828_579;
+
+fn xxh_round(acc: u64, lane: u64) -> u64 {
+    acc.wrapping_add(lane.wrapping_mul(P2))
+        .rotate_left(31)
+        .wrapping_mul(P1)
+}
+
+fn score_prefix(universe: &[u8; 32], node: &[u8; 32]) -> u64 {
+    let mut hash = Sha256::new();
+    hash.update(b"racer/placement/hrw/v1\0");
+    hash.update(universe);
+    hash.update(node);
+    let digest = hash.finalize();
+    let mut lanes = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
+    for (acc, chunk) in lanes.iter_mut().zip(digest.chunks_exact(8)) {
+        *acc = xxh_round(*acc, u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    let mut h = lanes[0]
+        .rotate_left(1)
+        .wrapping_add(lanes[1].rotate_left(7))
+        .wrapping_add(lanes[2].rotate_left(12))
+        .wrapping_add(lanes[3].rotate_left(18));
+    for lane in lanes {
+        h = (h ^ xxh_round(0, lane)).wrapping_mul(P1).wrapping_add(P4);
+    }
+    h.wrapping_add(36)
+}
+
+#[inline]
+fn score(prefix: u64, slot: u32) -> u64 {
+    let mut h = (prefix ^ u64::from(slot).wrapping_mul(P1))
+        .rotate_left(23)
+        .wrapping_mul(P2)
+        .wrapping_add(P3);
+    h = (h ^ (h >> 33)).wrapping_mul(P2);
+    h = (h ^ (h >> 29)).wrapping_mul(P3);
+    h ^ (h >> 32)
+}
+
+#[cfg(test)]
+#[path = "../tests/placement/hash.rs"]
+mod placement_hash;
+
+/// Disposable, single-universe acceleration, never persisted or trusted as
+/// externally supplied ownership. Adding nodes compares only their scores;
+/// removing nodes rescans only slots whose winner disappeared. Every result is
+/// exactly the cold HRW result, including simultaneous additions and removals.
+/// Space is O(slots + nodes); cold work is O(slots * nodes).
+#[derive(Default)]
+pub struct PlacementCache {
+    universe: String,
+    ids: Vec<String>,
+    winners: Vec<(usize, u64)>,
+}
+
+impl PlacementCache {
+    pub fn place(&mut self, slots: u32, universe: &str, ids: &[String]) -> Result<Vec<String>> {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        if slots == 0
+            || slots > SLOT_COUNT
+            || universe.is_empty()
+            || ids.len() > 100_000
+            || ids.windows(2).any(|w| w[0] == w[1])
+        {
+            return Err(Error(
+                "invalid placement capacity, universe or duplicate identity".into(),
+            ));
+        }
+        let universe_id = identity_bytes("universe", universe);
+        let prefixes: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                if id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(Error("invalid placement node identity".into()));
+                }
+                let mut node = [0; 32];
+                hex::decode_to_slice(id, &mut node).map_err(|e| Error(e.to_string()))?;
+                Ok(score_prefix(&universe_id, &node))
+            })
+            .collect::<Result<_>>()?;
+        if self.universe != universe || self.winners.len() != slots as usize {
+            self.ids.clear();
+            self.winners = vec![(usize::MAX, 0); slots as usize];
+        }
+        let remap: Vec<_> = self
+            .ids
+            .iter()
+            .map(|id| ids.binary_search(id).ok())
+            .collect();
+        let added: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| self.ids.binary_search(id).is_err().then_some(i))
+            .collect();
+        for (slot, winner) in self.winners.iter_mut().enumerate() {
+            let retained = remap.get(winner.0).copied().flatten();
+            let mut best = retained.map_or((usize::MAX, 0), |i| (i, winner.1));
+            let mut consider = |i: usize| {
+                let value = score(prefixes[i], slot as u32);
+                if value > best.1 || (value == best.1 && i < best.0) {
+                    best = (i, value);
+                }
+            };
+            if retained.is_some() {
+                for &i in &added {
+                    consider(i);
+                }
+            } else {
+                for i in 0..ids.len() {
+                    consider(i);
                 }
             }
+            *winner = best;
         }
-        return Ok((0..p)
-            .map(|i| names[(i + p - seam) % p % 2].clone())
-            .collect());
+        self.universe = universe.into();
+        self.ids = ids;
+        Ok(if self.ids.is_empty() {
+            Vec::new()
+        } else {
+            self.winners
+                .iter()
+                .map(|&(i, _)| self.ids[i].clone())
+                .collect()
+        })
     }
-    let quota: Vec<usize> = (0..n).map(|i| p / n + usize::from(i < p % n)).collect();
-    let mut owners = vec![n; p];
-    let mut counts = vec![0usize; n];
-    for (slot, owner) in prior.into_iter().enumerate() {
-        if owner < n {
-            owners[slot] = owner;
-            counts[owner] += 1;
-        }
-    }
-    let mut deficits: Vec<usize> = (0..n).filter(|&i| counts[i] < quota[i]).collect();
-    let mut i = 0;
-    for pass in 0..2 {
-        for slot in 0..p {
-            let old = owners[slot];
-            if old < n && counts[old] <= quota[old] {
-                continue;
-            }
-            while counts[deficits[i]] == quota[deficits[i]] {
-                deficits.swap_remove(i);
-                i %= deficits.len();
-            }
-            let mut owner = deficits[i];
-            if pass == 0 && !safe(&owners, slot, owner) {
-                let found = (1..deficits.len().min(8))
-                    .map(|offset| (i + offset) % deficits.len())
-                    .find(|&j| {
-                        counts[deficits[j]] < quota[deficits[j]] && safe(&owners, slot, deficits[j])
-                    });
-                let Some(j) = found else {
-                    continue;
-                };
-                i = j;
-                owner = deficits[i];
-            }
-            if old < n {
-                counts[old] -= 1;
-            }
-            owners[slot] = owner;
-            counts[owner] += 1;
-            i = (i + 1) % deficits.len();
-        }
-    }
-    if n > 2 && !diversify(&mut owners) {
-        for (slot, owner) in owners.iter_mut().enumerate() {
-            *owner = slot % n;
-        }
-        if owners[0] == owners[p - 1] {
-            owners.swap(p - 1, p - 2);
-        }
-    }
-    Ok(owners.into_iter().map(|i| names[i].clone()).collect())
-}
-
-fn safe(owners: &[usize], slot: usize, owner: usize) -> bool {
-    let p = owners.len();
-    owners[(slot + p - 1) % p] != owner && owners[(slot + 1) % p] != owner
-}
-
-fn diversify(owners: &mut [usize]) -> bool {
-    let p = owners.len();
-    let mut donor = 0;
-    let mut budget = 16 * p;
-    for slot in 0..p {
-        if owners[slot] != owners[(slot + p - 1) % p] {
-            continue;
-        }
-        let mut found = false;
-        for tried in 0..2 * p {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            let x = if tried < p { slot } else { (slot + p - 1) % p };
-            let y = donor;
-            donor = (donor + 1) % p;
-            if owners[x] == owners[y] {
-                continue;
-            }
-            owners.swap(x, y);
-            if safe(owners, x, owners[x]) && safe(owners, y, owners[y]) {
-                found = true;
-                break;
-            }
-            owners.swap(x, y);
-        }
-        if !found {
-            return false;
-        }
-    }
-    true
 }
 
 /// Compile desired content at the previous revision. Publication assigns the
 /// next revision only if content changed. Errors leave the caller's state intact.
 pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Generation> {
+    compile_cached(input, previous, &mut PlacementCache::default())
+}
+
+/// Compile from current inventory; `previous` supplies only the local revision.
+/// A caller may retain one disposable placement cache per universe across polls.
+pub fn compile_cached(
+    input: &Inventory,
+    previous: Option<&Generation>,
+    placement: &mut PlacementCache,
+) -> Result<Generation> {
     if input.universe.is_empty() {
         return Err(Error("universe must not be empty".into()));
     }
@@ -173,33 +203,9 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
         if old.universe != input.universe {
             return Err(Error("previous universe mismatch".into()));
         }
-        Topology::new(old)?;
     }
-    let mut g = previous
-        .cloned()
-        .unwrap_or_else(|| Generation::empty(&input.universe));
-    let pod_keys: BTreeMap<_, _> = input
-        .nodes
-        .iter()
-        .flat_map(|n| &n.pods)
-        .filter(|p| !p.uid.is_empty())
-        .map(|p| (p.uid.as_str(), p))
-        .collect();
-    for member in g.nodes.values_mut() {
-        member.ip = None;
-        if (member.pod_namespace.is_empty() || member.pod_name.is_empty())
-            && let Some(pod) = pod_keys.get(member.pod_uid.as_str())
-        {
-            member.pod_namespace = pod.namespace.clone();
-            member.pod_name = pod.name.clone();
-        }
-    }
-    let pod_identities: BTreeMap<_, _> = g
-        .nodes
-        .values()
-        .filter(|m| !m.pod_uid.is_empty())
-        .map(|m| (m.pod_uid.clone(), m.id.clone()))
-        .collect();
+    let mut g = Generation::empty(&input.universe);
+    g.revision = previous.map_or(0, |old| old.revision);
     let mut seen = BTreeSet::new();
     for node in &input.nodes {
         if !node.eligible || node.universe != input.universe {
@@ -216,10 +222,6 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
             return Err(Error(format!("node {} has invalid fabric", node.name)));
         }
         let id = identity("node", &node.uid);
-        if g.nodes.get(&node.name).is_some_and(|old| old.id != id) {
-            let old = g.nodes.remove(&node.name).unwrap();
-            g.nodes.insert(format!("deleted/{}", old.id), old);
-        }
         let member = g.nodes.entry(node.name.clone()).or_default();
         member.id = id;
         member.fabric = node.fabric.clone();
@@ -227,11 +229,7 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
             .pods
             .iter()
             .filter(|p| {
-                node.ready
-                    && p.available
-                    && !p.uid.is_empty()
-                    && available_ip(&p.ip).is_some()
-                    && pod_identities.get(&p.uid).is_none_or(|id| id == &member.id)
+                node.ready && p.available && !p.uid.is_empty() && available_ip(&p.ip).is_some()
             })
             .collect();
         pods.sort_by(|a, b| {
@@ -249,17 +247,28 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
             member.pod_name = pod.name.clone();
         }
     }
-    let active: Vec<_> = g
+    let active: BTreeMap<_, _> = g
         .nodes
         .iter()
         .filter(|(_, n)| n.ip.is_some())
-        .map(|(name, _)| name.clone())
+        .map(|(name, member)| (member.id.clone(), name.clone()))
         .collect();
     if active.len() > 100_000 {
         return Err(Error("universe exceeds 100000 participants".into()));
     }
-    let old_volumes = std::mem::take(&mut g.volumes);
-    g.withdrawn.extend(old_volumes.iter().map(|v| v.id.clone()));
+    let owners = if input.caches.is_empty() {
+        Vec::new()
+    } else {
+        placement
+            .place(
+                SLOT_COUNT,
+                &input.universe,
+                &active.keys().cloned().collect::<Vec<_>>(),
+            )?
+            .into_iter()
+            .map(|id| active[&id].clone())
+            .collect()
+    };
     let mut caches: Vec<_> = input.caches.iter().collect();
     caches.sort_by_key(|c| &c.name);
     let mut ids = BTreeSet::new();
@@ -277,17 +286,6 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
             )));
         }
         let (cache_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.name)?;
-        let prior = old_volumes
-            .iter()
-            .find(|v| v.id == cache.uid)
-            .map(|v| v.owners.as_slice())
-            .unwrap_or_default();
-        let owners = if active.is_empty() {
-            Vec::new()
-        } else {
-            place(SLOT_COUNT, &active, prior)?
-        };
-        g.withdrawn.remove(&cache.uid);
         g.slot_history.insert(cache.uid.clone(), SLOT_COUNT);
         g.volumes.push(Volume {
             id: cache.uid.clone(),
@@ -299,7 +297,7 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
             cache_generation: cache.cache_generation as u64,
             routing_algorithm: ROUTING_ALGORITHM,
             max_candidate_attempts: cache.max_candidate_attempts,
-            owners,
+            owners: owners.clone(),
         });
     }
     Topology::new(&g)?;
@@ -444,7 +442,9 @@ impl Topology {
             revision: g.revision,
             epoch: g.revision,
             fabric: member.fabric.clone(),
-            idle: g.volumes.is_empty() && member.ip.is_some() && !member.pod_uid.is_empty(),
+            idle: member.ip.is_some()
+                && !member.pod_uid.is_empty()
+                && self.local.iter().all(|local| !local.contains_key(name)),
             ..Default::default()
         };
         let mut peers = BTreeMap::new();

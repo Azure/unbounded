@@ -248,7 +248,8 @@ func TestEnrollmentVerificationRBAC(t *testing.T) {
 		{"apps", "replicasets", "racer-controlplane-revision", namespace, []string{"get"}},
 		{"apps", "deployments", controlPlaneName, namespace, []string{"get"}},
 		{"", "secrets", "racer-ca", namespace, []string{"get", "update", "create"}},
-		{"", "configmaps", "racer-trust", namespace, []string{"get", "list", "watch", "create", "update", "delete"}},
+		{"", "configmaps", "racer-trust", namespace, []string{"get", "list", "watch", "create", "update"}},
+		{"", "configmaps", "racer-runtime-revisions", namespace, []string{"get", "create", "update"}},
 		{"coordination.k8s.io", "leases", "racer-controlplane", namespace, []string{"get", "list", "watch", "create", "update", "patch"}},
 	} {
 		for _, verb := range tc.verbs {
@@ -260,6 +261,15 @@ func TestEnrollmentVerificationRBAC(t *testing.T) {
 
 	for _, account := range []string{controlPlaneName, dataplaneName} {
 		for _, ns := range []string{namespace, "other-namespace"} {
+			for _, name := range []string{"racer-trust", "racer-runtime-revisions", "racer-v4-store-gate", "unrelated"} {
+				for _, verb := range []string{"delete", "deletecollection", "patch", "update", "create"} {
+					want := account == controlPlaneName && ns == namespace && (verb == "update" || verb == "create")
+					if got := allowed(account, "", "configmaps", verb, name, ns); got != want {
+						t.Errorf("%s %s ConfigMap %s/%s = %v, want %v", account, verb, ns, name, got, want)
+					}
+				}
+			}
+
 			for _, verb := range []string{"delete", "deletecollection", "patch", "update"} {
 				want := account == controlPlaneName && ns == namespace && (verb == "delete" || verb == "patch")
 				if got := allowed(account, "", "pods", verb, "actual-pod", ns); got != want {

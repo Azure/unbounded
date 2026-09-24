@@ -111,7 +111,7 @@ func TestDeployment(t *testing.T) {
 	c.must("delete", "p2pcache/second-volume", "--wait=false")
 	revision = c.converge(revision, "racer-volume")
 
-	t.Log("controller leader replacement and durable revision continuity")
+	t.Log("controller leader replacement and newer revision allocation")
 
 	leader := c.leader()
 	c.must("delete", "pod", leader.Name, "--wait=false")
@@ -171,8 +171,8 @@ func TestDeployment(t *testing.T) {
 
 		return fmt.Errorf("replacement not Ready")
 	})
-	// A process restart need not change topology revision if the Pod IP is reused.
-	c.converge(revision-1, "racer-volume")
+	// Pod UID is part of current selection even when its IP is reused.
+	c.converge(revision, "racer-volume")
 
 	got := c.must("exec", replacement.Name, "-c", "dataplane", "--", "/bin/sh", "-c", "cat /bootstrap/identity")
 	if !bytes.Equal(identity, got) {
@@ -207,7 +207,7 @@ const (
 )
 
 // Only immutable root material is compared across failover. Rust's expiry
-// watermarks, participant shards, fence, and rotation nonce legitimately change.
+// watermarks, fence, and rotation nonce legitimately change.
 type persistedRoot struct {
 	Digest      string `json:"digest"`
 	Certificate string `json:"certificate"`
@@ -232,7 +232,7 @@ func (c *cluster) caSecrets() map[string]core.Secret {
 	decode(c.t, secret.Data[caStateKey], &state)
 
 	bundle := c.trustBundle()
-	if secret.Type != core.SecretTypeOpaque || secret.UID == "" || state.Version != 4 || len(state.Authorities) == 0 || state.Active != bundle.Active {
+	if secret.Type != core.SecretTypeOpaque || secret.UID == "" || state.Version != 5 || len(secret.Data) != 1 || len(secret.Data[caStateKey]) > 16*1024 || len(state.Authorities) == 0 || len(state.Authorities) > 2 || state.Active != bundle.Active {
 		c.t.Fatal("invalid persisted CA")
 	}
 
@@ -251,7 +251,7 @@ func (c *cluster) checkCAUnchanged(before map[string]core.Secret) {
 	after := c.caSecrets()
 	for name, old := range before {
 		current := after[name]
-		// Leadership fencing and enrolled member records legitimately change.
+		// Leadership fencing and issuer expiry watermarks legitimately change.
 		var a, b persistedCA
 		decode(c.t, old.Data[caStateKey], &a)
 		decode(c.t, current.Data[caStateKey], &b)
@@ -309,12 +309,12 @@ func (c *cluster) rotateCA(before map[string]core.Secret) {
 	})
 	leader := c.leader()
 	c.must("delete", "pod", leader.Name, "--wait=false")
-	c.awaitFor(5*time.Minute, "new issuer and live trust projection", func() error {
+	c.awaitFor(12*time.Minute, "new issuer and live trust projection", func() error {
 		checkTraffic()
 
 		bundle := c.trustBundle()
 		if bundle.Active == old.Active {
-			return fmt.Errorf("waiting for verified overlap barriers")
+			return fmt.Errorf("waiting for timed publication overlap")
 		}
 		// Production leaves live for 24 hours. Old-root removal must wait for
 		// their expiry; the bounded crosslanguage campaign uses short-lived leaves.

@@ -20,8 +20,7 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// Only successful rustls handshakes inside this module construct peer evidence.
-/// HTTP adapters may inspect it and must bind it to the durable boot with
-/// `CaState::verify_member` on every request (including long-lived connections).
+/// HTTP adapters authorize signed identity against local topology on each request.
 #[derive(Clone, Debug)]
 pub struct VerifiedPeer {
     pub(super) fingerprint: String,
@@ -30,9 +29,23 @@ pub struct VerifiedPeer {
     pub(super) not_before: i64,
     pub(super) not_after: i64,
     pub(super) is_server: bool,
+    pub(super) claims: SignedClaims,
 }
 
 impl VerifiedPeer {
+    pub fn identity(&self) -> &Identity {
+        &self.claims.identity
+    }
+    pub fn namespace(&self) -> &str {
+        &self.claims.namespace
+    }
+    pub fn valid_at(&self, now: i64) -> Result<()> {
+        ensure!(
+            now >= self.not_before && now < self.not_after,
+            "expired TLS identity"
+        );
+        Ok(())
+    }
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -52,13 +65,14 @@ impl VerifiedPeer {
             now >= self.not_before && now < self.not_after,
             "expired TLS identity"
         );
-        let prefix = format!("spiffe://racer/universe/{universe}/node/{node}/pod/");
-        let uid = self
-            .uri
-            .strip_prefix(&prefix)
-            .context("TLS route identity mismatch")?;
-        ensure!(process_id(uid), "invalid Pod URI");
-        Ok(uid)
+        let identity = self.identity();
+        ensure!(
+            identity.kind == IdentityKind::Node
+                && identity.universe == universe
+                && identity.node == node,
+            "TLS route identity mismatch"
+        );
+        Ok(&identity.pod_uid)
     }
 }
 
@@ -167,9 +181,12 @@ impl TlsSnapshot {
             .context("missing authenticated peer certificate")?;
         let cert = X509::from_der(der.as_ref())?;
         let (not_before, not_after) = cert_times(&cert)?;
+        let uri = super::certificates::leaf_uri(&cert)?;
+        let claims = SignedClaims::parse(&uri)?;
         Ok(VerifiedPeer {
             fingerprint: digest(der.as_ref()),
-            uri: super::certificates::leaf_uri(&cert)?,
+            uri,
+            claims,
             root: super::certificates::leaf_root(&cert, &self.bundle, is_server)?,
             not_before,
             not_after,
@@ -248,13 +265,8 @@ impl TlsSnapshot {
             let digest = message.header("x-racer-trust-digest")?.to_owned();
             ensure!(generation > 0 && hex_id(&digest), "invalid acknowledgment");
             let old: u64 = message.header("x-racer-old-connections")?.parse()?;
-            let uid = peer
-                .uri
-                .rsplit('/')
-                .next()
-                .context("missing Pod identity")?;
-            ensure!(process_id(uid), "invalid Pod identity");
-            let key = format!("{uid}/{boot}");
+            ensure!(peer.identity().boot_id == boot, "signed boot mismatch");
+            let key = peer.identity().key();
             term.check()?;
             let proof = TlsProof {
                 fence: term.token.clone(),
@@ -275,8 +287,8 @@ impl TlsSnapshot {
     }
 
     /// Connect directly to the expected Pod IP using the shared CP DNS SAN.
-    /// The actual enrolled fingerprint binds the Pod and boot when recorded.
-    /// A ConfigMap acknowledgment alone never counts as proof.
+    /// Signed claims bind the Pod and boot independently of annotation contents.
+    /// This diagnostic exchange does not gate rotation.
     pub async fn probe_replica(
         &self,
         raw: TcpStream,
@@ -295,7 +307,9 @@ impl TlsSnapshot {
             let conn = stream.get_ref().1;
             ensure!(conn.handshake_kind() == Some(rustls::HandshakeKind::Full), "proof requires full handshake");
             let peer = self.peer(conn.peer_certificates(), true)?;
-            ensure!(peer.uri == "spiffe://racer/controlplane", "not a CP server identity");
+            ensure!(peer.identity().kind == IdentityKind::ControlPlane
+                && peer.namespace() == namespace && peer.identity().pod_uid == expected.pod_uid
+                && peer.identity().boot_id == expected.boot_id, "not the expected CP server identity");
             let session = conn.export_keying_material([0u8; 32], b"racer-ca-proof/v1", Some(self.bundle.digest().as_bytes()))?;
             let at = unix_now();
             stream.write_all(format!("GET /v3/replica-proof HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;

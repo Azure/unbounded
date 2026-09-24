@@ -80,12 +80,15 @@ func sharedResources(namespace string) []client.Object {
 		),
 		clusterBinding(controlPlaneName, namespace, controlPlaneName),
 		role(stateRoleName, namespace, controlPlaneName,
-			// Same-Pod dataplane restarts require graceful Pod replacement before
-			// their ambiguous boot identities can leave the CA rotation barrier.
+			// Enrollment replaces Pods whose live Node or Site identity changed.
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"delete"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, ResourceNames: []string{controlPlaneName}, Verbs: []string{"get"}},
+			// Existing CP Pods carry bounded current CSR/response annotations and
+			// the serving-leader hint. No replica ConfigMaps are created.
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"patch"}},
-			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
+			// Trust and revision checkpoint state is retained. Obsolete runtime
+			// cleanup is an explicit operator action, never controller GC.
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch", "create", "update"}},
 			rbacv1.PolicyRule{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"racer-ca"}, Verbs: []string{"get", "update"}},

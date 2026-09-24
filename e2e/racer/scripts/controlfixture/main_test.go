@@ -186,6 +186,10 @@ func TestEnrollmentAndControl(t *testing.T) {
 		}
 	}
 
+	if status, _, _ := request(client, "GET", path, nil, map[string]string{"X-Racer-Boot": strings.Repeat("05", 32)}); status != http.StatusForbidden {
+		t.Fatalf("signed boot mismatch accepted: %d", status)
+	}
+
 	checkCommand := func(headers map[string]string) {
 		t.Helper()
 

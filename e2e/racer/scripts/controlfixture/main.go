@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -29,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,6 +36,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	originfixture "github.com/Azure/unbounded/e2e/racer/fixture"
 )
 
 type registration struct {
@@ -97,7 +98,9 @@ func newFixture(dir string) (*fixture, error) {
 		return nil, err
 	}
 
-	leaf, err := f.issue(&serverKey.PublicKey, "spiffe://racer/controlplane", []string{"localhost"})
+	claims := originfixture.Claims{Version: 1, Namespace: "probe", Identity: originfixture.CertificateIdentity{Kind: "controlplane", PodUID: "controller", BootID: strings.Repeat("04", 32), PodName: "controller"}}
+
+	leaf, err := f.issue(&serverKey.PublicKey, claims.URI(), []string{"racer-controlplane.probe.svc", "localhost"})
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +124,9 @@ func (f *fixture) issue(key any, identity string, dns []string) ([]byte, error) 
 	}
 
 	leaf := &x509.Certificate{SerialNumber: number, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(30 * time.Minute), URIs: []*url.URL{uri}, DNSNames: dns, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+	if len(dns) != 0 {
+		leaf.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
 
 	return x509.CreateCertificate(rand.Reader, leaf, f.root, key, f.key)
 }
@@ -189,7 +195,9 @@ func (f *fixture) enroll(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	leaf, err := f.issue(csr.PublicKey, r.uri(), nil)
+	claims := originfixture.Claims{Version: 1, Namespace: "probe", Identity: originfixture.CertificateIdentity{Kind: "node", Universe: r.Universe, Node: r.Node, PodUID: r.PodUID, BootID: req.Header.Get("X-Racer-Boot"), PodName: body.Pod}}
+
+	leaf, err := f.issue(csr.PublicKey, claims.URI(), nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -214,13 +222,13 @@ func (f *fixture) authenticated(req *http.Request) (registration, error) {
 		return registration{}, errors.New("invalid client identity")
 	}
 
-	parts := bytes.Split([]byte(leaf.URIs[0].Path), []byte("/"))
-	if len(parts) != 7 {
+	claims, err := originfixture.ParseClaims(leaf.URIs[0].String())
+	if err != nil || claims.Namespace != "probe" || claims.Identity.Kind != "node" || claims.Identity.BootID != req.Header.Get("X-Racer-Boot") {
 		return registration{}, errors.New("invalid client URI")
 	}
 
-	r, err := f.registration(string(parts[4]))
-	if err != nil || leaf.URIs[0].String() != r.uri() {
+	r, err := f.registration(claims.Identity.Node)
+	if err != nil || claims.Identity.PodUID != r.PodUID || claims.Identity.Universe != r.Universe || claims.Identity.PodName != r.Node {
 		return registration{}, errors.New("unregistered client identity")
 	}
 

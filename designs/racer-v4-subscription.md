@@ -1,8 +1,11 @@
 # Racer v4 subscription contract
 
 The dataplane uses mutually authenticated `GET /v4/config`, with any deployment
-query parameters preserved. Enrollment and fresh TLS proofs remain `/v3/enroll`
-and `/v3/proof`. The control endpoint must not emit legacy `ControlCommand`.
+query parameters preserved. Enrollment and diagnostic fresh TLS proofs remain
+`/v3/enroll` and `/v3/proof`. The control endpoint must not emit legacy
+`ControlCommand`. The [stateless contract](racer-rust-controlplane.md) governs
+signed process claims, live authorization, and revision reservation. Proofs do
+not gate CA rotation or create participant history.
 
 ## Request
 
@@ -66,8 +69,8 @@ has its own bounded timeouts. Connection rotation is jittered over 240-300
 seconds and leaves enough lifetime for a full response.
 
 Successful control observations refresh operational storage freshness for 75
-seconds without acknowledging storage application. Fresh TLS proofs have an
-independent five-minute security lifetime. Successful proof refresh is jittered
+seconds without acknowledging storage application. Diagnostic fresh TLS proofs
+are separate from expiry-overlap CA rotation. Successful proof refresh is jittered
 over 180-240 seconds. Worker installation changes and old-connection drains
 unpark the credential manager immediately; proof scheduling runs even when
 projection validation or reenrollment fails. Failed proofs retry after five
@@ -82,8 +85,8 @@ Old work drains locally and never blocks publication to other nodes.
 
 The Rust dataplane has one local application coordinator for file and HTTP
 sources. Remote phase commands and forward grants have been removed, including
-their superseded Rust tests. The protobuf `ControlCommand` remains only for the
-Go reference protocol until Go retirement.
+their superseded Rust tests. The protobuf `ControlCommand` was removed during
+Go retirement.
 
 Coverage migration retains local all-worker commit, duplicate/stale/foreign
 acknowledgment fencing, failure recovery, and real-thread publication exclusion.
@@ -100,7 +103,8 @@ timeout 240s env TMPDIR=/home/azureuser/code/unbounded/tmp RACER_REQUIRE_URING=1
 timeout 180s env TMPDIR=/home/azureuser/code/unbounded/tmp RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --doc
 ```
 
-Results: 330 library tests and 14 binary tests passed, with 30 explicitly ignored
+Historical pre-stateless results: 330 library tests and 14 binary tests passed,
+with 30 explicitly ignored
 entries; all 73 doctests passed. Twenty-one ignored entries are subprocess
 helpers exercised through parent tests. The nine remaining opt-in entries are
 the allocator benchmark, three Go snapshot export tests, two RDMA hardware or

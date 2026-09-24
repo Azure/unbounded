@@ -31,6 +31,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	"github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
@@ -166,7 +167,7 @@ func TestGantryControlFixture(t *testing.T) {
 			}
 		}
 
-		uri := "spiffe://racer/universe/" + strings.Repeat("01", 32) + "/node/" + gantryNode(i) + fmt.Sprintf("/pod/pod%d", i)
+		uri := (fixture.Claims{Version: 1, Namespace: "gantry-e2e", Identity: fixture.CertificateIdentity{Kind: "node", Universe: strings.Repeat("01", 32), Node: gantryNode(i), PodUID: fmt.Sprintf("pod%d", i), BootID: boot, PodName: fmt.Sprintf("node%d", i)}}).URI()
 		if len(leaf.URIs) != 1 || leaf.URIs[0].String() != uri || !key.PublicKey.Equal(leaf.PublicKey) {
 			t.Fatal("issued identity must bind the enrolled pod and CSR key, ignoring requested SANs")
 		}
@@ -175,6 +176,7 @@ func TestGantryControlFixture(t *testing.T) {
 		nodeTLS.Certificates = []tls.Certificate{{Certificate: [][]byte{leaf.Raw}, PrivateKey: key}}
 		nodeClient := newClient(nodeTLS)
 		request(nodeClient, "GET", controlURL, "", "bad", nil, 400)
+		request(nodeClient, "GET", controlURL, "", strings.Repeat("05", 32), nil, 403)
 		data = request(nodeClient, "GET", controlURL, "", boot, nil, 200)
 
 		var desired pb.DesiredState

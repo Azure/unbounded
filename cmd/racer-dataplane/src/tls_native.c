@@ -120,3 +120,20 @@ int racer_tls_offload(SSL *ssl) {
 }
 
 int racer_tls_is_ca(X509 *cert) { return X509_check_ca(cert) > 0; }
+
+/* Reject missing, duplicate, wildcard, and unrelated role usages. */
+int racer_tls_role_eku(X509 *cert, int node) {
+    int critical = -1;
+    EXTENDED_KEY_USAGE *usage = X509_get_ext_d2i(cert, NID_ext_key_usage, &critical, NULL);
+    if (usage == NULL) return 0;
+    int server = 0, client = 0, invalid = 0;
+    for (int i = 0; i < sk_ASN1_OBJECT_num(usage); i++) {
+        switch (OBJ_obj2nid(sk_ASN1_OBJECT_value(usage, i))) {
+        case NID_server_auth: server++; break;
+        case NID_client_auth: client++; break;
+        default: invalid = 1;
+        }
+    }
+    EXTENDED_KEY_USAGE_free(usage);
+    return !invalid && server == 1 && client == (node ? 1 : 0);
+}

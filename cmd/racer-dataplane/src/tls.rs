@@ -25,7 +25,7 @@ use openssl::{
         verify::{X509CheckFlags, X509VerifyFlags},
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::c_void,
@@ -37,10 +37,118 @@ use std::{
 
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 const WRITE_CHUNK: usize = 64 * 1024;
-const CONTROL_PLANE_URI: &str = "spiffe://racer/controlplane";
+const CLAIMS_PREFIX: &str = "spiffe://racer/v1/";
 
-/// Application admission lease, independent of record I/O. Accepted transfers
-/// keep their own deadlines even after certificate expiry or the connection cap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedClaims {
+    pub version: u32,
+    pub namespace: String,
+    pub identity: ProcessIdentity,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProcessIdentity {
+    pub kind: String,
+    pub universe: String,
+    pub node: String,
+    #[serde(rename = "podUID")]
+    pub pod_uid: String,
+    #[serde(rename = "bootID")]
+    pub boot_id: String,
+    pub pod_name: String,
+    #[serde(rename = "containerID")]
+    pub container_id: String,
+}
+impl SignedClaims {
+    pub fn parse(uri: &str) -> io::Result<Self> {
+        let encoded = uri
+            .strip_prefix(CLAIMS_PREFIX)
+            .ok_or_else(|| invalid("missing versioned signed claims"))?;
+        if uri.len() > 4096 || encoded.len() % 2 != 0 {
+            return Err(invalid("invalid claims length"));
+        }
+        let bytes: Vec<u8> = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair =
+                    std::str::from_utf8(pair).map_err(|_| invalid("invalid claims encoding"))?;
+                u8::from_str_radix(pair, 16).map_err(|_| invalid("invalid claims encoding"))
+            })
+            .collect::<io::Result<_>>()?;
+        let claims: Self = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+        let process = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.as_bytes()[0].is_ascii_alphanumeric()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        };
+        let ns = &claims.namespace;
+        if claims.version != 1
+            || ns.is_empty()
+            || ns.len() > 63
+            || !ns.as_bytes()[0].is_ascii_alphanumeric()
+            || !ns.as_bytes()[ns.len() - 1].is_ascii_alphanumeric()
+            || !ns
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || !process(&claims.identity.pod_uid)
+            || claims.identity.pod_name.is_empty()
+            || claims.identity.pod_name.len() > 253
+            || !claims.identity.pod_name.split('.').all(|s| {
+                !s.is_empty()
+                    && s.len() <= 63
+                    && s.as_bytes()[0].is_ascii_alphanumeric()
+                    && s.as_bytes()[s.len() - 1].is_ascii_alphanumeric()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+            || !is_id(&claims.identity.boot_id)
+            || claims.identity.container_id.len() > 256
+        {
+            return Err(invalid("invalid signed identity"));
+        }
+        match claims.identity.kind.as_str() {
+            "node" => {
+                PeerIdentity::new(
+                    &claims.identity.universe,
+                    &claims.identity.node,
+                    &claims.identity.pod_uid,
+                )?;
+            }
+            "controlplane"
+                if claims.identity.universe.is_empty() && claims.identity.node.is_empty() =>
+            {
+                ()
+            }
+            _ => return Err(invalid("invalid signed role")),
+        }
+        if claims.uri()? != uri {
+            return Err(invalid("noncanonical signed claims"));
+        }
+        Ok(claims)
+    }
+    pub fn uri(&self) -> io::Result<String> {
+        Ok(format!(
+            "{CLAIMS_PREFIX}{}",
+            hex(&serde_json::to_vec(self).map_err(invalid_json)?)
+        ))
+    }
+    fn peer(&self) -> io::Result<PeerIdentity> {
+        if self.identity.kind != "node" {
+            return Err(invalid("not a dataplane identity"));
+        }
+        PeerIdentity::new(
+            &self.identity.universe,
+            &self.identity.node,
+            &self.identity.pod_uid,
+        )
+    }
+}
+
+/// Application admission lease. TLS record I/O also enforces leaf expiry.
 #[derive(Clone, Copy)]
 pub(crate) struct Admission {
     created: std::time::Instant,
@@ -315,6 +423,32 @@ fn uri_san(cert: &X509) -> io::Result<String> {
     Ok(uris[0].into())
 }
 
+fn certificate_claims(cert: &X509) -> io::Result<SignedClaims> {
+    let claims = SignedClaims::parse(&uri_san(cert)?)?;
+    if unsafe {
+        racer_tls_role_eku(
+            cert.as_ptr().cast(),
+            i32::from(claims.identity.kind == "node"),
+        )
+    } != 1
+    {
+        return Err(invalid("signed role does not match certificate EKU"));
+    }
+    let sans = cert
+        .subject_alt_names()
+        .ok_or_else(|| invalid("missing SAN"))?;
+    let dns: Vec<_> = sans.iter().filter_map(|s| s.dnsname()).collect();
+    if claims.identity.kind == "controlplane" {
+        let expected = format!("racer-controlplane.{}.svc", claims.namespace);
+        if !dns.contains(&expected.as_str()) {
+            return Err(invalid("signed namespace does not match control-plane DNS"));
+        }
+    } else if !dns.is_empty() {
+        return Err(invalid("dataplane cannot claim DNS names"));
+    }
+    Ok(claims)
+}
+
 fn timestamp(time: &openssl::asn1::Asn1TimeRef) -> io::Result<u64> {
     let epoch = Asn1Time::from_unix(0).map_err(ssl_error)?;
     let delta = epoch.diff(time).map_err(ssl_error)?;
@@ -333,6 +467,7 @@ pub fn leaf_expiry_unix(certificate_pem: &[u8]) -> io::Result<u64> {
 #[derive(Clone, Debug)]
 pub struct LeafInfo {
     pub identity: PeerIdentity,
+    pub claims: SignedClaims,
     pub issuer: String,
     pub issued_unix: u64,
     pub expires_unix: u64,
@@ -353,7 +488,8 @@ pub fn validate_leaf(
     if unsafe { racer_tls_is_ca(leaf.as_ptr().cast()) } != 0 {
         return Err(invalid("identity certificate is a CA"));
     }
-    let identity = PeerIdentity::parse(&uri_san(leaf)?)?;
+    let claims = certificate_claims(leaf)?;
+    let identity = claims.peer()?;
     if &identity != expected {
         return Err(invalid("leaf certificate identity mismatch"));
     }
@@ -393,6 +529,7 @@ pub fn validate_leaf(
     }
     Ok(LeafInfo {
         identity,
+        claims,
         issuer: issuer.ok_or_else(|| invalid("verified chain has no root"))?,
         issued_unix: timestamp(leaf.not_before())?,
         expires_unix: expiry(leaf)?,
@@ -555,6 +692,7 @@ unsafe extern "C" {
     fn racer_tls_shutdown(ssl: *mut c_void) -> NativeResult;
     fn racer_tls_offload(ssl: *mut c_void) -> i32;
     fn racer_tls_is_ca(cert: *mut c_void) -> i32;
+    fn racer_tls_role_eku(cert: *mut c_void, node: i32) -> i32;
 }
 
 #[derive(Eq, PartialEq)]
@@ -709,22 +847,22 @@ impl TlsSession {
                 if unsafe { racer_tls_is_ca(cert.as_ptr().cast()) } != 0 {
                     return Err(invalid("TLS peer identity is a CA"));
                 }
-                let uri = uri_san(&cert)?;
+                let claims = certificate_claims(&cert)?;
                 match &self.expected {
                     ExpectedPeer::ControlPlane { .. } => {
-                        if uri != CONTROL_PLANE_URI {
+                        if claims.identity.kind != "controlplane" {
                             return Err(invalid("control-plane URI SAN mismatch"));
                         }
                     }
                     ExpectedPeer::Identity(expected) => {
-                        let actual = PeerIdentity::parse(&uri)?;
+                        let actual = claims.peer()?;
                         if &actual != expected {
                             return Err(invalid("TLS peer identity mismatch"));
                         }
                         self.peer = Some(actual);
                     }
                     ExpectedPeer::Universe(expected) => {
-                        let actual = PeerIdentity::parse(&uri)?;
+                        let actual = claims.peer()?;
                         if &actual.universe != expected {
                             return Err(invalid("TLS peer universe mismatch"));
                         }
@@ -769,6 +907,14 @@ impl TlsSession {
     fn ready(&self) -> io::Result<()> {
         if !self.authenticated || self.failed {
             Err(invalid("TLS session is not authenticated"))
+        } else if self.valid_until().is_none_or(|expiry| {
+            crate::environment::wall()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                >= expiry
+        }) {
+            Err(invalid("TLS session certificate expired"))
         } else {
             Ok(())
         }
@@ -792,7 +938,7 @@ impl TlsSession {
     /// Exclusive Unix-second deadline for admitting new requests. None means the
     /// session is not authenticated or has failed. For enrollment, only the peer
     /// leaf bounds validity. Context rotation cannot extend this session's limit.
-    /// Existing transfers may finish: read/write/sendfile do not enforce expiry.
+    /// Record I/O also rejects expired sessions, including existing transfers.
     pub fn valid_until(&self) -> Option<u64> {
         if !self.authenticated || self.failed {
             return None;

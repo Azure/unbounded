@@ -231,16 +231,18 @@ fn certificate(
                 .unwrap(),
         )
         .unwrap();
-        b.append_extension(
-            ExtendedKeyUsage::new()
-                .client_auth()
-                .server_auth()
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
+        let cp = uri == Some("spiffe://racer/controlplane");
+        let mut eku = ExtendedKeyUsage::new();
+        eku.server_auth();
+        if !cp {
+            eku.client_auth();
+        }
+        b.append_extension(eku.build().unwrap()).unwrap();
         let mut san = SubjectAlternativeName::new();
-        san.uri(uri.unwrap());
+        if cp {
+            san.dns("racer-controlplane.test-namespace.svc");
+        }
+        san.uri(&crate::tls::tests::signed_uri(uri.unwrap()));
         if let Some(dns) = dns {
             san.dns(dns);
         }
@@ -469,7 +471,9 @@ fn enroll_server_with_authorities(
             .unwrap();
             let san = SubjectAlternativeName::new()
                 .critical()
-                .uri(bad_identity.unwrap_or(&identity.uri()))
+                .uri(&crate::tls::tests::signed_uri(
+                    bad_identity.unwrap_or(&identity.uri()),
+                ))
                 .build(&leaf.x509v3_context(Some(&issuer.root), None))
                 .unwrap();
             leaf.append_extension(san).unwrap();

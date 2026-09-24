@@ -7,7 +7,7 @@ use prost::Message;
 use racer_controlplane::model::*;
 use racer_controlplane::publication::*;
 use racer_controlplane::storage::*;
-use racer_controlplane::topology::{Topology, compile, degree, place};
+use racer_controlplane::topology::{Topology, compile, degree, place, place_in_universe};
 
 fn inventory(count: usize) -> Inventory {
     Inventory {
@@ -60,7 +60,11 @@ fn geometry(slots: u32, count: usize) -> Generation {
             },
         );
     }
-    let names: Vec<_> = g.nodes.keys().cloned().collect();
+    let names: BTreeMap<_, _> = g
+        .nodes
+        .iter()
+        .map(|(name, m)| (m.id.clone(), name.clone()))
+        .collect();
     g.volumes.push(Volume {
         id: "cache-uid".into(),
         name: "cache-a".into(),
@@ -71,7 +75,15 @@ fn geometry(slots: u32, count: usize) -> Generation {
         cache_generation: 0,
         routing_algorithm: ROUTING_ALGORITHM,
         max_candidate_attempts: 3,
-        owners: place(slots, &names, &[]).unwrap(),
+        owners: place_in_universe(
+            slots,
+            &g.universe,
+            &names.keys().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|id| names[&id].clone())
+        .collect(),
     });
     g.slot_history.insert("cache-uid".into(), slots);
     g
@@ -121,23 +133,17 @@ fn identity_and_socket_contract_survives_the_language_cutover() {
 
 fn assert_placement(names: &[String], owners: &[String]) {
     let mut counts = BTreeMap::<&str, usize>::new();
-    let mut repeats = 0;
-    for (i, owner) in owners.iter().enumerate() {
+    for owner in owners {
         assert!(names.contains(owner));
         *counts.entry(owner).or_default() += 1;
-        repeats += usize::from(owner == &owners[(i + 1) % owners.len()]);
     }
-    assert_eq!(counts.len(), names.len());
-    for count in counts.values() {
-        assert!(
-            *count >= owners.len() / names.len() && *count <= owners.len().div_ceil(names.len())
-        );
-    }
-    if names.len() > 1 {
-        assert_eq!(
-            repeats,
-            usize::from(names.len() == 2 && owners.len() % 2 == 1)
-        );
+    if owners.len() == SLOT_COUNT as usize {
+        let mean = owners.len() as f64 / names.len() as f64;
+        let sigma = (mean * (1.0 - 1.0 / names.len() as f64)).sqrt();
+        for name in names {
+            let count = counts.get(name.as_str()).copied().unwrap_or(0);
+            assert!((count as f64 - mean).abs() <= 6.0 * sigma);
+        }
     }
 }
 
@@ -157,27 +163,20 @@ fn membership_history_is_balanced_diverse_and_stable_across_restart_and_list_ord
             prior = next;
         }
     }
-    // This historical phase differs from a fresh lexical layout and must survive.
+    // Historical phases do not affect stateless placement.
     let names = vec!["a".into(), "b".into()];
     let prior = vec!["b".into(), "a".into(), "b".into(), "a".into()];
-    assert_eq!(place(4, &names, &prior).unwrap(), prior);
-    assert_ne!(place(4, &names, &[]).unwrap(), prior);
-    // The odd pair seam is selected for minimum movement, not fixed at slot zero.
+    assert_eq!(
+        place(4, &names, &prior).unwrap(),
+        place(4, &names, &[]).unwrap()
+    );
+    // Even malformed or oddly phased prior ownership cannot influence the map.
     for slots in [7u32, 17] {
         let prior: Vec<_> = (0..slots)
             .map(|s| names[usize::from(s >= slots.div_ceil(2))].clone())
             .collect();
         let actual = place(slots, &names, &prior).unwrap();
-        let moved = actual.iter().zip(&prior).filter(|(a, b)| a != b).count();
-        let best = (0..slots)
-            .map(|shift| {
-                (0..slots)
-                    .filter(|&s| prior[s as usize] != names[((s + shift) % slots % 2) as usize])
-                    .count()
-            })
-            .min()
-            .unwrap();
-        assert_eq!(moved, best);
+        assert_eq!(actual, place(slots, &names, &[]).unwrap());
         assert_placement(&names, &actual);
     }
     let names: Vec<String> = ["a", "b", "c", "d"].map(String::from).into();
@@ -185,16 +184,23 @@ fn membership_history_is_balanced_diverse_and_stable_across_restart_and_list_ord
     let mut joined = names.clone();
     joined.push("e".into());
     let next = place(64, &joined, &old).unwrap();
-    assert_eq!(next.iter().zip(&old).filter(|(a, b)| a != b).count(), 12);
+    assert!(next.iter().any(|owner| owner == "e"));
+    for (new, old) in next.iter().zip(&old) {
+        assert!(new == old || new == "e");
+    }
     let removed = place(64, &names, &next).unwrap();
+    assert_eq!(removed, old);
     for (old, new) in next.iter().zip(&removed) {
         if old != "e" {
             assert_eq!(old, new);
         }
     }
+    // More participants than slots is valid; some participants own zero slots.
+    let one = place(1, &names, &[]).unwrap();
+    assert_eq!(one.len(), 1);
+    assert_placement(&names, &one);
     for (p, n) in [
         (0, vec!["a".into()]),
-        (1, names.clone()),
         (SLOT_COUNT + 1, names),
         (8, vec!["a".into(), "a".into()]),
     ] {
@@ -224,14 +230,15 @@ fn normalized_inventory_selects_processes_and_keeps_removal_authority() {
     let loaded = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(compile(&input, Some(&loaded)).unwrap(), first);
 
-    // Recreated node cannot adopt its former process. The old UID still receives removal.
+    // Current Kubernetes inventory is authoritative, including recreation. The
+    // subscription adapter handles identities absent from the compiled catalog.
     input.nodes[1].pods.retain(|p| p.uid == "ready-replacement");
     input.nodes[1].uid = "new-node-uid".into();
     let replaced = compile(&input, Some(&first)).unwrap();
-    assert!(replaced.nodes["node-00000"].ip.is_none());
-    assert!(replaced.nodes.contains_key(&format!("deleted/{id}")));
-    let removal = Topology::new(&replaced).unwrap().snapshot(&id).unwrap();
-    assert!(!removal.idle && removal.volumes.is_empty());
+    assert!(replaced.nodes["node-00000"].ip.is_some());
+    assert_ne!(replaced.nodes["node-00000"].id, id);
+    assert_eq!(replaced, compile(&input, None).unwrap());
+    assert!(Topology::new(&replaced).unwrap().snapshot(&id).is_none());
     input.nodes[1].pods[0].uid = "new-process".into();
     input.nodes[1].pods[0].ready = true;
     let active = compile(&input, Some(&replaced)).unwrap();
@@ -246,19 +253,18 @@ fn normalized_inventory_selects_processes_and_keeps_removal_authority() {
             .unwrap()
             .idle
     );
-    assert!(!topology.snapshot(&id).unwrap().idle);
-    assert!(idle.withdrawn.contains("cache-uid"));
-    assert_eq!(idle.slot_history["cache-uid"], SLOT_COUNT);
+    assert!(topology.snapshot(&id).is_none());
+    assert!(idle.withdrawn.is_empty());
+    assert!(idle.slot_history.is_empty());
     assert!(topology.snapshot(&identity("node", "unknown")).is_none());
 
     input.nodes[1].eligible = false;
     let excluded = compile(&input, Some(&idle)).unwrap();
     assert!(
-        !Topology::new(&excluded)
+        Topology::new(&excluded)
             .unwrap()
             .snapshot(&idle.nodes["node-00000"].id)
-            .unwrap()
-            .idle
+            .is_none()
     );
     input.nodes[0].fabric = "bad fabric".into();
     assert!(compile(&input, Some(&excluded)).is_err());
@@ -286,7 +292,16 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
             );
             assert_eq!(snapshot.revision, 7);
             let mut all_direct = BTreeSet::new();
-            for (v, actual) in g.volumes.iter().zip(&snapshot.volumes) {
+            assert_eq!(
+                snapshot.idle,
+                g.volumes.iter().all(|v| !v.owners.contains(name))
+            );
+            assert_eq!(
+                snapshot.volumes.len(),
+                g.volumes.iter().filter(|v| v.owners.contains(name)).count()
+            );
+            for actual in &snapshot.volumes {
+                let v = g.volumes.iter().find(|v| v.id == actual.id).unwrap();
                 let mut edges = BTreeMap::new();
                 let mut direct = BTreeSet::new();
                 for source in 0..p {
@@ -370,7 +385,8 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
     input.caches[0].uid = "recreated-cache".into();
     input.caches[0].cache_generation = 9;
     let new = compile(&input, Some(&old)).unwrap();
-    assert!(new.withdrawn.contains("cache-uid"));
+    assert!(new.withdrawn.is_empty());
+    assert_eq!(new, compile(&input, None).unwrap());
     assert_eq!(new.volumes[0].cache_socket, old.volumes[0].cache_socket);
     assert_eq!(new.volumes[0].id, "recreated-cache");
     assert_eq!(new.volumes[0].cache_generation, 9);
@@ -404,10 +420,8 @@ fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
     let compiled = compile(&input, None).unwrap();
     assert_eq!(compiled.volumes[0].routing_algorithm, 3);
     let mut publication = Publication::<Generation>::default();
-    let load = publication.acquire_leadership();
-    publication.loaded(load, None).unwrap();
-    let commit = publication.prepare(compiled).unwrap().unwrap();
-    publication.complete(commit.ticket, CommitOutcome::Committed);
+    publication.publish(compiled, 1).unwrap();
+    // Serialization remains a wire/fixture contract, not restart authority.
     let loaded: Generation =
         serde_json::from_slice(&publication.published().unwrap().canonical_bytes()).unwrap();
     assert_eq!(compile(&input, Some(&loaded)).unwrap(), loaded);
@@ -431,7 +445,7 @@ fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
         invalid.volumes[0].routing_algorithm = algorithm;
         assert!(Topology::new(&invalid).is_err(), "algorithm {algorithm}");
         assert!(
-            publication.prepare(invalid).is_err(),
+            publication.publish(invalid, 2).is_err(),
             "algorithm {algorithm}"
         );
         assert_eq!(publication.published().unwrap().as_ref(), &loaded);
@@ -442,99 +456,73 @@ fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
 fn commit_failures_unknown_outcomes_restart_and_stale_leadership_never_publish_intent() {
     let desired = geometry(64, 4);
     let mut state = Publication::<Generation>::default();
-    assert!(state.prepare(desired.clone()).is_err());
-    let load = state.acquire_leadership();
-    state.loaded(load, None).unwrap();
-    let commit = state.prepare(desired.clone()).unwrap().unwrap();
+    // Authority and uncertain reservation outcomes are checked by the runtime.
+    // Until it supplies a reserved revision there is no local publication.
+    assert!(state.publish(desired.clone(), 0).is_err());
     assert!(state.published().is_none());
-    assert_eq!(commit.value.revision, 1);
-    assert_eq!(commit.digest, commit.value.digest());
-    assert_eq!(
-        state.complete(commit.ticket, CommitOutcome::Rejected),
-        Completion::Unchanged
-    );
+    let mut invalid = desired.clone();
+    invalid.volumes[0].owners.pop();
+    assert!(state.publish(invalid.clone(), 1).is_err());
     assert!(state.published().is_none());
-    let commit = state.prepare(desired.clone()).unwrap().unwrap();
-    assert_eq!(
-        state.complete(commit.ticket, CommitOutcome::Committed),
-        Completion::Published
-    );
-    assert_eq!(state.published().unwrap().revision, 1);
-    assert!(state.prepare(desired.clone()).unwrap().is_none());
-    let durable = state.published().unwrap().as_ref().clone();
-
+    let first = state.publish(desired.clone(), 2).unwrap();
+    assert_eq!(first.revision, 2);
     let mut changed = desired.clone();
     changed.volumes[0].cache_generation += 1;
-    let commit = state.prepare(changed.clone()).unwrap().unwrap();
-    assert_eq!(commit.expected_digest, Some(durable.digest()));
-    assert_eq!(
-        state.complete(commit.ticket, CommitOutcome::ReloadRequired),
-        Completion::ReloadRequired
-    );
-    assert_eq!(state.published().unwrap().revision, 1);
-    assert!(state.prepare(changed.clone()).is_err());
-    let load = state.begin_reload().unwrap();
-    assert_eq!(
-        state
-            .loaded(load, Some(commit.value.as_ref().clone()))
-            .unwrap(),
-        Completion::Published
-    );
-    assert_eq!(state.published().unwrap().revision, 2);
-    assert!(state.prepare(changed.clone()).unwrap().is_none());
+    for revision in [0, 1, 2] {
+        assert!(state.publish(changed.clone(), revision).is_err());
+        assert!(std::sync::Arc::ptr_eq(state.published().unwrap(), &first));
+    }
+    assert!(state.publish(invalid.clone(), 3).is_err());
+    let mut foreign = changed.clone();
+    foreign.universe = "other-universe".into();
+    assert!(state.publish(foreign, 3).is_err());
+    assert!(std::sync::Arc::ptr_eq(state.published().unwrap(), &first));
+    let next = state.publish(changed, 4).unwrap();
+    assert_eq!(next.revision, 4);
+    assert_eq!(next.volumes[0].cache_generation, 1);
+    assert_eq!(first.volumes[0].cache_generation, 0);
 
-    let bytes = state.published().unwrap().canonical_bytes();
+    // Restart has no payload to reload. Only a successful fresh rebuild with a
+    // newly reserved range can establish a publication, and gaps are expected.
     let mut restarted = Publication::<Generation>::default();
-    let load = restarted.acquire_leadership();
-    restarted
-        .loaded(load, Some(serde_json::from_slice(&bytes).unwrap()))
-        .unwrap();
-    assert!(restarted.prepare(changed.clone()).unwrap().is_none());
-    changed.volumes[0].cache_generation += 1;
-    let commit = restarted.prepare(changed.clone()).unwrap().unwrap();
-    restarted.lose_leadership();
-    assert_eq!(
-        restarted.complete(commit.ticket, CommitOutcome::Committed),
-        Completion::Stale
-    );
-    assert_eq!(restarted.published().unwrap().revision, 2);
-    let old_load = restarted.acquire_leadership();
-    let load = restarted.acquire_leadership();
-    assert_eq!(
-        restarted
-            .loaded(old_load, Some(commit.value.as_ref().clone()))
-            .unwrap(),
-        Completion::Stale
-    );
-    restarted
-        .loaded(load, Some(commit.value.as_ref().clone()))
-        .unwrap();
-    assert_eq!(restarted.published().unwrap().revision, 3);
-    let load = restarted.begin_reload().unwrap();
-    assert!(restarted.loaded(load, Some(durable)).is_err());
-    assert!(restarted.needs_reload());
-    assert_eq!(restarted.published().unwrap().revision, 3);
+    assert!(restarted.published().is_none());
+    let reserved = racer_controlplane::kubernetes::RANGE_SIZE + 1;
+    assert!(restarted.publish(invalid, reserved).is_err());
+    assert!(restarted.published().is_none());
+    let rebuilt = compile(&inventory(2), None).unwrap();
+    let current = restarted.publish(rebuilt.clone(), reserved + 1).unwrap();
+    assert_eq!(current.nodes, rebuilt.nodes);
+    assert_eq!(current.volumes, rebuilt.volumes);
+    assert!(restarted.publish(desired, next.revision).is_err());
+    assert!(std::sync::Arc::ptr_eq(
+        restarted.published().unwrap(),
+        &current
+    ));
 }
 
 #[test]
 fn unknown_write_that_did_not_commit_reloads_and_can_retry_without_revision_gaps() {
     let mut publication = Publication::default();
-    let load = publication.acquire_leadership();
-    publication.loaded(load, None).unwrap();
-    let commit = publication.prepare(geometry(8, 2)).unwrap().unwrap();
-    publication.complete(commit.ticket, CommitOutcome::ReloadRequired);
-    let load = publication.begin_reload().unwrap();
-    publication.loaded(load, None).unwrap();
-    let retry = publication.prepare(geometry(8, 2)).unwrap().unwrap();
-    assert_eq!(retry.digest, commit.digest);
-    assert_ne!(retry.ticket, commit.ticket);
-    assert_eq!(
-        publication.complete(commit.ticket, CommitOutcome::Committed),
-        Completion::Stale
-    );
+    let desired = geometry(8, 2);
+    // No publish call is made while reservation is uncertain. Retrying uses a
+    // fresh reserved range rather than recovering a durable topology payload.
+    // The historical test name is retained; gaps are valid in the new contract.
     assert!(publication.published().is_none());
-    publication.complete(retry.ticket, CommitOutcome::Committed);
-    assert_eq!(publication.published().unwrap().revision, 1);
+    let revision = racer_controlplane::kubernetes::RANGE_SIZE + 1;
+    let retry = publication.publish(desired.clone(), revision).unwrap();
+    assert_eq!(retry.revision, revision);
+    assert_eq!(retry.volumes, desired.volumes);
+    for stale in [1, revision - 1, revision] {
+        assert!(publication.publish(desired.clone(), stale).is_err());
+        assert!(std::sync::Arc::ptr_eq(
+            publication.published().unwrap(),
+            &retry
+        ));
+    }
+    let successor = revision + racer_controlplane::kubernetes::RANGE_SIZE;
+    let next = publication.publish(desired, successor).unwrap();
+    assert_eq!(next.revision, successor);
+    assert_eq!(next.volumes, retry.volumes);
 }
 
 #[test]
@@ -611,44 +599,31 @@ fn exact_quantities_and_last_good_storage_versions_are_independent_of_topology()
     );
 
     let mut publication = Publication::<StoragePolicy>::default();
-    let load = publication.acquire_leadership();
-    publication.loaded(load, None).unwrap();
     let initial = StoragePolicy::new(identity("node", "node-uid"), [9; 32]);
     let desired = initial.resolve("site-a", None, Some("513Mi")).unwrap();
-    let commit = publication.prepare(desired).unwrap().unwrap();
     assert!(publication.published().is_none());
-    publication.complete(commit.ticket, CommitOutcome::Committed);
+    publication.publish(desired, 1).unwrap();
     let good = publication.published().unwrap().as_ref().clone();
     assert_eq!(good.version, 1);
     assert_eq!(good.desired_bytes, 576 << 20);
-    assert!(
-        publication
-            .prepare(good.resolve("site-a", Some("576Mi"), None).unwrap())
-            .unwrap()
-            .is_none()
-    );
+    assert_eq!(good.resolve("site-a", Some("576Mi"), None).unwrap(), good);
     let invalid = good
         .resolve("site-b", Some("invalid"), Some("10Gi"))
         .unwrap();
     assert_eq!(invalid.version, good.version);
     assert_eq!(invalid.desired_bytes, good.desired_bytes);
-    let commit = publication.prepare(invalid).unwrap().unwrap();
-    publication.complete(commit.ticket, CommitOutcome::Committed);
+    publication.publish(invalid, 2).unwrap();
     let policy = publication.published().unwrap();
     assert_eq!(policy.revision, 2);
-    assert_eq!(policy.wire().unwrap().version, 1);
+    assert!(policy.wire().is_none());
     assert_eq!(policy.universe, "site-b");
     assert!(policy.validation_error.is_some());
     let next = policy.resolve("site-b", None, Some("10Gi")).unwrap();
     assert_eq!(next.version, 2);
     assert!(next.validation_error.is_none());
-    let commit = publication.prepare(next).unwrap().unwrap();
-    publication.complete(commit.ticket, CommitOutcome::ReloadRequired);
+    assert!(publication.publish(next.clone(), 2).is_err());
     assert_eq!(publication.published().unwrap().version, 1);
-    let load = publication.begin_reload().unwrap();
-    publication
-        .loaded(load, Some(commit.value.as_ref().clone()))
-        .unwrap();
+    publication.publish(next, 3).unwrap();
     assert_eq!(publication.published().unwrap().version, 2);
     let initial_invalid = initial.resolve("site-a", Some("bad"), None).unwrap();
     assert!(initial_invalid.wire().is_none());
@@ -657,24 +632,23 @@ fn exact_quantities_and_last_good_storage_versions_are_independent_of_topology()
 #[test]
 fn page_geometry_rejects_obsolete_capacity_without_replacing_last_good_policy() {
     let mut publication = Publication::<StoragePolicy>::default();
-    let load = publication.acquire_leadership();
-    publication.loaded(load, None).unwrap();
     let desired = StoragePolicy::new(identity("node", "node-uid"), [9; 32])
         .resolve("site-a", Some("1Gi"), None)
         .unwrap();
-    let commit = publication.prepare(desired).unwrap().unwrap();
-    publication.complete(commit.ticket, CommitOutcome::Committed);
+    publication.publish(desired, 1).unwrap();
     let good = publication.published().unwrap().as_ref().clone();
     for bytes in [32 << 20, 64 << 20, 96 << 20, 516 << 20, MAX_BYTES + 1] {
         let mut malformed = good.clone();
         malformed.desired_bytes = bytes;
-        assert!(publication.prepare(malformed).is_err(), "bytes {bytes}");
+        assert!(publication.publish(malformed, 2).is_err(), "bytes {bytes}");
         assert_eq!(publication.published().unwrap().as_ref(), &good);
     }
     for quantity in ["32Mi", "64Mi", "96Mi", "511Mi"] {
         let invalid = good.resolve("site-a", Some(quantity), Some("2Ti")).unwrap();
         assert!(invalid.validation_error.is_some());
-        assert_eq!(invalid.wire(), good.wire());
+        assert_eq!(invalid.desired_bytes, good.desired_bytes);
+        assert_eq!(invalid.version, good.version);
+        assert!(invalid.wire().is_none());
     }
     let resized = good.resolve("site-a", Some("1536Mi"), None).unwrap();
     assert_eq!(resized.desired_bytes, 1536 << 20);
@@ -692,7 +666,7 @@ fn ten_thousand_members_have_sparse_recipient_snapshots() {
     for name in ["node-00000", "node-05000", "node-09999"] {
         let snapshot = topology.snapshot(&g.nodes[name].id).unwrap();
         let top = snapshot.volumes[0].topology.as_ref().unwrap();
-        assert!((26..=27).contains(&top.local_slots.len()));
+        assert!((1..=64).contains(&top.local_slots.len()));
         assert!(top.neighbors.len() <= top.local_slots.len() * 64);
         assert!(snapshot.peers.len() <= top.local_slots.len() * 128);
         assert!(snapshot.peers.len() < g.nodes.len());

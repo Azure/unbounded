@@ -223,14 +223,12 @@ mod placement_tests {
         let dir = crate::conformance::compiler_snapshots();
         let files: Vec<String> =
             serde_json::from_slice(&std::fs::read(dir.join("files.json")).unwrap()).unwrap();
+        let mut idle_count = 0;
+        let mut active_count = 0;
         for file in files {
             let s = snapshot(&dir.join(&file));
             let started = std::time::Instant::now();
             let prepared = trust(&s).prepare(envelope(s.clone())).unwrap();
-            let r = prepared.volumes()[0].routing();
-            let p = r.geometry.slot_count();
-            let v = &s.volumes[0];
-            let t = v.topology.as_ref().unwrap();
             let (prefix, recipient) = file.rsplit_once('-').unwrap();
             let owners: Vec<String> = serde_json::from_slice(
                 &std::fs::read(dir.join(format!("{prefix}-owners.json"))).unwrap(),
@@ -244,16 +242,66 @@ mod placement_tests {
                 "node-{:06}",
                 recipient.trim_end_matches(".pb").parse::<usize>().unwrap()
             );
+            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            assert_eq!(hex(&s.node), ids[&name]);
+            assert!(!owners.is_empty());
+            assert!(owners.iter().all(|owner| ids.contains_key(owner)));
+            if owners.len() == 262144 {
+                let mean = owners.len() as f64 / ids.len() as f64;
+                let sigma = (mean * (1.0 - 1.0 / ids.len() as f64)).sqrt();
+                let mut counts = std::collections::BTreeMap::new();
+                for owner in &owners {
+                    *counts.entry(owner).or_insert(0usize) += 1;
+                }
+                for name in ids.keys() {
+                    let count = counts.get(name).copied().unwrap_or(0);
+                    assert!((count as f64 - mean).abs() <= 6.0 * sigma);
+                }
+                // HRW balance and neighboring-owner diversity are statistical;
+                // adjacent repeats are expected, not invalid placement.
+                let repeats = owners.windows(2).filter(|w| w[0] == w[1]).count();
+                let expected = (owners.len() - 1) as f64 / ids.len() as f64;
+                assert!((repeats as f64 - expected).abs() <= 6.0 * sigma);
+                assert!(owners.windows(3).any(|w| w[0] == w[1] && w[1] == w[2]));
+            }
+            let local: Vec<_> = owners
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, owner)| (owner == &name).then_some(slot as u32))
+                .collect();
+            assert_eq!(s.idle, local.is_empty());
+            if local.is_empty() {
+                idle_count += 1;
+                assert!(s.volumes.is_empty());
+                assert!(s.peers.is_empty());
+                assert!(s.member_catalogs.is_empty());
+                assert!(prepared.volumes().is_empty());
+                let mut bad = s.clone();
+                bad.peers.push(proto::Peer::default());
+                assert!(trust(&bad).prepare(envelope(bad)).is_err());
+                continue;
+            }
+            active_count += 1;
+            assert_eq!(prepared.volumes().len(), 1);
+            assert_eq!(s.volumes.len(), 1);
+            let r = prepared.volumes()[0].routing();
+            let p = r.geometry.slot_count();
+            let v = &s.volumes[0];
+            let t = v.topology.as_ref().unwrap();
+            assert_eq!(p as usize, owners.len());
+            assert_eq!(t.local_slots, local);
+            assert_eq!(s.member_catalogs.len(), 1);
+            assert_eq!(v.member_catalog, Some(0));
+            assert_eq!(
+                s.member_catalogs[0]
+                    .members
+                    .iter()
+                    .map(|member| hex(&member.node))
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ids.values().cloned().collect(),
+            );
             for primary in 0..p as usize {
                 assert_eq!(r.local.contains(&(primary as u32)), owners[primary] == name);
-                if !file.contains("historical") {
-                    assert!(
-                        (1..3).any(|i| owners[primary] != owners[(primary + i) % owners.len()])
-                    );
-                    if !file.contains("-n2-") || p % 2 == 0 {
-                        assert_ne!(owners[primary], owners[(primary + 1) % owners.len()]);
-                    }
-                }
             }
             for (slot, peer) in &r.neighbors {
                 assert_eq!(
@@ -274,10 +322,6 @@ mod placement_tests {
             if file.contains("-n2-") && !file.contains("historical") {
                 let mut cursor = r.start("/all-primary-proof");
                 for primary in 0..p {
-                    assert!(
-                        (1..3).any(|i| r.local.contains(&primary)
-                            != r.local.contains(&((primary + i) % p)))
-                    );
                     if !r.local.contains(&primary) {
                         cursor.owner = primary;
                         // A remote physical owner does not imply a sparse proof
@@ -310,12 +354,26 @@ mod placement_tests {
                 .routing_algorithm = Some(1);
             assert!(Routing::new(&legacy.universe, &legacy.volumes[0]).is_err());
             assert!(trust(&legacy).prepare(envelope(legacy)).is_err());
-            // Exact sparse and endpoint checks cannot be bypassed by interleaving.
+            // Exact sparse and endpoint checks apply even to a sole slot owner.
             let mut bad = s.clone();
-            bad.volumes[0].topology.as_mut().unwrap().neighbors.pop();
+            let neighbors = &mut bad.volumes[0].topology.as_mut().unwrap().neighbors;
+            if neighbors.pop().is_none() {
+                neighbors.push(proto::SlotPeer {
+                    slot: p,
+                    peer: "unknown".into(),
+                });
+            }
             assert!(trust(&bad).prepare(envelope(bad.clone())).is_err());
             bad = s.clone();
-            bad.volumes[0].peer_endpoints.as_mut().unwrap().peers[0].peer = "unknown".into();
+            let endpoints = &mut bad.volumes[0].peer_endpoints.as_mut().unwrap().peers;
+            if let Some(endpoint) = endpoints.first_mut() {
+                endpoint.peer = "unknown".into();
+            } else {
+                endpoints.push(proto::VolumePeerEndpoint {
+                    peer: "unknown".into(),
+                    http_address: "127.0.0.1:9443".into(),
+                });
+            }
             assert!(trust(&bad).prepare(envelope(bad)).is_err());
             println!(
                 "RUST_COMPILER_CONFIG {file} binary={} prepare_and_checks_ms={}",
@@ -323,6 +381,11 @@ mod placement_tests {
                 started.elapsed().as_millis()
             );
         }
+        assert!(
+            idle_count > 0,
+            "conformance must exercise zero-slot live members"
+        );
+        assert!(active_count > 0);
         let s = snapshot(&dir.join("default.pb"));
         let r = Routing::new(&s.universe, &s.volumes[0]).unwrap();
         for label in [
@@ -340,7 +403,12 @@ mod placement_tests {
                 .map(|i| format!("/compiler-{label}-{i}"))
                 .find(|t| {
                     let c = r.start(t);
-                    r.local.contains(&c.owner) == local && (local || r.last_hop(&c))
+                    r.local.contains(&c.owner) == local
+                        && (local
+                            || (r.last_hop(&c)
+                                && (1..3).any(|i| {
+                                    r.local.contains(&((c.owner + i) % r.geometry.slot_count()))
+                                })))
                 })
                 .unwrap();
             let c = r.start(&target);

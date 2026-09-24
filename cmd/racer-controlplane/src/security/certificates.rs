@@ -249,7 +249,12 @@ pub(crate) fn sign_leaf(
     skew: i64,
 ) -> Result<(Vec<u8>, i64)> {
     let (parent, key) = ca.parse()?;
-    let uri = identity.uri()?;
+    let uri = SignedClaims {
+        version: 1,
+        namespace: namespace.into(),
+        identity: identity.clone(),
+    }
+    .uri()?;
     let expiry = now.checked_add(lifetime).context("expiry overflow")?;
     ensure!(lifetime > 0 && skew >= 0, "invalid leaf lifetime");
     ensure!(
@@ -316,6 +321,27 @@ pub(crate) fn leaf_uri(cert: &X509) -> Result<String> {
     let sans = cert.subject_alt_names().context("missing SAN")?;
     let uris: Vec<_> = sans.iter().filter_map(|s| s.uri()).collect();
     ensure!(uris.len() == 1, "expected exactly one URI");
+    let claims = SignedClaims::parse(uris[0])?;
+    let eku = parsed.extended_key_usage()?.context("missing leaf EKU")?;
+    ensure!(
+        eku.value.server_auth
+            && !eku.value.any
+            && !eku.value.code_signing
+            && !eku.value.email_protection
+            && !eku.value.time_stamping
+            && !eku.value.ocsp_signing
+            && eku.value.other.is_empty()
+            && eku.value.client_auth == (claims.identity.kind == IdentityKind::Node),
+        "invalid role EKU"
+    );
+    let dns: Vec<_> = sans.iter().filter_map(|s| s.dnsname()).collect();
+    match claims.identity.kind {
+        IdentityKind::ControlPlane => ensure!(
+            dns == [format!("racer-controlplane.{}.svc", claims.namespace)],
+            "invalid control-plane DNS"
+        ),
+        IdentityKind::Node => ensure!(dns.is_empty(), "node cannot claim DNS names"),
+    }
     Ok(uris[0].into())
 }
 
@@ -338,4 +364,15 @@ pub(crate) fn leaf_root(cert: &X509, bundle: &TrustBundle, server: bool) -> Resu
         }
     }
     bail!("leaf not valid under trust bundle")
+}
+
+pub fn certificate_issuer(pem: &[u8], bundle: &TrustBundle) -> Result<String> {
+    let certificates = parse_certificates(pem)?;
+    leaf_uri(&certificates[0])?;
+    leaf_root(&certificates[0], bundle, true)
+}
+
+pub fn certificate_claims(pem: &[u8]) -> Result<SignedClaims> {
+    let certificates = parse_certificates(pem)?;
+    SignedClaims::parse(&leaf_uri(&certificates[0])?)
 }

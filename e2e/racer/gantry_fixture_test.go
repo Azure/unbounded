@@ -40,6 +40,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	"github.com/Azure/unbounded/e2e/racer/fixture"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
@@ -404,7 +405,9 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		t.Fatal(err)
 	}
 
-	serverDER, err := issue(key.Public(), "spiffe://racer/controlplane", false)
+	serverClaims := fixture.Claims{Version: 1, Namespace: "gantry-e2e", Identity: fixture.CertificateIdentity{Kind: "controlplane", PodUID: "controller", BootID: strings.Repeat("04", 32), PodName: "controller"}}
+
+	serverDER, err := issue(key.Public(), serverClaims.URI(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,10 +422,9 @@ func (f *gantryFixture) control(nodes int) [][]string {
 
 	tokenValue := hex.EncodeToString(token)
 	configs := map[string]*pb.Configuration{}
-	nodeURI := func(i int) string {
-		return "spiffe://racer/universe/" + strings.Repeat("01", 32) + "/node/" + gantryNode(i) + fmt.Sprintf("/pod/pod%d", i)
+	nodeClaims := func(i int, boot string) fixture.Claims {
+		return fixture.Claims{Version: 1, Namespace: "gantry-e2e", Identity: fixture.CertificateIdentity{Kind: "node", Universe: strings.Repeat("01", 32), Node: gantryNode(i), PodUID: fmt.Sprintf("pod%d", i), BootID: boot, PodName: fmt.Sprintf("node%d", i)}}
 	}
-	identities := map[string]string{}
 
 	for i := 0; i < nodes; i++ {
 		node, _ := hex.DecodeString(gantryNode(i))
@@ -454,7 +456,6 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		}
 
 		configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: s}}
-		identities[nodeURI(i)] = gantryNode(i)
 	}
 
 	authenticatedNode := func(r *http.Request) string {
@@ -462,7 +463,18 @@ func (f *gantryFixture) control(nodes int) [][]string {
 			return ""
 		}
 
-		return identities[r.TLS.PeerCertificates[0].URIs[0].String()]
+		claims, err := fixture.ParseClaims(r.TLS.PeerCertificates[0].URIs[0].String())
+		if err != nil {
+			return ""
+		}
+
+		for i := range nodes {
+			if claims == nodeClaims(i, claims.Identity.BootID) {
+				return gantryNode(i)
+			}
+		}
+
+		return ""
 	}
 
 	mux := http.NewServeMux()
@@ -476,6 +488,12 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		boot, err := hex.DecodeString(r.Header.Get("X-Racer-Boot"))
 		if err != nil || len(boot) != 32 {
 			http.Error(w, "invalid boot", http.StatusBadRequest)
+			return
+		}
+
+		claims, _ := fixture.ParseClaims(r.TLS.PeerCertificates[0].URIs[0].String())
+		if claims.Identity.BootID != r.Header.Get("X-Racer-Boot") {
+			http.Error(w, "signed boot mismatch", http.StatusForbidden)
 			return
 		}
 
@@ -537,7 +555,13 @@ func (f *gantryFixture) control(nodes int) [][]string {
 			return
 		}
 
-		leaf, err := issue(csr.PublicKey, nodeURI(i), true)
+		boot, err := hex.DecodeString(r.Header.Get("X-Racer-Boot"))
+		if err != nil || len(boot) != 32 || hex.EncodeToString(boot) != r.Header.Get("X-Racer-Boot") {
+			http.Error(w, "invalid boot", http.StatusBadRequest)
+			return
+		}
+
+		leaf, err := issue(csr.PublicKey, nodeClaims(i, hex.EncodeToString(boot)).URI(), true)
 		if err != nil {
 			t.Error(err)
 			http.Error(w, "issuance failed", http.StatusInternalServerError)

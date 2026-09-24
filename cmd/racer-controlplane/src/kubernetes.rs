@@ -6,47 +6,36 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::{
-    ByteString, api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::ObjectMeta,
-};
 use kube::core::SelectorExt;
 use kube::{
     Api, Client, ResourceExt,
-    api::{
-        ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
-        Preconditions,
-    },
+    api::{ApiResource, DynamicObject, Patch, PatchParams},
     core::GroupVersionKind,
     runtime::watcher,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    model::{self, Cache, Generation, Inventory, Node, Pod, identity, universe_for_site},
-    publication::{CommitOutcome, Durable, Publication},
+    model::{self, Cache, Inventory, Node, Pod, identity, universe_for_site},
+    publication::Versioned,
     security::CaState,
     status,
     storage::StoragePolicy,
     subscription::{SecurityGetter, Subscriptions},
-    topology::compile,
+    topology::{PlacementCache, compile_cached},
 };
 
 const PREFIX: &str = "racer.unbounded-cloud.io/";
-const RECORD_LABEL: &str = "racer.unbounded-cloud.io/rust-state";
-const CHUNK_BYTES: usize = 512 * 1024;
-const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
-const STORE_GATE: &str = "racer-v4-store-gate";
-const GATE_TIMEOUT: Duration = Duration::from_secs(30);
-const GATE_RETRY: Duration = Duration::from_millis(100);
-const PAGE_SIZE: u32 = 64;
+
+#[path = "revision.rs"]
+mod revision;
+pub use revision::{CHECKPOINT, RANGE_SIZE, RevisionRange, RevisionStore};
 
 #[derive(Clone)]
 pub struct SecurityContext {
@@ -70,6 +59,9 @@ pub struct RuntimeOptions {
     pub snapshot_cache_bytes: usize,
     pub long_poll: Duration,
     pub retry_interval: Duration,
+    /// Maximum age of a completed authority/reconciliation round. Must exceed
+    /// the retry interval. Independent request checks enforce this during stalls.
+    pub authority_timeout: Duration,
 }
 
 impl RuntimeOptions {
@@ -80,6 +72,7 @@ impl RuntimeOptions {
             snapshot_cache_bytes: 64 * 1024 * 1024,
             long_poll: Duration::from_secs(28),
             retry_interval: Duration::from_secs(5),
+            authority_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -93,12 +86,11 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(options: RuntimeOptions, security: SecurityGetter) -> Self {
+        let subscriptions =
+            Subscriptions::new(security, options.snapshot_cache_bytes, options.long_poll);
+        subscriptions.authority_until(Instant::now());
         Self {
-            subscriptions: Subscriptions::new(
-                security,
-                options.snapshot_cache_bytes,
-                options.long_poll,
-            ),
+            subscriptions,
             options,
             ready: Arc::new(AtomicBool::new(false)),
         }
@@ -108,6 +100,7 @@ impl Runtime {
     }
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+            && self.subscriptions.authority_current()
             && (self.subscriptions.security)().is_some_and(|s| {
                 self.subscriptions.fence.read().unwrap().as_deref() == Some(s.fence.as_str())
             })
@@ -121,6 +114,10 @@ impl Runtime {
     /// Watches start on followers too. Each watch atomically replaces its indexed
     /// inventory on relist. Dirty universe names are a deterministic latest set.
     pub async fn run(self, client: Client, shutdown: CancellationToken) -> Result<()> {
+        ensure!(
+            self.options.authority_timeout > self.options.retry_interval,
+            "authority timeout must exceed retry interval"
+        );
         let (send, mut receive) = mpsc::channel(1024);
         let mut tasks = tokio::task::JoinSet::new();
         for kind in Kind::ALL {
@@ -144,12 +141,12 @@ impl Runtime {
         drop(send);
         let mut index = InventoryIndex::default();
         let mut fence = String::new();
-        let mut bindings = BTreeMap::new();
+        let mut revisions = None;
         let mut dirty = BTreeSet::new();
         let mut storage_dirty = BTreeSet::new();
+        let mut placements = BTreeMap::<String, PlacementCache>::new();
         let mut tick = tokio::time::interval(self.options.retry_interval);
-        let mut last_gc = std::time::Instant::now();
-        let store = RecordStore::new(
+        let store = RevisionStore::new(
             client.clone(),
             &self.options.namespace,
             self.subscriptions.security.clone(),
@@ -172,6 +169,7 @@ impl Runtime {
             let Some(context) = context else {
                 if !fence.is_empty() {
                     fence.clear();
+                    revisions = None;
                     self.subscriptions.set_fence(None);
                     self.ready.store(false, Ordering::Release);
                 }
@@ -180,30 +178,18 @@ impl Runtime {
             if index.initialized.len() != 4 {
                 continue;
             }
-            let current_bindings: BTreeMap<_, _> = context
-                .state
-                .members()
-                .filter(|m| m.identity.kind == crate::security::IdentityKind::Node)
-                .map(|m| {
-                    (
-                        m.identity.pod_uid.clone(),
-                        (m.identity.node.clone(), m.identity.universe.clone()),
-                    )
-                })
-                .collect();
-            if bindings != current_bindings {
-                // Admission can race an inventory event. Re-evaluate membership
-                // when its durable binding changes, independently of the fence.
-                dirty.extend(index.universes());
-                bindings = current_bindings;
-            }
+            // Authorization follows current Pod/Node bindings independently of
+            // last-good topology retained for a rejected cache configuration.
+            let live = index.live_selections();
             if fence != context.fence {
                 self.ready.store(false, Ordering::Release);
                 self.subscriptions.set_fence(None);
-                let load = self.reload(&store, &context.fence).await;
-                if let Err(error) = load {
-                    tracing::error!(%error, "authoritative runtime load failed");
-                    continue;
+                match store.reserve(&context.fence).await {
+                    Ok(range) => revisions = Some(range),
+                    Err(error) => {
+                        tracing::error!(%error, "revision reservation failed");
+                        continue;
+                    }
                 }
                 fence = context.fence;
                 dirty.extend(index.universes());
@@ -216,35 +202,69 @@ impl Runtime {
                         .map(|p| p.topology.generation().universe.clone()),
                 );
                 storage_dirty.extend(index.objects[&Kind::Node].keys().cloned());
-                self.subscriptions.set_fence(Some(fence.clone()));
+                // Each acquisition rebuilds from complete live inventory. No
+                // prior leader's payload can become authoritative after restart.
+                self.subscriptions.clear();
             }
+            if revisions.as_ref().is_some_and(RevisionRange::exhausted) {
+                self.subscriptions.set_fence(None);
+                self.ready.store(false, Ordering::Release);
+                match store.reserve(&fence).await {
+                    Ok(range) => revisions = Some(range),
+                    Err(error) => {
+                        tracing::error!(%error, "revision range renewal failed");
+                        continue;
+                    }
+                }
+            }
+            // Check authoritative lease/CA state and checkpoint existence before
+            // each publication batch. Suspend serving on uncertain authority.
+            let authority_deadline = Instant::now() + self.options.authority_timeout;
+            if let Err(error) = store.verify(&fence).await {
+                tracing::warn!(%error, "runtime authority unavailable");
+                self.subscriptions.set_fence(None);
+                self.ready.store(false, Ordering::Release);
+                continue;
+            }
+            let revisions = revisions.as_mut().expect("reserved leadership range");
+            let live_nodes: BTreeSet<_> = index.objects[&Kind::Node]
+                .values()
+                .filter_map(ResourceExt::uid)
+                .map(|uid| identity("node", &uid))
+                .collect();
+            self.subscriptions
+                .policies
+                .write()
+                .unwrap()
+                .retain(|id, _| live_nodes.contains(id));
             let work = std::mem::take(&mut dirty);
             for universe in work {
-                if let Err(error) = self.reconcile(&store, &index, &universe, &fence).await {
+                if let Err(error) = self
+                    .reconcile(
+                        &store,
+                        revisions,
+                        &index,
+                        &universe,
+                        &fence,
+                        placements.entry(universe.clone()).or_default(),
+                    )
+                    .await
+                {
                     tracing::warn!(%universe, %error, "topology reconcile retained last good state");
                     dirty.insert(universe);
                 }
             }
+            let current_universes = index.universes();
+            placements.retain(|universe, _| current_universes.contains(universe));
+            self.subscriptions.set_live_selections(live);
             // Invalid intent keeps last-good publications usable. A universe
             // without a committed publication still fails its own selection.
-            self.ready.store(
-                !self.subscriptions.universes.read().unwrap().is_empty()
-                    || index.universes().is_empty(),
-                Ordering::Release,
-            );
             let nodes = std::mem::take(&mut storage_dirty);
-            let results: Vec<_> = futures::stream::iter(nodes.into_iter().map(|node| {
-                let (runtime, store, index, fence) = (&self, &store, &index, &fence);
-                async move {
-                    let result = runtime.reconcile_storage(store, index, &node, fence).await;
-                    (node, result)
-                }
-            }))
-            .buffer_unordered(16)
-            .collect()
-            .await;
-            for (node, result) in results {
-                if let Err(error) = result {
+            for node in nodes {
+                if let Err(error) = self
+                    .reconcile_storage(&store, revisions, &index, &node, &fence)
+                    .await
+                {
                     tracing::warn!(%node, %error, "storage reconcile retry");
                     storage_dirty.insert(node);
                 }
@@ -252,11 +272,19 @@ impl Runtime {
             if let Err(error) = self.publish_cache_status(&client, &index, &fence).await {
                 tracing::warn!(%error, "cache status retry");
             }
-            if last_gc.elapsed() >= Duration::from_secs(300) {
-                if let Err(error) = store.collect_garbage(&fence).await {
-                    tracing::warn!(%error, "chunk collection retry");
-                }
-                last_gc = std::time::Instant::now();
+            if store.verify(&fence).await.is_ok() {
+                // Use the round's start, not the I/O completion time: a delayed
+                // response must not extend authority based on an old read.
+                self.subscriptions.authority_until(authority_deadline);
+                self.subscriptions.set_fence(Some(fence.clone()));
+                self.ready.store(
+                    !self.subscriptions.universes.read().unwrap().is_empty()
+                        || index.universes().is_empty(),
+                    Ordering::Release,
+                );
+            } else {
+                self.subscriptions.set_fence(None);
+                self.ready.store(false, Ordering::Release);
             }
         }
         self.ready.store(false, Ordering::Release);
@@ -267,139 +295,47 @@ impl Runtime {
         Ok(())
     }
 
-    async fn reload(&self, store: &RecordStore, fence: &str) -> Result<()> {
-        let mut continuation = String::new();
-        loop {
-            let records = store
-                .api
-                .list(
-                    &ListParams::default()
-                        .labels(&format!("{RECORD_LABEL}=pointer"))
-                        .limit(PAGE_SIZE)
-                        .continue_token(&continuation),
-                )
-                .await?;
-            continuation = records.metadata.continue_.clone().unwrap_or_default();
-            for pointer in records {
-                let name = pointer.name_any();
-                let Some(record) = store.load(&name).await? else {
-                    continue;
-                };
-                let record = store.claim(&name, record, fence).await?;
-                match record.pointer.kind.as_str() {
-                    "topology" => {
-                        let generation: Generation = serde_json::from_slice(&record.bytes)?;
-                        generation.validate()?;
-                        self.subscriptions.install(Arc::new(generation))?;
-                    }
-                    "storage" => {
-                        let policy: StoragePolicy = serde_json::from_slice(&record.bytes)?;
-                        policy.validate()?;
-                        self.subscriptions.install_policy(Arc::new(policy));
-                    }
-                    _ => bail!("unknown runtime record kind"),
-                }
-            }
-            if continuation.is_empty() {
-                break;
-            }
-        }
-        store.check(fence)?;
-        Ok(())
-    }
-
     async fn reconcile(
         &self,
-        store: &RecordStore,
+        store: &RevisionStore,
+        revisions: &mut RevisionRange,
         index: &InventoryIndex,
         universe: &str,
         fence: &str,
+        placement: &mut PlacementCache,
     ) -> Result<()> {
-        let key = format!("racer-v4-topology-{}", identity("universe", universe));
-        let old = store.load(&key).await?;
-        ensure!(
-            old.is_some()
-                || !self
-                    .subscriptions
-                    .universes
-                    .read()
-                    .unwrap()
-                    .contains_key(&identity("universe", universe)),
-            "committed topology disappeared"
-        );
-        let old = match old {
-            Some(old) => Some(store.claim(&key, old, fence).await?),
-            None => None,
-        };
-        let previous: Option<Generation> = old
-            .as_ref()
-            .map(|r| serde_json::from_slice(&r.bytes))
-            .transpose()?;
-        let mut input = index.inventory(universe, &self.options.socket_root)?;
-        // Enrollment already durably binds known Pods to Node UIDs. Reuse that
-        // authority after historical topology rows are removed.
-        let security = (self.subscriptions.security)().context("leadership lost")?;
-        let bindings: BTreeMap<_, _> = security
-            .state
-            .members()
-            .filter(|p| p.identity.kind == crate::security::IdentityKind::Node)
-            .map(|p| {
-                (
-                    p.identity.pod_uid.as_str(),
-                    (p.identity.node.as_str(), p.identity.universe.as_str()),
-                )
-            })
-            .collect();
-        for node in &mut input.nodes {
-            let id = identity("node", &node.uid);
-            for pod in &mut node.pods {
-                if bindings
-                    .get(pod.uid.as_str())
-                    .is_some_and(|old| old.0 != id || old.1 != identity("universe", universe))
-                {
-                    pod.available = false;
-                }
-            }
-        }
-        let (mut desired, previous) = tokio::task::spawn_blocking(move || {
-            compile(&input, previous.as_ref()).map(|desired| (desired, previous))
-        })
-        .await??;
-        // Deconfiguration is synthesized from durable enrollment and the current
-        // universe revision. It requires no historical recipient ledger.
-        desired.nodes.retain(|_, member| member.ip.is_some());
-        desired.withdrawn.clear();
-        desired
-            .slot_history
-            .retain(|id, _| desired.volumes.iter().any(|v| &v.id == id));
-        let next = persist(
-            store,
-            &key,
-            "topology",
-            old.as_ref(),
-            previous,
-            desired,
-            fence,
-        )
-        .await?;
-        let hex = identity("universe", universe);
-        let current = self
+        let previous = self
             .subscriptions
             .universes
             .read()
             .unwrap()
-            .get(&hex)
-            .map(|p| p.topology.generation().digest());
-        if current != Some(next.digest()) {
-            store.check(fence)?;
-            self.subscriptions.install(Arc::new(next))?;
+            .get(&identity("universe", universe))
+            .map(|p| p.topology.generation().clone());
+        let input = index.inventory(universe, &self.options.socket_root)?;
+        // Move the disposable per-universe cache into blocking compilation and
+        // retain it even when validation rejects the desired configuration.
+        let mut cached = std::mem::take(placement);
+        let (result, cached) = tokio::task::spawn_blocking(move || {
+            let result = compile_cached(&input, previous.as_deref(), &mut cached)
+                .map(|desired| (desired, previous));
+            (result, cached)
+        })
+        .await?;
+        *placement = cached;
+        let (mut desired, previous) = result?;
+        if previous.as_deref() != Some(&desired) {
+            desired.revision = next_revision(store, revisions, fence).await?;
+            desired.validate()?;
+            store.verify(fence).await?;
+            self.subscriptions.install(Arc::new(desired))?;
         }
         Ok(())
     }
 
     async fn reconcile_storage(
         &self,
-        store: &RecordStore,
+        store: &RevisionStore,
+        revisions: &mut RevisionRange,
         index: &InventoryIndex,
         name: &str,
         fence: &str,
@@ -426,51 +362,23 @@ impl Runtime {
             .unwrap()
             .get(&node_id)
             .cloned();
-        let unchanged = cached.as_ref().filter(|p| {
-            p.resolve(&universe, override_value, site_value)
-                .is_ok_and(|next| &next == p.as_ref())
-        });
-        let next = if let Some(policy) = unchanged {
-            policy.as_ref().clone()
-        } else {
-            let key = format!("racer-v4-storage-{node_id}");
-            let old = store.load(&key).await?;
-            ensure!(
-                old.is_some() || cached.is_none(),
-                "committed storage policy disappeared"
-            );
-            let old = match old {
-                Some(old) => Some(store.claim(&key, old, fence).await?),
-                None => None,
-            };
-            let previous: Option<StoragePolicy> = old
-                .as_ref()
-                .map(|r| serde_json::from_slice(&r.bytes))
-                .transpose()?;
-            let base = previous
-                .clone()
-                .unwrap_or_else(|| StoragePolicy::new(node_id.clone(), rand::random()));
-            let desired = base.resolve(&universe, override_value, site_value)?;
-            persist(
-                store,
-                &key,
-                "storage",
-                old.as_ref(),
-                previous,
-                desired,
-                fence,
-            )
-            .await?
-        };
-        let changed = self
-            .subscriptions
-            .policies
-            .read()
-            .unwrap()
-            .get(&node_id)
-            .is_none_or(|p| p.as_ref() != &next);
+        let base = cached
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| StoragePolicy::for_node(&uid));
+        let mut next = base.resolve(&universe, override_value, site_value)?;
+        let changed = cached.as_deref() != Some(&next);
         if changed {
-            store.check(fence)?;
+            next.revision = next_revision(store, revisions, fence).await?;
+            if next.validation_error.is_none()
+                && (base.desired_bytes != next.desired_bytes
+                    || base.validation_error.is_some()
+                    || base.version == 0)
+            {
+                next.version = next.revision;
+            }
+            next.validate()?;
+            store.verify(fence).await?;
             self.subscriptions.install_policy(Arc::new(next.clone()));
         }
         let universe_id = identity("universe", &universe);
@@ -625,586 +533,15 @@ impl Runtime {
     }
 }
 
-async fn persist<T: Durable + DeserializeOwned>(
-    store: &RecordStore,
-    key: &str,
-    kind: &str,
-    old: Option<&Record>,
-    previous: Option<T>,
-    desired: T,
+async fn next_revision(
+    store: &RevisionStore,
+    range: &mut RevisionRange,
     fence: &str,
-) -> Result<T> {
-    let mut publication = Publication::default();
-    let ticket = publication.acquire_leadership();
-    publication.loaded(ticket, previous)?;
-    let Some(commit) = publication.prepare(desired)? else {
-        return Ok(publication.published().unwrap().as_ref().clone());
-    };
-    let bytes = serde_json::to_vec(commit.value.as_ref())?;
-    match store.commit(key, kind, old, &bytes, fence).await {
-        Ok(_) => {
-            publication.complete(commit.ticket, CommitOutcome::Committed);
-        }
-        Err(error) => {
-            publication.complete(commit.ticket, CommitOutcome::ReloadRequired);
-            let readback = store.load(key).await?;
-            store.check(fence)?;
-            if let Some(record) = readback.filter(|r| r.pointer.fence == fence && r.bytes == bytes)
-            {
-                let ticket = publication.begin_reload()?;
-                publication.loaded(ticket, Some(serde_json::from_slice(&record.bytes)?))?;
-            } else {
-                return Err(error);
-            }
-        }
+) -> Result<u64> {
+    if range.exhausted() {
+        *range = store.reserve(fence).await?;
     }
-    store.check(fence)?;
-    Ok(publication.published().unwrap().as_ref().clone())
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Pointer {
-    pub format: u32,
-    pub kind: String,
-    pub fence: String,
-    pub digest: String,
-    pub chunks: Vec<String>,
-    pub bytes: usize,
-    /// Reserved before staging. Replacing this pointer fences abandoned writers;
-    /// GC protects both committed and proposed chunks across leader takeover.
-    #[serde(default)]
-    pub proposed: Vec<String>,
-}
-
-#[derive(Clone)]
-pub struct Record {
-    pub resource_version: String,
-    pub pointer: Pointer,
-    pub bytes: Vec<u8>,
-}
-
-/// Direct Kubernetes I/O seam. Immutable content is durable before the sole
-/// pointer CAS. Conflicts and transport errors always require authoritative load.
-#[derive(Clone)]
-pub struct RecordStore {
-    client: Client,
-    api: Api<ConfigMap>,
-    security: SecurityGetter,
-    gate_state: Arc<Mutex<Option<GateAttempt>>>,
-}
-
-struct GateAttempt {
-    fence: String,
-    operation: String,
-    previous_version: Option<String>,
-}
-
-/// Register ownership before sending acquisition I/O. Cancellation transfers the
-/// local lock to bounded cleanup; failed cleanup remains for the next store call.
-/// Only a new leadership fence can recover state lost in a process crash.
-struct StoreGuard {
-    api: Api<ConfigMap>,
-    state: Option<OwnedMutexGuard<Option<GateAttempt>>>,
-}
-impl Drop for StoreGuard {
-    fn drop(&mut self) {
-        if let Some(mut state) = self.state.take().filter(|state| state.is_some()) {
-            let api = self.api.clone();
-            tokio::spawn(async move {
-                if tokio::time::timeout(GATE_TIMEOUT, recover_gate(&api, &mut state))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("store gate cleanup timed out; next store call will retry");
-                }
-            });
-        }
-    }
-}
-
-async fn recover_gate(api: &Api<ConfigMap>, pending: &mut Option<GateAttempt>) {
-    let Some(attempt) = pending.as_ref() else {
-        return;
-    };
-    loop {
-        match release_gate_attempt(api, attempt).await {
-            Ok(()) => {
-                *pending = None;
-                return;
-            }
-            Err(error) => {
-                tracing::debug!(%error, "store gate cleanup retry");
-                tokio::time::sleep(GATE_RETRY).await;
-            }
-        }
-    }
-}
-
-async fn release_gate_attempt(api: &Api<ConfigMap>, attempt: &GateAttempt) -> Result<()> {
-    let current = api.get_opt(STORE_GATE).await?;
-    if let Some(mut object) = current {
-        ensure!(
-            object.labels().get(RECORD_LABEL).map(String::as_str) == Some("gate"),
-            "store gate collision during cleanup"
-        );
-        let data = object.data.as_mut().context("missing gate data")?;
-        if data.get("fence") == Some(&attempt.fence)
-            && data.get("operation") == Some(&attempt.operation)
-        {
-            data.insert("operation".into(), String::new());
-        } else if object.resource_version() != attempt.previous_version {
-            // A successor (or an already completed release) invalidated our CAS.
-            return Ok(());
-        }
-        // Even an unchanged predecessor must be CAS-touched: an acquisition with
-        // a lost response may still be in flight. Never clear a different owner.
-        api.replace(STORE_GATE, &PostParams::default(), &object)
-            .await?;
-    } else {
-        // Fence a delayed first-create by occupying the name. Keep this empty
-        // object as a CAS target; deleting it would allow that create to succeed.
-        api.create(
-            &PostParams::default(),
-            &ConfigMap {
-                metadata: ObjectMeta {
-                    name: Some(STORE_GATE.into()),
-                    labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "gate".into())])),
-                    ..Default::default()
-                },
-                data: Some(BTreeMap::from([
-                    ("fence".into(), attempt.fence.clone()),
-                    ("operation".into(), String::new()),
-                ])),
-                ..Default::default()
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-impl RecordStore {
-    pub fn new(client: Client, namespace: &str, security: SecurityGetter) -> Self {
-        Self {
-            api: Api::namespaced(client.clone(), namespace),
-            client,
-            security,
-            gate_state: Arc::new(Mutex::new(None)),
-        }
-    }
-    fn check(&self, fence: &str) -> Result<()> {
-        ensure!(
-            (self.security)().is_some_and(|s| s.fence == fence && s.state.fence() == fence),
-            "leadership lost"
-        );
-        Ok(())
-    }
-    async fn authoritative_fence(&self, fence: &str) -> Result<()> {
-        self.check(fence)?;
-        crate::security::kubernetes::KubernetesCaStore::new(
-            self.client.clone(),
-            self.api.namespace().unwrap_or_default().into(),
-            crate::security::Leadership::new(fence.into())?,
-        )
-        .check_fence()
-        .await?;
-        self.check(fence)
-    }
-
-    async fn gate(&self, fence: &str) -> Result<StoreGuard> {
-        let operation = uuid::Uuid::new_v4().to_string();
-        tokio::time::timeout(GATE_TIMEOUT, async {
-            let mut guard = StoreGuard {
-                api: self.api.clone(),
-                state: Some(self.gate_state.clone().lock_owned().await),
-            };
-            let state = guard.state.as_mut().unwrap();
-            recover_gate(&self.api, state).await;
-            loop {
-                let old = self.api.get_opt(STORE_GATE).await?;
-                self.authoritative_fence(fence).await?;
-                if let Some(object) = &old {
-                    ensure!(
-                        object.labels().get(RECORD_LABEL).map(String::as_str) == Some("gate"),
-                        "store gate collision"
-                    );
-                    let data = object.data.as_ref().context("missing gate data")?;
-                    if data.get("fence").map(String::as_str) == Some(fence)
-                        && data.get("operation").is_some_and(|s| !s.is_empty())
-                    {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                }
-                let object = ConfigMap {
-                    metadata: ObjectMeta {
-                        name: Some(STORE_GATE.into()),
-                        resource_version: old.as_ref().and_then(ResourceExt::resource_version),
-                        labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "gate".into())])),
-                        ..Default::default()
-                    },
-                    data: Some(BTreeMap::from([
-                        ("fence".into(), fence.into()),
-                        ("operation".into(), operation.clone()),
-                    ])),
-                    ..Default::default()
-                };
-                **state = Some(GateAttempt {
-                    fence: fence.into(),
-                    operation: operation.clone(),
-                    previous_version: object.resource_version(),
-                });
-                let result = if old.is_some() {
-                    self.api
-                        .replace(STORE_GATE, &PostParams::default(), &object)
-                        .await
-                } else {
-                    self.api.create(&PostParams::default(), &object).await
-                };
-                match result {
-                    Ok(_) => {}
-                    Err(kube::Error::Api(e)) if e.code == 409 => {
-                        **state = None;
-                        continue;
-                    }
-                    Err(error) => {
-                        let readback = self.api.get_opt(STORE_GATE).await?;
-                        if !readback.is_some_and(|o| {
-                            o.data.as_ref().is_some_and(|d| {
-                                d.get("operation") == Some(&operation)
-                                    && d.get("fence").map(String::as_str) == Some(fence)
-                            })
-                        }) {
-                            return Err(error.into());
-                        }
-                    }
-                }
-                self.check(fence)?;
-                return Ok(guard);
-            }
-        })
-        .await
-        .context("store gate busy")?
-    }
-
-    /// Collection holds the same gate as staging and pointer commit. References
-    /// are read directly in bounded pages; partial scans never delete anything.
-    /// Deletes use the candidate UID/RV, protecting chunks reused after takeover.
-    pub async fn collect_garbage(&self, fence: &str) -> Result<usize> {
-        let _guard = self.gate(fence).await?;
-        let mut referenced = BTreeSet::new();
-        let mut continuation = String::new();
-        loop {
-            let page = self
-                .api
-                .list(
-                    &ListParams::default()
-                        .labels(&format!("{RECORD_LABEL}=pointer"))
-                        .limit(PAGE_SIZE)
-                        .continue_token(&continuation),
-                )
-                .await?;
-            continuation = page.metadata.continue_.clone().unwrap_or_default();
-            for mut object in page {
-                let mut pointer: Pointer = serde_json::from_str(
-                    object
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("pointer"))
-                        .context("missing pointer")?,
-                )?;
-                ensure!(
-                    pointer.format == 1
-                        && pointer.chunks.len() <= MAX_RECORD_BYTES / CHUNK_BYTES + 1,
-                    "invalid pointer during collection"
-                );
-                if !pointer.proposed.is_empty() {
-                    // The gate proves no current writer is staging. Clear an
-                    // abandoned reservation by CAS before considering its chunks.
-                    // A delayed old commit still has the pre-clear target RV.
-                    pointer.proposed.clear();
-                    pointer.fence = fence.into();
-                    object
-                        .data
-                        .as_mut()
-                        .unwrap()
-                        .insert("pointer".into(), serde_json::to_string(&pointer)?);
-                    self.authoritative_fence(fence).await?;
-                    self.api
-                        .replace(&object.name_any(), &PostParams::default(), &object)
-                        .await?;
-                }
-                referenced.extend(pointer.chunks);
-                ensure!(
-                    referenced.len() <= 1_000_000,
-                    "GC reference capacity exceeded"
-                );
-            }
-            if continuation.is_empty() {
-                break;
-            }
-        }
-        let mut deleted = 0;
-        loop {
-            // Metadata-only list avoids materializing pages of 512KiB payloads.
-            let page = self
-                .api
-                .list_metadata(
-                    &ListParams::default()
-                        .labels(&format!("{RECORD_LABEL}=chunk"))
-                        .limit(PAGE_SIZE)
-                        .continue_token(&continuation),
-                )
-                .await?;
-            continuation = page.metadata.continue_.clone().unwrap_or_default();
-            for object in page {
-                let name = object.name_any();
-                let Some(digest) = name.strip_prefix("racer-v4-chunk-") else {
-                    continue;
-                };
-                if referenced.contains(digest) {
-                    continue;
-                }
-                self.authoritative_fence(fence).await?;
-                let params = DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: object.uid(),
-                        resource_version: object.resource_version(),
-                    }),
-                    ..Default::default()
-                };
-                match self.api.delete(&name, &params).await {
-                    Ok(_) => deleted += 1,
-                    Err(kube::Error::Api(e)) if matches!(e.code, 404 | 409) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if continuation.is_empty() {
-                break;
-            }
-        }
-        Ok(deleted)
-    }
-    pub async fn load(&self, name: &str) -> Result<Option<Record>> {
-        let fence = (self.security)().context("leadership unavailable")?.fence;
-        let _guard = self.gate(&fence).await?;
-        let Some(cm) = self.api.get_opt(name).await? else {
-            return Ok(None);
-        };
-        ensure!(
-            cm.labels().get(RECORD_LABEL).map(String::as_str) == Some("pointer"),
-            "state name collision"
-        );
-        let pointer: Pointer = serde_json::from_str(
-            cm.data
-                .as_ref()
-                .and_then(|d| d.get("pointer"))
-                .context("missing pointer")?,
-        )?;
-        ensure!(
-            pointer.format == 1
-                && pointer.bytes <= MAX_RECORD_BYTES
-                && pointer.chunks.len() <= MAX_RECORD_BYTES / CHUNK_BYTES + 1,
-            "invalid record bounds"
-        );
-        if pointer.bytes == 0 && pointer.chunks.is_empty() {
-            return Ok(None);
-        }
-        let mut bytes = Vec::with_capacity(pointer.bytes);
-        for digest in &pointer.chunks {
-            ensure!(
-                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
-                "invalid chunk identity"
-            );
-            let chunk = self.api.get(&format!("racer-v4-chunk-{digest}")).await?;
-            let data = &chunk
-                .binary_data
-                .as_ref()
-                .and_then(|d| d.get("content"))
-                .context("missing chunk content")?
-                .0;
-            ensure!(
-                chunk.immutable == Some(true)
-                    && data.len() <= CHUNK_BYTES
-                    && hex::encode(Sha256::digest(data)) == *digest,
-                "corrupt immutable chunk"
-            );
-            ensure!(
-                bytes.len() + data.len() <= pointer.bytes,
-                "chunk data exceeds record bounds"
-            );
-            bytes.extend_from_slice(data);
-        }
-        ensure!(
-            bytes.len() == pointer.bytes && hex::encode(Sha256::digest(&bytes)) == pointer.digest,
-            "record digest mismatch"
-        );
-        Ok(Some(Record {
-            resource_version: cm.resource_version().context("missing resourceVersion")?,
-            pointer,
-            bytes,
-        }))
-    }
-    pub async fn claim(&self, name: &str, old: Record, fence: &str) -> Result<Record> {
-        self.check(fence)?;
-        if old.pointer.fence == fence {
-            return Ok(old);
-        }
-        self.commit(name, &old.pointer.kind, Some(&old), &old.bytes, fence)
-            .await
-    }
-    pub async fn commit(
-        &self,
-        name: &str,
-        kind: &str,
-        old: Option<&Record>,
-        bytes: &[u8],
-        fence: &str,
-    ) -> Result<Record> {
-        ensure!(bytes.len() <= MAX_RECORD_BYTES, "record capacity exceeded");
-        let _guard = self.gate(fence).await?;
-        self.check(fence)?;
-        let proposed: Vec<_> = bytes
-            .chunks(CHUNK_BYTES)
-            .map(|b| hex::encode(Sha256::digest(b)))
-            .collect();
-        let mut reserved = old.map(|r| r.pointer.clone()).unwrap_or_else(|| Pointer {
-            format: 1,
-            kind: kind.into(),
-            fence: fence.into(),
-            digest: hex::encode(Sha256::digest([])),
-            chunks: vec![],
-            bytes: 0,
-            proposed: vec![],
-        });
-        reserved.fence = fence.into();
-        reserved.proposed = proposed;
-        // Reserve the target RV before any chunk is created. Even a first write
-        // has a CAS target; abandoned reservations are repaired on reconciliation.
-        self.authoritative_fence(fence).await?;
-        let reservation = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(name.into()),
-                resource_version: old.map(|r| r.resource_version.clone()),
-                labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "pointer".into())])),
-                ..Default::default()
-            },
-            data: Some(BTreeMap::from([(
-                "pointer".into(),
-                serde_json::to_string(&reserved)?,
-            )])),
-            ..Default::default()
-        };
-        let reservation = if old.is_some() {
-            self.api
-                .replace(name, &PostParams::default(), &reservation)
-                .await?
-        } else {
-            match self.api.create(&PostParams::default(), &reservation).await {
-                Ok(value) => value,
-                Err(kube::Error::Api(e)) if e.code == 409 => {
-                    let existing = self.api.get(name).await?;
-                    let pointer: Pointer = serde_json::from_str(
-                        existing
-                            .data
-                            .as_ref()
-                            .and_then(|d| d.get("pointer"))
-                            .context("missing reservation")?,
-                    )?;
-                    ensure!(
-                        pointer.bytes == 0 && pointer.chunks.is_empty(),
-                        "record already committed"
-                    );
-                    let mut reservation = reservation;
-                    reservation.metadata.resource_version = existing.resource_version();
-                    self.authoritative_fence(fence).await?;
-                    self.api
-                        .replace(name, &PostParams::default(), &reservation)
-                        .await?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        let mut chunks = Vec::new();
-        for content in bytes.chunks(CHUNK_BYTES) {
-            let digest = hex::encode(Sha256::digest(content));
-            let name = format!("racer-v4-chunk-{digest}");
-            let cm = ConfigMap {
-                metadata: ObjectMeta {
-                    name: Some(name.clone()),
-                    labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "chunk".into())])),
-                    ..Default::default()
-                },
-                immutable: Some(true),
-                binary_data: Some(BTreeMap::from([(
-                    "content".into(),
-                    ByteString(content.to_vec()),
-                )])),
-                ..Default::default()
-            };
-            match self.api.create(&PostParams::default(), &cm).await {
-                Ok(_) => {}
-                Err(kube::Error::Api(e)) if e.code == 409 => {
-                    let mut existing = self.api.get(&name).await?;
-                    ensure!(
-                        existing.immutable == Some(true) && existing.binary_data == cm.binary_data,
-                        "immutable chunk name collision"
-                    );
-                    // Metadata can change on immutable ConfigMaps. Touch on every
-                    // reuse so a paused predecessor's conditional delete cannot
-                    // remove a chunk this writer is about to reference.
-                    existing
-                        .metadata
-                        .annotations
-                        .get_or_insert_default()
-                        .insert(
-                            "racer.unbounded-cloud.io/chunk-use".into(),
-                            uuid::Uuid::new_v4().to_string(),
-                        );
-                    self.api
-                        .replace(&name, &PostParams::default(), &existing)
-                        .await?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-            chunks.push(digest);
-        }
-        // The target RV was captured before this authoritative fence read. A
-        // takeover claims every pointer before serving, invalidating paused CASes.
-        self.authoritative_fence(fence).await?;
-        self.check(fence)?;
-        let pointer = Pointer {
-            format: 1,
-            kind: kind.into(),
-            fence: fence.into(),
-            digest: hex::encode(Sha256::digest(bytes)),
-            chunks,
-            bytes: bytes.len(),
-            proposed: Vec::new(),
-        };
-        let cm = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(name.into()),
-                resource_version: reservation.resource_version(),
-                labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "pointer".into())])),
-                ..Default::default()
-            },
-            data: Some(BTreeMap::from([(
-                "pointer".into(),
-                serde_json::to_string(&pointer)?,
-            )])),
-            ..Default::default()
-        };
-        let stored = self.api.replace(name, &PostParams::default(), &cm).await?;
-        self.check(fence)?;
-        Ok(Record {
-            resource_version: stored
-                .resource_version()
-                .context("missing stored resourceVersion")?,
-            pointer,
-            bytes: bytes.into(),
-        })
-    }
+    range.take()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1507,6 +844,52 @@ impl InventoryIndex {
     }
 
     pub fn inventory(&self, universe: &str, socket_root: &str) -> Result<Inventory> {
+        self.inventory_inner(universe, socket_root, true)
+    }
+
+    /// Membership authorization depends only on live identity, eligibility, and
+    /// deterministic Pod selection. Invalid fabric/cache/placement intent cannot
+    /// revoke unrelated healthy members of the retained last-good topology.
+    pub fn live_selections(&self) -> BTreeMap<(String, String), Selection> {
+        let mut live = BTreeMap::new();
+        for universe in self.universes() {
+            let Ok(input) = self.inventory_inner(&universe, "", false) else {
+                continue;
+            };
+            for node in input.nodes {
+                if !node.eligible || !node.ready || node.uid.is_empty() || node.name.is_empty() {
+                    continue;
+                }
+                let pod = node
+                    .pods
+                    .iter()
+                    .filter(|p| {
+                        p.available && !p.uid.is_empty() && model::available_ip(&p.ip).is_some()
+                    })
+                    .min_by_key(|p| (!p.ready, p.created_at, &p.name, &p.uid));
+                if let Some(pod) = pod {
+                    live.insert(
+                        (identity("universe", &universe), identity("node", &node.uid)),
+                        Selection {
+                            node_name: node.name,
+                            pod_namespace: pod.namespace.clone(),
+                            pod_name: pod.name.clone(),
+                            pod_uid: pod.uid.clone(),
+                            universe: universe.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        live
+    }
+
+    fn inventory_inner(
+        &self,
+        universe: &str,
+        socket_root: &str,
+        include_caches: bool,
+    ) -> Result<Inventory> {
         let enabled = self.objects[&Kind::Site]
             .values()
             .any(|s| universe_for_site(&s.name_any()) == universe && site_enabled(s));
@@ -1581,7 +964,7 @@ impl InventoryIndex {
             });
         }
         let mut caches = Vec::new();
-        if enabled {
+        if enabled && include_caches {
             for c in self.objects[&Kind::Cache].values() {
                 if self.selected_universes(c)?.contains(universe) {
                     caches.push(Cache {

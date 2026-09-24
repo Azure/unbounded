@@ -5,30 +5,13 @@
 //! an externally elected term, and the fenced store below. No HTTP header can
 //! construct a `TlsProof`. Private CA state belongs in a Secret, never a log.
 //!
-//! Durable state is a fresh-deployment format (version 4); public bundle.json
-//! remains byte-compatible with the Go PKI helpers (version 1).
-//!
-//! Wiring order:
-//! 1. Start replica CSR publication and proof/production listeners on followers.
-//!    Keep LocalKey private to the process; publish only CSR, boot and Pod owner.
-//! 2. After election, acquire CaManager with a unique Leadership and publish trust.
-//!    Implement CaStore with direct reads, immutable shards and Secret/public CAS.
-//! 3. Direct-list every eligible replica and admit unknown boots as `pending`.
-//!    Authorize replica ownership, issue production/probe leaves, CAS responses
-//!    against the exact request boot/CSR, and atomically install both snapshots.
-//! 4. Enrollment uses TokenReview, authorize_renewal/authorize_enrollment and
-//!    committed topology selection before issue. Return chain_pem and issuer.
-//! 5. Acquire HotTls::production_connection before each handshake and retain its
-//!    guard through transport close. Put VerifiedPeer in trusted request context;
-//!    check node_pod and verify_member per request. Followers reject leader-only
-//!    handlers immediately; keep replica proof serving for warm standby checks.
-//! 6. Feed actual proof exchanges to record_proof. Complete direct admission and
-//!    absence sweeps before advance_rotation. Cancel Leadership on election loss.
-//!
-//! `crate::service` supplies deadlines/concurrency admission, automatic rotation,
-//! direct inventory, response CAS, old-connection closure and readiness. It
-//! replaces managed Pods with multiple actual boots and waits for UID absence.
-//! Retirement tombstones remain conservative and are not collected.
+//! Version 5 private state has at most two authorities and fixed-size rotation
+//! metadata. Leaves carry versioned signed claims; TLS proves key ownership.
+//! Enrollment always authorizes live Kubernetes resources. Request authentication
+//! uses only signed claims, current trust, expiry, and local topology policy.
+//! Rotation waits for publication overlap and durable issuer expiry watermarks,
+//! never for fleet acknowledgments. Replica keys remain process-local; bounded
+//! Pod annotations carry only the current CSR and certificate response.
 
 #[path = "security/certificates.rs"]
 mod certificates;
@@ -71,6 +54,10 @@ fn process_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+fn pod_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 253 && value.split('.').all(certificates::valid_namespace)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +111,55 @@ impl Identity {
                 Ok("spiffe://racer/controlplane".into())
             }
         }
+    }
+}
+
+/// Canonical URI SAN payload. Hex encoding keeps every claim unambiguous and
+/// avoids URL normalization differences between TLS implementations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedClaims {
+    pub version: u32,
+    pub namespace: String,
+    pub identity: Identity,
+}
+
+impl SignedClaims {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.version == 1, "unsupported certificate claims version");
+        ensure!(
+            certificates::valid_namespace(&self.namespace),
+            "invalid claims namespace"
+        );
+        self.identity.uri()?;
+        ensure!(hex_id(&self.identity.boot_id), "invalid signed boot nonce");
+        ensure!(pod_name(&self.identity.pod_name), "invalid signed Pod name");
+        ensure!(
+            self.identity.container_id.len() <= 256,
+            "container identity too long"
+        );
+        Ok(())
+    }
+
+    pub fn uri(&self) -> Result<String> {
+        self.validate()?;
+        let uri = format!(
+            "spiffe://racer/v1/{}",
+            hex::encode(serde_json::to_vec(self)?)
+        );
+        ensure!(uri.len() <= 4096, "certificate claims too large");
+        Ok(uri)
+    }
+
+    pub fn parse(uri: &str) -> Result<Self> {
+        ensure!(uri.len() <= 4096, "certificate claims too large");
+        let payload = uri
+            .strip_prefix("spiffe://racer/v1/")
+            .ok_or_else(|| anyhow::anyhow!("missing versioned certificate claims"))?;
+        let claims: Self = serde_json::from_slice(&hex::decode(payload)?)?;
+        claims.validate()?;
+        ensure!(claims.uri()? == uri, "noncanonical certificate claims");
+        Ok(claims)
     }
 }
 

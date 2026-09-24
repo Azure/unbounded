@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -118,6 +119,10 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 	// A singleton override event must reach the shared DaemonSet.
 	cm := overridesConfigMap(map[string]string{"racer.yaml": `apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
+- component: racer-controlplane
+  kind: Deployment
+  extraArgs:
+    controller: ["--ca-overlap-delay=10m"]
 - component: racer-dataplane
   kind: DaemonSet
   patch:
@@ -145,6 +150,16 @@ overrides:
 
 	if ds.Spec.Template.Spec.Containers[0].Image != "example.test/pinned:v2" {
 		t.Fatal("singleton event failed to fan out overrides")
+	}
+
+	var cp appsv1.Deployment
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "custom", Name: "racer-controlplane"}, &cp); err != nil {
+		t.Fatal(err)
+	}
+
+	args := cp.Spec.Template.Spec.Containers[0].Args
+	if !slices.Contains(args, "-state-namespace=custom") || !slices.Contains(args, "--ca-overlap-delay=10m") {
+		t.Fatalf("CA overlap override lost required or custom flags: %v", args)
 	}
 
 	var disabled unboundedv1alpha3.Site

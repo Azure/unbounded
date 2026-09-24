@@ -1,5 +1,10 @@
 # Resolved Racer live-campaign traffic failure
 
+> Historical pre-stateless campaign evidence. The signed-claim certificate,
+> revision-checkpoint, and expiry-overlap rotation changes require their own
+> verification; this record does not establish that they passed. See the current
+> [control-plane contract](racer-rust-controlplane.md).
+
 ## Final result
 
 The production-binary campaign passed with **3,518 continuous verified SDK reads**

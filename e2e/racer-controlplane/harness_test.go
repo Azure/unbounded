@@ -37,8 +37,9 @@ import (
 )
 
 const (
-	namespace = "racer-system"
-	prefix    = "racer.unbounded-cloud.io/"
+	namespace    = "racer-system"
+	prefix       = "racer.unbounded-cloud.io/"
+	overlapDelay = 10 * time.Second
 )
 
 // Put fixture Pod IPs in an isolated network namespace. The production topology
@@ -81,6 +82,7 @@ type replica struct {
 	pod                                       *corev1.Pod
 	ip, control, enroll, health, proof, trust string
 	process                                   *process
+	previousBoot                              string
 }
 
 type campaign struct {
@@ -307,7 +309,16 @@ func (p *process) stop(crash bool) {
 }
 
 func (c *campaign) startReplica(r *replica) {
-	cmd := exec.Command(c.cpBinary, "--state-namespace", namespace, "--pod-name", r.pod.Name, "--pod-uid", string(r.pod.UID), "--listen", r.control, "--enroll-listen", r.enroll, "--health-listen", r.health, "--replica-proof-listen", r.proof, "--trust-proof-listen", r.trust, "--socket-root", c.socketRoot, "--leaf-lifetime", "120s", "--clock-skew", "1s")
+	if pod, err := c.kube.CoreV1().Pods(namespace).Get(c.ctx, r.pod.Name, metav1.GetOptions{}); err == nil {
+		var request struct {
+			Boot string `json:"boot"`
+		}
+
+		_ = json.Unmarshal([]byte(pod.Annotations[prefix+"pki-request"]), &request)
+		r.previousBoot = request.Boot
+	}
+
+	cmd := exec.Command(c.cpBinary, "--state-namespace", namespace, "--pod-name", r.pod.Name, "--pod-uid", string(r.pod.UID), "--listen", r.control, "--enroll-listen", r.enroll, "--health-listen", r.health, "--replica-proof-listen", r.proof, "--trust-proof-listen", r.trust, "--socket-root", c.socketRoot, "--leaf-lifetime", "120s", "--clock-skew", "1s", "--ca-overlap-delay", overlapDelay.String())
 	cmd.Env = append(cleanEnv(), "KUBECONFIG="+c.kubeconfig, "RUST_LOG=racer_controlplane=debug,kube=warn")
 	r.process = c.start(r.pod.Name, cmd)
 }
@@ -345,6 +356,23 @@ func (c *campaign) leader() (*replica, error) {
 		}
 
 		if pod.Labels[prefix+"serving-leader"] == "true" {
+			var request struct {
+				Boot string `json:"boot"`
+			}
+			if json.Unmarshal([]byte(pod.Annotations[prefix+"pki-request"]), &request) != nil || request.Boot == "" || request.Boot == r.previousBoot || pod.Annotations[prefix+"routing-boot"] != request.Boot {
+				return nil, fmt.Errorf("stale serving route for %s", pod.Name)
+			}
+
+			response, err := c.http.Get("http://" + r.health + "/readyz")
+			if err != nil {
+				return nil, err
+			}
+
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("leader not ready: %d", response.StatusCode)
+			}
+
 			if found != nil {
 				return nil, fmt.Errorf("multiple serving leaders")
 			}

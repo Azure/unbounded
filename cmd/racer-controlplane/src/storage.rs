@@ -121,13 +121,13 @@ pub fn resolve_cache_size(node: Option<&str>, site: Option<&str>) -> Result<u64>
     }
 }
 
-/// Durable per-Node-UID policy. `version` changes only with effective bytes;
-/// `revision` fences the independent CAS record, including validation diagnostics.
+/// In-memory per-Node-UID intent. Runtime assigns ordered versions and revisions
+/// from its reserved range before offering changed capacity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoragePolicy {
     pub node: String,
     pub universe: String,
-    /// Random identity allocated by the adapter once, persisted before offering.
+    /// Domain-separated identity derived from the immutable Kubernetes Node UID.
     pub identity: [u8; 32],
     pub revision: u64,
     pub version: u64,
@@ -136,6 +136,13 @@ pub struct StoragePolicy {
 }
 
 impl StoragePolicy {
+    pub fn for_node(uid: &str) -> Self {
+        Self::new(
+            crate::model::identity("node", uid),
+            crate::model::identity_bytes("storage", uid),
+        )
+    }
+
     pub fn new(node: String, identity: [u8; 32]) -> Self {
         Self {
             node,
@@ -148,8 +155,8 @@ impl StoragePolicy {
         }
     }
 
-    /// Pure last-good update. Persist through a separate `Publication` before
-    /// offering it; invalid inputs never overwrite capacity or consume a version.
+    /// Pure in-memory last-good update. Invalid intent records diagnostics but
+    /// never offers the retained capacity as a replacement authoritative policy.
     pub fn resolve(&self, universe: &str, node: Option<&str>, site: Option<&str>) -> Result<Self> {
         let mut next = self.clone();
         next.universe = universe.into();
@@ -172,7 +179,7 @@ impl StoragePolicy {
     }
 
     pub fn wire(&self) -> Option<proto::StoragePolicy> {
-        (self.version != 0).then(|| proto::StoragePolicy {
+        (self.version != 0 && self.validation_error.is_none()).then(|| proto::StoragePolicy {
             identity: self.identity.to_vec(),
             version: self.version,
             desired_bytes: self.desired_bytes,
@@ -180,7 +187,7 @@ impl StoragePolicy {
     }
 }
 
-impl crate::publication::Durable for StoragePolicy {
+impl crate::publication::Versioned for StoragePolicy {
     fn validate(&self) -> Result<()> {
         if self.node.len() != 64
             || hex::decode(&self.node).is_err()
@@ -189,7 +196,7 @@ impl crate::publication::Durable for StoragePolicy {
                 && (!(MIN_BYTES..=MAX_BYTES).contains(&self.desired_bytes)
                     || !self.desired_bytes.is_multiple_of(ALIGNMENT)))
         {
-            return Err(Error("invalid durable storage policy".into()));
+            return Err(Error("invalid storage policy".into()));
         }
         Ok(())
     }

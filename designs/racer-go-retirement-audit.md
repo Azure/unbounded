@@ -1,5 +1,11 @@
 # Racer Go control-plane retirement
 
+> Historical audit of the Go-to-Rust retirement. Its placement-history, durable
+> chunk/GC, version-4 CA, same-Pod ambiguity, and fleet-proof claims describe the
+> implementation validated at that milestone, not the current stateless runtime.
+> The [stateless contract](racer-rust-controlplane.md) supersedes those semantics.
+> The results below must not be reused as validation of the stateless cutover.
+
 ## Final state
 
 Retirement is authorized after the production-binary campaign and real API GC

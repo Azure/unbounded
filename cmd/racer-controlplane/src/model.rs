@@ -90,7 +90,7 @@ pub fn cache_sockets(root: &str, name: &str) -> Result<(String, String)> {
 }
 
 /// Kubernetes adapters normalize membership/OS/deletion into `eligible` and
-/// readiness into `ready`. Include eligible unready nodes to preserve identity.
+/// readiness into `ready`. Include eligible unready nodes to send removals.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
@@ -105,7 +105,7 @@ pub struct Node {
 }
 
 /// `available` means running, nondeleting, managed DaemonSet-owned, with the
-/// expected labels/service account. IP validity and UID retention are checked here.
+/// expected labels/service account. The compiler additionally checks IP validity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pod {
     pub uid: String,
@@ -161,8 +161,9 @@ pub struct Volume {
     pub owners: Vec<String>,
 }
 
-/// A versioned Rust persistence format, independent of Go's legacy generations.
-/// Historical members and volume slot counts survive removal and restart.
+/// A versioned content format, independent of Go's legacy generations. The
+/// compiler derives members and volumes solely from current inventory. Historical
+/// fields remain readable for compatibility but are not placement authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
     pub format: u32,

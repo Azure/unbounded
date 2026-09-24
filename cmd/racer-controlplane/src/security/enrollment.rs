@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use anyhow::Context;
 use std::collections::BTreeMap;
 
 const PREFIX: &str = "racer.unbounded-cloud.io/";
@@ -270,11 +269,10 @@ pub fn authorize_dataplane_ownership(
     Ok(())
 }
 
-/// Renewal keeps an already admitted boot's historical Node/Site identity, even
-/// after exclusion or Node replacement. The adapter still checks committed
-/// topology selection and authenticates a current Pod-bound TokenReview.
+/// Historical renewal is unsupported. Call authorize_enrollment with fresh live
+/// ownership, Node and Site inputs for renewals as well as first enrollment.
 pub fn authorize_renewal(
-    state: &CaState,
+    _state: &CaState,
     namespace: &str,
     pod_name: &str,
     pod: &PodData,
@@ -290,26 +288,11 @@ pub fn authorize_renewal(
             && pod.service_account == DATAPLANE,
         "renewal Pod mismatch"
     );
-    let member = state
-        .member(&format!("{uid}/{boot}"))
-        .context("unadmitted boot")?;
-    ensure!(
-        member.identity.kind == IdentityKind::Node,
-        "not a node enrollment"
-    );
-    let mut identity = member.identity.clone();
-    if identity.pod_name.is_empty() {
-        identity.pod_name.clone_from(&pod.metadata.name);
-    }
-    ensure!(
-        identity.pod_name == pod.metadata.name,
-        "renewal Pod name changed"
-    );
-    Ok(identity)
+    anyhow::bail!("renewal requires live Node, Site, and ownership authorization")
 }
 
 /// CP labels alone do not authorize keys. Validate the live Pod -> ReplicaSet ->
-/// managed Deployment UID chain. Terminating replicas remain rotation members.
+/// managed Deployment UID chain. Terminating replicas cannot obtain new leaves.
 pub fn authorize_replica(
     namespace: &str,
     pod: &PodData,
@@ -329,6 +312,9 @@ pub fn authorize_replica(
     );
     ensure!(
         !pod.metadata.uid.is_empty()
+            && !pod.metadata.deleting
+            && !replica_set.metadata.deleting
+            && !deployment.metadata.deleting
             && pod.service_account == CONTROLPLANE
             && label(&pod.metadata, "component") == CONTROLPLANE,
         "unmanaged CP Pod"

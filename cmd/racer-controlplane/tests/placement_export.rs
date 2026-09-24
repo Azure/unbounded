@@ -5,7 +5,7 @@
 use prost::Message;
 use racer_controlplane::{
     model::*,
-    topology::{Topology, compile, place},
+    topology::{Topology, compile, place_in_universe},
 };
 
 #[test]
@@ -57,13 +57,26 @@ fn export_dataplane_placement() {
         assert_eq!(compile(&input, Some(&restored)).unwrap(), generation);
         let names: Vec<_> = generation.nodes.keys().cloned().collect();
         // Default production geometry plus cube/noncube boundaries exercise the
-        // same snapshot serializer against several persisted placement histories.
-        for slots in [8, 17, 64, SLOT_COUNT] {
+        // same snapshot serializer with deterministic universe/Node identities.
+        for slots in [1, 8, 17, 64, SLOT_COUNT] {
             let mut g = generation.clone();
             g.volumes[0].slots = slots;
             g.slot_history.insert("cache-uid".into(), slots);
             if slots != SLOT_COUNT {
-                g.volumes[0].owners = place(slots, &names, &[]).unwrap();
+                let by_id: std::collections::BTreeMap<_, _> = g
+                    .nodes
+                    .iter()
+                    .map(|(name, member)| (member.id.clone(), name.clone()))
+                    .collect();
+                g.volumes[0].owners = place_in_universe(
+                    slots,
+                    &g.universe,
+                    &by_id.keys().cloned().collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|id| by_id[&id].clone())
+                .collect();
             }
             let top = Topology::new(&g).unwrap();
             let prefix = format!("p{slots}-n{count}-fresh");
