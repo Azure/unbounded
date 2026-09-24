@@ -198,6 +198,8 @@ pub struct Provider {
     // while an earlier child or canceled transport still holds resources.
     receive_rank: Option<usize>,
     repaired_candidate: bool,
+    // Absolute consumer cap, distinct from the private candidate/service cap.
+    caller_deadline: Option<Instant>,
     flight: u64,
     reply_route: Option<([u8; 32], u32)>,
     volume: Option<String>,
@@ -353,6 +355,7 @@ impl Provider {
             chain: Rc::new(RefCell::new(Chain::default())),
             receive_rank: None,
             repaired_candidate: false,
+            caller_deadline: None,
             flight: 0,
             reply_route: None,
             volume: None,
@@ -499,7 +502,7 @@ impl Upstream for Provider {
                     .with_authorization(meta.authorization()),
                 service_end,
             )?
-            .service_deadline(service_end < deadline)
+            .service_deadline(self.private_service_deadline(service_end, deadline))
             .retry_idle_backend(&self.metrics);
         self.metrics.upstream(
             crate::metrics::Upstream::BackendHttp,
@@ -511,6 +514,8 @@ impl Upstream for Provider {
         error.attempt_failure().is_some_and(|f| f.owner_evidence())
     }
     fn candidate_deadline(&mut self, caller: Instant) -> Instant {
+        self.caller_deadline = Some(self.caller_deadline.map_or(caller, |old| old.min(caller)));
+        let caller = self.caller_deadline.unwrap();
         let now = crate::environment::now();
         let Some(state) = &self.active else {
             return caller;
@@ -807,7 +812,7 @@ impl Upstream for Provider {
                                 destination,
                                 service_end,
                             )?
-                            .service_deadline(service_end < deadline)
+                            .service_deadline(self.private_service_deadline(service_end, deadline))
                             .retry_idle_backend(&self.metrics),
                     ),
                     request,

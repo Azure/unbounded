@@ -5,6 +5,137 @@ use super::*;
 use crate::control::product_routing::tests::volume;
 use crate::outcome::{Cause, Failure, Phase, Transport};
 
+#[test]
+fn stalled_final_owner_headers_and_body_advance_within_original_caller_deadline() {
+    let Some(mut ring) = crate::conformance::kernel_ring(8, uring::Config::default()) else {
+        return;
+    };
+    for payload in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let ca = crate::tls::tests::Authority::new();
+        let id =
+            |m| PeerIdentity::new(&hex(&[1; 32]), &format!("{m:064x}"), "timeout-pod").unwrap();
+        let local = id(0);
+        let remote = id(1);
+        let tls = ca.context(&remote, false);
+        let credentials = crate::control::credentials::Provider::for_test(
+            local.clone(),
+            Arc::new(ca.context(&local, false)),
+        );
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let socket = accept(&listener);
+            socket.set_nonblocking(true).unwrap();
+            let mut stream = PeerStream::new(
+                TlsSession::server(&tls, socket.into(), ExpectedPeer::Identity(local.clone()))
+                    .unwrap(),
+                local,
+            );
+            let wire = request(&mut stream);
+            assert!(wire.starts_with("GET / "));
+            if payload {
+                // Complete valid headers, then stall the actual response body.
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: {}\r\nX-Racer-Crc64: {:016x}\r\n\r\na", crate::conformance::etag(b"abc"), crate::allocator::crc64(b"abc")).unwrap();
+            }
+            stopped.recv_timeout(Duration::from_secs(25)).unwrap();
+        });
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend =
+            Backend::new(&origin.local_addr().unwrap().to_string(), "product-test").unwrap();
+        let origin_thread = thread::spawn(move || {
+            let mut socket = accept(&origin);
+            let wire = request(&mut socket);
+            assert!(wire.starts_with(if payload {
+                "GET /stalled-owner "
+            } else {
+                "HEAD /stalled-owner "
+            }));
+            if payload {
+                write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/3\r\nETag: {}\r\nConnection: close\r\n\r\nabc", crate::conformance::etag(b"abc")).unwrap();
+            } else {
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", crate::conformance::etag(b"abc")).unwrap();
+            }
+        });
+        let mut handler = Handler::new(cache(&backend, 1), backend);
+        let v = volume(1, 3, vec![0, 1, 2], 0, vec![1, 0, 2]);
+        handler.set_routing(
+            Arc::new(crate::routing::Routing::new(&[1; 32], &v).unwrap()),
+            v.peers
+                .iter()
+                .map(|id| (id.clone(), Peer::new(&address.to_string(), None).unwrap()))
+                .collect(),
+        );
+        handler.set_attempt_policy(3).unwrap();
+        handler.set_peer_tls(
+            "product-test",
+            credentials,
+            &[(remote.node.clone(), remote)].into(),
+        );
+        let descriptor = if payload {
+            cache::PeerDescriptor::page(
+                "/stalled-owner",
+                cache::PeerPage::new(
+                    0,
+                    3,
+                    crate::metadata::Checksum(*blake3::hash(b"abc").as_bytes()),
+                ),
+            )
+        } else {
+            cache::PeerDescriptor::metadata("/stalled-owner")
+        };
+        let key = descriptor.key(handler.namespace).unwrap();
+        let mut p = handler.upstream.page_provider(&key).unwrap();
+        let start = Instant::now();
+        let caller = start + TIMEOUT;
+        let cap = p.candidate_deadline(caller);
+        assert!(cap > start + Duration::from_secs(9));
+        assert!(cap < start + Duration::from_secs(10));
+        assert!(p.private_service_deadline(p.service_end(cap), cap));
+        let mut fault = handler
+            .cache
+            .borrow_mut()
+            .peer_fault_in::<Provider>(&cache::Context::new(handler.namespace), descriptor, caller)
+            .unwrap();
+        let result = loop {
+            assert!(
+                Instant::now() < caller,
+                "owner fallback exceeded caller deadline"
+            );
+            ring.progress().unwrap();
+            handler.cache.borrow_mut().poll(&mut ring, 64).unwrap();
+            match handler
+                .cache
+                .borrow_mut()
+                .poll_value(fault, &mut ring, &mut p)
+            {
+                Ok(cache::Progress::Pending { fault: next, .. }) => fault = next,
+                other => break other,
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        let value = match result {
+            Ok(cache::Progress::Ready(value)) => value,
+            Err(error) => panic!(
+                "stalled final owner payload={payload} attempt={} error={error:?}",
+                p.active.as_ref().unwrap().borrow().cursor.attempt
+            ),
+            _ => panic!("unexpected pending result"),
+        };
+        assert_eq!(value.len(), if payload { 3 } else { cache::METADATA_SIZE });
+        assert_eq!(p.active.as_ref().unwrap().borrow().cursor.attempt, 1);
+        assert_eq!(p.caller_deadline, Some(caller));
+        assert!(Instant::now() >= cap && Instant::now() < caller);
+        drop(value);
+        origin_thread.join().unwrap();
+        handler.shutdown(&mut ring).unwrap();
+    }
+    ring.shutdown().unwrap();
+    ring.pool().assert_recovered();
+}
+
 fn provider(local: u32) -> Provider {
     let volume = volume(2, 2, (0..4).collect(), local, vec![3, 0]);
     let routing = Arc::new(crate::routing::Routing::new(&[1; 32], &volume).unwrap());
@@ -26,6 +157,120 @@ fn provider(local: u32) -> Provider {
     ));
     provider.routing = Some(routing);
     provider.routed(provider.route_state(None, &[0; 32], false).unwrap())
+}
+
+#[test]
+fn intermediate_private_timeout_repairs_but_caller_expiry_never_does() {
+    let Some(mut ring) = crate::conformance::kernel_ring(4, uring::Config::default()) else {
+        return;
+    };
+    for (private, late_poll) in [(true, false), (false, false), (true, true)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let ca = crate::tls::tests::Authority::new();
+        let local = peer_identity(2);
+        let remote = peer_identity(3);
+        let server_tls = ca.context(&remote, false);
+        let credentials = crate::control::credentials::Provider::for_test(
+            local.clone(),
+            Arc::new(ca.context(&local, false)),
+        );
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let (ready, started) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let socket = accept(&listener);
+            socket.set_nonblocking(true).unwrap();
+            let mut stream = PeerStream::new(
+                TlsSession::server(
+                    &server_tls,
+                    socket.into(),
+                    ExpectedPeer::Identity(local.clone()),
+                )
+                .unwrap(),
+                local,
+            );
+            request(&mut stream);
+            ready.send(()).unwrap();
+            stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let backend = Backend::new("127.0.0.1:1", "product-test").unwrap();
+        let handler = Handler::new(cache(&backend, 1), backend);
+        let page = page_request(
+            &mut handler.cache.borrow_mut(),
+            &mut ring,
+            "/intermediate-timeout",
+        );
+        let mut p = provider(0);
+        let peer = p.peer.as_ref().unwrap().clone();
+        peer.borrow_mut().http = HttpOrigin::peer(Endpoint::parse(&address.to_string()).unwrap());
+        peer.borrow_mut().http.set_tls(credentials, remote);
+        let start = Instant::now();
+        let service = start + Duration::from_millis(800);
+        let caller = if private {
+            start + Duration::from_millis(1600)
+        } else {
+            service
+        };
+        p.caller_deadline = Some(caller);
+        let (authority, destination) = destination(&ring, *page.key());
+        let mut exchange = p
+            .http_peer_attempt(
+                UpstreamRequest::PeerPage(page),
+                Some(destination),
+                service,
+                None,
+            )
+            .unwrap();
+        let mut delayed = false;
+        let error = loop {
+            ring.progress().unwrap();
+            if late_poll && !delayed && started.try_recv().is_ok() {
+                thread::sleep(
+                    (caller + Duration::from_millis(20)).saturating_duration_since(Instant::now()),
+                );
+                delayed = true;
+            }
+            match p.poll(exchange, &mut ring) {
+                Ok(ExchangeProgress::Pending { exchange: next, .. }) => exchange = next,
+                Err(error) => break error,
+                _ => panic!("stalled intermediate returned success"),
+            }
+            assert!(Instant::now() < start + Duration::from_secs(4));
+            thread::sleep(Duration::from_millis(1));
+        };
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        let can_repair = private && !late_poll;
+        assert_eq!(
+            error
+                .attempt_failure()
+                .unwrap()
+                .evidence
+                .as_ref()
+                .unwrap()
+                .cause,
+            if can_repair {
+                Cause::ServiceTimeout
+            } else {
+                Cause::CallerDeadline
+            }
+        );
+        let chain = *p.chain.borrow();
+        if can_repair {
+            assert!(p.peer_failed(error).unwrap());
+            assert!(p.repaired_candidate());
+            assert_eq!(p.active.as_ref().unwrap().borrow().cursor.path, [0, 1, 3]);
+        } else {
+            assert!(p.peer_failed(error).is_err());
+            assert_eq!(p.active.as_ref().unwrap().borrow().cursor.failed, u32::MAX);
+        }
+        assert_eq!(p.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+        assert_eq!(p.caller_deadline, Some(caller));
+        assert_eq!(*p.chain.borrow(), chain);
+        drop(authority);
+    }
+    ring.shutdown().unwrap();
+    ring.pool().assert_recovered();
 }
 
 fn failure(provider: &mut Provider, cause: Cause, initiated: bool) -> cache::Error {

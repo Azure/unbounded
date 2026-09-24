@@ -138,6 +138,13 @@ exchange retains its existing candidate deadline. The owner separately reserves
 starts with a 3.6875-second candidate window, leaving 1.1875 seconds before
 transport elapsed time after four hop reserves and the owner's backend reserve.
 Same-hop retries reuse the existing cap and spend existing chain authority.
+The absolute consumer deadline is retained separately from private candidate
+caps. An initiated final-peer HTTP timeout at a private cap is service-failure
+evidence and permits origin-only advancement while caller time remains. HTTP
+metadata, payload, and RDMA-to-HTTP recovery use the same distinction; actual
+caller expiry never authorizes owner advancement or intermediate repair. RDMA's
+speculative grant/read timeout still recovers over HTTP rather than proving an
+owner failure. Local repair retains the current candidate cap, including expiry.
 Repair evidence is fenced by the HTTP breaker permit generation: stale success
 cannot erase newer failure evidence, and stale failure cannot undo recovery.
 Variable-membership admission uses the shared product membership predicate:

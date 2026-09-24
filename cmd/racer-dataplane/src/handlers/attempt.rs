@@ -59,6 +59,10 @@ impl Provider {
         (now + MAX_CANDIDATE).min(deadline)
     }
 
+    pub(super) fn private_service_deadline(&self, service: Instant, candidate: Instant) -> bool {
+        service < self.caller_deadline.unwrap_or(candidate)
+    }
+
     /// Create an independently routed request over the shared endpoint registry.
     pub(super) fn routed(&self, state: Option<Rc<RefCell<RouteState>>>) -> Self {
         static NEXT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -67,6 +71,7 @@ impl Provider {
             chain: Rc::new(RefCell::new(Chain::default())),
             receive_rank: None,
             repaired_candidate: false,
+            caller_deadline: None,
             flight: NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             reply_route: None,
             volume: self.volume.clone(),
