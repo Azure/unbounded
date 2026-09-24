@@ -12,14 +12,11 @@
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
-use crate::http_auth::failure::{
-    error_status, metric_failure, reported, validate_owner_report, validate_peer_report,
-};
+use crate::http_auth::failure::{error_status, metric_failure, reported, validate_peer_report};
 #[cfg(test)]
 use crate::outcome::semantic_failure;
 use crate::outcome::{
-    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, owner_failure,
-    peer_failure,
+    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, peer_failure,
 };
 use crate::{
     buffers::{BUFFER_SIZE, Destination},
@@ -1728,12 +1725,6 @@ impl Handler {
                 task.position = 0;
                 task.end = 0;
                 task.next = 0;
-                let owner = owner_failure(&error)
-                    .filter(|_| {
-                        !task.peer
-                            || task.upstream.failure(&error).reason == PeerReason::OwnerUnavailable
-                    })
-                    .map(|s| s.to_string());
                 let failure = if task.peer {
                     task.upstream
                         .active
@@ -1753,16 +1744,7 @@ impl Handler {
                 } else {
                     None
                 };
-                let mut headers = owner
-                    .as_ref()
-                    .map(|s| {
-                        let mut headers = vec![("X-Racer-Owner-Unavailable", s.as_bytes())];
-                        if let Some(context) = &context {
-                            headers.push(("X-Racer-Attempt", context.as_bytes()));
-                        }
-                        headers
-                    })
-                    .unwrap_or_default();
+                let mut headers = Vec::new();
                 let response_metadata = error
                     .evidence()
                     .semantic
@@ -1776,9 +1758,7 @@ impl Handler {
                 }
                 if let (Some(failure), Some(context)) = (&failure, &context) {
                     headers.push(("X-Racer-Failure", failure.as_bytes()));
-                    if owner.is_none() {
-                        headers.push(("X-Racer-Attempt", context.as_bytes()));
-                    }
+                    headers.push(("X-Racer-Attempt", context.as_bytes()));
                 }
                 let status = if let Some(failure) = &failure {
                     let reported = io::Error::other(PeerFailure::decode(&unhex(failure)?)?).into();

@@ -57,7 +57,7 @@ pub(crate) mod failure {
     use crate::outcome::{PeerFailure, PeerReason};
     use crate::{cache, http::Headers};
     use cache::{
-        http_metadata::{decimal, identity_encoding, text},
+        http_metadata::{identity_encoding, text},
         peer_wire::unhex,
     };
     use std::io;
@@ -141,22 +141,6 @@ pub(crate) mod failure {
         };
         HttpFailure { reason, pressure }
     }
-    pub(crate) fn validate_owner_report(
-        headers: Headers<'_>,
-        length: Option<u64>,
-        route: &AttemptRoute,
-    ) -> io::Result<()> {
-        let slot =
-            text(headers, "x-racer-owner-unavailable")?.ok_or_else(|| invalid("missing owner"))?;
-        if decimal(slot)? != u64::from(route.candidate)
-            || length != Some(0)
-            || text(headers, "x-racer-attempt")? != Some(route.context.as_str())
-        {
-            return Err(invalid("mismatched owner report"));
-        }
-        identity_encoding(headers)?;
-        Ok(())
-    }
     pub(crate) fn validate_peer_report(
         headers: Headers<'_>,
         length: Option<u64>,
@@ -173,13 +157,6 @@ pub(crate) mod failure {
             || status != self::status(failure.reason)
         {
             return Err(invalid("invalid peer failure framing/context"));
-        }
-        if let Some(owner) = text(headers, "x-racer-owner-unavailable")? {
-            if failure.reason != PeerReason::OwnerUnavailable
-                || decimal(owner)? != u64::from(failure.candidate)
-            {
-                return Err(invalid("contradictory owner report"));
-            }
         }
         identity_encoding(headers)?;
         if crate::header_value::HeaderValue::parse(headers, "www-authenticate")?

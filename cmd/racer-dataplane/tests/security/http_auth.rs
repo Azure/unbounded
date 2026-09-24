@@ -232,13 +232,16 @@ pub(crate) mod failure_tests {
         }
     }
     #[test]
-    fn owner_reports_require_exact_bounded_request_context() {
+    fn typed_reports_require_exact_bounded_request_context() {
         let route = route(false);
         let valid = format!(
             "X-Racer-Owner-Unavailable: 3\r\nX-Racer-Attempt: {}\r\n",
             route.context
         );
-        assert!(headers(&valid, |h| validate_owner_report(h, Some(0), &route)).is_ok());
+        assert!(headers(&valid, |h| validate_peer_report(h, Some(0), 503, &route)).is_err());
+        let error = headers(&valid, |h| cache::http_metadata::response_status(503, h)).unwrap();
+        assert_eq!(owner_failure(&error), None);
+        assert!(!error.attempt_failure().is_some_and(|f| f.owner_evidence()));
         for wire in [
             valid.replace("Unavailable: 3", "Unavailable: 4"),
             valid.replace(&route.context, &"b".repeat(96)),
@@ -248,10 +251,10 @@ pub(crate) mod failure_tests {
             "X-Racer-Owner-Unavailable: 3\r\n".into(),
             format!("{valid}Content-Encoding: gzip\r\n"),
         ] {
-            assert!(headers(&wire, |h| validate_owner_report(h, Some(0), &route)).is_err());
+            assert!(headers(&wire, |h| validate_peer_report(h, Some(0), 503, &route)).is_err());
         }
         for length in [None, Some(1), Some(u64::MAX)] {
-            assert!(headers(&valid, |h| validate_owner_report(h, length, &route)).is_err());
+            assert!(headers(&valid, |h| validate_peer_report(h, length, 503, &route)).is_err());
         }
         for (reason, status, _) in SEMANTICS {
             let failure = PeerFailure {
@@ -274,7 +277,6 @@ pub(crate) mod failure_tests {
             for malformed in [
                 format!("{wire}X-Racer-Failure: {encoded}\r\n"),
                 format!("{wire}Content-Encoding: gzip\r\n"),
-                format!("{wire}X-Racer-Owner-Unavailable: 4\r\n"),
                 wire.replace(&route.context, &"b".repeat(96)),
                 wire.replace(&encoded, "00"),
             ] {

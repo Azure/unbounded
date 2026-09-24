@@ -419,7 +419,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
     let error = provider
         .peer_failed(cache::Error::Shared(shared))
         .unwrap_err();
-    assert_eq!(owner_failure(&error), Some(1));
+    assert_eq!(crate::outcome::owner_failure(&error), Some(1));
     assert_eq!(
         relay.borrow().cursor.attempt,
         0,
