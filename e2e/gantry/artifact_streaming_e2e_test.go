@@ -66,7 +66,10 @@ func TestE2E_ArtifactStreamingOriginThenPeer(t *testing.T) {
 	workers := h.workerNodes(ctx)
 	requesterPod := h.gantryPodOnNode(ctx, workers[0])
 	providerPod := h.gantryPodOnNode(ctx, workers[1])
-	originURL := "https://" + streamingOriginHost + ":8443/blob?d=" + digest + "&sig=redacted"
+	// A real SAS value is opaque, so use a sentinel that makes a leak unambiguous.
+	const signedQuerySentinel = "e2eSasValueMustNotLeak"
+
+	originURL := "https://" + streamingOriginHost + ":8443/blob?d=" + digest + "&sig=" + signedQuerySentinel
 
 	originBefore := h.metricSumOnPod(ctx, requesterPod, "gantry_streaming_requests_total", `source="origin"`, `outcome="success"`)
 	response := h.requestArtifactStreamingRange(ctx, requesterPod, originURL, "bytes=2-5")
@@ -97,6 +100,29 @@ func TestE2E_ArtifactStreamingOriginThenPeer(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("context canceled waiting for peer range service: %v", ctx.Err())
 		case <-time.After(2 * time.Second):
+		}
+	}
+
+	h.assertNoSignedQueryLeak(ctx, signedQuerySentinel)
+}
+
+// assertNoSignedQueryLeak pins that a signed origin credential never reaches
+// anything an operator or scrape can read back.
+func (h *harness) assertNoSignedQueryLeak(ctx context.Context, sentinel string) {
+	h.t.Helper()
+
+	for _, pod := range h.gantryPods(ctx) {
+		logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pod, "-c", "gantry", "--tail=-1")
+		if err != nil {
+			h.t.Fatalf("read %s logs: %v", pod, err)
+		}
+
+		if strings.Contains(logs, sentinel) {
+			h.t.Fatalf("signed origin query leaked into %s logs", pod)
+		}
+
+		if strings.Contains(h.fetchPodMetrics(ctx, pod), sentinel) {
+			h.t.Fatalf("signed origin query leaked into %s metrics", pod)
 		}
 	}
 }
