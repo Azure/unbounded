@@ -1,7 +1,25 @@
 # Test-only combined per-host registry and simulated image pulls.
-# See cmd/racer-loadgen/README.md for GANTRY_HOST_IP endpoint substitution.
+# See cmd/racer-loadgen/README.md for the node-local registry Service.
 # Enable Gantry's Racer backend and configure the image-fixture.test upstream
 # on every Gantry node before applying. Import racer-loadgen:local on all nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: image-loadgen-local-registry
+  namespace: unbounded-system
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  # Registry must serve before client readiness can pass Gantry's startup gate.
+  publishNotReadyAddresses: true
+  selector:
+    app: image-loadgen
+  ports:
+    - name: registry
+      port: 18081
+      targetPort: registry
+      protocol: TCP
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

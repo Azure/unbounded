@@ -223,24 +223,22 @@ participating Gantry node, retaining other entries:
 ```yaml
 upstream_registries:
   - name: image-fixture.test
-    endpoint: http://${GANTRY_HOST_IP}:18081
+    endpoint: http://image-loadgen-local-registry.unbounded-system.svc.cluster.local:18081
 ```
 
-Gantry supports this literal token in upstream endpoints only. Set the following
-environment variable on its container (through component overrides when managed
-by the operator). Use a Gantry image that supports this substitution:
+The example includes a ClusterIP Service with `internalTrafficPolicy: Local`
+selecting the host-network loadgen pods on port 18081. All Gantry instances use
+the same ordinary Service DNS name; no Gantry image or environment change is
+needed. The fixture binds all host interfaces so the Service can reach its
+registry port. Without a local endpoint, requests fail rather than routing to
+another node's registry.
 
-```yaml
-env:
-  - name: GANTRY_HOST_IP
-    valueFrom:
-      fieldRef:
-        fieldPath: status.hostIP
-```
-
-Gantry requires a valid IP when the token is used and brackets IPv6 addresses
-automatically. Other config values are not expanded. The fixture binds all host
-interfaces so Gantry pods can reach their node's registry without a Service.
+The Service sets `publishNotReadyAddresses: true` so registry traffic can reach
+the pod before combined client readiness passes Gantry's startup gate. This
+avoids a readiness cycle; it does not bypass registry preparation. Registry
+requests return 503 while hashing, then succeed even while management `/readyz`
+is still waiting for Gantry. Keep the Service selector independent of role and
+readiness so it selects both registry-only staging pods and combined pods.
 
 The example disables generic annotation scraping to avoid duplicate targets
 from its two declared ports. Add one dedicated Prometheus job (or equivalent
