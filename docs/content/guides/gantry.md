@@ -89,6 +89,16 @@ containerd's `certs.d` directory. Include the port when the image reference
 uses a non-default port. Gantry requires at least one accelerated upstream
 registry.
 
+For a node-local registry reached from Gantry's pod network, an endpoint may use
+the literal `${GANTRY_HOST_IP}` token, for example
+`http://${GANTRY_HOST_IP}:18081`. Supply `GANTRY_HOST_IP` through a Downward API
+environment variable with `fieldPath: status.hostIP` on the Gantry container
+(use component overrides for operator-managed Gantry). Gantry requires a valid
+IP when this token is present and brackets IPv6 addresses automatically.
+Only upstream endpoints support this substitution; other config fields are
+literal. Keep the registry name identical across nodes when they serve the same
+content. The node-local registry must listen on an address reachable from pods.
+
 
 
 ### 3. Deploy Gantry

@@ -562,7 +562,8 @@ func (c *Config) LoadYAML(r io.Reader) error {
 //
 // Only scalar fields are overlaid here; list fields (UpstreamRegistries,
 // Libp2pListen, OriginFailureClassesTrustedClusterWide) are file-only by
-// design - env vars are an awkward shape for them.
+// design - env vars are an awkward shape for them. Upstream endpoint URLs may
+// use the literal ${GANTRY_HOST_IP} token for a node-local registry host.
 func (c *Config) LoadEnv(env func(string) string) error {
 	var errs []error
 
@@ -693,6 +694,25 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("LOG_LEVEL", &c.LogLevel)
 	setStr("LOG_FORMAT", &c.LogFormat)
+
+	for i := range c.UpstreamRegistries {
+		endpoint := c.UpstreamRegistries[i].Endpoint
+		if !strings.Contains(endpoint, "${GANTRY_HOST_IP}") {
+			continue
+		}
+
+		host := env("GANTRY_HOST_IP")
+		if net.ParseIP(host) == nil {
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: GANTRY_HOST_IP must be an IP address", i))
+			continue
+		}
+
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+
+		c.UpstreamRegistries[i].Endpoint = strings.ReplaceAll(endpoint, "${GANTRY_HOST_IP}", host)
+	}
 
 	return errors.Join(errs...)
 }

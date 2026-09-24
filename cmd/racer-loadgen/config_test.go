@@ -22,6 +22,7 @@ func TestConfigDefaults(t *testing.T) {
 		endpoint: "/dev/racer/loadgen/cache", originSocket: "/dev/racer/loadgen/origin", listen: ":8080",
 		footprint: 512_000_000_000, objectSize: 1_000_000_000, seed: 42, exponent: 1,
 		concurrency: 4, pageConcurrency: 8, timeout: 5 * time.Minute, ttl: time.Hour,
+		gantryReadyTimeout: 10 * time.Minute,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaults = %+v, want %+v", got, want)
