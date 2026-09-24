@@ -21,19 +21,6 @@ pub fn degree(slots: u32) -> u32 {
     d
 }
 
-/// Compatibility helper for synthetic name-only fixtures. Production placement
-/// uses `place_in_universe` with the existing Node UID-derived identities.
-/// Previous ownership is deliberately ignored.
-pub fn place(slots: u32, names: &[String], _previous: &[String]) -> Result<Vec<String>> {
-    if names.iter().any(String::is_empty) {
-        return Err(Error("empty placement participant".into()));
-    }
-    let ids: Vec<_> = names.iter().map(|n| identity("node", n)).collect();
-    let by_id: BTreeMap<_, _> = ids.iter().zip(names).collect();
-    place_in_universe(slots, "placement-fixture", &ids)
-        .map(|owners| owners.iter().map(|id| by_id[id].clone()).collect())
-}
-
 /// Stateless highest-random-weight rendezvous. Each slot chooses the maximum
 /// unsigned 64-bit score; ties choose the lexically smallest Node identity.
 /// Balance is statistical. Adjacent slots may have the same owner, and live
@@ -215,11 +202,7 @@ pub fn compile_cached(
         if !node.eligible || node.universe != input.universe {
             continue;
         }
-        if node.name.is_empty()
-            || node.name.starts_with("deleted/")
-            || node.uid.is_empty()
-            || !seen.insert(&node.name)
-        {
+        if node.name.is_empty() || node.uid.is_empty() || !seen.insert(&node.name) {
             return Err(Error("empty or duplicate node identity".into()));
         }
         if node.fabric.len() > 256 || !node.fabric.bytes().all(|b| (0x21..=0x7e).contains(&b)) {

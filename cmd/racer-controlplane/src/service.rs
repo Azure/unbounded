@@ -268,8 +268,6 @@ fn address(value: &str) -> String {
     }
 }
 
-/// Both kubelet projection and direct API reads use this unchanged public key.
-pub const TRUST_PROJECTION_PATH: &str = "/var/run/racer-trust/bundle.json";
 fn now_micro() -> Result<MicroTime> {
     Ok(serde_json::from_value(serde_json::Value::String(
         time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,

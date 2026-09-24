@@ -784,6 +784,9 @@ async fn uncertain_bootstrap_resumes_checkpoint_trust_and_pending_marker_without
             let secret = fixture
                 .get(secret_path)
                 .context("durable bootstrap Secret missing")?;
+            let marker =
+                &secret["metadata"]["annotations"]["racer.unbounded.cloud/pki-bootstrap-pending"];
+            assert!(marker.is_null() || marker == "1");
             let checkpoint =
                 fixture.get("/api/v1/namespaces/system/configmaps/racer-runtime-revisions");
             fixture.objects.lock().unwrap().get_errors.clear();
@@ -792,6 +795,27 @@ async fn uncertain_bootstrap_resumes_checkpoint_trust_and_pending_marker_without
             lease["spec"]["holderIdentity"] = "second".into();
             fixture.put(&lease_path, lease);
             let term = Leadership::new("second".into())?;
+            let mut unsupported = secret.clone();
+            unsupported["metadata"]["annotations"]["racer.unbounded.cloud/pki-bootstrap-pending"] =
+                "5".into();
+            fixture.put(secret_path, unsupported);
+            assert!(
+                CaManager::acquire(
+                    KubernetesCaStore::new(client.clone(), "system".into(), term.clone()),
+                    term.clone(),
+                    SecurityOptions::new("system"),
+                    unix_now(),
+                )
+                .await
+                .is_err()
+            );
+            let mut restored = fixture.get(secret_path).unwrap();
+            restored["metadata"]["annotations"] = secret["metadata"]["annotations"].clone();
+            fixture.put(secret_path, restored);
+            let mut lease = fixture.get(&lease_path).unwrap();
+            lease["spec"]["holderIdentity"] = "third".into();
+            fixture.put(&lease_path, lease);
+            let term = Leadership::new("third".into())?;
             let next = CaManager::acquire(
                 KubernetesCaStore::new(client, "system".into(), term.clone()),
                 term,

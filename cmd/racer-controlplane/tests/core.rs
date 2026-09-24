@@ -7,7 +7,7 @@ use prost::Message;
 use racer_controlplane::model::*;
 use racer_controlplane::publication::*;
 use racer_controlplane::storage::*;
-use racer_controlplane::topology::{Topology, compile, degree, place, place_in_universe};
+use racer_controlplane::topology::{Topology, compile, degree, place_in_universe};
 
 fn inventory(count: usize) -> Inventory {
     Inventory {
@@ -147,48 +147,37 @@ fn assert_placement(names: &[String], owners: &[String]) {
     }
 }
 
+fn place(slots: u32, names: &[String]) -> racer_controlplane::Result<Vec<String>> {
+    let ids: Vec<_> = names.iter().map(|n| identity("node", n)).collect();
+    let by_id: BTreeMap<_, _> = ids.iter().zip(names).collect();
+    place_in_universe(slots, "placement-fixture", &ids)
+        .map(|owners| owners.iter().map(|id| by_id[id].clone()).collect())
+}
+
 #[test]
 fn membership_history_is_balanced_diverse_and_stable_across_restart_and_list_order() {
     for slots in [8, 17, SLOT_COUNT] {
-        let mut prior = Vec::new();
         for count in [1, 2, 3, 5, 7, 4, 2, 1, 3, 2] {
             let mut names: Vec<_> = (0..count).map(|i| format!("n{i}")).collect();
-            let next = place(slots, &names, &prior).unwrap();
+            let next = place(slots, &names).unwrap();
             assert_placement(&names, &next);
             let persisted = serde_json::to_vec(&next).unwrap();
             let reloaded: Vec<String> = serde_json::from_slice(&persisted).unwrap();
             names.reverse();
-            assert_eq!(place(slots, &names, &reloaded).unwrap(), next);
-            assert_eq!(place(slots, &names, &prior).unwrap(), next);
-            prior = next;
+            assert_eq!(reloaded, next);
+            assert_eq!(place(slots, &names).unwrap(), next);
         }
     }
-    // Historical phases do not affect stateless placement.
-    let names = vec!["a".into(), "b".into()];
-    let prior = vec!["b".into(), "a".into(), "b".into(), "a".into()];
-    assert_eq!(
-        place(4, &names, &prior).unwrap(),
-        place(4, &names, &[]).unwrap()
-    );
-    // Even malformed or oddly phased prior ownership cannot influence the map.
-    for slots in [7u32, 17] {
-        let prior: Vec<_> = (0..slots)
-            .map(|s| names[usize::from(s >= slots.div_ceil(2))].clone())
-            .collect();
-        let actual = place(slots, &names, &prior).unwrap();
-        assert_eq!(actual, place(slots, &names, &[]).unwrap());
-        assert_placement(&names, &actual);
-    }
     let names: Vec<String> = ["a", "b", "c", "d"].map(String::from).into();
-    let old = place(64, &names, &[]).unwrap();
+    let old = place(64, &names).unwrap();
     let mut joined = names.clone();
     joined.push("e".into());
-    let next = place(64, &joined, &old).unwrap();
+    let next = place(64, &joined).unwrap();
     assert!(next.iter().any(|owner| owner == "e"));
     for (new, old) in next.iter().zip(&old) {
         assert!(new == old || new == "e");
     }
-    let removed = place(64, &names, &next).unwrap();
+    let removed = place(64, &names).unwrap();
     assert_eq!(removed, old);
     for (old, new) in next.iter().zip(&removed) {
         if old != "e" {
@@ -196,7 +185,7 @@ fn membership_history_is_balanced_diverse_and_stable_across_restart_and_list_ord
         }
     }
     // More participants than slots is valid; some participants own zero slots.
-    let one = place(1, &names, &[]).unwrap();
+    let one = place(1, &names).unwrap();
     assert_eq!(one.len(), 1);
     assert_placement(&names, &one);
     for (p, n) in [
@@ -204,7 +193,7 @@ fn membership_history_is_balanced_diverse_and_stable_across_restart_and_list_ord
         (SLOT_COUNT + 1, names),
         (8, vec!["a".into(), "a".into()]),
     ] {
-        assert!(place(p, &n, &[]).is_err());
+        assert!(place(p, &n).is_err());
     }
 }
 

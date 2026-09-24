@@ -199,7 +199,7 @@ pub fn authorize_enrollment(data: &EnrollmentData<'_>) -> Result<Identity> {
         pod_name: pod.metadata.name.clone(),
         container_id: pod.running_container_id.clone(),
     };
-    identity.uri()?;
+    identity.validate()?;
     Ok(identity)
 }
 
@@ -268,28 +268,6 @@ pub fn authorize_dataplane_ownership(
     Ok(())
 }
 
-/// Historical renewal is unsupported. Call authorize_enrollment with fresh live
-/// ownership, Node and Site inputs for renewals as well as first enrollment.
-pub fn authorize_renewal(
-    _state: &CaState,
-    namespace: &str,
-    pod_name: &str,
-    pod: &PodData,
-    boot: &str,
-    review: &TokenReviewResult,
-) -> Result<Identity> {
-    let uid = reviewed_pod_uid(review)?;
-    ensure!(
-        hex_id(boot)
-            && pod.metadata.namespace == namespace
-            && pod.metadata.name == pod_name
-            && pod.metadata.uid == uid
-            && pod.service_account == DATAPLANE,
-        "renewal Pod mismatch"
-    );
-    anyhow::bail!("renewal requires live Node, Site, and ownership authorization")
-}
-
 /// CP labels alone do not authorize keys. Validate the live Pod -> ReplicaSet ->
 /// managed Deployment UID chain. Terminating replicas cannot obtain new leaves.
 pub fn authorize_replica(
@@ -353,14 +331,8 @@ pub fn authorize_replica(
         pod_name: pod.metadata.name.clone(),
         container_id: pod.running_container_id.clone(),
     };
-    identity.uri()?;
+    identity.validate()?;
     Ok(identity)
-}
-
-pub fn replica_request_owned(metadata: &ObjectMetadata, pod: &PodData) -> bool {
-    metadata.namespace == pod.metadata.namespace
-        && metadata.name == format!("racer-replica-{}", pod.metadata.uid)
-        && owned_by(metadata, &pod.metadata, "v1", "Pod", true)
 }
 
 pub fn certificate_matches_csr(certificate: &[u8], csr: &[u8]) -> Result<bool> {

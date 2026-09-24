@@ -186,7 +186,7 @@ impl CaStore for KubernetesCaStore {
                 metadata: ObjectMeta {
                     name: Some(CA_SECRET.into()),
                     namespace: Some(self.namespace.clone()),
-                    annotations: Some([(BOOTSTRAP_PENDING.into(), "5".into())].into()),
+                    annotations: Some([(BOOTSTRAP_PENDING.into(), "1".into())].into()),
                     ..Default::default()
                 },
                 type_: Some("Opaque".into()),
@@ -238,7 +238,12 @@ impl CaStore for KubernetesCaStore {
             .metadata
             .annotations
             .as_ref()
-            .is_some_and(|a| a.get(BOOTSTRAP_PENDING).map(String::as_str) == Some("5"));
+            .and_then(|a| a.get(BOOTSTRAP_PENDING));
+        ensure!(
+            pending.is_none_or(|value| value == "1"),
+            "unsupported bootstrap marker"
+        );
+        let pending = pending.is_some();
         if pending {
             // Only a durable fresh-domain marker authorizes checkpoint creation.
             // Interrupted bootstrap can observe its exact empty checkpoint again.
