@@ -74,12 +74,15 @@ class TestReinstallPayload(unittest.TestCase):
                 patch.object(e2e, "VM_DIR", Path(tmp)), \
                 patch.object(e2e, "host_image") as image, \
                 patch.object(e2e, "scp_cmd") as scp, \
-                patch.object(e2e, "ssh_cmd") as ssh:
+                patch.object(e2e, "ssh_cmd") as ssh, \
+                patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"test-binary")), \
+                patch.object(e2e, "ignition_bootstrap_invocation", return_value="inv-before"):
             image.return_value.host_prefix = prefix
             (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
 
-            e2e._reinstall_ignition_payload(self._doc(prefix, agent_config))
+            previous = e2e._reinstall_ignition_payload(self._doc(prefix, agent_config))
 
+            self.assertEqual(previous, "inv-before", "the wait needs the run from before the reinstall")
             self.assertEqual(scp.call_count, 3, "binary, agent config, bootstrap unit")
 
             commands = "\n".join(str(call) for call in ssh.call_args_list)
@@ -87,45 +90,63 @@ class TestReinstallPayload(unittest.TestCase):
             self.assertNotIn("waagent", commands)
             self.assertIn("enable --now --no-block", commands)
 
-    def test_the_binary_is_checked_against_the_rendered_digest(self):
+    @staticmethod
+    def _installed_digest(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest() + "  /opt/unbounded/bin/unbounded-agent"
+
+    def test_the_installed_binary_is_checked_against_the_rendered_digest(self):
         """The binary is fetched by URL in the Ignition path, so its digest is
         the only thing tying what gets installed to the build under test. A
         reinstall that delivers a different binary would pass every later
-        assertion while testing the wrong artifact."""
+        assertion while testing the wrong artifact, so the copy on the VM is
+        what gets checked."""
         prefix = "/opt/unbounded"
         doc = self._doc(prefix, json.dumps({"HostPrefix": prefix}))
 
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(e2e, "VM_DIR", Path(tmp)), \
                 patch.object(e2e, "host_image") as image, \
-                patch.object(e2e, "scp_cmd"), patch.object(e2e, "ssh_cmd"):
-            image.return_value.host_prefix = prefix
-            (Path(tmp) / "unbounded-agent").write_bytes(b"a different binary")
-
-            with self.assertRaises(SystemExit):
-                e2e._reinstall_ignition_payload(doc)
-
-    def test_an_unexpected_payload_is_refused(self):
-        """The payload set is asserted rather than filtered. A file appearing
-        here that the test does not know about is a change in what bootstrap
-        installs, and it should stop the run rather than be skipped silently."""
-        prefix = "/opt/unbounded"
-        doc = self._doc(prefix, json.dumps({"HostPrefix": prefix}))
-        doc["storage"]["files"][0]["path"] = "/somewhere/else/unbounded-agent"
-
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(e2e, "VM_DIR", Path(tmp)), \
-                patch.object(e2e, "host_image") as image, \
-                patch.object(e2e, "scp_cmd"), patch.object(e2e, "ssh_cmd"):
+                patch.object(e2e, "scp_cmd"), patch.object(e2e, "ssh_cmd"), \
+                patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"a different binary")), \
+                patch.object(e2e, "ignition_bootstrap_invocation", return_value=""):
             image.return_value.host_prefix = prefix
             (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
 
             with self.assertRaises(SystemExit):
                 e2e._reinstall_ignition_payload(doc)
 
+    def test_an_unexpected_payload_is_refused(self):
+        """The payload set is asserted rather than filtered. A file or unit
+        appearing here that the test does not know about is a change in what
+        bootstrap installs, and it should stop the run rather than be skipped
+        silently."""
+        prefix = "/opt/unbounded"
 
-if __name__ == "__main__":
-    unittest.main()
+        def moved_binary(doc):
+            doc["storage"]["files"][0]["path"] = "/somewhere/else/unbounded-agent"
+
+        def extra_file(doc):
+            doc["storage"]["files"].append({"path": "/etc/unbounded/agent/extra", "contents": {"source": "x"}})
+
+        def extra_unit(doc):
+            doc["systemd"]["units"].append({"name": "surprise.service", "contents": "[Service]\n"})
+
+        for name, change in (("moved binary", moved_binary), ("extra file", extra_file), ("extra unit", extra_unit)):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(e2e, "VM_DIR", Path(tmp)), \
+                    patch.object(e2e, "host_image") as image, \
+                    patch.object(e2e, "scp_cmd") as scp, patch.object(e2e, "ssh_cmd"), \
+                    patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"test-binary")), \
+                    patch.object(e2e, "ignition_bootstrap_invocation", return_value=""):
+                image.return_value.host_prefix = prefix
+                (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
+                doc = self._doc(prefix, json.dumps({"HostPrefix": prefix}))
+                change(doc)
+
+                with self.assertRaises(SystemExit):
+                    e2e._reinstall_ignition_payload(doc)
+                scp.assert_not_called()
+
 
 
 class TestBootstrapChoosesThePath(unittest.TestCase):
@@ -252,3 +273,7 @@ class TestBootstrapCompletionIsFresh(unittest.TestCase):
             e2e._wait_for_ignition_bootstrap()
 
         slept.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

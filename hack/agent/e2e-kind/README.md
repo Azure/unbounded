@@ -51,9 +51,12 @@ shared keys alike. The image can be chosen in other ways:
 - `HOST_IMAGE_PATH` boots a local file with no Azure login at all:
 
 ```sh
-HOST_BASE_OS=acl HOST_IMAGE_PATH="$PWD/acl.qcow2" \
+HOST_BASE_OS=acl E2E_SUITE=lifecycle HOST_IMAGE_PATH="$PWD/acl.qcow2" \
   bash hack/agent/e2e-kind/run-local.sh
 ```
+
+The configuration suite does not run on this host: its scenarios supply their
+own agent, and the Ignition path only boots the agent it staged itself.
 
 Running this locally needs `ovmf` and `qemu-nbd` in addition to the usual
 prerequisites. The host boots through its own UEFI bootloader, and the Ignition

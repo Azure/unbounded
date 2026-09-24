@@ -177,9 +177,6 @@ class TestDataURLs(unittest.TestCase):
         self.assertIsNone(e2e._decode_ignition_source("https://example.test/f"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestIgnitionHostBoundaries(unittest.TestCase):
     """Paths that assume a host the harness can prepare before it boots."""
@@ -215,6 +212,50 @@ class TestIgnitionHostBoundaries(unittest.TestCase):
 
         prepared.assert_not_called()
 
+    def test_an_outside_agent_is_refused_before_anything_is_built(self):
+        """The configuration scenarios pass their own AGENT_URL. The Ignition
+        path only serves the binary it staged, so such a run would die later,
+        after minting a bootstrap token."""
+        with patch.object(e2e, "host_image", return_value=self._ignition_image()), \
+                patch.dict(e2e.os.environ, {"AGENT_URL": "http://runner/unbounded-agent.tar.gz"}), \
+                patch.object(e2e, "prepare_agent_artifacts") as prepared, \
+                patch.object(e2e, "_run_agent_inner") as ran:
+            with self.assertRaises(SystemExit):
+                e2e.run_agent(e2e.NodeConfig(name="n", node_labels={}, register_with_taints=[]))
+
+        prepared.assert_not_called()
+        ran.assert_not_called()
+
+    def test_the_configuration_suite_is_refused_up_front(self):
+        with patch.object(e2e, "host_image", return_value=self._ignition_image()), \
+                patch.object(e2e, "patch_kind_control_plane_node_ip") as patched, \
+                patch.object(e2e, "discover_node_configs") as discovered:
+            with self.assertRaises(SystemExit):
+                e2e.validate_node_config_scenarios()
+
+        patched.assert_not_called()
+        discovered.assert_not_called()
+
+    def test_reset_failed_is_only_optional_on_an_ignition_host(self):
+        """A refused reset-failed is expected on Azure Container Linux. Elsewhere
+        it means something is wrong, and scenarios would share a start-limit
+        budget without anyone noticing."""
+        import subprocess
+
+        refused = subprocess.CompletedProcess(["ssh"], 1, "", "Access denied")
+        for provisioning, should_die in (("ignition", False), ("cloud-init", True)):
+            with self.subTest(provisioning=provisioning):
+                image = self._ignition_image()
+                image = e2e.replace(image, provisioning=provisioning)
+                with patch.object(e2e, "host_image", return_value=image), \
+                        patch.object(e2e, "ssh_capture_quiet", return_value=refused), \
+                        patch.object(e2e, "die", side_effect=SystemExit) as died:
+                    try:
+                        e2e.check_reset_failed()
+                    except SystemExit:
+                        pass
+                self.assertEqual(died.called, should_die)
+
 
 class TestIgnitionReboot(unittest.TestCase):
     """What counts as the first-boot unit repairing a healthy host on reboot."""
@@ -234,3 +275,7 @@ class TestIgnitionReboot(unittest.TestCase):
         for name, (args, want) in cases.items():
             with self.subTest(name):
                 self.assertEqual(e2e.ignition_reboot_problems(*args), [want])
+
+
+if __name__ == "__main__":
+    unittest.main()

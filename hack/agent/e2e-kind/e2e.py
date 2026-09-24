@@ -1386,6 +1386,23 @@ def wait_for_daemon_active(timeout_secs: int = 180) -> None:
     die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
 
 
+def check_reset_failed() -> None:
+    """Reset the daemon's start-limit budget between upgrade scenarios.
+
+    On Azure Container Linux reset-failed, a privileged D-Bus call, is refused
+    for a sudo'd SSH session even though the agent's own systemctl calls succeed
+    from its service context. Losing the isolation there only risks a scenario
+    inheriting a start-limit budget, so it is a warning. Every other host is
+    expected to allow it.
+    """
+    reset = ssh_capture_quiet("sudo systemctl reset-failed unbounded-agent-daemon.service")
+    if reset.returncode != 0:
+        if host_image().provisioning != "ignition":
+            die(f"could not reset the daemon start-limit budget: {reset.stderr.strip()}")
+        log("WARNING: could not reset the daemon start-limit budget "
+            f"({reset.stderr.strip()}); scenarios may share it")
+
+
 def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
 
@@ -1403,21 +1420,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Each scenario intentionally restarts or fails the daemon. Isolate its
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
-        #
-        # Best effort: reset-failed is a privileged D-Bus call, and on a
-        # SELinux-enforcing host such as Azure Container Linux it is refused for
-        # a sudo'd SSH session even though the agent's own systemctl calls
-        # succeed from its service context. Losing the isolation only risks a
-        # scenario inheriting a start-limit budget, which is worth a warning
-        # rather than failing a test about something else.
-        reset = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET,
-             "sudo systemctl reset-failed unbounded-agent-daemon.service"],
-            capture_output=True, text=True, check=False,
-        )
-        if reset.returncode != 0:
-            log("WARNING: could not reset the daemon start-limit budget "
-                f"({reset.stderr.strip()}); scenarios may share it")
+        check_reset_failed()
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
@@ -2681,6 +2684,13 @@ def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
         die("OFFLINE_BOOTSTRAP=1 is not supported with Ignition; "
             "use an explicit offlineArtifactsOCIRef scenario")
 
+    # The Ignition path serves the agent binary it stages itself, and points
+    # the config at that server. An agent from elsewhere, as the configuration
+    # scenarios pass, is never staged or served.
+    if os.environ.get("AGENT_URL") and host_image().provisioning == "ignition":
+        die("AGENT_URL is not supported with Ignition, so neither is the configuration suite; "
+            "run E2E_SUITE=lifecycle")
+
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
     for cmd in (KUBECTL,):
@@ -3219,36 +3229,47 @@ def _reinstall_ignition_payload(doc: dict[str, Any]) -> str:
     Only the agent binary, config and bootstrap unit are delivered. Guest
     identity, networking, filesystem, boot state and SSH access must survive
     reset; recreating those would hide cleanup/reinstallation defects.
+
+    The config is expected to hold exactly those plus the harness's own access
+    additions. Anything else is a change in what bootstrap installs, and stops
+    the run rather than being skipped.
     """
-    expected = {
+    agent_files = {
         f"{host_image().host_prefix}/bin/unbounded-agent",
         "/etc/unbounded/agent/config.json",
     }
-    payloads = {item["path"]: item for item in doc["storage"]["files"]
-                if item["path"] in expected}
-    if set(payloads) != expected:
-        die(f"unexpected Ignition agent payload paths: {sorted(payloads)}")
-    for index, (destination, item) in enumerate(payloads.items()):
-        source = item["contents"]["source"]
-        content = _decode_ignition_source(source)
-        local = VM_DIR / f"reinstall-{index}"
+    harness_files = {"/etc/hostname", f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}"}
+    files = {item["path"]: item for item in doc["storage"]["files"]}
+    if set(files) - harness_files != agent_files:
+        die(f"Ignition payload paths {sorted(set(files) - harness_files)} are not the agent's {sorted(agent_files)}")
+    units = {u["name"]: u for u in doc["systemd"]["units"]}
+    if set(units) - {"waagent.service"} != {IGNITION_BOOTSTRAP_UNIT}:
+        die(f"Ignition units {sorted(units)} are not the bootstrap unit and the harness's own")
+
+    for index, destination in enumerate(sorted(agent_files)):
+        item = files[destination]
+        content = _decode_ignition_source(item["contents"]["source"])
         if content is not None:
+            local = VM_DIR / f"reinstall-{index}"
             local.write_text(content)
+            local.chmod(0o600)
         elif destination.endswith("/bin/unbounded-agent"):
-            shutil.copyfile(VM_DIR / "unbounded-agent", local)
-            expected_hash = item["contents"]["verification"]["hash"]
-            actual_hash = "sha256-" + hashlib.sha256(local.read_bytes()).hexdigest()
-            if actual_hash != expected_hash:
-                die("reinstall agent binary differs from the rendered Ignition digest")
+            local = VM_DIR / "unbounded-agent"
         else:
             die(f"unsupported reinstall payload source for {destination}")
-        local.chmod(0o600)
         remote = f"/var/tmp/unbounded-reinstall-{index}"
         scp_cmd(str(local), f"{SSH_TARGET}:{remote}")
         ssh_cmd(f"sudo install -D -m {item['mode']:o} {remote} {destination} && rm {remote}")
 
-    unit = next(u for u in doc["systemd"]["units"]
-                if u["name"] == IGNITION_BOOTSTRAP_UNIT)
+        # Checked where it was installed, against the digest Ignition would
+        # have enforced, so what the host runs is tied to the build under test.
+        verification = item["contents"].get("verification")
+        if verification:
+            installed = ssh_capture(f"sudo sha256sum {destination}").split()[0]
+            if f"sha256-{installed}" != verification["hash"]:
+                die(f"{destination} on the VM does not match the rendered Ignition digest")
+
+    unit = units[IGNITION_BOOTSTRAP_UNIT]
     local = VM_DIR / "reinstall-bootstrap.service"
     local.write_text(unit["contents"])
 
@@ -4214,6 +4235,9 @@ def patch_kind_control_plane_node_ip() -> None:
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
+    # Refused before any mirroring or VM work; see the same check in run_agent.
+    if host_image().provisioning == "ignition":
+        die("the configuration suite is not supported with Ignition; run E2E_SUITE=lifecycle")
     workers = int(os.environ.get("CONFIG_SCENARIO_WORKERS", "2"))
     if workers < 1:
         die("CONFIG_SCENARIO_WORKERS must be positive")
