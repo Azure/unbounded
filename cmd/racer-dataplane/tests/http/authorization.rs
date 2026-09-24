@@ -120,6 +120,7 @@ fn multihop(routed: bool) {
             let volume = &mut config.volumes[0];
             volume.peers = vec!["next".into()];
             volume.topology = Some(crate::control::proto::Topology {
+                product: None,
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 8,

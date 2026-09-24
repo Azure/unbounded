@@ -315,6 +315,20 @@ impl Provider {
             }
         })();
         if let Err(error) = &result {
+            if peer
+                && let Some(permit) = permit.as_ref()
+                && let Some(failure) = error.attempt_failure()
+                && !failure.reported
+                && failure.evidence.as_ref().is_some_and(|e| {
+                    e.endpoint.tcp() == Some(failure.route.endpoint) && e.owner_evidence()
+                })
+            {
+                self.peer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .record_repair_failure(permit);
+            }
             if let Some(a) = attempt.as_mut()
                 && let Some(failure) = error.attempt_failure()
                 && failure.owner_evidence()
@@ -331,6 +345,13 @@ impl Provider {
             }
         }
         if let Some(permit) = permit {
+            if peer {
+                self.peer
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .clear_repair_failure(&permit);
+            }
             permit.success();
         }
         result

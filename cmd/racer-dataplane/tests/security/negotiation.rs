@@ -27,6 +27,7 @@ pub(crate) mod tests {
         config.peers[0].fabric = config.fabric.clone();
         config.volumes[0].peers = vec![config.peers[0].id.clone()];
         config.volumes[0].topology = Some(proto::Topology {
+            product: None,
             routing_algorithm: Some(1),
             epoch: 1,
             slot_count: 2,

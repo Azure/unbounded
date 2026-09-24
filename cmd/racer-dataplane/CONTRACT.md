@@ -11,7 +11,8 @@ Control subscriptions, enrollment, proof, and replica proof use `/v1/config`,
 `/v1/enroll`, `/v1/proof`, and `/v1/replica-proof`. The protobuf package remains
 `racer.control.v1` and the subscription profile is 1. Every volume references
 an explicit member catalog, including volumes with no remote members. A supplied
-topology must explicitly select routing algorithm 1.
+topology must explicitly select routing algorithm 2 for physical product routing.
+Algorithm 1 and its RR01 cursor remain accepted for legacy fixtures.
 
 RDMA negotiation and offers use version 1, with `RCR1` transport frames. CA
 state, trust bundles, identity claims, generation records, and revision checkpoint
@@ -79,7 +80,7 @@ Use a fresh slab for this format.
 
 `X-Racer-Fault` is hexadecimal encoding of a descriptor bounded to 3,500 decoded
 bytes. Distinct four-byte tags identify version 1 of each layer: `RB01` budget,
-`RR01` cursor, and `RD01` descriptor:
+`RR02` product cursor (`RR01` for algorithm 1), and `RD01` descriptor:
 
 - Metadata: `RD01`, byte 0, then target bytes.
 - Page: `RD01`, byte 1, LE u64 offset, LE u64 object length, 32 checksum bytes,
@@ -88,7 +89,9 @@ bytes. Distinct four-byte tags identify version 1 of each layer: `RB01` budget,
 
 An outer RC01 chain wraps the RB01 budget and binds the immutable namespace
 and forwarding allowances: `RC01 | namespace:32 | hops:u8 | work:u8 |
-candidate:LE-u32 | RB01...`. The inner RR01 cursor is placement-specific.
+candidate:LE-u32 | RB01...`. The inner cursor is placement-specific. Algorithm 2
+uses physical member indexes for candidate attribution, with distinct ranked
+physical candidates compiled per placement slot.
 Each new metadata or page resolution receives at most eight hops and 255 units
 of work. Forwarding splits work between the child and local recovery; admission
 retries do not spend it. Placement rebasing and transport retries never renew it.
@@ -107,8 +110,42 @@ this capacity cap. Mixed fleets and heterogeneous pool sizes may reject payload
 chains originated with a larger allowance; this does not authorize origin
 fallback or prove owner unavailability.
 
-Distributed client target admission reserves 410 bytes for the largest page,
-cursor, budget, and chain framing, allowing **3,090 target bytes**.
+Distributed client target admission reserves 436 bytes for the largest page,
+cursor, budget, and chain framing, allowing **3,064 target bytes**.
+
+RR02 has a fixed 71-byte body: topology identity (32 bytes), source member,
+placement owner slot, candidate attempt (three LE u32 values), position (u8),
+path length (u8), five physical member indexes (LE u32, unused entries all ones),
+failed member (LE u32, all ones when absent), and repair position (u8).
+Paths include endpoints and contain at most four successful physical edges.
+Each receiver reconstructs the deterministic healthy path or its single local
+repair and validates the entire path, selected candidate, and local position.
+Product requests with a different topology identity fail closed; they do not
+rebase and restart the four-edge allowance. Algorithm 1 retains bounded rebasing.
+
+Healthy product paths advance a distance-two coordinate first at every step.
+All members in adjacent role bundles are physical neighbors. Same-role endpoints
+use two edges through the lowest adjacent role. An initiated qualifying failure
+of the immediate intermediate HTTP peer permits one same-candidate repair:
+replace it with a surviving bundle twin or route around its role. The successful
+prefix is retained and prefix plus repair remains at most four edges. RDMA first
+recovers over same-peer HTTP. Repair never renews candidate deadlines, chain work,
+hop allowances, or receive ranks. Destination failure retains origin-only
+candidate advancement. Product flights are request-local to avoid repair cycles.
+Each forwarding hop reserves 500 ms once in the child's wire budget; the local
+exchange retains its existing candidate deadline. The owner separately reserves
+500 ms for its backend response. Thus a 30-second request with eight candidates
+starts with a 3.6875-second candidate window, leaving 1.1875 seconds before
+transport elapsed time after four hop reserves and the owner's backend reserve.
+Same-hop retries reuse the existing cap and spend existing chain authority.
+Repair evidence is fenced by the HTTP breaker permit generation: stale success
+cannot erase newer failure evidence, and stale failure cannot undo recovery.
+Variable-membership admission uses the shared product membership predicate:
+K1 permits only one member, K2 permits only two members, and bundled roles
+require base degree at least two. This rejects a singleton K2 bridge between
+two members of the other role before serving requests. The exact-10,000
+HS50 x Abas200 singleton assignment has neither this bundle degeneracy nor a
+degree expansion: each physical node has 23 peers.
 
 `X-Racer-Attempt` is 96 hexadecimal characters: a 32-byte BLAKE3 digest followed
 by a random 16-byte nonce. Hash input is the concatenation of:

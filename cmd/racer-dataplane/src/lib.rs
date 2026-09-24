@@ -41,6 +41,8 @@ pub(crate) use runtime::environment;
 #[cfg(test)]
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/contracts.rs"));
 
+#[path = "../../../internal/racer/product.rs"]
+pub mod product;
 pub mod topology;
 
 pub(crate) use uring::sys as uring_sys;

@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY api/racer/control.proto api/racer/control.proto
+COPY internal/racer/product.rs internal/racer/product.rs
 COPY cmd/racer-controlplane/Cargo.toml cmd/racer-controlplane/Cargo.lock cmd/racer-controlplane/build.rs cmd/racer-controlplane/
 COPY cmd/racer-controlplane/src/ cmd/racer-controlplane/src/
 ARG VERSION=dev

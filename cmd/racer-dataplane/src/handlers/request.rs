@@ -33,9 +33,7 @@ impl Handler {
                 .upstream
                 .routing
                 .as_ref()
-                .map_or(self.upstream.peer.is_some(), |r| {
-                    r.local.len() < r.geometry.slot_count() as usize
-                }),
+                .map_or(self.upstream.peer.is_some(), |r| r.distributed()),
             deadline,
             response_deadline,
             failure: None,

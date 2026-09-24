@@ -55,11 +55,25 @@ fn export_dataplane_placement() {
         let persisted = generation.canonical_bytes();
         let restored = serde_json::from_slice(&persisted).unwrap();
         assert_eq!(compile(&input, Some(&restored)).unwrap(), generation);
+        // A separate production corpus lets consumers validate algorithm 2
+        // without reinterpreting the retained algorithm-1 geometry fixtures.
+        let product_topology = Topology::new(&generation).unwrap();
+        for (i, member) in generation.nodes.values().enumerate() {
+            let snapshot = product_topology.snapshot(&member.id).unwrap();
+            std::fs::write(
+                dir.join(format!("product-n{count}-{i}.pb")),
+                snapshot.encode_to_vec(),
+            )
+            .unwrap();
+        }
         let names: Vec<_> = generation.nodes.keys().cloned().collect();
         // Default production geometry plus cube/noncube boundaries exercise the
         // same snapshot serializer with deterministic universe/Node identities.
         for slots in [1, 8, 17, 64, SLOT_COUNT] {
             let mut g = generation.clone();
+            // Retain the legacy conformance corpus alongside production exports.
+            g.product = None;
+            g.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
             g.volumes[0].slots = slots;
             if slots != SLOT_COUNT {
                 let by_id: std::collections::BTreeMap<_, _> = g
@@ -106,6 +120,8 @@ fn export_dataplane_placement() {
         }
         if count == 2 {
             let mut historical = generation.clone();
+            historical.product = None;
+            historical.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
             historical.volumes[0].slots = 8;
             historical.volumes[0].owners =
                 (0..8).map(|s| names[usize::from(s >= 4)].clone()).collect();

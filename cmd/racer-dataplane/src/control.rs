@@ -112,9 +112,19 @@ impl Trust {
                     return Err(invalid("slot geometry budget exceeded"));
                 }
                 work = work
-                    .checked_add(t.local_slots.len() as u64 * 64)
+                    .checked_add(if t.product.is_some() {
+                        0
+                    } else {
+                        t.local_slots.len() as u64 * 64
+                    })
                     .ok_or_else(|| invalid("work overflow"))?;
                 records += t.local_slots.len() + t.neighbors.len();
+                if let Some(p) = &t.product {
+                    records += p.members.len() + p.roles.len();
+                    work = work
+                        .checked_add(p.candidates.len() as u64 * 4 + p.members.len() as u64 * 8)
+                        .ok_or_else(|| invalid("work overflow"))?;
+                }
             }
             records += v.peers.len() + v.peer_endpoints.as_ref().map_or(0, |s| s.peers.len());
         }
@@ -201,6 +211,21 @@ impl Trust {
                 .iter()
                 .map(|(id, (address, _))| Ok((id.clone(), http::Endpoint::parse(address)?)))
                 .collect::<io::Result<BTreeMap<_, _>>>()?;
+            if let Some(p) = volume.topology.as_ref().and_then(|t| t.product.as_ref())
+                && (p
+                    .members
+                    .get(p.local_member as usize)
+                    .is_none_or(|id| crate::http_auth::identity_bytes(id).ok() != Some(self.node))
+                    || p.members.len() != members.len()
+                    || p.members.iter().any(|id| {
+                        crate::http_auth::identity_bytes(id)
+                            .ok()
+                            .is_none_or(|id| !members.contains_key(&id))
+                    })
+                    || effective.len() != volume.peers.len())
+            {
+                return Err(invalid("product membership or local identity mismatch"));
+            }
             volumes.push(PreparedVolume {
                 routing: Arc::new(crate::routing::Routing::new(&config.universe, volume)?),
                 config: volume.clone(),
@@ -1672,8 +1697,11 @@ impl Client {
     }
 }
 
+#[path = "control/product_routing.rs"]
+pub(crate) mod product_routing;
 pub mod routing {
     //! Immutable local topology and bounded, validated fault routing cursors.
+    use super::product_routing::Physical;
     use crate::{
         control::proto,
         topology::{Epoch, Step, Topology},
@@ -1683,7 +1711,7 @@ pub mod routing {
         io,
     };
 
-    fn invalid() -> io::Error {
+    pub(super) fn invalid() -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid topology routing context",
@@ -1693,16 +1721,19 @@ pub mod routing {
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub enum Algorithm {
         Canonical = 1,
+        Product = 2,
     }
     impl Algorithm {
         pub fn wire_version(self) -> u8 {
             match self {
                 Self::Canonical => 1,
+                Self::Product => 2,
             }
         }
         pub fn magic(self) -> &'static [u8; 4] {
             match self {
                 Self::Canonical => b"RR01",
+                Self::Product => b"RR02",
             }
         }
     }
@@ -1713,8 +1744,9 @@ pub mod routing {
         pub local: BTreeSet<u32>,
         pub neighbors: BTreeMap<u32, String>,
         pub identity: [u8; 32],
+        pub(super) product: Option<Physical>,
         #[cfg(test)]
-        namespace: crate::cache::Namespace,
+        pub(super) namespace: crate::cache::Namespace,
     }
     impl Routing {
         pub fn new(universe: &[u8], volume: &proto::Volume) -> io::Result<Self> {
@@ -1724,9 +1756,11 @@ pub mod routing {
                 slot_count: 1,
                 local_slots: vec![0],
                 neighbors: vec![],
+                product: None,
             });
             let algorithm = match config.routing_algorithm {
                 Some(1) => Algorithm::Canonical,
+                Some(2) => Algorithm::Product,
                 _ => return Err(invalid()),
             };
             if (volume.topology.is_none() && !volume.peers.is_empty())
@@ -1740,6 +1774,12 @@ pub mod routing {
             }
             let geometry = Topology::new(config.slot_count, Epoch::new(config.epoch))
                 .map_err(|_| invalid())?;
+            if algorithm == Algorithm::Product {
+                return Self::new_product(universe, volume, config, geometry);
+            }
+            if config.product.is_some() {
+                return Err(invalid());
+            }
             let local: BTreeSet<_> = config.local_slots.iter().copied().collect();
             if local.is_empty()
                 || local.len() != config.local_slots.len()
@@ -1799,6 +1839,7 @@ pub mod routing {
                 local,
                 neighbors,
                 identity: *identity.finalize().as_bytes(),
+                product: None,
             })
         }
         #[cfg(test)]
@@ -1811,16 +1852,61 @@ pub mod routing {
         }
         pub fn start_key(&self, key: &[u8; 32]) -> Cursor {
             let owner = self.geometry.owner(key).get();
-            Cursor {
+            let mut cursor = Cursor {
                 algorithm: self.algorithm,
                 identity: self.identity,
-                source: *self.local.first().unwrap(),
+                source: self
+                    .product
+                    .as_ref()
+                    .map_or_else(|| *self.local.first().unwrap(), |p| p.config.local_member),
                 owner,
                 attempt: 0,
                 position: 0,
+                path: Vec::new(),
+                failed: u32::MAX,
+                repair_position: 0,
+            };
+            if let Some(p) = &self.product {
+                cursor.source = p.config.local_member;
+                cursor.path = p
+                    .route(cursor.source, self.destination(&cursor))
+                    .expect("validated product");
             }
+            cursor
+        }
+        pub fn candidate_count(&self) -> u32 {
+            self.product
+                .as_ref()
+                .map_or(self.geometry.slot_count(), |p| p.config.candidate_width)
+        }
+        pub fn distributed(&self) -> bool {
+            self.product.as_ref().map_or(
+                self.local.len() < self.geometry.slot_count() as usize,
+                |p| p.config.members.len() > 1,
+            )
+        }
+        pub fn advance_candidate(&self, c: &mut Cursor) -> io::Result<()> {
+            if c.attempt >= self.candidate_count().saturating_sub(1) {
+                return Err(invalid());
+            }
+            c.attempt += 1;
+            c.position = 0;
+            c.failed = u32::MAX;
+            c.repair_position = 0;
+            if let Some(p) = &self.product {
+                c.path = p.route(c.source, self.destination(c))?;
+            }
+            Ok(())
         }
         pub fn destination(&self, c: &Cursor) -> u32 {
+            if let Some(p) = &self.product {
+                return p
+                    .config
+                    .candidates
+                    .get(c.owner as usize * p.config.candidate_width as usize + c.attempt as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+            }
             ((u64::from(c.owner) + u64::from(c.attempt)) % u64::from(self.geometry.slot_count()))
                 as u32
         }
@@ -1831,6 +1917,9 @@ pub mod routing {
                 return Err(invalid());
             }
             if c.identity != self.identity {
+                if self.algorithm == Algorithm::Product || c.algorithm == Algorithm::Product {
+                    return Err(invalid());
+                }
                 let mut local = self.start_key(key);
                 // Candidate retries remain bounded independently of placement.
                 local.attempt = c.attempt.min(self.geometry.slot_count() - 1);
@@ -1840,6 +1929,10 @@ pub mod routing {
             Ok(c)
         }
         fn path(&self, c: &Cursor) -> io::Result<Vec<u32>> {
+            if self.product.is_some() {
+                self.validate_product(c)?;
+                return Ok(c.path.clone());
+            }
             if c.identity != self.identity
                 || c.algorithm != self.algorithm
                 || c.owner >= self.geometry.slot_count()
@@ -1871,6 +1964,13 @@ pub mod routing {
                 return Err(invalid());
             }
             let path = self.path(c)?;
+            if let Some(p) = &self.product {
+                return if path.get(c.position as usize) == Some(&p.config.local_member) {
+                    Ok(())
+                } else {
+                    Err(invalid())
+                };
+            }
             if !path
                 .get(c.position as usize)
                 .is_some_and(|s| self.local.contains(s))
@@ -1880,6 +1980,18 @@ pub mod routing {
             Ok(())
         }
         pub fn next(&self, c: &Cursor) -> io::Result<Option<(String, Cursor)>> {
+            if let Some(p) = &self.product {
+                self.validate_product(c)?;
+                if c.path.get(c.position as usize) != Some(&p.config.local_member) {
+                    return Err(invalid());
+                }
+                let mut next = c.clone();
+                next.position += 1;
+                return Ok(c
+                    .path
+                    .get(next.position as usize)
+                    .map(|&member| (p.config.members[member as usize].clone(), next)));
+            }
             let path = self.path(c)?;
             let mut next = c.clone();
             // Co-located later slots are local transitions; bypassing the intervening
@@ -1897,6 +2009,14 @@ pub mod routing {
             Ok(None)
         }
         pub fn normalized_position(&self, c: &Cursor) -> io::Result<u8> {
+            if let Some(p) = &self.product {
+                self.validate_product(c)?;
+                return if c.path.get(c.position as usize) == Some(&p.config.local_member) {
+                    Ok(c.position)
+                } else {
+                    Err(invalid())
+                };
+            }
             let path = self.path(c)?;
             if !path
                 .get(c.position as usize)
@@ -1921,6 +2041,9 @@ pub mod routing {
             })
         }
         pub fn compatible(&self, a: &Cursor, b: &Cursor) -> bool {
+            if self.product.is_some() {
+                return a == b && self.validate_product(a).is_ok();
+            }
             a.identity == b.identity
                 && self.destination(a) == self.destination(b)
                 && self
@@ -1934,6 +2057,14 @@ pub mod routing {
             self.final_peer(c).is_some()
         }
         pub(crate) fn final_peer(&self, c: &Cursor) -> Option<&str> {
+            if let Some(p) = &self.product {
+                self.validate_product(c).ok()?;
+                if c.path.get(c.position as usize) != Some(&p.config.local_member) {
+                    return None;
+                }
+                return (c.path.get(c.position as usize + 1) == Some(&self.destination(c)))
+                    .then(|| p.config.members[self.destination(c) as usize].as_str());
+            }
             if c.identity != self.identity {
                 return None;
             }
@@ -1945,7 +2076,7 @@ pub mod routing {
         }
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Cursor {
         pub algorithm: Algorithm,
         pub identity: [u8; 32],
@@ -1953,10 +2084,14 @@ pub mod routing {
         pub owner: u32,
         pub attempt: u32,
         pub position: u8,
+        pub path: Vec<u32>,
+        pub failed: u32,
+        pub repair_position: u8,
     }
     impl Cursor {
         pub const LEN: usize = 45;
-        /// Encode the cursor body. The enclosing RR01 magic must
+        pub const PRODUCT_LEN: usize = 71;
+        /// Encode the cursor body. The enclosing RR01/RR02 magic must
         /// be selected from `algorithm`; the body alone is not a wire descriptor.
         pub fn encode(&self) -> Vec<u8> {
             let mut bytes = self.identity.to_vec();
@@ -1964,6 +2099,14 @@ pub mod routing {
             bytes.extend(self.owner.to_le_bytes());
             bytes.extend(self.attempt.to_le_bytes());
             bytes.push(self.position);
+            if self.algorithm == Algorithm::Product {
+                bytes.push(self.path.len() as u8);
+                for i in 0..5 {
+                    bytes.extend(self.path.get(i).copied().unwrap_or(u32::MAX).to_le_bytes());
+                }
+                bytes.extend(self.failed.to_le_bytes());
+                bytes.push(self.repair_position);
+            }
             bytes
         }
         /// Decode a canonical RR01 body.
@@ -1971,8 +2114,38 @@ pub mod routing {
             Self::decode_algorithm(bytes, Algorithm::Canonical)
         }
         pub fn decode_algorithm(bytes: &[u8], algorithm: Algorithm) -> io::Result<Self> {
-            if bytes.len() != Self::LEN || bytes[44] > 3 {
+            let product = algorithm == Algorithm::Product;
+            if bytes.len()
+                != if product {
+                    Self::PRODUCT_LEN
+                } else {
+                    Self::LEN
+                }
+                || bytes[44] > if product { 4 } else { 3 }
+            {
                 return Err(invalid());
+            }
+            let mut path = Vec::new();
+            let (mut failed, mut repair_position) = (u32::MAX, 0);
+            if product {
+                let len = bytes[45] as usize;
+                if !(1..=5).contains(&len) || bytes[44] as usize >= len {
+                    return Err(invalid());
+                }
+                for i in 0..5 {
+                    let member =
+                        u32::from_le_bytes(bytes[46 + i * 4..50 + i * 4].try_into().unwrap());
+                    if i < len {
+                        path.push(member);
+                    } else if member != u32::MAX {
+                        return Err(invalid());
+                    }
+                }
+                failed = u32::from_le_bytes(bytes[66..70].try_into().unwrap());
+                repair_position = bytes[70];
+                if repair_position > bytes[44] || (failed == u32::MAX && repair_position != 0) {
+                    return Err(invalid());
+                }
             }
             Ok(Self {
                 algorithm,
@@ -1981,6 +2154,9 @@ pub mod routing {
                 owner: u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
                 attempt: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
                 position: bytes[44],
+                path,
+                failed,
+                repair_position,
             })
         }
     }

@@ -154,7 +154,7 @@ fn compiler_ignores_history_and_volatile_fields_and_shares_universe_placement() 
     for volume in &current.volumes {
         assert_eq!(volume.owners, first.volumes[0].owners);
         assert_eq!(volume.slots, SLOT_COUNT);
-        assert_eq!(volume.routing_algorithm, ROUTING_ALGORITHM);
+        assert_eq!(volume.routing_algorithm, PRODUCT_ROUTING_ALGORITHM);
     }
     let cold = compile(&input, None).unwrap();
     assert_eq!(current.volumes, cold.volumes);
@@ -173,6 +173,10 @@ fn compiler_ignores_history_and_volatile_fields_and_shares_universe_placement() 
 #[test]
 fn zero_slot_live_nodes_are_idle_and_remain_in_membership_catalog() {
     let mut generation = compile(&input(4), None).unwrap();
+    // Legacy graph fixtures retain the zero-slot idle contract. Product roles
+    // forward regardless of whether the physical node wins a placement slot.
+    generation.product = None;
+    generation.volumes[0].routing_algorithm = ROUTING_ALGORITHM;
     let by_id: BTreeMap<_, _> = generation
         .nodes
         .iter()

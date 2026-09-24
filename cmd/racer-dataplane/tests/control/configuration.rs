@@ -116,6 +116,7 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
                 }],
             }),
             topology: Some(proto::Topology {
+                product: None,
                 routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,
@@ -250,6 +251,7 @@ pub(crate) fn cluster_config(
         }
     }
     volume.topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: algorithm,
         epoch: 1,
         slot_count: 8,
@@ -289,6 +291,7 @@ pub(crate) fn runtime_pair(
     config.peers[0].fabric = config.fabric.clone();
     config.peers[0].http_address = remote.to_string();
     config.volumes[0].topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
@@ -695,6 +698,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
     let v = &mut snapshot.volumes[0];
     v.peers.clear();
     v.topology = Some(proto::Topology {
+        product: None,
         epoch: 1,
         slot_count: MAX_SLOTS,
         local_slots: (0..MAX_SLOTS).collect(),
@@ -719,6 +723,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
     let v = &mut snapshot.volumes[0];
     v.peers = vec![peer.clone()];
     v.topology = Some(proto::Topology {
+        product: None,
         epoch: 1,
         slot_count: 512,
         local_slots: (0..65).collect(),
@@ -916,6 +921,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     snapshot.volumes[0].peers = vec![second.id.clone(), "ef".repeat(32), first.clone()];
     snapshot.volumes[0].topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 27,
@@ -941,6 +947,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     volume.origin_socket = "/dev/racer/second/origin".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
@@ -995,6 +1002,7 @@ fn rdma_capabilities_pin_original_policy_and_do_not_survive_removal_in_new_gener
     next.peers.clear();
     next.volumes[0].peers.clear();
     next.volumes[0].topology = Some(proto::Topology {
+        product: None,
         routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,

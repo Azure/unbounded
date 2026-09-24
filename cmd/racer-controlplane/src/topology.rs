@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::model::*;
 use crate::{Error, Result, proto};
 
+#[path = "placement_candidates.rs"]
+mod placement_candidates;
+
 pub fn degree(slots: u32) -> u32 {
     let mut d = 1u32;
     while u64::from(d).pow(3) < u64::from(slots) {
@@ -104,6 +107,7 @@ pub struct PlacementCache {
     universe: String,
     ids: Vec<String>,
     winners: Vec<(usize, u64)>,
+    rankings: placement_candidates::Rankings,
 }
 
 impl PlacementCache {
@@ -189,7 +193,7 @@ pub fn compile(input: &Inventory, previous: Option<&Generation>) -> Result<Gener
     compile_cached(input, previous, &mut PlacementCache::default())
 }
 
-/// Compile from current inventory; `previous` supplies only the local revision.
+/// Compile current ownership from inventory, retaining valid process-local roles.
 /// A caller may retain one disposable placement cache per universe across polls.
 pub fn compile_cached(
     input: &Inventory,
@@ -256,18 +260,36 @@ pub fn compile_cached(
     if active.len() > 100_000 {
         return Err(Error("universe exceeds 100000 participants".into()));
     }
-    let owners = if input.caches.is_empty() {
+    let members: Vec<_> = active.keys().cloned().collect();
+    let max_attempts = input
+        .caches
+        .iter()
+        .map(|c| c.max_candidate_attempts)
+        .max()
+        .unwrap_or(1);
+    if !(1..=8).contains(&max_attempts) {
+        return Err(Error("invalid candidate attempt limit".into()));
+    }
+    let owners = if input.caches.is_empty() || active.is_empty() {
         Vec::new()
     } else {
-        placement
-            .place(
-                SLOT_COUNT,
-                &input.universe,
-                &active.keys().cloned().collect::<Vec<_>>(),
-            )?
-            .into_iter()
-            .map(|id| active[&id].clone())
-            .collect()
+        let width = max_attempts.min(members.len() as u32);
+        let candidates = placement.candidates(SLOT_COUNT, &input.universe, &members, width)?;
+        let (product, roles) =
+            crate::product_topology::assign(&members, previous.and_then(|g| g.product.as_ref()))?;
+        let owners = candidates
+            .chunks_exact(width as usize)
+            .map(|row| active[&members[row[0] as usize]].clone())
+            .collect();
+        g.product = Some(ProductPlacement {
+            left_factor: product.left.order(),
+            right_factor: product.right.order(),
+            members,
+            roles,
+            candidate_width: width,
+            candidates,
+        });
+        owners
     };
     let mut caches: Vec<_> = input.caches.iter().collect();
     caches.sort_by_key(|c| &c.name);
@@ -294,7 +316,7 @@ pub fn compile_cached(
             origin_socket,
             slots: SLOT_COUNT,
             cache_generation: cache.cache_generation as u64,
-            routing_algorithm: ROUTING_ALGORITHM,
+            routing_algorithm: PRODUCT_ROUTING_ALGORITHM,
             max_candidate_attempts: cache.max_candidate_attempts,
             owners: owners.clone(),
         });
@@ -312,7 +334,7 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// Validate persisted content and profile-1 admission before publishing it.
+    /// Validate generation content and profile-1 admission before publishing it.
     pub fn new(g: &Generation) -> Result<Self> {
         Self::from_generation(Arc::new(g.clone()))
     }
@@ -352,7 +374,8 @@ impl Topology {
                 || !ids.insert(&volume.id)
                 || volume.slots == 0
                 || volume.slots > SLOT_COUNT
-                || volume.routing_algorithm != ROUTING_ALGORITHM
+                || ![ROUTING_ALGORITHM, PRODUCT_ROUTING_ALGORITHM]
+                    .contains(&volume.routing_algorithm)
                 || !(1..=8).contains(&volume.max_candidate_attempts)
                 || (!volume.owners.is_empty() && volume.owners.len() != volume.slots as usize)
                 || [&volume.cache_socket, &volume.origin_socket]
@@ -370,6 +393,7 @@ impl Topology {
             }
             local.push(slots);
         }
+        crate::product_topology::validate(&g)?;
         let result = Self {
             members: proto::MemberCatalog {
                 members: g
@@ -392,6 +416,11 @@ impl Topology {
     }
 
     fn admit(&self) -> Result<()> {
+        let peer_counts = self
+            .generation
+            .product
+            .as_ref()
+            .map(crate::product_topology::peer_counts);
         let membership_bytes: u64 = self
             .members
             .members
@@ -402,6 +431,22 @@ impl Topology {
             let (mut work, mut records, mut wire) =
                 (0u64, self.members.members.len() as u64, membership_bytes);
             for (v, local) in self.generation.volumes.iter().zip(&self.local) {
+                if v.routing_algorithm == PRODUCT_ROUTING_ALGORITHM {
+                    if let Some(product) = &self.generation.product {
+                        if let Ok(index) = product
+                            .members
+                            .binary_search(&self.generation.nodes[name].id)
+                        {
+                            let direct =
+                                peer_counts.as_ref().unwrap()[product.roles[index] as usize];
+                            let (w, r, b) = crate::product_topology::budget(product, v, direct)?;
+                            work += w;
+                            records += r;
+                            wire += b;
+                        }
+                    }
+                    continue;
+                }
                 let l = local.get(name.as_str()).map_or(0, |s| s.len()) as u64;
                 if l == 0 {
                     continue;
@@ -443,11 +488,32 @@ impl Topology {
             fabric: member.fabric.clone(),
             idle: member.ip.is_some()
                 && !member.pod_uid.is_empty()
+                && g.product.is_none()
                 && self.local.iter().all(|local| !local.contains_key(name)),
             ..Default::default()
         };
         let mut peers = BTreeMap::new();
         for (v, local) in g.volumes.iter().zip(&self.local) {
+            if v.routing_algorithm == PRODUCT_ROUTING_ALGORITHM {
+                if let Some(product) = &g.product {
+                    if let Ok(index) = product
+                        .members
+                        .binary_search_by(|member| member.as_str().cmp(id))
+                    {
+                        let (volume, direct) = crate::product_topology::snapshot(
+                            g,
+                            product,
+                            v,
+                            index,
+                            local.get(name).cloned().unwrap_or_default(),
+                            &self.by_id,
+                        );
+                        snapshot.volumes.push(volume);
+                        peers.extend(direct);
+                    }
+                }
+                continue;
+            }
             let Some(slots) = local.get(name) else {
                 continue;
             };
@@ -536,6 +602,7 @@ impl Topology {
                     local_slots: slots.clone(),
                     neighbors,
                     routing_algorithm: Some(v.routing_algorithm),
+                    product: None,
                 }),
                 member_catalog: Some(0),
             });
