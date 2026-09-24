@@ -35,7 +35,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -475,6 +475,7 @@ struct Shared {
     enrollment_capacity: Arc<Semaphore>,
     reviews: ReviewCache,
     refresh: Mutex<()>,
+    replica_cursor: AtomicUsize,
     stop: CancellationToken,
 }
 
@@ -1383,13 +1384,30 @@ async fn issue_replica(
 }
 
 async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> {
+    use futures::{StreamExt, stream};
+    const REPLICA_BATCH: usize = 8;
+    const REPLICA_DEADLINE: Duration = Duration::from_secs(5);
+
     active.manager.publish().await?;
     let pods = shared.pods().list(&ListParams::default()).await?;
-    for pod in &pods.items {
-        if pod.labels().get(COMPONENT_LABEL).map(String::as_str) != Some(COMPONENT) {
-            continue;
-        }
-        let result: Result<()> = async {
+    let mut candidates: Vec<_> = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            pod.labels().get(COMPONENT_LABEL).map(String::as_str) == Some(COMPONENT)
+                && pod.annotations().contains_key(REPLICA_REQUEST)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    let count = candidates.len().min(REPLICA_BATCH);
+    // Advance before awaiting work: cancellation and repeated slow owners must
+    // not restart each pass at the same prefix. Bound the entire batch as well
+    // as concurrency so route publication gets a turn even with many slow Pods.
+    let start = shared.replica_cursor.fetch_add(count, Ordering::Relaxed);
+    let mut work = stream::iter((0..count).map(|offset| {
+        let pod = candidates[start.wrapping_add(offset) % candidates.len()];
+        async move {
+        let result = tokio::time::timeout(REPLICA_DEADLINE, async {
             let Some(request) = pod.annotations().get(REPLICA_REQUEST) else {
                 return Ok(());
             };
@@ -1403,12 +1421,15 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
             )
             .await?;
             issue_replica(shared, active, pod, identity).await
+        }).await;
+        match result {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => tracing::debug!(pod = pod.name_any(), %error, "replica issuance pending"),
+            Err(error) => tracing::debug!(pod = pod.name_any(), %error, "replica issuance deadline exceeded"),
         }
-        .await;
-        if let Err(error) = result {
-            tracing::debug!(pod = pod.name_any(), %error, "replica issuance pending");
         }
-    }
+    })).buffer_unordered(REPLICA_BATCH);
+    while work.next().await.is_some() {}
     shared.refresh_state(active).await?;
     Ok(())
 }
@@ -1618,6 +1639,7 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
         enrollment_capacity: Arc::new(Semaphore::new(8)),
         reviews: ReviewCache::new(options.review_qps, options.review_burst),
         refresh: Mutex::new(()),
+        replica_cursor: AtomicUsize::new(0),
         options,
         stop: shutdown.child_token(),
     });

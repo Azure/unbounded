@@ -50,6 +50,8 @@ struct Objects {
     in_flight: BTreeMap<u64, (String, Instant)>,
     write_fault: Option<(String, Method, bool, bool)>,
     secret_read_pause: Option<(usize, Arc<RoutePause>)>,
+    stalled_gets: BTreeMap<String, CancellationToken>,
+    stalled_get_attempts: usize,
 }
 #[derive(Clone)]
 struct Fixture {
@@ -153,6 +155,19 @@ async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap();
     let patch: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let stalled = if parts.method == Method::GET {
+        let mut objects = fixture.objects.lock().unwrap();
+        let stalled = objects.stalled_gets.get(parts.uri.path()).cloned();
+        if stalled.is_some() {
+            objects.stalled_get_attempts += 1;
+        }
+        stalled
+    } else {
+        None
+    };
+    if let Some(stalled) = stalled {
+        stalled.cancelled().await;
+    }
     let pause = if parts.method == Method::GET && parts.uri.path().ends_with("/secrets/racer-ca") {
         let mut objects = fixture.objects.lock().unwrap();
         if let Some((remaining, _)) = objects.secret_read_pause.as_mut() {
@@ -1410,6 +1425,87 @@ async fn bad_replica_owners_do_not_block_healthy_startup_or_renewal() -> Result<
     run.await??;
     api_stop.cancel();
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_replica_owners_do_not_starve_later_issuance_renewal_or_initial_route() -> Result<()>
+{
+    let (fixture, client, api_stop) = Fixture::start().await?;
+    fixture.seed();
+    let release = CancellationToken::new();
+    let key = generate_local_key()?;
+    // More stalled entries than the concurrency limit, sorted before both
+    // healthy replicas. Every retry stalls; only owner GETs are held.
+    for index in 0..9 {
+        let name = format!("a-stalled-{index}");
+        let mut pod = replica_pod(&fixture, &name);
+        attach_replica_request(&mut pod, &key);
+        pod["metadata"]["ownerReferences"][0]["name"] = name.clone().into();
+        fixture.objects.lock().unwrap().stalled_gets.insert(
+            format!("/apis/apps/v1/namespaces/system/replicasets/{name}"),
+            release.clone(),
+        );
+        fixture.put(&format!("/api/v1/namespaces/system/pods/{name}"), pod);
+    }
+    let healthy_path = "/api/v1/namespaces/system/pods/z-healthy";
+    let mut healthy = replica_pod(&fixture, "z-healthy");
+    attach_replica_request(&mut healthy, &key);
+    fixture.put(healthy_path, healthy);
+    let options = Options {
+        leaf_lifetime: Duration::from_secs(30),
+        clock_skew: Duration::from_secs(1),
+        ..route_options().await
+    };
+    let stop = CancellationToken::new();
+    let run = tokio::spawn(service::run(client, options.clone(), stop.clone()));
+    let result: Result<()> = async {
+        wait_for_route(&fixture, &options, Duration::from_secs(25))
+            .await
+            .context("initial route starved by earlier owner GETs")?;
+        let original =
+            replica_response(&fixture, healthy_path).context("later healthy replica not issued")?;
+        let controller = replica_response(&fixture, CONTROLLER_PATH).unwrap();
+        let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+        let lease = fixture.get(&lease_path).unwrap();
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let renewed = replica_response(&fixture, healthy_path).unwrap();
+                let local = replica_response(&fixture, CONTROLLER_PATH).unwrap();
+                if renewed["certificate"] != original["certificate"]
+                    && local["certificate"] != controller["certificate"]
+                {
+                    assert_eq!(renewed["boot"], original["boot"]);
+                    assert_eq!(renewed["csr_digest"], original["csr_digest"]);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("healthy renewal starved by repeated owner GET stalls")?;
+        let renewed_lease = fixture.get(&lease_path).unwrap();
+        assert_eq!(
+            renewed_lease["spec"]["holderIdentity"],
+            lease["spec"]["holderIdentity"]
+        );
+        assert_ne!(
+            renewed_lease["metadata"]["resourceVersion"],
+            lease["metadata"]["resourceVersion"]
+        );
+        assert!(fixture.objects.lock().unwrap().stalled_get_attempts > 9);
+        assert!(
+            !release.is_cancelled(),
+            "owner requests must stay stalled through renewal"
+        );
+        wait_for_route(&fixture, &options, Duration::from_secs(10)).await?;
+        Ok(())
+    }
+    .await;
+    stop.cancel();
+    release.cancel();
+    run.await??;
+    api_stop.cancel();
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	"github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
@@ -83,7 +84,9 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 		t.Fatal(err)
 	}
 
-	serverDER, err := issue(key.Public(), "spiffe://racer/controlplane", false)
+	serverClaims := fixture.Claims{Version: 1, Namespace: "sdk", Identity: fixture.CertificateIdentity{Kind: "controlplane", PodUID: "controller", BootID: strings.Repeat("04", 32), PodName: "controller"}}
+
+	serverDER, err := issue(key.Public(), serverClaims.URI(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,15 +94,17 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
 
-	nodeURI := "spiffe://racer/universe/" + strings.Repeat("01", 32) + "/node/" + strings.Repeat("02", 32) + "/pod/sdk-pod"
+	nodeClaims := func(boot string) fixture.Claims {
+		return fixture.Claims{Version: 1, Namespace: "sdk", Identity: fixture.CertificateIdentity{Kind: "node", Universe: strings.Repeat("01", 32), Node: strings.Repeat("02", 32), PodUID: "sdk-pod", BootID: boot, PodName: "dataplane"}}
+	}
 	authenticated := func(r *http.Request) bool {
-		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.PeerCertificates[0].URIs) != 1 {
 			return false
 		}
 
-		leaf := r.TLS.PeerCertificates[0]
+		claims, err := fixture.ParseClaims(r.TLS.PeerCertificates[0].URIs[0].String())
 
-		return len(leaf.URIs) == 1 && leaf.URIs[0].String() == nodeURI
+		return err == nil && claims == nodeClaims(r.Header.Get("X-Racer-Boot"))
 	}
 
 	mux := http.NewServeMux()
@@ -185,7 +190,15 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 			return
 		}
 
-		leaf, err := issue(csr.PublicKey, nodeURI, true)
+		boot := r.Header.Get("X-Racer-Boot")
+
+		decodedBoot, err := hex.DecodeString(boot)
+		if err != nil || len(decodedBoot) != 32 || hex.EncodeToString(decodedBoot) != boot {
+			http.Error(w, "invalid boot", http.StatusBadRequest)
+			return
+		}
+
+		leaf, err := issue(csr.PublicKey, nodeClaims(boot).URI(), true)
 		if err != nil {
 			t.Error(err)
 			http.Error(w, "issuance failed", http.StatusInternalServerError)
