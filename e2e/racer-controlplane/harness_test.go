@@ -410,7 +410,7 @@ func (c *campaign) create(resource schema.GroupVersionResource, obj map[string]a
 	return v
 }
 
-func (c *campaign) patch(resource schema.GroupVersionResource, name string, patch string) {
+func (c *campaign) patch(resource schema.GroupVersionResource, name, patch string) {
 	c.t.Helper()
 	_, err := c.dynamic.Resource(resource).Patch(c.ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 	require(c.t, err)

@@ -343,8 +343,8 @@ func TestRacerDisconnectCancelsLaterPage(t *testing.T) {
 
 	select {
 	case result := <-stats:
-		if result.SpliceBytes == 0 || result.TeeBytes == 0 {
-			t.Fatal("lost verified splice", result)
+		if result.SpliceBytes == 0 || result.TeeCalls != 0 || result.TeeBytes != 0 {
+			t.Fatal("lost splice forwarding without verification", result)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("mirror did not release")

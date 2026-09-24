@@ -93,9 +93,11 @@ func TestGantryRacerContainerImage(t *testing.T) {
 		t.Fatal("warm image pull failed or bypassed Racer")
 	}
 
-	if f.metric(0, `gantry_racer_stream_total{outcome="verified"}`) < 16 || f.metric(0, "gantry_racer_splice_bytes_total") < 128<<20 {
-		t.Fatal("missing verified real Racer payload streams")
+	if f.metric(0, `gantry_racer_stream_total{outcome="completed"}`) < 16 || f.metric(0, "gantry_racer_splice_bytes_total") < 128<<20 {
+		t.Fatal("missing completed real Racer payload streams")
 	}
+
+	gantryAssertNoTee(t, f, 0)
 
 	puller.stop()
 }

@@ -272,7 +272,7 @@ help: ## Show this help
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
 	@echo "  e2e-gantry-racer-build           Build Gantry, loadgen, locked Rust dataplane, and warm the e2e Go build cache"
-	@echo "  e2e-gantry-racer                 Run five real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
+	@echo "  e2e-gantry-racer                 Run six real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
@@ -803,7 +803,7 @@ e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and inde
 			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
 		done; \
 		failed=0; \
-		for suite in Striped Authorization Recovery Corruption ContainerImage; do \
+		for suite in Striped Authorization Recovery Corruption ContainerImage Generation; do \
 			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
 			$(RACER_TEST_HARNESS) run "gantry-$$suite" 60 $(GOTEST) -json -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v || failed=1; \
 		done; exit $$failed
@@ -818,7 +818,7 @@ e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 		exit $$failed
 
 e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
-	$(RACER_TEST_HARNESS) run e2e-fixtures 300 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -timeout=4m -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract|TestBackendWireRepresentation|TestGantryControlFixture|TestEnrollmentAndControl)$$' ./e2e/racer/...
+	$(RACER_TEST_HARNESS) run e2e-fixtures 300 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -timeout=4m -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract|TestBackendWireRepresentation|TestGantryControlFixture|TestGantryRecoveryFixture|TestEnrollmentAndControl)$$' ./e2e/racer/...
 
 e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
 	$(RACER_TEST_HARNESS) run kind-deployment 2760 $(GOTEST) -json -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer

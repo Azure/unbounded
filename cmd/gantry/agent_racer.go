@@ -94,12 +94,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 	}
 	defer originHTTP.Close() //nolint:errcheck // Shutdown cleanup.
 
-	spliceCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_calls_total", Help: "Actual SDK splice syscalls."})
-	spliceBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_bytes_total", Help: "Payload bytes forwarded with splice."})
-	teeCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_calls_total", Help: "Actual SDK verification tee syscalls."})
-	teeBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_bytes_total", Help: "Bytes duplicated for SHA-256 verification."})
-	bufferedBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_buffered_bytes_total", Help: "Payload bytes forwarded through userspace."})
-	streams := reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_stream_total", Help: "Racer response outcomes; partial is not full digest verification."}, []string{"outcome"})
+	onRacerStream := newRacerStreamMetrics(reg)
 	fallback := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_fallback_total", Help: "Pre-header ordinary registry fallbacks."})
 	available := reg.NewGauge("racer", prometheus.GaugeOpts{Name: "gantry_racer_available", Help: "Cache and origin UDS and containerd readiness."})
 	tracker := newStreamCommitTracker(store, logger,
@@ -115,28 +110,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 
 	server := mirror.New(c, local, origin,
 		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
-		mirror.WithRacer(&gantryracer.Backend{Client: client}, func(stats sdk.TransferStats, partial bool, err error) {
-			spliceCalls.Add(float64(stats.SpliceCalls))
-			spliceBytes.Add(float64(stats.SpliceBytes))
-			teeCalls.Add(float64(stats.TeeCalls))
-			teeBytes.Add(float64(stats.TeeBytes))
-			bufferedBytes.Add(float64(stats.BufferedBytes))
-
-			outcome := "verified"
-			if partial {
-				outcome = "partial"
-			}
-
-			if err != nil {
-				outcome = "aborted"
-			}
-
-			if errors.Is(err, sdk.ErrDigestMismatch) {
-				outcome = "digest_mismatch"
-			}
-
-			streams.WithLabelValues(outcome).Inc()
-		}, fallback.Inc),
+		mirror.WithRacer(&gantryracer.Backend{Client: client}, onRacerStream, fallback.Inc),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
@@ -232,6 +206,34 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 		return fmt.Errorf("racer origin: %w", err)
 	case err := <-opsErrors:
 		return fmt.Errorf("operations endpoint: %w", err)
+	}
+}
+
+func newRacerStreamMetrics(reg *metrics.Registry) func(sdk.TransferStats, bool, error) {
+	spliceCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_calls_total", Help: "Actual SDK splice syscalls."})
+	spliceBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_splice_bytes_total", Help: "Payload bytes forwarded with splice."})
+	teeCalls := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_calls_total", Help: "Actual SDK verification tee syscalls; expected to be zero because Gantry forwards Racer streams without a verification tee."})
+	teeBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_tee_bytes_total", Help: "Bytes duplicated by SDK verification tee; expected to be zero because containerd performs OCI digest verification."})
+	bufferedBytes := reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_buffered_bytes_total", Help: "Payload bytes forwarded through userspace."})
+	streams := reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_stream_total", Help: "Racer response forwarding outcomes: completed (full response), partial (range response), or aborted. Completion does not imply OCI digest verification or a containerd commit; containerd verifies the digest separately."}, []string{"outcome"})
+
+	return func(stats sdk.TransferStats, partial bool, err error) {
+		spliceCalls.Add(float64(stats.SpliceCalls))
+		spliceBytes.Add(float64(stats.SpliceBytes))
+		teeCalls.Add(float64(stats.TeeCalls))
+		teeBytes.Add(float64(stats.TeeBytes))
+		bufferedBytes.Add(float64(stats.BufferedBytes))
+
+		outcome := "completed"
+		if partial {
+			outcome = "partial"
+		}
+
+		if err != nil {
+			outcome = "aborted"
+		}
+
+		streams.WithLabelValues(outcome).Inc()
 	}
 }
 

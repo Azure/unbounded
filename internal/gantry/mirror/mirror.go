@@ -382,8 +382,9 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 }
 
 // WithLiveStreamCompletedHook registers a callback fired after any live
-// stream-through response (peer or origin) fully completes and passes the
-// final digest check.
+// stream-through response (peer, origin, or Racer) fully completes. Direct peer
+// and origin paths also check the digest in-process; Racer forwarding leaves
+// OCI digest verification to containerd. Completion does not imply a commit.
 // Callers use this to correlate the response with a later containerd
 // inventory observation without forcing the mirror to ingest the bytes
 // itself.
@@ -396,6 +397,8 @@ func WithLiveStreamCompletedHook(onCompleted func(d digest.Digest)) Option {
 // WithMirrorResponseCompletedHook registers a callback after a complete GET
 // response body has been written successfully to the local containerd client.
 // It is not fired for HEAD requests, partial streams, or failed copies.
+// Racer response completion reports forwarding, not digest verification or a
+// containerd commit.
 func WithMirrorResponseCompletedHook(onCompleted func(d digest.Digest, kind, source string)) Option {
 	return func(s *Server) {
 		s.metrics.onMirrorResponseCompleted = onCompleted

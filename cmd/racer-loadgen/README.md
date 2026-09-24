@@ -147,11 +147,14 @@ cold. Compare upstream range bytes and Racer cache hits in both windows. A
 working set larger than available slab capacity will continue evicting pages.
 
 Successful HTTP pulls alone do not prove acceleration. Check
-`gantry_racer_stream_total{outcome="verified"}`, splice/tee byte counters,
+`gantry_racer_stream_total{outcome="completed"}`, positive splice byte counters,
+zero `gantry_racer_tee_calls_total` / `gantry_racer_tee_bytes_total`,
 `gantry_mirror_bytes_served_total{source="racer"}`, and
 `gantry_racer_fallback_total`. Use Racer peer-page request and kTLS sendfile
-counters when measuring multi-node transport. Client SHA-256 and synthetic
-origin generation consume CPU; record their CPU limits and utilization alongside
+counters when measuring multi-node transport. Gantry's completion metric reports
+forwarding, not OCI digest acceptance; the loadgen client performs its own SHA-256
+validation. Client SHA-256 and synthetic origin generation consume CPU; record
+their CPU limits and utilization alongside
 Gantry/Racer throughput. The client remains closed-loop with one-second backoff
 after errors, so throughput includes backpressure and retry delays.
 

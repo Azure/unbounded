@@ -18,8 +18,10 @@ truncated. Authorization is never included in SDK error text.
 
 ## Sequential reads and explicit splice
 
-- `object.Stream(ctx) (*Stream, error)` reads the whole pinned snapshot.
-- `object.ReadRange(ctx, offset, length) (*Stream, error)` reads an exact interval.
+- `object.Stream(ctx) (*Stream, error)` reads the whole pinned snapshot without
+  verifying a content digest.
+- `object.ReadRange(ctx, offset, length) (*Stream, error)` reads an exact pinned
+  interval without verifying a content digest.
 - `object.StreamVerified(ctx, expectedSHA256 [32]byte) (*Stream, error)` reads
   the whole object and verifies an independently supplied SHA-256 digest.
 - `stream.Prepare() error` opens and validates the first GET response headers
@@ -42,7 +44,8 @@ Read-ahead bytes and portable copies appear in `BufferedBytes`.
 For a Gantry HTTP/1 mirror, prepare the stream, hijack the response connection,
 write status and headers (including exact Content-Length and Content-Type),
 flush the hijacker's buffered writer, then call `stream.WriteTo(conn)`.
-The mirror owns the hijacked connection, request framing, and keep-alive loop.
+The mirror owns the hijacked connection and request framing. Gantry serves one
+response per connection with `Connection: close`.
 Close that connection on any transfer/verification error. Do not pass the
 buffered writer or `http.ResponseWriter` when splice is required. TLS writers
 and non-Linux platforms use bounded userspace copies.
@@ -56,9 +59,39 @@ wrong empty-object digest is rejected before response completion. `Read` follows
 normal Go reader semantics and may return final bytes alongside a digest error;
 callers using Read must inspect that error.
 
-Racer's ETag is a version identity, not necessarily SHA-256. Supply the OCI
-digest explicitly. A partial range cannot establish the full object's digest;
-verify a complete object separately when that assurance is required.
+Racer's ETag is a version identity, not necessarily SHA-256. To use
+`StreamVerified`, supply the expected digest independently. A partial range cannot
+establish the full object's digest; verify a complete object separately when that
+assurance is required.
+
+### Gantry's integrity boundary
+
+Gantry uses `Stream` for full Racer responses and `ReadRange` for single ranges.
+Its former SHA-256 verification tee is removed; `StreamVerified` remains available
+to SDK callers. Gantry checks the metadata ETag against the requested OCI digest,
+but matching metadata does not prove that the payload hashes to that digest.
+Containerd's expected OCI digest check at commit determines whether downloaded
+image content is accepted. HTTP completion and Gantry's
+`gantry_racer_stream_total{outcome="completed"}` report forwarding only. The former
+`verified` outcome is replaced by `completed`; Racer forwarding no longer emits
+`digest_mismatch`. Gantry's `gantry_racer_tee_calls_total` and
+`gantry_racer_tee_bytes_total` remain exported and are expected to be zero.
+
+Racer retains CRC64/ECMA-182 validation at peer transfer admission and background
+disk scrubbing. Origin admission computes a CRC over received bytes, not an OCI
+SHA-256 proof; incorrect origin bytes can have a consistent CRC. File-backed
+local hits are not rehashed in the foreground. Version pinning and these CRC
+checks therefore do not replace end-to-end content validation. Generic SDK/HTTP
+consumers must validate content themselves, using `StreamVerified` or their own
+check against an independently trusted expected digest before accepting it.
+
+Known incorrect cached origin bytes require source repair and explicit cache
+generation recovery. A missing downstream commit signal alone does not establish
+corruption or trigger global invalidation. See the
+[Gantry operator recovery guide](../../docs/content/guides/gantry.md#recover-from-known-incorrect-cached-content)
+for activation barriers and retained containerd ingest handling.
+
+### Cancellation and connection reuse
 
 Context cancellation and Close interrupt upstream socket I/O and downstream
 splice. The client's Timeout bounds an entire sequential stream. Caller-set

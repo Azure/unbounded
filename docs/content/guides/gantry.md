@@ -13,8 +13,9 @@ Gantry runs as a DaemonSet and uses each node's existing containerd content
 store. The default `content_backend: direct` uses libp2p discovery, a distributed
 hash table (DHT), and Lease chairs without a separate image cache. The optional
 `content_backend: racer` uses Racer's distributed cache after a local miss.
-Containerd remains the committed image store and verifies every content digest
-before using it. `storage_mode: containerd` is required with either backend.
+Containerd remains the committed image store and checks incoming content against
+the expected OCI digest at commit. `storage_mode: containerd` is required with
+either backend.
 
 After the node-level mirror configuration is installed, Gantry is transparent
 to workloads. Pods continue to use normal OCI image references,
@@ -278,10 +279,26 @@ nodes need the same upstream allowlist, endpoint settings, and any explicitly
 configured shared-identity credentials. The trusted-cache limitation in the
 authentication section applies here too.
 
-Full responses use verified streaming: Linux splice forwards payload while tee
-feeds SHA-256 verification. Single-range responses are version-pinned but are
-not reported as full-object digest verification. Containerd still verifies the
-completed object. Racer mode is demand-only: no direct Gantry transfer server,
+Full Racer responses use the SDK's version-pinned `Stream`, without SHA-256
+verification in Gantry. The SHA-256 tee has been removed from this path; Linux
+splice forwards payload without duplicating it for hashing. Single-range
+responses use version-pinned `ReadRange`. Neither establishes the OCI digest.
+Containerd's check against the expected OCI digest at commit is authoritative
+for accepting downloaded image content. A complete HTTP response is forwarding
+completion, not content acceptance: incorrect same-length bytes can complete
+HTTP successfully and still fail containerd's commit.
+
+Racer retains CRC64/ECMA-182 checks for peer transfer admission and background
+disk scrubbing. It computes an admission CRC over origin bytes, but that CRC is
+not proof that those bytes match an OCI digest. Incorrect origin bytes can have
+a self-consistent CRC and be cached and forwarded. File-backed local cache hits
+are not rehashed on each foreground read; background scrubbing detects changes
+relative to the stored CRC, not an incorrect original OCI payload. Generic HTTP
+consumers must validate content themselves. The SDK's `StreamVerified` remains
+available for callers that supply an independent expected SHA-256 digest.
+Gantry's ordinary registry fallback still checks SHA-256 in-process.
+
+Racer mode is demand-only: no direct Gantry transfer server,
 chair calls, please-pull coordination, DHT content advertising, or speculative
 layer downloads. Libp2p uses a separate `/gantry/racer` protocol namespace.
 Ports 5001/5002 and service-account token mounting are omitted. Fresh Racer-mode
@@ -312,18 +329,85 @@ kubectl -n unbounded-system rollout status daemonset/gantry
 kubectl -n unbounded-system get pods -o wide
 ```
 
-Inspect `gantry_racer_available`, `gantry_racer_stream_total{outcome}`, actual
-`gantry_racer_splice_bytes_total` / `gantry_racer_tee_bytes_total`,
-`gantry_racer_buffered_bytes_total`, and `gantry_racer_fallback_total` alongside
-`gantry_mirror_bytes_served_total{source="racer"}`. Exercise a cold image pull and
-a repeated pull across multiple nodes. Do not use DHT/chair metrics as Racer
-readiness evidence.
+Inspect these signals while exercising a cold image pull and a repeated pull
+across multiple nodes. Do not use DHT/chair metrics as Racer readiness evidence.
+
+| Signal | Meaning |
+| --- | --- |
+| `gantry_racer_available` | Gantry's cache/origin UDS and containerd readiness. |
+| `gantry_racer_stream_total{outcome="completed"}` | Full response forwarded; neither OCI verification nor containerd commit is implied. Replaces the former `verified` outcome. |
+| `gantry_racer_stream_total{outcome="partial"}` | Range response forwarded successfully. |
+| `gantry_racer_stream_total{outcome="aborted"}` | Response forwarding failed. Gantry no longer emits a Racer `digest_mismatch` outcome. |
+| `gantry_racer_splice_calls_total`, `gantry_racer_splice_bytes_total` | Actual forwarding splice syscalls and bytes. |
+| `gantry_racer_tee_calls_total`, `gantry_racer_tee_bytes_total` | Compatibility counters, expected to remain zero because this path has no verification tee. |
+| `gantry_racer_buffered_bytes_total` | Payload forwarded through userspace, including buffered prefixes. |
+| `gantry_racer_fallback_total` | Pre-header ordinary registry fallbacks. |
+| `gantry_mirror_bytes_served_total{source="racer"}` | Racer bytes forwarded, including incomplete responses. |
+| `gantry_containerd_commit_observed_total` | Completed live-stream digests later observed openable in local containerd. |
+| `gantry_containerd_commit_observation_duration_seconds`, `gantry_containerd_commit_latest_observation_duration_seconds` | Time from full response completion to observed openability; measurement resolution is bounded by the storage probe interval. |
+| `gantry_containerd_commit_missing_after_stream_total` | No later openability observed within the observation window; not proof of corruption or a digest mismatch. Unavailable-containerd windows pause correlation. |
+
+Update dashboards and alerts from `outcome="verified"` to `outcome="completed"`
+and treat completion separately from consumer validation. A missing commit
+observation does not trigger automatic cache-wide eviction or a generation bump.
 
 To return to direct distribution, set `content_backend: direct` in the same
 ConfigMap and wait for Gantry's rollout before disabling Racer. Chair resources
 are reconciled again. The dedicated P2PCache and Racer slab are retained; remove
 the unused cache explicitly only after no Gantry process uses it. Changing
 backend never migrates or deletes containerd's committed images.
+
+### Recover from known incorrect cached content
+
+Use explicit recovery after establishing a content mismatch:
+
+1. Fix the source so subsequent origin reads return bytes matching the expected
+   OCI digest. Stop or finish affected pulls, including pre-bump requests.
+2. Read the dedicated P2PCache's current `spec.cacheGeneration` and increase it
+   monotonically. For example, this compare-and-swap patch changes **1 to 2**
+   only if the stored value is still 1:
+
+   ```bash
+   kubectl get p2pcache gantry -o yaml
+   kubectl patch p2pcache gantry --type=json -p='[{"op":"test","path":"/spec/cacheGeneration","value":1},{"op":"replace","path":"/spec/cacheGeneration","value":2}]'
+   ```
+
+   Substitute the actual cache name, current value, and next value. If the test
+   fails, reread the resource instead of overwriting a concurrent update.
+3. Wait for `Ready=True` for the new Kubernetes `metadata.generation`, with
+   `status.observedGeneration` and the Ready condition's `observedGeneration`
+   matching it, and `status.participants.ready == status.participants.desired`
+   with a nonzero desired count. Every serving participant must activate the
+   resulting configuration. When inspecting dataplane `/status`, require the
+   resulting `activeRevision == candidateRevision`, `localState: applied`,
+   `ready: true`, no rejection, and all workers activated. Configuration revision,
+   Kubernetes resource generation, and `spec.cacheGeneration` are distinct
+   values. A patch response or an old Ready condition is not an activation barrier.
+4. Inspect containerd in the failed pull's original namespace for a retained
+   ingest. After the failed pull has returned and no writer can resume it,
+   explicitly abort **only the known failed inactive ingest**, if present, using
+   the containerd content API (`ContentStore.Abort(ctx, ref)`). The native test
+   acquires the exact failed writer, inspects it, and closes it before aborting;
+   keep concurrent retries stopped during this sequence.
+5. Retry the same image reference and confirm containerd accepts the expected
+   digest. Verify Gantry readiness and subsequent warm reads as well.
+
+The generation bump is cache-wide logical invalidation for that P2PCache across
+its selected Sites, not per-object eviction or immediate physical deletion of
+old slab data. It does not delete containerd content or ingests, and activation
+does not change an already-started stream. Repairing the origin alone can leave
+warm bad pages reusable until invalidated or evicted.
+
+In the native recovery campaign, containerd **daemon 2.2.1 / Go client 2.3.5**
+retained a complete **1,179,648-byte** failed layer ingest after digest mismatch.
+A normal `Client.Pull` retry after generation activation issued **zero additional
+layer GETs** and failed on the same retained bytes. After the exact idle ingest
+was acquired, closed, and aborted, the same image/ingest reference fetched the
+repaired layer and committed successfully. This is tested behavior for that
+runtime/client combination, not a guarantee for every containerd version or
+consumer. Inspect the actual ingest state rather than assuming either automatic
+cleanup or retention. See the
+[native test contract](https://github.com/Azure/unbounded/blob/main/e2e/racer/README.md#explicit-generation-recovery-fixture).
 
 ### Synthetic image-pull benchmarks
 
@@ -338,8 +422,9 @@ The [loadgen guide](https://github.com/Azure/unbounded/blob/main/cmd/racer-loadg
 includes local commands, cold/warm comparisons, and Prometheus queries. The
 [cluster example](https://github.com/Azure/unbounded/blob/main/e2e/racer/examples/container-image-loadgen.yaml)
 deploys a fake registry and host-network pullers using Gantry's existing Racer
-cache. Check verified Racer streams and fallback counters alongside loadgen
-throughput to confirm the intended data path.
+cache. Check completed Racer streams, zero tee counters, and fallback counters
+alongside loadgen throughput and its downstream validation results to confirm
+the intended data path.
 
 ### Standalone manifests
 

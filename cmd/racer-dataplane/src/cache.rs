@@ -790,6 +790,9 @@ impl UpstreamRequest {
 /// Racer computes CRC64/ECMA-182 before publication and retains it for later scrub.
 /// Peer checksums are verified; backend checksums are ignored. Foreground cache
 /// hits do not checksum payloads.
+/// CRC detects accidental corruption relative to the bytes admitted from origin;
+/// it does not verify those bytes against an expected OCI digest. For Gantry
+/// pulls, containerd owns that end-to-end digest verification.
 pub struct Received {
     pub destination: Destination,
     pub len: usize,

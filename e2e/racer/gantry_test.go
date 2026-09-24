@@ -13,11 +13,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 	ocidigest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -55,11 +61,13 @@ func TestGantryRacerStriped(t *testing.T) {
 		t.Fatalf("cold object: status=%v bytes=%d err=%v", resp, len(body), err)
 	}
 
-	gantryAwait(t, "verified splice", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="verified"}`) == 1 })
+	gantryAwait(t, "completed splice", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="completed"}`) == 1 })
 
-	if f.metric(0, "gantry_racer_splice_calls_total") == 0 || f.metric(0, "gantry_racer_tee_calls_total") == 0 || f.metric(0, "gantry_racer_splice_bytes_total") < float64(len(data)-8192) || f.metric(0, "gantry_racer_tee_bytes_total") < float64(len(data)-8192) {
-		t.Fatal("real splice/tee counters did not cover the payload")
+	if f.metric(0, "gantry_racer_splice_calls_total") == 0 || f.metric(0, "gantry_racer_splice_bytes_total") < float64(len(data)-8192) {
+		t.Fatal("real splice counters did not cover the payload")
 	}
+
+	gantryAssertNoTee(t, f, 0)
 
 	if f.metric(0, "gantry_racer_fallback_total") != 0 {
 		t.Fatal("cold read fell back outside Racer")
@@ -165,7 +173,7 @@ func TestGantryRacerStriped(t *testing.T) {
 		t.Fatalf("warm reads contacted offline origins: before=%d after=%d", before, len(f.hits))
 	}
 
-	t.Logf("verified %d bytes, four exact origin pages, owners=%v, offline warm reuse, boundary/final ranges, real splice+tee", len(data), owners)
+	t.Logf("verified %d downstream bytes, four exact origin pages, owners=%v, offline warm reuse, boundary/final ranges, real splice without tee", len(data), owners)
 }
 
 func TestGantryRacerAuthorization(t *testing.T) {
@@ -289,7 +297,7 @@ func TestGantryRacerRecovery(t *testing.T) {
 		t.Fatalf("restarted daemon: %v %v", resp, err)
 	}
 
-	gantryAwait(t, "verified after restart", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="verified"}`) > 0 })
+	gantryAwait(t, "completed after restart", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="completed"}`) > 0 })
 	// Abandon a warm response while Gantry is forwarding to a real TCP socket.
 	r, err := http.NewRequestWithContext(t.Context(), "GET", "http://"+f.mirrors[0]+path+"?ns=fixture.test", nil)
 	if err != nil {
@@ -339,52 +347,217 @@ func TestGantryRacerCorruption(t *testing.T) {
 
 	data := bytes.Repeat([]byte("integrity"), 1<<17)
 	path := gantryPath("public", "blobs", data)
-	f := newGantryFixture(t, 1, map[string]gantryObject{path: {data: data, mediaType: "application/octet-stream", corrupt: true}})
+	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: ocidigest.FromBytes(data), Size: int64(len(data))}
+	config := fmt.Appendf(nil, `{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[%q]}}`, desc.Digest)
+	manifest := fmt.Appendf(nil, `{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":%d,"digest":%q},"layers":[{"mediaType":%q,"size":%d,"digest":%q}]}`, ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageConfig, len(config), ocidigest.FromBytes(config), desc.MediaType, desc.Size, desc.Digest)
+	object := gantryObject{data: data, mediaType: desc.MediaType, corrupt: true}
+	f := newGantryFixture(t, 2, map[string]gantryObject{
+		path:                                  object,
+		gantryPath("public", "blobs", config): {data: config, mediaType: ocispec.MediaTypeImageConfig},
+		gantryPath("public", "manifests", manifest): {data: manifest, mediaType: ocispec.MediaTypeImageManifest},
+	})
+	bad := bytes.Clone(data)
+	bad[len(bad)/2] ^= 1
+	badDigest := ocidigest.FromBytes(bad)
+	read := func(node int, want []byte) {
+		t.Helper()
 
-	resp, body, err := f.request(0, "GET", path, "", "")
-	if err == nil || resp == nil || resp.StatusCode != 200 || len(body) >= len(data) {
-		t.Fatalf("corrupt full response was not truncated: bytes=%d err=%v", len(body), err)
+		completed := f.metric(node, `gantry_racer_stream_total{outcome="completed"}`)
+
+		resp, body, err := f.request(node, "GET", path, "", "")
+		if err != nil || resp.StatusCode != http.StatusOK || resp.ContentLength != desc.Size || resp.Header.Get("Docker-Content-Digest") != desc.Digest.String() || !bytes.Equal(body, want) {
+			t.Fatalf("node%d complete HTTP forward: status=%v bytes=%d err=%v", node, resp, len(body), err)
+		}
+
+		gantryAwait(t, "Racer forward completed", func() bool { return f.metric(node, `gantry_racer_stream_total{outcome="completed"}`) == completed+1 })
+	}
+	// Corruption is at the origin, before Racer computes its admission CRC.
+	// Reading through both nodes exercises peer admission of those same bad bytes.
+	for node := range 2 {
+		read(node, bad)
+		gantryAssertNoTee(t, f, node)
 	}
 
-	gantryAwait(t, "digest mismatch metric", func() bool { return f.metric(0, `gantry_racer_stream_total{outcome="digest_mismatch"}`) == 1 })
+	var peerPages float64
 
-	if f.metric(0, `gantry_racer_stream_total{outcome="verified"}`) != 0 {
-		t.Fatal("corrupt response counted verified")
+	gantryAwait(t, "corrupt peer page metrics", func() bool {
+		peerPages = 0
+		for _, address := range f.racerMetrics {
+			peerPages += f.metricAt(address, `racer_dataplane_upstream_requests_total{destination="peer",transport="http",kind="page"}`)
+		}
+
+		return peerPages > 0
+	})
+
+	// Keep the consumer namespace separate from Gantry's local content stores,
+	// so later warm HTTP reads must still use Racer after the successful commit.
+	ctx, release, err := f.containerd.WithLease(namespaces.WithNamespace(t.Context(), "corruption-pull"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer release(ctx)
 
-	if f.metric(0, "gantry_racer_tee_calls_total") == 0 {
-		t.Fatal("corruption did not use kernel tee verification")
-	}
-	// The actual containerd content store must reject the quarantined fallback.
-	ctx := namespaces.WithNamespace(t.Context(), "node0")
-	desc := ocispec.Descriptor{Digest: ocidigest.FromBytes(data), Size: int64(len(data))}
+	var layerGETs atomic.Int64
 
-	r, err := http.NewRequestWithContext(ctx, "GET", "http://"+f.mirrors[0]+path+"?ns=fixture.test", nil)
+	pullClient := &http.Client{Timeout: f.client.Timeout, Transport: gantryRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.Path == path {
+			layerGETs.Add(1)
+		}
+
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	resolver := docker.NewResolver(docker.ResolverOptions{Hosts: func(host string) ([]docker.RegistryHost, error) {
+		if host != "fixture.test" {
+			return nil, fmt.Errorf("unexpected registry %q", host)
+		}
+
+		return []docker.RegistryHost{{Client: pullClient, Host: f.mirrors[0], Scheme: "http", Path: "/v2", Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve}}, nil
+	}})
+	imageRef := "fixture.test/public@" + ocidigest.FromBytes(manifest).String()
+	store := f.containerd.ContentStore()
+	// Fetch the valid config through the real resolver first. A failed layer
+	// cancels sibling config requests during Pull, which can otherwise count an
+	// unrelated pre-header fallback and obscure this layer-integrity campaign.
+	fetcher, err := resolver.Fetcher(ctx, imageRef)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err = f.client.Do(r)
+	if err := remotes.Fetch(ctx, store, fetcher, ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: ocidigest.FromBytes(config), Size: int64(len(config))}); err != nil {
+		t.Fatal(err)
+	}
+
+	pull := func() error {
+		_, err := f.containerd.Pull(ctx, imageRef, containerd.WithResolver(resolver))
+		return err
+	}
+	ingestRef := remotes.MakeRefKey(ctx, desc)
+	assertRejected := func(stage string, err error) {
+		t.Helper()
+
+		want := fmt.Sprintf("unexpected commit digest %s, expected %s", badDigest, desc.Digest)
+		if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: expected OCI digest mismatch, got %v", stage, err)
+		}
+
+		for _, digest := range []ocidigest.Digest{desc.Digest, badDigest} {
+			if _, err := store.Info(ctx, digest); !errdefs.IsNotFound(err) {
+				t.Fatalf("%s: content %s should be absent: %v", stage, digest, err)
+			}
+		}
+
+		if _, err := f.containerd.GetImage(ctx, imageRef); !errdefs.IsNotFound(err) {
+			t.Fatalf("%s: failed pull published an image: %v", stage, err)
+		}
+
+		status, err := store.Status(ctx, ingestRef)
+		if err != nil || status.Ref != ingestRef || status.Offset != desc.Size || status.Total != desc.Size {
+			t.Fatalf("%s: retained ingest: %+v err=%v", stage, status, err)
+		}
+
+		t.Logf("%s: digest mismatch; retained ref=%s offset=%d total=%d layer GETs=%d", stage, ingestRef, status.Offset, status.Total, layerGETs.Load())
+	}
+	assertRejected("initial normal pull", pull())
+
+	if layerGETs.Load() != 1 {
+		t.Fatalf("initial normal pull layer GETs=%d, want 1", layerGETs.Load())
+	}
+
+	before := f.originRequestCount("GET", path)
+
+	object.corrupt = false
+	if err := f.setOriginObject(path, object); err != nil {
+		t.Fatal(err)
+	}
+
+	for node := range 2 {
+		read(node, bad)
+	}
+
+	if f.originRequestCount("GET", path) != before {
+		t.Fatal("origin repair alone refetched a warmed bad page")
+	}
+
+	revision := f.bumpCacheGeneration("gantry")
+	// A normal retry can recommit its complete failed ingest without any GET,
+	// even after all dataplanes activate the operator's generation bump.
+	assertRejected("normal retry after generation activation", pull())
+
+	if layerGETs.Load() != 1 || f.originRequestCount("GET", path) != before {
+		t.Fatal("complete failed ingest retry unexpectedly fetched the repaired layer")
+	}
+
+	// Both synchronous pulls have returned. Acquire the exact failed writer to
+	// prove it is idle and still complete, then close before abort. The commit
+	// error above identifies its bad digest; the remote Writer.Digest may be empty.
+	writer, err := store.Writer(ctx, content.WithRef(ingestRef), content.WithDescriptor(desc))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	commitErr := content.WriteBlob(ctx, f.containerd.ContentStore(), "corrupt-downstream", resp.Body, desc)
-	resp.Body.Close()
-
-	if commitErr == nil {
-		t.Fatal("containerd accepted corrupt content")
+	retained, statusErr := writer.Status()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := f.containerd.ContentStore().Info(ctx, desc.Digest); err == nil {
-		t.Fatal("corrupt digest exists in containerd")
+	if statusErr != nil || retained.Ref != ingestRef || retained.Offset != desc.Size {
+		t.Fatalf("retained writer status=%+v err=%v", retained, statusErr)
 	}
 
-	resp, body, err = f.request(0, "GET", path, "", "")
-	if err == nil || resp == nil || len(body) >= len(data) {
-		t.Fatalf("corrupt quarantine fallback was accepted: bytes=%d err=%v", len(body), err)
+	if err := store.Abort(ctx, ingestRef); err != nil {
+		t.Fatal(err)
 	}
 
-	gantryAwait(t, "quarantine fallback", func() bool { return f.metric(0, "gantry_racer_fallback_total") == 2 })
-	t.Log("Racer full-hash mismatch and quarantined ordinary fallback both truncate before complete framing")
+	if _, err := store.Status(ctx, ingestRef); !errdefs.IsNotFound(err) {
+		t.Fatalf("aborted ingest still present: %v", err)
+	}
+	// Reuse the identical image and ingest references in the same namespace.
+	if err := pull(); err != nil {
+		t.Fatalf("normal same-ref pull after explicit abort: %v", err)
+	}
+
+	if layerGETs.Load() != 2 || f.originRequestCount("GET", path) <= before {
+		t.Fatal("recovery did not freshly fetch the repaired layer")
+	}
+
+	stored, err := content.ReadBlob(ctx, store, desc)
+	if err != nil || !bytes.Equal(stored, data) || ocidigest.FromBytes(stored) != desc.Digest {
+		t.Fatalf("recovered containerd content: bytes=%d err=%v", len(stored), err)
+	}
+
+	if _, err := store.Status(ctx, ingestRef); !errdefs.IsNotFound(err) {
+		t.Fatalf("successful commit retained an ingest: %v", err)
+	}
+
+	before = f.originRequestCount("GET", path)
+	f.offline.Store(true)
+
+	for node := range 2 {
+		read(node, data)
+		gantryAssertNoTee(t, f, node)
+
+		if f.metric(node, "gantry_racer_fallback_total") != 0 || f.metric(node, "gantry_racer_splice_calls_total") == 0 || f.metric(node, "gantry_racer_splice_bytes_total") < float64(len(data)-8192) {
+			t.Fatalf("node%d Racer recovery: fallback=%g splice calls=%g bytes=%g", node, f.metric(node, "gantry_racer_fallback_total"), f.metric(node, "gantry_racer_splice_calls_total"), f.metric(node, "gantry_racer_splice_bytes_total"))
+		}
+	}
+
+	if f.originRequestCount("GET", path) != before {
+		t.Fatal("recovered warm reads contacted offline origins")
+	}
+
+	t.Logf("revision=%d; peer pages=%g; full corrupt HTTP forwarding, downstream digest rejection, explicit idle-ingest abort, same-ref commit, and offline warm reads verified", revision, peerPages)
+}
+
+type gantryRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn gantryRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return fn(r) }
+
+func gantryAssertNoTee(t *testing.T, f *gantryFixture, node int) {
+	t.Helper()
+
+	for _, metric := range []string{"gantry_racer_tee_calls_total", "gantry_racer_tee_bytes_total", `gantry_racer_stream_total{outcome="verified"}`, `gantry_racer_stream_total{outcome="digest_mismatch"}`} {
+		if got := f.metric(node, metric); got != 0 {
+			t.Fatalf("node%d %s=%g; Racer forwarding must not claim SHA verification", node, metric, got)
+		}
+	}
 }

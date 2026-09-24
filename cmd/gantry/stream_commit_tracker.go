@@ -30,6 +30,7 @@ type openabilitySource interface {
 // records "stream completed" immediately, while this tracker answers
 // the distinct question "did the local containerd later show the
 // digest as present within a bounded window?".
+// A missing observation does not establish corruption or a digest mismatch.
 type streamCommitTracker struct {
 	store  openabilitySource
 	logger *slog.Logger
