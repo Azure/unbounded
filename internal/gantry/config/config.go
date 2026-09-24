@@ -159,8 +159,8 @@ type Config struct {
 
 	// ---------- Kubernetes identity and legacy membership fields ----------
 
-	// NodeName is retained for configuration compatibility. Chair selection
-	// uses the persistent libp2p peer ID instead.
+	// NodeName scopes the Racer readiness target to this node. Empty uses the
+	// process hostname. Chair selection uses the persistent libp2p peer ID instead.
 	NodeName string `yaml:"node_name"`
 
 	// PodIP rewrites wildcard listeners into the addresses stored in chair
@@ -715,7 +715,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
-	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
+	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name for Racer readiness (empty uses hostname)")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
 	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the 64 Gantry chair Leases")

@@ -4,10 +4,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +39,13 @@ func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 	defer folder.Close()
 
 	socket := fmt.Sprintf("/proc/self/fd/%d/origin", folder.Fd())
-	if racerSocketReady(t.Context(), socket) {
+
+	target, err := racerReadinessTarget("node-a", os.Hostname)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if racerSocketReady(t.Context(), socket, target) {
 		t.Fatal("missing socket ready")
 	}
 
@@ -51,7 +60,7 @@ func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 	}
 	defer server.Close()
 
-	if !racerSocketReady(t.Context(), socket) {
+	if !racerSocketReady(t.Context(), socket, target) {
 		t.Fatal("running origin not ready")
 	}
 
@@ -63,7 +72,7 @@ func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if racerSocketReady(t.Context(), socket) {
+	if racerSocketReady(t.Context(), socket, target) {
 		t.Fatal("closed origin ready")
 	}
 
@@ -73,8 +82,122 @@ func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 	}
 	defer bad.Close()
 
-	if racerSocketReady(t.Context(), socket) {
+	if racerSocketReady(t.Context(), socket, target) {
 		t.Fatal("unavailable cache ready")
+	}
+}
+
+func TestRacerReadinessTargetIdentity(t *testing.T) {
+	seen := make(map[string]string)
+
+	for _, identity := range []string{"node-a", "node-b", "node/a?x=1&node=other#fragment +%\r\n", "node-雪"} {
+		t.Run(identity, func(t *testing.T) {
+			hostname := func() (string, error) {
+				t.Error("configured node name must take precedence over hostname")
+				return "", errors.New("unexpected hostname lookup")
+			}
+
+			target, err := racerReadinessTarget(identity, hostname)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			repeated, err := racerReadinessTarget(identity, hostname)
+			if err != nil || repeated != target {
+				t.Fatalf("unstable target: %q, %q, %v", target, repeated, err)
+			}
+
+			if previous, exists := seen[target]; exists {
+				t.Fatalf("identities %q and %q share target %q", previous, identity, target)
+			}
+
+			seen[target] = identity
+
+			parsed, err := url.ParseRequestURI(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if parsed.Path != "/gantry-readiness" || parsed.Fragment != "" || len(parsed.Query()) != 1 || parsed.Query().Get("node") != identity {
+				t.Fatalf("identity escaped incorrectly: %q", target)
+			}
+
+			if _, err := gantryracer.ParseTarget(target); err == nil {
+				t.Fatalf("readiness target is a valid OCI target: %q", target)
+			}
+		})
+	}
+}
+
+func TestRacerReadinessTargetHostnameFallback(t *testing.T) {
+	for _, hostname := range []string{"gantry-pod-a", "gantry-pod-b"} {
+		fallback, err := racerReadinessTarget("", func() (string, error) { return hostname, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		explicit, err := racerReadinessTarget(hostname, os.Hostname)
+		if err != nil || fallback != explicit {
+			t.Fatalf("hostname fallback: %q, explicit: %q, error: %v", fallback, explicit, err)
+		}
+	}
+
+	lookupErr := errors.New("hostname unavailable")
+	if _, err := racerReadinessTarget("", func() (string, error) { return "", lookupErr }); !errors.Is(err, lookupErr) {
+		t.Fatalf("hostname error not preserved: %v", err)
+	}
+
+	if _, err := racerReadinessTarget("", func() (string, error) { return "", nil }); err == nil {
+		t.Fatal("empty identity must not create a fleet-wide readiness key")
+	}
+}
+
+func TestRacerSocketReadinessExactStatusAndTarget(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace socket via proc fd")
+	}
+
+	dir, err := os.MkdirTemp(".", ".racer-readiness-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	folder, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer folder.Close()
+
+	target, err := racerReadinessTarget("node/a?x=1&node=other#fragment +%\r\n", os.Hostname)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var status atomic.Int64
+
+	socket := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
+
+	server, _, err := startRacerOrigin(socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.RequestURI != target {
+			t.Errorf("unexpected probe: %s %q, want HEAD %q", r.Method, r.RequestURI, target)
+		}
+
+		w.WriteHeader(int(status.Load()))
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for _, code := range []int{404, 503, 200, 403, 500, 404} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			status.Store(int64(code))
+
+			if ready := racerSocketReady(t.Context(), socket, target); ready != (code == http.StatusNotFound) {
+				t.Fatalf("status %d: ready=%v", code, ready)
+			}
+		})
 	}
 }
 

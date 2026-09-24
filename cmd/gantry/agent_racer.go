@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -37,6 +38,11 @@ import (
 func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	readinessTarget, err := racerReadinessTarget(c.NodeName, os.Hostname)
+	if err != nil {
+		return err
+	}
 
 	opts := racerDiscoveryOptions(c)
 
@@ -179,7 +185,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 			return false
 		}
 
-		return racerSocketReady(probeCtx, originSocket) && racerSocketReady(probeCtx, cacheSocket)
+		return racerSocketReady(probeCtx, originSocket, readinessTarget) && racerSocketReady(probeCtx, cacheSocket, readinessTarget)
 	}
 
 	go func() {
@@ -286,9 +292,28 @@ func startRacerOrigin(socket string, handler http.Handler) (*http.Server, <-chan
 	return server, done, nil
 }
 
+// Resolve once at startup so each node probes a stable metadata key rather than
+// concentrating the fleet's uncached negative lookups on one metadata owner.
+func racerReadinessTarget(nodeName string, hostname func() (string, error)) (string, error) {
+	if nodeName == "" {
+		var err error
+
+		nodeName, err = hostname()
+		if err != nil {
+			return "", fmt.Errorf("racer readiness hostname: %w", err)
+		}
+	}
+
+	if nodeName == "" {
+		return "", errors.New("racer readiness requires a node name or hostname")
+	}
+
+	return "/gantry-readiness?node=" + url.QueryEscape(nodeName), nil
+}
+
 // A reserved invalid target must reach HTTP and return 404. A mere filesystem
 // existence check could release readiness before either socket is serving.
-func racerSocketReady(ctx context.Context, socket string) bool {
+func racerSocketReady(ctx context.Context, socket, target string) bool {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}
@@ -296,7 +321,7 @@ func racerSocketReady(ctx context.Context, socket string) bool {
 
 	client := &http.Client{Transport: transport}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://localhost/gantry-readiness", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://localhost"+target, nil)
 	if err != nil {
 		return false
 	}
