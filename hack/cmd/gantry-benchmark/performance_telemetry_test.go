@@ -132,19 +132,24 @@ func TestParseContainerdJournal(t *testing.T) {
 	}
 }
 
-func TestParseContainerdJournalRequiresEveryObserver(t *testing.T) {
+func TestParseContainerdJournalAllowsPartialObserverCoverage(t *testing.T) {
 	window := telemetryWindow{
 		StartedAt:  time.Date(2026, time.August, 4, 1, 2, 3, 0, time.UTC),
 		FinishedAt: time.Date(2026, time.August, 4, 1, 12, 3, 0, time.UTC),
 	}
 	raw := `[pod/observer-a/containerd-journal] 2026-08-04T01:03:04Z level=debug msg="image unpacked" duration=2s`
 
-	_, err := parseContainerdJournal(raw, map[string]string{
+	events, err := parseContainerdJournal(raw, map[string]string{
 		"observer-a": "node-a",
 		"observer-b": "node-b",
 	}, window)
-	if err == nil || !strings.Contains(err.Error(), "1/2 observer pods") {
-		t.Fatalf("error = %v, want incomplete observer coverage", err)
+	if err != nil {
+		t.Fatalf("parseContainerdJournal: %v", err)
+	}
+
+	observed, unpackTelemetry := summarizeContainerdJournal(events)
+	if observed != 1 || !unpackTelemetry {
+		t.Fatalf("journal summary = %d, %t, want 1, true", observed, unpackTelemetry)
 	}
 }
 

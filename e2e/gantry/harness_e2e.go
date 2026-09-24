@@ -829,8 +829,7 @@ func patchConfigMapForE2E(raw string) (string, error) {
 	// rollouts do not wait for the eligibility lottery to widen.
 	for _, sub := range []struct{ from, to string }{
 		{"    chair_cluster_size_estimate: 100000", "    chair_cluster_size_estimate: 8"},
-		{"    chair_seed_percentage: 10", "    chair_seed_percentage: 100"},
-		{"    chair_seed_count: 50", "    chair_seed_count: 8"},
+		{"    chair_holder_count: 64", "    chair_holder_count: 8"},
 		{"    chair_claim_initial_divisor: 2048", "    chair_claim_initial_divisor: 1"},
 		{`    chair_startup_jitter: "30s"`, `    chair_startup_jitter: "2s"`},
 	} {

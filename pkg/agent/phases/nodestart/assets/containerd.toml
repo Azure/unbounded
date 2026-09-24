@@ -5,7 +5,7 @@ version = 2
 
 [plugins."io.containerd.grpc.v1.cri"]
 sandbox_image = "{{.SandboxImage}}"
-image_pull_progress_timeout = "15m"
+image_pull_progress_timeout = "30m"
 
 [plugins."io.containerd.grpc.v1.cri".containerd]
 default_runtime_name = "runc"
@@ -33,6 +33,9 @@ config_path = "/etc/containerd/certs.d"
 
 [plugins."io.containerd.grpc.v1.cri".registry.headers]
 X-Meta-Source-Client = ["unbounded-kube/kubelet"]
+
+[plugins."io.containerd.transfer.v1.local"]
+max_concurrent_downloads = 6
 
 [metrics]
 address = "{{.MetricsAddress}}"

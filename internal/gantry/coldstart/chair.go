@@ -49,12 +49,13 @@ type ChairOptions struct {
 	PollManifest          time.Duration
 	PollLayer             time.Duration
 	APITimeout            time.Duration
+	HolderCount           int
 	SeedCount             int
 	TrustedFailureClasses []ifaces.FailureClass
 	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
 	// were selectable, how many were contacted, and how many accepted. contacted
-	// above SeedCount means the cohort accepted nothing and the resolver moved
-	// down the ranking, which widens the set of nodes fetching from origin.
+	// above the effective scaled cohort means the resolver moved down the ranking,
+	// which widens the set of nodes fetching from origin.
 	OnSeedRecruit func(kind string, selectable, contacted, accepted int)
 	// OnChairDispatch reports the outcome of one please_pull to one chair.
 	// reason is "accepted" or why the chair did not count: "rpc_error" (no
@@ -110,7 +111,11 @@ func NewChairResolver(opts ChairOptions) *ChairResolver {
 	}
 
 	if opts.SeedCount <= 0 {
-		opts.SeedCount = chairs.DefaultSeedCount
+		opts.SeedCount = chairs.SeedCount
+	}
+
+	if opts.HolderCount <= 0 {
+		opts.HolderCount = chairs.Count
 	}
 
 	if opts.APITimeout <= 0 {
@@ -142,7 +147,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 
 	ranked := chairs.Rank(snapshot, d)
 
-	seedCount := min(len(ranked), r.opts.SeedCount)
+	seedCount := r.seedCount(len(ranked))
 	if seedCount == 0 {
 		return nil, ErrExhausted
 	}
@@ -418,7 +423,7 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 
 		ranked := chairs.Rank(snapshot, child.Digest)
 
-		seedCount := min(len(ranked), r.opts.SeedCount)
+		seedCount := r.seedCount(len(ranked))
 		if seedCount == 0 {
 			continue
 		}
@@ -486,6 +491,17 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 	}
 
 	return nil
+}
+
+func (r *ChairResolver) seedCount(selectable int) int {
+	if selectable <= 0 {
+		return 0
+	}
+
+	seedCount := (selectable*r.opts.SeedCount + r.opts.HolderCount - 1) / r.opts.HolderCount
+	seedCount = min(seedCount, r.opts.SeedCount)
+
+	return min(seedCount, selectable)
 }
 
 func allChairOutcomesAccepted(outcomes []ifaces.PleasePullOutcome) bool {

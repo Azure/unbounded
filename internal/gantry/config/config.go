@@ -174,11 +174,14 @@ type Config struct {
 	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
 	// ChairCapacityDaemonSet supplies actual Gantry scheduling capacity.
 	ChairCapacityDaemonSet string `yaml:"chair_capacity_daemonset"`
-	// ChairSeedPercentage selects a proportional chair cohort from capacity.
-	ChairSeedPercentage int `yaml:"chair_seed_percentage"`
-	// ChairSeedCount caps the proportional chair cohort.
-	ChairSeedCount  int           `yaml:"chair_seed_count"`
-	ChairAPITimeout time.Duration `yaml:"chair_api_timeout"`
+	// ChairHolderCount caps the number of agents holding fixed chair Leases.
+	ChairHolderCount int `yaml:"chair_holder_count"`
+	// ChairSeedCount is the per-digest replica count at a full holder pool.
+	ChairSeedCount int `yaml:"chair_seed_count"`
+	// ChairSeedPercentage is accepted for compatibility with the short-lived
+	// capacity-coupled configuration. Holder and seed sizing ignore it.
+	ChairSeedPercentage int           `yaml:"chair_seed_percentage,omitempty"`
+	ChairAPITimeout     time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -494,8 +497,8 @@ func NewDefault() *Config {
 		ChairClaimInitialDivisor: 2048,
 		ChairClusterSizeEstimate: 100_000,
 		ChairCapacityDaemonSet:   "gantry",
-		ChairSeedPercentage:      10,
-		ChairSeedCount:           50,
+		ChairHolderCount:         64,
+		ChairSeedCount:           8,
 		ChairAPITimeout:          5 * time.Second,
 
 		StorageMode: StorageModeContainerd,
@@ -640,8 +643,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("CHAIR_CLAIM_INITIAL_DIVISOR", &c.ChairClaimInitialDivisor)
 	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
 	setStr("CHAIR_CAPACITY_DAEMONSET", &c.ChairCapacityDaemonSet)
-	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
+	setInt("CHAIR_HOLDER_COUNT", &c.ChairHolderCount)
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
+	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
@@ -722,9 +726,10 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ChairClaimJitter, "chair-claim-jitter", c.ChairClaimJitter, "maximum deterministic delay before a chair claim")
 	fs.IntVar(&c.ChairClaimInitialDivisor, "chair-claim-initial-divisor", c.ChairClaimInitialDivisor, "initial hash-lottery divisor, halved each claim round")
 	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
-	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count sizes the chair cohort")
-	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "percentage of Gantry DaemonSet capacity selected as chairs")
-	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "maximum number of ranked chairs in each cold-start seed cohort")
+	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count bounds the holder pool")
+	fs.IntVar(&c.ChairHolderCount, "chair-holder-count", c.ChairHolderCount, "maximum number of agents holding fixed chair Leases")
+	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "per-digest seed replicas at a full holder pool")
+	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "deprecated and ignored")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
@@ -978,12 +983,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("chair_capacity_daemonset: must not be empty"))
 	}
 
-	if c.ChairSeedPercentage < 1 || c.ChairSeedPercentage > 100 {
-		errs = append(errs, fmt.Errorf("chair_seed_percentage: must be between 1 and 100, got %d", c.ChairSeedPercentage))
+	if c.ChairHolderCount < 1 || c.ChairHolderCount > 64 {
+		errs = append(errs, fmt.Errorf("chair_holder_count: must be between 1 and 64, got %d", c.ChairHolderCount))
 	}
 
-	if c.ChairSeedCount < 1 || c.ChairSeedCount > 64 {
-		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and 64, got %d", c.ChairSeedCount))
+	if c.ChairSeedCount < 1 || c.ChairSeedCount > c.ChairHolderCount {
+		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and chair_holder_count (%d), got %d", c.ChairHolderCount, c.ChairSeedCount))
 	}
 
 	if c.Libp2pConnManagerHigh <= 0 {

@@ -9,12 +9,13 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh <plan|deploy|status> [config-file]
+Usage: deploy.sh <plan|scale|deploy|status> [config-file]
 
 One idempotent entrypoint for the complete Gantry benchmark stack. The config
 file is a shell environment file. No credentials are stored in it.
 
   plan    validate inputs and print the complete deployment contract
+  scale   resize the existing AKS node pool and wait for Ready nodes
   deploy  create or validate every resource and leave the benchmark ready
   status  report Azure and Kubernetes readiness without mutation
 USAGE
@@ -24,7 +25,7 @@ action=${1:-plan}
 config_file=${2:-${GANTRY_BENCHMARK_DEPLOY_CONFIG:-$script_dir/deploy.env}}
 
 case "$action" in
-plan | deploy | status) ;;
+plan | scale | deploy | status) ;;
 -h | --help | help)
   usage
   exit 0
@@ -423,6 +424,12 @@ build_source_image() {
   log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
 
+  local source_context
+  source_context=$(mktemp -d "$DEPLOY_STATE_DIR/source-context.XXXXXX")
+  trap 'rm -rf -- "$source_context"' RETURN
+  git archive "$source_revision" | tar -x -C "$source_context"
+  log "prepared committed source context ($(du -sb "$source_context" | cut -f1) bytes)"
+
   public_restore_needed=true
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
     --default-action Allow --public-network-enabled true --only-show-errors -o none
@@ -436,9 +443,9 @@ build_source_image() {
     if az acr build \
       --registry "$GANTRY_ACR_NAME" \
       --image "gantry-benchmark-source:$source_revision" \
-      --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+      --file images/gantry-benchmark-source/Containerfile \
       --build-arg "SOURCE_REVISION=$source_revision" \
-      "$repo_root" --only-show-errors -o none >"$build_log" 2>&1; then
+      "$source_context" --only-show-errors -o none >"$build_log" 2>&1; then
       built=true
       break
     fi
@@ -493,6 +500,39 @@ ensure_aks() {
   assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
   assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
   assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
+}
+
+scale_aks_node_pool() {
+  az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null || {
+    echo "AKS cluster $AZURE_AKS_CLUSTER_NAME does not exist; run deploy first" >&2
+    exit 1
+  }
+
+  local subnet_id cluster_json pool_json current_count
+  subnet_id=$(az network vnet subnet show -g "$AZURE_RESOURCE_GROUP" --vnet-name "$VNET_NAME" \
+    -n "$AKS_SUBNET_NAME" --query id -o tsv)
+  cluster_json=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -o json)
+  pool_json=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+    -n "$AKS_NODE_POOL_NAME" -o json)
+
+  assert_equal "AKS location" "$(jq -r .location <<<"$cluster_json")" "$AZURE_LOCATION"
+  assert_equal "AKS Kubernetes version" "$(jq -r .kubernetesVersion <<<"$cluster_json")" "$AKS_KUBERNETES_VERSION"
+  assert_equal "AKS node resource group" "$(jq -r .nodeResourceGroup <<<"$cluster_json")" "$AZURE_NODE_RESOURCE_GROUP"
+  assert_equal "AKS node VM size" "$(jq -r .vmSize <<<"$pool_json")" "$AKS_NODE_VM_SIZE"
+  assert_equal "AKS max pods" "$(jq -r .maxPods <<<"$pool_json")" "$AKS_MAX_PODS"
+  assert_equal "AKS node OS disk" "$(jq -r .osDiskSizeGb <<<"$pool_json")" "$AKS_NODE_OS_DISK_GB"
+  assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
+  assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
+  assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
+
+  current_count=$(jq -r .count <<<"$pool_json")
+  if [[ "$current_count" == "$AKS_NODE_COUNT" ]]; then
+    log "AKS node pool already has $AKS_NODE_COUNT nodes"
+  else
+    log "submitting AKS node pool scale: $current_count -> $AKS_NODE_COUNT"
+    az aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+      -n "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" --no-wait --only-show-errors -o none
+  fi
 }
 
 ensure_role() {
@@ -688,12 +728,21 @@ private_dns_ip() {
   exit 1
 }
 
-install_node_configuration() {
+install_containerd_pull_tuning() {
   export KUBECONFIG
   kubectl create namespace "$GANTRY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-  kubectl apply -f "$repo_root/hack/gantry-benchmark/manifests/containerd.yaml"
+  kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-benchmark-containerd-config \
+    --ignore-not-found=true --wait=true
+  kubectl -n "$GANTRY_NAMESPACE" delete configmap gantry-benchmark-containerd-config \
+    --ignore-not-found=true
+  kubectl apply -f "$repo_root/hack/gantry-benchmark/manifests/containerd-pull-tuning.yaml"
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
-    daemonset/gantry-benchmark-containerd-config --timeout=45m
+    daemonset/gantry-benchmark-containerd-pull-tuning --timeout=45m
+}
+
+install_private_dns_guard() {
+  export KUBECONFIG
+  kubectl create namespace "$GANTRY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
   local baseline_login_ip baseline_data_ip gantry_login_ip gantry_data_ip
   baseline_login_ip=$(private_dns_ip "$BASELINE_ACR_NAME")
@@ -855,7 +904,7 @@ replace_private_pull_tls_nodes() {
     return 1
   }
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
-    daemonset/gantry-benchmark-containerd-config --timeout=30m
+    daemonset/gantry-benchmark-containerd-pull-tuning --timeout=30m
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
     daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
@@ -921,46 +970,88 @@ PROBE
   kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-baseline-acr-pull-probe --wait=true
 }
 
-chair_leases_exist() {
-  kubectl -n "$GANTRY_NAMESPACE" get leases -l gantry.io/chair=true -o json | jq -e '
-    ([range(0; 64) | if . < 10 then "gantry-chair-0\(.)" else "gantry-chair-\(.)" end] | sort) as $expected |
-    ([.items[].metadata.name] | sort) == $expected
-  ' >/dev/null
-}
+assert_legacy_helm_resource() {
+  local resource=$1
+  shift
 
-ensure_chair_leases() {
-  local manifest=$1
-
-  if chair_leases_exist; then
+  local output
+  if ! output=$(kubectl "$@" get "$resource" -o json 2>/dev/null); then
     return
   fi
 
-  if ! kubectl create -f "$manifest"; then
-    log "chair Lease creation raced with another writer; verifying fixed set"
+  local managed_by
+  managed_by=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$output")
+  [[ "$managed_by" == Helm ]] || {
+    echo "$resource exists without legacy Helm-rendered ownership; remove or restore it before deployment" >&2
+    exit 1
+  }
+}
+
+migrate_legacy_gantry_install() {
+  local release_secrets
+  release_secrets=$(kubectl -n "$GANTRY_NAMESPACE" get secrets \
+    -l owner=helm,name=gantry -o json)
+  if [[ $(jq '.items | length' <<<"$release_secrets") -gt 0 ]]; then
+    return
   fi
 
-  chair_leases_exist
+  local legacy=false
+  if kubectl -n "$GANTRY_NAMESPACE" get daemonset gantry >/dev/null 2>&1 || \
+    kubectl get priorityclass gantry-low >/dev/null 2>&1; then
+    legacy=true
+  fi
+  [[ "$legacy" == true ]] || return
+
+  local resource
+  for resource in \
+    daemonset/gantry \
+    daemonset/gantry-containerd-config \
+    configmap/gantry-config \
+    configmap/gantry-containerd-hosts \
+    serviceaccount/gantry \
+    role/gantry-agent \
+    rolebinding/gantry-agent; do
+    assert_legacy_helm_resource "$resource" -n "$GANTRY_NAMESPACE"
+  done
+  assert_legacy_helm_resource priorityclass/gantry-low
+
+  local leases
+  leases=$(kubectl -n "$GANTRY_NAMESPACE" get leases -l gantry.io/chair=true -o json)
+  jq -e 'all(.items[]; .metadata.labels["app.kubernetes.io/managed-by"] == "Helm")' \
+    <<<"$leases" >/dev/null || {
+    echo "chair Leases exist without legacy Helm-rendered ownership; remove or restore them before deployment" >&2
+    exit 1
+  }
+
+  log "removing legacy rendered Gantry resources before first Helm install"
+  kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry gantry-containerd-config \
+    --ignore-not-found=true --wait=true
+  kubectl -n "$GANTRY_NAMESPACE" delete \
+    configmap/gantry-config \
+    configmap/gantry-containerd-hosts \
+    serviceaccount/gantry \
+    role/gantry-agent \
+    rolebinding/gantry-agent \
+    --ignore-not-found=true
+  kubectl -n "$GANTRY_NAMESPACE" delete leases -l gantry.io/chair=true \
+    --ignore-not-found=true --wait=true
+  kubectl delete priorityclass gantry-low --ignore-not-found=true --wait=true
 }
 
 deploy_gantry() {
   export KUBECONFIG
-  local render_root=$DEPLOY_STATE_DIR/gantry-rendered
-  local rendered=$render_root/gantry/templates
-  rm -rf "$render_root"
   GOTOOLCHAIN=auto make -C "$repo_root" install-helm
-  "$repo_root/bin/helm" template gantry "$repo_root/deploy/gantry/chart" \
+  migrate_legacy_gantry_install
+  "$repo_root/bin/helm" upgrade --install gantry "$repo_root/deploy/gantry/chart" \
     --namespace "$GANTRY_NAMESPACE" \
+    --create-namespace \
     --set-string "image.reference=$GANTRY_IMAGE" \
     --set-string 'gantry.pprofListen=127.0.0.1:6060' \
     --set-string "gantry.upstreamRegistries[0].name=$GANTRY_ACR_LOGIN_SERVER" \
     --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER" \
-    --output-dir "$render_root"
+    --wait \
+    --timeout 45m
 
-  kubectl apply -f "$rendered/serviceaccount.yaml"
-  kubectl apply -f "$rendered/configmap.yaml"
-  ensure_chair_leases "$rendered/rendezvous-leases.yaml"
-  kubectl apply -f "$rendered/node-config.yaml"
-  kubectl apply -f "$rendered/daemonset.yaml"
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=45m
 }
@@ -1039,7 +1130,16 @@ release_operator_run_command_lock() {
   exec {operator_run_command_lock_fd}>&-
 }
 
+acquire_operator_run_command_lock
 guard_active_benchmark
+if [[ "$action" == scale ]]; then
+  scale_aks_node_pool
+  wait_for_nodes
+  release_operator_run_command_lock
+  log "AKS node pool scale complete"
+  exit 0
+fi
+
 ensure_group
 ensure_vnet
 ensure_acr "$BASELINE_ACR_NAME"
@@ -1057,15 +1157,14 @@ ensure_role "$kubelet_object_id" AcrPull \
   "$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query id -o tsv)"
 
 wait_for_nodes
-install_node_configuration
+install_containerd_pull_tuning
+install_private_dns_guard
 install_monitoring
 
 set_acrs_private
 
-acquire_operator_run_command_lock
 provision_operator
 build_operator_images
-release_operator_run_command_lock
 verify_private_baseline_pull
 deploy_gantry
 
@@ -1077,7 +1176,7 @@ assert_equal "Gantry ACR public access" \
 
 kubectl -n "$MONITORING_NAMESPACE" get endpoints "$PROMETHEUS_SERVICE" -o json | \
   jq -e '.subsets | any(.addresses | length > 0)' >/dev/null
-for daemonset in gantry-benchmark-containerd-config gantry-acr-private-dns-guard gantry-containerd-config gantry; do
+for daemonset in gantry-benchmark-containerd-pull-tuning gantry-acr-private-dns-guard gantry-containerd-config gantry; do
   namespace=$GANTRY_NAMESPACE
   desired=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.desiredNumberScheduled}')
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')
@@ -1086,14 +1185,13 @@ done
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"
-  acquire_operator_run_command_lock
   az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
     --command-id RunShellScript \
     --scripts 'systemctl reset-failed gantry-benchmark-operator.service; systemctl start --no-block gantry-benchmark-operator.service' \
     --only-show-errors -o none
-  release_operator_run_command_lock
 fi
 
+release_operator_run_command_lock
 trap - EXIT INT TERM
 log "deployment complete"
 print_plan

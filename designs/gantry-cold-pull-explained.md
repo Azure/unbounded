@@ -93,8 +93,9 @@ flowchart LR
 A chair is not a coordinator and does not decide anything for anyone else. It is
 simply a node that has agreed to be one of the designated registry fetchers.
 
-Being a chair is a small extra duty. Gantry selects 10% of its DaemonSet's
-desired capacity, rounded up, with a minimum of one and a maximum of 50 chairs.
+Being a chair is a small extra duty. Gantry fills up to 64 chair slots, with at
+most one chair per node. Clusters smaller than 64 nodes therefore use every
+node as a chair holder.
 
 ### Choosing which chairs seed which layer
 
@@ -106,7 +107,7 @@ digest against the 64 chair names, producing a ranking.
 flowchart LR
     D["layer digest<br/>sha256:abc..."] --> H["hash against<br/>64 chair names"]
     H --> RK["ranked list<br/>chair-41, chair-07, chair-29, ..."]
-    RK --> T["active chairs = seeds for this layer"]
+    RK --> T["top-ranked seed cohort"]
 
     style T fill:#cfe6ff,stroke:#3b7dd8
 ```
@@ -115,8 +116,10 @@ Because the input is just the digest and the chair names, every node computes
 the **same** ranking independently. No election, no coordination, no chatter.
 
 A different layer hashes to a different ranking, so the 40 layers of an image
-spread their seeding work across the active chairs rather than piling onto the
-same nodes.
+spread their seeding work across the holder pool rather than piling onto the
+same nodes. A full 64-holder pool uses the top eight chairs for each digest.
+Smaller pools preserve that ratio, rounded up: 32 holders use four seeds, 16
+use two, and eight or fewer use one.
 
 ### The cold pull, end to end
 
@@ -125,7 +128,7 @@ sequenceDiagram
     participant CD as containerd
     participant G as Gantry (this node)
     participant IX as index
-    participant CH as active chairs
+    participant CH as seed cohort
     participant REG as registry
 
     CD->>G: get layer sha256:abc
@@ -133,8 +136,8 @@ sequenceDiagram
     IX-->>G: nobody
     G->>G: rank 64 chairs for this digest
     G->>CH: please pull sha256:abc
-    Note over CH: each chair checks:<br/>am I already pulling this?
-    CH->>REG: fetch layer (one copy per active chair)
+    Note over CH: each selected chair checks:<br/>am I already pulling this?
+    CH->>REG: fetch layer (one copy per selected chair)
     REG-->>CH: layer bytes
     CH->>IX: publish "I have sha256:abc"
     G->>IX: who has sha256:abc?
@@ -154,15 +157,19 @@ duplicate requests and pulls once.
 
 ### How many seeds
 
-The target balances registry cost and resilience:
+Holder capacity and per-digest seed count are separate:
 
 $$
-	ext{chairs}=\min\left(50,\max\left(1,\left\lceil0.10\times\text{desired Gantry pods}\right\rceil\right)\right)
+    ext{holders}=\min\left(64,\text{desired Gantry pods}\right)
 $$
 
-For example, 3 desired pods select 1 chair, 20 select 2, and 500 or more select
-the maximum of 50. The table below records the earlier eight-seed benchmark,
-not the current proportional default.
+$$
+    ext{seeds}=\max\left(1,\left\lceil\frac{8\times\text{selectable holders}}{64}\right\rceil\right)
+$$
+
+For example, 3 selectable holders select 1 seed, 20 select 3, 32 select 4,
+and the full 64-holder pool selects 8. The table below records the full-pool
+eight-seed benchmark.
 
 | Seeds | Registry traffic | Risk |
 |---|---|---|
@@ -170,8 +177,8 @@ not the current proportional default.
 | **8** | **343.6 GB** | tolerates several slow or dead seeds |
 | 1,000 | 42 TB | no sharing at all |
 
-Eight copies of a 40 GiB image is 343.6 GB. Under the proportional policy,
-registry copies grow with Gantry capacity only until the 50-chair maximum.
+Eight copies of a 40 GiB image is 343.6 GB. Under the scaled-seed policy,
+registry copies grow with selectable holder capacity only until eight seeds.
 
 ## Failure handling
 
@@ -366,6 +373,6 @@ flowchart TB
     style D fill:#e9f7e9,stroke:#5c9c5c
 ```
 
-The registry path is the narrow red box, entered once per layer by each active
-chair, up to 50. Everything else is the green box, and that is where the
+The registry path is the narrow red box, entered once per layer by each selected
+seed chair, up to 8. Everything else is the green box, and that is where the
 terabytes go.

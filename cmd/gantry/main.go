@@ -240,7 +240,7 @@ func runAgent(args []string) error {
 		}
 
 		chairStore = chairs.NewStore(chairClient.CoordinationV1().Leases(c.ChairNamespace))
-		chairCache = chairs.NewCache(chairStore, c.ChairSeedCount)
+		chairCache = chairs.NewCache(chairStore, c.ChairHolderCount)
 	}
 
 	// Without a chair namespace every cold pull falls back to the origin
@@ -250,8 +250,8 @@ func runAgent(args []string) error {
 		slog.String("chair_namespace", c.ChairNamespace),
 		slog.String("chair_listen", c.ChairListen),
 		slog.String("chair_capacity_daemonset", c.ChairCapacityDaemonSet),
-		slog.Int("chair_seed_percentage", c.ChairSeedPercentage),
-		slog.Int("chair_seed_maximum", c.ChairSeedCount),
+		slog.Int("chair_holder_count", c.ChairHolderCount),
+		slog.Int("chair_seed_count", c.ChairSeedCount),
 	)
 
 	const kademliaMaxRoutingTable = 256
@@ -324,8 +324,7 @@ func runAgent(args []string) error {
 		capacity := daemonSetChairCapacity{
 			daemonSets: chairClient.AppsV1().DaemonSets(c.ChairNamespace),
 			name:       c.ChairCapacityDaemonSet,
-			percentage: c.ChairSeedPercentage,
-			maximum:    c.ChairSeedCount,
+			maximum:    c.ChairHolderCount,
 		}
 		chairManager = chairs.NewManager(chairs.ManagerOptions{
 			Store:      chairStore,
@@ -337,7 +336,7 @@ func runAgent(args []string) error {
 				return disco.ConnectPeers(connectCtx, addresses)
 			},
 			BootstrapHealthy:    func() bool { return disco.RoutingTableSize() > 0 },
-			SeedTarget:          capacity.SeedTarget,
+			HolderTarget:        capacity.HolderTarget,
 			Logger:              logger,
 			LeaseDuration:       c.ChairLeaseDuration,
 			RenewPeriod:         c.ChairRenewPeriod,
@@ -349,7 +348,7 @@ func runAgent(args []string) error {
 			ClaimInitialDivisor: uint64(c.ChairClaimInitialDivisor),
 			APITimeout:          c.ChairAPITimeout,
 			ClusterSizeEstimate: c.ChairClusterSizeEstimate,
-			SeedCount:           c.ChairSeedCount,
+			HolderCount:         c.ChairHolderCount,
 		})
 	}
 	// pullerPump bridges inbound please_pull RPCs to the local origin
@@ -461,6 +460,7 @@ func runAgent(args []string) error {
 			Claimer:               chairManager,
 			Logger:                logger,
 			APITimeout:            c.ChairAPITimeout,
+			HolderCount:           c.ChairHolderCount,
 			SeedCount:             c.ChairSeedCount,
 			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
@@ -479,7 +479,8 @@ func runAgent(args []string) error {
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_slots", chairs.Count),
-			slog.Int("seed_maximum", c.ChairSeedCount),
+			slog.Int("holder_count", c.ChairHolderCount),
+			slog.Int("seed_count", c.ChairSeedCount),
 		)
 	} else {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")

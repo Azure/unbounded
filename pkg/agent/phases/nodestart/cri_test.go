@@ -35,7 +35,7 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
 }
 
-func TestConfigureContainerdSetsImagePullProgressTimeout(t *testing.T) {
+func TestConfigureContainerdSetsImagePullTuning(t *testing.T) {
 	t.Parallel()
 
 	machineDir := t.TempDir()
@@ -51,7 +51,9 @@ func TestConfigureContainerdSetsImagePullProgressTimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(data), "[plugins.\"io.containerd.grpc.v1.cri\"]\n"+
 		"sandbox_image = \""+goalState.Containerd.SandboxImage+"\"\n"+
-		"image_pull_progress_timeout = \"15m\"")
+		"image_pull_progress_timeout = \"30m\"")
+	require.Contains(t, string(data), "[plugins.\"io.containerd.transfer.v1.local\"]\n"+
+		"max_concurrent_downloads = 6")
 }
 
 func TestConfigureContainerdDoesNotInstallLifecycleReadinessGate(t *testing.T) {

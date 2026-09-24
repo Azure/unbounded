@@ -172,6 +172,86 @@ func TestChairResolverUsesAvailableSmallCohort(t *testing.T) {
 	}
 }
 
+func TestChairResolverPreservesHolderToSeedRatio(t *testing.T) {
+	tests := []struct {
+		holders int
+		seeds   int
+	}{
+		{holders: 64, seeds: 8},
+		{holders: 32, seeds: 4},
+		{holders: 16, seeds: 2},
+		{holders: 9, seeds: 2},
+		{holders: 8, seeds: 1},
+		{holders: 3, seeds: 1},
+		{holders: 2, seeds: 1},
+		{holders: 1, seeds: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("holders=%d", test.holders), func(t *testing.T) {
+			d := digest.MustParse("sha256:abababababababababababababababababababababababababababababababab")
+			snapshot := fullChairSnapshot(5)
+			snapshot.Chairs = snapshot.Chairs[:test.holders]
+			coord := &chairCoordStub{}
+			resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+				Chairs:       &chairSnapshotStub{snapshot: snapshot},
+				Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}}},
+				Coord:        coord,
+				Inflight:     inflight.New(inflight.DefaultStalls(), nil),
+				SelfPeerID:   "self",
+				CurrentEpoch: func() int64 { return 5 },
+				HolderCount:  chairs.Count,
+				SeedCount:    chairs.SeedCount,
+			})
+
+			if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			coord.mu.Lock()
+			calls := len(coord.calls)
+			coord.mu.Unlock()
+
+			if calls != test.seeds {
+				t.Fatalf("chair calls = %d; want %d", calls, test.seeds)
+			}
+		})
+	}
+}
+
+func TestChairPrefetchPreservesHolderToSeedRatio(t *testing.T) {
+	d := digest.MustParse("sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+	snapshot := fullChairSnapshot(5)
+	snapshot.Chairs = snapshot.Chairs[:32]
+	coord := &chairCoordStub{}
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:       &chairSnapshotStub{snapshot: snapshot},
+		Discovery:    &stubDisco{},
+		Coord:        coord,
+		Inflight:     inflight.New(inflight.DefaultStalls(), nil),
+		SelfPeerID:   "self",
+		CurrentEpoch: func() int64 { return 5 },
+		HolderCount:  chairs.Count,
+		SeedCount:    chairs.SeedCount,
+	})
+
+	err := resolver.PrefetchManifestChildren(context.Background(), d, []coldstart.ChildDigest{{
+		Digest: d,
+		Kind:   ifaces.KindBlob,
+	}}, "registry.example.com", "repo/image")
+	if err != nil {
+		t.Fatalf("PrefetchManifestChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	calls := len(coord.calls)
+	coord.mu.Unlock()
+
+	if calls != 4 {
+		t.Fatalf("chair calls = %d; want 4", calls)
+	}
+}
+
 func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
 	snapshot := fullChairSnapshot(8)
