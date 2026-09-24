@@ -4,6 +4,213 @@
 use super::*;
 
 #[test]
+fn peer_crc_rejection_leaves_no_cached_value_and_allows_healthy_refetch() {
+    let Some(mut ring) = crate::conformance::kernel_ring(4, uring::Config::default()) else {
+        return;
+    };
+    let pool = crate::crypto::Pool::test_pool(ring.pool());
+    let (worker, source) = pool.attach_local(ring.pool(), ring.wake_handle()).unwrap();
+    let worker = Rc::new(RefCell::new(worker));
+    for metadata in [false, true] {
+        for bad in [
+            "missing",
+            "empty",
+            "malformed",
+            "duplicate",
+            "metadata-flip",
+        ] {
+            if !metadata && bad == "metadata-flip" {
+                continue; // Payload flips already exercise async CRC in cache_persistence.
+            }
+            let record = crate::metadata::Metadata {
+                checksum: crate::metadata::Checksum(*blake3::hash(b"abc").as_bytes()),
+                len: 3,
+                expires: crate::environment::wall()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+                content_type: Default::default(),
+            };
+            let bytes = if metadata {
+                record.to_bytes().to_vec()
+            } else {
+                b"abc".to_vec()
+            };
+            let crc = crate::allocator::crc64(&bytes);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let tls = PeerTls::new();
+            let client_context = tls.client.clone();
+            let server = thread::spawn(move || {
+                for healthy in [false, true] {
+                    let end = deadline();
+                    let socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < end, "missing refetch: {metadata}/{bad}");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(e) => panic!("accept: {e}"),
+                        }
+                    };
+                    socket.set_nonblocking(true).unwrap();
+                    let mut stream = PeerStream::new(
+                        TlsSession::server(
+                            &tls.server,
+                            socket.into(),
+                            ExpectedPeer::Identity(peer_identity(2)),
+                        )
+                        .unwrap(),
+                        peer_identity(2),
+                    );
+                    assert!(request(&mut stream).starts_with("GET / HTTP/1.1\r\n"));
+                    let valid = format!("X-Racer-Crc64: {crc:016x}\r\n");
+                    let header = match (healthy, bad) {
+                        (false, "missing") => String::new(),
+                        (false, "empty") => "X-Racer-Crc64: \r\n".into(),
+                        (false, "malformed") => "X-Racer-Crc64: not-hex\r\n".into(),
+                        (false, "duplicate") => valid.repeat(2),
+                        _ => valid,
+                    };
+                    let mut body = bytes.clone();
+                    if !healthy && bad == "metadata-flip" {
+                        // Keep a decodable record and matching ETag, but change its length
+                        // without updating the origin-admission CRC.
+                        body[32] ^= 1;
+                    }
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\n{header}Connection: close\r\n\r\n", body.len(), record.checksum.etag().as_str()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            });
+            let backend = Backend::new("127.0.0.1:1", "crc-origin").unwrap();
+            let context =
+                cache::Context::new(backend.namespace()).with_crypto(Some(worker.clone()));
+            let mut handler = Handler::new(cache(&backend, 1), backend);
+            handler.set_peer(Peer::new(&address.to_string(), None).unwrap());
+            let (trust, config) = crate::control::tests::fixture();
+            let prepared = trust
+                .prepare(crate::control::proto::Configuration {
+                    contents: Some(crate::control::proto::configuration::Contents::Snapshot(
+                        config,
+                    )),
+                })
+                .unwrap();
+            let routing = prepared.volumes()[0].routing().clone();
+            let target = (0..)
+                .map(|n| format!("/crc-{n}"))
+                .find(|t| routing.start(t).owner == 1)
+                .unwrap();
+            handler.upstream.active = Some(Rc::new(RefCell::new(RouteState {
+                cursor: routing.start(&target),
+                origin: true,
+                exhausted: false,
+            })));
+            handler.upstream.routing = Some(routing);
+            // One direct peer hop leaves room for the native TLS scratch buffers.
+            handler.upstream.receive_rank = Some(1);
+            handler
+                .upstream
+                .peer
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .http
+                .set_tls(
+                    crate::control::credentials::Provider::for_test(
+                        peer_identity(2),
+                        Arc::new(client_context),
+                    ),
+                    peer_identity(3),
+                );
+            for attempt in 0..3 {
+                if attempt == 1 {
+                    let peer = handler.upstream.peer.as_ref().unwrap();
+                    assert!(!peer.borrow().http.breaker.available());
+                    let end = deadline();
+                    while !peer.borrow().http.breaker.available() {
+                        assert!(Instant::now() < end, "CRC failure breaker never reopened");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                if attempt == 2 {
+                    // A successful refetch must now be cached, even with no peer.
+                    handler.upstream.peer = None;
+                }
+                let descriptor = if metadata {
+                    cache::PeerDescriptor::metadata(&target)
+                } else {
+                    cache::PeerDescriptor::page(
+                        &target,
+                        cache::PeerPage::new(0, 3, record.checksum),
+                    )
+                };
+                let end = deadline();
+                let mut fault = handler
+                    .cache
+                    .borrow_mut()
+                    .peer_fault_in::<Provider>(&context, descriptor, end)
+                    .unwrap();
+                let result = loop {
+                    assert!(Instant::now() < end, "stalled: {metadata}/{bad}/{attempt}");
+                    ring.progress().unwrap();
+                    handler.cache.borrow_mut().poll(&mut ring, 16).unwrap();
+                    match handler.cache.borrow_mut().poll_value(
+                        fault,
+                        &mut ring,
+                        &mut handler.upstream,
+                    ) {
+                        Ok(cache::Progress::Pending { fault: next, .. }) => fault = next,
+                        result => break result,
+                    }
+                    thread::yield_now();
+                };
+                if attempt == 0 {
+                    assert!(
+                        result.is_err(),
+                        "published invalid peer CRC: {metadata}/{bad}"
+                    );
+                    let state = handler.upstream.active.as_ref().unwrap().borrow();
+                    assert!(
+                        !handler
+                            .upstream
+                            .owners
+                            .borrow()
+                            .blocked(state.cursor.identity, 1)
+                    );
+                    assert_eq!(state.cursor.attempt, 0);
+                } else {
+                    if let Err(error) = &result {
+                        panic!(
+                            "healthy refetch/cache hit failed: {metadata}/{bad}/{attempt}: {error}"
+                        );
+                    }
+                    let Ok(cache::Progress::Ready(value)) = result else {
+                        panic!("healthy refetch/cache hit failed: {metadata}/{bad}/{attempt}");
+                    };
+                    assert_eq!(value.checksum(), Some(crc));
+                    if metadata {
+                        let cache::CachedValue::Metadata(actual) = value else {
+                            panic!("metadata expected")
+                        };
+                        assert_eq!(actual.to_bytes(), record.to_bytes());
+                    } else {
+                        assert!(matches!(value, cache::CachedValue::File(_)));
+                    }
+                }
+            }
+            server.join().unwrap();
+            handler.shutdown(&mut ring).unwrap();
+        }
+    }
+    drop((source, worker));
+    pool.shutdown().unwrap();
+    ring.shutdown().unwrap();
+}
+
+#[test]
 fn production_peer_recovery_is_budgeted_and_never_replays_responses() {
     let Some(mut ring) = crate::conformance::kernel_ring(8, uring::Config::default()) else {
         return;
