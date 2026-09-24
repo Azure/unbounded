@@ -161,6 +161,7 @@ func TestNodeWSFrameTransport(t *testing.T) {
 						result <- err
 						return
 					}
+
 					defer func() {
 						if err := conn.CloseNow(); err != nil && !errors.Is(err, net.ErrClosed) {
 							t.Errorf("server close: %v", err)
@@ -184,6 +185,7 @@ func TestNodeWSFrameTransport(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+
 				defer func() {
 					if err := conn.CloseNow(); err != nil && !errors.Is(err, net.ErrClosed) {
 						t.Errorf("client close: %v", err)
@@ -232,6 +234,7 @@ func TestNodeWSFrameCancellation(t *testing.T) {
 			result <- err
 			return
 		}
+
 		defer func() {
 			if err := conn.CloseNow(); err != nil && !errors.Is(err, net.ErrClosed) {
 				t.Errorf("server close: %v", err)
@@ -251,6 +254,7 @@ func TestNodeWSFrameCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() {
 		if err := conn.CloseNow(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("client close: %v", err)

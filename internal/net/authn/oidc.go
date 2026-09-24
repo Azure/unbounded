@@ -335,6 +335,7 @@ func (v *KubernetesOIDCVerifier) refreshKeys(ctx context.Context, force bool) er
 
 	// A disconnected caller must not cancel shared work or poison the cooldown.
 	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oidcHTTPTimeout)
+
 	go func() {
 		defer cancel()
 
@@ -515,6 +516,7 @@ func getJSON(ctx context.Context, client *http.Client, endpoint string, target a
 	if err != nil {
 		return fmt.Errorf("request %s: %w", endpoint, err)
 	}
+
 	defer func() {
 		if err := resp.Body.Close(); err != nil && returnErr == nil {
 			returnErr = fmt.Errorf("close response from %s: %w", endpoint, err)
