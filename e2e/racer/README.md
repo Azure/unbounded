@@ -22,7 +22,9 @@ deadlines. Rerun the build target after changing binary or test sources.
 `ContainerImage` starts separate loadgen registry and puller processes against
 one real Gantry/Racer pair. It verifies manifest, config, and two 64 MiB layers,
 exact cold origin range counts, repeated pulls with the registry offline,
-verified splice bytes, and zero Gantry fallback. `Striped` independently verifies
+completed splice streams, zero tee counters, and zero Gantry fallback. Payload
+verification belongs to the downstream reader; Gantry's `completed` metric does
+not claim OCI digest verification. `Striped` independently verifies
 multi-node page distribution and peer transport. See the
 [loadgen guide](../../cmd/racer-loadgen/README.md#container-image-mode) and
 [cluster example](examples/container-image-loadgen.yaml) for benchmarks.
@@ -33,7 +35,22 @@ multi-node page distribution and peer transport. See the
 bytes, repair the origin at the same digest URL, prove warm old-generation reads
 still return the old bytes, increment the cache generation, await activation on
 every dataplane, then verify repaired bytes and offline warm reuse with zero
-Gantry fallback. It uses HTTP reads rather than a containerd corruption campaign.
+Gantry fallback. It complements `TestGantryRacerCorruption`, which exercises two
+peers and containerd's normal `Client.Pull` path against a real content store.
+
+`Corruption` serves incorrect same-length layer bytes under the correct advertised
+OCI digest. Racer computes a self-consistent admission CRC for those bytes, and
+Gantry completes HTTP forwarding through both nodes with positive splice and zero
+tee counters. Containerd must reject specifically with an unexpected commit
+digest (`FailedPrecondition`), with neither the expected nor incorrect digest
+committed and no image published. Repairing the origin alone leaves warmed bad
+bytes intact. After explicit generation activation on every dataplane, the test
+demonstrates the retained-ingest retry behavior below, aborts only that idle failed
+ingest, and repeats the same normal pull in the same namespace. It checks the
+committed bytes and then reads through Racer on both peers with origins offline.
+The valid image config is fetched through containerd's resolver before the pulls,
+so layer rejection cannot cancel a sibling config fetch and introduce an unrelated
+fallback. Manifest and layer fetching use the normal pull path.
 
 The native `gantryFixture` helpers for follow-on tests are:
 
@@ -83,13 +100,22 @@ generation, and wait for every serving dataplane to activate the resulting
 configuration. Generation recovery is explicit; there is no automatic corruption
 feedback or new invalidation protocol.
 
-For a containerd recovery test, close the failed response and use a fresh ingest
-reference, or explicitly abort the failed reference in the same containerd
-namespace before retrying. `content.WriteBlob` closes its writer but does not
-abort a failed ingest; a reused reference can resume its old offset and bytes.
-Assert that the expected digest is absent after failure and present with verified
-bytes after recovery. Drain/finish pre-bump requests before asserting post-bump
-reads: activation does not retroactively change an already-started stream.
+Containerd recovery also needs attention to its retained failed ingest. In the
+native campaign (containerd daemon 2.2.1, Go client 2.3.5), a normal pull leaves
+`layer-<digest>` at offset/total 1,179,648 after digest rejection. Retrying after
+generation activation recommits those bytes and fails with the same bad digest,
+without issuing another layer GET. The test asserts that behavior rather than
+hiding it behind a fresh `content.WriteBlob` reference. Its lease keeps the
+campaign's content and ingest available across the sequential attempts.
+
+For operator recovery, finish the failed pull and ensure there is no active writer
+before explicitly aborting only the known failed ingest in its original containerd
+namespace. In the test, acquiring and closing that exact writer confirms it is idle;
+after abort, the same image/ingest reference fetches the repaired layer and commits
+successfully. The consumer namespace is separate from Gantry's local stores, and
+subsequent offline reads must increment Racer's `completed` counter. Drain/finish
+pre-bump requests before asserting post-bump reads: activation does not
+retroactively change an already-started stream.
 
 ### Prerequisites
 
@@ -134,7 +160,8 @@ RACER_REQUIRE_KTLS=1 make e2e-gantry-racer
 
 `Striped` fails if it does not observe at least one page of kTLS sendfile bytes
 when this flag is set. Without it, the test still requires real peer transfers
-and Gantry splice/tee verification, and logs the observed sendfile byte count.
+and Gantry splice forwarding with zero tee counters, and logs the observed
+sendfile byte count.
 
 ### CI
 
