@@ -216,30 +216,30 @@ impl Settings {
         )?;
         let enroll = url::Url::parse(&env("RACER_ENROLL_URL")?).map_err(invalid)?;
         if enroll.scheme() != "https"
-            || enroll.path() != "/v3/enroll"
+            || enroll.path() != "/v1/enroll"
             || enroll.query().is_some()
             || enroll.fragment().is_some()
             || !enroll.username().is_empty()
             || enroll.password().is_some()
         {
-            return Err(invalid("expected HTTPS /v3/enroll enrollment URL"));
+            return Err(invalid("expected HTTPS /v1/enroll enrollment URL"));
         }
         let mut proof = enroll.clone();
         proof
             .set_port(Some(8446))
             .map_err(|_| invalid("invalid proof port"))?;
-        proof.set_path("/v3/proof");
+        proof.set_path("/v1/proof");
         if let Ok(value) = std::env::var("RACER_TRUST_PROOF_URL") {
             proof = url::Url::parse(&value).map_err(invalid)?;
         }
         if proof.scheme() != "https"
-            || proof.path() != "/v3/proof"
+            || proof.path() != "/v1/proof"
             || proof.query().is_some()
             || proof.fragment().is_some()
             || !proof.username().is_empty()
             || proof.password().is_some()
         {
-            return Err(invalid("expected HTTPS /v3/proof URL"));
+            return Err(invalid("expected HTTPS /v1/proof URL"));
         }
         let result = Self {
             boot: hex(&boot),
@@ -295,7 +295,7 @@ impl Leaf {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let wire = zeroize::Zeroizing::new(format!(
-            "POST /v3/enroll HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /v1/enroll HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             settings.boot,
             body.len()
         ));
@@ -533,7 +533,7 @@ fn prove(settings: &Settings, provider: &Arc<Provider>) -> io::Result<()> {
     let authority = &settings.proof[url::Position::BeforeHost..url::Position::AfterPort];
     write!(
         stream,
-        "POST /v3/proof HTTP/1.1\r\nHost: {authority}\r\nX-Racer-Boot: {}\r\n",
+        "POST /v1/proof HTTP/1.1\r\nHost: {authority}\r\nX-Racer-Boot: {}\r\n",
         settings.boot
     )?;
     for (name, value) in headers {

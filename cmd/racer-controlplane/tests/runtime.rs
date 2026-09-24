@@ -1069,7 +1069,7 @@ fn seed(api: &FakeApi, state: &CaState) {
 
 fn request(peer: &VerifiedPeer, boot: &str, cursor: &str) -> Request<Body> {
     let mut request = Request::builder()
-        .uri("/v4/config")
+        .uri("/v1/config")
         .header("x-racer-boot", boot)
         .header("x-racer-profile", "1")
         .header("x-racer-cursor", cursor)
@@ -1206,7 +1206,7 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
         )
         .await
         .unwrap();
-    stream.write_all(format!("GET /v4/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nX-Racer-Storage-Policy: 1\r\nX-Racer-Cursor: {}\r\n\r\n", credentials.boot, current.cursor).as_bytes()).await.unwrap();
+    stream.write_all(format!("GET /v1/config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nX-Racer-Storage-Policy: 1\r\nX-Racer-Cursor: {}\r\n\r\n", credentials.boot, current.cursor).as_bytes()).await.unwrap();
     until(|| runtime.subscriptions.waiter_count() >= 1).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(40), stream.read_u8())

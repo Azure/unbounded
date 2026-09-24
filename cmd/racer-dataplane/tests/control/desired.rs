@@ -46,7 +46,7 @@ fn desired_cursor_survives_rejection_and_local_ack_interrupts_poll() {
     let server = Server::new();
     let (subscriber, updates, trust, mut config) = server.start();
     let (mut socket, request, _) = server.next();
-    assert!(request.starts_with("GET /v4/config HTTP/1.1\r\n"));
+    assert!(request.starts_with("GET /v1/config HTTP/1.1\r\n"));
     assert!(request.contains("X-Racer-Applied-Revision: 0\r\n"));
     assert!(!request.contains("X-Racer-Phase:"));
     reply(&mut socket, &signed(&trust, config.clone()), "\"one\"");

@@ -992,7 +992,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
     );
     let boot = "a".repeat(64);
     let enrollment = format!(
-        "POST /v3/enroll HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {boot}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/enroll HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nAuthorization: Bearer {token}\r\nX-Racer-Boot: {boot}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     // A stale init identity must not receive a leaf for the Node's new identity.
@@ -1098,26 +1098,26 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         &bundle,
         Some((response["certificate"].as_str().unwrap(), &key)),
     );
-    let control = request(&options.listen, &format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n"), Some(config)).await?;
+    let control = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n"), Some(config)).await?;
     ensure!(
         control.starts_with(b"HTTP/1.1 200"),
         "control failed: {}",
         String::from_utf8_lossy(&control)
     );
     next_sweep.resume.notify_one();
-    let wrong_boot = request(&options.listen, &format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n", "f".repeat(64)), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
+    let wrong_boot = request(&options.listen, &format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {}\r\nX-Racer-Profile: 1\r\nConnection: close\r\n\r\n", "f".repeat(64)), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
     assert!(
         wrong_boot.starts_with(b"HTTP/1.1 403"),
         "header cannot replace signed boot"
     );
-    let proof = request(&options.trust_proof_listen, &format!("POST /v3/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", bundle.generation, bundle.digest(), response["issuer"].as_str().unwrap()), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
+    let proof = request(&options.trust_proof_listen, &format!("POST /v1/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", bundle.generation, bundle.digest(), response["issuer"].as_str().unwrap()), Some(tls_config(&bundle, Some((response["certificate"].as_str().unwrap(), &key))))).await?;
     ensure!(
         proof.starts_with(b"HTTP/1.1 204"),
         "proof failed: {}",
         String::from_utf8_lossy(&proof)
     );
     // A caller-provided identity header cannot substitute for a client certificate.
-    assert!(request(&options.listen, "GET /v4/config HTTP/1.1\r\nHost: x\r\nX-Racer-Pod: worker-pod\r\nConnection: close\r\n\r\n", Some(tls_config(&bundle, None))).await.is_err());
+    assert!(request(&options.listen, "GET /v1/config HTTP/1.1\r\nHost: x\r\nX-Racer-Pod: worker-pod\r\nConnection: close\r\n\r\n", Some(tls_config(&bundle, None))).await.is_err());
     let mut trust = fixture
         .get("/api/v1/namespaces/system/configmaps/racer-trust")
         .unwrap();
@@ -1141,7 +1141,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
     .await?;
     assert_eq!(overlap.active, bundle.active);
     let proof_request = format!(
-        "POST /v3/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         overlap.generation,
         overlap.digest(),
         response["issuer"].as_str().unwrap()
@@ -1683,7 +1683,7 @@ async fn enrollment_status(fixture: &Fixture, options: &Options) -> Result<Vec<u
     // An empty request reaches token validation only when request serving is enabled.
     request(
         &options.enroll_listen,
-        "POST /v3/enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         Some(tls_config(&bundle, None)),
     )
     .await
@@ -1964,7 +1964,7 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     let bundle = TrustBundle::parse(original.as_bytes())?;
     let rejected = request(
         &second.enroll_listen,
-        "POST /v3/enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         Some(tls_config(&bundle, None)),
     )
     .await?;

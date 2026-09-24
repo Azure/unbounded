@@ -4,18 +4,18 @@
 #[test]
 fn maximum_descriptor_http_bounds() {
     use crate::http_client as client;
-    // Full RF04 metadata/page frames, not just target+ETag, at the cap.
+    // Full RB01 metadata/page frames, not just target+ETag, at the cap.
     for page in [false, true] {
         let (_, config) = crate::control::tests::fixture();
         let routing = crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap();
         let target_len = if page { 3132 } else { 3438 };
         let target = format!("/{}", "x".repeat(target_len - 1));
         let cursor = routing.start(&target);
-        let mut wire = b"RF04".to_vec();
+        let mut wire = b"RB01".to_vec();
         wire.extend(1000u32.to_le_bytes());
         wire.extend(cursor.algorithm.magic());
         wire.extend(cursor.encode());
-        wire.extend(b"RF08");
+        wire.extend(b"RD01");
         wire.push(u8::from(page));
         if page {
             wire.extend(0u64.to_le_bytes());
@@ -69,7 +69,7 @@ fn maximum_descriptor_http_bounds() {
 
 #[test]
 fn bounded_chain_rejects_truncation_nesting_and_oversized_hops() {
-    let bytes = with_budget(b"RF08\0/object".to_vec(), Duration::from_secs(1)).unwrap();
+    let bytes = with_budget(b"RD01\0/object".to_vec(), Duration::from_secs(1)).unwrap();
     let mut wire = with_chain(bytes, [7; 32], 0, 0, 42).unwrap();
     assert_eq!(chain(&wire).unwrap(), Some(([7; 32], 0, 0, 42)));
     assert_eq!(routed_descriptor(&wire).unwrap().1.target(), "/object");
@@ -137,7 +137,7 @@ fn exact_descriptor_boundaries() {
                     }
                     let mut wire = Vec::new();
                     if budget {
-                        wire.extend(b"RF04");
+                        wire.extend(b"RB01");
                         wire.extend(1000u32.to_le_bytes());
                     }
                     if routed {
@@ -197,7 +197,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
     let backend = Backend::new("127.0.0.1:1", "test-origin").unwrap();
     let mut cache = super::adapter_fixture::cache(backend.namespace(), 1);
     let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let wire = b"RF08\0//%2f?x=1&x=2";
+    let wire = b"RD01\0//%2f?x=1&x=2";
     assert_eq!(unhex(&hex(wire)).unwrap(), wire);
     let fault = cache
         .peer_fault::<Provider>(decode_descriptor(wire).unwrap(), deadline())
@@ -214,7 +214,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
             )
             .is_err()
     );
-    let mut largest = b"RF08\0/".to_vec();
+    let mut largest = b"RD01\0/".to_vec();
     largest.resize(MAX_DESCRIPTOR, b'x');
     assert!(decode_descriptor(&largest).is_ok());
     largest.push(b'x');
@@ -228,7 +228,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
         b"RF01\x02/",
         b"RF01\x01/",
         b"RF01\0/legacy",
-        b"RF08\x01/",
+        b"RD01\x01/",
     ] {
         assert!(decode_descriptor(bytes).is_err());
     }
@@ -236,7 +236,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
         assert!(unhex(wire).is_err());
     }
     // Structurally valid page facts still require cache bounds/version validation.
-    let mut page = b"RF08\x01".to_vec();
+    let mut page = b"RD01\x01".to_vec();
     page.extend_from_slice(&1u64.to_le_bytes());
     page.extend_from_slice(&3u64.to_le_bytes());
     page.extend_from_slice(&[42; 32]);
@@ -262,15 +262,15 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
     use crate::handlers::{remote_deadline, routing_identity};
     let (_, mut config) = crate::control::tests::fixture();
     let target = "/%2f?x=1&x=2";
-    let mut page = b"RF08\x01".to_vec();
+    let mut page = b"RD01\x01".to_vec();
     page.extend(0u64.to_le_bytes());
     page.extend(3u64.to_le_bytes());
     page.extend([42; 32]);
     page.extend([0; 258]);
     page.extend(target.as_bytes());
-    let mut meta = b"RF08\0".to_vec();
+    let mut meta = b"RD01\0".to_vec();
     meta.extend(target.as_bytes());
-    for algorithm in [3] {
+    for algorithm in [1] {
         config.volumes[0]
             .topology
             .as_mut()
@@ -286,7 +286,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             wire.extend(cursor.encode());
             wire.extend(inner);
             assert!(routed_descriptor(&wire).is_err(), "budget is mandatory");
-            let mut bounded = b"RF04".to_vec();
+            let mut bounded = b"RB01".to_vec();
             bounded.extend(1500u32.to_le_bytes());
             bounded.extend(&wire);
             let (decoded, descriptor) = routed_descriptor(&bounded).unwrap();
@@ -319,7 +319,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             bounded[4..8].fill(0);
             assert!(routed_descriptor(&bounded).is_err());
             bounded[4..8].copy_from_slice(&1u32.to_le_bytes());
-            bounded[8..12].copy_from_slice(b"RF04");
+            bounded[8..12].copy_from_slice(b"RB01");
             assert!(routed_descriptor(&bounded).is_err());
             for n in 0..4 + crate::routing::Cursor::LEN + 6 {
                 assert!(routed_descriptor(&wire[..n.min(wire.len())]).is_err());
@@ -327,7 +327,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             wire[3] = b'9';
             assert!(routed_descriptor(&wire).is_err());
         }
-        let mut largest = b"RF04".to_vec();
+        let mut largest = b"RB01".to_vec();
         largest.extend(1000u32.to_le_bytes());
         largest.extend(cursor.algorithm.magic());
         largest.extend(cursor.encode());

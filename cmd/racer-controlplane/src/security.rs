@@ -5,7 +5,7 @@
 //! an externally elected term, and the fenced store below. No HTTP header can
 //! construct a `TlsProof`. Private CA state belongs in a Secret, never a log.
 //!
-//! Version 5 private state has at most two authorities and fixed-size rotation
+//! Version 1 private state has at most two authorities and fixed-size rotation
 //! metadata. Leaves carry versioned signed claims; TLS proves key ownership.
 //! Enrollment always authorizes live Kubernetes resources. Request authentication
 //! uses only signed claims, current trust, expiry, and local topology policy.

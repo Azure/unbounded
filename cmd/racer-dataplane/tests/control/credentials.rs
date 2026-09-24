@@ -352,9 +352,9 @@ impl Scratch {
         std::fs::write(self.0.join("token"), "test-bound-token\n").unwrap();
         Settings {
             boot: "03".repeat(32),
-            proof: url::Url::parse("https://127.0.0.1:1/v3/proof").unwrap(),
+            proof: url::Url::parse("https://127.0.0.1:1/v1/proof").unwrap(),
             trust_dir: self.0.clone(),
-            enroll: url::Url::parse(&format!("https://{address}/v3/enroll")).unwrap(),
+            enroll: url::Url::parse(&format!("https://{address}/v1/enroll")).unwrap(),
             token: self.0.join("token"),
             namespace: "test-namespace".into(),
             pod: "test-name".into(),
@@ -424,7 +424,7 @@ fn enroll_server_with_authorities(
                     break;
                 }
             }
-            assert!(headers.starts_with("POST /v3/enroll HTTP/1.1\r\n"));
+            assert!(headers.starts_with("POST /v1/enroll HTTP/1.1\r\n"));
             assert!(headers.contains("Authorization: Bearer test-bound-token\r\n"));
             assert!(headers.contains(&format!("X-Racer-Boot: {}\r\n", "03".repeat(32))));
             let length: usize = headers
@@ -611,7 +611,7 @@ fn reenrollment_recovers_when_offline_root_is_already_retired() {
     let replacement = TrustBundle::parse(&second.bundle(2), Some(&first.trust)).unwrap();
     assert!(leaf.snapshot(&replacement, 2, &settings.identity).is_err());
     let (address, server) = enroll_server(&second, vec![(copy_fixture(&second), 2, None)]);
-    settings.enroll = url::Url::parse(&format!("https://{address}/v3/enroll")).unwrap();
+    settings.enroll = url::Url::parse(&format!("https://{address}/v1/enroll")).unwrap();
     leaf = Leaf::enroll(&settings, &replacement).unwrap();
     let snapshot = leaf.snapshot(&replacement, 2, &settings.identity).unwrap();
     assert_eq!(snapshot.issuer, second.trust.active);
@@ -693,7 +693,7 @@ fn proof_requires_installed_context_and_fresh_mutual_tls() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let mut settings = scratch.settings(address);
-    settings.proof = url::Url::parse(&format!("https://{address}/v3/proof")).unwrap();
+    settings.proof = url::Url::parse(&format!("https://{address}/v1/proof")).unwrap();
     // A not-yet-installed context must not even establish a proof connection.
     prove(&settings, &provider).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -719,7 +719,7 @@ fn proof_requires_installed_context_and_fresh_mutual_tls() {
                     break;
                 }
             }
-            assert!(headers.starts_with("POST /v3/proof HTTP/1.1\r\n"));
+            assert!(headers.starts_with("POST /v1/proof HTTP/1.1\r\n"));
             assert!(headers.contains("X-Racer-Trust-Generation: 1\r\n"));
             assert!(headers.contains("X-Racer-Old-Connections: 2\r\n"));
             assert!(headers.contains(&format!("X-Racer-Boot: {}\r\n", "03".repeat(32))));
@@ -757,7 +757,7 @@ fn manager_proves_installation_and_drain_immediately_then_holds_refresh() {
     listener.set_nonblocking(true).unwrap();
     let mut settings = scratch.settings(enroll);
     settings.proof = url::Url::parse(&format!(
-        "https://{}/v3/proof",
+        "https://{}/v1/proof",
         listener.local_addr().unwrap()
     ))
     .unwrap();

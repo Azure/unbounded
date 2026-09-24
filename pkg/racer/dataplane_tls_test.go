@@ -108,7 +108,7 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v4/config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if !authenticated(r) {
 			http.Error(w, "client certificate required", http.StatusForbidden)
 			return
@@ -163,7 +163,7 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 			return
 		}
 	})
-	mux.HandleFunc("POST /v3/enroll", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/enroll", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			CSR       string `json:"csr"`
 			Namespace string `json:"pod_namespace"`
@@ -211,7 +211,7 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	})
-	mux.HandleFunc("POST /v3/proof", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/proof", func(w http.ResponseWriter, r *http.Request) {
 		if !authenticated(r) {
 			http.Error(w, "client certificate required", http.StatusForbidden)
 			return
@@ -231,9 +231,9 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 	}
 
 	return []string{
-		"RACER_CONTROL_PLANE_URL=" + server.URL + "/v4/config",
+		"RACER_CONTROL_PLANE_URL=" + server.URL + "/v1/config",
 		"RACER_TLS_TRUST_DIR=" + dir,
-		"RACER_ENROLL_URL=" + server.URL + "/v3/enroll",
+		"RACER_ENROLL_URL=" + server.URL + "/v1/enroll",
 		"RACER_CONTROL_SERVER_NAME=racer-controlplane.sdk.svc",
 		"RACER_CONTROL_TOKEN_FILE=" + filepath.Join(dir, "token"),
 		"RACER_POD_NAMESPACE=sdk", "RACER_POD_NAME=dataplane", "RACER_POD_UID=sdk-pod",

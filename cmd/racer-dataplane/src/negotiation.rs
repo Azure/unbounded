@@ -23,7 +23,7 @@ use std::{
 };
 
 pub const HEADER: &str = "X-Racer-Rdma";
-const VERSION: u8 = 3;
+const VERSION: u8 = 1;
 const PREFIX: usize = 106;
 const MAX_CONTROL: usize = 4096;
 const CHANNEL_DEPTH: usize = 128;
@@ -121,7 +121,7 @@ pub(crate) mod control_wire {
     impl Frame {
         pub(crate) fn encode(self, out: &mut [u8]) {
             out[..HEADER].fill(0);
-            out[..4].copy_from_slice(b"RCR4");
+            out[..4].copy_from_slice(b"RCR1");
             out[4] = self.kind;
             out[8..24].copy_from_slice(&self.session);
             out[24..32].copy_from_slice(&self.request.to_be_bytes());
@@ -134,7 +134,7 @@ pub(crate) mod control_wire {
         }
         pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
             if bytes.len() < HEADER
-                || &bytes[..4] != b"RCR4"
+                || &bytes[..4] != b"RCR1"
                 || bytes[5..8]
                     .iter()
                     .chain(&bytes[90..HEADER])
@@ -243,7 +243,7 @@ impl Offer {
         v
     }
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() < 76 || u32::from_be_bytes(field(bytes, 0)) != 2 {
+        if bytes.len() < 76 || u32::from_be_bytes(field(bytes, 0)) != 1 {
             return Err(invalid("invalid RDMA offer"));
         }
         let len = u16::from_be_bytes(field(bytes, 74)) as usize;
@@ -251,7 +251,7 @@ impl Offer {
             return Err(invalid("invalid RDMA offer length"));
         }
         let offer = Self {
-            version: 2,
+            version: 1,
             nonce: field(bytes, 4),
             challenge: field(bytes, 20),
             fabric: String::from_utf8(bytes[76..].to_vec())

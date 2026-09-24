@@ -151,7 +151,7 @@ fn colocated_positions_share_only_normalized_candidate_scope() {
     let volume = &mut config.volumes[0];
     volume.peers = vec!["p2".into(), "p3".into()];
     volume.topology = Some(crate::control::proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 8,
         local_slots: vec![0, 1],
@@ -183,7 +183,7 @@ fn colocated_positions_share_only_normalized_candidate_scope() {
         ..Provider::new(Backend::new("127.0.0.1:1", "test-origin").unwrap())
     };
     let first = provider.network_scope([1; 32]).unwrap();
-    assert_eq!(first.version, 6);
+    assert_eq!(first.version, 1);
     let state = provider.active.as_ref().unwrap().clone();
     state.borrow_mut().cursor.position = 1;
     assert_eq!(first, provider.network_scope([1; 32]).unwrap());
@@ -718,11 +718,11 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
             if peer {
                 fields.push((
                     "X-Racer-Fault".to_owned(),
-                    hex(b"RF04\x88\x13\0\0RF08\0/pinned").into_bytes(),
+                    hex(b"RB01\x88\x13\0\0RD01\0/pinned").into_bytes(),
                 ));
                 fields.push(("X-Racer-Volume".to_owned(), b"test-volume".to_vec()));
                 let binding = crate::authorization::binding(
-                    b"RF04\x88\x13\0\0RF08\0/pinned",
+                    b"RB01\x88\x13\0\0RD01\0/pinned",
                     &Default::default(),
                 );
                 fields.push((

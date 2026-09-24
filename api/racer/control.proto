@@ -71,7 +71,7 @@ message Configuration {
   }
 }
 
-// Full independently applicable desired state on /v4/config. Cursor acknowledges
+// Full independently applicable desired state on /v1/config. Cursor acknowledges
 // receipt, not successful local preparation or application.
 message DesiredState {
   bytes universe = 1;

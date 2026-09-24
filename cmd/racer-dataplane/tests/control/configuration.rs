@@ -32,11 +32,11 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     let routing = volume.routing.clone();
     let (_, cursor) = routing.next(&routing.start(&target)).unwrap().unwrap();
     let wire = |cursor: &crate::routing::Cursor| {
-        let mut bytes = b"RF04".to_vec();
+        let mut bytes = b"RB01".to_vec();
         bytes.extend(5000u32.to_le_bytes());
         bytes.extend(cursor.algorithm.magic());
         bytes.extend(cursor.encode());
-        bytes.extend(b"RF08\0");
+        bytes.extend(b"RD01\0");
         bytes.extend(target.as_bytes());
         let bytes = crate::cache::peer_wire::with_chain(
             bytes,
@@ -48,7 +48,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
         .unwrap();
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    c.reload(1, Some(3));
+    c.reload(1, Some(1));
     let result = c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&cursor))]);
     assert_eq!(result.0, 200);
     assert_eq!(result.1.len(), crate::cache::METADATA_SIZE);
@@ -63,7 +63,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
             .0,
         200
     );
-    let unknown = wire(&cursor).replacen("52463038", "52463039", 1);
+    let unknown = wire(&cursor).replacen("52443031", "52443032", 1);
     assert_eq!(c.get_headers(1, "/", &[("X-Racer-Fault", &unknown)]).0, 409);
     for (field, status) in [("position", 400), ("identity", 200), ("attempt", 400)] {
         let mut bad = current_cursor.clone();
@@ -116,7 +116,7 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
                 }],
             }),
             topology: Some(proto::Topology {
-                routing_algorithm: None,
+                routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,
                 local_slots: vec![0],
@@ -237,7 +237,7 @@ pub(crate) fn runtime_pair(
     config.peers[0].fabric = config.fabric.clone();
     config.peers[0].http_address = remote.to_string();
     config.volumes[0].topology = Some(proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
         local_slots: vec![if node == 2 { 0 } else { 1 }],
@@ -287,7 +287,7 @@ fn protojson_wire_and_complete_replacement() {
         snapshot.epoch = epoch;
         let wire = envelope(snapshot);
         let json = serde_json::to_string(&wire).unwrap();
-        // The legacy fixture omits snapshot.epoch (topology has its own).
+        // ProtoJSON omits a zero snapshot epoch (topology has its own).
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["snapshot"].get("epoch").is_some(), epoch != 0);
         let decoded = serde_json::from_str::<proto::Configuration>(&json).unwrap();
@@ -316,10 +316,7 @@ fn protojson_wire_and_complete_replacement() {
             proto::Configuration::decode(encoded.encode_to_vec().as_slice()).unwrap(),
             encoded
         );
-        assert_eq!(
-            trust.prepare(encoded).is_ok(),
-            matches!(algorithm, None | Some(3))
-        );
+        assert_eq!(trust.prepare(encoded).is_ok(), algorithm == Some(1));
     }
     let updates = Updates::default();
     updates.publish(trust.prepare(wire).unwrap()).unwrap();
@@ -410,7 +407,7 @@ fn topology_validation_and_reload_are_atomic() {
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().epoch = 0,
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().slot_count = 0,
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(0),
-        |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(1),
+        |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(3),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(2),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().local_slots.push(0),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors.clear(),
@@ -650,7 +647,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
         slot_count: MAX_SLOTS,
         local_slots: (0..MAX_SLOTS).collect(),
         neighbors: vec![],
-        routing_algorithm: Some(3),
+        routing_algorithm: Some(1),
     });
     let start = Instant::now();
     let prepared = trust.prepare(envelope(snapshot.clone())).unwrap();
@@ -679,7 +676,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
                 peer: peer.clone(),
             })
             .collect(),
-        routing_algorithm: Some(3),
+        routing_algorithm: Some(1),
     });
     trust.prepare(envelope(snapshot.clone())).unwrap();
     snapshot.volumes[0]
@@ -869,7 +866,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     snapshot.volumes[0].peers = vec![second.id.clone(), "alias".into(), first.clone()];
     snapshot.volumes[0].topology = Some(proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 27,
         local_slots: vec![1],
@@ -894,7 +891,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     volume.origin_socket = "/dev/racer/second/origin".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 1,
         slot_count: 2,
         local_slots: vec![0],
@@ -948,7 +945,7 @@ fn rdma_capabilities_pin_original_policy_and_do_not_survive_removal_in_new_gener
     next.peers.clear();
     next.volumes[0].peers.clear();
     next.volumes[0].topology = Some(proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,
         local_slots: vec![0, 1],
@@ -1585,7 +1582,7 @@ mod subscriber_tests {
             let updates = Arc::new(Updates::default());
             updates.set_credentials(self.provider.clone());
             let subscriber = Subscriber::start_with_first_byte_timeout(
-                Source::parse(&format!("https://{}/v4/config", self.address)).unwrap(),
+                Source::parse(&format!("https://{}/v1/config", self.address)).unwrap(),
                 Arc::new(Trust {
                     universe: trust.universe,
                     node: trust.node,

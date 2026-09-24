@@ -468,7 +468,7 @@ async fn connect(
     )
 }
 async fn send(stream: &mut TlsClient, boot: &str, cursor: &str, progress: &ClientProgress) {
-    progress.bounded(3,4,stream.write_all(format!("GET /v4/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nContent-Length: 0\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nX-Racer-Cursor: {cursor}\r\nX-Racer-Applied-Revision: 0\r\nX-Racer-Local-State: failed\r\n\r\n").as_bytes())).await.unwrap();
+    progress.bounded(3,4,stream.write_all(format!("GET /v1/config HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nContent-Length: 0\r\nX-Racer-Boot: {boot}\r\nX-Racer-Profile: 1\r\nX-Racer-Cursor: {cursor}\r\nX-Racer-Applied-Revision: 0\r\nX-Racer-Local-State: failed\r\n\r\n").as_bytes())).await.unwrap();
 }
 async fn receive(
     stream: &mut TlsClient,
@@ -718,7 +718,7 @@ async fn scenario(
     let roots = Arc::new(roots);
     let image = StateImage {
         metadata: serde_json::to_vec(&json!({
-            "version": 5, "namespace": "system", "fence": "scale", "generation": 1,
+            "version": 1, "namespace": "system", "fence": "scale", "generation": 1,
             "active": ca.digest, "phase": "stable", "authorities": [ca],
             "rotation_nonce": "", "published_at": null, "overlap_delay": 60,
             "retirement_skew": 60

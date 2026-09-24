@@ -478,7 +478,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v4/config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/config", func(w http.ResponseWriter, r *http.Request) {
 		node := authenticatedNode(r)
 		if node == "" {
 			http.Error(w, "client certificate required", http.StatusForbidden)
@@ -524,7 +524,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		_, _ = w.Write(body)
 	})
-	mux.HandleFunc("POST /v3/enroll", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/enroll", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			CSR       string `json:"csr"`
 			Namespace string `json:"pod_namespace"`
@@ -572,7 +572,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"certificate": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf})), "generation": bundle.Generation, "issuer": bundle.Active})
 	})
-	mux.HandleFunc("POST /v3/proof", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/proof", func(w http.ResponseWriter, r *http.Request) {
 		if authenticatedNode(r) == "" {
 			http.Error(w, "client certificate required", http.StatusForbidden)
 			return
@@ -589,7 +589,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 
 	result := make([][]string, nodes)
 	for i := range result {
-		result[i] = []string{"RACER_CONTROL_PLANE_URL=" + server.URL + "/v4/config", "RACER_TLS_TRUST_DIR=" + f.dir, "RACER_ENROLL_URL=" + server.URL + "/v3/enroll", "RACER_CONTROL_SERVER_NAME=racer-controlplane.gantry-e2e.svc", "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(f.dir, "token"), "RACER_POD_NAMESPACE=gantry-e2e", fmt.Sprintf("RACER_POD_NAME=node%d", i), fmt.Sprintf("RACER_POD_UID=pod%d", i)}
+		result[i] = []string{"RACER_CONTROL_PLANE_URL=" + server.URL + "/v1/config", "RACER_TLS_TRUST_DIR=" + f.dir, "RACER_ENROLL_URL=" + server.URL + "/v1/enroll", "RACER_CONTROL_SERVER_NAME=racer-controlplane.gantry-e2e.svc", "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(f.dir, "token"), "RACER_POD_NAMESPACE=gantry-e2e", fmt.Sprintf("RACER_POD_NAME=node%d", i), fmt.Sprintf("RACER_POD_UID=pod%d", i)}
 	}
 
 	return result

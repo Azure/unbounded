@@ -144,7 +144,7 @@ func TestEnrollmentAndControl(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			status, data, _ := request(client, "POST", "/v3/enroll", body, map[string]string{"Authorization": "Bearer " + tc.token, "X-Racer-Boot": tc.boot})
+			status, data, _ := request(client, "POST", "/v1/enroll", body, map[string]string{"Authorization": "Bearer " + tc.token, "X-Racer-Boot": tc.boot})
 			if status != tc.want {
 				t.Fatalf("status %d: %s", status, data)
 			}
@@ -165,8 +165,8 @@ func TestEnrollmentAndControl(t *testing.T) {
 		})
 	}
 
-	path := "/v4/config"
-	for _, endpoint := range []struct{ method, path string }{{"GET", path}, {"POST", "/v3/proof"}} {
+	path := "/v1/config"
+	for _, endpoint := range []struct{ method, path string }{{"GET", path}, {"POST", "/v1/proof"}} {
 		status, _, _ := request(client, endpoint.method, endpoint.path, nil, nil)
 		if status != http.StatusForbidden {
 			t.Fatalf("unauthenticated %s: %d", endpoint.path, status)
@@ -179,7 +179,7 @@ func TestEnrollmentAndControl(t *testing.T) {
 	defer mtls.CloseIdleConnections()
 
 	client = &http.Client{Transport: mtls, Timeout: 5 * time.Second}
-	for _, path := range []string{"/v4/config?universe=" + strings.Repeat("04", 32), "/v4/config?node=" + strings.Repeat("04", 32)} {
+	for _, path := range []string{"/v1/config?universe=" + strings.Repeat("04", 32), "/v1/config?node=" + strings.Repeat("04", 32)} {
 		status, _, _ := request(client, "GET", path, nil, nil)
 		if status != http.StatusForbidden {
 			t.Fatalf("cross-identity control: %d", status)
@@ -227,7 +227,7 @@ func TestEnrollmentAndControl(t *testing.T) {
 	writeConfig()
 	checkCommand(headers)
 
-	status, _, _ := request(client, "POST", "/v3/proof", nil, nil)
+	status, _, _ := request(client, "POST", "/v1/proof", nil, nil)
 	if status != http.StatusNoContent {
 		t.Fatalf("authenticated proof: %d", status)
 	}

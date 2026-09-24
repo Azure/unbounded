@@ -883,11 +883,11 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
         .find(|t| routing.start(t).owner == 0)
         .unwrap();
     let cursor = routing.start(&target);
-    let mut bytes = b"RF04".to_vec();
+    let mut bytes = b"RB01".to_vec();
     bytes.extend(5000u32.to_le_bytes());
     bytes.extend(cursor.algorithm.magic());
     bytes.extend(cursor.encode());
-    bytes.extend(b"RF08\0");
+    bytes.extend(b"RD01\0");
     bytes.extend(target.as_bytes());
     let volume = &config.volumes[0];
     let backend = crate::handlers::Backend::unix(&volume.origin_socket, &volume.id).unwrap();

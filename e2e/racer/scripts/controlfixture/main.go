@@ -307,9 +307,9 @@ func (f *fixture) control(w http.ResponseWriter, req *http.Request) {
 
 func (f *fixture) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v3/enroll", f.enroll)
-	mux.HandleFunc("GET /v4/config", f.control)
-	mux.HandleFunc("POST /v3/proof", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/enroll", f.enroll)
+	mux.HandleFunc("GET /v1/config", f.control)
+	mux.HandleFunc("POST /v1/proof", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := f.authenticated(r); err != nil {
 			http.Error(w, "unauthorized proof", http.StatusForbidden)
 			return

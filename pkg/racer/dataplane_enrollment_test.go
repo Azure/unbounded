@@ -159,7 +159,7 @@ func TestDataplaneEnrollment(t *testing.T) {
 	mtlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: mtlsConfig}, Timeout: 5 * time.Second}
 	t.Cleanup(mtlsClient.CloseIdleConnections)
 
-	for _, endpoint := range []struct{ method, path string }{{http.MethodGet, "/v4/config"}, {http.MethodPost, "/v3/proof"}} {
+	for _, endpoint := range []struct{ method, path string }{{http.MethodGet, "/v1/config"}, {http.MethodPost, "/v1/proof"}} {
 		for _, tc := range []struct {
 			name   string
 			client *http.Client
@@ -171,7 +171,7 @@ func TestDataplaneEnrollment(t *testing.T) {
 			{"authorized", mtlsClient, boot},
 		} {
 			t.Run(endpoint.path+"/"+tc.name, func(t *testing.T) {
-				r, err := http.NewRequest(endpoint.method, strings.TrimSuffix(env["RACER_ENROLL_URL"], "/v3/enroll")+endpoint.path, nil)
+				r, err := http.NewRequest(endpoint.method, strings.TrimSuffix(env["RACER_ENROLL_URL"], "/v1/enroll")+endpoint.path, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -187,7 +187,7 @@ func TestDataplaneEnrollment(t *testing.T) {
 				want := http.StatusForbidden
 				if tc.name == "authorized" {
 					want = http.StatusNoContent
-					if endpoint.path == "/v4/config" {
+					if endpoint.path == "/v1/config" {
 						// Authentication succeeds, but this test has no configuration.
 						want = http.StatusServiceUnavailable
 					}

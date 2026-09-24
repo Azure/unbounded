@@ -53,7 +53,7 @@ impl Authorization {
 /// credentials from the descriptor; the nonce is supplied by the HTTP adapter.
 pub(crate) fn binding(descriptor: &[u8], auth: &Authorization) -> blake3::Hash {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"racer/request-binding/v2");
+    hash.update(b"racer/request-binding/v1");
     hash.update(&(descriptor.len() as u32).to_le_bytes());
     hash.update(descriptor);
     let value = auth.as_str().unwrap_or("");
@@ -62,7 +62,7 @@ pub(crate) fn binding(descriptor: &[u8], auth: &Authorization) -> blake3::Hash {
     hash.finalize()
 }
 
-/// RF07 is only carried inside the encrypted TLS RDMA control channel.
+/// RA01 is only carried inside the encrypted TLS RDMA control channel.
 pub(crate) fn rdma_envelope(descriptor: &[u8], auth: &Authorization) -> Option<Vec<u8>> {
     let value = auth.as_str().unwrap_or("");
     if descriptor.len() > crate::cache::MAX_PEER_INPUT
@@ -70,7 +70,7 @@ pub(crate) fn rdma_envelope(descriptor: &[u8], auth: &Authorization) -> Option<V
     {
         return None;
     }
-    let mut out = b"RF07".to_vec();
+    let mut out = b"RA01".to_vec();
     out.extend((descriptor.len() as u16).to_le_bytes());
     out.extend((value.len() as u16).to_le_bytes());
     out.extend(descriptor);
@@ -78,7 +78,7 @@ pub(crate) fn rdma_envelope(descriptor: &[u8], auth: &Authorization) -> Option<V
     Some(out)
 }
 pub(crate) fn rdma_decode(bytes: &[u8]) -> io::Result<(&[u8], Authorization)> {
-    if bytes.len() < 8 || bytes.len() > crate::rdma::MAX_METADATA || &bytes[..4] != b"RF07" {
+    if bytes.len() < 8 || bytes.len() > crate::rdma::MAX_METADATA || &bytes[..4] != b"RA01" {
         return Err(crate::http::protocol("invalid request envelope"));
     }
     let d = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;

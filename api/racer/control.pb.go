@@ -701,7 +701,7 @@ type Configuration_Snapshot struct {
 
 func (*Configuration_Snapshot) isConfiguration_Contents() {}
 
-// Full independently applicable desired state on /v4/config. Cursor acknowledges
+// Full independently applicable desired state on /v1/config. Cursor acknowledges
 // receipt, not successful local preparation or application.
 type DesiredState struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`

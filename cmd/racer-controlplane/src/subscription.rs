@@ -94,7 +94,7 @@ impl Subscriptions {
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v4/config", get(config))
+            .route("/v1/config", get(config))
             .with_state(self.clone())
     }
 

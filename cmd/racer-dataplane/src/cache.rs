@@ -371,7 +371,7 @@ impl Namespace {
     /// Routing epochs and resolved socket addresses are not cache identities.
     pub fn volume(universe: &[u8], volume: &str, generation: u64, backend: Self) -> Self {
         Self(digest(
-            b"racer-volume-v5",
+            b"racer-volume-v1",
             &[
                 universe,
                 volume.as_bytes(),

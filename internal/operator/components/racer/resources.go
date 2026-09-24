@@ -226,17 +226,17 @@ func dataplaneDaemonSet(namespace string, cfg component.Config) *appsv1.DaemonSe
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
 			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
-			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v4/config"`,
+			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v1/config"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},
 		SecurityContext: securityContext(false), Resources: dataplaneResources(false),
 		Env: append(podIdentityEnv(), []corev1.EnvVar{
 			{Name: "RACER_CONTROL_TOKEN_FILE", Value: "/var/run/racer-control/token"},
 			{Name: "RACER_TLS_TRUST_DIR", Value: "/var/run/racer-trust"},
-			{Name: "RACER_ENROLL_URL", Value: "https://racer-controlplane." + namespace + ".svc:8444/v3/enroll"},
+			{Name: "RACER_ENROLL_URL", Value: "https://racer-controlplane." + namespace + ".svc:8444/v1/enroll"},
 			{Name: "RACER_CONTROL_SERVER_NAME", Value: "racer-controlplane." + namespace + ".svc"},
 			fieldEnv("RACER_POD_IP", "status.podIP"),
-			{Name: "RACER_SLAB_PATH", Value: "/cache/cache-v5.slab"},
+			{Name: "RACER_SLAB_PATH", Value: "/cache/cache-v1.slab"},
 			// Creation defaults only. TLS-authenticated storage policy owns subsequent capacity;
 			// persisted geometry wins on restart. Keep the execution cap at one even
 			// when automatic runtime storage planning creates hundreds of shards.

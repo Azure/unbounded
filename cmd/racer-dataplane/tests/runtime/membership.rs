@@ -143,7 +143,7 @@ fn compiler_snapshots_http_and_rdma() {
     assert!(br.next(&rebased).unwrap().is_none());
     let mut inner = cursor.algorithm.magic().to_vec();
     inner.extend(cursor.encode());
-    inner.extend(b"RF08\0");
+    inner.extend(b"RD01\0");
     inner.extend(target.as_bytes());
     let wire = peer_wire::with_chain(
         peer_wire::with_budget(inner, Duration::from_secs(5)).unwrap(),

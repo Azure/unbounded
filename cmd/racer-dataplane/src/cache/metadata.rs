@@ -4,7 +4,7 @@
 //! Bounded peer descriptors and HTTP metadata/page fact parsing.
 use super::*;
 
-/// Transport-independent RF08 metadata descriptors and bounded hexadecimal framing.
+/// Transport-independent RD01 metadata descriptors and bounded hexadecimal framing.
 pub(crate) mod peer_wire {
     use super::{Checksum, PeerDescriptor, PeerPage, UpstreamRequest};
     use std::{io, time::Duration};
@@ -15,15 +15,15 @@ pub(crate) mod peer_wire {
     pub(crate) const MAX_WORK: u8 = 255;
     pub(crate) const CHAIN_LEN: usize = 42;
 
-    /// RF06 binds immutable storage namespace and affine forwarding allowances.
+    /// RC01 binds immutable storage namespace and affine forwarding allowances.
     pub(crate) fn chain(bytes: &[u8]) -> io::Result<Option<([u8; 32], u8, u8, u32)>> {
-        if !bytes.starts_with(b"RF06") {
+        if !bytes.starts_with(b"RC01") {
             return Ok(None);
         }
         if bytes.len() < CHAIN_LEN + 14
             || bytes.len() > MAX_DESCRIPTOR
             || bytes[36] > MAX_HOPS
-            || !bytes[CHAIN_LEN..].starts_with(b"RF04")
+            || !bytes[CHAIN_LEN..].starts_with(b"RB01")
         {
             return Err(invalid("invalid request chain"));
         }
@@ -41,7 +41,7 @@ pub(crate) mod peer_wire {
         work: u8,
         candidate: u32,
     ) -> io::Result<Vec<u8>> {
-        let mut out = b"RF06".to_vec();
+        let mut out = b"RC01".to_vec();
         out.extend(namespace);
         out.extend([hops, work]);
         out.extend(candidate.to_le_bytes());
@@ -58,7 +58,7 @@ pub(crate) mod peer_wire {
                 "peer budget exhausted",
             ));
         }
-        let mut out = b"RF04".to_vec();
+        let mut out = b"RB01".to_vec();
         out.extend(ms.to_le_bytes());
         out.extend(bytes);
         if out.len() > MAX_DESCRIPTOR {
@@ -66,7 +66,7 @@ pub(crate) mod peer_wire {
         }
         Ok(out)
     }
-    /// Exact RF08 plus optional RF06 cursor and RF04 budget size.
+    /// Exact RD01 plus optional RR01 cursor and RB01 budget size.
     pub(crate) fn encoded_len(target: usize, page: bool, routed: bool, budget: bool) -> usize {
         target
             .saturating_add(if page { 311 } else { 5 })
@@ -95,7 +95,7 @@ pub(crate) mod peer_wire {
         };
         Ok(encoded_len(target, page, routed, budget))
     }
-    // RF04 budgets cover RF08/RF06 and are bound by authenticated transports.
+    // RB01 budgets cover RD01/RR01 and are bound by authenticated transports.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
     pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
         let bytes = if chain(bytes)?.is_some() {
@@ -103,14 +103,14 @@ pub(crate) mod peer_wire {
         } else {
             bytes
         };
-        if !bytes.starts_with(b"RF04") {
+        if !bytes.starts_with(b"RB01") {
             return Err(invalid("missing peer budget descriptor"));
         }
         if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 14 {
             return Err(invalid("short budget descriptor"));
         }
         let ms = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if ms == 0 || bytes[8..].starts_with(b"RF04") {
+        if ms == 0 || bytes[8..].starts_with(b"RB01") {
             return Err(invalid("invalid budget descriptor"));
         }
         Ok((
@@ -122,7 +122,7 @@ pub(crate) mod peer_wire {
         bytes: &[u8],
     ) -> super::Result<(Option<crate::routing::Cursor>, PeerDescriptor<'_>)> {
         let (bytes, _) = budget_descriptor(bytes)?;
-        if bytes.starts_with(b"RF06") {
+        if bytes.starts_with(b"RR01") {
             if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + crate::routing::Cursor::LEN {
                 return Err(invalid("short routed descriptor").into());
             }
@@ -142,7 +142,7 @@ pub(crate) mod peer_wire {
         if request_len(request, false, false)? > MAX_DESCRIPTOR {
             return Err(invalid("fault descriptor too large"));
         }
-        let mut out = Vec::from(b"RF08".as_slice());
+        let mut out = Vec::from(b"RD01".as_slice());
         let target = match request {
             UpstreamRequest::PeerMetadata(meta) => {
                 out.push(0);
@@ -167,7 +167,7 @@ pub(crate) mod peer_wire {
         Ok(out)
     }
     pub(crate) fn decode_descriptor(bytes: &[u8]) -> super::Result<PeerDescriptor<'_>> {
-        if bytes.len() < 6 || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"RF08" {
+        if bytes.len() < 6 || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"RD01" {
             return Err(invalid("invalid fault descriptor").into());
         }
         let utf8 = |bytes| std::str::from_utf8(bytes).map_err(|_| invalid("non-UTF8 descriptor"));

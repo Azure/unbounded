@@ -11,7 +11,7 @@ use crate::{Error, Result};
 
 pub const SLOT_COUNT: u32 = 262_144;
 /// Canonical placement with 64MiB page striping, matching the dataplane.
-pub const ROUTING_ALGORITHM: u32 = 3;
+pub const ROUTING_ALGORITHM: u32 = 1;
 pub const GENERATION_FORMAT: u32 = 1;
 pub const SOCKET_ROOT: &str = "/dev/racer";
 

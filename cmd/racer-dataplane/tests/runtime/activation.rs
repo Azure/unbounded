@@ -441,7 +441,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let source = Source::parse(&format!(
-        "https://{}/v4/config",
+        "https://{}/v1/config",
         listener.local_addr().unwrap()
     ))
     .unwrap();

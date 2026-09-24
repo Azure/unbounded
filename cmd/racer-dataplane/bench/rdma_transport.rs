@@ -37,7 +37,7 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
                 }],
             }),
             topology: Some(proto::Topology {
-                routing_algorithm: None,
+                routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 2,
                 local_slots: vec![if o.server { 0 } else { 1 }],

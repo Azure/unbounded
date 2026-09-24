@@ -116,7 +116,7 @@ func TestShippingMTLS(t *testing.T) {
 	c := p.Containers[0]
 
 	for key, want := range map[string]string{
-		"RACER_ENROLL_URL":          "https://racer-controlplane.custom-system.svc:8444/v3/enroll",
+		"RACER_ENROLL_URL":          "https://racer-controlplane.custom-system.svc:8444/v1/enroll",
 		"RACER_CONTROL_SERVER_NAME": "racer-controlplane.custom-system.svc",
 		"RACER_CONTROL_TOKEN_FILE":  "/var/run/racer-control/token",
 	} {
@@ -414,7 +414,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("unexpected host namespaces")
 	}
 
-	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache-v5.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
+	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache-v1.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
 		if envValues(c)[name] != value {
 			t.Fatalf("profile setting drift: %s", name)
 		}
@@ -427,7 +427,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		". /bootstrap/identity",
 		"chgrp 65532 /dev/racer",
 		"chmod 2770 /dev/racer",
-		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v4/config"`,
+		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v1/config"`,
 		"exec /usr/local/bin/racer-dataplane",
 	}, "\n")
 	if command != wantCommand || strings.Join(c.Command, " ") != "/bin/sh -ec" {

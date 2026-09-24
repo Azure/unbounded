@@ -247,8 +247,7 @@ impl TlsSnapshot {
             let peer = peer.context("missing mutual TLS identity")?;
             let message = read_http_head(&mut stream).await?;
             ensure!(
-                message.start == "POST /v3/proof HTTP/1.1"
-                    || message.start == "POST /v4/proof HTTP/1.1",
+                message.start == "POST /v1/proof HTTP/1.1",
                 "invalid proof request"
             );
             ensure!(
@@ -312,7 +311,7 @@ impl TlsSnapshot {
                 && peer.identity().boot_id == expected.boot_id, "not the expected CP server identity");
             let session = conn.export_keying_material([0u8; 32], b"racer-ca-proof/v1", Some(self.bundle.digest().as_bytes()))?;
             let at = unix_now();
-            stream.write_all(format!("GET /v3/replica-proof HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            stream.write_all(format!("GET /v1/replica-proof HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
             let message = read_http_head(&mut stream).await?;
             ensure!(message.start == "HTTP/1.1 200 OK", "replica proof HTTP status rejected");
             let length = message.content_length()?;
@@ -346,7 +345,7 @@ pub struct ReplicaAcknowledgment {
 }
 
 /// Response for a warm replica's installed process-local state. Call after
-/// validating GET /v3/replica-proof on its proof listener, even on followers.
+/// validating GET /v1/replica-proof on its proof listener, even on followers.
 pub async fn write_replica_ack<W: AsyncWrite + Unpin>(
     stream: &mut W,
     ack: &ReplicaAcknowledgment,

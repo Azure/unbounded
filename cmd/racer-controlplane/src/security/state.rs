@@ -96,7 +96,7 @@ impl CaState {
         );
         let state: Self = serde_json::from_slice(&image.metadata)?;
         ensure!(
-            state.version == 5
+            state.version == 1
                 && !state.fence.is_empty()
                 && state.fence.len() <= 256
                 && state.generation > 0
@@ -337,7 +337,7 @@ impl<S: CaStore> CaManager<S> {
             let ca =
                 Authority::generate(now, manager.options.ca_lifetime, manager.options.clock_skew)?;
             CaState {
-                version: 5,
+                version: 1,
                 namespace: manager.options.namespace.clone(),
                 fence: manager.term.token.clone(),
                 generation: 1,

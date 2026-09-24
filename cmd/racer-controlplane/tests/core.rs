@@ -320,7 +320,7 @@ fn snapshots_match_an_independent_directed_graph_and_volume_scopes() {
                 }
                 let actual_top = actual.topology.as_ref().unwrap();
                 assert_eq!(actual_top.epoch, 7);
-                assert_eq!(actual_top.routing_algorithm, Some(3));
+                assert_eq!(actual_top.routing_algorithm, Some(1));
                 assert_eq!(
                     actual_top
                         .neighbors
@@ -418,7 +418,7 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
 fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
     let input = inventory(1);
     let compiled = compile(&input, None).unwrap();
-    assert_eq!(compiled.volumes[0].routing_algorithm, 3);
+    assert_eq!(compiled.volumes[0].routing_algorithm, 1);
     let mut publication = Publication::<Generation>::default();
     publication.publish(compiled, 1).unwrap();
     // Serialization remains a wire/fixture contract, not restart authority.
@@ -437,10 +437,10 @@ fn page_striping_algorithm_survives_compile_persistence_and_wire_publication() {
             .as_ref()
             .unwrap()
             .routing_algorithm,
-        Some(3)
+        Some(1)
     );
     // Old object routing must not be served to a page-striped dataplane.
-    for algorithm in [0, 1, 2, 4, u32::MAX] {
+    for algorithm in [0, 2, 3, 4, u32::MAX] {
         let mut invalid = loaded.clone();
         invalid.volumes[0].routing_algorithm = algorithm;
         assert!(Topology::new(&invalid).is_err(), "algorithm {algorithm}");

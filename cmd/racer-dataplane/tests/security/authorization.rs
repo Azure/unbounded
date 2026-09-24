@@ -36,7 +36,7 @@ fn exact_limit_opaque_credentials_and_keyed_isolation() {
 
 #[test]
 fn rdma_exact_envelope_threshold_and_multihop_forwarding() {
-    let descriptor = b"RF04\xe8\x03\0\0RF08\0/object";
+    let descriptor = b"RB01\xe8\x03\0\0RD01\0/object";
     let max = crate::rdma::MAX_METADATA - 8 - descriptor.len();
     for n in [0, 1, max - 1, max, max + 1, MAX_AUTHORIZATION] {
         let auth = if n == 0 {

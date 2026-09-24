@@ -52,7 +52,7 @@ mod tests {
     fn metadata_and_pages_have_independent_stable_owner_chains() {
         use crate::cache::{Namespace, PeerDescriptor, PeerPage};
         use crate::metadata::Checksum;
-        let mut r = routing(257, &[0], None);
+        let mut r = routing(257, &[0], Some(1));
         let namespace = Namespace::new("striping-test").unwrap();
         let size = crate::buffers::BUFFER_SIZE as u64;
         let metadata = PeerDescriptor::metadata("/large?exact=%2f")
@@ -80,7 +80,7 @@ mod tests {
         assert!(!keys.contains(&metadata));
         // A different placement must rebase each page using its own key,
         // preserving the bounded candidate attempt rather than metadata's owner.
-        let mut next = routing(263, &[0], None);
+        let mut next = routing(263, &[0], Some(1));
         next.identity[0] ^= 1;
         for key in std::iter::once(&metadata).chain(&keys) {
             let mut cursor = r.start_key(key);
@@ -128,7 +128,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // Independent hashing allows collisions; it does not reserve a slot per page.
-        let one = routing(1, &[0], None);
+        let one = routing(1, &[0], Some(1));
         assert!(
             keys.iter()
                 .all(|key| one.start_key(key).owner == one.start_key(&metadata).owner)
@@ -138,8 +138,8 @@ mod tests {
     #[test]
     fn canonical_effective_slots_prevent_colocated_cross_dependencies() {
         use crate::buffers::{NetworkDependency, NetworkFlightKey, NetworkProgress};
-        let a = routing(5, &[0, 4], None);
-        let b = routing(5, &[2, 3], None);
+        let a = routing(5, &[0, 4], Some(1));
+        let b = routing(5, &[2, 3], Some(1));
         // Two physical hosts have crossing dependencies, even though logical
         // ranks strictly decrease: A4 -> B3 -> owner, B2 -> A0 -> owner.
         let a4 = cursor(&a, 4, 1, 0);
@@ -200,7 +200,7 @@ mod tests {
         }
         // A non-contiguous local shortcut (0 -> 1 -> 3 -> 7) normalizes to
         // slot 3, whose suffix is identical to direct ingress at slot 3.
-        let r = routing(8, &[0, 3], None);
+        let r = routing(8, &[0, 3], Some(1));
         let c = cursor(&r, 0, 7, 0);
         assert_eq!(r.normalized_position(&c).unwrap(), 2);
         assert!(r.compatible(&c, &cursor(&r, 3, 7, 0)));
@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn canonical_wire_identity_and_dependency_context() {
-        let new = routing(8, &[1, 2], None);
-        let explicit = routing(8, &[1, 2], Some(3));
+        let new = routing(8, &[1, 2], Some(1));
+        let explicit = routing(8, &[1, 2], Some(1));
         assert_eq!(new.identity, explicit.identity);
         // Both generations can have live producers for the same stored value,
         // destination and effective local slot in one NUMA registry.

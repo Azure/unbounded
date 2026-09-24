@@ -27,7 +27,7 @@ pub(crate) mod tests {
         config.peers[0].fabric = config.fabric.clone();
         config.volumes[0].peers = vec![config.peers[0].id.clone()];
         config.volumes[0].topology = Some(proto::Topology {
-            routing_algorithm: None,
+            routing_algorithm: Some(1),
             epoch: 1,
             slot_count: 2,
             local_slots: vec![if node == 2 { 0 } else { 1 }],
@@ -54,7 +54,7 @@ pub(crate) mod tests {
         fabric: &str,
     ) -> Offer {
         Offer {
-            version: 2,
+            version: 1,
             nonce: [nonce; 16],
             challenge,
             rail,
@@ -336,7 +336,7 @@ pub(crate) mod tests {
         for n in 0..bytes.len() {
             assert!(Offer::decode(&bytes[..n]).is_err());
         }
-        for version in [0u32, 1, 3] {
+        for version in [0u32, 2, 3] {
             let mut bad = bytes.clone();
             bad[..4].copy_from_slice(&version.to_be_bytes());
             assert!(Offer::decode(&bad).is_err());

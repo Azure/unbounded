@@ -118,7 +118,7 @@ impl Cluster {
             let (mut trust, _) = fixture();
             trust.node = [node as u8 + 10; 32];
             let mut config =
-                cluster_config(node, &cluster.addresses, backend, None, "topology-test");
+                cluster_config(node, &cluster.addresses, backend, Some(1), "topology-test");
             peer_endpoints(&mut config);
             let prepared = crate::control::tests::prepare_cluster_snapshot(&trust, config);
             let updates = Arc::new(Updates::default());
@@ -320,7 +320,10 @@ fn multiple_pages_stripe_and_refill_on_independent_owner_failure() {
         .map(|n| c.target(7, &format!("multipage-{n}")))
         .find(|target| {
             let owners = owners(target);
-            owners.iter().all(|&o| o > 0 && o < 6)
+            // Losing slot 4 leaves the routes to metadata slot 7 and
+            // successor slot 5 intact. Do not depend on a lucky hash domain.
+            owners[1] == 4
+                && owners.iter().all(|&o| o > 0 && o < 6)
                 && owners
                     .iter()
                     .collect::<std::collections::BTreeSet<_>>()
@@ -618,7 +621,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     config.revision = 2;
     config.volumes[0].peers.clear();
     config.volumes[0].topology = Some(proto::Topology {
-        routing_algorithm: None,
+        routing_algorithm: Some(1),
         epoch: 2,
         slot_count: 2,
         local_slots: vec![0, 1],

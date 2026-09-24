@@ -162,7 +162,7 @@ func (c *campaign) relay(target *atomic.Pointer[replica], endpoint func(*replica
 func (c *campaign) startDataplane(d *dataplane, control, enroll, proof, creationSize string) {
 	t := c.t
 	require(t, os.WriteFile(filepath.Join(d.dir, "token"), []byte(c.token(d.pod)), 0o600))
-	env := []string{"RACER_CONTROL_PLANE_URL=https://" + control + "/v4/config", "RACER_UNIVERSE=" + identity("universe", d.node.Labels["unbounded-cloud.io/site"]), "RACER_NODE=" + identity("node", string(d.node.UID)), "RACER_TLS_TRUST_DIR=" + d.dir, "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(d.dir, "token"), "RACER_ENROLL_URL=https://" + enroll + "/v3/enroll", "RACER_TRUST_PROOF_URL=https://" + proof + "/v3/proof", "RACER_CONTROL_SERVER_NAME=racer-controlplane." + namespace + ".svc", "RACER_POD_NAMESPACE=" + namespace, "RACER_POD_NAME=" + d.pod.Name, "RACER_POD_UID=" + string(d.pod.UID), "RACER_POD_IP=" + d.ip, "RACER_SLAB_PATH=" + filepath.Join(d.dir, "cache.slab"), "RACER_SLAB_SIZE=" + creationSize, "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_RDMA_MODE=disabled", "RACER_METRICS_ADDR=" + d.metrics, "RACER_SLAB_IOPS=100", "RACER_SLAB_IO_BURST=1"}
+	env := []string{"RACER_CONTROL_PLANE_URL=https://" + control + "/v1/config", "RACER_UNIVERSE=" + identity("universe", d.node.Labels["unbounded-cloud.io/site"]), "RACER_NODE=" + identity("node", string(d.node.UID)), "RACER_TLS_TRUST_DIR=" + d.dir, "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(d.dir, "token"), "RACER_ENROLL_URL=https://" + enroll + "/v1/enroll", "RACER_TRUST_PROOF_URL=https://" + proof + "/v1/proof", "RACER_CONTROL_SERVER_NAME=racer-controlplane." + namespace + ".svc", "RACER_POD_NAMESPACE=" + namespace, "RACER_POD_NAME=" + d.pod.Name, "RACER_POD_UID=" + string(d.pod.UID), "RACER_POD_IP=" + d.ip, "RACER_SLAB_PATH=" + filepath.Join(d.dir, "cache.slab"), "RACER_SLAB_SIZE=" + creationSize, "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_RDMA_MODE=disabled", "RACER_METRICS_ADDR=" + d.metrics, "RACER_SLAB_IOPS=100", "RACER_SLAB_IO_BURST=1"}
 	args := []string{"-n", "unshare", "--mount", "sh", "-ec", `mount --make-rprivate /; mount --bind "$1" "$2"; shift 2; exec "$@"`, "racer-live", d.sockets, c.socketRoot, "setpriv", "--reuid", strconv.Itoa(os.Getuid()), "--regid", strconv.Itoa(os.Getgid()), "--clear-groups", "env"}
 	args = append(args, env...)
 	args = append(args, "RACER_HTTP_DIAGNOSTICS=1")
@@ -444,7 +444,7 @@ func TestProductionBinaryCampaign(t *testing.T) {
 	anonymous := &http.Client{Transport: transport, Timeout: 3 * time.Second}
 	defer anonymous.CloseIdleConnections()
 
-	response, err := anonymous.Get("https://" + control + "/v4/config")
+	response, err := anonymous.Get("https://" + control + "/v1/config")
 	if err == nil {
 		response.Body.Close()
 		t.Fatalf("control accepted missing client certificate: %d", response.StatusCode)

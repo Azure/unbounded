@@ -793,7 +793,7 @@ impl Transport {
             return Err(e);
         }
         let offer = Offer {
-            version: 2,
+            version: 1,
             fabric: fabric.to_owned(),
             nonce,
             challenge,

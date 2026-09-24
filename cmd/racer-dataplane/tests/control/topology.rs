@@ -339,7 +339,7 @@ mod placement_tests {
                     }
                 }
             }
-            for algorithm in [None, Some(3)] {
+            for algorithm in [Some(1)] {
                 let mut v = v.clone();
                 v.topology.as_mut().unwrap().routing_algorithm = algorithm;
                 let canonical = Routing::new(&s.universe, &v).unwrap();
@@ -351,7 +351,7 @@ mod placement_tests {
                 .topology
                 .as_mut()
                 .unwrap()
-                .routing_algorithm = Some(1);
+                .routing_algorithm = Some(3);
             assert!(Routing::new(&legacy.universe, &legacy.volumes[0]).is_err());
             assert!(trust(&legacy).prepare(envelope(legacy)).is_err());
             // Exact sparse and endpoint checks apply even to a sole slot owner.
@@ -502,6 +502,7 @@ mod physical_owner_proof {
                 .into_iter()
                 .collect(),
             topology: Some(proto::Topology {
+                routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 8,
                 local_slots: local.to_vec(),
@@ -519,15 +520,15 @@ mod physical_owner_proof {
     }
 
     #[test]
-    fn routing_algorithm_defaults_to_canonical_and_rejects_legacy() {
+    fn routing_algorithm_requires_v1_and_rejects_legacy() {
         let mut v = volume(&[4, 5, 6, 7], &["A", "A", "A", "A", "B", "B", "B", "B"]);
-        let default = Routing::new(&[1; 32], &v).unwrap();
-        assert_eq!(default.algorithm, crate::routing::Algorithm::Canonical);
-        v.topology.as_mut().unwrap().routing_algorithm = Some(3);
+        v.topology.as_mut().unwrap().routing_algorithm = None;
+        assert!(Routing::new(&[1; 32], &v).is_err());
+        v.topology.as_mut().unwrap().routing_algorithm = Some(1);
         let explicit = Routing::new(&[1; 32], &v).unwrap();
-        assert_eq!(explicit.algorithm, default.algorithm);
-        assert_eq!(explicit.identity, default.identity);
-        for algorithm in [0, 1, 2, u32::MAX] {
+        assert_eq!(explicit.algorithm, crate::routing::Algorithm::Canonical);
+        assert_eq!(explicit.algorithm.wire_version(), 1);
+        for algorithm in [0, 2, 3, u32::MAX] {
             v.topology.as_mut().unwrap().routing_algorithm = Some(algorithm);
             let error = Routing::new(&[1; 32], &v).err().unwrap();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -536,7 +537,7 @@ mod physical_owner_proof {
 
     #[test]
     fn b03_sparse_identity_proof_and_conservative_unknowns() {
-        for algorithm in [None, Some(3)] {
+        for algorithm in [Some(1)] {
             let mut v = volume(&[4, 5, 6, 7], &["A", "A", "A", "A", "B", "B", "B", "B"]);
             v.topology.as_mut().unwrap().routing_algorithm = algorithm;
             let r = Routing::new(&[1; 32], &v).unwrap();

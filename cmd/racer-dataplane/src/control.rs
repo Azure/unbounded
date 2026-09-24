@@ -895,9 +895,9 @@ impl Subscriber {
         first_byte_timeout: Duration,
     ) -> io::Result<Self> {
         if let Source::Http { target, .. } = &source
-            && target.split('?').next() != Some("/v4/config")
+            && target.split('?').next() != Some("/v1/config")
         {
-            return Err(invalid("control subscription requires /v4/config"));
+            return Err(invalid("control subscription requires /v1/config"));
         }
         let coordinated = matches!(&source, Source::Http { .. });
         let credentials = updates.credentials();
@@ -1722,17 +1722,17 @@ pub mod routing {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub enum Algorithm {
-        Canonical = 3,
+        Canonical = 1,
     }
     impl Algorithm {
         pub fn wire_version(self) -> u8 {
             match self {
-                Self::Canonical => 6,
+                Self::Canonical => 1,
             }
         }
         pub fn magic(self) -> &'static [u8; 4] {
             match self {
-                Self::Canonical => b"RF06",
+                Self::Canonical => b"RR01",
             }
         }
     }
@@ -1749,14 +1749,14 @@ pub mod routing {
     impl Routing {
         pub fn new(universe: &[u8], volume: &proto::Volume) -> io::Result<Self> {
             let config = volume.topology.clone().unwrap_or(proto::Topology {
-                routing_algorithm: None,
+                routing_algorithm: Some(1),
                 epoch: 1,
                 slot_count: 1,
                 local_slots: vec![0],
                 neighbors: vec![],
             });
-            let algorithm = match config.routing_algorithm.unwrap_or(3) {
-                3 => Algorithm::Canonical,
+            let algorithm = match config.routing_algorithm {
+                Some(1) => Algorithm::Canonical,
                 _ => return Err(invalid()),
             };
             if (volume.topology.is_none() && !volume.peers.is_empty())
@@ -1986,7 +1986,7 @@ pub mod routing {
     }
     impl Cursor {
         pub const LEN: usize = 45;
-        /// Encode the cursor body. The enclosing RF06 magic must
+        /// Encode the cursor body. The enclosing RR01 magic must
         /// be selected from `algorithm`; the body alone is not a wire descriptor.
         pub fn encode(&self) -> Vec<u8> {
             let mut bytes = self.identity.to_vec();
@@ -1996,7 +1996,7 @@ pub mod routing {
             bytes.push(self.position);
             bytes
         }
-        /// Decode a canonical RF06 body.
+        /// Decode a canonical RR01 body.
         pub fn decode(bytes: &[u8]) -> io::Result<Self> {
             Self::decode_algorithm(bytes, Algorithm::Canonical)
         }

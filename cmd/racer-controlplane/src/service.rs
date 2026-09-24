@@ -1655,13 +1655,11 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
     };
     let control = runtime.router();
     let enrollment = Router::new()
-        .route("/v3/enroll", post(enroll))
-        .route("/v4/enroll", post(enroll))
+        .route("/v1/enroll", post(enroll))
         .layer(DefaultBodyLimit::max(32768))
         .with_state(state.clone());
     let replica = Router::new()
-        .route("/v3/replica-proof", get(replica_ack))
-        .route("/v4/replica-proof", get(replica_ack))
+        .route("/v1/replica-proof", get(replica_ack))
         .with_state(shared.clone());
     let health = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))

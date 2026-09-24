@@ -425,7 +425,7 @@ async fn node_proof(
             raw,
         )
         .await?;
-    stream.write_all(format!("POST /v3/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {issuer}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\n\r\n", bundle.generation, bundle.digest()).as_bytes()).await?;
+    stream.write_all(format!("POST /v1/proof HTTP/1.1\r\nHost: racer-controlplane.system.svc\r\nX-Racer-Boot: {boot}\r\nX-Racer-Trust-Generation: {}\r\nX-Racer-Trust-Digest: {}\r\nX-Racer-Certificate-Issuer: {issuer}\r\nX-Racer-Old-Connections: 0\r\nContent-Length: 0\r\n\r\n", bundle.generation, bundle.digest()).as_bytes()).await?;
     task.await?
 }
 
@@ -455,7 +455,7 @@ async fn replica_proof(
             request.push(stream.read_u8().await?);
         }
         ensure!(
-            request.starts_with(b"GET /v3/replica-proof HTTP/1.1"),
+            request.starts_with(b"GET /v1/replica-proof HTTP/1.1"),
             "wrong proof route"
         );
         write_replica_ack(&mut stream, &ack).await

@@ -8,7 +8,7 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RF08/RF06/RF04 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RD01/RR01/RB01 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
