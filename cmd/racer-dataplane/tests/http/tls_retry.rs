@@ -262,7 +262,7 @@ fn cached_peer_tls_abrupt_close_child() {
                     let failure = error
                         .get_ref()
                         .unwrap()
-                        .downcast_ref::<attempt::Failure>()
+                        .downcast_ref::<crate::outcome::Failure>()
                         .unwrap();
                     if cut == "refused" {
                         assert!(failure.owner_evidence());

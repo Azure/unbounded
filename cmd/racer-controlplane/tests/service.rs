@@ -719,7 +719,7 @@ async fn actual_kube_store_cas_uncertain_write_and_takeover() -> Result<()> {
             .is_err()
     );
     let old_image = old_snapshot.image.as_ref().unwrap();
-    assert!(old_image.shards.is_empty());
+    assert!(old_image.metadata.len() <= 16384);
     second.collect().await?;
     assert_eq!(
         fixture
@@ -1252,11 +1252,7 @@ async fn service_replacement_scenario(change: &str) -> Result<()> {
         .decode(secret["data"]["state.json"].as_str().unwrap())
         .unwrap();
     assert!(metadata.len() < 16384);
-    let state = CaState::from_image(&StateImage {
-        metadata,
-        shards: BTreeMap::new(),
-    })
-    .unwrap();
+    let state = CaState::from_image(&StateImage { metadata }).unwrap();
     let certificate =
         openssl::x509::X509::from_pem(response["certificate"].as_str().unwrap().as_bytes())
             .unwrap();
@@ -1414,7 +1410,7 @@ async fn bad_replica_owners_do_not_block_healthy_startup_or_renewal() -> Result<
         initial.active,
         "bad owners cannot block timed rotation"
     );
-    assert!(state.to_image()?.shards.is_empty());
+    assert!(state.to_image()?.metadata.len() <= 16384);
     for name in bad_names {
         assert!(
             replica_response(&fixture, &format!("/api/v1/namespaces/system/pods/{name}")).is_none()
@@ -1572,7 +1568,7 @@ async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation(
         loop {
             let state = participant_state(&client).await?;
             if state.bundle().active != initial.active {
-                assert!(state.to_image()?.shards.is_empty());
+                assert!(state.to_image()?.metadata.len() <= 16384);
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

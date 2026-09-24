@@ -10,7 +10,7 @@
 use std::{fmt, io, net::SocketAddr};
 
 mod classified;
-pub(crate) mod legacy;
+pub(crate) mod io_adapter;
 pub use classified::Classified;
 mod wire;
 

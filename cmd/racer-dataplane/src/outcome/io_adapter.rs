@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compatibility boundary for public io::Result APIs and explicit Error::Io.
+//! Error evidence extraction at io::Result boundaries and explicit Error::Io.
 //! Collect dynamic payloads once, then classify typed facts in the neutral owner.
 //! New internal callers can construct Evidence directly instead of wrapping it.
 
@@ -106,12 +106,4 @@ pub(crate) fn collect<'a>(error: &'a (dyn std::error::Error + 'static)) -> Evide
         _ => PeerReason::Service,
     });
     facts
-}
-#[allow(unused_imports)]
-pub(crate) use super::{
-    attempt_evidence, failure_reason, owner_failure, peer_failure, semantic_failure,
-};
-#[allow(dead_code)] // Retain the historical adapter/test path.
-pub(crate) fn io_error(error: cache::Error) -> io::Error {
-    error.into_io()
 }

@@ -592,9 +592,6 @@ fn site_for_node(node: &DynamicObject) -> String {
         node.labels()
             .get("unbounded-cloud.io/site")
             .map(String::as_str),
-        node.labels()
-            .get("net.unbounded-cloud.io/site")
-            .map(String::as_str),
     )
 }
 fn condition(object: &DynamicObject, kind: &str) -> bool {

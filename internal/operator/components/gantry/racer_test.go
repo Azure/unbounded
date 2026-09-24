@@ -125,6 +125,10 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 			s.Spec.Components.Gantry = &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
 		}},
 		{name: "unassigned node", mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) { delete(n.Labels, racermeta.SiteLabelKey) }},
+		{name: "deprecated-only node", mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) {
+			delete(n.Labels, racermeta.SiteLabelKey)
+			n.Labels[racermeta.DeprecatedSiteLabelKey] = "edge"
+		}},
 		{name: "excluded node", mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) { n.Labels[racermeta.ExcludeLabelKey] = "true" }},
 		{name: "canonical empty overrides legacy", mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) {
 			n.Labels[racermeta.SiteLabelKey] = ""
@@ -171,9 +175,9 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 	}
 }
 
-func TestRacerPreservesCacheGenerationAndSupportsLegacySite(t *testing.T) {
+func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
 	cache := &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom", Labels: map[string]string{cacheOwnerLabel: "true"}}, Spec: racerv1alpha1.P2PCacheSpec{CacheGeneration: 9, MaxCandidateAttempts: 5}}
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.DeprecatedSiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
 	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_name: custom"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})

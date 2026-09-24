@@ -62,7 +62,7 @@ impl Classified {
         }
     }
     pub(crate) fn boundary(source: io::Error) -> Self {
-        let facts = legacy::collect(&source);
+        let facts = io_adapter::collect(&source);
         let route = facts.routed.cloned();
         let detail = Detail::Boundary {
             healthy_status: source

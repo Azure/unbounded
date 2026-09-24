@@ -80,16 +80,6 @@ impl Trust {
         })
     }
     pub fn prepare(&self, envelope: proto::Configuration) -> io::Result<Prepared> {
-        self.prepare_source(envelope, false)
-    }
-    pub fn prepare_http(&self, envelope: proto::Configuration) -> io::Result<Prepared> {
-        self.prepare_source(envelope, true)
-    }
-    fn prepare_source(
-        &self,
-        envelope: proto::Configuration,
-        _remote: bool,
-    ) -> io::Result<Prepared> {
         #[cfg(test)]
         tests::probe_prepare()?;
         if envelope.encoded_len() > LIMIT {
@@ -186,41 +176,27 @@ impl Trust {
                 }
             }
             let effective = effective_peers(&config, volume)?;
-            let members = if let Some(index) = volume.member_catalog {
-                let members = catalogs
-                    .get(index as usize)
-                    .ok_or_else(|| invalid("unknown member catalog"))?
-                    .clone();
-                // Endpoint hints cannot replace the catalog's process identity.
-                for peer in config
-                    .peers
-                    .iter()
-                    .filter(|p| effective.contains_key(&p.id))
+            let index = volume
+                .member_catalog
+                .ok_or_else(|| invalid("missing member catalog"))?;
+            let members = catalogs
+                .get(index as usize)
+                .ok_or_else(|| invalid("unknown member catalog"))?
+                .clone();
+            // Endpoint hints cannot replace the catalog's process identity.
+            for peer in config
+                .peers
+                .iter()
+                .filter(|p| effective.contains_key(&p.id))
+            {
+                let node = crate::http_auth::identity_bytes(&peer.id)?;
+                if !members
+                    .get(&node)
+                    .is_some_and(|(pod, fabric)| pod == &peer.pod_uid && fabric == &peer.fabric)
                 {
-                    let node = crate::http_auth::identity_bytes(&peer.id)?;
-                    if !members
-                        .get(&node)
-                        .is_some_and(|(pod, fabric)| pod == &peer.pod_uid && fabric == &peer.fabric)
-                    {
-                        return Err(invalid("endpoint process differs from membership"));
-                    }
+                    return Err(invalid("endpoint process differs from membership"));
                 }
-                members
-            } else {
-                // Legacy/file fixtures retain their explicit scoped membership.
-                Arc::new(
-                    config
-                        .peers
-                        .iter()
-                        .filter(|p| effective.contains_key(&p.id))
-                        .filter_map(|p| {
-                            crate::http_auth::identity_bytes(&p.id)
-                                .ok()
-                                .map(|n| (n, (p.pod_uid.clone(), p.fabric.clone())))
-                        })
-                        .collect(),
-                )
-            };
+            }
             let endpoints = effective
                 .iter()
                 .map(|(id, (address, _))| Ok((id.clone(), http::Endpoint::parse(address)?)))
@@ -461,8 +437,7 @@ impl Prepared {
         Ok(crate::http_auth::Policy {
             universe: self.crypto.universe().bytes(),
             node: self.local_node().bytes(),
-            peers: BTreeSet::new(),
-            members: Some(volume.members.clone()),
+            members: volume.members.clone(),
         })
     }
     pub(crate) fn authorize_member(
@@ -1041,7 +1016,7 @@ impl Subscriber {
                                             return Err(invalid("candidate revision mismatch"));
                                         }
                                         if digest != hex(&hash) {
-                                            let prepared = match trust.prepare_http(envelope) {
+                                            let prepared = match trust.prepare(envelope) {
                                                 Ok(p) => p,
                                                 Err(e) => {
                                                     rejection.record(command.revision, hex(&hash));
@@ -1617,7 +1592,6 @@ impl Watch {
 }
 
 pub struct Client {
-    source: Source,
     watch: Option<Watch>,
     trust: Arc<Trust>,
     updates: Arc<Updates>,
@@ -1636,7 +1610,6 @@ impl Client {
             _ => return Err(invalid("use Subscriber for coordinated HTTP control")),
         };
         Ok(Self {
-            source,
             watch,
             trust,
             updates,
@@ -1646,10 +1619,7 @@ impl Client {
         })
     }
     fn accept(&self, config: proto::Configuration) -> io::Result<()> {
-        self.updates.publish(
-            self.trust
-                .prepare_source(config, matches!(self.source, Source::Http { .. }))?,
-        )
+        self.updates.publish(self.trust.prepare(config)?)
     }
     pub fn poll(&mut self, ring: &mut uring::Ring, budget: usize) -> uring::Work {
         match self.poll_inner(ring, budget) {

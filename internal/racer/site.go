@@ -14,18 +14,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
-// NodeSite returns the Node's Site, or empty for nil/unassigned Nodes. Presence
-// of the canonical label wins, even when empty; only absence permits fallback.
+// NodeSite returns the canonical Site label, or empty for nil/unassigned Nodes.
 func NodeSite(node *corev1.Node) string {
 	if node == nil {
 		return ""
 	}
 
-	if site, present := node.Labels[SiteLabelKey]; present {
-		return site
-	}
-
-	return node.Labels[DeprecatedSiteLabelKey]
+	return node.Labels[SiteLabelKey]
 }
 
 // UniverseForSite maps one Site name to one stable universe label value. Empty
@@ -95,8 +90,7 @@ func UniverseIDForSite(site string) string {
 	return Identity("universe", universe)
 }
 
-// RequiredNodeAffinity selects eligible members of site, with canonical-first
-// fallback semantics. Exclusion is ANDed into both OR branches. Empty or invalid
+// RequiredNodeAffinity selects eligible canonical members of site. Empty or invalid
 // Site label values match no Nodes. OS/profile selection is left to callers,
 // who may AND nodeSelector constraints with this required affinity.
 func RequiredNodeAffinity(site string) *corev1.NodeAffinity {
@@ -115,30 +109,18 @@ func RequiredNodeAffinity(site string) *corev1.NodeAffinity {
 				{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{site}},
 				{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
 			}},
-			{MatchExpressions: []corev1.NodeSelectorRequirement{
-				{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
-				{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{site}},
-				{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
-			}},
 		}
 	}
 
 	return &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: selector}
 }
 
-// EligibleNodeAffinity selects nonempty canonical Site membership, falling back
-// to the deprecated label only when the canonical label is absent.
+// EligibleNodeAffinity selects nonempty canonical Site membership.
 func EligibleNodeAffinity() *corev1.NodeAffinity {
 	return &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
 		{MatchExpressions: []corev1.NodeSelectorRequirement{
 			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpExists},
 			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
-			{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
-		}},
-		{MatchExpressions: []corev1.NodeSelectorRequirement{
-			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
-			{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpExists},
-			{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
 			{Key: ExcludeLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
 		}},
 	}}}

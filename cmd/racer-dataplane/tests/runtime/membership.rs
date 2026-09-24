@@ -112,12 +112,8 @@ fn compiler_snapshots_http_and_rdma() {
     let policy = b.authentication(volume).unwrap();
     for v in b.volumes() {
         assert!(Arc::ptr_eq(
-            policy.members.as_ref().unwrap(),
-            b.authentication(&v.config().id)
-                .unwrap()
-                .members
-                .as_ref()
-                .unwrap()
+            &policy.members,
+            &b.authentication(&v.config().id).unwrap().members
         ));
     }
     let ar = a.volumes()[0].routing();

@@ -566,7 +566,7 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 				t.Fatalf("match=%v want=%v", got, tc.want)
 			}
 
-			// Bootstrap reads current canonical-first Node membership.
+			// Bootstrap reads current canonical Node membership.
 			universe := racermeta.NodeUniverse(n)
 			if err := racermeta.ValidateBootstrapNode(n, universe); (err == nil) != tc.want {
 				t.Fatalf("bootstrap and scheduling disagree: %v", err)
@@ -617,7 +617,7 @@ func siteAdmissionCases() []struct {
 		want   bool
 	}{
 		{"default-enrollment", map[string]string{racermeta.SiteLabelKey: "rack-a"}, true},
-		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
+		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
 		{"canonical-wins", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.DeprecatedSiteLabelKey: "rack-b"}, true},
 		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
 		{"fallback-empty", map[string]string{racermeta.DeprecatedSiteLabelKey: ""}, false},
@@ -628,7 +628,7 @@ func siteAdmissionCases() []struct {
 		{"fallback-excluded", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
 		{"explicit-inclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "false"}, true},
 		{"case-sensitive-exclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "True"}, true},
-		{"non-boolean-exclusion", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "1"}, true},
+		{"non-boolean-exclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "1"}, true},
 		{"old-mirror-irrelevant", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.UniverseKey: "foreign"}, true},
 	}
 }

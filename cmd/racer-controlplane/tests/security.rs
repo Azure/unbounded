@@ -334,7 +334,7 @@ async fn durable_admission_prevents_rebinding_a_live_pod() {
     replacement.universe = "f".repeat(64);
     manager.admit(replacement).await.unwrap();
     let image = manager.state().await.unwrap().to_image().unwrap();
-    assert!(image.shards.is_empty());
+    assert!(image.metadata.len() <= 16384);
     assert!(
         !String::from_utf8(image.metadata)
             .unwrap()
@@ -621,12 +621,14 @@ async fn retirement_candidates_bind_the_observation_term_and_original_identity()
 }
 
 #[tokio::test]
-async fn lost_private_state_and_corrupt_shards_never_bootstrap() {
+async fn lost_private_state_and_unsupported_metadata_never_bootstrap() {
     let store = Store::default();
     let first = manager(&store, "first").await;
     issue(&first, node("member"), false).await;
     let mut image = store.read().await.unwrap().image.unwrap();
-    image.shards.insert("unsupported".into(), vec![]);
+    let mut metadata: serde_json::Value = serde_json::from_slice(&image.metadata).unwrap();
+    metadata["version"] = serde_json::json!(5);
+    image.metadata = serde_json::to_vec(&metadata).unwrap();
     assert!(CaState::from_image(&image).is_err());
     {
         let mut memory = store.0.lock().unwrap();
@@ -821,8 +823,9 @@ async fn real_tls_rotation_requires_every_boot_fresh_term_and_expiry() {
             .unwrap()
             .to_image()
             .unwrap()
-            .shards
-            .is_empty()
+            .metadata
+            .len()
+            <= 16384
     );
 }
 
@@ -1087,8 +1090,9 @@ async fn old_root_retires_with_live_processes_only_after_fresh_switched_tls() {
             .unwrap()
             .to_image()
             .unwrap()
-            .shards
-            .is_empty()
+            .metadata
+            .len()
+            <= 16384
     );
     assert_ne!(
         manager.state().await.unwrap().bundle().active,
@@ -1198,7 +1202,7 @@ async fn signed_process_claims_are_exact_and_old_leaves_need_no_issuance_ledger(
     let state = manager.state().await.unwrap();
     assert_eq!(state.verify_peer(&peer, unix_now()).unwrap(), &identity);
     assert!(state.verify_peer(&peer, leaf.not_after).is_err());
-    assert!(state.to_image().unwrap().shards.is_empty());
+    assert!(state.to_image().unwrap().metadata.len() <= 16384);
     drop(stream);
 }
 
@@ -1333,7 +1337,7 @@ async fn ten_thousand_idle_participants_round_trip_sharded_state() {
     }
     let state = manager.state().await.unwrap();
     let encoded = state.to_image().unwrap();
-    assert!(encoded.metadata.len() < 16384 && encoded.shards.is_empty());
+    assert!(encoded.metadata.len() < 16384);
     assert!(encoded.metadata.len() <= image.metadata.len() + 10);
     assert!(CaState::from_image(&encoded).unwrap().to_image().unwrap() == encoded);
 }
@@ -1437,6 +1441,8 @@ fn enrollment_requires_bound_audience_and_actual_ownership() {
     canonical
         .labels
         .insert("net.unbounded-cloud.io/site".into(), "edge".into());
+    assert!(node_site(&canonical).is_empty());
+    canonical.labels.remove("unbounded-cloud.io/site");
     assert!(node_site(&canonical).is_empty());
     assert_eq!(
         token_review_request("token").unwrap()["spec"]["audiences"],

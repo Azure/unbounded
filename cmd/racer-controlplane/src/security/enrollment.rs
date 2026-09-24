@@ -142,11 +142,10 @@ pub fn universe_for_site(site: &str) -> String {
     result
 }
 
-/// Canonical label presence wins even when its value is empty.
+/// Only the canonical Site label assigns membership.
 pub fn node_site(node: &ObjectMetadata) -> &str {
     node.labels
         .get("unbounded-cloud.io/site")
-        .or_else(|| node.labels.get("net.unbounded-cloud.io/site"))
         .map(String::as_str)
         .unwrap_or("")
 }

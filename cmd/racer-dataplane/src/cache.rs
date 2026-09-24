@@ -298,9 +298,9 @@ impl Error {
         let reason = match self {
             Self::Shared(error) => return error.evidence(),
             Self::Outcome(error) => return error.evidence(),
-            // Explicit Io is a public compatibility entry point. Internal
+            // Explicit Io is a public error adapter entry point. Internal
             // producers use From<io::Error> or typed constructors instead.
-            Self::Io(error) => return crate::outcome::legacy::collect(error),
+            Self::Io(error) => return crate::outcome::io_adapter::collect(error),
             Self::NotFound => PeerReason::NotFound,
             Self::Gone => PeerReason::Gone,
             Self::Precondition => PeerReason::Precondition,
@@ -321,7 +321,7 @@ impl Error {
         match self {
             Self::Shared(error) => error.attempt_failure(),
             Self::Outcome(error) => error.routed(),
-            Self::Io(_) => crate::outcome::legacy::error_detail(self),
+            Self::Io(_) => crate::outcome::io_adapter::error_detail(self),
             _ => None,
         }
     }

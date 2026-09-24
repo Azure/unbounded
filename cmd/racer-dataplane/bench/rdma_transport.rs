@@ -18,6 +18,13 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
         node: vec![local; 32],
         revision: 1,
         fabric: "benchmark".into(),
+        member_catalogs: vec![proto::MemberCatalog {
+            members: vec![proto::Member {
+                node: vec![remote; 32],
+                pod_uid: "benchmark".into(),
+                fabric: "benchmark".into(),
+            }],
+        }],
         peers: vec![proto::Peer {
             id: peer.clone(),
             pod_uid: "benchmark".into(),
@@ -27,6 +34,7 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
         }],
         volumes: vec![proto::Volume {
             id: fixture::VOLUME.into(),
+            member_catalog: Some(0),
             cache_socket: "/dev/racer/v1/cache".into(),
             origin_socket: "/dev/racer/v1/origin".into(),
             peers: vec![peer.clone()],

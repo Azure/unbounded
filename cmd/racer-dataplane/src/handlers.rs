@@ -1105,10 +1105,14 @@ impl Handler {
     pub(crate) fn test_authentication(&mut self, node: u8, peers: &[u8], selected: Option<u8>) {
         let (trust, _) = crate::control::tests::fixture();
         self.set_authentication(crate::http_auth::Policy {
-            members: None,
+            members: Arc::new(
+                peers
+                    .iter()
+                    .map(|peer| ([*peer; 32], ("metadata-test-pod".into(), String::new())))
+                    .collect(),
+            ),
             universe: trust.universe,
             node: [node; 32],
-            peers: peers.iter().map(|peer| [*peer; 32]).collect(),
         });
         self.upstream.selected = selected.map(|peer| hex(&[peer; 32]));
     }

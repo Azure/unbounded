@@ -74,19 +74,10 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, sites []unboun
 		return plan, component.Disabled("no Site enables Racer and no retained installation exists"), nil
 	}
 
-	routes, err := planRoutingMigration(ctx, env, plan)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
 	var dependencies []component.ObjectRef
 
 	for _, obj := range sharedResources(env.Namespace) {
 		op := component.Operation{Kind: component.OpApply, Object: resourceObject(obj), Component: controlPlaneName}
-		if op.Ref().GVK.Kind == "Service" {
-			op.DependsOn = routes
-		}
-
 		plan.Add(op)
 		dependencies = append(dependencies, op.Ref())
 	}

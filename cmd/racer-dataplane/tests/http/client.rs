@@ -466,7 +466,7 @@ fn destination_get(ring: &mut Ring) {
 }
 
 fn admission_timeout_evidence(ring: &mut Ring) {
-    use attempt::{Cause, Phase};
+    use crate::outcome::{Cause, Phase};
     for service in [false, true] {
         let pressure = Pressure::new(ring, false);
         let mut exchange = Connection::new("127.0.0.1:9".parse().unwrap(), "test")
@@ -994,9 +994,9 @@ fn retire<B: Writable>(mut get: GetExchange<B>, ring: &mut Ring, mode: usize) {
             let evidence = error
                 .get_ref()
                 .unwrap()
-                .downcast_ref::<attempt::Failure>()
+                .downcast_ref::<crate::outcome::Failure>()
                 .unwrap();
-            assert_eq!(evidence.cause, attempt::Cause::CallerDeadline);
+            assert_eq!(evidence.cause, crate::outcome::Cause::CallerDeadline);
             assert!(!evidence.owner_evidence());
             assert!(get.0.socket.is_none());
         }
@@ -1339,10 +1339,10 @@ mod idle_pressure {
         let failure = error
             .get_ref()
             .unwrap()
-            .downcast_ref::<attempt::Failure>()
+            .downcast_ref::<crate::outcome::Failure>()
             .unwrap();
-        assert_eq!(failure.cause, attempt::Cause::LocalPressure);
-        assert_eq!(failure.phase, attempt::Phase::LocalAdmission);
+        assert_eq!(failure.cause, crate::outcome::Cause::LocalPressure);
+        assert_eq!(failure.phase, crate::outcome::Phase::LocalAdmission);
         assert!(!failure.initiated && !failure.owner_evidence());
         assert!(crate::environment::now() - start < Duration::from_millis(500));
         assert_eq!(f.hits.get(), hits);

@@ -449,9 +449,6 @@ pub(crate) mod owner_health {
     }
 }
 
-/// Compatibility path for transport-neutral attempt outcomes.
-pub use crate::outcome as attempt;
-
 /// Validated origin-form target and additional headers, borrowed only until start.
 /// Host and all request framing/connection-control headers are transport-owned.
 #[derive(Clone, Copy)]

@@ -715,7 +715,6 @@ async fn chunk_gc_preserves_staging_recovers_interruption_and_fences_takeover() 
     metadata["fence"] = json!("term-b");
     let state = CaState::from_image(&StateImage {
         metadata: serde_json::to_vec(&metadata).unwrap(),
-        shards: image.shards,
     })
     .unwrap();
     *shared.write().unwrap() = Some(SecurityContext {

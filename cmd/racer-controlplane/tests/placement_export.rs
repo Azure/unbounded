@@ -61,7 +61,6 @@ fn export_dataplane_placement() {
         for slots in [1, 8, 17, 64, SLOT_COUNT] {
             let mut g = generation.clone();
             g.volumes[0].slots = slots;
-            g.slot_history.insert("cache-uid".into(), slots);
             if slots != SLOT_COUNT {
                 let by_id: std::collections::BTreeMap<_, _> = g
                     .nodes
@@ -108,7 +107,6 @@ fn export_dataplane_placement() {
         if count == 2 {
             let mut historical = generation.clone();
             historical.volumes[0].slots = 8;
-            historical.slot_history.insert("cache-uid".into(), 8);
             historical.volumes[0].owners =
                 (0..8).map(|s| names[usize::from(s >= 4)].clone()).collect();
             let top = Topology::new(&historical).unwrap();

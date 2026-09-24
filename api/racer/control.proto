@@ -41,7 +41,7 @@ message Volume {
   VolumePeerEndpoints peer_endpoints = 9;
   string cache_socket = 10;
   string origin_socket = 12;
-  // Index into Snapshot.member_catalogs. Absence retains legacy scoped peers.
+  // Required index into Snapshot.member_catalogs, including for empty membership.
   optional uint32 member_catalog = 13;
 }
 

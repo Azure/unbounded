@@ -15,10 +15,9 @@ mod peer_recovery;
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {
-        members: None,
+        members: Arc::new([([peer; 32], ("handler-pod".into(), String::new()))].into()),
         universe: trust.universe,
         node: [node; 32],
-        peers: [[peer; 32]].into(),
     }
 }
 
@@ -218,9 +217,9 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         .unwrap();
     let mut provider = Provider {
         peers: Rc::new(RefCell::new(BTreeMap::from([(
-            "p1".into(),
+            "03".repeat(32),
             Rc::new(RefCell::new(Peer::from_endpoint(
-                prepared.peers()["p1"].clone(),
+                prepared.peers()[&"03".repeat(32)].clone(),
             ))),
         )]))),
         routing: Some(routing.clone()),
@@ -267,7 +266,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         final_hop: true,
         context: "a".repeat(96),
     };
-    use client::attempt::{Cause, Failure, Phase, Transport};
+    use crate::outcome::{Cause, Failure, Phase, Transport};
     let evidence = Failure {
         endpoint: route.endpoint.into(),
         transport: Transport::Http,
@@ -335,7 +334,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
             identity: route.cursor.identity,
             candidate: 1,
             reason,
-            evidence: crate::http_client::attempt::PeerEvidence::from_failure(&evidence),
+            evidence: crate::outcome::PeerEvidence::from_failure(&evidence),
         };
         let decoded = PeerFailure::decode(&failure.encode()).unwrap();
         assert_eq!(failure, decoded);
@@ -475,11 +474,14 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
         .find(|t| routing.start(t).owner == 1)
         .unwrap();
     let peer = Rc::new(RefCell::new(Peer::from_endpoint(
-        prepared.peers()["p1"].clone(),
+        prepared.peers()[&"03".repeat(32)].clone(),
     )));
     let provider = Provider {
         routing: Some(routing.clone()),
-        peers: Rc::new(RefCell::new(BTreeMap::from([("p1".into(), peer.clone())]))),
+        peers: Rc::new(RefCell::new(BTreeMap::from([(
+            "03".repeat(32),
+            peer.clone(),
+        )]))),
         ..Provider::new(prepared.volumes()[0].backend().clone())
     };
     let state = || {

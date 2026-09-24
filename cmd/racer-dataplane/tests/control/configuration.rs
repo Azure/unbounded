@@ -94,13 +94,13 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
         universe: [1; 32],
         node: [2; 32],
     };
-    let snapshot = proto::Snapshot {
+    let mut snapshot = proto::Snapshot {
         universe: trust.universe.to_vec(),
         node: trust.node.to_vec(),
         revision: 1,
         peers: vec![proto::Peer {
             pod_uid: "test-pod".into(),
-            id: "p1".into(),
+            id: "03".repeat(32),
             http_address: "127.0.0.1:8081".into(),
             ..Default::default()
         }],
@@ -108,10 +108,10 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
             id: "v1".into(),
             cache_socket: "/dev/racer/v1/cache".into(),
             origin_socket: "/dev/racer/v1/origin".into(),
-            peers: vec!["p1".into()],
+            peers: vec!["03".repeat(32)],
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {
-                    peer: "p1".into(),
+                    peer: "03".repeat(32),
                     http_address: String::new(),
                 }],
             }),
@@ -122,23 +122,75 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
                 local_slots: vec![0],
                 neighbors: vec![proto::SlotPeer {
                     slot: 1,
-                    peer: "p1".into(),
+                    peer: "03".repeat(32),
                 }],
             }),
             ..Default::default()
         }],
         ..Default::default()
     };
+    scope_peers(&mut snapshot);
     (trust, snapshot)
 }
 pub(crate) fn prepare_snapshot(trust: &Trust, config: proto::Snapshot) -> Prepared {
     trust.prepare(envelope(config)).unwrap()
 }
+
+#[test]
+fn member_catalog_is_required_and_process_identity_is_exact() {
+    let (trust, snapshot) = fixture();
+    let raw = |s| proto::Configuration {
+        contents: Some(proto::configuration::Contents::Snapshot(s)),
+    };
+    trust.prepare(raw(snapshot.clone())).unwrap();
+    for mutate in [
+        |s: &mut proto::Snapshot| s.volumes[0].member_catalog = None,
+        |s: &mut proto::Snapshot| s.volumes[0].member_catalog = Some(1),
+        |s: &mut proto::Snapshot| s.member_catalogs.clear(),
+        |s: &mut proto::Snapshot| s.member_catalogs[0].members.clear(),
+        |s: &mut proto::Snapshot| s.member_catalogs[0].members[0].pod_uid = "other-pod".into(),
+        |s: &mut proto::Snapshot| s.member_catalogs[0].members[0].fabric = "other-fabric".into(),
+    ] {
+        let mut invalid = snapshot.clone();
+        mutate(&mut invalid);
+        assert!(trust.prepare(raw(invalid)).is_err());
+    }
+    let mut local = snapshot;
+    local.peers.clear();
+    local.volumes[0].peers.clear();
+    local.volumes[0].peer_endpoints = Some(proto::VolumePeerEndpoints::default());
+    local.volumes[0].topology = None;
+    local.member_catalogs[0].members.clear();
+    trust.prepare(raw(local.clone())).unwrap();
+    local.volumes[0].member_catalog = None;
+    assert!(trust.prepare(raw(local)).is_err());
+}
+
 pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
+    if snapshot.volumes.is_empty() {
+        snapshot.member_catalogs.clear();
+        return;
+    }
+    snapshot.member_catalogs = vec![proto::MemberCatalog {
+        members: snapshot
+            .peers
+            .iter()
+            .map(|peer| proto::Member {
+                node: peer
+                    .id
+                    .parse::<crate::peer_identity::NodeId>()
+                    .map(|n| n.bytes().to_vec())
+                    .unwrap_or_default(),
+                pod_uid: peer.pod_uid.clone(),
+                fabric: peer.fabric.clone(),
+            })
+            .collect(),
+    }];
     for volume in &mut snapshot.volumes {
+        volume.member_catalog = Some(0);
         if volume.peer_endpoints.as_ref().is_some_and(|scope| {
             scope.peers.len() != 1
-                || scope.peers[0].peer != "p1"
+                || scope.peers[0].peer != "03".repeat(32)
                 || !scope.peers[0].http_address.is_empty()
         }) {
             continue;
@@ -254,10 +306,10 @@ pub(crate) fn runtime_pair(
 fn tls_configuration_rejects_tcp_ingress_and_missing_pod_identity() {
     let (trust, mut config) = fixture();
     config.volumes[0].cache_socket = "127.0.0.1:9443".into();
-    assert!(trust.prepare_http(envelope(config)).is_err());
+    assert!(trust.prepare(envelope(config)).is_err());
     let (_, mut config) = fixture();
     config.peers[0].pod_uid.clear();
-    assert!(trust.prepare_http(envelope(config)).is_err());
+    assert!(trust.prepare(envelope(config)).is_err());
     assert!(Source::parse("http://127.0.0.1:8443/v3/control").is_err());
     assert!(Source::parse("https://user:password@127.0.0.1:8443/v3/control").is_err());
 }
@@ -385,7 +437,7 @@ fn rejects_partial_invalid_and_untrusted_snapshots() {
         mutate(&mut s);
         assert!(trust.prepare(envelope(s)).is_err());
     }
-    assert!(trust.prepare_http(envelope(original.clone())).is_ok());
+    assert!(trust.prepare(envelope(original.clone())).is_ok());
     let mut unscoped = original.clone();
     unscoped.volumes[0].peer_endpoints = None;
     assert!(
@@ -786,9 +838,6 @@ fn rdma_eligibility_binds_direct_membership_endpoint_and_snapshot() {
 fn rdma_ineligible_configuration_preserves_http_routes() {
     let (trust, original) = rdma_fixture();
     for mutate in [
-        |s: &mut proto::Snapshot| s.peers[0].id = "neighbor".into(),
-        |s: &mut proto::Snapshot| s.peers[0].id = "g".repeat(64),
-        |s: &mut proto::Snapshot| s.peers[0].id = "a".repeat(63),
         |s: &mut proto::Snapshot| s.peers[0].id = "02".repeat(32),
         |s: &mut proto::Snapshot| s.fabric.clear(),
         |s: &mut proto::Snapshot| s.peers[0].fabric.clear(),
@@ -832,23 +881,24 @@ fn rdma_ineligible_configuration_preserves_http_routes() {
 }
 
 #[test]
-fn rdma_node_hex_is_case_insensitive_but_ambiguous_duplicates_are_http_only() {
+fn rdma_node_ids_require_canonical_hex_and_unique_membership() {
     let (trust, mut snapshot) = rdma_fixture();
+    for id in ["neighbor".into(), "g".repeat(64), "a".repeat(63)] {
+        let mut invalid = snapshot.clone();
+        invalid.peers[0].id = id.clone();
+        invalid.volumes[0].peers = vec![id.clone()];
+        invalid.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = id;
+        assert!(trust.prepare(envelope(invalid)).is_err());
+    }
     snapshot.peers[0].id.make_ascii_uppercase();
     snapshot.volumes[0].peers = vec![snapshot.peers[0].id.clone()];
     snapshot.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = snapshot.peers[0].id.clone();
-    let prepared = trust.prepare(envelope(snapshot.clone())).unwrap();
-    assert_eq!(
-        prepared.eligible_peers().next().unwrap().node().bytes(),
-        [0xab; 32]
-    );
+    assert!(trust.prepare(envelope(snapshot.clone())).is_err());
     let mut duplicate = snapshot.peers[0].clone();
     duplicate.id.make_ascii_lowercase();
     duplicate.http_address = "127.0.0.1:8083".into();
     snapshot.peers.push(duplicate);
-    let prepared = trust.prepare(envelope(snapshot)).unwrap();
-    assert_eq!(prepared.peers.len(), 2);
-    assert_eq!(prepared.eligible_peers().count(), 0);
+    assert!(trust.prepare(envelope(snapshot)).is_err());
 }
 
 #[test]
@@ -860,11 +910,11 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     snapshot.peers.push(second.clone());
     snapshot.peers.push(proto::Peer {
         pod_uid: "test-pod".into(),
-        id: "alias".into(),
+        id: "ef".repeat(32),
         http_address: "127.0.0.1:8084".into(),
-        fabric: "rack-1".into(),
+        fabric: "rack-2".into(),
     });
-    snapshot.volumes[0].peers = vec![second.id.clone(), "alias".into(), first.clone()];
+    snapshot.volumes[0].peers = vec![second.id.clone(), "ef".repeat(32), first.clone()];
     snapshot.volumes[0].topology = Some(proto::Topology {
         routing_algorithm: Some(1),
         epoch: 1,
@@ -877,7 +927,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
             },
             proto::SlotPeer {
                 slot: 4,
-                peer: "alias".into(),
+                peer: "ef".repeat(32),
             },
             proto::SlotPeer {
                 slot: 5,
@@ -924,7 +974,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
         let selected = prepared.select_eligible_peer("v1", &target);
         assert_eq!(
             selected.map(|p| p.id().to_owned()),
-            expected.filter(|id| id != "alias")
+            expected.filter(|id| id != &"ef".repeat(32))
         );
     }
     assert!(slots.len() >= 3);
@@ -1173,7 +1223,7 @@ pub(crate) mod activation_tests {
         config.peers.clear();
         assert!(trust.prepare(envelope(config.clone())).is_ok());
         // HTTPS authenticates the control plane; snapshots still bind node identity.
-        assert!(trust.prepare_http(envelope(config)).is_ok());
+        assert!(trust.prepare(envelope(config)).is_ok());
     }
 
     #[test]
@@ -1603,8 +1653,9 @@ mod subscriber_tests {
             }
         }
     }
-    fn signed(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
+    fn signed(trust: &Trust, mut snapshot: proto::Snapshot) -> Vec<u8> {
         use sha2::Digest;
+        scope_peers(&mut snapshot);
         proto::DesiredState {
             universe: snapshot.universe.clone(),
             node: snapshot.node.clone(),
@@ -1946,10 +1997,7 @@ mod subscriber_tests {
         );
     }
     fn json(config: &proto::Snapshot) -> Vec<u8> {
-        serde_json::to_vec(&proto::Configuration {
-            contents: Some(proto::configuration::Contents::Snapshot(config.clone())),
-        })
-        .unwrap()
+        serde_json::to_vec(&envelope(config.clone())).unwrap()
     }
 
     #[test]

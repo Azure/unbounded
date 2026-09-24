@@ -82,16 +82,7 @@ impl KubernetesCaStore {
         let maps = self.maps().list(&ListParams::default()).await?;
         Ok(maps.items.iter().any(|cm| {
             let name = cm.metadata.name.as_deref().unwrap_or_default();
-            name == TRUST_MAP
-                || name == REVISION_CHECKPOINT
-                || name.starts_with("racer-pki-")
-                || name.starts_with("racer-replica-")
-                || name.starts_with("racer-v4-")
-                || name.starts_with("racer-desired-")
-                || cm.metadata.labels.as_ref().is_some_and(|l| {
-                    l.get("racer.unbounded-cloud.io/state")
-                        .is_some_and(|s| s == "commit")
-                })
+            name == TRUST_MAP || name == REVISION_CHECKPOINT
         }))
     }
     fn load_image(&self, secret: &Secret) -> Result<StateImage> {
@@ -103,7 +94,6 @@ impl KubernetesCaStore {
                 .context("CA Secret missing state.json")?
                 .0
                 .clone(),
-            shards: Default::default(),
         };
         CaState::from_image(&image)?;
         Ok(image)

@@ -117,7 +117,7 @@ func TestSiteWorkloadAdmission(t *testing.T) {
 							t.Fatal(err)
 						}
 
-						if matchesNode(t, pod, admitted) != (value != "") {
+						if matchesNode(t, pod, admitted) != (key == racermeta.SiteLabelKey && value != "") {
 							t.Fatalf("singleton eligibility disagrees for %s=%q", key, value)
 						}
 					}

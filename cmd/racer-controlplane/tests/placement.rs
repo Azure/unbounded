@@ -128,8 +128,6 @@ fn compiler_ignores_history_and_volatile_fields_and_shares_universe_placement() 
     let mut historical = first.clone();
     historical.revision = 99;
     historical.volumes[0].owners.reverse();
-    historical.withdrawn.insert("deleted-cache".into());
-    historical.slot_history.insert("deleted-cache".into(), 7);
     historical
         .nodes
         .insert("deleted/obsolete".into(), Member::default());

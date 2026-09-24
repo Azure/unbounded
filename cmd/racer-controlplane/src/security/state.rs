@@ -4,7 +4,6 @@
 use super::*;
 use anyhow::{Context, bail};
 use std::{
-    collections::BTreeMap,
     future::Future,
     sync::{
         Arc,
@@ -39,12 +38,10 @@ pub struct CaState {
     retirement_skew: i64,
 }
 
-/// `shards` remains an empty adapter field to make unsupported old state fail
-/// explicitly. Only metadata is persisted, in one bounded Secret.
+/// The bounded CA metadata persisted in one Secret.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StateImage {
     pub metadata: Vec<u8>,
-    pub shards: BTreeMap<String, Vec<u8>>,
 }
 
 impl CaState {
@@ -84,14 +81,11 @@ impl CaState {
     pub fn to_image(&self) -> Result<StateImage> {
         let metadata = serde_json::to_vec(self)?;
         ensure!(metadata.len() <= STATE_LIMIT, "CA state capacity exceeded");
-        Ok(StateImage {
-            metadata,
-            shards: BTreeMap::new(),
-        })
+        Ok(StateImage { metadata })
     }
     pub fn from_image(image: &StateImage) -> Result<Self> {
         ensure!(
-            image.metadata.len() <= STATE_LIMIT && image.shards.is_empty(),
+            image.metadata.len() <= STATE_LIMIT,
             "unsupported CA state image"
         );
         let state: Self = serde_json::from_slice(&image.metadata)?;

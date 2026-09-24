@@ -312,7 +312,7 @@ type Volume struct {
 	PeerEndpoints        *VolumePeerEndpoints   `protobuf:"bytes,9,opt,name=peer_endpoints,json=peerEndpoints,proto3" json:"peer_endpoints,omitempty"`
 	CacheSocket          string                 `protobuf:"bytes,10,opt,name=cache_socket,json=cacheSocket,proto3" json:"cache_socket,omitempty"`
 	OriginSocket         string                 `protobuf:"bytes,12,opt,name=origin_socket,json=originSocket,proto3" json:"origin_socket,omitempty"`
-	// Index into Snapshot.member_catalogs. Absence retains legacy scoped peers.
+	// Required index into Snapshot.member_catalogs, including for empty membership.
 	MemberCatalog *uint32 `protobuf:"varint,13,opt,name=member_catalog,json=memberCatalog,proto3,oneof" json:"member_catalog,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -6,7 +6,8 @@ pub(crate) mod failure_tests {
     use super::failure::*;
     use crate::{cache, http_client as client};
     use cache::{http_metadata::headers, peer_wire::hex};
-    use client::attempt::{PeerFailure, PeerReason};
+    use crate::outcome::{AttemptFailure, AttemptRoute, PeerFailure, PeerReason, attempt_evidence,
+        failure_reason, owner_failure, peer_failure};
     use std::{io, sync::Arc};
 
     include!(concat!(
@@ -17,7 +18,7 @@ pub(crate) mod failure_tests {
     #[test]
     fn http_metric_classification_preserves_shared_and_remote_evidence() {
         use crate::metrics::{HttpErrorReason as R, HttpPressure as P};
-        use client::attempt::{Cause, PeerEvidence, Phase, Transport};
+        use crate::outcome::{Cause, PeerEvidence, Phase, Transport};
         for (reason, expected) in [
             (PeerReason::OwnerUnavailable, R::OwnerUnavailable),
             (PeerReason::Busy, R::Busy),
@@ -107,7 +108,7 @@ pub(crate) mod failure_tests {
 
     #[test]
     fn local_pressure_classification_survives_adapter_and_fanout_wrappers() {
-        use client::attempt::{Cause, Failure, Phase, Transport};
+        use crate::outcome::{Cause, Failure, Phase, Transport};
         let route = route(true);
         for (cause, kind, reason, status) in [
             (
@@ -171,7 +172,7 @@ pub(crate) mod failure_tests {
                         message: "classification regression".into(),
                     };
                     let expected =
-                        crate::http_client::attempt::PeerEvidence::from_failure(&evidence).unwrap();
+                        crate::outcome::PeerEvidence::from_failure(&evidence).unwrap();
                     let error = if routed {
                         io::Error::other(AttemptFailure {
                             route: route.clone(),
@@ -185,10 +186,10 @@ pub(crate) mod failure_tests {
                     let error = match wrapper {
                         0 => error,
                         1 => cache::Error::Shared(Arc::new(error)),
-                        2 => io_error(cache::Error::Shared(Arc::new(error))).into(),
+                        2 => cache::Error::Shared(Arc::new(error)).into_io().into(),
                         _ => io::Error::new(
                             io::ErrorKind::TimedOut,
-                            io_error(cache::Error::Shared(Arc::new(error))),
+                            cache::Error::Shared(Arc::new(error)).into_io(),
                         )
                         .into(),
                     };
@@ -198,7 +199,7 @@ pub(crate) mod failure_tests {
                     assert_eq!(report.evidence, Some(expected));
                     assert_eq!(owner_failure(&error), None);
                     assert!(
-                        !error_detail::<AttemptFailure>(&error).is_some_and(|f| f.owner_evidence())
+                        !error.attempt_failure().is_some_and(|f| f.owner_evidence())
                     );
                     if matches!(
                         cause,
@@ -305,10 +306,9 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
-            members: None,
+            members: Arc::new([[2; 32], [0xab; 32]].into_iter().map(|node| (node, ("pod-123".into(), String::new()))).collect()),
             universe: [8; 32],
             node: [1; 32],
-            peers: [[2; 32], [0xab; 32]].into_iter().collect(),
         }
     }
 
@@ -332,17 +332,20 @@ mod tests {
                 io::ErrorKind::PermissionDenied
             );
         }
-        policy.peers.insert(policy.node);
+        Arc::make_mut(&mut policy.members).insert(policy.node, ("pod-123".into(), String::new()));
         assert!(policy.authorize(&identity(8, 1)).is_err());
-        policy.peers.remove(&[2; 32]);
+        Arc::make_mut(&mut policy.members).remove(&[2; 32]);
         assert!(policy.authorize(&identity(8, 2)).is_err());
-        policy.peers.clear();
+        Arc::make_mut(&mut policy.members).clear();
         assert!(policy.authorize(&identity(8, 0xab)).is_err());
     }
 
     #[test]
     fn membership_rejects_noncanonical_identity_fields() {
         let policy = policy();
+        let mut replaced = identity(8, 2);
+        replaced.pod_uid = "replaced-pod".into();
+        assert_eq!(policy.authorize(&replaced).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         for malformed in [
             String::new(),
             "ab".repeat(31),
@@ -404,7 +407,7 @@ mod tests {
         assert_eq!(server.peer_identity(), Some(&remote));
         let mut policy = policy();
         policy.authorize(server.peer_identity().unwrap()).unwrap();
-        policy.peers.remove(&[2; 32]);
+        Arc::make_mut(&mut policy.members).remove(&[2; 32]);
         assert_eq!(
             policy
                 .authorize(server.peer_identity().unwrap())

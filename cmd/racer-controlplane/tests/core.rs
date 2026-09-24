@@ -85,7 +85,6 @@ fn geometry(slots: u32, count: usize) -> Generation {
         .map(|id| names[&id].clone())
         .collect(),
     });
-    g.slot_history.insert("cache-uid".into(), slots);
     g
 }
 
@@ -110,8 +109,9 @@ fn identity_and_socket_contract_survives_the_language_cutover() {
     for value in ["", "site.a", "A_site.1"] {
         assert_eq!(universe_for_site(value), value);
     }
-    assert_eq!(node_site(Some(""), Some("fallback")), "");
-    assert_eq!(node_site(None, Some("fallback")), "fallback");
+    assert_eq!(node_site(Some("")), "");
+    assert_eq!(node_site(None), "");
+    assert_eq!(node_site(Some("edge")), "edge");
     assert_eq!(
         cache_sockets("/dev//racer/../racer/.", "cache-a").unwrap(),
         (
@@ -254,8 +254,6 @@ fn normalized_inventory_selects_processes_and_keeps_removal_authority() {
             .idle
     );
     assert!(topology.snapshot(&id).is_none());
-    assert!(idle.withdrawn.is_empty());
-    assert!(idle.slot_history.is_empty());
     assert!(topology.snapshot(&identity("node", "unknown")).is_none());
 
     input.nodes[1].eligible = false;
@@ -385,7 +383,6 @@ fn cache_recreation_empty_membership_and_admission_are_checked_before_commit() {
     input.caches[0].uid = "recreated-cache".into();
     input.caches[0].cache_generation = 9;
     let new = compile(&input, Some(&old)).unwrap();
-    assert!(new.withdrawn.is_empty());
     assert_eq!(new, compile(&input, None).unwrap());
     assert_eq!(new.volumes[0].cache_socket, old.volumes[0].cache_socket);
     assert_eq!(new.volumes[0].id, "recreated-cache");

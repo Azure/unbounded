@@ -724,7 +724,6 @@ async fn scenario(
             "retirement_skew": 60
         }))
         .unwrap(),
-        shards: BTreeMap::new(),
     };
     let ca_state = Arc::new(CaState::from_image(&image).unwrap());
     let before_leaves = ca_state.to_image().unwrap();
@@ -782,7 +781,7 @@ async fn scenario(
         after_leaves.metadata == before_leaves.metadata,
         "leaf count must not grow CA state"
     );
-    assert!(after_leaves.shards.is_empty());
+    assert!(after_leaves.metadata.len() <= 16384);
     assert!(after_leaves.metadata.len() <= 16 * 1024);
     assert_eq!(
         ca_state.expiry_watermarks().collect::<Vec<_>>(),

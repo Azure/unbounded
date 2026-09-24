@@ -428,8 +428,9 @@ func (f *gantryFixture) control(nodes int) [][]string {
 
 	for i := 0; i < nodes; i++ {
 		node, _ := hex.DecodeString(gantryNode(i))
-		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/dev/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/dev/racer/node%d/origin", i), PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
-		s := &pb.Snapshot{Universe: bytes.Repeat([]byte{1}, 32), Node: node, Revision: 1, Epoch: 1, Volumes: []*pb.Volume{v}}
+		algorithm, catalog := uint32(1), uint32(0)
+		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/dev/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/dev/racer/node%d/origin", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
+		s := &pb.Snapshot{Universe: bytes.Repeat([]byte{1}, 32), Node: node, Revision: 1, Epoch: 1, Volumes: []*pb.Volume{v}, MemberCatalogs: []*pb.MemberCatalog{{}}}
 
 		degree := 1
 		for degree*degree*degree < nodes {
@@ -442,6 +443,8 @@ func (f *gantryFixture) control(nodes int) [][]string {
 			}
 
 			id := gantryNode(j)
+			memberNode, _ := hex.DecodeString(id)
+			s.MemberCatalogs[0].Members = append(s.MemberCatalogs[0].Members, &pb.Member{Node: memberNode, PodUid: fmt.Sprintf("pod%d", j)})
 			s.Peers = append(s.Peers, &pb.Peer{Id: id, HttpAddress: fmt.Sprintf("127.0.0.%d:9443", j+2), PodUid: fmt.Sprintf("pod%d", j)})
 			v.PeerEndpoints.Peers = append(v.PeerEndpoints.Peers, &pb.VolumePeerEndpoint{Peer: id})
 

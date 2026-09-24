@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -49,9 +49,9 @@ pub fn universe_id_for_site(site: &str) -> String {
     }
 }
 
-/// Presence of the canonical label, including an empty value, wins.
-pub fn node_site(canonical: Option<&str>, deprecated: Option<&str>) -> String {
-    canonical.or(deprecated).unwrap_or_default().into()
+/// Only the canonical Site label assigns membership.
+pub fn node_site(canonical: Option<&str>) -> String {
+    canonical.unwrap_or_default().into()
 }
 
 pub fn cache_sockets(root: &str, name: &str) -> Result<(String, String)> {
@@ -161,9 +161,7 @@ pub struct Volume {
     pub owners: Vec<String>,
 }
 
-/// A versioned content format, independent of Go's legacy generations. The
-/// compiler derives members and volumes solely from current inventory. Historical
-/// fields remain readable for compatibility but are not placement authority.
+/// A versioned content format derived solely from current inventory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
     pub format: u32,
@@ -171,8 +169,6 @@ pub struct Generation {
     pub revision: u64,
     pub nodes: BTreeMap<String, Member>,
     pub volumes: Vec<Volume>,
-    pub slot_history: BTreeMap<String, u32>,
-    pub withdrawn: BTreeSet<String>,
 }
 
 impl Generation {
@@ -183,8 +179,6 @@ impl Generation {
             revision: 0,
             nodes: BTreeMap::new(),
             volumes: Vec::new(),
-            slot_history: BTreeMap::new(),
-            withdrawn: BTreeSet::new(),
         }
     }
 

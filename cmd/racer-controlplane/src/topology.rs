@@ -286,7 +286,6 @@ pub fn compile_cached(
             )));
         }
         let (cache_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.name)?;
-        g.slot_history.insert(cache.uid.clone(), SLOT_COUNT);
         g.volumes.push(Volume {
             id: cache.uid.clone(),
             name: cache.name.clone(),

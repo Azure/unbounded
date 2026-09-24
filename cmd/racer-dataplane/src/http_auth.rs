@@ -3,11 +3,7 @@
 
 //! TLS peer membership policy and request-bound failure attribution.
 use crate::tls::PeerIdentity;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, io, sync::Arc};
 
 /// One index per catalog: exact process UID and RDMA fabric by binary node ID.
 pub(crate) type Members = BTreeMap<[u8; 32], (String, String)>;
@@ -16,9 +12,7 @@ pub(crate) type Members = BTreeMap<[u8; 32], (String, String)>;
 pub struct Policy {
     pub universe: [u8; 32],
     pub node: [u8; 32],
-    /// Legacy fixture membership. Runtime always supplies an exact process catalog.
-    pub peers: BTreeSet<[u8; 32]>,
-    pub(crate) members: Option<Arc<Members>>,
+    pub(crate) members: Arc<Members>,
 }
 impl Policy {
     /// Authorize an identity verified by the completed mutual TLS handshake.
@@ -26,14 +20,10 @@ impl Policy {
     pub fn authorize(&self, identity: &PeerIdentity) -> io::Result<()> {
         let universe = identity_bytes(&identity.universe)?;
         let node = identity_bytes(&identity.node)?;
-        let member = self.members.as_ref().map_or_else(
-            || self.peers.contains(&node),
-            |members| {
-                members
-                    .get(&node)
-                    .is_some_and(|(pod, _)| *pod == identity.pod_uid)
-            },
-        );
+        let member = self
+            .members
+            .get(&node)
+            .is_some_and(|(pod, _)| *pod == identity.pod_uid);
         if universe != self.universe || node == self.node || !member {
             return Err(denied());
         }
@@ -63,16 +53,8 @@ pub(crate) fn identity_bytes(value: &str) -> io::Result<[u8; 32]> {
 
 /// Request-bound failure attribution, shared by HTTP and authenticated RDMA.
 pub(crate) mod failure {
-    // Retain old internal paths while request/cache adapters migrate independently.
-    #[allow(unused_imports)]
-    pub(crate) use crate::outcome::legacy::{error_detail, io_error};
-    #[allow(unused_imports)]
-    pub(crate) use crate::outcome::{AttemptFailure, AttemptRoute, OwnerUnavailable};
+    use crate::outcome::{AttemptFailure, AttemptRoute, failure_reason};
     use crate::outcome::{PeerFailure, PeerReason};
-    #[allow(unused_imports)]
-    pub(crate) use crate::outcome::{
-        attempt_evidence, failure_reason, owner_failure, peer_failure, semantic_failure,
-    };
     use crate::{cache, http::Headers};
     use cache::{
         http_metadata::{decimal, identity_encoding, text},
