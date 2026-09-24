@@ -219,6 +219,20 @@ impl KernelRing {
     pub(crate) fn pending(&self) -> u32 {
         self.tail.wrapping_sub(load(self.sq_head))
     }
+    #[cfg(test)]
+    pub(crate) fn unpublished(&self, id: u64) -> Option<abi::Sqe> {
+        let mut cursor = load(self.sq_tail);
+        while cursor != self.tail {
+            let index = (cursor & (self.sq_size - 1)) as usize;
+            // SAFETY: only this worker owns these not-yet-published SQEs.
+            let sqe = unsafe { *self.sqes.as_ptr().add(index) };
+            if sqe.user_data == id {
+                return Some(sqe);
+            }
+            cursor = cursor.wrapping_add(1);
+        }
+        None
+    }
     pub(crate) fn discard_unsubmitted(&mut self, id: u64) -> bool {
         // Only touch SQEs whose tail has never been published to the kernel.
         let mut cursor = load(self.sq_tail);

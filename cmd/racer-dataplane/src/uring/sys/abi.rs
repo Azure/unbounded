@@ -100,6 +100,7 @@ pub(crate) const READ: u8 = 22;
 pub(crate) const SEND: u8 = 26;
 pub(crate) const RECV: u8 = 27;
 pub(crate) const SEND_ZC: u8 = 47;
+pub(crate) const ASYNC: u8 = 1 << 4; // IOSQE_ASYNC
 pub(crate) const MORE: u32 = 2;
 pub(crate) const NOTIF: u32 = 8;
 pub(crate) const WAKE: u64 = 0;

@@ -674,6 +674,17 @@ impl Ring {
         fd: Option<Descriptor>,
         io: Option<crate::slab_io::Io>,
     ) -> Result<Ticket<O>, (io::Error, Resource)> {
+        // Buffered file IO can block even during io_uring's initial nonblocking
+        // issue (for example ext4 readahead waiting for block tags). Keep that
+        // work off the reactor so it can service peers, deadlines and heartbeats.
+        // Pipe-to-socket draining and socket IO retain their poll-driven fast path.
+        if matches!(
+            sqe.opcode,
+            abi::READ_FIXED | abi::WRITE_FIXED | 22 | 23 | 3 | 17
+        ) || (sqe.opcode == 30 && sqe.addr != u64::MAX)
+        {
+            sqe.flags |= abi::ASYNC;
+        }
         let io = io.filter(|io| io.limited());
         let reserve =
             if io.is_some() || matches!(sqe.opcode, abi::ACCEPT | abi::RECV | abi::CONNECT) {
