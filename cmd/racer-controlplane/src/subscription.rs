@@ -468,6 +468,7 @@ async fn config_inner(
     let (universe, node, pod) = state.authorize(&peer, boot)?;
     let deadline = tokio::time::Instant::now() + state.wait;
     let mut observed = false;
+    let mut response_permit = None;
     loop {
         // Subscribe before reading either topology or policy to close the lost-wakeup race.
         let mut changes = state
@@ -526,12 +527,21 @@ async fn config_inner(
         if !unchanged {
             // Wait with small identities only. The permit remains in the Body
             // until it is consumed or dropped, bounding slow-reader responses.
-            let permit = state
-                .responses
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if response_permit.is_none() {
+                response_permit = Some(
+                    state
+                        .responses
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+                );
+                // Admission can span many publications. Refresh revision,
+                // selection, policy, and authorization before building anything.
+                // Retain admission across publication races so current work does
+                // not repeatedly return to the tail of a fleet-sized queue.
+                continue;
+            }
             let (snapshot, publication, snapshot_selected) =
                 state.snapshot(&universe, &node, &pod).await?;
             if snapshot.value.revision != revision
@@ -554,7 +564,6 @@ async fn config_inner(
             state.authorize(&peer, boot)?;
             if next_cursor == cursor {
                 drop(snapshot);
-                drop(permit);
             } else {
                 let desired = proto::DesiredState {
                     universe: snapshot.value.universe.clone(),
@@ -574,6 +583,7 @@ async fn config_inner(
                 };
                 let bytes = desired.encode_to_vec();
                 let length = bytes.len();
+                let permit = response_permit.take().expect("response admitted");
                 let body =
                     futures::stream::unfold((Some(bytes), permit), |(bytes, permit)| async move {
                         bytes
@@ -587,6 +597,8 @@ async fn config_inner(
                     .unwrap());
             }
         }
+        // An unchanged long poll must not occupy a response slot.
+        drop(response_permit.take());
         // A waiter retains no snapshot payload or publication. Payload eviction
         // therefore bounds aggregate snapshot memory even with 10,000 subscribers.
         if tokio::time::Instant::now() >= deadline {

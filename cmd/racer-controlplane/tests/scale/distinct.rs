@@ -267,6 +267,10 @@ async fn bounded<T>(
 }
 
 fn run_bounded(nodes: usize, universes: usize, slots: u32, stress: bool) {
+    run_bounded_churn(nodes, universes, slots, stress, false);
+}
+
+fn run_bounded_churn(nodes: usize, universes: usize, slots: u32, stress: bool, churn: bool) {
     assert!(
         universes > 0 && nodes >= universes && nodes <= 16000 && nodes.is_multiple_of(universes),
         "scale geometry requires 1 <= universes <= nodes <= 16000 and evenly divided universes"
@@ -283,7 +287,7 @@ fn run_bounded(nodes: usize, universes: usize, slots: u32, stress: bool) {
         runtime.block_on(bounded(
             if stress { 140 } else { 12 },
             "whole scenario",
-            scenario(nodes, universes, slots, stress, progress.clone()),
+            scenario(nodes, universes, slots, stress, churn, progress.clone()),
         ))
     }));
     if result.is_err() {
@@ -567,6 +571,224 @@ fn distinct_tls_representative() {
     run_bounded(24, 3, 512, false);
 }
 
+#[test]
+#[ignore = "1500-recipient full-geometry TLS churn; run separately in release"]
+fn distinct_tls_rollout_churn() {
+    assert!(!cfg!(debug_assertions), "run the churn scenario in release");
+    run_bounded_churn(1500, 1, SLOT_COUNT, true, true);
+}
+
+#[tokio::test]
+async fn queued_admission_refreshes_state_and_fails_closed() {
+    let mut ca = Authority::generate(unix_now(), 86400, 60).unwrap();
+    ca.last_issued_expiry = unix_now() + 7200;
+    let identity = Identity {
+        kind: IdentityKind::Node,
+        universe: identity("universe", "queued"),
+        node: identity("node", "queued"),
+        pod_uid: "pod-queued".into(),
+        pod_name: "queued".into(),
+        boot_id: "a".repeat(64),
+        container_id: String::new(),
+    };
+    let (cert, key) = leaf(&ca, &identity, 0);
+    let (server_cert, server_key) = leaf(
+        &ca,
+        &Identity {
+            kind: IdentityKind::ControlPlane,
+            universe: String::new(),
+            node: String::new(),
+            pod_uid: "control".into(),
+            pod_name: "control".into(),
+            boot_id: "b".repeat(64),
+            container_id: String::new(),
+        },
+        1,
+    );
+    let bundle = crate::security::TrustBundle {
+        version: 1,
+        generation: 1,
+        active: ca.digest.clone(),
+        certificates: ca.certificate.clone(),
+    };
+    let tls = TlsSnapshot::new(
+        &bundle.json(),
+        &X509::from_der(&server_cert).unwrap().to_pem().unwrap(),
+        &PKey::private_key_from_pkcs8(&server_key)
+            .unwrap()
+            .private_key_to_pem_pkcs8()
+            .unwrap(),
+    )
+    .unwrap();
+    // Peer evidence must come from a real authenticated handshake, even though
+    // the deterministic queue checks below call the handler directly.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepting = tokio::spawn(async move {
+        tls.accept(listener.accept().await.unwrap().0, true)
+            .await
+            .unwrap()
+            .1
+            .unwrap()
+    });
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(
+            X509::from_pem(ca.certificate.as_bytes())
+                .unwrap()
+                .to_der()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_client_auth_cert(
+        vec![cert.into()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()),
+    )
+    .unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(
+            rustls::pki_types::ServerName::try_from("racer-controlplane.system.svc").unwrap(),
+            TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = accepting.await.unwrap();
+    drop(stream);
+    let image = StateImage {
+        metadata: serde_json::to_vec(&json!({
+            "version":5,"namespace":"system","fence":"scale","generation":1,
+            "active":ca.digest,"phase":"stable","authorities":[ca],
+            "rotation_nonce":"","published_at":null,"overlap_delay":60,"retirement_skew":60
+        }))
+        .unwrap(),
+        shards: BTreeMap::new(),
+    };
+    let security = Arc::new(RwLock::new(Some(SecurityContext {
+        fence: "scale".into(),
+        state: Arc::new(CaState::from_image(&image).unwrap()),
+    })));
+    let getter = security.clone();
+    let state = Subscriptions::new(
+        Arc::new(move || getter.read().unwrap().clone()),
+        1 << 20,
+        Duration::from_millis(10),
+    );
+    state.set_fence(Some("scale".into()));
+    let mut generation = Generation::empty("queued");
+    generation.revision = 1;
+    generation.nodes.insert(
+        "queued".into(),
+        Member {
+            id: identity.node.clone(),
+            ip: Some("10.0.0.1".parse().unwrap()),
+            pod_uid: identity.pod_uid.clone(),
+            pod_name: identity.pod_name.clone(),
+            pod_namespace: "system".into(),
+            fabric: String::new(),
+        },
+    );
+    state.install(Arc::new(generation.clone())).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-racer-profile", "1".parse().unwrap());
+    headers.insert("x-racer-boot", identity.boot_id.parse().unwrap());
+    headers.insert("x-racer-storage-policy", "1".parse().unwrap());
+    let policy = crate::storage::StoragePolicy::for_node("queued")
+        .resolve("queued", Some("1Gi"), None)
+        .unwrap();
+    state.install_policy(Arc::new(policy));
+    for action in ["publication", "revocation", "authority", "cancellation"] {
+        state.set_live_selections(BTreeMap::from([(
+            (identity.universe.clone(), identity.node.clone()),
+            state.universes.read().unwrap()[&identity.universe].selections[&identity.node].clone(),
+        )]));
+        let held = state
+            .responses
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+        let mut request = Box::pin(config_inner(
+            state.clone(),
+            Some(peer.clone()),
+            headers.clone(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut request)
+                .await
+                .is_err()
+        );
+        match action {
+            "publication" => {
+                generation.revision = 2;
+                generation.nodes.get_mut("queued").unwrap().ip = Some("10.0.0.2".parse().unwrap());
+                state.install(Arc::new(generation.clone())).unwrap();
+                let mut policy = crate::storage::StoragePolicy::for_node("queued")
+                    .resolve("queued", Some("2Gi"), None)
+                    .unwrap();
+                policy.version = 2;
+                state.install_policy(Arc::new(policy));
+            }
+            "revocation" => state.set_live_selections(BTreeMap::new()),
+            "authority" => *security.write().unwrap() = None,
+            "cancellation" => {
+                drop(request);
+                drop(held);
+                assert_eq!(state.response_count(), 0);
+                break;
+            }
+            _ => unreachable!(),
+        }
+        drop(held);
+        // A competing fleet fills the response queue behind this request. A
+        // pre-admission revision mismatch must not yield this request's permit
+        // and then wait behind that fleet a second time.
+        let result = {
+            let competitor = state.responses.clone().acquire_many_owned(16);
+            tokio::pin!(competitor);
+            let mut competing_permits = None;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    biased;
+                    result = &mut request => result,
+                    held = &mut competitor => {
+                        competing_permits = Some(held.unwrap());
+                        request.await
+                    }
+                }
+            })
+            .await
+            .expect("admitted request requeued behind the competing fleet")
+        };
+        match action {
+            "publication" => {
+                let body = axum::body::to_bytes(result.unwrap().into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let desired = proto::DesiredState::decode(body).unwrap();
+                assert_eq!(desired.revision, 2);
+                assert_eq!(desired.storage_policy.unwrap().desired_bytes, 2 << 30);
+            }
+            "revocation" => assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN),
+            "authority" => {
+                assert_eq!(result.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
+                *security.write().unwrap() = Some(SecurityContext {
+                    fence: "scale".into(),
+                    state: Arc::new(CaState::from_image(&image).unwrap()),
+                });
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(state.response_count(), 0);
+    }
+}
+
 #[tokio::test]
 async fn scale_coordinator_cancels_siblings_on_failure() {
     use futures::FutureExt;
@@ -664,6 +886,7 @@ async fn scenario(
     universes: usize,
     slots: u32,
     stress: bool,
+    churn: bool,
     progress: Arc<Progress>,
 ) {
     progress.report("start");
@@ -894,6 +1117,41 @@ async fn scenario(
         }
     }
     let _accept_task = AbortOnDrop(accept_task);
+    // Change a real member endpoint while recipients are queued for their first
+    // full snapshot. Keep publishing until every recipient makes progress, not
+    // merely until a fixed burst ends and lets a starved queue recover.
+    let (stop_churn, mut churn_stopped) = watch::channel(false);
+    let churn_publications = Arc::new(AtomicUsize::new(0));
+    let churn_task = if churn {
+        let subscriptions = subscriptions.clone();
+        let mut generation = generations[0].clone();
+        let publications = churn_publications.clone();
+        Some(AbortOnDrop(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = churn_stopped.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                generation.revision =
+                    revisions(0).0 + publications.load(Ordering::Relaxed) as u64 + 1;
+                let member = generation.nodes.values_mut().next().unwrap();
+                member.ip = Some(if generation.revision.is_multiple_of(2) {
+                    "10.250.0.1".parse().unwrap()
+                } else {
+                    "10.250.0.2".parse().unwrap()
+                });
+                let state = subscriptions.clone();
+                let next = Arc::new(generation.clone());
+                tokio::task::spawn_blocking(move || state.install(next))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                publications.fetch_add(1, Ordering::Relaxed);
+            }
+        })))
+    } else {
+        None
+    };
     let (events, mut receiver) = mpsc::channel(nodes);
     let (finish, finished) = watch::channel(false);
     let connections = Arc::new(Semaphore::new(128));
@@ -921,7 +1179,11 @@ async fn scenario(
                 send(&mut stream, &boot, "", &progress).await;
                 let (mut cursor, revision, bytes, latency) =
                     receive(&mut stream, &node, &progress).await.unwrap();
-                assert_eq!(revision, initial_revision);
+                if churn {
+                    assert!((initial_revision..successor_revision).contains(&revision));
+                } else {
+                    assert_eq!(revision, initial_revision);
+                }
                 if !progress.event(&events, (0, bytes, latency)).await {
                     return;
                 }
@@ -931,6 +1193,11 @@ async fn scenario(
                     if let Some((next, revision, bytes, latency)) =
                         receive(&mut stream, &node, &progress).await
                     {
+                        if churn && revision < successor_revision {
+                            assert!(revision >= initial_revision);
+                            cursor = next;
+                            continue;
+                        }
                         assert_eq!(revision, successor_revision);
                         cursor = next;
                         if !progress.event(&events, (1, bytes, latency)).await {
@@ -989,6 +1256,17 @@ async fn scenario(
         initial_latency.push(latency);
     }
     let initial = json!({"wall_seconds":phase_start.elapsed().as_secs_f64(),"cpu_start":cpu_start,"resources":sample(),"bytes":initial_bytes,"qps":nodes as f64/phase_start.elapsed().as_secs_f64(),"first_byte":latencies(initial_latency)});
+    if let Some(mut task) = churn_task {
+        stop_churn.send(true).unwrap();
+        bounded(3, "stop churn publisher", async { (&mut task.0).await })
+            .await
+            .unwrap();
+        eprintln!(
+            "CHURN_RESULT publications={} initial={initial}",
+            churn_publications.load(Ordering::Relaxed)
+        );
+        assert!(churn_publications.load(Ordering::Relaxed) >= 2);
+    }
     progress.enter("initial held requests");
     await_waiters(&subscriptions, nodes, 3, "initial held requests").await;
     let held_start = sample();
