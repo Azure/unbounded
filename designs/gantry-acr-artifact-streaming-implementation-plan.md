@@ -433,24 +433,21 @@ tests and callers that do not enable Artifact Streaming.
 
 ### Gantry configuration
 
-Add flat fields consistent with the existing config style:
+Expose only the two decisions an operator actually owns:
 
 ```text
 artifact_streaming_enabled
 artifact_streaming_allowed_host_suffixes
-artifact_streaming_peer_lookup_timeout
-artifact_streaming_max_peer_attempts
-artifact_streaming_max_concurrent_origin_reads
-artifact_streaming_origin_response_header_timeout
 ```
 
-The exact timeout/concurrency defaults come from Phase 0 measurements. Add each
-scalar to defaults, YAML, environment, flags, validation, redacted output, and
-configuration tests. Keep the host suffix list YAML-only unless an established
-list flag pattern is added.
+The peer lookup budget, peer attempt count, origin read concurrency, and origin
+response-header timeout are tuning values rather than operator policy: a wrong
+value degrades cold-start latency in ways an operator cannot observe from the
+outside. Keep them as defaults in `internal/gantry/streaming` beside the
+behavior they govern and change them with a measurement, not a knob.
 
-Validation must reject enabled configurations with an empty allowlist,
-non-positive budgets, malformed host entries, or origin concurrency below one.
+Validation must reject an enabled configuration with an empty allowlist or a
+malformed host entry.
 
 ### Metrics
 
@@ -534,6 +531,8 @@ upstream Peerd configurator:
 - node selector/affinity limiting it to Artifact Streaming node pools;
 - use the AKS-provided `/opt/acr/tools/overlaybd/config.sh` rather than editing
   JSON with string replacement;
+- set only `p2pConfig` and leave every other OverlayBD setting exactly as the
+  host had it;
 - verify Gantry readiness before enabling the proxy;
 - record the previous values for rollback;
 - avoid repeated service restarts when the desired config is already present;

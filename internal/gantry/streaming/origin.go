@@ -23,6 +23,11 @@ const (
 	defaultOriginDialTimeout         = 30 * time.Second
 	defaultOriginTLSHandshakeTimeout = 10 * time.Second
 	defaultOriginIdleConnTimeout     = 90 * time.Second
+
+	// Origin range reads are bounded separately from complete chair pulls so a
+	// slow registry cannot starve them.
+	maxConcurrentOriginReads    = 32
+	originResponseHeaderTimeout = 30 * time.Second
 )
 
 // OriginStatusError reports a non-206 response from the signed origin.
@@ -44,15 +49,7 @@ type OriginClient struct {
 type redirectDigestContextKey struct{}
 
 // NewOriginClient constructs a client with independent origin concurrency.
-func NewOriginClient(policy URLPolicy, maxConcurrent int, responseHeaderTimeout time.Duration) (*OriginClient, error) {
-	if maxConcurrent < 1 {
-		return nil, fmt.Errorf("streaming origin concurrency must be positive")
-	}
-
-	if responseHeaderTimeout <= 0 {
-		return nil, fmt.Errorf("streaming response header timeout must be positive")
-	}
-
+func NewOriginClient(policy URLPolicy) *OriginClient {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: defaultOriginDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -61,7 +58,7 @@ func NewOriginClient(policy URLPolicy, maxConcurrent int, responseHeaderTimeout 
 		IdleConnTimeout:       defaultOriginIdleConnTimeout,
 		TLSHandshakeTimeout:   defaultOriginTLSHandshakeTimeout,
 		ExpectContinueTimeout: time.Second,
-		ResponseHeaderTimeout: responseHeaderTimeout,
+		ResponseHeaderTimeout: originResponseHeaderTimeout,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 
@@ -90,7 +87,7 @@ func NewOriginClient(policy URLPolicy, maxConcurrent int, responseHeaderTimeout 
 		},
 	}
 
-	return &OriginClient{hc: hc, sem: make(chan struct{}, maxConcurrent)}, nil
+	return &OriginClient{hc: hc, sem: make(chan struct{}, maxConcurrentOriginReads)}
 }
 
 // FetchRange fetches exactly requested from origin and returns the complete

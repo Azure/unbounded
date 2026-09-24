@@ -35,14 +35,24 @@ type OriginRangeFetcher interface {
 	FetchRange(ctx context.Context, origin OriginURL, requested httprange.Range) (io.ReadCloser, int64, string, error)
 }
 
+// Tuning values rather than operator configuration: changing one requires a
+// latency measurement, so they live in code with the behavior they affect.
+const (
+	defaultPeerLookupTimeout = 250 * time.Millisecond
+	defaultMaxPeerAttempts   = 3
+)
+
 type Options struct {
-	URLPolicy         URLPolicy
+	URLPolicy URLPolicy
+
+	// PeerLookupTimeout and MaxPeerAttempts fall back to defaults when zero.
 	PeerLookupTimeout time.Duration
 	MaxPeerAttempts   int
-	SelfPeerID        ifaces.NodeID
-	StartupGated      bool
-	Logger            *slog.Logger
-	Metrics           MetricsHooks
+
+	SelfPeerID   ifaces.NodeID
+	StartupGated bool
+	Logger       *slog.Logger
+	Metrics      MetricsHooks
 }
 
 type MetricsHooks struct {
@@ -70,11 +80,11 @@ func NewServer(local LocalRangeStore, discovery ProviderDiscovery, peer PeerRang
 	}
 
 	if opts.PeerLookupTimeout <= 0 {
-		return nil, fmt.Errorf("streaming server: peer lookup timeout must be positive")
+		opts.PeerLookupTimeout = defaultPeerLookupTimeout
 	}
 
 	if opts.MaxPeerAttempts < 1 {
-		return nil, fmt.Errorf("streaming server: max peer attempts must be positive")
+		opts.MaxPeerAttempts = defaultMaxPeerAttempts
 	}
 
 	if opts.Logger == nil {
