@@ -10,7 +10,7 @@ const (
 	ConditionReady    = "Ready"
 )
 
-// P2PCache names a node-local HTTP cache backed by a node-local origin.
+// ClusterCache names a node-local HTTP cache backed by a node-local origin.
 // Each selected nonterminating Site has an independent cache universe.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
@@ -20,15 +20,15 @@ const (
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=".status.participants.desired"
 // +kubebuilder:printcolumn:name="Participants",type=integer,JSONPath=".status.participants.ready"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
-type P2PCache struct {
+type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 	// +kubebuilder:default={cacheGeneration:1,maxCandidateAttempts:3}
-	Spec   P2PCacheSpec   `json:"spec,omitempty"`
-	Status P2PCacheStatus `json:"status,omitempty"`
+	Spec   ClusterCacheSpec   `json:"spec,omitempty"`
+	Status ClusterCacheStatus `json:"status,omitempty"`
 }
 
-type P2PCacheSpec struct {
+type ClusterCacheSpec struct {
 	// SiteSelector matches Site labels. An omitted or empty selector matches all
 	// nonterminating Sites.
 	// +optional
@@ -46,16 +46,22 @@ type P2PCacheSpec struct {
 	MaxCandidateAttempts int32 `json:"maxCandidateAttempts"`
 }
 
-type P2PCacheStatus struct {
+type ClusterCacheStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// CacheSocket is the configured node-local cache path, not a readiness signal.
+	// +optional
+	CacheSocket string `json:"cacheSocket,omitempty"`
+	// OriginSocket is the configured node-local origin path, not a readiness signal.
+	// +optional
+	OriginSocket string `json:"originSocket,omitempty"`
 	// Conditions describe acceptance and activation, not origin availability.
 	// +listType=map
 	// +listMapKey=type
-	Conditions   []metav1.Condition   `json:"conditions,omitempty"`
-	Participants P2PCacheParticipants `json:"participants,omitempty"`
+	Conditions   []metav1.Condition       `json:"conditions,omitempty"`
+	Participants ClusterCacheParticipants `json:"participants,omitempty"`
 }
 
-type P2PCacheParticipants struct {
+type ClusterCacheParticipants struct {
 	// Desired includes eligible Nodes even while their dataplane is starting.
 	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=0
@@ -67,8 +73,8 @@ type P2PCacheParticipants struct {
 }
 
 // +kubebuilder:object:root=true
-type P2PCacheList struct {
+type ClusterCacheList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []P2PCache `json:"items"`
+	Items           []ClusterCache `json:"items"`
 }

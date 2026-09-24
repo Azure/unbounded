@@ -74,7 +74,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Gantry's optional Racer backend creates a dedicated cache and validates it.
   - apiGroups: ["racer.unbounded-cloud.io"]
-    resources: ["p2pcaches"]
+    resources: ["clustercaches"]
     verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]

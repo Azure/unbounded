@@ -74,13 +74,16 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 		log.Fatal(err)
 	}
 
-	listener, err := net.Listen("unix", "/dev/racer/dataset/origin")
+	// Supply ClusterCache.status.originSocket, for example /run/racer/<uid>/origin.
+	originSocket := os.Getenv("RACER_ORIGIN_SOCKET")
+
+	listener, err := net.Listen("unix", originSocket)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
 
-	if err := os.Chmod("/dev/racer/dataset/origin", 0o660); err != nil {
+	if err := os.Chmod(originSocket, 0o660); err != nil {
 		log.Fatal(err)
 	}
 
@@ -89,7 +92,8 @@ func ExampleNewOrigin() { //nolint:testableexamples // Illustrates a long-runnin
 }
 
 func ExampleClient_Open() { //nolint:testableexamples // Requires an external cache serving application data.
-	client, err := racer.NewClient("/dev/racer/dataset/cache", racer.ClientOptions{Concurrency: 8})
+	// Supply ClusterCache.status.cacheSocket, for example /run/racer/<uid>/cache.
+	client, err := racer.NewClient(os.Getenv("RACER_CACHE_SOCKET"), racer.ClientOptions{Concurrency: 8})
 	if err != nil {
 		log.Fatal(err)
 	}

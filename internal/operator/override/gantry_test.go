@@ -23,10 +23,11 @@ func TestGantryBackendAuthority(t *testing.T) {
 	}{
 		{name: "resources and unrelated flags", valid: true, change: func(c *corev1.Container) { c.Args = append(c.Args, "--log-level=debug") }},
 		{name: "backend flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--content-backend=racer") }},
-		{name: "cache flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-name", "other") }},
+		{name: "cache flag", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-uid", "other") }},
+		{name: "cache flag equals", change: func(c *corev1.Container) { c.Args = append(c.Args, "--racer-cache-uid=other") }},
 		{name: "config redirect", change: func(c *corev1.Container) { c.Args = []string{"agent", "--config=/other"} }},
 		{name: "backend env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_CONTENT_BACKEND", Value: "racer"}} }},
-		{name: "cache env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_RACER_CACHE_NAME", Value: "other"}} }},
+		{name: "cache env", change: func(c *corev1.Container) { c.Env = []corev1.EnvVar{{Name: "GANTRY_RACER_CACHE_UID", Value: "other"}} }},
 		{name: "opaque envFrom", change: func(c *corev1.Container) {
 			c.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "hidden"}}}}
 		}},
@@ -61,8 +62,8 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 			AutomountServiceAccountToken: &no,
 			SecurityContext:              &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}},
 			Volumes:                      []corev1.Volume{{Name: "racer-sockets"}},
-			InitContainers:               []corev1.Container{{Name: "chown-hostpaths", Command: []string{"sh", "-c", "mkdir -p /dev/racer/cache"}}},
-			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-name=cache"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/dev/racer"}}}},
+			InitContainers:               []corev1.Container{{Name: "chown-hostpaths", Command: []string{"sh", "-c", "mkdir -p /run/racer/selected-uid"}}},
+			Containers:                   []corev1.Container{{Name: "gantry", Args: []string{"agent", "--config=/etc/gantry/config.yaml", "--content-backend=racer", "--racer-cache-uid=selected-uid"}, VolumeMounts: []corev1.VolumeMount{{Name: "racer-sockets", MountPath: "/run/racer"}}}},
 		},
 	}}}
 
@@ -78,7 +79,7 @@ func TestGantryRacerPodSelectionProtected(t *testing.T) {
 			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "transfer", ContainerPort: 5001}}
 		}},
 		{name: "mount", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].VolumeMounts = nil }},
-		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-name=other" }},
+		{name: "cache args", mutate: func(p *corev1.PodTemplateSpec) { p.Spec.Containers[0].Args[3] = "--racer-cache-uid=other" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := ds.DeepCopy()
@@ -107,7 +108,7 @@ func TestGantryOverrideWithholdsHiddenBackend(t *testing.T) {
 }
 
 func TestRacerOriginCoverageOverrides(t *testing.T) {
-	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: "racer-edge"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "dataplane", VolumeMounts: []corev1.VolumeMount{{Name: "sockets", MountPath: "/dev/racer"}}}}}}}}
+	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: "racer-edge"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "dataplane", VolumeMounts: []corev1.VolumeMount{{Name: "sockets", MountPath: "/run/racer"}}}}}}}}
 
 	for _, tc := range []struct {
 		name   string

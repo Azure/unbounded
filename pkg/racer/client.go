@@ -41,7 +41,8 @@ type Client struct {
 }
 
 // NewClient connects to an absolute filesystem Unix socket, such as
-// /dev/racer/dataset/cache. Targets are exact, already-escaped path/query strings.
+// /run/racer/<uid>/cache, published in ClusterCache.status.cacheSocket.
+// Targets are exact, already-escaped path/query strings.
 func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	if !filepath.IsAbs(endpoint) || len(endpoint) > 107 || strings.ContainsRune(endpoint, 0) {
 		return nil, fmt.Errorf("racer: invalid Unix socket path %q", endpoint)

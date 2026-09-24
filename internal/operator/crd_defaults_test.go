@@ -78,7 +78,7 @@ func TestSiteCRDDefaultsTokenRefresherEnabled(t *testing.T) {
 	}
 }
 
-// Keep the historical test name while asserting the P2PCache-driven contract:
+// Keep the historical test name while asserting the ClusterCache-driven contract:
 // Sites no longer expose a Racer component or an installation vote.
 func TestSiteCRDRacerIsOptIn(t *testing.T) {
 	crd := findSiteCRD(t)

@@ -78,7 +78,7 @@ func TestDeployment(t *testing.T) {
 	c.checkObject("probe-a", "racer-volume", "/after-origin-recreation", 1)
 	t.Log("cache-generation update")
 	c.setVersion("origin", 2)
-	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":2}}`)
+	c.must("patch", "clustercache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":2}}`)
 
 	revision = c.converge(revision, "racer-volume")
 	for _, probe := range []string{"probe-a", "probe-b"} {
@@ -86,16 +86,16 @@ func TestDeployment(t *testing.T) {
 	}
 
 	t.Log("independent second volume and removal")
-	c.setVersion("origin-alt", 3)
 	c.apply(cacheResource("second-volume", primarySite))
+	c.startAlternateOrigins("second-volume")
 	revision = c.converge(revision, "racer-volume", "second-volume")
 
-	var first, second racerapi.P2PCache
-	if err := c.get("p2pcache", "racer-volume", &first); err != nil {
+	var first, second racerapi.ClusterCache
+	if err := c.get("clustercache", "racer-volume", &first); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := c.get("p2pcache", "second-volume", &second); err != nil {
+	if err := c.get("clustercache", "second-volume", &second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,7 +108,7 @@ func TestDeployment(t *testing.T) {
 		c.checkObject(probe, "racer-volume", "/object-0", 2)
 	}
 
-	c.must("delete", "p2pcache/second-volume", "--wait=false")
+	c.must("delete", "clustercache/second-volume", "--wait=false")
 	revision = c.converge(revision, "racer-volume")
 
 	t.Log("controller leader replacement and newer revision allocation")
@@ -131,14 +131,14 @@ func TestDeployment(t *testing.T) {
 	})
 	// A fresh object proves origin access still works after leadership changes.
 	c.checkObject("probe-a", "racer-volume", "/after-failover", 2)
-	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":3}}`)
+	c.must("patch", "clustercache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":3}}`)
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
 	c.checkCAUnchanged(keys)
 	t.Log("all controller replicas restart and reuse the CA")
 	c.must("delete", "pods", "-l", controlSelector, "--wait=false")
 	c.leader()
-	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":4}}`)
+	c.must("patch", "clustercache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":4}}`)
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
 	c.checkCAUnchanged(keys)
@@ -390,7 +390,7 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 
 	var revision uint64
 
-	c.await("all workers and P2PCaches converged", func() error {
+	c.await("all workers and ClusterCaches converged", func() error {
 		pods, err := c.pods(dataplaneSelector)
 		if err != nil {
 			return err
@@ -434,8 +434,8 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 			}
 
 			for _, name := range volumes {
-				var cache racerapi.P2PCache
-				if err := c.get("p2pcache", name, &cache); err != nil {
+				var cache racerapi.ClusterCache
+				if err := c.get("clustercache", name, &cache); err != nil {
 					return err
 				}
 
@@ -460,13 +460,22 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 		}
 
 		for _, name := range volumes {
-			var cache racerapi.P2PCache
-			if err := c.get("p2pcache", name, &cache); err != nil {
+			var cache racerapi.ClusterCache
+			if err := c.get("clustercache", name, &cache); err != nil {
 				return err
 			}
 
 			if cache.Status.ObservedGeneration != cache.Generation || !apiMeta.IsStatusConditionTrue(cache.Status.Conditions, "Ready") || cache.Status.Participants.Desired != 2 || cache.Status.Participants.Ready != 2 {
 				return fmt.Errorf("cache status not converged: %+v", cache.Status)
+			}
+
+			cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID))
+			if err != nil {
+				return err
+			}
+
+			if cache.Status.CacheSocket != cacheSocket || cache.Status.OriginSocket != originSocket {
+				return fmt.Errorf("cache %s socket status does not match UID %s: %+v", name, cache.UID, cache.Status)
 			}
 			// Verify each local origin independently of activation readiness.
 			for _, probe := range []string{"probe-a", "probe-b"} {
@@ -935,7 +944,7 @@ func (c *cluster) must(args ...string) []byte {
 func (c *cluster) apply(value any) {
 	c.t.Helper()
 
-	if cache, ok := value.(*racerapi.P2PCache); ok {
+	if cache, ok := value.(*racerapi.ClusterCache); ok {
 		if err := validateFixtureCache(cache); err != nil {
 			c.t.Fatal(err)
 		}
@@ -1030,15 +1039,13 @@ func (c *cluster) deploy() {
 	c.apply(testSite(primarySite))
 	c.apply(cacheResource("racer-volume", primarySite))
 
-	for _, name := range []string{"origin", "origin-alt"} {
-		c.fixturePod(name, c.name+"-worker", name)
-		c.fixturePod(name+"-b", c.name+"-worker2", name)
-	}
+	c.fixturePod("origin", c.name+"-worker", "origin")
+	c.fixturePod("origin-b", c.name+"-worker2", "origin")
 
 	c.fixturePod("probe-a", c.name+"-worker", "probe")
 	c.fixturePod("probe-b", c.name+"-worker2", "probe")
 	c.await("origin and probe readiness", func() error {
-		for _, name := range []string{"origin", "origin-b", "origin-alt", "origin-alt-b", "probe-a", "probe-b"} {
+		for _, name := range []string{"origin", "origin-b", "probe-a", "probe-b"} {
 			var p core.Pod
 			if err := c.get("pod", name, &p); err != nil {
 				return err
@@ -1052,21 +1059,31 @@ func (c *cluster) deploy() {
 		return nil
 	})
 	c.manifest("volume", func(_ string, raw []byte) any {
-		var s racerapi.P2PCache
+		var s racerapi.ClusterCache
 		decode(c.t, raw, &s)
 
 		return &s
 	})
 }
 
-func (c *cluster) fixturePod(name, node, app string) {
+func (c *cluster) fixturePod(name, node, app string, caches ...string) {
 	args := []string{"serve"}
+
 	if app == "origin" {
-		args = append(args, "racer-volume")
+		caches = []string{"racer-volume"}
 	}
 
-	if app == "origin-alt" {
-		args = append(args, "second-volume", "site-b-volume")
+	for _, name := range caches {
+		var cache racerapi.ClusterCache
+		if err := c.get("clustercache", name, &cache); err != nil {
+			c.t.Fatal(err)
+		}
+
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+			c.t.Fatal(err)
+		}
+
+		args = append(args, string(cache.UID))
 	}
 
 	c.apply(&core.Pod{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": app}}, Spec: core.PodSpec{
@@ -1081,7 +1098,34 @@ func (c *cluster) fixturePod(name, node, app string) {
 	}})
 }
 
+func (c *cluster) startAlternateOrigins(cache string) {
+	c.must("delete", "pod", "origin-alt", "origin-alt-b", "--ignore-not-found=true", "--wait=true")
+	c.fixturePod("origin-alt", c.name+"-worker", "origin-alt", cache)
+	c.fixturePod("origin-alt-b", c.name+"-worker2", "origin-alt", cache)
+	c.must("wait", "--for=condition=Ready", "pod/origin-alt", "pod/origin-alt-b", "--timeout=90s")
+	c.setVersion("origin-alt", 3)
+}
+
 func (c *cluster) request(probe, method, url, byteRange string, headers ...string) (fixture.Response, error) {
+	// Resolve the current resource after creation, including same-name recreation.
+	if strings.HasPrefix(url, "unix://") {
+		name, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
+		if !ok {
+			return fixture.Response{}, fmt.Errorf("invalid cache URL %q", url)
+		}
+
+		var cache racerapi.ClusterCache
+		if err := c.get("clustercache", name, &cache); err != nil {
+			return fixture.Response{}, err
+		}
+
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+			return fixture.Response{}, err
+		}
+
+		url = serviceURL(string(cache.UID), "/"+target)
+	}
+
 	b, err := c.kubectl(nil, append([]string{"exec", probe, "--", "/fixture", "request", method, url, byteRange}, headers...)...)
 	if err != nil {
 		return fixture.Response{}, err
@@ -1121,7 +1165,7 @@ func (c *cluster) diagnostics() {
 		name string
 		args []string
 	}{
-		{"resources.yaml", []string{"get", "pods,services,p2pcaches,daemonsets,deployments,configmaps,leases", "-o", "yaml"}},
+		{"resources.yaml", []string{"get", "pods,services,clustercaches,daemonsets,deployments,configmaps,leases", "-o", "yaml"}},
 		{"events.txt", []string{"get", "events", "--sort-by=.metadata.creationTimestamp"}},
 		{"describe.txt", []string{"describe", "pods"}},
 		{"sites.yaml", []string{"get", "sites.unbounded-cloud.io", "-o", "yaml"}},

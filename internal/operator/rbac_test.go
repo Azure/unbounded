@@ -183,8 +183,8 @@ func TestOperatorClusterRoleAllowsGantryPriorityClass(t *testing.T) {
 func TestOperatorClusterRoleAllowsGantryCache(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 	for _, verb := range []string{"get", "list", "watch", "create"} {
-		if !clusterRoleGrants(cr, "racer.unbounded-cloud.io", "p2pcaches", verb) {
-			t.Fatalf("operator must grant %s on Gantry's P2PCache", verb)
+		if !clusterRoleGrants(cr, "racer.unbounded-cloud.io", "clustercaches", verb) {
+			t.Fatalf("operator must grant %s on Gantry's ClusterCache", verb)
 		}
 	}
 }

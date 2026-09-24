@@ -47,7 +47,7 @@ func TestGantryRacerRollingSwitch(t *testing.T) {
 			[]string{"SSL_CERT_FILE=" + filepath.Join(f.dir, fmt.Sprintf("registry-%d.pem", node))},
 			os.Getenv("GANTRY_BINARY"), "agent", "--config", f.agentConfigs[node],
 			fmt.Sprintf("--node-name=node%d", node),
-			"--content-backend="+backend, fmt.Sprintf("--racer-cache-name=node%d", node),
+			"--content-backend="+backend, fmt.Sprintf("--racer-cache-uid=node%d", node),
 			"--peer-rediscover-budget=0", "--bootstrap-window=1ms", "--nf5-jitter-base=1ms", "--nf5-jitter-cap=1ms",
 			fmt.Sprintf("--transfer-listen=127.0.0.1:%d", 18000+node),
 			fmt.Sprintf("--chair-listen=127.0.0.1:%d", 19000+node))
@@ -58,7 +58,7 @@ func TestGantryRacerRollingSwitch(t *testing.T) {
 
 			for _, socket := range []string{"origin", "cache"} {
 				transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, "unix", fmt.Sprintf("/dev/racer/node%d/%s", node, socket))
+					return (&net.Dialer{}).DialContext(ctx, "unix", fmt.Sprintf("/run/racer/node%d/%s", node, socket))
 				}}
 				probe := &http.Client{Transport: transport, Timeout: time.Second}
 

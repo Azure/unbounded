@@ -41,7 +41,7 @@ func TestCLI(t *testing.T) {
 		{name: "explicit-true", args: []string{"-version=true"}},
 		{name: "before-network", args: []string{"-endpoint=invalid", "-listen=invalid", "--version"}},
 		{name: "before-validation", args: []string{"-footprint=invalid", "--version"}},
-		{name: "explicit-false", args: []string{"-version=false", "-footprint=invalid"}, wantError: true, wantStderr: "footprint:"},
+		{name: "explicit-false", args: []string{"-version=false", "-cache-uid=cli-uid", "-footprint=invalid"}, wantError: true, wantStderr: "footprint:"},
 		{name: "unknown-flag", args: []string{"--version", "-unknown"}, wantError: true, wantStderr: "flag provided but not defined"},
 		{name: "invalid-boolean", args: []string{"--version=invalid"}, wantError: true, wantStderr: "invalid boolean value"},
 		{name: "unexpected-argument", args: []string{"--version", "unexpected"}, wantError: true, wantStderr: "unexpected arguments"},

@@ -6,14 +6,14 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: p2pcaches.racer.unbounded-cloud.io
+  name: clustercaches.racer.unbounded-cloud.io
 spec:
   group: racer.unbounded-cloud.io
   names:
-    kind: P2PCache
-    listKind: P2PCacheList
-    plural: p2pcaches
-    singular: p2pcache
+    kind: ClusterCache
+    listKind: ClusterCacheList
+    plural: clustercaches
+    singular: clustercache
   scope: Cluster
   versions:
   - additionalPrinterColumns:
@@ -33,7 +33,7 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          P2PCache names a node-local HTTP cache backed by a node-local origin.
+          ClusterCache names a node-local HTTP cache backed by a node-local origin.
           Each selected nonterminating Site has an independent cache universe.
         properties:
           apiVersion:
@@ -131,6 +131,10 @@ spec:
             type: object
           status:
             properties:
+              cacheSocket:
+                description: CacheSocket is the configured node-local cache path,
+                  not a readiness signal.
+                type: string
               conditions:
                 description: Conditions describe acceptance and activation, not origin
                   availability.
@@ -195,6 +199,10 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              originSocket:
+                description: OriginSocket is the configured node-local origin path,
+                  not a readiness signal.
+                type: string
               participants:
                 properties:
                   desired:

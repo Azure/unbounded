@@ -13,7 +13,7 @@ pub const SLOT_COUNT: u32 = 262_144;
 /// Physical-owner HRW with independent Cartesian-product routing roles.
 pub const PRODUCT_ROUTING_ALGORITHM: u32 = 1;
 pub const GENERATION_FORMAT: u32 = 1;
-pub const SOCKET_ROOT: &str = "/dev/racer";
+pub const SOCKET_ROOT: &str = "/run/racer";
 
 pub fn identity_bytes(domain: &str, value: &str) -> [u8; 32] {
     Sha256::digest(format!("racer/{domain}/v1\0{value}").as_bytes()).into()
@@ -54,18 +54,20 @@ pub fn node_site(canonical: Option<&str>) -> String {
     canonical.unwrap_or_default().into()
 }
 
-pub fn cache_sockets(root: &str, name: &str) -> Result<(String, String)> {
+/// Derive sockets from the exact metadata UID, never the resource name. UIDs are
+/// 1..=63 lowercase ASCII alphanumeric bytes with optional interior hyphens.
+pub fn cache_sockets(root: &str, uid: &str) -> Result<(String, String)> {
     let label_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     if !root.starts_with('/')
         || root.contains('\0')
-        || name.is_empty()
-        || name.len() > 63
-        || !name.as_bytes().first().is_some_and(|b| label_char(*b))
-        || !name.as_bytes().last().is_some_and(|b| label_char(*b))
-        || !name.bytes().all(|b| label_char(b) || b == b'-')
+        || uid.is_empty()
+        || uid.len() > 63
+        || !uid.as_bytes().first().is_some_and(|b| label_char(*b))
+        || !uid.as_bytes().last().is_some_and(|b| label_char(*b))
+        || !uid.bytes().all(|b| label_char(b) || b == b'-')
     {
         return Err(Error(
-            "socket root must be absolute and cache name must be a DNS label".into(),
+            "socket root must be absolute and cache UID must be a lowercase DNS label of at most 63 bytes".into(),
         ));
     }
     // Match filepath.Clean without resolving symlinks or consulting the filesystem.
@@ -79,7 +81,7 @@ pub fn cache_sockets(root: &str, name: &str) -> Result<(String, String)> {
             _ => parts.push(part),
         }
     }
-    parts.push(name);
+    parts.push(uid);
     let base = format!("/{}", parts.join("/"));
     let cache = format!("{base}/cache");
     let origin = format!("{base}/origin");

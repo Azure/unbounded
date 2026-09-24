@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 const ObjectSize = 16384
@@ -43,13 +45,18 @@ func Fetch(method, url, byteRange string, headers ...string) (Response, error) {
 	transport := &http.Transport{DisableCompression: true}
 
 	if strings.HasPrefix(url, "unix://") {
-		cache, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
-		if !ok || cache == "" {
+		uid, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
+		if !ok {
 			return Response{}, fmt.Errorf("invalid local cache URL %q", url)
 		}
 
+		socket, _, err := racermeta.CacheSockets(racermeta.SocketRoot, uid)
+		if err != nil {
+			return Response{}, err
+		}
+
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", "/dev/racer/"+cache+"/cache")
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 		}
 		url = "http://localhost/" + target
 	}

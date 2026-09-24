@@ -256,7 +256,9 @@ func TestOperatorFixturePlan(t *testing.T) {
 		}
 	}
 
-	env := &component.Env{Namespace: namespace, Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cacheResource("racer-volume", primarySite)).Build()}
+	cache := cacheResource("racer-volume", primarySite)
+	cache.UID = "racer-volume-uid"
+	env := &component.Env{Namespace: namespace, Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(cache).Build()}
 
 	control, _, err := operatorracer.NewControlPlane().Plan(t.Context(), env, []machina.Site{*site})
 	if err != nil {
@@ -405,11 +407,11 @@ func testSite(name string) *machina.Site {
 	}
 }
 
-func cacheResource(name, site string) *racerapi.P2PCache {
-	return &racerapi.P2PCache{
-		TypeMeta:   meta.TypeMeta{APIVersion: racerapi.GroupVersion.String(), Kind: "P2PCache"},
+func cacheResource(name, site string) *racerapi.ClusterCache {
+	return &racerapi.ClusterCache{
+		TypeMeta:   meta.TypeMeta{APIVersion: racerapi.GroupVersion.String(), Kind: "ClusterCache"},
 		ObjectMeta: meta.ObjectMeta{Name: name},
-		Spec:       racerapi.P2PCacheSpec{SiteSelector: meta.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": site}}, CacheGeneration: 1, MaxCandidateAttempts: 3},
+		Spec:       racerapi.ClusterCacheSpec{SiteSelector: meta.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": site}}, CacheGeneration: 1, MaxCandidateAttempts: 3},
 	}
 }
 
@@ -428,6 +430,7 @@ func (c *cluster) membershipChanges() {
 	const secondSite = "racer-b"
 	c.apply(testSite(secondSite))
 	c.apply(cacheResource("site-b-volume", secondSite))
+	c.startAlternateOrigins("site-b-volume")
 	c.must("label", "node", node, racermeta.SiteLabelKey+"="+secondSite, "--overwrite")
 	c.awaitMembership(map[string]string{c.name + "-worker": primarySite, node: secondSite})
 	c.awaitVolume("probe-a", "racer-volume", "/site-isolation", 2)
@@ -441,7 +444,7 @@ func (c *cluster) membershipChanges() {
 	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 	c.leader()
 	c.checkCAUnchanged(keys)
-	c.must("delete", "p2pcache/site-b-volume")
+	c.must("delete", "clustercache/site-b-volume")
 	c.must("label", "node", node, racermeta.SiteLabelKey+"="+primarySite, "--overwrite")
 	c.converge(0, "racer-volume")
 	c.awaitVolume("probe-b", "racer-volume", "/after-site-return", 2)
@@ -562,8 +565,8 @@ func (c *cluster) checkSiteVolumeIsolation(site, volume string) {
 			return err
 		}
 
-		var cache racerapi.P2PCache
-		if err := c.get("p2pcache", volume, &cache); err != nil {
+		var cache racerapi.ClusterCache
+		if err := c.get("clustercache", volume, &cache); err != nil {
 			return err
 		}
 

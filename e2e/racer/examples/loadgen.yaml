@@ -1,5 +1,8 @@
 # Test workload only. Install the operator, create Site racer-a, and
 # label qualified Nodes unbounded-cloud.io/site=racer-a before applying.
+# After applying, configure the actual API-assigned UID (repeat after recreation):
+# kubectl -n unbounded-system create configmap racer-loadgen-cache --from-literal=uid="$(kubectl get clustercache racer-loadgen-volume -o jsonpath='{.metadata.uid}')" --dry-run=client -o yaml | kubectl apply -f -
+# kubectl -n unbounded-system rollout restart daemonset/racer-loadgen
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -49,8 +52,7 @@ spec:
           image: racer-loadgen:local
           imagePullPolicy: IfNotPresent
           args:
-            - -endpoint=/dev/racer/racer-loadgen-volume/cache
-            - -origin-socket=/dev/racer/racer-loadgen-volume/origin
+            - -cache-uid=$(RACER_CACHE_UID)
             - -listen=:8080
             - -footprint=512GB
             - -object-size=1GB
@@ -61,6 +63,11 @@ spec:
             - -ttl=1h
             - -duration=0
           env:
+            - name: RACER_CACHE_UID
+              valueFrom:
+                configMapKeyRef:
+                  name: racer-loadgen-cache
+                  key: uid
             - name: GOMAXPROCS
               value: "2"
           ports:
@@ -68,7 +75,7 @@ spec:
               containerPort: 8080
           volumeMounts:
             - name: sockets
-              mountPath: /dev/racer/racer-loadgen-volume
+              mountPath: /run/racer
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -99,11 +106,11 @@ spec:
       volumes:
         - name: sockets
           hostPath:
-            path: /dev/racer/racer-loadgen-volume
+            path: /run/racer
             type: Directory
 ---
 apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: P2PCache
+kind: ClusterCache
 metadata:
   name: racer-loadgen-volume
 spec:

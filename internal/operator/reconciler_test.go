@@ -947,7 +947,7 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 
 	targets := []*unboundedv1alpha3.Site{&sites[0]}
 
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache"}}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache", UID: "custom-cache-uid"}}).Build()
 	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
 
 	_, _, plan := planComponents(t.Context(), env, DefaultRegistry(), sites, targets)

@@ -150,9 +150,9 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 
 	quiet()
 
-	cache := &racerapi.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
+	cache := &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
 
-	cache.Spec = racerapi.P2PCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
+	cache.Spec = racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
 	if err := kube.Create(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 
 		pod := ds.Spec.Template.Spec
 		if ds.Spec.Template.Annotations["unbounded-cloud.io/gantry-cache-uid"] != string(cache.UID) ||
-			!slices.Contains(pod.Containers[0].Args, "--content-backend=racer") || !slices.Contains(pod.Containers[0].Args, "--racer-cache-name=backing") {
+			!slices.Contains(pod.Containers[0].Args, "--content-backend=racer") || !slices.Contains(pod.Containers[0].Args, "--racer-cache-uid="+string(cache.UID)) {
 			t.Fatalf("Racer selection did not reach stored pod: %+v", ds.Spec.Template)
 		}
 
@@ -175,10 +175,10 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 		}
 
 		if !slices.ContainsFunc(pod.Volumes, func(v corev1.Volume) bool {
-			return v.Name == "racer-sockets" && v.HostPath != nil && v.HostPath.Path == "/dev/racer"
+			return v.Name == "racer-sockets" && v.HostPath != nil && v.HostPath.Path == "/run/racer"
 		}) ||
 			!slices.ContainsFunc(pod.Containers[0].VolumeMounts, func(v corev1.VolumeMount) bool { return v.Name == "racer-sockets" }) ||
-			!strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "/dev/racer/backing") {
+			!strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "/run/racer/"+string(cache.UID)) {
 			t.Fatal("Racer socket volume, mount, or init command missing")
 		}
 
@@ -280,9 +280,9 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 	assertDirect()
 
 	oldUID := cache.UID
-	cache = &racerapi.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
+	cache = &racerapi.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "backing", Annotations: map[string]string{"unbounded-cloud.io/gantry-backing": "true"}}}
 
-	cache.Spec = racerapi.P2PCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
+	cache.Spec = racerapi.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}
 	if err := kube.Create(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
@@ -296,12 +296,12 @@ func TestGantryRacerAPITransitions(t *testing.T) {
 		t.Fatal("same-name cache replacement did not change pod rollout identity")
 	}
 
-	var live racerapi.P2PCache
+	var live racerapi.ClusterCache
 	if err := kube.Get(t.Context(), client.ObjectKey{Name: cache.Name}, &live); err != nil {
 		t.Fatal(err)
 	}
 
 	if live.ResourceVersion != cache.ResourceVersion {
-		t.Fatal("operator wrote user-owned P2PCache")
+		t.Fatal("operator wrote user-owned ClusterCache")
 	}
 }

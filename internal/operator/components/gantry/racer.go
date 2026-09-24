@@ -34,19 +34,19 @@ const (
 // visible diagnostic) from failed API reads (no plan, so the current pod stays).
 // ConfigMap contents and the old gantry-cache label are not selection inputs.
 // Gantry still parses its preserved YAML strictly before applying generated flags.
-func selectBackingCache(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*racerv1alpha1.P2PCache, component.Result, error) {
-	invalid := func(message string) (*racerv1alpha1.P2PCache, component.Result, error) {
+func selectBackingCache(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*racerv1alpha1.ClusterCache, component.Result, error) {
+	invalid := func(message string) (*racerv1alpha1.ClusterCache, component.Result, error) {
 		return nil, component.NotReady("InvalidGantryBacking", message+"; using direct backend"), nil
 	}
 
-	caches := &racerv1alpha1.P2PCacheList{}
+	caches := &racerv1alpha1.ClusterCacheList{}
 	if err := env.Client.List(ctx, caches); err != nil {
 		return nil, component.Result{}, fmt.Errorf("list Gantry backing caches: %w", err)
 	}
 
-	slices.SortFunc(caches.Items, func(a, b racerv1alpha1.P2PCache) int { return strings.Compare(a.Name, b.Name) })
+	slices.SortFunc(caches.Items, func(a, b racerv1alpha1.ClusterCache) int { return strings.Compare(a.Name, b.Name) })
 
-	var selected *racerv1alpha1.P2PCache
+	var selected *racerv1alpha1.ClusterCache
 
 	for i := range caches.Items {
 		cache := &caches.Items[i]
@@ -60,7 +60,7 @@ func selectBackingCache(ctx context.Context, env *component.Env, sites []unbound
 		}
 
 		if value != "true" {
-			return invalid(fmt.Sprintf("P2PCache %q annotation %s must be true or false, got %q", cache.Name, backingAnnotation, value))
+			return invalid(fmt.Sprintf("ClusterCache %q annotation %s must be true or false, got %q", cache.Name, backingAnnotation, value))
 		}
 
 		if selected != nil {
@@ -75,11 +75,11 @@ func selectBackingCache(ctx context.Context, env *component.Env, sites []unbound
 	}
 
 	if len(selected.Spec.SiteSelector.MatchLabels) != 0 || len(selected.Spec.SiteSelector.MatchExpressions) != 0 {
-		return invalid(fmt.Sprintf("Gantry backing P2PCache %q requires an empty siteSelector", selected.Name))
+		return invalid(fmt.Sprintf("Gantry backing ClusterCache %q requires an empty siteSelector", selected.Name))
 	}
 
-	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, selected.Name); err != nil {
-		return invalid(fmt.Sprintf("Gantry backing P2PCache %q: %v", selected.Name, err))
+	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(selected.UID)); err != nil {
+		return invalid(fmt.Sprintf("Gantry backing ClusterCache %q: %v", selected.Name, err))
 	}
 
 	eligible := map[string]bool{}
@@ -136,7 +136,13 @@ func daemonSetTolerates(taint corev1.Taint) bool {
 	return true
 }
 
-func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.P2PCache) error {
+func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.ClusterCache) error {
+	if cache != nil {
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, string(cache.UID)); err != nil {
+			return fmt.Errorf("gantry backing ClusterCache %q: %w", cache.Name, err)
+		}
+	}
+
 	ds := &appsv1.DaemonSet{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, ds); err != nil {
 		return err
@@ -149,7 +155,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.P2
 			if cache == nil {
 				c.Args = append(c.Args, "--content-backend=direct")
 			} else {
-				c.Args = append(c.Args, "--content-backend=racer", "--racer-cache-name="+cache.Name)
+				c.Args = append(c.Args, "--content-backend=racer", "--racer-cache-uid="+string(cache.UID))
 			}
 		}
 	}
@@ -160,7 +166,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.P2
 		}
 
 		ds.Spec.Template.Annotations[cacheUIDAnnotation] = string(cache.UID)
-		configureRacerPod(pod, cache.Name)
+		configureRacerPod(pod, string(cache.UID))
 	}
 
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ds)
@@ -174,7 +180,7 @@ func configureBackendPod(obj *unstructured.Unstructured, cache *racerv1alpha1.P2
 	return nil
 }
 
-func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
+func configureRacerPod(pod *corev1.PodSpec, cacheUID string) {
 	pod.AutomountServiceAccountToken = ptr.To(false)
 	pod.SecurityContext = &corev1.PodSecurityContext{SupplementalGroups: []int64{65532}}
 	pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "racer-sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
@@ -184,7 +190,9 @@ func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
 		init := &pod.InitContainers[i]
 		if init.Name == "chown-hostpaths" {
 			init.VolumeMounts = append(init.VolumeMounts, mount)
-			init.Command[len(init.Command)-1] += "\nmkdir -p /dev/racer/" + cacheName + "\nchgrp 65532 /dev/racer /dev/racer/" + cacheName + "\nchmod 2770 /dev/racer /dev/racer/" + cacheName + "\n"
+			root := racermeta.SocketRoot
+			directory := root + "/" + cacheUID
+			init.Command[len(init.Command)-1] += "\nmkdir -p " + directory + "\nchgrp 65532 " + root + " " + directory + "\nchmod 2770 " + root + " " + directory + "\n"
 		}
 	}
 
@@ -208,7 +216,7 @@ func configureRacerPod(pod *corev1.PodSpec, cacheName string) {
 }
 
 func setupRacerWatches(b *builder.Builder, env *component.Env) {
-	b.Watches(&racerv1alpha1.P2PCache{}, env.RequestSingleton(), builder.WithPredicates(backingCachePredicate()))
+	b.Watches(&racerv1alpha1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(backingCachePredicate()))
 	b.Watches(&unboundedv1alpha3.Site{}, env.RequestSingleton(), builder.WithPredicates(gantrySitePredicate()))
 	b.Watches(&corev1.Node{}, env.RequestSingleton(), builder.WithPredicates(gantryNodePredicate()))
 }
@@ -218,9 +226,9 @@ func backingCachePredicate() predicate.Predicate {
 		CreateFunc: func(event.CreateEvent) bool { return true },
 		DeleteFunc: func(event.DeleteEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			old, oldOK := e.ObjectOld.(*racerv1alpha1.P2PCache)
+			old, oldOK := e.ObjectOld.(*racerv1alpha1.ClusterCache)
 
-			next, nextOK := e.ObjectNew.(*racerv1alpha1.P2PCache)
+			next, nextOK := e.ObjectNew.(*racerv1alpha1.ClusterCache)
 			if !oldOK || !nextOK {
 				return false
 			}

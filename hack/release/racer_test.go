@@ -40,7 +40,7 @@ func TestRacerTargets(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(tc.caches))
+			f.set("getjson-clustercaches.racer.unbounded-cloud.io", replyOf(tc.caches))
 			f.set("getjson-serviceaccount_racer-controlplane", replyOf(tc.account))
 			f.set("getjson-deploy_racer-controlplane", replyOf(tc.deployment))
 			f.set("getjson-ds_racer-dataplane", replyOf(tc.dataplane))
@@ -81,7 +81,7 @@ func TestRacerTargetNameEncodingAndQueryFailures(t *testing.T) {
 	for _, name := range []string{"edge.a", strings.Repeat("a", 49), strings.Repeat("a", 57), strings.Repeat("a", 58), "edge-1"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(fmt.Sprintf(`{"items":[{"metadata":{"name":%q}}]}`, name)))
+			f.set("getjson-clustercaches.racer.unbounded-cloud.io", replyOf(fmt.Sprintf(`{"items":[{"metadata":{"name":%q}}]}`, name)))
 			output, code := f.runScript("racer-targets.sh", nil)
 			requireCode(t, code, 0, output)
 
@@ -89,10 +89,10 @@ func TestRacerTargetNameEncodingAndQueryFailures(t *testing.T) {
 		})
 	}
 
-	for _, key := range []string{"p2pcaches.racer.unbounded-cloud.io", "serviceaccount_racer-controlplane", "deploy_racer-controlplane", "ds_racer-dataplane"} {
+	for _, key := range []string{"clustercaches.racer.unbounded-cloud.io", "serviceaccount_racer-controlplane", "deploy_racer-controlplane", "ds_racer-dataplane"} {
 		t.Run(key, func(t *testing.T) {
 			f := newFake(t)
-			f.set("getjson-p2pcaches.racer.unbounded-cloud.io", replyOf(`{"items":[]}`))
+			f.set("getjson-clustercaches.racer.unbounded-cloud.io", replyOf(`{"items":[]}`))
 			f.set("getjson-"+key, reply{exit: 1, stderr: "Forbidden"})
 
 			output, code := f.runScript("racer-targets.sh", nil)

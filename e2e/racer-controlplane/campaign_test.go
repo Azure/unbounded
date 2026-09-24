@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	originfixture "github.com/Azure/unbounded/e2e/racer/fixture"
+	racermeta "github.com/Azure/unbounded/internal/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
@@ -289,6 +290,18 @@ func (c *campaign) cacheReady(name string, desired, ready int64) error {
 		return fmt.Errorf("cache %s participants desired=%d ready=%d status=%v", name, d, r, v.Object["status"])
 	}
 
+	cacheSocket, originSocket, err := racermeta.CacheSockets(c.socketRoot, string(v.GetUID()))
+	if err != nil {
+		return err
+	}
+
+	actualCache, _, _ := unstructured.NestedString(v.Object, "status", "cacheSocket")
+
+	actualOrigin, _, _ := unstructured.NestedString(v.Object, "status", "originSocket")
+	if actualCache != cacheSocket || actualOrigin != originSocket {
+		return fmt.Errorf("cache %s socket status does not match UID %s: %v", name, v.GetUID(), v.Object["status"])
+	}
+
 	return nil
 }
 
@@ -297,8 +310,12 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 
 	for _, d := range workers {
 		name := d.node.Labels["unbounded-cloud.io/site"]
-		require(t, os.MkdirAll(filepath.Join(d.sockets, name), 0o700))
-		l, err := net.Listen("unix", filepath.Join(d.sockets, name, "origin"))
+		cache, err := c.dynamic.Resource(cacheResource).Get(c.ctx, name, metav1.GetOptions{})
+		require(t, err)
+		cacheSocket, originSocket, err := racermeta.CacheSockets(d.sockets, string(cache.GetUID()))
+		require(t, err)
+		require(t, os.MkdirAll(filepath.Dir(originSocket), 0o700))
+		l, err := net.Listen("unix", originSocket)
 		require(t, err)
 
 		backend := originfixture.NewOrigin()
@@ -310,7 +327,7 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 		origin.Start()
 		t.Cleanup(origin.Close)
 
-		d.client, err = sdk.NewClient(filepath.Join(d.sockets, name, "cache"), sdk.ClientOptions{})
+		d.client, err = sdk.NewClient(cacheSocket, sdk.ClientOptions{})
 		require(t, err)
 		t.Cleanup(d.client.CloseIdleConnections)
 	}
@@ -318,7 +335,7 @@ func (c *campaign) startOrigins(workers []*dataplane) {
 
 func (c *campaign) createSite(site string) {
 	c.create(siteResource, map[string]any{"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Site", "metadata": map[string]any{"name": site, "labels": map[string]any{"campaign": site}}, "spec": map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}, "podCidrAssignments": []any{map[string]any{"cidrBlocks": []any{"10.1.0.0/16"}}}}})
-	c.create(cacheResource, map[string]any{"apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache", "metadata": map[string]any{"name": site}, "spec": map[string]any{"siteSelector": map[string]any{"matchLabels": map[string]any{"campaign": site}}}})
+	c.create(cacheResource, map[string]any{"apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "ClusterCache", "metadata": map[string]any{"name": site}, "spec": map[string]any{"siteSelector": map[string]any{"matchLabels": map[string]any{"campaign": site}}}})
 }
 
 // Isolate cold HEAD -> conditional GET through real peers from storage changes,

@@ -1,6 +1,6 @@
 # Each selected participant supplies the same dataset at its local origin socket.
 apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: P2PCache
+kind: ClusterCache
 metadata:
   name: racer-volume
 spec:

@@ -114,8 +114,8 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
         volumes: vec![proto::Volume {
             max_candidate_attempts: Some(3),
             id: "v1".into(),
-            cache_socket: "/dev/racer/v1/cache".into(),
-            origin_socket: "/dev/racer/v1/origin".into(),
+            cache_socket: "/run/racer/v1/cache".into(),
+            origin_socket: "/run/racer/v1/origin".into(),
             peers: vec!["03".repeat(32)],
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {
@@ -253,7 +253,7 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
         });
     }
 }
-/// Replicas share the P2PCache UID while using node-local origins.
+/// Replicas share the ClusterCache UID while using node-local origins.
 pub(crate) fn prepare_cluster_snapshot(trust: &Trust, config: proto::Snapshot) -> Prepared {
     prepare_snapshot(trust, config)
 }
@@ -559,7 +559,7 @@ fn topology_validation_and_reload_are_atomic() {
         .unwrap();
     let mut next = original.clone();
     next.revision = 2;
-    next.volumes[0].origin_socket = "/dev/racer/v1/rebound-origin".into();
+    next.volumes[0].origin_socket = "/run/racer/v1/rebound-origin".into();
     assert!(
         updates
             .publish(trust.prepare(envelope(next.clone())).unwrap())
@@ -991,8 +991,8 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     let mut volume = snapshot.volumes[0].clone();
     volume.id = "v2".into();
-    volume.cache_socket = "/dev/racer/second/cache".into();
-    volume.origin_socket = "/dev/racer/second/origin".into();
+    volume.cache_socket = "/run/racer/second/cache".into();
+    volume.origin_socket = "/run/racer/second/origin".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
         product: Some(proto::ProductTopology {
@@ -1219,15 +1219,15 @@ pub(crate) mod activation_tests {
                 "add" => {
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
-                    b.cache_socket = "/dev/racer/second/cache".into();
-                    b.origin_socket = "/dev/racer/second/origin".into();
+                    b.cache_socket = "/run/racer/second/cache".into();
+                    b.origin_socket = "/run/racer/second/origin".into();
                     config.volumes.push(b);
                 }
                 "same" => {
-                    config.volumes[0].origin_socket = "/dev/racer/changed/origin".into();
+                    config.volumes[0].origin_socket = "/run/racer/changed/origin".into();
                     config.volumes[0].topology.as_mut().unwrap().epoch = 2;
                 }
-                "address" => config.volumes[0].cache_socket = "/dev/racer/moved/cache".into(),
+                "address" => config.volumes[0].cache_socket = "/run/racer/moved/cache".into(),
                 "identity" => config.volumes[0].id = "B".into(),
                 "empty" => config.volumes.clear(),
                 "idle" | "initial-idle" => {
@@ -1510,7 +1510,7 @@ pub(crate) mod activation_tests {
 
         config.revision = 2;
         config.epoch = 42;
-        config.volumes[0].cache_socket = "/dev/racer/moved/cache".into();
+        config.volumes[0].cache_socket = "/run/racer/moved/cache".into();
         config.volumes[0].topology.as_mut().unwrap().epoch = 2;
         let next = prepare_snapshot(&trust, config);
         let publisher_updates = updates.clone();

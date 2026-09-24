@@ -73,8 +73,8 @@ func sharedResources(namespace string) []client.Object {
 			rbacv1.PolicyRule{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{unboundedv1alpha3.GroupVersion.Group}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
-			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches"}, Verbs: []string{"get", "list", "watch"}},
-			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches/status"}, Verbs: []string{"get", "patch", "update"}},
+			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"clustercaches"}, Verbs: []string{"get", "list", "watch"}},
+			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"clustercaches/status"}, Verbs: []string{"get", "patch", "update"}},
 			// Storage status is published as Node metadata annotations, not nodes/status.
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"patch"}},
 		),
@@ -217,7 +217,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config) *appsv1.DaemonSe
 			"ulimit -l 8388608", ". /bootstrap/identity",
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
-			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
+			"chgrp 65532 " + racermeta.SocketRoot, "chmod 2770 " + racermeta.SocketRoot,
 			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v1/config"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},

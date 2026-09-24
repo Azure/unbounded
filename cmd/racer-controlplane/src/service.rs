@@ -126,7 +126,7 @@ impl Default for Options {
             replica_proof_listen: ":8445".into(),
             trust_proof_listen: ":8446".into(),
             namespace: "racer-system".into(),
-            socket_root: "/dev/racer".into(),
+            socket_root: crate::model::SOCKET_ROOT.into(),
             review_qps: 20.,
             review_burst: 30,
             rotation_interval: Duration::from_secs(30 * 86400),

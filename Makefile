@@ -732,6 +732,8 @@ gantry: test gantry-build ## Build gantry (implies test)
 gantry-integration-test: gantry-manifests unbounded-operator-manifests ## Check Gantry backend/operator/template integration without live control-plane tests
 	timeout 60s $(GOTEST) -timeout 50s ./internal/operator/components/gantry ./internal/operator/override ./deploy/gantry ./internal/gantry/config
 
+GANTRY_RACER_CACHE_UID ?=
+
 gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rendered
 	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
 	@find $(GANTRY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
@@ -739,7 +741,8 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--templates-dir $(GANTRY_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(GANTRY_NAMESPACE) \
-		--set Image=$(GANTRY_IMAGE)
+		--set Image=$(GANTRY_IMAGE) \
+		--set 'RacerCacheUID=$(GANTRY_RACER_CACHE_UID)'
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
 
 # Inventory render knobs. SSLMode/Password feed the database config and

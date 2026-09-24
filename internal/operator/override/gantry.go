@@ -56,12 +56,12 @@ func validateGantryConfig(original, candidate *unstructured.Unstructured) error 
 		// Keep the generated prefix intact: inserting a positional argument or
 		// '--' before the flags makes Go's flag parser stop before selection.
 		if !reflect.DeepEqual(c.Command, oldContainer.Command) || len(c.Args) < len(oldContainer.Args) || !slices.Equal(c.Args[:len(oldContainer.Args)], oldContainer.Args) || !reflect.DeepEqual(configArgs(c.Args), configArgs(oldContainer.Args)) || !reflect.DeepEqual(c.EnvFrom, oldContainer.EnvFrom) {
-			return fmt.Errorf("gantry backend selection is operator-owned from P2PCache annotations; command, generated args, config/backend flags and envFrom cannot redirect it")
+			return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache annotations; command, generated args, config/backend flags and envFrom cannot redirect it")
 		}
 
 		for _, env := range c.Env {
-			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_NAME" {
-				return fmt.Errorf("gantry backend selection is operator-owned from P2PCache annotations, not %s", env.Name)
+			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_UID" {
+				return fmt.Errorf("gantry backend selection is operator-owned from ClusterCache annotations, not %s", env.Name)
 			}
 		}
 
@@ -218,7 +218,7 @@ func configArgs(args []string) []string {
 
 	for i, arg := range args {
 		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
-		if name == "config" || name == "content-backend" || name == "racer-cache-name" {
+		if name == "config" || name == "content-backend" || name == "racer-cache-uid" {
 			selected = append(selected, arg)
 			if !strings.Contains(arg, "=") && i+1 < len(args) {
 				selected = append(selected, args[i+1])

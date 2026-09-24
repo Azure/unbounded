@@ -103,7 +103,7 @@ fn list_kind(path: &str) -> &str {
         "leases" => "LeaseList",
         "sites" => "SiteList",
         "racercaches" => "RacerCacheList",
-        "p2pcaches" => "P2PCacheList",
+        "clustercaches" => "ClusterCacheList",
         "caches" => "RacerCacheList",
         _ => "List",
     }
@@ -375,7 +375,7 @@ async fn api_inner(State(fixture): State<Fixture>, request: Request<Body>) -> Re
             "leases",
             "sites",
             "racercaches",
-            "p2pcaches",
+            "clustercaches",
             "caches",
             "daemonsets",
             "replicasets",
@@ -639,6 +639,16 @@ fn cli_accepts_operator_flags_and_rejects_invalid_values() {
     .unwrap();
     assert_eq!(options.listen, ":9443");
     assert_eq!(options.namespace, "system");
+    assert_eq!(options.socket_root, "/run/racer");
+    assert_eq!(
+        Options::parse(["--socket-root=/custom/racer".into()])
+            .unwrap()
+            .socket_root,
+        "/custom/racer"
+    );
+    for root in ["relative", "/run/\0racer", &format!("/{}", "a".repeat(40))] {
+        assert!(Options::parse([format!("--socket-root={root}")]).is_err());
+    }
     assert_eq!(options.rotation_interval, Duration::from_secs(30 * 86400));
     assert_eq!(options.lease_timing.duration_seconds, 15);
     assert_eq!(options.lease_timing.renew_deadline, Duration::from_secs(10));
@@ -1885,9 +1895,9 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     let (fixture, client, api_stop) = Fixture::start().await?;
     fixture.seed();
     fixture.put(
-        "/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/catalog",
+        "/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/catalog",
         json!({
-            "apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache",
+            "apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "ClusterCache",
             "metadata": {"name": "catalog", "uid": "catalog-uid", "generation": 1},
             "spec": {"cacheGeneration": 1, "maxCandidateAttempts": 3, "siteSelector": {}}
         }),

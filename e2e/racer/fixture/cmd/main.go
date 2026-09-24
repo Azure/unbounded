@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/e2e/racer/fixture"
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 func main() {
@@ -21,8 +22,11 @@ func main() {
 		origin := fixture.NewOrigin()
 		origin.Source = os.Getenv("NODE_NAME")
 
-		for _, cache := range os.Args[2:] {
-			path := "/dev/racer/" + cache + "/origin"
+		for _, uid := range os.Args[2:] {
+			_, path, err := racermeta.CacheSockets(racermeta.SocketRoot, uid)
+			if err != nil {
+				log.Fatal(err)
+			}
 
 			go func() {
 				for {
@@ -70,7 +74,7 @@ func main() {
 	}
 
 	if len(os.Args) < 5 || os.Args[1] != "request" {
-		log.Fatal("usage: fixture serve | fixture request METHOD URL RANGE [HEADER...]")
+		log.Fatal("usage: fixture serve [CACHE_UID...] | fixture request METHOD URL RANGE [HEADER...]")
 	}
 
 	r, err := fixture.Fetch(os.Args[2], os.Args[3], os.Args[4], os.Args[5:]...)

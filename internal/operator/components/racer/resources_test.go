@@ -430,8 +430,8 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	wantCommand := strings.Join([]string{
 		"ulimit -l 8388608",
 		". /bootstrap/identity",
-		"chgrp 65532 /dev/racer",
-		"chmod 2770 /dev/racer",
+		"chgrp 65532 /run/racer",
+		"chmod 2770 /run/racer",
 		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v1/config"`,
 		"exec /usr/local/bin/racer-dataplane",
 	}, "\n")
@@ -453,7 +453,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		}
 
 		if v.Name == "sockets" {
-			sockets = v.HostPath != nil && ptr.Deref(v.HostPath.Type, "") == corev1.HostPathDirectoryOrCreate && v.HostPath.Path == "/dev/racer"
+			sockets = v.HostPath != nil && ptr.Deref(v.HostPath.Type, "") == corev1.HostPathDirectoryOrCreate && v.HostPath.Path == "/run/racer"
 		}
 	}
 
@@ -468,7 +468,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 			writableDirectory = true
 		}
 
-		if mount.Name == "sockets" && mount.MountPath == "/dev/racer" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+		if mount.Name == "sockets" && mount.MountPath == "/run/racer" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
 			socketDirectory = true
 		}
 	}
@@ -478,7 +478,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	}
 
 	if !sockets || !socketDirectory {
-		t.Fatal("socket replacement requires the whole /dev/racer host directory")
+		t.Fatal("socket replacement requires the whole /run/racer host directory")
 	}
 
 	if d.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal != 1 {

@@ -222,7 +222,7 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 	})
 
 	dev := filepath.Join(dir, "dev")
-	if err := os.MkdirAll(filepath.Join(dev, "racer"), 0o755); err != nil {
+	if err := os.MkdirAll(dev, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,6 +240,16 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 		t.Fatal(err)
 	}
 
+	// Isolate the runtime socket root as well as devices from the host.
+	run := filepath.Join(dir, "run")
+	if err := os.MkdirAll(filepath.Join(run, "racer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := unix.Mount(run, "/run", "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+
 	if out, err := exec.Command("ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
 		t.Fatalf("loopback: %v %s", err, out)
 	}
@@ -248,12 +258,12 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 	t.Cleanup(f.client.CloseIdleConnections)
 
 	cdConfig := filepath.Join(dir, "containerd.toml")
-	gantryWrite(t, cdConfig, fmt.Appendf(nil, "version = 2\nroot = %q\nstate = %q\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\", \"io.containerd.nri.v1.nri\"]\n[grpc]\naddress = \"/dev/racer/containerd\"\n[plugins.\"io.containerd.internal.v1.opt\"]\npath = %q\n", filepath.Join(dir, "content"), filepath.Join(dir, "state"), filepath.Join(dir, "opt")))
+	gantryWrite(t, cdConfig, fmt.Appendf(nil, "version = 2\nroot = %q\nstate = %q\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\", \"io.containerd.nri.v1.nri\"]\n[grpc]\naddress = \"/run/racer/containerd\"\n[plugins.\"io.containerd.internal.v1.opt\"]\npath = %q\n", filepath.Join(dir, "content"), filepath.Join(dir, "state"), filepath.Join(dir, "opt")))
 	gantryStart(t, dir, "containerd", nil, "containerd", "--config", cdConfig)
 
 	var err error
 
-	f.containerd, err = containerd.New("/dev/racer/containerd")
+	f.containerd, err = containerd.New("/run/racer/containerd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,8 +301,9 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, 
 
 		cfg := config.NewDefault()
 		cfg.ContentBackend = "racer"
-		cfg.RacerCacheName = fmt.Sprintf("node%d", i)
-		cfg.ContainerdSocket = "/dev/racer/containerd"
+		// Synthetic per-node UIDs isolate daemons sharing this fixture's mount namespace.
+		cfg.RacerCacheUID = fmt.Sprintf("node%d", i)
+		cfg.ContainerdSocket = "/run/racer/containerd"
 		cfg.ContainerdNamespace = fmt.Sprintf("node%d", i)
 		cfg.MirrorListen = f.mirrors[i]
 		cfg.MetricsListen = f.metrics[i]
@@ -432,7 +443,7 @@ func (f *gantryFixture) control(nodes int) [][]string {
 	for i := 0; i < nodes; i++ {
 		node, _ := hex.DecodeString(gantryNode(i))
 		algorithm, catalog := uint32(1), uint32(0)
-		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/dev/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/dev/racer/node%d/origin", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
+		v := &pb.Volume{Id: "gantry", CacheGeneration: 1, CacheSocket: fmt.Sprintf("/run/racer/node%d/cache", i), OriginSocket: fmt.Sprintf("/run/racer/node%d/origin", i), MemberCatalog: &catalog, PeerEndpoints: &pb.VolumePeerEndpoints{}, Topology: &pb.Topology{RoutingAlgorithm: &algorithm, Epoch: 1, SlotCount: uint32(nodes), LocalSlots: []uint32{uint32(i)}}}
 		s := &pb.Snapshot{Universe: bytes.Repeat([]byte{1}, 32), Node: node, Revision: 1, Epoch: 1, Volumes: []*pb.Volume{v}, MemberCatalogs: []*pb.MemberCatalog{{}}}
 
 		attempts := uint32(min(nodes, 3))

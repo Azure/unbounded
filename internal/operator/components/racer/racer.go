@@ -39,9 +39,9 @@ func (Dataplane) ConditionType() string           { return "RacerDataplaneReady"
 // installation reads live lifecycle inputs before planning any writes. Cache
 // selectors and Site membership are runtime policy, not installation votes.
 func installation(ctx context.Context, env *component.Env) (bool, map[string]*unstructured.Unstructured, error) {
-	var caches racerv1alpha1.P2PCacheList
+	var caches racerv1alpha1.ClusterCacheList
 	if err := env.LiveReader().List(ctx, &caches); err != nil {
-		return false, nil, fmt.Errorf("list Racer P2PCaches: %w", err)
+		return false, nil, fmt.Errorf("list Racer ClusterCaches: %w", err)
 	}
 
 	for i := range caches.Items {
@@ -92,7 +92,7 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, _ []unboundedv
 
 	plan := component.NewPlan()
 	if !install && len(retained) == 0 {
-		return plan, component.Disabled("no live P2PCaches or retained Racer workloads"), nil
+		return plan, component.Disabled("no live ClusterCaches or retained Racer workloads"), nil
 	}
 
 	var dependencies []component.ObjectRef
@@ -104,7 +104,7 @@ func (ControlPlane) Plan(ctx context.Context, env *component.Env, _ []unboundedv
 	}
 
 	if !install && retained[controlPlaneName] == nil {
-		return plan, component.Disabled("no live P2PCaches or retained Racer control plane"), nil
+		return plan, component.Disabled("no live ClusterCaches or retained Racer control plane"), nil
 	}
 
 	op := workloadOperation(controlDeployment(env.Namespace, env.Config), install, retained)
@@ -123,7 +123,7 @@ func (Dataplane) Plan(ctx context.Context, env *component.Env, _ []unboundedv1al
 	}
 
 	if !install && retained[dataplaneName] == nil {
-		return plan, component.Disabled("no live P2PCaches or retained Racer dataplane"), nil
+		return plan, component.Disabled("no live ClusterCaches or retained Racer dataplane"), nil
 	}
 
 	var dependencies []component.ObjectRef
@@ -144,7 +144,7 @@ func (Dataplane) Plan(ctx context.Context, env *component.Env, _ []unboundedv1al
 // deliberately absent. Component conditions describe applied intent, so workload
 // status updates (including standby readiness) do not trigger writes.
 func (ControlPlane) SetupWatches(b *builder.Builder, env *component.Env) {
-	b.Watches(&racerv1alpha1.P2PCache{}, env.RequestSingleton(), builder.WithPredicates(cachePredicate()))
+	b.Watches(&racerv1alpha1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(cachePredicate()))
 
 	objects := append(sharedResources(env.Namespace), controlDeployment(env.Namespace, env.Config))
 	byKind := map[string][]client.Object{}

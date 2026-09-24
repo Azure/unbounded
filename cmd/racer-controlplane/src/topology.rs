@@ -281,7 +281,7 @@ pub fn compile_cached(
                 cache.name
             )));
         }
-        let (cache_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.name)?;
+        let (cache_socket, origin_socket) = cache_sockets(&input.socket_root, &cache.uid)?;
         g.volumes.push(Volume {
             id: cache.uid.clone(),
             name: cache.name.clone(),

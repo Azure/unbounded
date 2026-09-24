@@ -60,8 +60,9 @@ const (
 type Config struct {
 	// ContentBackend selects direct Gantry distribution or the Racer cache UDS.
 	ContentBackend string `yaml:"content_backend"`
-	// RacerCacheName derives /dev/racer/<name>/{cache,origin}.
-	RacerCacheName string `yaml:"racer_cache_name"`
+	// RacerCacheUID is the selected ClusterCache's metadata.uid and derives
+	// /run/racer/<uid>/{cache,origin}. It is required for the racer backend.
+	RacerCacheUID string `yaml:"racer_cache_uid"`
 	// RacerMetadataTimeout bounds cache HEAD only, not cold-page preparation.
 	RacerMetadataTimeout time.Duration `yaml:"racer_metadata_timeout"`
 	// RacerMaxConcurrentTransfers bounds active cache-miss requests, including
@@ -469,7 +470,6 @@ type LegacyDeprecatedConfig struct {
 func NewDefault() *Config {
 	return &Config{
 		ContentBackend:              "direct",
-		RacerCacheName:              "gantry",
 		RacerMetadataTimeout:        3 * time.Second,
 		RacerMaxConcurrentTransfers: 64,
 		MirrorListen:                "127.0.0.1:5000",
@@ -618,7 +618,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setStr("CONTENT_BACKEND", &c.ContentBackend)
-	setStr("RACER_CACHE_NAME", &c.RacerCacheName)
+	setStr("RACER_CACHE_UID", &c.RacerCacheUID)
 	setDur("RACER_METADATA_TIMEOUT", &c.RacerMetadataTimeout)
 	setInt("RACER_MAX_CONCURRENT_TRANSFERS", &c.RacerMaxConcurrentTransfers)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
@@ -701,7 +701,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ContentBackend, "content-backend", c.ContentBackend, "content distribution backend (direct or racer)")
-	fs.StringVar(&c.RacerCacheName, "racer-cache-name", c.RacerCacheName, "Racer cache name deriving /dev/racer/<name>/{cache,origin}")
+	fs.StringVar(&c.RacerCacheUID, "racer-cache-uid", c.RacerCacheUID, "ClusterCache metadata.uid deriving /run/racer/<uid>/{cache,origin} (required for racer backend)")
 	fs.DurationVar(&c.RacerMetadataTimeout, "racer-metadata-timeout", c.RacerMetadataTimeout, "Racer HEAD availability budget (cold pages use peer-fetch-timeout)")
 	fs.IntVar(&c.RacerMaxConcurrentTransfers, "racer-max-concurrent-transfers", c.RacerMaxConcurrentTransfers, "maximum active Racer and registry fallback transfers")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
@@ -829,11 +829,11 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("racer_metadata_timeout and racer_max_concurrent_transfers must be positive"))
 	}
 
-	// A direct selection does not use the cache name. In particular, generated
+	// A direct selection does not use the cache UID. In particular, generated
 	// operator flags must be able to override stale Racer YAML during fallback.
 	if c.ContentBackend == "racer" {
-		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName); err != nil {
-			errs = append(errs, fmt.Errorf("racer_cache_name: %w", err))
+		if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheUID); err != nil {
+			errs = append(errs, fmt.Errorf("racer_cache_uid: %w", err))
 		}
 	}
 

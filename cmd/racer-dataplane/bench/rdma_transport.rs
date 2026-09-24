@@ -39,8 +39,8 @@ pub(super) fn context(o: &Options, tls: &tls::TlsContext) -> io::Result<Rc<negot
             max_candidate_attempts: Some(2),
             id: fixture::VOLUME.into(),
             member_catalog: Some(0),
-            cache_socket: "/dev/racer/v1/cache".into(),
-            origin_socket: "/dev/racer/v1/origin".into(),
+            cache_socket: "/run/racer/v1/cache".into(),
+            origin_socket: "/run/racer/v1/origin".into(),
             peers: vec![peer.clone()],
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {

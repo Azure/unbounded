@@ -505,8 +505,8 @@ mod overlap {
             let (trust, mut config) = fixture();
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();
-            extra.cache_socket = "/dev/racer/b/cache".into();
-            extra.origin_socket = "/dev/racer/b/origin".into();
+            extra.cache_socket = "/run/racer/b/cache".into();
+            extra.origin_socket = "/run/racer/b/origin".into();
             match collision {
                 "cache-cache" => extra.cache_socket = config.volumes[0].cache_socket.clone(),
                 "cache-origin" => extra.cache_socket = config.volumes[0].origin_socket.clone(),
@@ -558,7 +558,10 @@ mod overlap {
     }
 
     fn head(workers: &mut [(Volumes, uring::Ring)], address: SocketAddr) -> u16 {
-        use std::io::{Read, Write};
+        assert!(
+            TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_err(),
+            "cache unexpectedly exposes TCP ingress"
+        );
         let node = &workers[0].0;
         let server = node
             .servers
@@ -578,13 +581,14 @@ mod overlap {
             .config()
             .cache_socket
             .clone();
+        head_path(workers, path)
+    }
+
+    fn head_path(workers: &mut [(Volumes, uring::Ring)], path: String) -> u16 {
+        use std::io::{Read, Write};
         let (tx, rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
             let timeout = Duration::from_secs(3);
-            assert!(
-                TcpStream::connect_timeout(&address, timeout).is_err(),
-                "cache unexpectedly exposes TCP ingress"
-            );
             let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
             socket.set_read_timeout(Some(timeout)).unwrap();
             socket.set_write_timeout(Some(timeout)).unwrap();
@@ -609,7 +613,7 @@ mod overlap {
             if let Ok(code) = rx.try_recv() {
                 break code;
             }
-            assert!(Instant::now() < end, "TCP request watchdog: {address}");
+            assert!(Instant::now() < end, "Unix request watchdog");
             std::thread::sleep(Duration::from_micros(100));
         };
         client.join().unwrap();
@@ -618,6 +622,131 @@ mod overlap {
 
     fn destination(a: SocketAddr) -> SocketAddr {
         a
+    }
+
+    #[test]
+    fn recreated_uid_retires_old_path_and_never_uses_old_origin() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::{UnixListener, UnixStream},
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "racer-uid-{}-{}",
+            std::process::id(),
+            address().port()
+        ));
+        for uid in ["old-uid", "new-uid"] {
+            std::fs::create_dir_all(root.join(uid)).unwrap();
+        }
+        let path = |uid: &str, kind: &str| root.join(uid).join(kind).to_str().unwrap().to_owned();
+        let old_cache = path("old-uid", "cache");
+        let old_origin = path("old-uid", "origin");
+        let new_cache = path("new-uid", "cache");
+        let new_origin = path("new-uid", "origin");
+        let stop = Arc::new(AtomicBool::new(false));
+        let serve_origin = |path: &str, hits: Arc<AtomicUsize>| {
+            let listener = UnixListener::bind(path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "origin watchdog");
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(3)))
+                                .unwrap();
+                            let mut request = Vec::new();
+                            while !request.ends_with(b"\r\n\r\n") {
+                                let mut byte = [0];
+                                socket.read_exact(&mut byte).unwrap();
+                                request.push(byte[0]);
+                            }
+                            assert!(request.starts_with(b"HEAD "));
+                            hits.fetch_add(1, Ordering::AcqRel);
+                            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", crate::conformance::etag(b"abc")).unwrap();
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            })
+        };
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let old_server = serve_origin(&old_origin, old_hits.clone());
+        let (trust, mut config) = local_fixture(address(), address());
+        config.volumes[0].id = "old-uid".into();
+        config.volumes[0].cache_socket = old_cache.clone();
+        config.volumes[0].origin_socket = old_origin.clone();
+        let updates = Arc::new(Updates::default());
+        let mut workers: Vec<_> = (0..2)
+            .map(|id| {
+                let ring = crate::control::tests::ring().expect("real io_uring required");
+                (volumes(&ring, &updates, id), ring)
+            })
+            .collect();
+        let activate = |workers: &mut Vec<(Volumes, uring::Ring)>,
+                        config: crate::control::proto::Snapshot| {
+            let revision = config.revision;
+            updates.publish(prepare_snapshot(&trust, config)).unwrap();
+            poll(workers);
+            poll(workers);
+            assert_eq!(updates.status()["activeRevision"], revision);
+            assert_eq!(updates.status()["ready"], true);
+        };
+        activate(&mut workers, config.clone());
+        assert_eq!(head_path(&mut workers, old_cache.clone()), 200);
+        let before = old_hits.load(Ordering::Acquire);
+        assert!(before > 0);
+        // The wire uses UID identity rather than the Kubernetes display name.
+        // Recreate with a new UID and both new paths while the old origin is live.
+        config.revision += 1;
+        config.volumes[0].id = "new-uid".into();
+        config.volumes[0].cache_socket = new_cache.clone();
+        config.volumes[0].origin_socket = new_origin.clone();
+        activate(&mut workers, config);
+        assert_eq!(head_path(&mut workers, old_cache.clone()), 409);
+        assert_eq!(
+            head_path(&mut workers, new_cache.clone()),
+            502,
+            "new cache used an old origin or cached response"
+        );
+        assert_eq!(old_hits.load(Ordering::Acquire), before);
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        let new_server = serve_origin(&new_origin, new_hits.clone());
+        // The intentional missing-origin request opened one worker's endpoint
+        // breaker. Let its one-second cooldown expire before either worker can
+        // accept the recovery request from their shared listener.
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(head_path(&mut workers, new_cache.clone()), 200);
+        assert!(new_hits.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            head_path(&mut workers, old_cache.clone()),
+            409,
+            "old path redirected to recreated cache"
+        );
+        assert_eq!(old_hits.load(Ordering::Acquire), before);
+        for (node, ring) in &mut workers {
+            for retired in node.retired.values_mut() {
+                retired.0 = Instant::now();
+            }
+            node.poll_listeners(ring, 64).unwrap();
+            assert!(node.retired.is_empty());
+        }
+        assert!(!std::path::Path::new(&old_cache).exists());
+        assert!(UnixStream::connect(&old_cache).is_err());
+        assert_eq!(head_path(&mut workers, new_cache), 200);
+        for (node, ring) in &mut workers {
+            node.shutdown(ring).unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        old_server.join().unwrap();
+        new_server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

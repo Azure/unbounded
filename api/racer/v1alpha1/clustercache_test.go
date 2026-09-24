@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-func TestP2PCacheAPISchema(t *testing.T) {
+func TestClusterCacheAPISchema(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("set KUBEBUILDER_ASSETS for API schema validation")
 	}
@@ -48,14 +48,14 @@ func TestP2PCacheAPISchema(t *testing.T) {
 	ctx := context.Background()
 
 	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": GroupVersion.String(), "kind": "P2PCache",
+		"apiVersion": GroupVersion.String(), "kind": "ClusterCache",
 		"metadata": map[string]any{"name": "defaults"},
 	}}
 	if err := kube.Create(ctx, obj); err != nil {
 		t.Fatal(err)
 	}
 
-	var cache P2PCache
+	var cache ClusterCache
 	if err := kube.Get(ctx, client.ObjectKey{Name: "defaults"}, &cache); err != nil {
 		t.Fatal(err)
 	}
@@ -88,14 +88,14 @@ func TestP2PCacheAPISchema(t *testing.T) {
 		{"excess-attempts", 1, 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			invalid := &P2PCache{ObjectMeta: metav1.ObjectMeta{Name: tc.name}, Spec: P2PCacheSpec{CacheGeneration: tc.generation, MaxCandidateAttempts: tc.attempts}}
+			invalid := &ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: tc.name}, Spec: ClusterCacheSpec{CacheGeneration: tc.generation, MaxCandidateAttempts: tc.attempts}}
 			if err := kube.Create(ctx, invalid); !apierrors.IsInvalid(err) {
 				t.Fatalf("invalid spec accepted: %v", err)
 			}
 		})
 	}
 
-	if err := kube.Create(ctx, &P2PCache{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("x", 63)}, Spec: P2PCacheSpec{CacheGeneration: 0, MaxCandidateAttempts: 8}}); err != nil {
+	if err := kube.Create(ctx, &ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("x", 63)}, Spec: ClusterCacheSpec{CacheGeneration: 0, MaxCandidateAttempts: 8}}); err != nil {
 		t.Fatalf("boundary values rejected: %v", err)
 	}
 
@@ -104,15 +104,23 @@ func TestP2PCacheAPISchema(t *testing.T) {
 	}
 
 	cache.Status.ObservedGeneration = cache.Generation
+	cache.Status.CacheSocket = "/run/racer/" + string(cache.UID) + "/cache"
+
+	cache.Status.OriginSocket = "/run/racer/" + string(cache.UID) + "/origin"
 	if err := kube.Status().Update(ctx, &cache); err != nil {
 		t.Fatalf("status subresource: %v", err)
 	}
 
+	cache = ClusterCache{}
 	if err := kube.Get(ctx, client.ObjectKey{Name: "defaults"}, &cache); err != nil {
 		t.Fatal(err)
 	}
 
 	if cache.Status.ObservedGeneration != cache.Generation {
 		t.Fatal("status was not persisted")
+	}
+
+	if cache.Status.CacheSocket != "/run/racer/"+string(cache.UID)+"/cache" || cache.Status.OriginSocket != "/run/racer/"+string(cache.UID)+"/origin" {
+		t.Fatalf("socket status was not persisted: %+v", cache.Status)
 	}
 }

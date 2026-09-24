@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 type config struct {
@@ -31,6 +33,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	var (
 		c                     config
 		footprint, objectSize string
+		cacheUID              string
 	)
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
@@ -45,8 +48,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	f.DurationVar(&c.gantryReadyTimeout, "gantry-ready-timeout", 10*time.Minute, "both role: maximum wait for Gantry startup readiness after registry preparation")
 	f.IntVar(&c.layersPerImage, "layers-per-image", 4, "unique layers per synthetic image; object-size is layer size")
 	f.IntVar(&c.layerConcurrency, "layer-concurrency", 3, "parallel layer downloads per image")
-	f.StringVar(&c.endpoint, "endpoint", "/dev/racer/loadgen/cache", "local Racer cache Unix socket")
-	f.StringVar(&c.originSocket, "origin-socket", "/dev/racer/loadgen/origin", "local origin Unix socket")
+	f.StringVar(&cacheUID, "cache-uid", "", "ClusterCache metadata.uid deriving /run/racer/<uid>/{cache,origin}")
+	f.StringVar(&c.endpoint, "endpoint", "", "local Racer cache Unix socket (ClusterCache.status.cacheSocket)")
+	f.StringVar(&c.originSocket, "origin-socket", "", "local origin Unix socket (ClusterCache.status.originSocket)")
 	f.StringVar(&c.listen, "listen", ":8080", "management TCP address for /metrics and /healthz")
 	f.StringVar(&footprint, "footprint", "512GB", "shared logical dataset size (bytes, KB/MB/GB/TB, KiB/MiB/GiB/TiB)")
 	f.StringVar(&objectSize, "object-size", "1GB", "fixed object size; must divide footprint exactly")
@@ -76,6 +80,25 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 	if c.showVersion {
 		return c, nil
+	}
+
+	if c.mode == "racer" {
+		if cacheUID != "" {
+			if c.endpoint != "" || c.originSocket != "" {
+				return c, fmt.Errorf("cache-uid cannot be combined with endpoint or origin-socket")
+			}
+
+			var err error
+
+			c.endpoint, c.originSocket, err = racermeta.CacheSockets(racermeta.SocketRoot, cacheUID)
+			if err != nil {
+				return c, fmt.Errorf("cache-uid: %w", err)
+			}
+		}
+
+		if c.endpoint == "" || c.originSocket == "" {
+			return c, fmt.Errorf("racer mode requires cache-uid or both endpoint and origin-socket")
+		}
 	}
 
 	var err error

@@ -68,7 +68,7 @@ func (f *gantryFixture) advanceCacheGeneration(volumeIDs ...string) (uint64, err
 
 		for _, v := range s.Volumes {
 			if selected[v.Id] {
-				// P2PCache.spec.cacheGeneration is a signed Kubernetes integer.
+				// ClusterCache.spec.cacheGeneration is a signed Kubernetes integer.
 				if v.CacheGeneration >= math.MaxInt64 {
 					return 0, fmt.Errorf("volume %q generation exhausted", v.Id)
 				}

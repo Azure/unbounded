@@ -30,8 +30,8 @@ func racerSite() unboundedv1alpha3.Site {
 	return unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}
 }
 
-func backingCache(name string) *racerv1alpha1.P2PCache {
-	return &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "true"}}, Spec: racerv1alpha1.P2PCacheSpec{CacheGeneration: 9, MaxCandidateAttempts: 5}}
+func backingCache(name string) *racerv1alpha1.ClusterCache {
+	return &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "true"}}, Spec: racerv1alpha1.ClusterCacheSpec{CacheGeneration: 9, MaxCandidateAttempts: 5}}
 }
 
 func racerConfig(payload string) *corev1.ConfigMap {
@@ -40,7 +40,7 @@ func racerConfig(payload string) *corev1.ConfigMap {
 
 func TestRacerPlan(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
-	env := testEnv(t, node, backingCache("gantry"), racerConfig("content_backend: direct\nracer_cache_name: stale\n"))
+	env := testEnv(t, node, backingCache("gantry"), racerConfig("content_backend: direct\nracer_cache_uid: stale\n"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 	if err != nil {
@@ -57,7 +57,7 @@ func TestRacerPlan(t *testing.T) {
 		switch op.Object.GetKind() {
 		case "Lease", "Role", "RoleBinding":
 			t.Fatalf("Racer plan must not install chair resources: %s", op.Ref())
-		case "P2PCache":
+		case "ClusterCache":
 			t.Fatal("operator must never write the user-managed cache")
 		case "DaemonSet":
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds); err != nil {
@@ -66,7 +66,7 @@ func TestRacerPlan(t *testing.T) {
 		}
 	}
 
-	if ds.Spec.Template.Annotations[cacheUIDAnnotation] != "cache-uid" || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--content-backend=racer") || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-name=gantry") {
+	if ds.Spec.Template.Annotations[cacheUIDAnnotation] != "cache-uid" || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--content-backend=racer") || !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-uid=cache-uid") {
 		t.Fatalf("cache identity and flags missing: %#v", ds.Spec.Template)
 	}
 
@@ -84,7 +84,7 @@ func TestRacerPlan(t *testing.T) {
 
 		for _, mount := range c.VolumeMounts {
 			if mount.Name == "racer-sockets" {
-				found = mount.MountPath == "/dev/racer" && mount.SubPath == "" && !mount.ReadOnly
+				found = mount.MountPath == "/run/racer" && mount.SubPath == "" && !mount.ReadOnly
 			}
 		}
 
@@ -100,12 +100,12 @@ func TestRacerPlan(t *testing.T) {
 	}
 
 	command := strings.Join(pod.InitContainers[0].Command, " ")
-	if !strings.Contains(command, "mkdir -p /dev/racer/gantry") || !strings.Contains(command, "chmod 2770 /dev/racer /dev/racer/gantry") {
+	if !strings.Contains(command, "mkdir -p /run/racer/cache-uid") || !strings.Contains(command, "chgrp 65532 /run/racer /run/racer/cache-uid") || !strings.Contains(command, "chmod 2770 /run/racer /run/racer/cache-uid") {
 		t.Fatalf("cache directory must be writable before either process starts: %s", command)
 	}
 
 	for _, volume := range pod.Volumes {
-		if volume.Name == "racer-sockets" && (volume.HostPath == nil || volume.HostPath.Path != "/dev/racer" || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate) {
+		if volume.Name == "racer-sockets" && (volume.HostPath == nil || volume.HostPath.Path != "/run/racer" || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate) {
 			t.Fatalf("unexpected socket hostPath: %#v", volume)
 		}
 	}
@@ -116,17 +116,17 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		name    string
 		payload string
 		mutate  func(*unboundedv1alpha3.Site, *corev1.Node)
-		cache   *racerv1alpha1.P2PCache
+		cache   *racerv1alpha1.ClusterCache
 		valid   bool
 		direct  bool
 	}{
 		{name: "unknown backend", valid: true, payload: "content_backend: other"},
-		{name: "invalid cache name", valid: true, payload: "content_backend: racer\nracer_cache_name: ../bad"},
+		{name: "invalid configured cache UID overridden", valid: true, payload: "content_backend: racer\nracer_cache_uid: ../bad"},
 		// Parsing remains the binary's responsibility. Invalid YAML cannot
 		// freeze a former Racer pod configuration after cache removal.
 		{name: "unknown config field", valid: true, payload: "content_backnd: racer"},
 		{name: "malformed YAML", valid: true, payload: "[not: yaml"},
-		{name: "Racer disabled", valid: true, direct: true, cache: &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", Annotations: map[string]string{backingAnnotation: "false"}}}},
+		{name: "Racer disabled", valid: true, direct: true, cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "false"}}}},
 		{name: "Racer omitted", valid: true},
 		{name: "Gantry disabled", mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) {
 			s.Spec.Components.Gantry = &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
@@ -156,8 +156,8 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		{name: "tolerated taint", valid: true, mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) {
 			n.Spec.Taints = []corev1.Taint{{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoExecute}}
 		}},
-		{name: "foreign cache", valid: true, direct: true, cache: &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry"}}},
-		{name: "selector excludes origin", cache: &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", Annotations: map[string]string{backingAnnotation: "true"}}, Spec: racerv1alpha1.P2PCacheSpec{SiteSelector: metav1.LabelSelector{MatchLabels: map[string]string{"other": "true"}}}}},
+		{name: "foreign cache", valid: true, direct: true, cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid"}}},
+		{name: "selector excludes origin", cache: &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Annotations: map[string]string{backingAnnotation: "true"}}, Spec: racerv1alpha1.ClusterCacheSpec{SiteSelector: metav1.LabelSelector{MatchLabels: map[string]string{"other": "true"}}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			site := racerSite()
@@ -203,7 +203,7 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
 	cache := backingCache("custom")
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", Labels: map[string]string{racermeta.SiteLabelKey: "edge", corev1.LabelOSStable: "linux"}}}
-	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_name: custom"))
+	env := testEnv(t, cache, node, racerConfig("content_backend: racer\nracer_cache_uid: custom"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{racerSite()})
 	if err != nil {
@@ -211,14 +211,14 @@ func TestRacerPreservesCacheGenerationAndSupportsCanonicalSite(t *testing.T) {
 	}
 
 	for _, op := range plan.Operations {
-		if op.Object.GetKind() == "P2PCache" {
+		if op.Object.GetKind() == "ClusterCache" {
 			t.Fatal("existing cache generation/policy must not be overwritten")
 		}
 	}
 }
 
 func TestReturnToDirectRetainsCacheAndRestoresChairs(t *testing.T) {
-	cache := &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", Labels: map[string]string{"unbounded-cloud.io/gantry-cache": "true"}}}
+	cache := &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry", UID: "cache-uid", Labels: map[string]string{"unbounded-cloud.io/gantry-cache": "true"}}}
 	env := testEnv(t, cache, racerConfig("content_backend: racer"))
 
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
@@ -229,7 +229,7 @@ func TestReturnToDirectRetainsCacheAndRestoresChairs(t *testing.T) {
 	chairs := 0
 
 	for _, op := range plan.Operations {
-		if op.Object.GetKind() == "P2PCache" {
+		if op.Object.GetKind() == "ClusterCache" {
 			t.Fatal("returning to direct must retain the cache")
 		}
 
@@ -284,25 +284,29 @@ func TestBackingCacheSelectionMatrix(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
-		mutate  func(*racerv1alpha1.P2PCache)
+		mutate  func(*racerv1alpha1.ClusterCache)
 		extra   bool
 		racer   bool
 		invalid bool
 	}{
 		{name: "true", racer: true},
-		{name: "false", mutate: func(c *racerv1alpha1.P2PCache) { c.Annotations[backingAnnotation] = "false" }},
-		{name: "removed", mutate: func(c *racerv1alpha1.P2PCache) { delete(c.Annotations, backingAnnotation) }},
-		{name: "label ignored", mutate: func(c *racerv1alpha1.P2PCache) {
+		{name: "missing UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "" }},
+		{name: "unsafe UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "../other;id" }},
+		{name: "uppercase UID", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.UID = "UPPER" }},
+		{name: "name does not determine socket", racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Name = "cache.with.dots" }},
+		{name: "false", mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
+		{name: "removed", mutate: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
+		{name: "label ignored", mutate: func(c *racerv1alpha1.ClusterCache) {
 			c.Annotations = nil
 			c.Labels = map[string]string{"unbounded-cloud.io/gantry-cache": "true"}
 		}},
-		{name: "empty invalid", invalid: true, mutate: func(c *racerv1alpha1.P2PCache) { c.Annotations[backingAnnotation] = "" }},
-		{name: "case invalid", invalid: true, mutate: func(c *racerv1alpha1.P2PCache) { c.Annotations[backingAnnotation] = "True" }},
-		{name: "whitespace invalid", invalid: true, mutate: func(c *racerv1alpha1.P2PCache) { c.Annotations[backingAnnotation] = " true" }},
+		{name: "empty invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "" }},
+		{name: "case invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "True" }},
+		{name: "whitespace invalid", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = " true" }},
 		{name: "duplicate", extra: true, invalid: true},
-		{name: "terminating", mutate: func(c *racerv1alpha1.P2PCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
-		{name: "terminating duplicate ignored", extra: true, racer: true, mutate: func(c *racerv1alpha1.P2PCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
-		{name: "expression selector", invalid: true, mutate: func(c *racerv1alpha1.P2PCache) {
+		{name: "terminating", mutate: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
+		{name: "terminating duplicate ignored", extra: true, racer: true, mutate: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = &now; c.Finalizers = []string{"test"} }},
+		{name: "expression selector", invalid: true, mutate: func(c *racerv1alpha1.ClusterCache) {
 			c.Spec.SiteSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "region", Operator: metav1.LabelSelectorOpExists}}
 		}},
 	} {
@@ -334,7 +338,7 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 	cache := backingCache("gantry")
 	cache.Labels = map[string]string{"user": "preserve"}
 	cache.Annotations["user"] = "preserve"
-	cm := racerConfig("content_backend: racer\nracer_cache_name: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")
+	cm := racerConfig("content_backend: racer\nracer_cache_uid: ../stale\nupstream_registries:\n  - name: private.example\n    endpoint: https://private.example\n")
 	cm.Data["extra"] = "user data"
 	cm.Labels = map[string]string{"user": "preserve"}
 	env := testEnv(t, cache, cm)
@@ -348,7 +352,7 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 		}
 
 		for _, op := range plan.Operations {
-			if op.Object.GetKind() == "P2PCache" || (op.Object.GetKind() == "ConfigMap" && op.Object.GetName() == configName) {
+			if op.Object.GetKind() == "ClusterCache" || (op.Object.GetKind() == "ConfigMap" && op.Object.GetName() == configName) {
 				t.Fatalf("must preserve user-owned object: %s", op.Ref())
 			}
 		}
@@ -362,7 +366,7 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 	}
 	first := planPod(true)
 
-	var stored racerv1alpha1.P2PCache
+	var stored racerv1alpha1.ClusterCache
 	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(cache), &stored); err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +440,20 @@ func TestBackingCacheTransitionsAndUserData(t *testing.T) {
 		t.Fatal("same-name recreation did not roll pods")
 	}
 
+	for _, ds := range []*appsv1.DaemonSet{first, second} {
+		uid := ds.Spec.Template.Annotations[cacheUIDAnnotation]
+		if !slices.Contains(ds.Spec.Template.Spec.Containers[0].Args, "--racer-cache-uid="+uid) {
+			t.Fatalf("recreation did not update cache UID argument: %v", ds.Spec.Template.Spec.Containers[0].Args)
+		}
+
+		command := strings.Join(ds.Spec.Template.Spec.InitContainers[0].Command, " ")
+		for _, prefix := range []string{"mkdir -p ", "chgrp 65532 /run/racer ", "chmod 2770 /run/racer "} {
+			if !strings.Contains(command, prefix+"/run/racer/"+uid+"\n") {
+				t.Fatalf("recreation directory setup missing: %s", command)
+			}
+		}
+	}
+
 	var preserved corev1.ConfigMap
 	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(cm), &preserved); err != nil {
 		t.Fatal(err)
@@ -485,7 +503,7 @@ func TestBackingCacheAPIReadFailuresPreservePlan(t *testing.T) {
 			failure := errors.New("API unavailable")
 			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
 				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					_, cacheList := list.(*racerv1alpha1.P2PCacheList)
+					_, cacheList := list.(*racerv1alpha1.ClusterCacheList)
 
 					_, nodeList := list.(*corev1.NodeList)
 					if (failing == "caches" && cacheList) || (failing == "nodes" && nodeList) {
@@ -516,21 +534,21 @@ func TestBackingCacheWatches(t *testing.T) {
 
 	for _, tc := range []struct {
 		name   string
-		change func(*racerv1alpha1.P2PCache)
+		change func(*racerv1alpha1.ClusterCache)
 		want   bool
 	}{
-		{name: "identical relist", change: func(*racerv1alpha1.P2PCache) {}},
-		{name: "UID-only recreation", want: true, change: func(c *racerv1alpha1.P2PCache) { c.UID = "replacement-uid" }},
-		{name: "resource version only", change: func(c *racerv1alpha1.P2PCache) { c.ResourceVersion = "new" }},
-		{name: "annotation", want: true, change: func(c *racerv1alpha1.P2PCache) { c.Annotations[backingAnnotation] = "false" }},
-		{name: "annotation removed", want: true, change: func(c *racerv1alpha1.P2PCache) { delete(c.Annotations, backingAnnotation) }},
-		{name: "unrelated annotation", change: func(c *racerv1alpha1.P2PCache) { c.Annotations["other"] = "new" }},
-		{name: "label", change: func(c *racerv1alpha1.P2PCache) { c.Labels = map[string]string{"other": "new"} }},
-		{name: "status", change: func(c *racerv1alpha1.P2PCache) {
+		{name: "identical relist", change: func(*racerv1alpha1.ClusterCache) {}},
+		{name: "UID-only recreation", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.UID = "replacement-uid" }},
+		{name: "resource version only", change: func(c *racerv1alpha1.ClusterCache) { c.ResourceVersion = "new" }},
+		{name: "annotation", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.Annotations[backingAnnotation] = "false" }},
+		{name: "annotation removed", want: true, change: func(c *racerv1alpha1.ClusterCache) { delete(c.Annotations, backingAnnotation) }},
+		{name: "unrelated annotation", change: func(c *racerv1alpha1.ClusterCache) { c.Annotations["other"] = "new" }},
+		{name: "label", change: func(c *racerv1alpha1.ClusterCache) { c.Labels = map[string]string{"other": "new"} }},
+		{name: "status", change: func(c *racerv1alpha1.ClusterCache) {
 			c.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}
 		}},
-		{name: "spec", want: true, change: func(c *racerv1alpha1.P2PCache) { c.Spec.CacheGeneration++ }},
-		{name: "deletion timestamp", want: true, change: func(c *racerv1alpha1.P2PCache) { c.DeletionTimestamp = ptr.To(metav1.Now()) }},
+		{name: "spec", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.Spec.CacheGeneration++ }},
+		{name: "deletion timestamp", want: true, change: func(c *racerv1alpha1.ClusterCache) { c.DeletionTimestamp = ptr.To(metav1.Now()) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			old := backingCache("gantry")

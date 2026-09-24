@@ -52,7 +52,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		return err
 	}
 
-	cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName)
+	cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheUID)
 	if err != nil {
 		return err
 	}

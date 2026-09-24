@@ -9,6 +9,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/racer-loadgen/ cmd/racer-loadgen/
 COPY internal/version/ internal/version/
+COPY internal/racer/ internal/racer/
+COPY api/ api/
 COPY pkg/racer/ pkg/racer/
 ARG TARGETOS
 ARG TARGETARCH

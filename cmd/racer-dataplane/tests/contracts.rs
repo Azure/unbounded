@@ -696,8 +696,9 @@ mod endpoint_tests {
                         .as_slice(),
                 )
                 .unwrap();
-                assert_eq!(s.volumes[0].origin_socket, "/dev/racer/cache-a/origin");
-                assert_eq!(s.volumes[0].cache_socket, "/dev/racer/cache-a/cache");
+                assert_eq!(s.volumes[0].id, "cache-uid");
+                assert_eq!(s.volumes[0].origin_socket, "/run/racer/cache-uid/origin");
+                assert_eq!(s.volumes[0].cache_socket, "/run/racer/cache-uid/cache");
                 let trust = Trust {
                     universe: s.universe.clone().try_into().unwrap(),
                     node: s.node.clone().try_into().unwrap(),
@@ -705,7 +706,7 @@ mod endpoint_tests {
                 let prepared = trust.prepare(envelope(s.clone())).unwrap();
                 assert_eq!(prepared.volumes()[0].backend().host(), "localhost");
                 assert_last_good(&trust, s);
-                println!("Rust compiler P2PCache snapshot prepared: {name}");
+                println!("Rust compiler ClusterCache snapshot prepared: {name}");
             }
         }
     }

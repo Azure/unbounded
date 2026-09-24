@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 
 var (
 	siteResource  = schema.GroupVersionResource{Group: "unbounded-cloud.io", Version: "v1alpha3", Resource: "sites"}
-	cacheResource = schema.GroupVersionResource{Group: "racer.unbounded-cloud.io", Version: "v1alpha1", Resource: "p2pcaches"}
+	cacheResource = schema.GroupVersionResource{Group: "racer.unbounded-cloud.io", Version: "v1alpha1", Resource: "clustercaches"}
 )
 
 type process struct {

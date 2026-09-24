@@ -358,7 +358,7 @@ async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
         if let Some(object) = data.objects.get(&path) {
             return reply(StatusCode::OK, object.clone());
         }
-        if ["nodes", "pods", "sites", "p2pcaches", "configmaps"]
+        if ["nodes", "pods", "sites", "clustercaches", "configmaps"]
             .iter()
             .any(|s| path.ends_with(&format!("/{s}")))
         {
@@ -1163,6 +1163,113 @@ async fn subscription_requires_storage_policy_v1_capability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_status_publishes_uid_sockets_before_participants_are_ready() {
+    use racer_controlplane::{
+        model::{Cache, Inventory, SOCKET_ROOT, cache_sockets},
+        topology::compile,
+    };
+    let credentials = credentials().await;
+    const CACHE: &str = "/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/cache-a";
+    for root in [SOCKET_ROOT, "/custom//racer/../sockets/."] {
+        let api = FakeApi::new();
+        seed(&api, &credentials.context.state);
+        let node = api
+            .inner
+            .lock()
+            .unwrap()
+            .objects
+            .remove("/api/v1/nodes/node-a")
+            .unwrap();
+        let context = credentials.context.clone();
+        let mut options = RuntimeOptions::new("system");
+        options.socket_root = root.into();
+        options.retry_interval = Duration::from_millis(20);
+        let runtime = Runtime::new(options, Arc::new(move || Some(context.clone())));
+        let (client, api_task) = api.serve().await;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.clone().run(client, stop.clone()));
+        // No matching Site, then a selected Site with no Nodes, then a starting
+        // participant. Status paths must not depend on compilation or readiness.
+        for (generation, uid, zone, participants) in [
+            (1, "old-uid", "missing", 0),
+            (2, "old-uid", "a", 0),
+            (3, "old-uid", "a", 1),
+            (1, "new-uid", "a", 1),
+        ] {
+            if participants == 1 {
+                api.put("/api/v1/nodes/node-a", node.clone());
+            }
+            api.put(CACHE, json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"ClusterCache","metadata":{"name":"cache-a","uid":uid,"generation":generation},"spec":{"cacheGeneration":generation,"maxCandidateAttempts":3,"siteSelector":{"matchLabels":{"zone":zone}}}}));
+            let expected = cache_sockets(root, uid).unwrap();
+            until(|| {
+                let data = api.inner.lock().unwrap();
+                let status = &data.objects[CACHE]["status"];
+                status["observedGeneration"] == generation
+                    && status["cacheSocket"] == expected.0
+                    && status["originSocket"] == expected.1
+                    && status["participants"]["desired"] == participants
+            })
+            .await;
+            let status = api.inner.lock().unwrap().objects[CACHE]["status"].clone();
+            assert_eq!(status["participants"]["ready"], 0);
+            assert!(
+                status["conditions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["type"] == "Ready" && c["status"] == "False")
+            );
+            let compiled = compile(
+                &Inventory {
+                    universe: "site-a".into(),
+                    nodes: vec![],
+                    socket_root: root.into(),
+                    caches: vec![Cache {
+                        name: "cache-a".into(),
+                        uid: uid.into(),
+                        resource_generation: generation,
+                        cache_generation: generation,
+                        max_candidate_attempts: 3,
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(status["cacheSocket"], compiled.volumes[0].cache_socket);
+            assert_eq!(status["originSocket"], compiled.volumes[0].origin_socket);
+            if participants == 1 {
+                // Compare with the actual configuration offered by this runtime,
+                // before sending any activation acknowledgment.
+                let offered = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let offered =
+                            desired(runtime.router(), &credentials.peer, &credentials.boot, "")
+                                .await;
+                        let racer_controlplane::proto::configuration::Contents::Snapshot(snapshot) =
+                            offered.configuration.unwrap().contents.unwrap();
+                        if snapshot
+                            .volumes
+                            .first()
+                            .is_some_and(|v| v.id == uid && v.cache_generation == generation as u64)
+                        {
+                            break snapshot;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(status["cacheSocket"], offered.volumes[0].cache_socket);
+                assert_eq!(status["originSocket"], offered.volumes[0].origin_socket);
+            }
+        }
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        api_task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("racer_controlplane=warn")
@@ -1372,7 +1479,7 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
     node["metadata"]["labels"]["racer.unbounded-cloud.io/exclude"] = json!("false");
     api.put("/api/v1/nodes/node-a", node);
-    api.put("/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/cache-a", json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"P2PCache","metadata":{"name":"cache-a","uid":"cache-uid","generation":1},"spec":{"cacheGeneration":1,"maxCandidateAttempts":3,"siteSelector":{"matchLabels":{"zone":"a"}}}}));
+    api.put("/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/cache-a", json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"ClusterCache","metadata":{"name":"cache-a","uid":"cache-uid","generation":1},"spec":{"cacheGeneration":1,"maxCandidateAttempts":3,"siteSelector":{"matchLabels":{"zone":"a"}}}}));
     let mut active = desired(
         restarted.router(),
         &credentials.peer,
@@ -1399,7 +1506,7 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
         .headers_mut()
         .insert("x-racer-worker-healthy", "1".parse().unwrap());
     let feedback = tokio::spawn(restarted.router().oneshot(applied));
-    until(|| api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/cache-a"].pointer("/status/participants/ready") == Some(&json!(1))).await;
+    until(|| api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/cache-a"].pointer("/status/participants/ready") == Some(&json!(1))).await;
     feedback.abort();
     let _ = feedback.await;
     // Sites define membership without any Racer component configuration.
@@ -1614,7 +1721,7 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
     })
     .await;
 
-    api.put("/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad", json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"P2PCache","metadata":{"name":"bad","uid":"bad-uid"},"spec":{"cacheGeneration":-1}}));
+    api.put("/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/bad", json!({"apiVersion":"racer.unbounded-cloud.io/v1alpha1","kind":"ClusterCache","metadata":{"name":"bad","uid":"bad-uid"},"spec":{"cacheGeneration":-1}}));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let retained = desired(runtime.router(), &credentials.peer, &credentials.boot, "").await;
     assert_eq!(retained.revision, good.revision);
@@ -1686,11 +1793,11 @@ async fn invalid_inventory_retains_only_running_memory_and_restart_withholds() {
         StatusCode::SERVICE_UNAVAILABLE
     );
     let mut cache =
-        api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad"]
+        api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/bad"]
             .clone();
     cache["spec"]["cacheGeneration"] = json!(1);
     api.put(
-        "/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/bad",
+        "/apis/racer.unbounded-cloud.io/v1alpha1/clustercaches/bad",
         cache,
     );
     until(|| restarted.ready()).await;

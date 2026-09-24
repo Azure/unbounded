@@ -77,8 +77,8 @@ func execute(t *testing.T, env *component.Env, plan *component.Plan) component.E
 	return result
 }
 
-func testCache() *racerv1alpha1.P2PCache {
-	return &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache"}, Spec: racerv1alpha1.P2PCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}}
+func testCache() *racerv1alpha1.ClusterCache {
+	return &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache", UID: "custom-cache-uid"}, Spec: racerv1alpha1.ClusterCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}}
 }
 
 // The fake API does not allocate UIDs. Retention deliberately requires the same

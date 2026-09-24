@@ -36,7 +36,7 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "a"}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "rack-b", UID: "b"}},
 	}
-	cache := &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache"}}
+	cache := &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "custom-cache", UID: "custom-cache-uid"}}
 
 	writes := 0
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sites[0], sites[1], cache).WithStatusSubresource(&unboundedv1alpha3.Site{}).WithInterceptorFuncs(interceptor.Funcs{
@@ -217,7 +217,7 @@ func TestRacerCacheSingletonWithoutSitesOrGantry(t *testing.T) {
 	}
 	run()
 
-	cache := &racerv1alpha1.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "independent-cache"}, Spec: racerv1alpha1.P2PCacheSpec{SiteSelector: metav1.LabelSelector{MatchLabels: map[string]string{"no": "match"}}}}
+	cache := &racerv1alpha1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "independent-cache", UID: "independent-cache-uid"}, Spec: racerv1alpha1.ClusterCacheSpec{SiteSelector: metav1.LabelSelector{MatchLabels: map[string]string{"no": "match"}}}}
 	if err := c.Create(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}

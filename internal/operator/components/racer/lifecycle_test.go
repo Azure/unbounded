@@ -233,16 +233,16 @@ func TestCacheWatchesIntentNotStatus(t *testing.T) {
 
 	for _, tc := range []struct {
 		name   string
-		mutate func(*racerv1alpha1.P2PCache)
+		mutate func(*racerv1alpha1.ClusterCache)
 		want   bool
 	}{
-		{"identical relist", func(*racerv1alpha1.P2PCache) {}, false},
-		{"UID-only recreation", func(c *racerv1alpha1.P2PCache) { c.UID = "replacement-cache-uid" }, true},
-		{"status", func(c *racerv1alpha1.P2PCache) { c.Status.Participants.Ready = 2 }, false},
-		{"resource version", func(c *racerv1alpha1.P2PCache) { c.ResourceVersion = "new" }, false},
-		{"selector", func(c *racerv1alpha1.P2PCache) { c.Spec.SiteSelector.MatchLabels = map[string]string{"x": "y"} }, true},
-		{"generation", func(c *racerv1alpha1.P2PCache) { c.Spec.CacheGeneration++ }, true},
-		{"termination", func(c *racerv1alpha1.P2PCache) { now := metav1.Now(); c.DeletionTimestamp = &now }, true},
+		{"identical relist", func(*racerv1alpha1.ClusterCache) {}, false},
+		{"UID-only recreation", func(c *racerv1alpha1.ClusterCache) { c.UID = "replacement-cache-uid" }, true},
+		{"status", func(c *racerv1alpha1.ClusterCache) { c.Status.Participants.Ready = 2 }, false},
+		{"resource version", func(c *racerv1alpha1.ClusterCache) { c.ResourceVersion = "new" }, false},
+		{"selector", func(c *racerv1alpha1.ClusterCache) { c.Spec.SiteSelector.MatchLabels = map[string]string{"x": "y"} }, true},
+		{"generation", func(c *racerv1alpha1.ClusterCache) { c.Spec.CacheGeneration++ }, true},
+		{"termination", func(c *racerv1alpha1.ClusterCache) { now := metav1.Now(); c.DeletionTimestamp = &now }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			next := base.DeepCopy()

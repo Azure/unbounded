@@ -8,8 +8,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestFetchRejectsUnsafeCacheUID(t *testing.T) {
+	for _, uid := range []string{"", "..", "UPPER", "-edge", "edge-", "a.b", strings.Repeat("a", 64)} {
+		if _, err := Fetch("HEAD", "unix://"+uid+"/object", ""); err == nil || !strings.Contains(err.Error(), "cache UID") {
+			t.Fatalf("unsafe UID %q was not rejected before dialing: %v", uid, err)
+		}
+	}
+}
 
 // Use a real HTTP server: ResponseRecorder alone does not model the server's
 // implicit content sniffing when a handler returns from a bodyless HEAD.

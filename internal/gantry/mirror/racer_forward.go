@@ -97,6 +97,7 @@ func (s *racerState) forward(ctx context.Context, cancel context.CancelFunc, w h
 	defer conn.Close() //nolint:errcheck // One response per hijacked connection.
 
 	result := racerForwardResult{ownership: racerConnectionOwned}
+
 	if !s.register(conn, cancel) {
 		result.err = errors.New("mirror: Racer is draining")
 		return result

@@ -1,7 +1,11 @@
 # Strategic merge patch, not a standalone Kubernetes resource.
-# Standalone only: select content_backend: racer and racer_cache_name: gantry
-# in gantry-config (or use equivalent flags). Operator-managed deployments use
-# the P2PCache gantry-backing annotation and generate the whole pod atomically.
+# Standalone only: render with --set RacerCacheUID=$(kubectl get clustercache gantry -o jsonpath='{.metadata.uid}').
+# Without a UID this optional patch is empty. Operator-managed deployments use
+# the ClusterCache gantry-backing annotation and generate the whole pod atomically.
+{{ if .RacerCacheUID -}}
+{{ if not (regexMatch "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" .RacerCacheUID) -}}
+{{ fail "RacerCacheUID must be the selected ClusterCache metadata.uid (1..63 lowercase alphanumeric/hyphen characters, alphanumeric edges)" }}
+{{ end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -9,6 +13,9 @@ metadata:
   namespace: {{ default "unbounded-system" .Namespace }}
 spec:
   template:
+    metadata:
+      annotations:
+        unbounded-cloud.io/gantry-cache-uid: {{ .RacerCacheUID | quote }}
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -21,14 +28,19 @@ spec:
             - |
               chown -R 65532:65532 /var/lib/gantry/libp2p
               chmod 0700 /var/lib/gantry/libp2p
-              mkdir -p /dev/racer/gantry
-              chgrp 65532 /dev/racer /dev/racer/gantry
-              chmod 2770 /dev/racer /dev/racer/gantry
+              mkdir -p /run/racer/{{ .RacerCacheUID }}
+              chgrp 65532 /run/racer /run/racer/{{ .RacerCacheUID }}
+              chmod 2770 /run/racer /run/racer/{{ .RacerCacheUID }}
           volumeMounts:
             - name: racer-sockets
-              mountPath: /dev/racer
+              mountPath: /run/racer
       containers:
         - name: gantry
+          args:
+            - agent
+            - --config=/etc/gantry/config.yaml
+            - --content-backend=racer
+            - --racer-cache-uid={{ .RacerCacheUID }}
           ports:
             - containerPort: 5001
               $patch: delete
@@ -36,9 +48,10 @@ spec:
               $patch: delete
           volumeMounts:
             - name: racer-sockets
-              mountPath: /dev/racer
+              mountPath: /run/racer
       volumes:
         - name: racer-sockets
           hostPath:
-            path: /dev/racer
+            path: /run/racer
             type: DirectoryOrCreate
+{{ end -}}

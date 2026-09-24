@@ -102,7 +102,7 @@ impl Attempt {
         }
     }
 }
-/// Origin transport plus a cache identity derived from its P2PCache UID.
+/// Origin transport plus a cache identity derived from its ClusterCache UID.
 #[derive(Clone)]
 pub struct Backend {
     endpoint: Endpoint,
