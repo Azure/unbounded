@@ -79,6 +79,8 @@ type Server struct {
 	logger               *slog.Logger
 	metrics              metricsHooks
 	racer                *gantryracer.Backend
+	racerMode            bool
+	racerRegistry        gantryracer.Registry
 	onRacerStream        func(sdk.TransferStats, bool, error)
 	onRacerFallback      func()
 	racerMu              sync.Mutex
@@ -652,15 +654,14 @@ func WithStartupReadinessGate() Option {
 	return func(s *Server) { s.startupGated = true }
 }
 
-// New builds a Server bound to the given local content store and origin.
+// New builds a direct-backend Server bound to the local content store and origin.
+// Use NewRacer to construct a Racer-backend Server.
 func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
-	limit := cfg.RacerMaxConcurrentTransfers
-	if limit <= 0 {
-		limit = 64
-	}
+	return newServer(cfg, store, origin, opts...)
+}
 
+func newServer(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
 	s := &Server{
-		racerAdmission:       make(chan struct{}, limit),
 		cfg:                  cfg,
 		store:                store,
 		origin:               origin,
@@ -772,7 +773,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
-	if s.cfg.ContentBackend == "racer" && r.Header.Get("Gantry-Mirrored") != "" {
+	if s.racerMode && r.Header.Get("Gantry-Mirrored") != "" {
 		http.Error(w, "incompatible direct peer protocol", http.StatusConflict)
 		return
 	}
@@ -889,7 +890,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	s.bumpCacheMiss()
 
-	if s.cfg.ContentBackend == "racer" {
+	if s.racerMode {
 		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
 		return
 	}

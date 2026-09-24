@@ -73,7 +73,7 @@ func TestRacerColdPagePreparationExceedsMetadataBudget(t *testing.T) {
 
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 1)}
 
-	m := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), up, mirror.WithRacer(&gantryracer.Backend{Client: client}, nil, func() { fallback.Add(1) })).Handler())
+	m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallback.Add(1) })).Handler())
 	defer m.Close()
 
 	resp, err := m.Client().Get(m.URL + "/v2/repo/blobs/" + d.String())
@@ -97,6 +97,9 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 		{"late-index-type", "application/vnd.oci.image.index.v1+json", `{"padding":"` + strings.Repeat(" ", 600) + `","mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`, false},
 		{"absent-json-field", "application/vnd.oci.image.index.v1+json", `{"schemaVersion":2,"manifests":[]}`, true},
 		{"absent-http-header", "", `{"schemaVersion":2,"manifests":[]}`, false},
+		{"absent-header-typed-json", "", `{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`, false},
+		{"opaque-get-type", "application/custom; version=1", `{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`, false},
+		{"empty-object-no-type", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var heads atomic.Int64
@@ -131,7 +134,7 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			m := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), registry).Handler())
+			m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), registry, nil).Handler())
 			defer m.Close()
 
 			kind := "manifests"
@@ -147,8 +150,12 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 			body, err := io.ReadAll(resp.Body)
 
 			_ = resp.Body.Close()
-			if err != nil || string(body) != tc.payload || resp.Header.Get("Content-Type") != tc.contentType || heads.Load() != 0 {
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != tc.payload || resp.Header.Get("Content-Type") != tc.contentType || heads.Load() != 0 {
 				t.Fatal(resp.Status, resp.Header, err)
+			}
+
+			if tc.contentType == "" && len(resp.Header.Values("Content-Type")) != 0 {
+				t.Fatal("absent upstream Content-Type was synthesized", resp.Header)
 			}
 		})
 	}
@@ -157,6 +164,20 @@ func TestRacerFallbackAuthoritativeGETContentType(t *testing.T) {
 type stalledFallbackOrigin struct {
 	opened, closed chan struct{}
 	once           sync.Once
+}
+
+func (o *stalledFallbackOrigin) PullWithMetadata(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	body, size, err := o.Pull(ctx, ref)
+	return body, size, "application/octet-stream", err
+}
+
+func (o *stalledFallbackOrigin) HeadMetadata(ctx context.Context, ref ifaces.OriginRef) (ifaces.OriginMetadata, error) {
+	size, contentType, err := o.Head(ctx, ref)
+	return ifaces.OriginMetadata{Ref: ref, Size: size, ContentType: contentType}, err
+}
+
+func (*stalledFallbackOrigin) OpenRange(context.Context, ifaces.OriginRef, int64, int64, int64) (io.ReadCloser, error) {
+	return nil, &ifaces.OriginRangeUnsupportedError{Reason: "fixture only serves full objects"}
 }
 
 func (o *stalledFallbackOrigin) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
@@ -186,7 +207,7 @@ func TestRacerFallbackStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 	cfg.PeerFetchTimeout = 500 * time.Millisecond
 	cfg.RacerMaxConcurrentTransfers = 1
 	up := &stalledFallbackOrigin{opened: make(chan struct{}), closed: make(chan struct{})}
-	server := mirror.New(cfg, fakes.NewCache(), up)
+	server := mirror.NewRacer(cfg, fakes.NewCache(), up, nil)
 	finished := make(chan struct{}, 4)
 	handler := server.Handler()
 
@@ -299,7 +320,7 @@ func TestRacerDisconnectCancelsLaterPage(t *testing.T) {
 	cfg.RacerMaxConcurrentTransfers = 1
 	up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
 	stats := make(chan sdk.TransferStats, 1)
-	server := mirror.New(cfg, fakes.NewCache(), up, mirror.WithRacer(&gantryracer.Backend{Client: client}, func(s sdk.TransferStats, _ bool, _ error) { stats <- s }, nil))
+	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, _ bool, _ error) { stats <- s }, nil))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()

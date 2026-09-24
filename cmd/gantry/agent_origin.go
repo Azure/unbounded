@@ -8,7 +8,6 @@ import (
 	"log/slog"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
-	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 )
 
@@ -44,7 +43,7 @@ func buildOriginClients(
 	c *config.Config,
 	inst *phase1Metrics,
 	logger *slog.Logger,
-) (puller, mirror ifaces.OriginPuller, bgSuccess func(kind string, bytes int64), bgDownstreamFailure func(kind, class string), err error) {
+) (puller, mirror *origin.Client, bgSuccess func(kind string, bytes int64), bgDownstreamFailure func(kind, class string), err error) {
 	bgSuccess = func(kind string, _ int64) {
 		inst.originPullSuccess.WithLabelValues(kind).Inc()
 	}

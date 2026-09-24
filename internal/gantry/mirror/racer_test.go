@@ -5,6 +5,7 @@ package mirror_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -19,12 +20,91 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
+
+func (o *authorizationCapturingOrigin) PullWithMetadata(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	body, size, err := o.Pull(ctx, ref)
+	return body, size, "application/octet-stream", err
+}
+
+func (o *authorizationCapturingOrigin) HeadMetadata(ctx context.Context, ref ifaces.OriginRef) (ifaces.OriginMetadata, error) {
+	size, contentType, err := o.Head(ctx, ref)
+	return ifaces.OriginMetadata{Ref: ref, Size: size, ContentType: contentType}, err
+}
+
+func (*authorizationCapturingOrigin) OpenRange(context.Context, ifaces.OriginRef, int64, int64, int64) (io.ReadCloser, error) {
+	return nil, &ifaces.OriginRangeUnsupportedError{Reason: "fixture only serves full objects"}
+}
+
+type metadataOnlyRegistry struct {
+	authorizationCapturingOrigin
+}
+
+func (*metadataOnlyRegistry) Pull(context.Context, ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	panic("Racer fallback must use PullWithMetadata")
+}
+
+func TestNewRacerInitializationAndNilBackend(t *testing.T) {
+	data := []byte("metadata fallback")
+	d := digestOf(data)
+	registry := &metadataOnlyRegistry{authorizationCapturingOrigin{body: data, seen: make(chan string, 2)}}
+	cfg := config.NewDefault()
+	cfg.UpstreamRegistries = []config.UpstreamRegistry{{Name: "registry.example"}}
+
+	var fallbacks, misses int
+
+	server := mirror.NewRacer(cfg, fakes.NewCache(), registry, nil,
+		mirror.WithStartupReadinessGate(),
+		mirror.WithMetrics(nil, func() { misses++ }),
+		mirror.WithRacerMetrics(nil, func() { fallbacks++ }))
+	handler := server.Handler()
+	request := httptest.NewRequest(http.MethodGet, "/v2/repo/blobs/"+d.String(), nil)
+	request.Header.Set("Authorization", "Bearer delegated")
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable || len(registry.seen) != 0 || fallbacks != 0 {
+		t.Fatal("startup gate did not block fallback", response.Code, fallbacks)
+	}
+
+	server.MarkReady()
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), data) || response.Header().Get("Content-Type") != "application/octet-stream" || fallbacks != 1 || misses != 1 {
+		t.Fatal("nil backend did not use registry metadata", response.Code, response.Header(), fallbacks, misses)
+	}
+
+	if got := <-registry.seen; got != "Bearer delegated" {
+		t.Fatal("lost delegated authorization", got)
+	}
+
+	request.Header.Set("Gantry-Mirrored", "1")
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict || fallbacks != 1 {
+		t.Fatal("constructor did not select Racer mode", response.Code, fallbacks)
+	}
+
+	server.Drain()
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable || fallbacks != 1 {
+		t.Fatal("drain did not block fallback", response.Code, fallbacks)
+	}
+}
 
 func racerUDS(t *testing.T, handler http.Handler) *sdk.Client {
 	t.Helper()
@@ -119,8 +199,8 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 
 	var completed atomic.Int64
 
-	server := mirror.New(cfg, fakes.NewCache(), up,
-		mirror.WithRacer(&gantryracer.Backend{Client: cache}, func(s sdk.TransferStats, p bool, err error) { results <- result{s, p, err} }, nil),
+	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: cache},
+		mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) { results <- result{s, p, err} }, nil),
 		mirror.WithLiveStreamCompletedHook(func(_ digest.Digest) { completed.Add(1) }))
 
 	finished := make(chan struct{}, 1)
@@ -305,7 +385,7 @@ func TestRacerRegistryRangeOriginAndFallback(t *testing.T) {
 
 			client := racerUDS(t, handler)
 
-			m := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), registry, mirror.WithRacer(&gantryracer.Backend{Client: client}, nil, nil)).Handler())
+			m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), registry, &gantryracer.Backend{Client: client}).Handler())
 			defer m.Close()
 
 			r, err := http.NewRequestWithContext(t.Context(), "GET", m.URL+"/v2/repo/blobs/"+d.String(), nil)
@@ -356,7 +436,7 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	local.Put(d, data)
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 4)}
 
-	m := httptest.NewServer(mirror.New(cfg, local, up).Handler())
+	m := httptest.NewServer(mirror.NewRacer(cfg, local, up, nil).Handler())
 	defer m.Close()
 
 	for _, tc := range []struct {
@@ -393,7 +473,7 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	// The ordinary fallback also withholds its last byte on digest mismatch.
 	corrupt := &authorizationCapturingOrigin{body: bytes.Repeat([]byte("x"), 16384), seen: make(chan string, 1)}
 
-	bad := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), corrupt).Handler())
+	bad := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), corrupt, nil).Handler())
 	defer bad.Close()
 
 	resp, err := bad.Client().Get(bad.URL + "/v2/repo/blobs/" + d.String())
@@ -437,7 +517,7 @@ func TestRacerOutageAndEmptyObject(t *testing.T) {
 
 			var fallbacks atomic.Int64
 
-			server := mirror.New(cfg, fakes.NewCache(), up, mirror.WithRacer(&gantryracer.Backend{Client: client}, nil, func() { fallbacks.Add(1) }))
+			server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallbacks.Add(1) }))
 
 			m := httptest.NewServer(server.Handler())
 			defer m.Close()

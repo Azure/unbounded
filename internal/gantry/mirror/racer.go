@@ -18,17 +18,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
-// WithRacer installs the explicit post-local-miss backend. Racer streams are
-// version pinned; containerd verifies the complete OCI SHA-256 digest.
-func WithRacer(backend *gantryracer.Backend, stream func(sdk.TransferStats, bool, error), fallback func()) Option {
+// NewRacer builds a Racer-backend Server with an explicit registry contract.
+// A nil backend sends local misses directly to the registry fallback.
+func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantryracer.Registry, backend *gantryracer.Backend, opts ...Option) *Server {
+	s := newServer(cfg, store, registry, opts...)
+	s.racerMode = true
+	s.racerRegistry = registry
+	s.racer = backend
+	s.manifestObservations = make(chan struct{}, 16)
+
+	limit := cfg.RacerMaxConcurrentTransfers
+	if limit <= 0 {
+		limit = 64
+	}
+
+	s.racerAdmission = make(chan struct{}, limit)
+
+	return s
+}
+
+// WithRacerMetrics registers Racer forwarding and registry fallback callbacks.
+func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), fallback func()) Option {
 	return func(s *Server) {
-		s.racer, s.onRacerStream, s.onRacerFallback = backend, stream, fallback
-		s.manifestObservations = make(chan struct{}, 16)
+		s.onRacerStream, s.onRacerFallback = stream, fallback
 	}
 }
 
@@ -336,7 +354,7 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 	}
 
 	if r.Method == http.MethodHead {
-		size, ct, err := s.origin.Head(r.Context(), ref)
+		size, ct, err := s.racerRegistry.Head(r.Context(), ref)
 		if err != nil {
 			writeOriginError(w, err, logger)
 			return
@@ -361,20 +379,7 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 
 	s.fireOriginStreamStarted(ref.Kind)
 
-	var (
-		body        io.ReadCloser
-		size        int64
-		contentType string
-		err         error
-	)
-
-	metadataPuller, authoritative := s.origin.(ifaces.OriginMetadataPuller)
-	if authoritative {
-		body, size, contentType, err = metadataPuller.PullWithMetadata(r.Context(), ref)
-	} else {
-		body, size, err = s.origin.Pull(r.Context(), ref)
-	}
-
+	body, size, contentType, err := s.racerRegistry.PullWithMetadata(r.Context(), ref)
 	if err != nil {
 		s.fireOriginStreamFailed(ref.Kind)
 		writeOriginError(w, err, logger)
@@ -394,19 +399,15 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
-	if authoritative {
-		w.Header().Set("Docker-Content-Digest", ref.Digest.String())
+	w.Header().Set("Docker-Content-Digest", ref.Digest.String())
 
-		w.Header()["Content-Type"] = nil
-		if contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		}
+	w.Header()["Content-Type"] = nil
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
 
-		if size >= 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		}
-	} else {
-		writeBlobHeadersWithPrefix(w, ref.Digest, size, ref.Kind, prefix)
+	if size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
 
 	hash := sha256.New()

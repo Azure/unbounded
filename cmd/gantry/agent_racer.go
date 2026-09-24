@@ -23,7 +23,6 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
@@ -34,7 +33,7 @@ import (
 // runRacerAgent deliberately starts no libp2p host, DHT, transfer client/server,
 // chair client/server, coordinator, advertiser, or content-selection machinery.
 // Direct coordination has no listener; Racer owns peer discovery and transport.
-func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
+func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Registry, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -53,11 +52,6 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 		return err
 	}
 
-	ranges, ok := origin.(ifaces.OriginRangePuller)
-	if !ok {
-		return errors.New("racer requires a range-capable registry client")
-	}
-
 	cacheSocket, originSocket, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName)
 	if err != nil {
 		return err
@@ -74,7 +68,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 		registries[registry.Name] = true
 	}
 
-	handler, err := sdk.NewRangeOrigin(&gantryracer.Origin{Local: store, Registry: ranges, Registries: registries})
+	handler, err := sdk.NewRangeOrigin(&gantryracer.Origin{Local: store, Registry: origin, Registries: registries})
 	if err != nil {
 		return err
 	}
@@ -99,9 +93,9 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginPu
 		}
 	}()
 
-	server := mirror.New(c, local, origin,
+	server := mirror.NewRacer(c, local, origin, &gantryracer.Backend{Client: client},
 		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
-		mirror.WithRacer(&gantryracer.Backend{Client: client}, onRacerStream, fallback.Inc),
+		mirror.WithRacerMetrics(onRacerStream, fallback.Inc),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
