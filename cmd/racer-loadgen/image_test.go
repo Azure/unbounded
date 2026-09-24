@@ -51,6 +51,11 @@ func TestImageConfig(t *testing.T) {
 		{"-role=load"},
 		{"-mode=container-image"},
 		{"-mode=container-image", "-role=both"},
+		{"-mode=container-image", "-role=unknown"},
+		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-layers-per-image=3"},
+		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-registry-url=http://registry"},
+		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-gantry-ready-timeout=0"},
+		{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-gantry-endpoint=unix:///cache"},
 		{"-mode=container-image", "-role=registry", "-layers-per-image=0"},
 		{"-mode=container-image", "-role=registry", "-layers-per-image=1025"},
 		{"-mode=container-image", "-role=registry", "-layer-concurrency=0"},
@@ -80,6 +85,11 @@ func TestImageConfig(t *testing.T) {
 
 	if _, err := parseConfig([]string{"-mode=container-image", "-role=load", "-registry-url=http://registry:8081", "-registry-namespace=registry:8081"}, io.Discard); err != nil {
 		t.Fatal(err)
+	}
+
+	c, err := parseConfig([]string{"-mode=container-image", "-role=both", "-registry-namespace=fixture.test", "-footprint=80GB", "-object-size=1GB", "-layers-per-image=80", "-concurrency=8", "-layer-concurrency=8", "-timeout=30m"}, io.Discard)
+	if err != nil || c.footprint != 80_000_000_000 || c.layersPerImage != 80 || c.registryURL != "" {
+		t.Fatalf("combined config: %+v, %v", c, err)
 	}
 }
 
@@ -391,7 +401,7 @@ func TestImageCatalogValidation(t *testing.T) {
 }
 
 func TestImageServiceLifecycle(t *testing.T) {
-	for _, role := range []string{"registry", "load"} {
+	for _, role := range []string{"registry", "load", "both"} {
 		t.Run(role, func(t *testing.T) {
 			s, c := imageTestRegistry(t)
 

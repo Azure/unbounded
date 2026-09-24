@@ -89,6 +89,16 @@ containerd's `certs.d` directory. Include the port when the image reference
 uses a non-default port. Gantry requires at least one accelerated upstream
 registry.
 
+For an identical registry on each node, use a ClusterIP Service with
+`internalTrafficPolicy: Local` selecting the registry pods, and configure its
+ordinary Service DNS name as the upstream endpoint on every Gantry node. Traffic
+from each Gantry pod reaches only an endpoint on that node. If no local endpoint
+exists, the request fails rather than falling back to another node's registry.
+For the combined loadgen fixture, also set `publishNotReadyAddresses: true`:
+its registry must be reachable before client readiness can pass the Gantry
+startup gate. The registry itself returns 503 while preparing its dataset.
+See the [loadgen example](https://github.com/Azure/unbounded/blob/main/e2e/racer/examples/container-image-loadgen.yaml).
+
 
 
 ### 3. Deploy Gantry

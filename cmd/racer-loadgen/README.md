@@ -2,7 +2,7 @@
 
 Test-only load generator with two workload modes. The default `-mode=racer`
 provides a synthetic origin and full-object download workers using the Racer Go
-SDK over Unix sockets. `-mode=container-image` provides a fake HTTP registry or
+SDK over Unix sockets. `-mode=container-image` provides a fake HTTP registry and/or
 simulated image pulls through Gantry. Downloaded bytes are counted and discarded.
 
 ## Build and try it
@@ -33,13 +33,14 @@ Zipf sampling, and timeouts. Omit `-duration` to run until interrupted.
 
 ## Container-image mode
 
-Use separate processes with `-role=registry` and `-role=load`. Each process runs
-one workload type. The registry serves digest-addressed OCI manifests/configs
+Use separate processes with `-role=registry` and `-role=load`, or one process per
+host with `-role=both`. The registry serves digest-addressed OCI manifests/configs
 and deterministic opaque layer bytes with real SHA-256 digests. Layers are not
 tar archives: this measures manifest-driven download/verification throughput,
 not containerd image commit, unpack, or container startup.
 
-The puller discovers manifest descriptors at the registry's `/loadgen/catalog`.
+The separate puller discovers descriptors at the registry's `/loadgen/catalog`;
+combined mode uses its own prepared catalog without an HTTP catalog request.
 Every manifest, config, and layer GET then goes to `-gantry-endpoint` using a
 digest and `?ns=<registry-namespace>`. It verifies size and SHA-256, discards
 layers with bounded memory, and fetches layers concurrently. It never follows
@@ -89,15 +90,46 @@ and Racer readiness, then start the puller:
   -concurrency=4 -layer-concurrency=3 -exponent=1 -seed=42 -duration=60s
 ```
 
-Both roles expose `/healthz`, `/readyz`, and `/metrics` on `-listen`. Health is
+All roles expose `/healthz`, `/readyz`, and `/metrics` on `-listen`. Health is
 process health. Registry readiness requires hashing the entire dataset first;
-memory retains descriptors and metadata, not layer bodies. The puller retries
+memory retains descriptors and metadata, not layer bodies. The separate `load` role retries
 catalog discovery until successful or interrupted. Its readiness means catalog
 discovery succeeded, not that Gantry pulls are succeeding. `-duration` starts
 after preparation/discovery, so hashing is outside the measurement interval.
 At shutdown, in-flight canceled pulls count as errors and consumed bytes remain
 counted. Final pull and byte totals are logged before exit; normal duration
 expiry does not make the process exit nonzero when individual pulls failed.
+
+### Combined per-host benchmark
+
+Run an identical registry and client on every participating Gantry/Racer node:
+
+```sh
+./bin/racer-loadgen -mode=container-image -role=both \
+  -listen=:18082 -registry-listen=:18081 \
+  -footprint=80GB -object-size=1GB -layers-per-image=80 \
+  -registry-namespace=image-fixture.test -gantry-endpoint=http://127.0.0.1:5000 \
+  -concurrency=8 -layer-concurrency=8 -timeout=30m -gantry-ready-timeout=10m
+```
+
+This is one deterministic 80 GB image with 80 unique 1 GB layers per node.
+Keep all dataset flags and the registry namespace identical across nodes.
+Each process hashes the full dataset at startup and generates bodies on demand;
+it does not retain 80 GB in memory. Do not set `-registry-url` in combined mode.
+Every client payload still goes through its configured Gantry endpoint, including
+when that process also hosts the registry. Gantry's origin fetches can reach the
+registry independently of the client's readiness.
+
+Management and registry listeners start before hashing. The registry returns
+503 while preparing, then serves immediately. Only after preparation does the
+client probe Gantry's `/v2/` startup gate, requiring HTTP 200 and the
+`Docker-Distribution-API-Version: registry/2.0` header. Probes have a five-second
+deadline and a one-second retry delay, bounded overall by
+`-gantry-ready-timeout`. Expiry exits nonzero; interruption cancels hashing,
+probes, or pulls and shuts down both listeners. Combined `/readyz` becomes 200
+and `-duration` starts only after this gate opens. This is initial readiness,
+not continuous health or proof of Racer acceleration; subsequent fallback and
+pull failures remain visible in Gantry and client metrics.
 
 ### Dataset and concurrency
 
@@ -111,6 +143,7 @@ expiry does not make the process exit nonzero when individual pulls failed.
 | `-exponent` | Zipf image-popularity exponent (default 1; 0 is uniform) |
 | `-seed` | Sampling seed; random if omitted, printed in readiness log |
 | `-timeout` | Whole-image deadline, catalog-request deadline, and registry response write timeout (default 5m) |
+| `-gantry-ready-timeout` | Combined mode's bounded Gantry startup wait after local hashing (default 10m) |
 
 Image count is `footprint / object-size / layers-per-image`; both divisions must
 be exact. There are at most one million layers and 100,000 images. Layers are
@@ -125,8 +158,11 @@ tag, listing, or authorization APIs.
 
 ### Metrics and cold/warm comparisons
 
-Scrape the puller's `:18082/metrics` and registry's `:18080/metrics` in the local
-example. Image metrics are separate from the default Racer download metrics:
+Scrape the puller's `:18082/metrics` and registry's `:18080/metrics` in the separate
+local example. In combined mode scrape only `:18082/metrics`, once per pod; it
+exposes both independent metric families. Gantry fallback metrics remain on
+Gantry's metrics endpoint. Image metrics are separate from the default Racer
+download metrics:
 
 - `racer_loadgen_image_pulls_total{result="success|error"}`: whole-image attempts.
 - `racer_loadgen_image_pull_duration_seconds{result}`: verified image latency.
@@ -178,27 +214,65 @@ make image-racer-loadgen-local CONTAINER_ENGINE=docker RACER_LOADGEN_IMAGE=racer
 Import `racer-loadgen:local` into your cluster's nodes (for kind, use
 `kind load docker-image racer-loadgen:local --name <cluster>`), then use
 [`e2e/racer/examples/container-image-loadgen.yaml`](../../e2e/racer/examples/container-image-loadgen.yaml).
-It supplies a single registry Deployment/Service and a host-network puller
-DaemonSet on Site `racer-a`. Change the Site selector and image tag as needed.
-Configure this upstream on every participating Gantry node:
+It supplies a combined host-network DaemonSet on Site `racer-a`, with low resource
+requests and no CPU/memory limits or explicit `GOMAXPROCS`/`GOMEMLIMIT` caps.
+Change the Site selector and image tag as needed. Gantry runs in the pod network,
+so its loopback is not the node's loopback. Configure this upstream on every
+participating Gantry node, retaining other entries:
 
 ```yaml
 upstream_registries:
   - name: image-fixture.test
-    endpoint: http://image-loadgen-registry.unbounded-system.svc.cluster.local:8081
+    endpoint: http://image-loadgen-local-registry.unbounded-system.svc.cluster.local:18081
+```
+
+The example includes a ClusterIP Service with `internalTrafficPolicy: Local`
+selecting the host-network loadgen pods on port 18081. All Gantry instances use
+the same ordinary Service DNS name; no Gantry image or environment change is
+needed. The fixture binds all host interfaces so the Service can reach its
+registry port. Without a local endpoint, requests fail rather than routing to
+another node's registry.
+
+The Service sets `publishNotReadyAddresses: true` so registry traffic can reach
+the pod before combined client readiness passes Gantry's startup gate. This
+avoids a readiness cycle; it does not bypass registry preparation. Registry
+requests return 503 while hashing, then succeed even while management `/readyz`
+is still waiting for Gantry. Keep the Service selector independent of role and
+readiness so it selects both registry-only staging pods and combined pods.
+
+The example disables generic annotation scraping to avoid duplicate targets
+from its two declared ports. Add one dedicated Prometheus job (or equivalent
+PodMonitor selecting only `management`):
+
+```yaml
+- job_name: image-loadgen
+  kubernetes_sd_configs:
+    - role: pod
+      namespaces:
+        names: [unbounded-system]
+      selectors:
+        - role: pod
+          label: app=image-loadgen
+          field: status.phase=Running
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_container_name, __meta_kubernetes_pod_container_port_name]
+      action: keep
+      regex: loadgen;management
+    - source_labels: [__meta_kubernetes_pod_node_name]
+      target_label: node
 ```
 
 Then apply the example and observe preparation and pull metrics:
 
 ```sh
 kubectl apply -f e2e/racer/examples/container-image-loadgen.yaml
-kubectl -n unbounded-system logs deployment/image-loadgen-registry -f
+kubectl -n unbounded-system logs <image-loadgen-pod> --tail=30
 kubectl -n unbounded-system get pods -l app=image-loadgen -o wide
 ```
 
-Port 18082 must be free on participating nodes. The puller uses host networking
-to reach Gantry's node-local `127.0.0.1:5000`; cluster DNS is retained for catalog
-discovery. Gantry must also resolve/reach the registry Service. This workload
+Ports 18081 and 18082 must be free on participating nodes. The puller uses host
+networking to reach Gantry's node-local `127.0.0.1:5000`. Ensure every Gantry/Racer
+origin node has a prepared registry before measuring fleet throughput. This workload
 uses Gantry's existing P2PCache and requires no loadgen socket mounts or extra
 P2PCache. Keep the default unbounded duration for the DaemonSet; a finite duration
 causes Kubernetes to restart it. Delete the example to stop the benchmark:

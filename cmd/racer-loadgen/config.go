@@ -24,6 +24,7 @@ type config struct {
 	exponent                                                                   float64
 	concurrency, pageConcurrency                                               int
 	timeout, ttl, duration                                                     time.Duration
+	gantryReadyTimeout                                                         time.Duration
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -36,11 +37,12 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	f.SetOutput(output)
 	f.BoolVar(&c.showVersion, "version", false, "print version and exit")
 	f.StringVar(&c.mode, "mode", "racer", "workload: racer or container-image")
-	f.StringVar(&c.role, "role", "", "container-image role: registry or load")
+	f.StringVar(&c.role, "role", "", "container-image role: registry, load, or both")
 	f.StringVar(&c.registryListen, "registry-listen", ":8081", "fake registry TCP listen address")
 	f.StringVar(&c.registryURL, "registry-url", "", "fake registry HTTP(S) URL for catalog discovery")
 	f.StringVar(&c.registryNamespace, "registry-namespace", "", "Gantry upstream registry name (ns query parameter)")
 	f.StringVar(&c.gantryEndpoint, "gantry-endpoint", "http://127.0.0.1:5000", "Gantry mirror HTTP(S) URL")
+	f.DurationVar(&c.gantryReadyTimeout, "gantry-ready-timeout", 10*time.Minute, "both role: maximum wait for Gantry startup readiness after registry preparation")
 	f.IntVar(&c.layersPerImage, "layers-per-image", 4, "unique layers per synthetic image; object-size is layer size")
 	f.IntVar(&c.layerConcurrency, "layer-concurrency", 3, "parallel layer downloads per image")
 	f.StringVar(&c.endpoint, "endpoint", "/dev/racer/loadgen/cache", "local Racer cache Unix socket")
@@ -115,24 +117,32 @@ func (c config) validateMode() error {
 			return fmt.Errorf("role is only supported in container-image mode")
 		}
 	case "container-image":
-		if c.role != "registry" && c.role != "load" {
-			return fmt.Errorf("container-image mode requires -role=registry or -role=load")
+		if c.role != "registry" && c.role != "load" && c.role != "both" {
+			return fmt.Errorf("container-image mode requires -role=registry, -role=load, or -role=both")
 		}
 
 		if c.layersPerImage < 1 || c.layersPerImage > 1024 || c.layerConcurrency < 1 {
 			return fmt.Errorf("layers-per-image must be 1..1024 and layer-concurrency must be positive")
 		}
 
-		if c.role == "registry" {
+		if c.role != "load" {
 			layers := c.footprint / c.objectSize
 			if layers%int64(c.layersPerImage) != 0 || layers/int64(c.layersPerImage) > 100_000 {
 				return fmt.Errorf("layer count must be divisible by layers-per-image and produce at most 100000 images")
 			}
-		} else {
+		}
+
+		if c.role == "load" {
 			if err := validateHTTPURL(c.registryURL); err != nil {
 				return fmt.Errorf("registry-url: %w", err)
 			}
+		}
 
+		if c.role == "both" && (c.gantryReadyTimeout <= 0 || c.registryURL != "") {
+			return fmt.Errorf("both role requires positive gantry-ready-timeout and no registry-url (catalog is local)")
+		}
+
+		if c.role != "registry" {
 			if err := validateHTTPURL(c.gantryEndpoint); err != nil {
 				return fmt.Errorf("gantry-endpoint: %w", err)
 			}

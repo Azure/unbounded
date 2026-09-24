@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -75,7 +76,7 @@ func serveImages(ctx context.Context, c config) error {
 		return err
 	}
 
-	if c.role == "registry" {
+	if c.role != "load" {
 		if err := startServer(c.registryListen, registry); err != nil {
 			return err
 		}
@@ -89,9 +90,13 @@ func serveImages(ctx context.Context, c config) error {
 		setupErr error
 	)
 
-	if c.role == "registry" {
+	if c.role != "load" {
 		setupErr = registry.prepare(ctx, c)
 		catalog = registry.catalog
+
+		if setupErr == nil && c.role == "both" {
+			setupErr = waitForImageGantry(ctx, client, c)
+		}
 	} else {
 		// Registry preparation can be long for large footprints. Keep health and
 		// metrics live while waiting, and honor cancellation between retries.
@@ -126,7 +131,7 @@ func serveImages(ctx context.Context, c config) error {
 
 		slog.Info("image service ready", "role", c.role, "images", len(catalog.Images), "gantry_endpoint", c.gantryEndpoint, "seed", c.seed, "concurrency", c.concurrency, "layer_concurrency", c.layerConcurrency)
 
-		if c.role == "load" {
+		if c.role != "registry" {
 			runImageLoad(runCtx, client, c, catalog, m)
 		} else {
 			<-runCtx.Done()
@@ -173,6 +178,56 @@ func serveImages(ctx context.Context, c config) error {
 
 	if setupErr != nil && !interrupted {
 		return setupErr
+	}
+
+	return nil
+}
+
+// The mirror's /v2/ startup gate opens only after Gantry's initial readiness
+// checks converge. Keep the prepared registry serving while waiting so origin
+// requests cannot deadlock behind client readiness. This is a startup check,
+// not a guarantee that subsequent pulls use Racer rather than Gantry fallback.
+func waitForImageGantry(ctx context.Context, client *http.Client, c config) error {
+	ctx, cancel := context.WithTimeout(ctx, c.gantryReadyTimeout)
+	defer cancel()
+
+	var lastErr error
+	for ctx.Err() == nil {
+		lastErr = probeImageGantry(ctx, client, c.gantryEndpoint)
+		if lastErr == nil {
+			return nil
+		}
+
+		slog.Warn("waiting for Gantry startup readiness", "error", lastErr)
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("waiting for Gantry startup readiness: %w (last probe: %v)", ctx.Err(), lastErr)
+}
+
+func probeImageGantry(ctx context.Context, client *http.Client, endpoint string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(endpoint, "/")+"/v2/", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck // Readiness needs only response headers.
+
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Docker-Distribution-API-Version") != "registry/2.0" {
+		return fmt.Errorf("gantry /v2/: %s (registry/2.0 header required)", resp.Status)
 	}
 
 	return nil
