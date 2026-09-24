@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -899,6 +899,29 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     }
 }
 
+// Management-only metadata, using the existing plain HTTP health listener.
+// Never forward this request through the process-bound configuration handler.
+async fn product_catalog(State(state): State<HttpState>, Path(universe): Path<String>) -> Response {
+    if !state.shared.serving() || !state.runtime.ready() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let result = state.runtime.subscriptions.product_catalog(&universe);
+    if !state.shared.serving() || !state.runtime.ready() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match result {
+        Ok(body) => (
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
 async fn replica_ack(State(shared): State<Arc<Shared>>) -> Response {
     if !shared.hot.ready(
         unix_now(),
@@ -1664,6 +1687,7 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
     let health = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readiness))
+        .route("/debug/product-catalog/{universe}", get(product_catalog))
         .with_state(state);
     let control_listener = TcpListener::bind(address(&shared.options.listen)).await?;
     let enroll_listener = TcpListener::bind(address(&shared.options.enroll_listen)).await?;

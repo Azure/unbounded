@@ -1860,6 +1860,14 @@ async fn stale_route_publication_cannot_overwrite_successor_or_enable_serving() 
 async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
     let (fixture, client, api_stop) = Fixture::start().await?;
     fixture.seed();
+    fixture.put(
+        "/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/catalog",
+        json!({
+            "apiVersion": "racer.unbounded-cloud.io/v1alpha1", "kind": "P2PCache",
+            "metadata": {"name": "catalog", "uid": "catalog-uid", "generation": 1},
+            "spec": {"cacheGeneration": 1, "maxCandidateAttempts": 3, "siteSelector": {}}
+        }),
+    );
     let proof_address = free_address().await;
     let port = proof_address.rsplit(':').next().unwrap();
     // Exercise real Lease CAS/expiry and TLS takeover with shorter timing.
@@ -1968,6 +1976,24 @@ async fn warm_standby_takes_over_without_regenerating_trust() -> Result<()> {
         rejected.starts_with(b"HTTP/1.1 503"),
         "warm follower must reject enrollment"
     );
+    let catalog_request = format!(
+        "GET /debug/product-catalog/{} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        racer_controlplane::model::identity("universe", "edge")
+    );
+    let standby_catalog = request(&second.health_listen, &catalog_request, None).await?;
+    assert!(
+        standby_catalog.starts_with(b"HTTP/1.1 503"),
+        "ready warm standby has no authority to expose a published catalog"
+    );
+    let leader_catalog = request(&first.health_listen, &catalog_request, None).await?;
+    assert!(leader_catalog.starts_with(b"HTTP/1.1 200"));
+    let leader_catalog = String::from_utf8(leader_catalog)?;
+    let (headers, catalog) = leader_catalog.split_once("\r\n\r\n").unwrap();
+    assert!(headers.contains("content-type: application/json"));
+    assert!(headers.contains("cache-control: no-store"));
+    let catalog: Value = serde_json::from_str(catalog)?;
+    assert_eq!(catalog["catalog"]["selectedPodUIDs"], json!(["worker-pod"]));
+    assert_eq!(catalog["catalog"]["members"].as_array().unwrap().len(), 1);
     let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
     let original_lease = fixture.get(&lease_path).unwrap();
     assert_eq!(original_lease["spec"]["leaseDurationSeconds"], 3);

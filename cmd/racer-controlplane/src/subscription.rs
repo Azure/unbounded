@@ -24,6 +24,9 @@ use crate::status::{Observation, Reports, header};
 use crate::storage::StoragePolicy;
 use crate::topology::Topology;
 
+#[path = "subscription/catalog.rs"]
+mod catalog;
+
 pub type SecurityGetter = Arc<dyn Fn() -> Option<SecurityContext> + Send + Sync>;
 
 pub(crate) struct Published {
