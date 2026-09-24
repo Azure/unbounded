@@ -4,8 +4,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +22,101 @@ import (
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racer"
 )
+
+func TestRacerCacheSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace socket via proc fd")
+	}
+
+	dir, err := os.MkdirTemp(".", ".racer-cache-readiness-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	folder, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer folder.Close()
+
+	socket := fmt.Sprintf("/proc/self/fd/%d/cache", folder.Fd())
+	if racerCacheSocketReady(t.Context(), socket) {
+		t.Fatal("missing socket reported ready")
+	}
+
+	for _, tc := range []struct {
+		name          string
+		status        int
+		allow, length string
+		want          bool
+	}{
+		{name: "local parser with origins unavailable", status: 405, allow: "GET, HEAD", length: "0", want: true},
+		{name: "missing allow", status: 405, length: "0"},
+		{name: "wrong allow", status: 405, allow: "GET", length: "0"},
+		{name: "unexpected body", status: 405, allow: "GET, HEAD", length: "1"},
+		{name: "unavailable", status: 503, allow: "GET, HEAD", length: "0"},
+		{name: "bad gateway", status: 502, allow: "GET, HEAD", length: "0"},
+		{name: "not found", status: 404, allow: "GET, HEAD", length: "0"},
+		{name: "unexpected success", status: 200, allow: "GET, HEAD", length: "0"},
+		{name: "redirect", status: 307, allow: "GET, HEAD", length: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int64
+
+			server, _, err := startRacerOrigin(socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+
+				if r.Method != http.MethodOptions || r.RequestURI != "/" {
+					t.Errorf("probe entered content path: %s %q", r.Method, r.RequestURI)
+					w.WriteHeader(http.StatusBadGateway)
+
+					return
+				}
+
+				w.Header().Set("Allow", tc.allow)
+				w.Header().Set("Content-Length", tc.length)
+				w.Header().Set("Location", "/redirected")
+				w.WriteHeader(tc.status)
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.Close()
+
+			if got := racerCacheSocketReady(t.Context(), socket); got != tc.want {
+				t.Fatalf("ready=%v, want %v", got, tc.want)
+			}
+
+			if requests.Load() != 1 {
+				t.Fatalf("probe followed a redirect or retried: requests=%d", requests.Load())
+			}
+		})
+	}
+
+	// A bound socket without a serving worker is not sufficient. The caller's
+	// deadline must bound a stalled parser, not merely its connect operation.
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	if racerCacheSocketReady(ctx, socket) || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatal("stalled listener did not fail at the probe deadline")
+	}
+
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if racerCacheSocketReady(t.Context(), socket) {
+		t.Fatal("closed socket reported ready")
+	}
+}
 
 func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 	if runtime.GOOS != "linux" {
