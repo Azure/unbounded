@@ -86,6 +86,7 @@ impl Provider {
             active: state,
             owners: self.owners.clone(),
             negotiations: self.negotiations.clone(),
+            diagnostics: self.diagnostics.clone(),
         };
         request.select_peer();
         request

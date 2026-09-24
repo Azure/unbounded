@@ -10,6 +10,8 @@ pub mod crypto;
 #[cfg(feature = "dev-bench")]
 #[path = "../bench/mod.rs"]
 pub mod dev_bench;
+mod failure_diagnostics;
+pub use failure_diagnostics::initialize as initialize_failure_diagnostics;
 pub mod handlers;
 pub mod header_value;
 pub mod http;

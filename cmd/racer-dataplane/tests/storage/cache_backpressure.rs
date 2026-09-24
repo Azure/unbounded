@@ -195,6 +195,21 @@ fn buffer_backpressure() {
         ));
         assert!(upstream.starts.is_empty());
         assert_eq!(upstream.advances, 0);
+        let diagnostics = upstream.diagnostics.borrow();
+        let event = diagnostics.last().expect("expiry must retain causal state");
+        assert_eq!(event.state, "acquire");
+        assert!(event.buffer_wait);
+        assert_eq!(event.offset, Some(0));
+        assert_eq!(event.key.len(), 64);
+        assert_eq!(event.candidate_remaining_ms, 0);
+        if candidate {
+            assert_eq!(event.site, "candidate_before_step");
+            assert!(event.caller_remaining_ms > 0);
+        } else {
+            assert_eq!(event.site, "caller_before_poll");
+            assert_eq!(event.caller_remaining_ms, 0);
+        }
+        drop(diagnostics);
         drop(held);
         cache.shutdown(&mut ring).unwrap();
         pool.assert_recovered();

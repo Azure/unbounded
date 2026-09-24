@@ -211,6 +211,7 @@ pub struct Provider {
     active: Option<Rc<RefCell<RouteState>>>,
     owners: Rc<RefCell<Owners>>,
     negotiations: Rc<RefCell<BTreeMap<String, String>>>,
+    diagnostics: Rc<RefCell<crate::failure_diagnostics::Samples>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Chain {
@@ -367,6 +368,7 @@ impl Provider {
             active: None,
             owners: Rc::new(RefCell::new(Owners::default())),
             negotiations: Rc::new(RefCell::new(BTreeMap::new())),
+            diagnostics: Rc::new(RefCell::new(Default::default())),
         }
     }
     fn reported(
@@ -458,6 +460,48 @@ impl Provider {
     }
 }
 impl Upstream for Provider {
+    fn diagnose_failure(
+        &self,
+        fault: crate::failure_diagnostics::CacheFailure,
+        error: &cache::Error,
+    ) {
+        if !crate::failure_diagnostics::selected(&fault.key) {
+            return;
+        }
+        let Some(suppressed) = self
+            .diagnostics
+            .borrow_mut()
+            .take(crate::environment::now())
+        else {
+            return;
+        };
+        let route=self.active.as_ref().map(|s| {
+            let s=s.borrow(); let c=&s.cursor;
+            serde_json::json!({"identity":hex(&c.identity),"owner_slot":c.owner,"candidate_ordinal":c.attempt,
+                "candidate":self.routing.as_ref().map(|r|r.destination(c)),"path":c.path,"position":c.position,
+                "ingress":s.origin,"repaired":c.failed!=u32::MAX})
+        });
+        let peer=self.peer.as_ref().map(|p| {
+            let p=p.borrow(); serde_json::json!({"id":self.selected,"endpoint":p.http.endpoint.address.tcp().map(|v|v.to_string()),
+                "breaker":format!("{:?}",p.http.breaker.status()),"last_breaker_failure":p.http.breaker.last_failure()})
+        });
+        let backend = if self.peer.is_none() {
+            let backend = self.backend.borrow();
+            Some(
+                serde_json::json!({"breaker":format!("{:?}",backend.breaker.status()),
+                "last_breaker_failure":backend.breaker.last_failure()}),
+            )
+        } else {
+            None
+        };
+        let chain = self.chain.borrow();
+        crate::failure_diagnostics::emit(
+            serde_json::json!({"event":"racer_page_failure","volume":self.volume,
+            "worker":std::thread::current().name(),"flight":self.flight,"cache":fault,"route":route,"peer":peer,"backend":backend,
+            "hops":chain.hops,"work":chain.work,"rank":self.receive_rank,"suppressed":suppressed,
+            "failure":crate::failure_diagnostics::Failure::from_error(error)}),
+        );
+    }
     type Exchange = Exchange;
     fn start_metadata(
         &mut self,

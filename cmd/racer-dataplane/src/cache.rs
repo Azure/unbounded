@@ -832,6 +832,7 @@ pub enum ExchangeProgress<E> {
 /// exchanges own only small transport storage. Drop cancels; driver-held storage
 /// stays pinned until I/O quiesces. Fallbacks share the candidate deadline.
 pub trait Upstream {
+    fn diagnose_failure(&self, _fault: crate::failure_diagnostics::CacheFailure, _error: &Error) {}
     type Exchange;
     /// Metadata exchanges never reserve payload storage.
     fn start_metadata(
@@ -1027,6 +1028,52 @@ pub struct Fault<U: Upstream> {
     candidate_deadline: Option<Instant>,
 }
 impl<U: Upstream> Fault<U> {
+    fn diagnostic_state(&self) -> &'static str {
+        match &self.state {
+            Loading::Metadata(_) => "metadata_publish",
+            Loading::MetadataExchange(_) => "metadata_exchange",
+            Loading::MetadataRetry(_) => "metadata_retry",
+            Loading::Admitting(_) => "admitting",
+            Loading::File(_) => "file",
+            Loading::Publishing(_) => "publishing",
+            Loading::Materializing(..) => "materializing",
+            Loading::Materialized => "materialized",
+            Loading::Shared(_) => "shared",
+            Loading::ChecksumPending(_) => "checksum_pending",
+            Loading::Checksum(_) => "checksum",
+            Loading::Acquire => "acquire",
+            Loading::RetryPeer { .. } => "retry_peer",
+            Loading::Upstream { .. } => "upstream",
+            Loading::Done => "done",
+        }
+    }
+    fn diagnose(
+        &self,
+        upstream: &U,
+        error: &Error,
+        site: &'static str,
+        polled_state: Option<&'static str>,
+    ) {
+        let now = crate::environment::now();
+        upstream.diagnose_failure(
+            crate::failure_diagnostics::CacheFailure {
+                key: peer_wire::hex(&self.key),
+                checksum: self.representation_checksum().map(|c| peer_wire::hex(&c.0)),
+                offset: match &self.spec {
+                    Spec::Page(p) => Some(p.offset),
+                    _ => None,
+                },
+                state: self.diagnostic_state(),
+                polled_state,
+                site,
+                caller_remaining_ms: self.deadline.saturating_duration_since(now).as_millis(),
+                candidate_remaining_ms: self.deadline().saturating_duration_since(now).as_millis(),
+                buffer_wait: self.buffer_wait.is_some(),
+                network_flight: self.network.is_some(),
+            },
+            error,
+        );
+    }
     pub(crate) fn representation_checksum(&self) -> Option<Checksum> {
         match &self.spec {
             Spec::Metadata(_) => None,
@@ -1661,6 +1708,7 @@ impl Cache {
         }
         self.bind(ring)?;
         if crate::environment::now() >= fault.deadline {
+            fault.diagnose(upstream, &Error::Timeout, "caller_before_poll", None);
             return Err(Error::Timeout);
         }
         if let Spec::Page(page) = &fault.spec {
@@ -1846,6 +1894,12 @@ impl Cache {
                                 if crate::environment::now() >= candidate_end
                                     && !upstream.proven_failure(&error)
                                 {
+                                    fault.diagnose(
+                                        upstream,
+                                        &error,
+                                        "shared_candidate_expiry",
+                                        None,
+                                    );
                                     return Err(Error::Timeout);
                                 }
                                 return self.candidate_failed(fault, error, ring, upstream);
@@ -1862,13 +1916,21 @@ impl Cache {
                 Loading::Upstream { .. } | Loading::MetadataExchange(_)
             )
         {
+            fault.diagnose(upstream, &Error::Timeout, "candidate_before_step", None);
             return Err(Error::Timeout);
         }
+        let polled_state = fault.diagnostic_state();
         let state = std::mem::replace(&mut fault.state, Loading::Done);
         let acquiring = matches!(state, Loading::Acquire);
         let result = self.step(&mut fault, state, ring, upstream);
         // Adapters may do synchronous work; completion never extends the budget.
         if crate::environment::now() >= fault.deadline {
+            fault.diagnose(
+                upstream,
+                result.as_ref().err().unwrap_or(&Error::Timeout),
+                "caller_after_step",
+                Some(polled_state),
+            );
             return Err(Error::Timeout);
         }
         if crate::environment::now() >= candidate_end
@@ -1878,6 +1940,12 @@ impl Cache {
                 .is_some_and(|e| upstream.proven_failure(e))
         {
             // Private expiry relinquishes the producer lease to a surviving consumer.
+            fault.diagnose(
+                upstream,
+                result.as_ref().err().unwrap_or(&Error::Timeout),
+                "candidate_after_step",
+                Some(polled_state),
+            );
             return Err(Error::Timeout);
         }
         match result {
@@ -1941,6 +2009,7 @@ impl Cache {
                 })
             }
             Err(error) => {
+                fault.diagnose(upstream, &error, "step_failure", Some(polled_state));
                 let error = Self::finish_failure(&mut fault, error);
                 self.candidate_failed(fault, error, ring, upstream)
             }
@@ -2029,6 +2098,7 @@ impl Cache {
         ring: &mut Ring,
         upstream: &mut U,
     ) -> Result<Progress<Fault<U>, CachedValue>> {
+        fault.diagnose(upstream, &error, "candidate_failure", None);
         if matches!(
             error.evidence().reason(),
             crate::outcome::PeerReason::Unauthorized | crate::outcome::PeerReason::Forbidden

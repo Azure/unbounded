@@ -170,7 +170,7 @@ impl Origin {
         if !peer && healthy_status {
             permit.success();
         } else {
-            permit.failure();
+            permit.failure_with_evidence(error);
         }
     }
     pub(crate) fn new(endpoint: Endpoint) -> Self {

@@ -23,6 +23,7 @@ enum Phase {
     Probe,
 }
 struct State {
+    last_failure: Option<(Instant, crate::failure_diagnostics::Failure)>,
     phase: Phase,
     active: usize,
     generation: Rc<()>,
@@ -40,6 +41,21 @@ pub struct CircuitBreaker {
     inner: Rc<Inner>,
 }
 impl CircuitBreaker {
+    pub(crate) fn last_failure(&self) -> Option<(u128, crate::failure_diagnostics::Failure)> {
+        self.inner
+            .state
+            .borrow()
+            .last_failure
+            .as_ref()
+            .map(|(at, f)| {
+                (
+                    (self.inner.clock)()
+                        .saturating_duration_since(*at)
+                        .as_millis(),
+                    f.clone(),
+                )
+            })
+    }
     /// Observing a cooldown never starts a probe or changes admission.
     pub(crate) fn status(&self) -> Status {
         match self.inner.state.borrow().phase {
@@ -65,6 +81,7 @@ impl CircuitBreaker {
         Self {
             inner: Rc::new(Inner {
                 state: RefCell::new(State {
+                    last_failure: None,
                     phase: Phase::Closed,
                     active: 0,
                     generation: Rc::new(()),
@@ -114,6 +131,15 @@ pub struct Permit {
     completed: bool,
 }
 impl Permit {
+    pub(crate) fn failure_with_evidence(mut self, error: &crate::cache::Error) {
+        if self.current() {
+            self.inner.state.borrow_mut().last_failure = Some((
+                (self.inner.clock)(),
+                crate::failure_diagnostics::Failure::from_error(error),
+            ));
+        }
+        self.finish(false);
+    }
     pub(crate) fn current(&self) -> bool {
         Rc::ptr_eq(&self.inner.state.borrow().generation, &self.generation)
     }
@@ -121,6 +147,9 @@ impl Permit {
         self.finish(true);
     }
     pub fn failure(mut self) {
+        if self.current() {
+            self.inner.state.borrow_mut().last_failure = None;
+        }
         self.finish(false);
     }
     fn finish(&mut self, success: bool) {
@@ -135,12 +164,16 @@ impl Permit {
         } else if self.probe {
             state.phase = Phase::Closed;
             state.generation = Rc::new(());
+            state.last_failure = None;
         }
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
         if !self.completed && self.probe {
+            if self.current() {
+                self.inner.state.borrow_mut().last_failure = None;
+            }
             self.finish(false);
         }
         self.inner.state.borrow_mut().active -= 1;

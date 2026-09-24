@@ -811,6 +811,7 @@ struct Exchange {
 }
 #[derive(Default)]
 struct Fake {
+    diagnostics: std::cell::RefCell<Vec<crate::failure_diagnostics::CacheFailure>>,
     content_type: crate::metadata::ContentType,
     receive_reserve: usize,
     release: bool,
@@ -838,6 +839,9 @@ impl Fake {
     }
 }
 impl Upstream for Fake {
+    fn diagnose_failure(&self, fault: crate::failure_diagnostics::CacheFailure, _: &Error) {
+        self.diagnostics.borrow_mut().push(fault);
+    }
     type Exchange = Exchange;
     fn start_metadata(
         &mut self,

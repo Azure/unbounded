@@ -191,6 +191,7 @@ fn main_with_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
 }
 
 fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result<()> {
+    racer_dataplane::initialize_failure_diagnostics()?;
     stop.check_startup()?;
     let io_stop = stop.clone();
     let slab_io = racer_dataplane::slab_io::Io::new(racer_dataplane::slab_io::Config::from_env()?)

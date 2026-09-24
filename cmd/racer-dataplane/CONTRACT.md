@@ -200,3 +200,33 @@ and emits matching WWW-Authenticate/Retry-After headers with Content-Length: 0.
 RDMA negative responses carry the existing 32-byte descriptor hash followed by
 the failure record. All lengths and padding are validated. No credential is
 included in the failure record.
+
+## Bounded failure diagnostics
+
+The daemon initializes automatic WARN samples before starting reactors. Cache
+deadline/failed-candidate events use `event=racer_page_failure`; no protocol or
+retry policy changes. Samples are limited to one per worker/volume provider per
+30 seconds and 16 per process per 30 seconds, including across provider resets.
+A 16-record queue feeds a dedicated stderr writer. Reactor calls use nonblocking
+admission and `try_send`; contention/full queues drop samples. There is no flush
+wait on shutdown, and writer startup failure disables diagnostics. Missing
+samples therefore never prove absence of failures.
+
+`RACER_DIAGNOSTIC_PAGE_KEY`, when set, must be exactly 64 lowercase hexadecimal
+characters and filters the immutable cache key before the provider rate limit.
+Unset enables all-key sampling. Invalid filters fail startup without logging
+their value. This filter is not an OCI digest: page identity includes the volume
+namespace, target hash, representation checksum, length, offset, and page size.
+
+Records contain IDs, key/checksum/offset, cache state and polled state, failure
+site, remaining candidate/caller budgets, route/candidate/path, hop/work/rank,
+numeric peer endpoint, and finite typed failure fields. `failure.relayed=true`
+means remote semantic or reported-owner evidence rather than local initiation.
+After-step deadline records preserve any observed step error; the site identifies
+the terminal deadline. HTTP breakers retain one generation-fenced opening
+failure with its age in milliseconds, cleared by recovery, unannotated failure,
+or canceled probe. This retained failure may be for another page using the same
+endpoint; it is not proof that the current page initiated it. Raw target strings,
+origin data, tokens, authentication/retry header values, socket paths and error
+messages are never included. These samples are diagnostic evidence, not health
+authority, exhaustive tracing, or permission to advance a candidate.
