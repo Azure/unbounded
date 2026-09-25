@@ -13,6 +13,20 @@ length-delimited AAD. Node HTTP signatures use Ed25519 and a certificate validat
 against projected peer roots, with the exact URI SAN
 `spiffe://<cluster UUID>/node/<Node UID>`. Deployment TLS trust is separate.
 
+Page AAD is the concatenation of `racer/page/aead/v1\0`, u32-BE byte length and
+canonical cache UID bytes, exact 32-byte object key, u32-BE byte length and exact
+quoted ETag bytes, u64-BE page number, 16-byte key ID, 24-byte nonce, u32-BE plaintext
+length, and u32-BE ciphertext length. The plaintext is nonempty and at most 16 MiB;
+ciphertext length is plaintext length plus 16. Disk padding is not authenticated
+payload. `security::aead::page_aad` provides this encoding.
+
+Credential AAD is `racer/credentials/aead/v1\0`, 16-byte key ID, u32-BE cache UID
+length and bytes, 32-byte object key, 16-byte request ID, 16-byte attempt ID, one
+metadata-presence byte, then when present u32-BE metadata length and exact bytes.
+Credential ciphertext contains only exact Authorization bytes plus tag. Page and
+credential keys must be distinct; no key material is reused across cache/purpose
+identities. Credentials are never page identities or persisted record fields.
+
 ## Canonical message profile
 
 Use RFC 9421 signature-base construction and structured `Signature-Input` and
@@ -22,6 +36,34 @@ duplicate fields, malformed structured fields, unsupported signature algorithms,
 unknown profile versions, and logical fields that disagree with the signed head.
 The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v1`.
 No body digest is used: the signed page envelope and AEAD tag protect page bytes.
+
+Signature components begin with request derived components in the order above (or
+response `@status`) followed by every lowercased header name sorted lexically,
+excluding only `signature` and `signature-input`. Singleton duplicates are rejected
+case-insensitively. Header values must be ASCII without leading/trailing whitespace.
+The signature parameters have this exact canonical structured-field serialization:
+
+```
+("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v1"
+```
+
+The base consists of RFC 9421 `"component": value` lines joined by LF, followed by
+`"@signature-params": <parameters>`, without a trailing LF. Header dictionaries are
+`Signature-Input: racer=<parameters>` and `Signature: racer=:<padded base64>:`.
+`SignedHead.signature` is exactly the same 64-byte signature as that dictionary.
+Verification rejects alternate parameters, algorithms, labels, or coverage lists.
+
+Authentication headers are `racer-profile`, `racer-cluster`, `racer-signer`,
+`racer-receiver`, `racer-certificates`, `racer-nonce`, `racer-challenge`, and
+`racer-timestamp`. Cluster/signer/receiver are plain canonical UUID text. Certificates
+are base64 of concatenated u32-big-endian-length-prefixed DER certificates. The
+timestamp is Unix milliseconds, and `created` must equal its integer seconds.
+
+The signed-head binding is SHA-256 of `racer-peer-v1/signed-head\0`, u64-BE base
+length, exact base, u64-BE signature length, and exact signature. Forwarding heads
+include `racer-original` and `racer-previous` bindings. Canonical `protocol` encoders
+are authoritative for all application and route headers; no unsigned side channel
+may replace a value from these heads.
 
 All binary header values use canonical padded standard base64. UUIDs use canonical
 lowercase text. Object keys are lowercase hex; strong ETags include exact quotes;
@@ -81,7 +123,8 @@ identity for TLS and peer signing; adapt `LocalSigningIdentity` explicitly rathe
 than make its fields public. Enrollment persistence remains control-owned.
 
 Memory/runtime: provide `PlaintextBuffer::into_parts() -> (Box<[u8]>, Reservation)`
-and reservation `amount()` / `class()` accessors. Retain reservation when moving
+and `PlaintextBuffer::reservation() -> &Reservation`, plus reservation `amount()` /
+`class()` accessors. Retain reservation when moving
 staging bytes into security-produced authenticated pages. Runtime crypto job and
 completion fields already permit crate-visible access; preserve that handoff.
 
@@ -123,6 +166,11 @@ not just arbitrary alphanumeric path components. Tests must use canonical IDs.
 Certificate checks must require Ed25519 digital-signature usage and client-auth EKU
 and reject absent/mismatched usage; bounds apply to the total chain as well as each
 certificate. The certificate leaf must not be a CA.
+
+Successful page/metadata responses must be signed by the requested destination.
+Relays can return request-bound unavailable/error outcomes but cannot impersonate
+the destination by choosing a self-consistent shorter response path. Response
+verification checks the outstanding request deadline before admitting a result.
 
 Signature challenge discovery is implemented in `security/session.rs` by the
 parent. Add a typed `Signatures::install_peer_challenge(AuthenticatedChallenge)`
