@@ -223,7 +223,7 @@ impl WireCodec {
     }
 }
 
-fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
+pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     if head.signature.len() != 64 {
         return Err(Error::InvalidRequest);
     }
@@ -235,7 +235,7 @@ fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     Ok(STANDARD.encode(framed).into_bytes())
 }
 
-fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
+pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     if bytes.len() > (MAX_SIGNED_HEAD + 64).div_ceil(3) * 4 {
         return Err(Error::InvalidRequest);
     }

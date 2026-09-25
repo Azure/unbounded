@@ -84,6 +84,28 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
         ),
     })
 }
+pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, PageEnvelope)> {
+    let metadata = metadata(head)?;
+    let envelope = PageEnvelope {
+        page: PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(p::number(head, "racer-page")?),
+        },
+        key_id: KeyId(array(head, "racer-page-key")?),
+        nonce: Nonce(array(head, "racer-page-nonce")?),
+        plaintext_length: p::number(head, "racer-plaintext-length")?
+            .try_into()
+            .map_err(|_| Error::InvalidRequest)?,
+        ciphertext_length: p::number(head, "racer-ciphertext-length")?
+            .try_into()
+            .map_err(|_| Error::InvalidRequest)?,
+    };
+    metadata.immutable().validate_page(&envelope)?;
+    if envelope.plaintext_length.checked_add(16) != Some(envelope.ciphertext_length) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok((metadata, envelope))
+}
 fn present(head: &MessageHead, name: &str) -> Result<bool> {
     match p::number(head, name)? {
         0 => Ok(false),

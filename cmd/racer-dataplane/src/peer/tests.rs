@@ -95,7 +95,7 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     }
     (signers, discovery)
 }
-fn signers() -> Vec<Rc<Signatures>> {
+pub(super) fn signers() -> Vec<Rc<Signatures>> {
     let (signers, _) = identities();
     for signer in &signers {
         for peer in &signers {

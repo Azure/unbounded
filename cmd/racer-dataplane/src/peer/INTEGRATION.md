@@ -12,17 +12,22 @@ let peer_io = Rc::new(HttpIo::with_admission(
     Codec::new(wire::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
     admission.clone(),
 ));
-let transfers = Rc::new(Transfers::new(http.clone(), peer_io.clone(), rdma.clone())
-    .with_wire(admission.clone(), codec.clone()));
+let mut transfers = Transfers::new(http.clone(), peer_io.clone(), rdma.clone())
+    .with_wire(admission.clone(), codec.clone());
+if let Some(sessions) = &sessions {
+    transfers = transfers.with_native(signatures.clone(), sessions.clone());
+}
+let transfers = Rc::new(transfers);
 let handshake = Rc::new(Handshake::new(signatures.clone(), sessions)
     .with_http(network.clone(), transfers.clone())
     .with_discovery(keys.clone(), certificates.clone(), replay.clone()));
 let requester = Rc::new(Requester::new(paths.clone(), rails, forwarding.clone(),
-    handshake.clone(), transfers).with_network(network.clone()));
+    handshake.clone(), transfers.clone()).with_network(network.clone()));
 let relay = Rc::new(Relay::new(paths, forwarding.clone(), requester.clone(), admission.clone())
     .with_network(network.clone()).with_handshake(handshake.clone()));
 let server = PeerServer::new(peer_io, forwarding, admission, local_service, relay)
-    .with_network(network).with_wire(codec).with_handshake(handshake).with_reactor(reactor);
+    .with_network(network).with_wire(codec).with_handshake(handshake).with_reactor(reactor)
+    .with_transfers(transfers);
 ```
 
 The worker must poll `server.listen(address, scope)` and drive its reactor. HTTP
@@ -48,13 +53,18 @@ Page, metadata, and copy-only requests use actual pooled HTTP. Page bodies prese
 ciphertext; AEAD verification belongs to the receiving read coordinator. Relay
 verification preserves the original and every hop signature in both directions.
 
-Native RDMA scoped operations are exposed through `prepare_session`,
-`finish_session`, `send_scoped`, `prepare_receive`, and `finish_receive`. They require
-verified signed setup, grant, and completion messages. Capability-only handshakes
-currently advertise HTTP and no RDMA grants. Automatic RDMA page/control exchange
-is not integrated: it needs a security-approved control schema carrying the scoped
-setup/grant/completion and original page request binding. These APIs do not claim a
-native transfer occurred. Standalone legacy `send`/`receive` reject unbound work.
+`Requester::exchange` selects the route rail and automatically attempts native
+transfer when the local session provider is ready. The server validates the entire
+signed response path's rail mapping, then exchanges setup, grant, and completion
+controls on the same HTTP connection. Setup unavailability chooses ordinary HTTP.
+Post-offer native failures use a signed fallback handshake and retained ciphertext,
+without repeating acquisition, resetting the deadline, or decrypting credentials.
+Both terminal native fences precede fallback data delivery. Cancellation and
+authentication failures terminate the exchange. Standalone legacy `send`/`receive`
+reject unbound work. The native lifecycle service must be activated and driven on
+the existing paired worker as described by the RDMA owner's `native/README.md`.
+
+See `NATIVE_PROTOCOL.md` for the exact closed control schema and review points.
 
 ## Checks
 

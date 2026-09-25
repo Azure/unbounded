@@ -102,16 +102,10 @@ impl PeerClient for Requester {
                 )
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
-            let capabilities = self
+            let _capabilities = self
                 .handshake
                 .negotiate_at(next, request.route.membership, &scope)
                 .await?;
-            if let super::wire::Operation::Page { page, .. } = &request.operation {
-                let proposed = self.rails.select(&route, page)?;
-                // No transfer-scoped session is installed by a capability-only
-                // handshake. Selection therefore safely falls back to HTTP.
-                let _plan = self.transfers.select(proposed, capabilities, None);
-            }
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
             let response = self.exchange(signed, &scope).await?;
             scope.check()?;
@@ -138,7 +132,27 @@ impl PeerTransport for Requester {
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(budget.membership, &next)?;
-            self.transfers.exchange(endpoint, request, &scope).await
+            let plan = if let super::wire::Operation::Page { page, .. } = &request.request.operation
+            {
+                let search = super::search_budget(budget, &network.local)?;
+                let route = self
+                    .paths
+                    .shortest_async(
+                        network.membership(budget.membership)?,
+                        &network.local,
+                        &search,
+                    )
+                    .await?;
+                if route.nodes.get(1) != Some(&next) {
+                    return Err(Error::Unavailable);
+                }
+                self.rails.select(&route, page)?
+            } else {
+                crate::topology::rails::TransportPlan::Http
+            };
+            self.transfers
+                .exchange_planned(endpoint, request, plan, &scope)
+                .await
         })
     }
 }

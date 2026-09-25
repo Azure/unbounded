@@ -241,9 +241,24 @@ impl Handshake {
             "racer-session-challenge",
             &self.signatures.challenge()?,
         );
-        // Native sessions are advertised only by an installed session negotiator.
-        p::push(&mut response, "racer-rdma", 0);
-        p::push(&mut response, "racer-scoped-grants", 0);
+        let native_ready = self.rdma.as_ref().is_some_and(|sessions| {
+            network
+                .membership(membership)
+                .ok()
+                .and_then(|members| {
+                    members
+                        .members()
+                        .iter()
+                        .find(|m| m.node == network.local)
+                        .cloned()
+                })
+                .is_some_and(|member| {
+                    member.alignment_enabled
+                        && member.rails.iter().any(|rail| sessions.ready(rail.rail))
+                })
+        });
+        p::push(&mut response, "racer-rdma", u8::from(native_ready));
+        p::push(&mut response, "racer-scoped-grants", u8::from(native_ready));
         self.signatures.sign(response)
     }
     pub fn with_exchange(

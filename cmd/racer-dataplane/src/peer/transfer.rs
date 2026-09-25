@@ -46,10 +46,14 @@ impl IoBuffer for WireBuffer {
 }
 
 pub struct Transfers {
-    http: Rc<HttpPool>,
-    io: Rc<HttpIo>,
-    rdma: Option<Rc<RdmaTransfer>>,
-    wire: Option<(Rc<Admission>, Rc<dyn LogicalCodec>)>,
+    pub(super) http: Rc<HttpPool>,
+    pub(super) io: Rc<HttpIo>,
+    pub(super) rdma: Option<Rc<RdmaTransfer>>,
+    pub(super) wire: Option<(Rc<Admission>, Rc<dyn LogicalCodec>)>,
+    pub(super) native: Option<(
+        Rc<crate::security::signing::Signatures>,
+        Rc<crate::rdma::session::Sessions>,
+    )>,
 }
 impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
@@ -58,7 +62,16 @@ impl Transfers {
             io,
             rdma,
             wire: None,
+            native: None,
         }
+    }
+    pub fn with_native(
+        mut self,
+        signatures: Rc<crate::security::signing::Signatures>,
+        sessions: Rc<crate::rdma::session::Sessions>,
+    ) -> Self {
+        self.native = Some((signatures, sessions));
+        self
     }
     pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
         self.wire = Some((admission, codec));
@@ -213,6 +226,15 @@ impl Transfers {
         request: SignedRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
+        self.exchange_planned(endpoint, request, TransportPlan::Http, scope)
+    }
+    pub fn exchange_planned<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        request: SignedRequest,
+        plan: TransportPlan,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             scope.check()?;
             let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -232,11 +254,33 @@ impl Transfers {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            let head = WireCodec::encode(&request.authentication, false, 0)?;
+            let mut head = WireCodec::encode(&request.authentication, false, 0)?;
+            let native = self.accept_native(&request, plan, scope)?;
+            if let Some((_, accept, _)) = &native {
+                super::native::attach(&mut head, accept)?;
+            }
             let connection = self.http.checkout(&endpoint, scope).await?;
             let sent = self.io.send_head(connection, head, scope).await?;
-            let received = self.io.receive_head(sent.connection, scope).await?;
+            let mut received = self.io.receive_head(sent.connection, scope).await?;
+            let control = super::native::detach(&mut received.value)?;
             let (authentication, length) = WireCodec::decode(received.value, true)?;
+            if let Some(control) = control {
+                let (binding, accept, peer) = native.ok_or(Error::Unauthorized)?;
+                if length != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                return self
+                    .receive_native(
+                        received.connection,
+                        authentication,
+                        binding,
+                        accept,
+                        peer,
+                        control,
+                        scope,
+                    )
+                    .await;
+            }
             let mut connection = received.connection;
             let (body, _staging_reservation) = if length == 0 {
                 (Vec::new(), None)

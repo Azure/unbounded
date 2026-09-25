@@ -38,6 +38,7 @@ pub struct PeerServer {
     wire: Option<Rc<dyn super::wire::LogicalCodec>>,
     handshake: Option<Rc<super::handshake::Handshake>>,
     reactor: Option<Rc<crate::runtime::reactor::Reactor>>,
+    transfers: Option<Rc<super::transfer::Transfers>>,
 }
 impl PeerServer {
     /// Accept bounded neighbor HTTP connections on the owning reactor. The shared
@@ -109,7 +110,12 @@ impl PeerServer {
             wire: None,
             handshake: None,
             reactor: None,
+            transfers: None,
         }
+    }
+    pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
+        self.transfers = Some(transfers);
+        self
     }
     pub fn with_reactor(mut self, reactor: Rc<crate::runtime::reactor::Reactor>) -> Self {
         self.reactor = Some(reactor);
@@ -140,7 +146,7 @@ impl PeerServer {
             use crate::runtime::reactor::IoBuffer;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
-            let received = self.io.receive_head(connection, scope).await?;
+            let mut received = self.io.receive_head(connection, scope).await?;
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())
                     .and_then(|n| n.checked_add(h.value.len()))
@@ -189,6 +195,7 @@ impl PeerServer {
                 connection.finish_exchange()?;
                 return Ok(connection);
             }
+            let native_control = super::native::detach(&mut received.value)?;
             let (authentication, length) = WireCodec::decode(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
@@ -231,16 +238,36 @@ impl PeerServer {
                 .deadline
                 .0
                 .min(request.request.route.deadline.0);
+            let admitted = match (native_control, &self.transfers) {
+                (Some(control), Some(transfers)) => {
+                    transfers.admit_native(&request, control, &request_scope)?
+                }
+                _ => None,
+            };
             let response = self.dispatch(request, &request_scope).await?;
+            let mut connection = received.connection;
+            if let (Some(admitted), Some(transfers)) = (admitted, &self.transfers) {
+                let (returned, sent) = transfers
+                    .send_native(
+                        connection,
+                        &response,
+                        admitted,
+                        self.network.as_ref().ok_or(Error::InvalidConfiguration)?,
+                        &request_scope,
+                    )
+                    .await?;
+                connection = returned;
+                if sent {
+                    connection.finish_exchange()?;
+                    return Ok(connection);
+                }
+            }
             let body = match &response.response {
                 PeerResponse::Page { ciphertext, .. } => ciphertext.bytes(),
                 _ => &[],
             };
             let head = WireCodec::encode(&response.authentication, true, body.len())?;
-            let sent = self
-                .io
-                .send_head(received.connection, head, &request_scope)
-                .await?;
+            let sent = self.io.send_head(connection, head, &request_scope).await?;
             let mut connection = sent.connection;
             if !body.is_empty() {
                 let mut buffer = WireBuffer::new(&self.admission, body.len())?;
