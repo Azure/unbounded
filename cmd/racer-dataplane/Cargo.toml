@@ -1,0 +1,15 @@
+[package]
+name = "racer-dataplane"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Racer node-local read-through cache dataplane"
+
+[features]
+default = []
+# Enables the optional verbs adapter surface. Hardware/library selection is pending.
+rdma = []
+
+[dependencies]
+# Choose vetted HTTP, crypto, io_uring, and verbs adapters at implementation time.
+# The API scaffold deliberately requires no runtime or native library dependencies.
