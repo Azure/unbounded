@@ -615,6 +615,103 @@ mod tests {
     }
 
     #[test]
+    fn iowq_helpers_use_compute_and_spare_siblings_without_changing_workers() {
+        let cpus: Vec<_> = (0..8)
+            .map(|id| cpu(id, 0, &[id / 2 * 2, id / 2 * 2 + 1]))
+            .collect();
+        for counts in [
+            WorkerCounts::default(),
+            WorkerCounts {
+                io_per_node: NonZeroUsize::new(2),
+                compute_per_node: NonZeroUsize::new(2),
+            },
+        ] {
+            let plan = CpuPlan::bounded(
+                config(8),
+                counts,
+                cpus.clone(),
+                crate::tuning::Limits {
+                    cpu_quota: None,
+                    available_memory: 8 << 30,
+                    memlock: 8 << 30,
+                },
+                8,
+            )
+            .unwrap();
+            assert_eq!(plan.io.iter().map(|p| p.cpu.0).collect::<Vec<_>>(), [0, 2]);
+            assert_eq!(
+                plan.compute
+                    .cpus
+                    .iter()
+                    .map(|(c, _)| c.0)
+                    .collect::<Vec<_>>(),
+                [6, 4]
+            );
+            for p in &plan.io {
+                assert_eq!(p.iowq_cpus, [CpuId(4), CpuId(5), CpuId(6), CpuId(7)]);
+                assert_eq!(p.shards.len(), 4);
+            }
+        }
+        // A quota limits pinned workers, not the allowed topology snapshot.
+        let plan = CpuPlan::bounded(
+            config(8),
+            WorkerCounts::default(),
+            cpus,
+            crate::tuning::Limits {
+                cpu_quota: Some(1),
+                available_memory: 8 << 30,
+                memlock: 8 << 30,
+            },
+            8,
+        )
+        .unwrap();
+        assert_eq!((plan.io.len(), plan.compute.cpus.len()), (1, 1));
+        assert_eq!(plan.io[0].iowq_cpus, (2..8).map(CpuId).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn iowq_helpers_prefer_numa_and_respect_sparse_allowed_cpuset() {
+        let cpus = vec![
+            cpu(1, 0, &[0, 1]),
+            cpu(3, 0, &[2, 3]),
+            cpu(4097, 9, &[4096, 4097]),
+            cpu(4100, 9, &[4100, 4101]),
+        ];
+        let mut placements = crate::sharding::placements(
+            vec![(CpuId(1), NumaNodeId(0)), (CpuId(4097), NumaNodeId(9))],
+            8,
+        )
+        .unwrap();
+        assign_helpers(&mut placements, &cpus);
+        assert_eq!(placements[0].iowq_cpus, [CpuId(3)]);
+        assert_eq!(placements[1].iowq_cpus, [CpuId(4100)]);
+        // With no local helper, remote fallback still excludes the other reactor.
+        assign_helpers(
+            &mut placements,
+            &cpus
+                .iter()
+                .filter(|c| c.id != CpuId(3))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(placements[0].iowq_cpus, [CpuId(4100)]);
+        assert_eq!(placements[1].iowq_cpus, [CpuId(4100)]);
+    }
+
+    #[test]
+    fn iowq_helpers_never_fall_back_to_any_reactor_sibling() {
+        let cpus = vec![
+            cpu(0, 0, &[0, 1]),
+            cpu(1, 0, &[0, 1]),
+            cpu(2, 1, &[2, 3]),
+            cpu(3, 1, &[2, 3]),
+        ];
+        let mut placements = place(config(2), cpus.clone()).unwrap();
+        assign_helpers(&mut placements, &cpus);
+        assert!(placements.iter().all(|p| p.iowq_cpus.is_empty()));
+    }
+
+    #[test]
     fn automatic_plan_respects_topology_quota_and_pool_capacity() {
         let topology = |cores: usize, numa: usize| {
             (0..cores)

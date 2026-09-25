@@ -100,6 +100,14 @@ fn store(ptr: NonNull<AtomicU32>, value: u32) {
     }
 }
 impl KernelRing {
+    /// Linux 5.14+; required by our Linux 6.1+ execution profile. Never silently
+    /// fall back to the reactor's inherited singleton mask on registration error.
+    pub(crate) fn register_iowq_affinity(&self, cpus: &[crate::workers::CpuId]) -> io::Result<()> {
+        register_iowq_affinity(cpus, |mask, bytes| {
+            self.register(17, mask.as_ptr().cast(), bytes) // IORING_REGISTER_IOWQ_AFF
+        })
+    }
+
     pub(crate) fn new(entries: u32) -> io::Result<Self> {
         let mut p = abi::Params {
             // CQSIZE | SUBMIT_ALL | TASKRUN_FLAG | SINGLE_ISSUER | DEFER_TASKRUN
@@ -316,3 +324,34 @@ impl KernelRing {
         Ok(())
     }
 }
+
+fn register_iowq_affinity(
+    cpus: &[crate::workers::CpuId],
+    register: impl FnOnce(&[libc::c_ulong], u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let max =
+        cpus.iter().map(|cpu| cpu.0).max().ok_or_else(|| {
+            invalid("no allowed io_wq helper CPUs outside reactor physical cores")
+        })?;
+    let words = max / libc::c_ulong::BITS as usize + 1;
+    let bytes = words
+        .checked_mul(size_of::<libc::c_ulong>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| invalid("io_wq helper CPU mask too large"))?;
+    let mut mask = vec![0 as libc::c_ulong; words];
+    for cpu in cpus {
+        mask[cpu.0 / libc::c_ulong::BITS as usize] |= 1 << (cpu.0 % libc::c_ulong::BITS as usize);
+    }
+    // The registration count is BYTES, not words or number of CPUs. The kernel
+    // copies the mask synchronously; no userspace pointer survives this call.
+    register(&mask, bytes).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("IORING_REGISTER_IOWQ_AFF failed for {cpus:?}: {error}"),
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "../../tests/execution/iowq_registration.rs"]
+mod iowq_registration;

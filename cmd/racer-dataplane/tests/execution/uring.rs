@@ -5,6 +5,8 @@ use super::*;
 
 #[path = "file_dispatch.rs"]
 mod file_dispatch;
+#[path = "iowq_affinity.rs"]
+mod iowq_affinity;
 #[path = "../storage/slab_io_ring.rs"]
 mod slab_io_ring;
 use crate::buffers::{self, Key};

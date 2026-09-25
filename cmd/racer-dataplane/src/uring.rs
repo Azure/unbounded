@@ -7,6 +7,10 @@
 //! factory with its placement and NUMA-local [`WorkerPool`]. [`Driver`] combines
 //! the ring with application and external completion sources in one sleep loop.
 //! Pool registration requires sufficient RLIMIT_MEMLOCK. No SQPOLL thread is used.
+//! Kernel io_wq helpers use the pre-pin allowed CPU topology, preferring the
+//! worker's NUMA node and excluding every reactor's physical core (including
+//! SMT siblings). Compute/spare cores may be shared. Startup fails if there is
+//! no helper CPU or IORING_REGISTER_IOWQ_AFF fails; no inherited-affinity fallback.
 //!
 //! Submissions consume their storage; tickets never own in-flight storage.
 //! Dropping or forgetting a ticket cannot recycle a kernel-accessible buffer.
@@ -484,7 +488,23 @@ impl Ring {
         if cpu as usize != placement.cpu_id().0 || pool.numa_node_id() != placement.numa_node_id() {
             return Err(invalid("ring placement does not match worker pool/CPU"));
         }
-        Self::create(pool, config)
+        let ring = Self::create(pool, config)?;
+        ring.core
+            .as_ref()
+            .unwrap()
+            .raw
+            .register_iowq_affinity(&placement.iowq_cpus)?;
+        eprintln!(
+            "worker {}: registered io_wq helper CPUs {:?} (reactor CPU {})",
+            placement.worker_id().0,
+            placement
+                .iowq_cpus
+                .iter()
+                .map(|cpu| cpu.0)
+                .collect::<Vec<_>>(),
+            placement.cpu_id().0,
+        );
+        Ok(ring)
     }
 
     fn create(pool: WorkerPool, config: Config) -> io::Result<Self> {

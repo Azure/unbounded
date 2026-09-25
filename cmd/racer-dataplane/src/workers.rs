@@ -45,7 +45,8 @@ impl Default for Config {
 
 /// Worker counts per participating NUMA node. By default, split physical cores
 /// evenly, giving I/O the odd core. With one override, the other uses the rest;
-/// with both overrides, spare cores stay idle. I/O is also limited by shard count.
+/// with both overrides, spare cores have no pinned worker. I/O is also limited by
+/// shard count. Kernel I/O helpers may share non-reactor cores with compute work.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkerCounts {
     pub io_per_node: Option<NonZeroUsize>,
@@ -68,8 +69,8 @@ impl ComputePlacement {
     }
 }
 impl CpuPlan {
-    /// Automatic daemon profile leaves half the allowed logical CPUs available
-    /// to co-located work, never uses SMT siblings, and caps automatic execution
+    /// Automatic daemon profile pins workers on at most half the allowed logical
+    /// CPUs, never pins SMT siblings, and caps automatic execution
     /// at 16 physical cores. At least two disjoint cores are needed even under a
     /// fractional quota; CFS still enforces that quota. Explicit counts retain
     /// the existing per-NUMA semantics and bypass the automatic CPU budget.
@@ -139,15 +140,20 @@ impl CpuPlan {
             .iter()
             .flat_map(|(cores, n)| cores.iter().take(*n).copied())
             .collect();
-        Self::build(
+        let mut plan = Self::build(
             Config {
                 shard_count: NonZeroUsize::new(config.shard_count.get().min(max_io)).unwrap(),
             },
             counts,
-            cpus.into_iter()
+            cpus.iter()
                 .filter(|c| selected.contains(&c.id))
+                .cloned()
                 .collect(),
-        )
+        )?;
+        // Keep the pre-pin allowed topology, including SMT siblings and CPUs
+        // outside the pinned-worker budget, for kernel helper placement.
+        assign_helpers(&mut plan.io, &cpus);
+        Ok(plan)
     }
 
     pub fn discover(config: Config, counts: WorkerCounts) -> io::Result<Self> {
@@ -192,7 +198,8 @@ impl CpuPlan {
         if counts.io_per_node.is_some() && candidates.len() > config.shard_count.get() {
             return Err(invalid("explicit I/O worker count exceeds shard count"));
         }
-        let io = place(config, candidates)?;
+        let mut io = place(config, candidates)?;
+        assign_helpers(&mut io, &cpus);
         let mut compute = Vec::new();
         for (node, cores) in nodes {
             let io_count = io.iter().filter(|p| p.node == node).count();
@@ -263,6 +270,30 @@ struct Cpu {
     id: CpuId,
     node: NumaNodeId,
     siblings: Vec<CpuId>,
+}
+
+// sched_getaffinity is sampled before any worker pins itself. It already
+// intersects task affinity with online CPUs and the effective cgroup cpuset.
+// Exclude whole physical reactor cores across ALL nodes, not just this ring's
+// CPU. Share compute/spare cores (including their allowed SMT siblings), prefer
+// the ring's node, and use remote non-reactor cores only if there are no local
+// candidates. An empty set remains explicit and is rejected by ring startup.
+fn assign_helpers(placements: &mut [Placement], cpus: &[Cpu]) {
+    let reactors: BTreeSet<_> = placements.iter().map(|p| p.cpu).collect();
+    let excluded: BTreeSet<_> = cpus
+        .iter()
+        .filter(|c| reactors.contains(&c.id))
+        .flat_map(|c| c.siblings.iter().copied())
+        .collect();
+    let candidates: Vec<_> = cpus.iter().filter(|c| !excluded.contains(&c.id)).collect();
+    for placement in placements {
+        let local = candidates.iter().any(|c| c.node == placement.node);
+        placement.iowq_cpus = candidates
+            .iter()
+            .filter(|c| !local || c.node == placement.node)
+            .map(|c| c.id)
+            .collect();
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -581,7 +612,10 @@ impl Workers {
         D: Driver + 'static,
         F: Fn(&WorkerContext) -> io::Result<D> + Send + Sync + 'static,
     {
-        Self::start_placed(place(config, discover()?)?, factory, pin)
+        let cpus = discover()?;
+        let mut placements = place(config, cpus.clone())?;
+        assign_helpers(&mut placements, &cpus);
+        Self::start_placed(placements, factory, pin)
     }
 
     fn start_placed<D, F, P>(placements: Vec<Placement>, factory: F, pin: P) -> io::Result<Self>
@@ -841,6 +875,7 @@ pub mod sharding {
         pub(crate) cpu: CpuId,
         pub(crate) node: NumaNodeId,
         pub(crate) shards: Vec<ShardId>,
+        pub(crate) iowq_cpus: Vec<CpuId>,
         plan: Arc<Identity>,
         count: usize,
         workers: usize,
@@ -920,6 +955,7 @@ pub mod sharding {
                 initial: initial.clone(),
                 plan: plan.clone(),
                 shards: (worker..count).step_by(workers).map(ShardId).collect(),
+                iowq_cpus: Vec::new(),
             })
             .collect())
     }
