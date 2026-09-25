@@ -1,16 +1,53 @@
 //! Versioned metadata. TTL controls new unpinned admission, never page eviction.
 
 use super::{
+    MAX_WIRE_INTEGER,
     envelope::PageEnvelope,
     identity::{ObjectVersion, PageId},
+    parse_decimal,
     range::PAGE_BYTES,
 };
 use crate::error::{Error, Result};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Absolute wall-clock deadline. Wire epoch/precision must be standardized.
+/// Absolute Unix-millisecond deadline in 0..=i64::MAX, never a stream deadline.
+/// The public tuple field is retained for compatibility; validate before encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpiresAt(pub std::time::SystemTime);
+
+impl ExpiresAt {
+    pub fn from_unix_millis(milliseconds: u64) -> Result<Self> {
+        if milliseconds > MAX_WIRE_INTEGER {
+            return Err(Error::InvalidRequest);
+        }
+        UNIX_EPOCH
+            .checked_add(Duration::from_millis(milliseconds))
+            .map(Self)
+            .ok_or(Error::InvalidRequest)
+    }
+
+    /// Reject pre-epoch, overflowing, or sub-millisecond times without rounding.
+    pub fn to_unix_millis(self) -> Result<u64> {
+        let duration = self
+            .0
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::InvalidRequest)?;
+        if duration.subsec_nanos() % 1_000_000 != 0
+            || duration.as_millis() > u128::from(MAX_WIRE_INTEGER)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(duration.as_millis() as u64)
+    }
+
+    pub fn parse(value: &[u8]) -> Result<Self> {
+        Self::from_unix_millis(parse_decimal(value)?)
+    }
+
+    pub fn to_header(self) -> Result<String> {
+        Ok(self.to_unix_millis()?.to_string())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectMetadata {
@@ -37,6 +74,14 @@ pub struct CurrentVersion {
 }
 
 impl ObjectMetadata {
+    pub fn validate(&self) -> Result<()> {
+        if self.length > MAX_WIRE_INTEGER {
+            return Err(Error::InvalidRequest);
+        }
+        self.expires_at.to_unix_millis()?;
+        Ok(())
+    }
+
     pub fn immutable(&self) -> VersionMetadata {
         VersionMetadata {
             version: self.version.clone(),
@@ -58,6 +103,7 @@ impl VersionMetadata {
 
     /// Structural consistency only, not authentication of origin/peer/disk input.
     pub fn validate_page(&self, envelope: &PageEnvelope) -> Result<()> {
+        envelope.validate()?;
         if self.page_length(&envelope.page)? != envelope.plaintext_length {
             return Err(Error::CorruptRecord);
         }
@@ -70,7 +116,7 @@ impl VersionMetadata {
             .0
             .checked_mul(PAGE_BYTES)
             .ok_or(Error::CorruptRecord)?;
-        if page.version != self.version || start >= self.length {
+        if self.length > MAX_WIRE_INTEGER || page.version != self.version || start >= self.length {
             return Err(Error::CorruptRecord);
         }
         Ok((self.length - start).min(PAGE_BYTES) as u32)
@@ -88,6 +134,10 @@ impl CurrentVersion {
         if self.version != descriptor.version {
             return Err(Error::VersionUnavailable);
         }
+        if descriptor.length > MAX_WIRE_INTEGER {
+            return Err(Error::CorruptRecord);
+        }
+        self.expires_at.to_unix_millis()?;
         Ok((now < self.expires_at.0).then(|| ObjectMetadata {
             version: descriptor.version.clone(),
             length: descriptor.length,
@@ -111,6 +161,80 @@ mod tests {
         identity::{CacheId, CacheKey, ObjectId, PageNumber, StrongEtag},
     };
     use std::time::Duration;
+
+    #[test]
+    fn expiry_round_trips_sdk_epoch_milliseconds_including_signed63_maximum() {
+        for milliseconds in [0, 1, 999, 1000, 123_456_789, MAX_WIRE_INTEGER] {
+            let value = milliseconds.to_string();
+            let expiry = ExpiresAt::parse(value.as_bytes()).unwrap();
+            assert_eq!(expiry.to_unix_millis(), Ok(milliseconds));
+            assert_eq!(expiry.to_header(), Ok(value));
+        }
+    }
+
+    #[test]
+    fn expiry_rejects_noncanonical_precision_and_overflow() {
+        for value in [
+            "",
+            "-1",
+            "+1",
+            "01",
+            " 1",
+            "1 ",
+            "1.0",
+            "9223372036854775808",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                ExpiresAt::parse(value.as_bytes()),
+                Err(Error::InvalidRequest)
+            );
+        }
+        assert_eq!(
+            ExpiresAt::from_unix_millis(MAX_WIRE_INTEGER + 1),
+            Err(Error::InvalidRequest)
+        );
+        for time in [
+            UNIX_EPOCH - Duration::from_millis(1),
+            UNIX_EPOCH + Duration::from_nanos(1),
+            UNIX_EPOCH + Duration::from_millis(MAX_WIRE_INTEGER + 1),
+        ] {
+            assert_eq!(ExpiresAt(time).to_unix_millis(), Err(Error::InvalidRequest));
+        }
+    }
+
+    #[test]
+    fn metadata_validation_rejects_invalid_public_numeric_fields() {
+        let mut metadata = descriptor("v1", MAX_WIRE_INTEGER).for_pin();
+        assert_eq!(metadata.validate(), Ok(()));
+        metadata.length += 1;
+        assert_eq!(metadata.validate(), Err(Error::InvalidRequest));
+        metadata.length = 0;
+        metadata.expires_at = ExpiresAt(UNIX_EPOCH + Duration::from_nanos(1));
+        assert_eq!(metadata.validate(), Err(Error::InvalidRequest));
+    }
+
+    #[test]
+    fn current_version_rejects_invalid_descriptors_before_fresh_admission() {
+        let descriptor = descriptor("v1", MAX_WIRE_INTEGER + 1);
+        let mut current = CurrentVersion {
+            version: descriptor.version.clone(),
+            expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_secs(1)),
+        };
+        assert_eq!(
+            current.resolve(&descriptor, UNIX_EPOCH),
+            Err(Error::CorruptRecord)
+        );
+        let valid = VersionMetadata {
+            length: 1,
+            ..descriptor
+        };
+        current.expires_at = ExpiresAt(UNIX_EPOCH + Duration::from_nanos(1));
+        assert_eq!(
+            current.resolve(&valid, UNIX_EPOCH),
+            Err(Error::InvalidRequest)
+        );
+    }
 
     pub(crate) fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
@@ -168,6 +292,12 @@ mod tests {
             ciphertext_length: 19,
         };
         assert_eq!(descriptor.validate_page(&envelope), Ok(()));
+        envelope.ciphertext_length = 18;
+        assert_eq!(
+            descriptor.validate_page(&envelope),
+            Err(Error::CorruptRecord)
+        );
+        envelope.ciphertext_length = 19;
         envelope.plaintext_length = 4;
         assert_eq!(
             descriptor.validate_page(&envelope),
