@@ -384,7 +384,9 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	manifest := string(raw)
 	for _, fragment := range []string{
 		"path: /etc/containerd/certs.d",
-		"target_file=\"$target_dir/hosts.toml\"",
+		"path: _default/hosts.toml",
+		"for source_file in /config/*/hosts.toml; do",
+		"relative_path=${source_file#/config/}",
 		"while true; do",
 		"if ! cmp -s \"$source_file\" \"$target_file\"; then",
 		"mv \"$temp_file\" \"$target_file\"",
@@ -447,15 +449,20 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	}
 
 	hostRoot := t.TempDir()
+	sourceRoot := t.TempDir()
 	targetDir := filepath.Join(hostRoot, "_default")
+	sourceDir := filepath.Join(sourceRoot, "_default")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
 
-	sourceFile := filepath.Join(t.TempDir(), "hosts.toml")
+	sourceFile := filepath.Join(sourceDir, "hosts.toml")
 	if err := os.WriteFile(sourceFile, []byte(hostsConfig), 0o644); err != nil {
 		t.Fatalf("write source hosts config: %v", err)
 	}
 
-	reconcileScript = strings.Replace(reconcileScript, "target_dir=/host-certs/_default", fmt.Sprintf("target_dir=%q", targetDir), 1)
-	reconcileScript = strings.Replace(reconcileScript, "source_file=/config/hosts.toml", fmt.Sprintf("source_file=%q", sourceFile), 1)
+	reconcileScript = strings.ReplaceAll(reconcileScript, "/host-certs", hostRoot)
+	reconcileScript = strings.ReplaceAll(reconcileScript, "/config", sourceRoot)
 	reconcileScript = strings.Replace(reconcileScript, "sleep 5", "sleep 0.05", 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -480,6 +487,99 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	}
 
 	waitForFileContent(t, targetFile, hostsConfig)
+}
+
+func TestArtifactStreamingUsesAKSMirrorChain(t *testing.T) {
+	t.Parallel()
+
+	const registry = "gantrystreamacr1.azurecr.io"
+
+	outputDir := renderChart(t, false,
+		"--set", "gantry.artifactStreaming.enabled=true",
+		"--set-string", "gantry.upstreamRegistries[0].name="+registry,
+		"--set-string", "gantry.upstreamRegistries[0].endpoint=http://127.0.0.1:8578?ns="+registry,
+	)
+
+	daemonSetRaw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered daemonset: %v", err)
+	}
+
+	var daemonSet struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					HostNetwork bool   `yaml:"hostNetwork"`
+					DNSPolicy   string `yaml:"dnsPolicy"`
+					Containers  []struct {
+						Name  string `yaml:"name"`
+						Ports []struct {
+							Name     string `yaml:"name"`
+							HostPort int    `yaml:"hostPort"`
+						} `yaml:"ports"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(daemonSetRaw, &daemonSet); err != nil {
+		t.Fatalf("unmarshal rendered daemonset: %v", err)
+	}
+
+	if !daemonSet.Spec.Template.Spec.HostNetwork {
+		t.Fatal("artifact-streaming Gantry hostNetwork = false, want true")
+	}
+
+	if got := daemonSet.Spec.Template.Spec.DNSPolicy; got != "ClusterFirstWithHostNet" {
+		t.Fatalf("artifact-streaming Gantry dnsPolicy = %q", got)
+	}
+
+	for _, container := range daemonSet.Spec.Template.Spec.Containers {
+		if container.Name != "gantry" {
+			continue
+		}
+
+		for _, port := range container.Ports {
+			if port.Name == "mirror" && port.HostPort != 0 {
+				t.Fatalf("host-networked mirror hostPort = %d, want omitted", port.HostPort)
+			}
+		}
+	}
+
+	configRaw, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered configmap: %v", err)
+	}
+
+	for _, fragment := range []string{
+		`mirror_listen: "127.0.0.1:5000"`,
+		`endpoint: "http://127.0.0.1:8578?ns=` + registry + `"`,
+	} {
+		if !strings.Contains(string(configRaw), fragment) {
+			t.Fatalf("artifact-streaming config missing %q:\n%s", fragment, configRaw)
+		}
+	}
+
+	nodeConfigRaw, err := os.ReadFile(filepath.Join(outputDir, "node-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered node config: %v", err)
+	}
+
+	manifest := string(nodeConfigRaw)
+	for _, fragment := range []string{
+		`server = "https://` + registry + `"`,
+		`[host."http://127.0.0.1:5000"]`,
+		`[host."http://127.0.0.1:8578"]`,
+		"path: " + registry + "/hosts.toml",
+	} {
+		if !strings.Contains(manifest, fragment) {
+			t.Fatalf("AKS node config missing %q:\n%s", fragment, manifest)
+		}
+	}
+
+	if strings.Contains(manifest, "path: _default/hosts.toml") {
+		t.Fatalf("AKS node config overwrites _default:\n%s", manifest)
+	}
 }
 
 func waitForFileContent(t *testing.T, path, want string) {

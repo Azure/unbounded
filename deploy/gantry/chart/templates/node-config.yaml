@@ -10,8 +10,7 @@ metadata:
     {{- include "gantry.managerLabel" . | nindent 4 }}
     app.kubernetes.io/component: node-config
 data:
-  hosts.toml: |
-    {{- include "gantry.nodeConfigHosts" . | nindent 4 }}
+  {{- include "gantry.nodeConfigPayload" . | nindent 2 }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -38,7 +37,7 @@ spec:
         {{- include "gantry.managerLabel" . | nindent 8 }}
         app.kubernetes.io/component: node-config
       annotations:
-        checksum/hosts-config: {{ include "gantry.nodeConfigHosts" . | sha256sum }}
+        checksum/hosts-config: {{ include "gantry.nodeConfigPayload" . | sha256sum }}
     spec:
       automountServiceAccountToken: false
       priorityClassName: gantry-low
@@ -58,38 +57,46 @@ spec:
                   - sh
                   - -c
                   - |
-                    target_file=/host-certs/_default/hosts.toml
-                    if cmp -s /config/hosts.toml "$target_file"; then
-                      rm -f "$target_file"
-                    fi
+                    for source_file in /config/*/hosts.toml; do
+                      relative_path=${source_file#/config/}
+                      target_file=/host-certs/$relative_path
+                      if cmp -s "$source_file" "$target_file"; then
+                        rm -f "$target_file"
+                      fi
+                    done
           command:
             - sh
             - -c
             - |
               set -eu
 
-              target_dir=/host-certs/_default
-              target_file="$target_dir/hosts.toml"
-              source_file=/config/hosts.toml
-              temp_file="$target_dir/.hosts.toml.gantry.tmp"
-
               while true; do
-                mkdir -p "$target_dir"
-                if ! cmp -s "$source_file" "$target_file"; then
-                  cp "$source_file" "$temp_file"
-                  chmod 0644 "$temp_file"
-                  mv "$temp_file" "$target_file"
-                  echo "reconciled $target_file"
-                fi
+                for source_file in /config/*/hosts.toml; do
+                  relative_path=${source_file#/config/}
+                  target_file=/host-certs/$relative_path
+                  target_dir=$(dirname "$target_file")
+                  temp_file="$target_dir/.hosts.toml.gantry.tmp"
+
+                  mkdir -p "$target_dir"
+                  if ! cmp -s "$source_file" "$target_file"; then
+                    cp "$source_file" "$temp_file"
+                    chmod 0644 "$temp_file"
+                    mv "$temp_file" "$target_file"
+                    echo "reconciled $target_file"
+                  fi
+                done
                 sleep {{ .Values.nodeConfig.reconcileIntervalSeconds }}
               done
           readinessProbe:
             exec:
               command:
-                - cmp
-                - -s
-                - /config/hosts.toml
-                - /host-certs/_default/hosts.toml
+                - sh
+                - -c
+                - |
+                  for source_file in /config/*/hosts.toml; do
+                    relative_path=${source_file#/config/}
+                    cmp -s "$source_file" "/host-certs/$relative_path" || exit 1
+                  done
             initialDelaySeconds: 1
             periodSeconds: 5
           resources:
@@ -118,4 +125,14 @@ spec:
         - name: config
           configMap:
             name: gantry-containerd-hosts
+            items:
+              {{- if .Values.gantry.artifactStreaming.enabled }}
+              {{- range $index, $registry := .Values.gantry.upstreamRegistries }}
+              - key: hosts-{{ $index }}.toml
+                path: {{ $registry.name }}/hosts.toml
+              {{- end }}
+              {{- else }}
+              - key: hosts.toml
+                path: _default/hosts.toml
+              {{- end }}
 {{- end }}

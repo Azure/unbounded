@@ -1068,6 +1068,38 @@ func TestNSAliasResolves(t *testing.T) {
 	rc.Close()
 }
 
+func TestEndpointQueryIsPreserved(t *testing.T) {
+	body := []byte("proxied")
+	d := digestOf(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/proxy/v2/owner/repo/blobs/"+d.String() {
+			t.Errorf("path = %q", got)
+		}
+
+		if got := r.URL.Query().Get("ns"); got != "registry.example.com" {
+			t.Errorf("ns = %q", got)
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{
+		Name:     "registry.example.com",
+		Endpoint: srv.URL + "/proxy?ns=registry.example.com",
+	})
+
+	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "registry.example.com", Repository: "owner/repo", Digest: d,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	rc.Close()
+}
+
 func TestNewRejectsBadCredentialsFile(t *testing.T) {
 	dir := t.TempDir()
 

@@ -18,7 +18,7 @@ and examples used by development and benchmark tooling.
 | `chart/templates/serviceaccount.yaml` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + Role + PriorityClass. |
 | `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
-| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's default Gantry mirror route. |
+| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's Gantry mirror route. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
@@ -28,9 +28,9 @@ and examples used by development and benchmark tooling.
 - Operator-managed clusters use the manifests embedded in the
    `unbounded-operator` binary. The operator never runs Helm.
 - Clusters without the operator install the released OCI chart. The chart
-   continuously reconciles `/etc/containerd/certs.d/_default/hosts.toml` on
-   every selected node. Containerd must already be configured to read
-   `/etc/containerd/certs.d`; the chart does not edit or restart containerd.
+   continuously reconciles its route under `/etc/containerd/certs.d` on every
+   selected node. Containerd must already be configured to read that directory;
+   the chart does not edit or restart containerd.
 
 The paths are mutually exclusive. `PriorityClass/gantry-low` records the active
 manager, and both installers reject ownership by the other path.
@@ -81,11 +81,15 @@ the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
 Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
-resident reconciler checks the default `hosts.toml` every five seconds and
-atomically restores the chart-owned payload when the file is missing or
-different, including after a node upgrade resets host configuration. Graceful
-shutdown removes the file only when it still matches the chart payload. Set
-`nodeConfig.enabled=false` when another node-management system owns this file.
+resident reconciler checks its `hosts.toml` files every five seconds and
+atomically restores chart-owned payloads when they are missing or different,
+including after a node upgrade resets host configuration. Graceful shutdown
+removes a file only when it still matches the chart payload. Set
+`nodeConfig.enabled=false` when another node-management system owns these files.
+
+The default profile owns `_default/hosts.toml`. Artifact Streaming instead owns
+one registry-specific `<registry-host>/hosts.toml` for each configured upstream,
+leaving AKS's `_default/hosts.toml` unchanged.
 
 Externally managed installations can instead drop a registry-specific
 `hosts.toml` at:
@@ -107,19 +111,36 @@ it only on nodes where AKS already provides
 `overlaybd-snapshotter`.
 
 For a standalone Helm installation, enable the Gantry range endpoint and its
-host configurator together, with an explicit selector for only the streaming
-node pool:
+host configurator together. Point Gantry's OCI upstream at the node-local AKS
+Artifact Streaming mirror and select only the streaming node pool:
 
 ```yaml
+nodeSelector:
+   gantry-streaming: "true"
+
 gantry:
    artifactStreaming:
       enabled: true
+   upstreamRegistries:
+      - name: <registry>.azurecr.io
+        endpoint: http://127.0.0.1:8578?ns=<registry>.azurecr.io
 
 overlaybdConfig:
    enabled: true
    nodeSelector:
-      kubernetes.azure.com/agentpool: <streaming-node-pool>
+      gantry-streaming: "true"
 ```
+
+In this mode Gantry uses host networking so it can reach the loopback-only AKS
+mirror. Containerd resolves through Gantry on port 5000; Gantry forwards OCI
+requests to the AKS mirror on port 8578, preserving its `ns` query. The AKS
+mirror returns the OverlayBD manifest, which triggers Gantry's complete-layer
+chair pulls. OverlayBD sends range reads to the same Gantry listener under
+`/blobs/`, where the source order remains local, peer, then signed ACR origin.
+
+The registry-specific containerd file lists the AKS mirror after Gantry. If
+Gantry is unavailable, containerd continues through port 8578 with Artifact
+Streaming but without Gantry peer reuse.
 
 The configurator waits for `/artifact-streaming/readyz`, snapshots the current
 host configuration under `/var/lib/gantry/overlaybd-config`, then uses the
@@ -130,7 +151,10 @@ host file differs from Gantry's managed snapshot, apply or rollback preserves
 that file and reports the conflict.
 
 For an operator-managed installation, opt in through every participating
-`Site` using the same selector:
+`Site` using the same selector. This path assumes `unbounded-agent` or another
+node manager already routes containerd through Gantry. Use the standalone Helm
+chart on stock AKS nodes so the registry-specific route is installed alongside
+the OverlayBD configuration.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
