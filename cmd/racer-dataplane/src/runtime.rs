@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod affinity;
 pub mod channel;
+pub mod crypto;
 pub mod deadline;
 pub mod reactor;
 pub mod worker;

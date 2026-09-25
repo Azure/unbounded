@@ -13,6 +13,8 @@ use crate::{
 };
 use std::{path::PathBuf, time::Duration};
 
+pub const DEFAULT_MAX_THREADS: usize = 8;
+
 pub struct Config {
     pub cluster: ClusterId,
     /// Resolved by verified bootstrap/local identity recovery before workers start,

@@ -46,10 +46,12 @@ use crate::{
     runtime::{
         affinity::AffinityPlan,
         deadline::RequestScope,
-        worker::{WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService},
+        worker::{
+            CryptoRuntime, CryptoService, WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService,
+        },
     },
     security::{
-        aead::PageCrypto,
+        aead::{PageCrypto, PageCryptoEngine},
         certificates::Certificates,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
@@ -157,7 +159,7 @@ impl WorkerApplication {
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates, replay));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone()));
-        let crypto = Rc::new(PageCrypto::new(keys.clone()));
+        let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
         let control = if worker == node.control_worker {
             let enrollment = Rc::new(Enrollment::new(
                 config.cluster.clone(),
@@ -371,39 +373,83 @@ impl WorkerFactory for Application {
             runtime,
         )))
     }
+    fn build_crypto(
+        &self,
+        _worker: WorkerId,
+        runtime: CryptoRuntime,
+    ) -> Result<Box<dyn CryptoService>> {
+        Ok(Box::new(PageCryptoEngine::new(runtime)))
+    }
 }
 impl WorkerService for WorkerApplication {
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        WorkerApplication::start(self, scope)
+    }
     fn poll_budgeted(&mut self, _work_budget: usize) -> Result<()> {
         pending("app.poll_budgeted")
     }
     fn stop_admission(&mut self) -> Result<()> {
         pending("app.stop_admission")
     }
+    fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
+        deferred("app.drain")
+    }
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        WorkerApplication::shutdown(self, scope)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{admission::Admission, reactor::Reactor};
+    use crate::runtime::{
+        admission::Admission,
+        crypto::{self, CryptoClient},
+        reactor::Reactor,
+    };
 
     #[test]
     fn composes_http_and_optional_rdma_without_operational_side_effects() {
         for enable_rdma in [false, true] {
             let config = crate::test_support::cluster::config(enable_rdma);
             let admission = Rc::new(Admission::new(config.limits.clone()));
+            let (io, engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
+            let crypto = Rc::new(CryptoClient::new(io));
             let runtime = WorkerRuntime {
                 reactor: Rc::new(Reactor::new(admission.clone())),
                 admission,
+                crypto: crypto.clone(),
             };
+            let application =
+                Application::assemble(crate::test_support::cluster::config(enable_rdma)).unwrap();
+            let _engine = application
+                .build_crypto(WorkerId(0), CryptoRuntime { port: engine })
+                .unwrap();
             let node = NodeState::default();
             let mut worker = WorkerApplication::assemble(&config, &node, WorkerId(0), runtime);
             assert!(worker.control.is_some());
             assert_eq!(worker.rdma.is_some(), enable_rdma);
+            assert_eq!(
+                Rc::strong_count(&crypto),
+                3,
+                "runtime and page facade share one local crypto client"
+            );
             let second_admission = Rc::new(Admission::new(config.limits.clone()));
+            let (second_io, second_engine) =
+                crypto::pair(WorkerId(1), 0, config.limits.queue_entries);
             let second_runtime = WorkerRuntime {
                 reactor: Rc::new(Reactor::new(second_admission.clone())),
                 admission: second_admission,
+                crypto: Rc::new(CryptoClient::new(second_io)),
             };
+            let _second_engine = application
+                .build_crypto(
+                    WorkerId(1),
+                    CryptoRuntime {
+                        port: second_engine,
+                    },
+                )
+                .unwrap();
             let second = WorkerApplication::assemble(&config, &node, WorkerId(1), second_runtime);
             assert!(
                 second.control.is_none(),
@@ -419,6 +465,13 @@ mod tests {
                 Err(crate::error::Error::Unimplemented("app.poll_budgeted"))
             );
         }
+    }
+
+    #[test]
+    fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Application>();
+        shared::<NodeState>();
     }
 
     // Implement startup rollback, control owner fanout, all-shard checkpoints,

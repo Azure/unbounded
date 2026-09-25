@@ -29,8 +29,25 @@ library. There are no third-party dependencies yet.
   Each logical worker has two separate threads: I/O and page crypto. The default
   cap is eight total userspace threads (up to four pairs), sized against allowed
   CPUs and cgroup quotas. Prefer separate NIC-local cores; on one allowed CPU both
-  threads share it. Control and diagnostics fit within that budget. Pair-aware
-  lifecycle and owned crypto job/completion interfaces still need to be specified.
+  threads share it. Control and diagnostics fit within that budget. This explicitly
+  supersedes `tmp/design.md`'s combined-role single-core description.
+  `WorkerPair` represents both roles and local CPU/core/NIC/NUMA constraints;
+  pure pair sizing floors odd caps/cores and effective quotas to complete pairs.
+  Local discovery/planning validates accepted rail mappings without changing the
+  cluster rail contract or deterministic page-to-rail selection.
+  The `Sync` factory builds separate I/O and crypto services on their pinned
+  threads. Group APIs specify start, concurrent drain, shutdown, and join,
+  including partial-start rollback; operational lifecycle remains fail-closed.
+  `runtime::crypto` defines owned Send jobs/completions, generation/sequence IDs,
+  key leases, original deadlines/cancellation, and a non-cloneable pair-bound
+  permit reserving both job and completion space before enqueue. Rejection returns
+  ownership. Completion consumption releases capacity, including for canceled or
+  abandoned waiters. Wakeable polling and bounded quanta must permit single-CPU
+  progress. Queue allocation, wakeups, cancellation fencing, and AEAD are pending.
+  I/O-local `PageCrypto` selects a key lease and submits owned inputs via its
+  runtime's `CryptoClient`; the paired `PageCryptoEngine` cannot access the Rc
+  service graph. Output reservations move to jobs, rather than borrowing a fill's
+  admission state. I/O alone owns flights, storage, metadata, and admission.
 - `read` coordinates one per-page flight per worker. `client` and `peer` use that
   same coordinator; transport does not create another acquisition pipeline.
   Explicit version pins may use expired metadata; fresh/unpinned admission requires
