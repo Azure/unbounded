@@ -158,7 +158,7 @@ impl WorkerApplication {
         ));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates, replay));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone()));
+        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
         let control = if worker == node.control_worker {
             let enrollment = Rc::new(Enrollment::new(

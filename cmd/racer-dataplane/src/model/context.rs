@@ -10,7 +10,10 @@ use super::{
     envelope::{KeyId, Nonce},
     identity::{AttemptId, ObjectId, RequestId},
 };
-use crate::error::{Result, pending};
+use crate::{
+    error::{Result, pending},
+    runtime::{admission::Reservation, deadline::RequestScope},
+};
 
 pub const METADATA_HEADER: &str = "Racer-Metadata";
 
@@ -47,6 +50,12 @@ impl OpaqueMetadata {
     }
 }
 
+/// One request owns the raw context and lends it to origin writes and sealing.
+/// Retrying/fanning out must not require duplicating secrets:
+/// ```compile_fail
+/// use racer_dataplane::model::context::OriginContext;
+/// fn duplicate(origin: OriginContext) { let _copy = origin.clone(); }
+/// ```
 pub struct OriginContext {
     pub object: ObjectId,
     pub metadata: Option<OpaqueMetadata>,
@@ -54,7 +63,8 @@ pub struct OriginContext {
 }
 
 /// Separate AEAD domain from page encryption. Bind to request/attempt/object and
-/// metadata using canonical AAD; retries reseal rather than change bound fields.
+/// metadata using canonical AAD; retries reseal with a fresh cryptographic nonce
+/// rather than change bound fields or reuse this ciphertext for a new attempt.
 /// Any eligible origin-fetching node can open this cache-scoped credential envelope.
 pub struct EncryptedAuthorization {
     pub key_id: KeyId,
@@ -62,12 +72,41 @@ pub struct EncryptedAuthorization {
     pub ciphertext: Vec<u8>,
 }
 
+/// Owned per-attempt envelope, with no borrow of the raw request context. Relays
+/// preserve it unopened. Local quota and scope are never serialized on the wire.
+/// Neither envelope nor quota can be cloned to bypass per-attempt admission:
+/// ```compile_fail
+/// use racer_dataplane::model::context::PeerOriginContext;
+/// fn duplicate(envelope: PeerOriginContext) { let _copy = envelope.clone(); }
+/// ```
+/// Wire decoding must also admit its allocations before constructing this owner;
+/// callers cannot construct an uncharged envelope using only its wire fields:
+/// ```compile_fail
+/// use racer_dataplane::model::{context::PeerOriginContext,
+///     identity::{ObjectId, RequestId, AttemptId}};
+/// fn uncharged(object: ObjectId, request: RequestId, attempt: AttemptId) {
+///     let _envelope = PeerOriginContext {
+///         object, request, attempt, metadata: None, authorization: None,
+///     };
+/// }
+/// ```
 pub struct PeerOriginContext {
     pub object: ObjectId,
     pub request: RequestId,
     pub attempt: AttemptId,
     pub metadata: Option<OpaqueMetadata>,
     pub authorization: Option<EncryptedAuthorization>,
+    /// Charge all owned field allocations, including ciphertext/tag and metadata.
+    /// Transport retains this owner until all I/O using those fields is fenced.
+    pub(crate) reservation: Reservation,
+    pub(crate) scope: RequestScope,
+}
+
+impl PeerOriginContext {
+    /// Original deadline/shared cancellation, never reset by retry or fanout.
+    pub fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
 }
 
 #[cfg(test)]

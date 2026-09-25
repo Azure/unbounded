@@ -72,6 +72,15 @@ library. There are no third-party dependencies yet.
   Metadata stays signed plaintext across peers; Authorization is encrypted across
   peers and decrypted for the local origin socket. Credentials are opaque upstream
   fetch context, not Racer authorization, and never enter caches, disk, or logs.
+  `CredentialCrypto::seal` synchronously borrows the request's `OriginContext` and
+  original `RequestScope`, returning an independent owned `PeerOriginContext` per
+  attempt. Retry/fanout reseals without cloning raw secrets. Each encryption must
+  generate a fresh cryptographic nonce and bind the credential domain, key ID,
+  request/attempt, object, and exact opaque metadata in canonical AAD. The facade
+  shares worker admission; each envelope owns its request-context reservation and
+  original cancellation/deadline through transport completion. Bounded allocation,
+  nonce generation, canonicalization, zeroization, and credential AEAD remain
+  fail-closed implementation work; compile/API tests establish ownership only.
   `SignedRequest` and `SignedResponse` own the logical message plus its original
   signed head and ordered forwarding heads. `Forwarding` signs/verifies complete
   envelopes and appends request/response hops without replacing the original.
