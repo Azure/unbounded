@@ -466,8 +466,9 @@ impl Reactor {
             state.entries.remove(&id);
             return Err(Error::Overloaded);
         }
-        // Submission itself is driven by poll_budgeted, so polling a future never
-        // executes potentially blocking file/socket operations on the worker.
+        // Kernel submission is driven by poll_budgeted and by wait before sleeping,
+        // including SQEs queued in the intervening service turn. Polling a future
+        // only queues work; potentially blocking file operations use ASYNC.
         Ok(Waiting { reply, signal })
     }
 
@@ -743,7 +744,7 @@ impl Reactor {
                 }
             }
         }
-        let submitted = state.ring.as_ref().unwrap().submit();
+        let submitted = state.submit_pending();
         drop(state);
         // Wakers may reenter the worker; never invoke under the reactor RefCell.
         for entry in finished {
@@ -754,24 +755,18 @@ impl Reactor {
         for waker in fence_wakes {
             waker.wake();
         }
-        match submitted {
-            Ok(_) => Ok(completed),
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
-                ) =>
-            {
-                Ok(completed)
-            }
-            Err(_) => Err(Error::Io),
-        }
+        submitted.map(|()| completed)
     }
 
     /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
     /// fallback for producers that cannot yet attach the eventfd wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
         let state = self.state.borrow();
+        // Service polling can queue SQEs after poll_budgeted. Submit once before
+        // sleeping so that work can produce the CQEs we wait for. Transient errors
+        // defer progress to the next worker turn; completion/cancel budgets stay
+        // in poll_budgeted, and an absent ring remains uninitialized.
+        state.submit_pending()?;
         let mut fds = [
             libc::pollfd {
                 fd: state.ring.as_ref().map_or(-1, AsRawFd::as_raw_fd),
@@ -858,6 +853,13 @@ fn offset_or_zero(operation: BufferOperation) -> u64 {
 }
 
 impl State {
+    fn submit_pending(&self) -> Result<()> {
+        match &self.ring {
+            Some(ring) => submission_result(ring.submit()),
+            None => Ok(()),
+        }
+    }
+
     fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<Waker> {
         let keys: Vec<_> = self
             .fence_waiters
@@ -897,6 +899,21 @@ impl State {
         } else {
             Ok(None)
         }
+    }
+}
+
+fn submission_result(result: std::io::Result<usize>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(Error::Io),
     }
 }
 
@@ -1114,6 +1131,141 @@ mod tests {
         assert!(reactor.state.borrow().wake.is_none());
         assert_eq!(reactor.in_flight(), 0);
         assert_eq!(reactor.poll_budgeted(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn wait_does_not_initialize_absent_ring() {
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+        reactor.wait(Duration::ZERO).unwrap();
+        let state = reactor.state.borrow();
+        assert!(state.ring.is_none());
+        assert!(state.wake.is_none());
+        assert!(state.ring_reservation.is_none());
+        assert!(state.entries.is_empty());
+        assert_eq!(reactor.admission.used(ResourceClass::RequestContext), 0);
+    }
+
+    #[test]
+    fn submission_classifies_transient_and_fatal_errors() {
+        for count in [0, 1, 8] {
+            assert_eq!(submission_result(Ok(count)), Ok(()));
+        }
+        for errno in [libc::EINTR, libc::EAGAIN, libc::EBUSY] {
+            assert_eq!(
+                submission_result(Err(std::io::Error::from_raw_os_error(errno))),
+                Ok(())
+            );
+        }
+        for errno in [libc::EIO, libc::EBADF, libc::EINVAL, libc::ENOMEM] {
+            assert_eq!(
+                submission_result(Err(std::io::Error::from_raw_os_error(errno))),
+                Err(Error::Io)
+            );
+        }
+        assert_eq!(
+            submission_result(Err(std::io::Error::other("submission failed"))),
+            Err(Error::Io)
+        );
+    }
+
+    #[test]
+    fn wait_submits_service_turn_sqe_before_next_completion_poll() {
+        use std::io::Write;
+
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let baseline = reactor.admission.used(ResourceClass::RequestContext);
+        let request = scope();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = Rc::new(OwnedFd::from(socket));
+        let weak = Rc::downgrade(&fd);
+        let drops = Rc::new(Cell::new(0));
+
+        // Match the worker order: poll_runtime's empty reactor poll, then service
+        // polling queues I/O, then wait. No second completion poll may submit it.
+        assert_eq!(reactor.poll_budgeted(8).unwrap(), 0);
+        let mut receive = reactor.recv(
+            fd,
+            Buffer(vec![0; 1].into(), drops.clone()),
+            Lease(drops.clone()),
+            &request,
+        );
+        assert!(poll(&mut receive).is_pending());
+        assert_eq!(
+            reactor
+                .state
+                .borrow_mut()
+                .ring
+                .as_mut()
+                .unwrap()
+                .submission()
+                .len(),
+            1
+        );
+        drop(receive);
+        let retained = reactor.admission.used(ResourceClass::RequestContext);
+        assert!(retained > baseline);
+
+        reactor.wait(Duration::ZERO).unwrap();
+        {
+            let mut state = reactor.state.borrow_mut();
+            let ring = state.ring.as_mut().unwrap();
+            assert_eq!(ring.submission().len(), 0, "wait must submit queued SQEs");
+            assert_eq!(ring.completion().len(), 0, "receive still awaits peer data");
+            let entry = state.entries.first_key_value().unwrap().1;
+            assert!(entry.original.is_none());
+            assert!(!entry.cancel_sent, "wait must not scan cancellations");
+        }
+        assert_eq!(reactor.in_flight(), 1);
+        assert_eq!(drops.get(), 0);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            retained
+        );
+
+        // Make the submitted receive complete without driving poll_budgeted.
+        peer.write_all(b"x").unwrap();
+        let mut descriptor = libc::pollfd {
+            fd: reactor.state.borrow().ring.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows one initialized descriptor for this bounded call.
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 1000) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLIN, 0);
+        reactor.wait(Duration::ZERO).unwrap();
+        assert_eq!(reactor.poll_budgeted(0).unwrap(), 0);
+        assert_eq!(
+            reactor
+                .state
+                .borrow_mut()
+                .ring
+                .as_mut()
+                .unwrap()
+                .completion()
+                .len(),
+            1,
+            "wait and a zero budget must leave the CQE for the next worker turn"
+        );
+        assert_eq!(reactor.in_flight(), 1);
+        assert_eq!(drops.get(), 0);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            retained
+        );
+
+        assert_eq!(reactor.poll_budgeted(1).unwrap(), 1);
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(drops.get(), 2);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            baseline
+        );
     }
 
     #[test]
