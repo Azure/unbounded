@@ -27,10 +27,7 @@ use crate::{
     model::identity::WorkerId,
     origin::client::{Origin, OriginClient},
     peer::{
-        handshake::Handshake,
-        relay::Relay,
-        requester::{PeerClient, Requester},
-        server::PeerServer,
+        handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
         transfer::Transfers,
     },
     rdma::{
@@ -158,6 +155,7 @@ impl WorkerApplication {
             config.limits.replay_entries.get(),
         ));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates, replay));
+        let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone()));
         let control = if worker == node.control_worker {
@@ -260,10 +258,10 @@ impl WorkerApplication {
         let placement = Rc::new(Placement::new(config.limits.cached_rankings.get()));
         let handshake = Rc::new(Handshake::new(signatures.clone(), sessions));
         let transfers = Rc::new(Transfers::new(http.clone(), io.clone(), rdma.clone()));
-        let requester: Rc<dyn PeerClient> = Rc::new(Requester::new(
+        let requester = Rc::new(Requester::new(
             paths.clone(),
             rails,
-            signatures.clone(),
+            forwarding.clone(),
             handshake,
             transfers.clone(),
         ));
@@ -291,7 +289,7 @@ impl WorkerApplication {
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,
-            requester,
+            requester.clone(),
             credentials.clone(),
             config.limits.metadata_entries.get(),
         ));
@@ -310,8 +308,8 @@ impl WorkerApplication {
         ));
         let relay = Rc::new(Relay::new(
             paths,
-            Rc::new(Forwarding::new(signatures.clone())),
-            transfers,
+            forwarding.clone(),
+            requester,
             admission.clone(),
         ));
         let dispatcher = Rc::new(Dispatcher::new(
@@ -321,7 +319,7 @@ impl WorkerApplication {
         ));
         let peers = PeerServer::new(
             io.clone(),
-            signatures,
+            forwarding,
             admission.clone(),
             dispatcher.clone(),
             relay,

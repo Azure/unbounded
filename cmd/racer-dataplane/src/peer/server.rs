@@ -1,25 +1,35 @@
 //! Authenticate, replay-check, authorize, and admit before local dispatch or relay.
 use super::{
     relay::Relay,
-    wire::{PeerRequest, PeerResponse},
+    wire::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
 };
 use crate::{
     error::{Operation, deferred},
     runtime::{admission::Admission, deadline::RequestScope},
-    security::signing::{Signatures, SignedHead},
+    security::forwarding::Forwarding,
 };
 use std::rc::Rc;
 /// Implemented by the existing read coordinator, never a second acquisition graph.
+/// Ingress must be verified; the local result is unsigned until the server signs
+/// it with a retained clone of the request binding.
+///
+/// ```compile_fail
+/// use racer_dataplane::{peer::{server::LocalPageService, wire::PeerRequest},
+///     runtime::deadline::RequestScope};
+/// fn unverified(service: &dyn LocalPageService, request: PeerRequest, scope: &RequestScope) {
+///     service.serve_peer(request, scope);
+/// }
+/// ```
 pub trait LocalPageService {
     fn serve_peer<'a>(
         &'a self,
-        request: PeerRequest,
+        request: VerifiedRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
     io: Rc<crate::http::io::HttpIo>,
-    signatures: Rc<Signatures>,
+    forwarding: Rc<Forwarding>,
     admission: Rc<Admission>,
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
@@ -36,25 +46,27 @@ impl PeerServer {
     }
     pub fn new(
         io: Rc<crate::http::io::HttpIo>,
-        signatures: Rc<Signatures>,
+        forwarding: Rc<Forwarding>,
         admission: Rc<Admission>,
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
     ) -> Self {
         Self {
             io,
-            signatures,
+            forwarding,
             admission,
             local,
             relay,
         }
     }
+    /// Verify the complete ingress envelope before service or relay. Sign a local
+    /// result against its binding; return a relayed signed result without replacing
+    /// the responder's original signature or discarding forwarding headers.
     pub fn dispatch<'a>(
         &'a self,
-        _head: SignedHead,
-        _request: PeerRequest,
+        _request: SignedRequest,
         _scope: &'a RequestScope,
-    ) -> Operation<'a, PeerResponse> {
+    ) -> Operation<'a, SignedResponse> {
         deferred("peer.dispatch")
     }
 }

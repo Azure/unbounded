@@ -12,7 +12,7 @@ use crate::{
     model::identity::WorkerId,
     peer::{
         server::LocalPageService,
-        wire::{PeerRequest, PeerResponse},
+        wire::{PeerResponse, VerifiedRequest},
     },
     runtime::deadline::RequestScope,
 };
@@ -61,7 +61,7 @@ impl ReadService for Dispatcher {
 impl LocalPageService for Dispatcher {
     fn serve_peer<'a>(
         &'a self,
-        _request: PeerRequest,
+        _request: VerifiedRequest,
         _scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         deferred("dispatch.peer")

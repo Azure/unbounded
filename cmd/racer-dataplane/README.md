@@ -46,6 +46,18 @@ library. There are no third-party dependencies yet.
   Metadata stays signed plaintext across peers; Authorization is encrypted across
   peers and decrypted for the local origin socket. Credentials are opaque upstream
   fetch context, not Racer authorization, and never enter caches, disk, or logs.
+  `SignedRequest` and `SignedResponse` own the logical message plus its original
+  signed head and ordered forwarding heads. `Forwarding` signs/verifies complete
+  envelopes and appends request/response hops without replacing the original.
+  Its opaque `VerifiedRequest` is required by local service and relay; its
+  `VerifiedResponse` is returned to logical requesters. Both retain the full chain
+  and expose signed fields read-only. Local `PeerResponse` results are unsigned.
+  `RequestBinding`, minted by request signing/verification, retains the exact
+  original request head/signature and is required for response signing/verification.
+  `PeerTransport` exchanges owned signed envelopes, including through relays.
+  Canonical field agreement, original/hop signatures, replay/identity checks,
+  response correlation, route consumption, and reverse-path I/O remain fail-closed
+  implementation work. These API states do not implement authentication.
 - `store` accepts only encrypted pages. Slabs require `O_DIRECT` with discovered
   address/offset/length alignment. Aligned padded record lengths differ from
   authenticated ciphertext lengths. Padding is initialized and never delivered.

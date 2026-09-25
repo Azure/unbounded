@@ -67,7 +67,7 @@ impl CandidatePolicy {
     }
 }
 pub enum CandidateResolution {
-    Copy(crate::peer::wire::PeerResponse),
+    Copy(crate::peer::wire::VerifiedResponse),
     Origin(OriginAuthority),
 }
 impl OriginAuthority {

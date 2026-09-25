@@ -16,7 +16,7 @@ use crate::{
     model::{metadata::ObjectMetadata, range::ResolvedRange},
     peer::{
         server::LocalPageService,
-        wire::{PeerRequest, PeerResponse},
+        wire::{PeerResponse, VerifiedRequest},
     },
     runtime::deadline::RequestScope,
     security::credentials::CredentialCrypto,
@@ -70,7 +70,7 @@ impl ReadService for Coordinator {
 impl LocalPageService for Coordinator {
     fn serve_peer<'a>(
         &'a self,
-        _request: PeerRequest,
+        _request: VerifiedRequest,
         _scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         deferred("read.serve_peer")
