@@ -24,7 +24,7 @@
 //! (and `reset`), so aging contention is bounded to "epoch
 //! boundary" rather than "every admit".
 //!
-//! Under concurrent admits for the same key, multiple racers can
+//! Under concurrent admits for the same key, multiple callers can
 //! each see the doorkeeper bits unset and each return `false`
 //! once. This is acceptable: the filter is probabilistic and the
 //! eventual-admit semantics are preserved.
@@ -92,7 +92,7 @@ impl AdmissionFilter {
     /// registers the key in the doorkeeper; the second call (or
     /// later, within the same epoch) returns true.
     ///
-    /// Under concurrency, two racers can each observe "first
+    /// Under concurrency, two callers can each observe "first
     /// touch" for the same key and both return false; this is
     /// acceptable (see the module-level concurrency note).
     pub fn should_admit(&self, key: &PageKey) -> bool {
