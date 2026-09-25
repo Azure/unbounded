@@ -450,4 +450,199 @@ mod tests {
         assert_eq!((last.offset, last.length), (0, 7));
         assert!(range.slice_at(PageNumber(2)).unwrap().is_none());
     }
+
+    #[test]
+    fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
+        use crate::{
+            client::response::Responses,
+            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            memory::{
+                pipe::PipePool,
+                pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+            },
+            model::{
+                envelope::{KeyId, Nonce, PageEnvelope},
+                identity::{RequestId, WorkerId},
+                limits::ResourceClass,
+            },
+            read::serve::ReadResponse,
+            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+            topology::membership::Membership,
+        };
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixStream,
+            time::{Duration, Instant},
+        };
+        let total = 4 * PAGE_BYTES + 17;
+        let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
+        for capped in [true, false] {
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let io = Rc::new(HttpIo::with_admission(
+                reactor.clone(),
+                Codec::new(
+                    32768,
+                    if capped {
+                        PAGE_BYTES + 16
+                    } else {
+                        i64::MAX as u64
+                    },
+                ),
+                admission.clone(),
+            ));
+            let delivery = Rc::new(Delivery::new(
+                Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+                Duration::from_secs(30),
+            ));
+            let directory = Arc::new(
+                WorkerDirectory::new(
+                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                    vec![WorkerId(0)],
+                    8,
+                )
+                .unwrap(),
+            );
+            let mut metadata = metadata();
+            metadata.length = total;
+            let scope =
+                RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+            let membership = Arc::new(
+                Membership::validate(crate::model::identity::MembershipVersion(1), vec![]).unwrap(),
+            );
+            let mut ready = VecDeque::new();
+            for number in 1..=4 {
+                let length = if number == 4 { 17 } else { PAGE_BYTES as usize };
+                let page = PageId {
+                    version: metadata.version.clone(),
+                    number: PageNumber(number),
+                };
+                let plaintext = VerifiedPage {
+                    inner: Arc::new(VerifiedBytes {
+                        page: page.clone(),
+                        bytes: vec![number as u8; length],
+                        reservation: admission
+                            .reserve(
+                                Some(&metadata.version.object.cache),
+                                ResourceClass::Plaintext,
+                                length,
+                            )
+                            .unwrap(),
+                    }),
+                };
+                let ciphertext = CiphertextPage {
+                    inner: Arc::new(CiphertextBytes {
+                        envelope: PageEnvelope {
+                            page,
+                            key_id: KeyId([1; 16]),
+                            nonce: Nonce([2; 24]),
+                            plaintext_length: length as u32,
+                            ciphertext_length: length as u32 + 16,
+                        },
+                        bytes: vec![0; length + 16],
+                        reservation: admission
+                            .reserve(
+                                Some(&metadata.version.object.cache),
+                                ResourceClass::Ciphertext,
+                                length + 16,
+                            )
+                            .unwrap(),
+                    }),
+                };
+                ready.push_back((
+                    PageNumber(number),
+                    WindowPage::Ready(Ok(PageResult {
+                        metadata: metadata.clone(),
+                        plaintext,
+                        ciphertext,
+                    })),
+                ));
+            }
+            let stream = RangeStream {
+                metadata: metadata.clone(),
+                range,
+                context: OriginContext {
+                    object: metadata.version.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+                membership,
+                scope: scope.clone(),
+                directory,
+                delivery: delivery.clone(),
+                window_pages: 4,
+                budget: AcquisitionBudget::new(scope.deadline.0, 0, 0),
+                next_page: None,
+                ready,
+                terminated: false,
+            };
+            let response = ReadResponse {
+                metadata,
+                range: Some(range),
+                body: Some(stream),
+            };
+            let responses = Responses::new(io.clone(), delivery);
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let reader = std::thread::spawn(move || {
+                client
+                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .unwrap();
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if client.read(&mut byte).unwrap() == 0 {
+                        assert!(capped);
+                        assert!(head.is_empty());
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                assert!(!capped);
+                let head = String::from_utf8(head).unwrap();
+                assert!(head.starts_with("HTTP/1.1 206"));
+                assert!(head.contains(&format!("Content-Length: {}\r\n", 3 * PAGE_BYTES + 17)));
+                let mut scratch = [0; 65536];
+                for number in 1..=4 {
+                    let mut left = if number == 4 { 17 } else { PAGE_BYTES as usize };
+                    while left != 0 {
+                        let count = left.min(scratch.len());
+                        client.read_exact(&mut scratch[..count]).unwrap();
+                        assert!(scratch[..count].iter().all(|value| *value == number));
+                        left -= count;
+                    }
+                }
+            });
+            let work = async {
+                let connection = ConnectionLease::from_accepted(server.into(), &admission)?;
+                let head = io.receive_head(connection, &scope).await?;
+                responses
+                    .send(head.connection, response, &scope)
+                    .await
+                    .map(drop)
+            };
+            let mut work = std::pin::pin!(work);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let result = loop {
+                if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                    break result;
+                }
+                reactor.poll_budgeted(128).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            };
+            if capped {
+                assert_eq!(result, Err(Error::InvalidRequest));
+            } else {
+                result.unwrap();
+            }
+            reader.join().unwrap();
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+    }
 }
