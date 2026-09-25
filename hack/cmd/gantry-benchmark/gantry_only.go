@@ -246,9 +246,13 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 		if err := b.prepareArtifactStreaming(ctx, state, gantryImage); err != nil {
 			return err
 		}
+		streamingImage, err := b.resolveArtifactStreamingImage(ctx, state, gantryImage, standaloneGantryTaggedImage(state))
+		if err != nil {
+			return err
+		}
 
 		state.ArtifactStreamingPrepared = true
-		state.ArtifactStreamingImage = standaloneGantryTaggedImage(state)
+		state.ArtifactStreamingImage = streamingImage
 	}
 
 	state.StandaloneGantry = true
@@ -335,6 +339,58 @@ func standaloneGantryTaggedImage(state benchmarkState) string {
 	tag := strings.ReplaceAll(state.RunID+"-gantry-fresh", "_", "-")
 
 	return fmt.Sprintf("%s/%s:%s", state.GantryACRLoginServer, state.WorkloadRepository, tag)
+}
+
+func (b *benchmark) resolveArtifactStreamingImage(
+	ctx context.Context,
+	state benchmarkState,
+	originalImage string,
+	taggedImage string,
+) (string, error) {
+	originalRepository, originalDigest, err := splitImageReference(originalImage, state.GantryACRLoginServer)
+	if err != nil {
+		return "", fmt.Errorf("resolve original image: %w", err)
+	}
+	taggedRepository, tag, err := splitImageReference(taggedImage, state.GantryACRLoginServer)
+	if err != nil {
+		return "", fmt.Errorf("resolve converted image tag: %w", err)
+	}
+	if originalRepository != state.WorkloadRepository || taggedRepository != state.WorkloadRepository {
+		return "", fmt.Errorf("Artifact Streaming image repositories must both be %q", state.WorkloadRepository)
+	}
+	if strings.HasPrefix(tag, "sha256:") {
+		return "", fmt.Errorf("converted image lookup must use a tag: %s", taggedImage)
+	}
+
+	commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	output, err := b.commands.Run(commandContext, nil,
+		"az", "acr", "manifest", "show-metadata",
+		"--registry", b.config.GantryACRName,
+		"--name", taggedRepository+":"+tag,
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s: %w", taggedImage, err)
+	}
+
+	var metadata struct {
+		Digest string `json:"digest"`
+	}
+	if err := json.Unmarshal(output, &metadata); err != nil {
+		return "", fmt.Errorf("decode converted Artifact Streaming manifest metadata: %w", err)
+	}
+	convertedDigest, err := digest.Parse(metadata.Digest)
+	if err != nil || convertedDigest.Algorithm() != digest.SHA256 {
+		return "", fmt.Errorf("converted Artifact Streaming manifest has invalid digest %q", metadata.Digest)
+	}
+	if metadata.Digest == originalDigest {
+		return "", fmt.Errorf("converted Artifact Streaming manifest digest still equals original image digest %s", originalDigest)
+	}
+
+	return fmt.Sprintf("%s/%s@%s", state.GantryACRLoginServer, taggedRepository, convertedDigest), nil
 }
 
 func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benchmarkState, imageReference string) error {

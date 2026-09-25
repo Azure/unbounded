@@ -203,7 +203,7 @@ func TestPreparedStandaloneRequiresArtifactStreamingConversion(t *testing.T) {
 	}
 
 	state.ArtifactStreamingPrepared = true
-	state.ArtifactStreamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted"
+	state.ArtifactStreamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if _, _, err := state.preparedImages(); err != nil {
 		t.Fatalf("preparedImages rejected converted image: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestPreparedStandaloneRequiresArtifactStreamingConversion(t *testing.T) {
 
 func TestGantryRuntimeImage(t *testing.T) {
 	const digestImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	const taggedImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted"
+	const streamingImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 	classic := benchmarkState{GantryColdImage: digestImage}
 	if got, err := classic.gantryRuntimeImage(); err != nil || got != digestImage {
@@ -220,12 +220,66 @@ func TestGantryRuntimeImage(t *testing.T) {
 
 	streaming := benchmarkState{
 		ArtifactStreaming:      true,
-		ArtifactStreamingImage: taggedImage,
+		ArtifactStreamingImage: streamingImage,
 		GantryACRLoginServer:   "benchstreamacr.azurecr.io",
 		WorkloadRepository:     "gantry-benchmark-pull",
 	}
-	if got, err := streaming.gantryRuntimeImage(); err != nil || got != taggedImage {
+	if got, err := streaming.gantryRuntimeImage(); err != nil || got != streamingImage {
 		t.Fatalf("streaming runtime image = %q, %v", got, err)
+	}
+}
+
+func TestArtifactStreamingRuntimeImageRejectsTagAndOriginalDigest(t *testing.T) {
+	const originalImage = "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	state := benchmarkState{
+		ArtifactStreaming:      true,
+		GantryColdImage:        originalImage,
+		GantryACRLoginServer:   "benchstreamacr.azurecr.io",
+		WorkloadRepository:     "gantry-benchmark-pull",
+		ArtifactStreamingImage: "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted",
+	}
+	if _, err := state.gantryRuntimeImage(); err == nil {
+		t.Fatal("Artifact Streaming runtime accepted a tag reference")
+	}
+
+	state.ArtifactStreamingImage = originalImage
+	if _, err := state.gantryRuntimeImage(); err == nil {
+		t.Fatal("Artifact Streaming runtime accepted the original image digest")
+	}
+}
+
+func TestResolveArtifactStreamingImageReturnsConvertedDigest(t *testing.T) {
+	runner := &artifactStreamingPollingRunner{outputs: [][]byte{
+		[]byte(`{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}`),
+	}}
+	benchmark := &benchmark{
+		config:   benchmarkConfig{GantryACRName: "benchstreamacr"},
+		commands: runner,
+	}
+	state := benchmarkState{
+		WorkloadRepository:   "gantry-benchmark-pull",
+		GantryACRLoginServer: "benchstreamacr.azurecr.io",
+	}
+	originalImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	taggedImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted"
+
+	resolved, err := benchmark.resolveArtifactStreamingImage(context.Background(), state, originalImage, taggedImage)
+	if err != nil {
+		t.Fatalf("resolveArtifactStreamingImage: %v", err)
+	}
+	want := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if resolved != want {
+		t.Fatalf("resolved image = %q, want %q", resolved, want)
+	}
+	if len(runner.commands) != 1 || runner.commands[0].name != "az" ||
+		!reflect.DeepEqual(runner.commands[0].args, []string{
+			"acr", "manifest", "show-metadata",
+			"--registry", "benchstreamacr",
+			"--name", "gantry-benchmark-pull:converted",
+			"--only-show-errors",
+			"--output", "json",
+		}) {
+		t.Fatalf("resolver command = %+v", runner.commands)
 	}
 }
 
