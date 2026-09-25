@@ -101,6 +101,21 @@ func clusterRoleGrants(cr *rbacv1.ClusterRole, group, resource, verb string) boo
 	return false
 }
 
+func TestOperatorRacerPermissions(t *testing.T) {
+	role := loadOperatorClusterRole(t)
+	for _, verb := range []string{"get", "list", "watch"} {
+		if !clusterRoleGrants(role, "racer.unbounded-cloud.io", "clustercaches", verb) {
+			t.Errorf("missing ClusterCache %s permission", verb)
+		}
+	}
+
+	for _, verb := range []string{"get", "list", "watch", "create"} {
+		if !clusterRoleGrants(role, "batch", "jobs", verb) {
+			t.Errorf("missing initialization Job %s permission", verb)
+		}
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {

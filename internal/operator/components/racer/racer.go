@@ -226,6 +226,12 @@ func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secre
 				continue
 			}
 
+			// Only the elected leader is ready. RollingUpdate would wait for
+			// ready followers before stopping that leader and never finish.
+			if err := unstructured.SetNestedField(obj.Object, "Recreate", "spec", "strategy", "type"); err != nil {
+				return err
+			}
+
 			if err := component.SetPodSpecImages(obj, env.Config.Image(controllerName)); err != nil {
 				return err
 			}

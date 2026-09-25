@@ -4,8 +4,10 @@
 package racer
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -150,6 +153,16 @@ func TestLifecycleWithoutSites(t *testing.T) {
 
 	if deployment.Spec.Template.Spec.Containers[0].Image != env.Config.Image(controllerName) {
 		t.Fatal("controller image not version matched")
+	}
+
+	if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatal("leader-only readiness would stall a rolling update")
+	}
+
+	for _, op := range plan.Operations {
+		if len(op.Object.GetOwnerReferences()) != 0 {
+			t.Fatal("installation must survive cache deletion")
+		}
 	}
 
 	config := &corev1.ConfigMap{}
@@ -302,5 +315,118 @@ func TestServingTLSRenewal(t *testing.T) {
 
 	if _, err := cert.Verify(x509.VerifyOptions{DNSName: "racer-controller.custom-system.svc", Roots: roots}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInitializationFailures(t *testing.T) {
+	for _, scenario := range []string{"failed-job", "foreign-job", "active-consumed", "consumed-no-version", "fresh-with-version"} {
+		t.Run(scenario, func(t *testing.T) {
+			env := testEnv(t, cache("cache"))
+			for range 3 {
+				persist(t, env, planPass(t, env))
+			}
+
+			job := &batchv1.Job{}
+			if err := env.Client.Get(t.Context(), objectKey(env, jobName), job); err != nil {
+				t.Fatal(err)
+			}
+
+			marker := &corev1.ConfigMap{}
+			if err := env.Client.Get(t.Context(), objectKey(env, markerName), marker); err != nil {
+				t.Fatal(err)
+			}
+
+			switch scenario {
+			case "failed-job":
+				job.Status.Failed = 1
+			case "foreign-job":
+				job.Annotations = nil
+			case "active-consumed", "consumed-no-version":
+				marker.Data["state"] = "consumed"
+				immutable := true
+
+				marker.Immutable = &immutable
+				if err := env.Client.Update(t.Context(), marker); err != nil {
+					t.Fatal(err)
+				}
+
+				if scenario == "active-consumed" {
+					job.Status.Active = 1
+				}
+			case "fresh-with-version":
+				if err := env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: "racer-version"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := env.Client.Update(t.Context(), job); err != nil {
+				t.Fatal(err)
+			}
+
+			if scenario == "failed-job" || scenario == "active-consumed" {
+				if scenario == "failed-job" {
+					job.Status.Failed = 1
+				} else {
+					job.Status.Active = 1
+				}
+
+				if err := env.Client.Status().Update(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			plan, result, err := (Component{}).Plan(t.Context(), env, nil)
+			if scenario == "active-consumed" {
+				if err != nil || result.RequeueAfter <= 0 || plan.Len() != 0 {
+					t.Fatalf("active initializer: %+v %v", result, err)
+				}
+			} else if err == nil || plan.Len() != 0 {
+				t.Fatalf("accepted unsafe initialization: %v %s", err, plan.Summary())
+			}
+		})
+	}
+}
+
+func TestCacheListFailureDoesNotInstall(t *testing.T) {
+	env := testEnv(t)
+	env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+			return errors.New("unavailable")
+		},
+	})
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+	if err == nil || plan.Len() != 0 {
+		t.Fatalf("list failure ignored: %v", err)
+	}
+}
+
+func TestTLSMissingAndInvalidFailClosed(t *testing.T) {
+	for _, scenario := range []string{"missing", "invalid"} {
+		t.Run(scenario, func(t *testing.T) {
+			env := testEnv(t, cache("cache"))
+			initialize(t, env)
+
+			secret := &corev1.Secret{}
+			if err := env.Client.Get(t.Context(), objectKey(env, tlsName), secret); err != nil {
+				t.Fatal(err)
+			}
+
+			if scenario == "missing" {
+				if err := env.Client.Delete(t.Context(), secret); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				secret.Data["tls.key"] = []byte("invalid")
+				if err := env.Client.Update(t.Context(), secret); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+			if err == nil || plan.Len() != 0 {
+				t.Fatalf("replaced damaged TLS state: %v", err)
+			}
+		})
 	}
 }
