@@ -1,6 +1,7 @@
 //! Environment and deployment configuration, validated before startup.
 //!
-//! Default to at most eight allowed CPU threads. Shares and rail alignment come
+//! Default to at most eight total userspace threads (four I/O/crypto worker pairs).
+//! Shares and rail alignment come
 //! exclusively from accepted controller membership, derived from Node annotations.
 
 use crate::{
@@ -15,6 +16,8 @@ use std::{path::PathBuf, time::Duration};
 pub struct Config {
     pub cluster: ClusterId,
     pub node: NodeId,
+    /// Total thread cap, minimum two; odd caps round down to complete worker pairs.
+    /// Control and diagnostics run on I/O threads within this budget.
     pub max_threads: usize,
     pub enable_rdma: bool,
     pub control_endpoint: String,

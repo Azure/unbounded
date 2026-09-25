@@ -20,7 +20,7 @@ pub fn config(enable_rdma: bool) -> Config {
     Config {
         cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
         node: NodeId("00000000-0000-4000-8000-000000000002".into()),
-        max_threads: 1,
+        max_threads: 2,
         enable_rdma,
         control_endpoint: "https://control.invalid".into(),
         peer_listen: "127.0.0.1:0".parse().unwrap(),

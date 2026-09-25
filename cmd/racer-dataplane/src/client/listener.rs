@@ -1,4 +1,6 @@
 //! Owned per-cache Unix sockets with permissions, bounded connections, and draining.
+//! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
+//! from the origin directory so pods receive only their authorized endpoint.
 use super::{request::RequestParser, response::Responses};
 use crate::{
     control::caches::CacheDefinition,

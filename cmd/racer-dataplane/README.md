@@ -26,8 +26,21 @@ library. There are no third-party dependencies yet.
 - `runtime` owns explicit pinned workers, bounded handoffs, admission, and completion
   lifetimes. Worker-local futures and services do not require `Send`. Actual
   cross-worker commands must transfer resource ownership explicitly.
+  Each logical worker has two separate threads: I/O and page crypto. The default
+  cap is eight total userspace threads (up to four pairs), sized against allowed
+  CPUs and cgroup quotas. Prefer separate NIC-local cores; on one allowed CPU both
+  threads share it. Control and diagnostics fit within that budget. Pair-aware
+  lifecycle and owned crypto job/completion interfaces still need to be specified.
 - `read` coordinates one per-page flight per worker. `client` and `peer` use that
   same coordinator; transport does not create another acquisition pipeline.
+  Explicit version pins may use expired metadata; fresh/unpinned admission requires
+  revalidation. Existing reads never switch ETags.
+- Per-cache UDS paths are exactly `/run/racer/<cache name>/client/socket` and
+  `/run/racer/<cache name>/origin/socket`. Racer owns the client listener; the
+  application adapter owns the origin listener. Separate endpoint directories let
+  pods mount only the UDS directory authorized by a future admission controller.
+  Cache names must be safe single path components, and complete paths must fit the
+  platform UDS limit. Cache reconciliation must reject noncanonical supplied paths.
 - `security` uses separate page and ephemeral-credential encryption domains.
   Pass the exact cache key, `Racer-Metadata`, and optional Authorization to origin.
   Metadata stays signed plaintext across peers; Authorization is encrypted across

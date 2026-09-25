@@ -59,7 +59,11 @@ may immediately repeat. Keep tokens and key material out of diagnostics.
 ## Publication lifecycle
 
 A publication contains cluster ID, schema version, sequence, membership version,
-members, and cache definitions (UID, client/origin socket paths, socket mode).
+members, and cache definitions (UID, resource name, client/origin socket paths,
+socket mode). Socket paths must be `/run/racer/<cache name>/client/socket` and
+`/run/racer/<cache name>/origin/socket`; validate the name as a single safe path
+component and enforce the platform UDS path-length limit. Separate endpoint
+directories support independently authorized pod mounts.
 Both counters start at 1 and persist across leader changes/restarts. Every update
 advances sequence; member-input changes also advance membership version. Cache-only
 updates do not. Endpoint/rail updates cannot move ownership: placement uses only

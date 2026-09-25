@@ -1,4 +1,5 @@
 //! Per-cache local adapter operations requiring validated candidate authority.
+//! Connect to the adapter-owned /run/racer/<cache name>/origin/socket.
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
