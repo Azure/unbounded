@@ -154,6 +154,24 @@ if ! az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --ou
     --disk-mbps-read-write "$OPERATOR_BUILD_DISK_MBPS" \
     --only-show-errors \
     -o none
+else
+  current_build_disk_gb=$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" \
+    --query diskSizeGB -o tsv)
+  if ((current_build_disk_gb > OPERATOR_BUILD_DISK_GB)); then
+    echo "operator build disk is ${current_build_disk_gb} GiB; shrinking to ${OPERATOR_BUILD_DISK_GB} GiB is not supported" >&2
+    exit 1
+  fi
+  if ((current_build_disk_gb < OPERATOR_BUILD_DISK_GB)); then
+    echo "expanding operator build disk: ${current_build_disk_gb} GiB -> ${OPERATOR_BUILD_DISK_GB} GiB"
+    az disk update \
+      -g "$AZURE_RESOURCE_GROUP" \
+      -n "$OPERATOR_BUILD_DISK_NAME" \
+      --size-gb "$OPERATOR_BUILD_DISK_GB" \
+      --disk-iops-read-write "$OPERATOR_BUILD_DISK_IOPS" \
+      --disk-mbps-read-write "$OPERATOR_BUILD_DISK_MBPS" \
+      --only-show-errors \
+      -o none
+  fi
 fi
 
 build_disk_id=$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --query id -o tsv)
