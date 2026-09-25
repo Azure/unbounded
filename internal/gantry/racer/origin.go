@@ -69,18 +69,6 @@ func validOriginData(data []byte) bool {
 	return strings.TrimSpace(auth) == auth && registryauth.Normalize(auth) != ""
 }
 
-// Stat prefers local metadata, using registry HEAD when local media type is
-// unknown. It never guesses a manifest/index media type or reads payload.
-func (o *Origin) Stat(ctx context.Context, target string, originData []byte) (sdk.Metadata, error) {
-	resolved, err := o.ResolveRange(ctx, target, originData)
-	if err != nil {
-		return sdk.Metadata{}, err
-	}
-	defer resolved.Close() //nolint:errcheck // Release metadata-only request state.
-
-	return resolved.Metadata(), nil
-}
-
 var _ sdk.ResolvedRangeStore = (*Origin)(nil)
 
 type resolvedRange struct {
@@ -147,29 +135,6 @@ func (o *Origin) ResolveRange(ctx context.Context, target string, originData []b
 		origin: o, ref: ref, originData: originData, remote: remote,
 		meta: sdk.Metadata{Size: size, ETag: `"` + ref.Digest.Hex() + `"`, ContentType: contentType, TTL: &ttl},
 	}, nil
-}
-
-func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, length int64, originData []byte) (io.ReadCloser, error) {
-	if !validOriginData(originData) {
-		return nil, &sdk.HTTPError{StatusCode: http.StatusUnauthorized}
-	}
-
-	ref, err := o.reference(target)
-	if err != nil {
-		return nil, err
-	}
-
-	if etag != `"`+ref.Digest.Hex()+`"` {
-		return nil, sdk.ErrVersionChanged
-	}
-
-	resolved, err := o.ResolveRange(ctx, target, originData)
-	if err != nil {
-		return nil, err
-	}
-	defer resolved.Close() //nolint:errcheck // The returned body owns its own resources.
-
-	return resolved.OpenRange(ctx, offset, length)
 }
 
 func (r *resolvedRange) OpenRange(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
