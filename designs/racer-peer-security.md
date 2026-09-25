@@ -197,6 +197,16 @@ Current compiler integration requests:
   credentials from it. Security will not make `OriginContext` fields public beyond
   the model's existing interface or bypass reservation ownership.
 
+Peer decoder integration: `PeerOriginContext.reservation` must be cache-scoped
+(`reserve(Some(&object.cache), RequestContext, bytes)`), not node-only `None`.
+Credential opening intentionally rejects a mismatched or absent cache charge.
+Charge at least `512 + cache_UID_length + metadata_length + credential_ciphertext_length`
+for the output envelope, in addition to any retained signed-head allocation. Decode
+the bounded cache UID before reserving the context, then reserve before allocating
+metadata/ciphertext. A real encrypted request decoded from HTTP must be exercised
+through `CredentialCrypto::open_charged`, not only forwarding tests with synthetic
+encrypted bytes.
+
 Keyring validation review: equal-generation identical content is idempotent; lower
 generation or changed equal-generation content fails. Generation zero fails. Exactly
 one active key per represented cache/purpose is required, while a removed scope can

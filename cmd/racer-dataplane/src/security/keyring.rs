@@ -244,6 +244,41 @@ pub(crate) mod tests {
         rotated.generation = BundleGeneration(3);
         assert!(keys.install(rotated).is_err());
     }
+    #[test]
+    fn identity_installation_and_leases_follow_current_trust() {
+        use super::super::identity::tests::{CLUSTER, NODE};
+        let (pending, chain, roots) = super::super::identity::tests::issued();
+        let identity = Arc::new(
+            pending
+                .accept(
+                    ClusterId(CLUSTER.into()),
+                    NodeId(NODE.into()),
+                    chain,
+                    &roots,
+                )
+                .unwrap(),
+        );
+        let keys = Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::new(KeyEpochs::default()),
+        );
+        keys.install(bundle(1, roots, CacheKeyState::Active))
+            .unwrap();
+        keys.install_signing_identity(identity.clone()).unwrap();
+        let leased = keys.signing_identity().unwrap();
+        assert_eq!(
+            leased.sign(b"admitted operation").unwrap(),
+            identity.sign(b"admitted operation").unwrap()
+        );
+        let (_, _, replacement_roots) = super::super::identity::tests::issued();
+        keys.install(bundle(2, replacement_roots, CacheKeyState::Active))
+            .unwrap();
+        assert!(keys.signing_identity().is_err());
+        assert!(keys.install_signing_identity(identity).is_err());
+        // Already admitted owners remain memory-safe during trust replacement.
+        assert!(leased.sign(b"admitted operation").is_ok());
+    }
 }
 struct Entry {
     reference: CacheKeyRef,
@@ -288,6 +323,10 @@ impl KeyLease {
     }
     pub fn cache(&self) -> &CacheId {
         &self.reference.cache
+    }
+    /// Exact immutable epoch identity for storage/transport retirement fences.
+    pub fn reference(&self) -> &CacheKeyRef {
+        &self.reference
     }
     pub(crate) fn material(&self, purpose: KeyPurpose) -> Result<&[u8; 32]> {
         if self.reference.purpose != purpose.cache()? {
@@ -475,18 +514,17 @@ impl Keyring {
         if identity.node() != &self.node || identity.cluster() != &self.cluster {
             return Err(Error::Unauthorized);
         }
-        let roots = self.peer_trust_roots()?;
+        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+        if state.cluster.as_ref() != Some(&self.cluster) {
+            return Err(Error::MissingKey);
+        }
         super::certificates::verify_chain(
-            &roots,
+            &state.roots,
             identity.certificate_chain(),
             &self.cluster,
             &self.node,
         )?;
-        self.epochs
-            .state
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .identity = Some(identity);
+        state.identity = Some(identity);
         Ok(())
     }
     pub fn signing_identity(&self) -> Result<Arc<SigningIdentity>> {

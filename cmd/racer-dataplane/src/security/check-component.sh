@@ -19,8 +19,10 @@ for native in "$root"/target/debug/build/ring-*/out; do
   [[ ! -d "$native" ]] || args+=(-L "native=$native")
 done
 export CARGO_MANIFEST_DIR="$root"
-# Absolute normalized #[path] attributes let rustc resolve nested production
-# modules exactly as cargo does, without copying or altering their source files.
+output="$root/target/security-component-tests-$$"
+trap 'rm -f "$output"' EXIT
+# In-memory module expansion resolves nested production modules without altering
+# source files or substituting component implementations.
 python3 "$root/src/security/component_tests.py" "$root" |
-  rustc "${args[@]}" - -o "$root/target/security-component-tests"
-"$root/target/security-component-tests" 'security::' "$@"
+  rustc "${args[@]}" - -o "$output"
+"$output" 'security::' "$@"
