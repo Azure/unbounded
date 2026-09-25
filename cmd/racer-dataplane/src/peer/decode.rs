@@ -41,8 +41,8 @@ fn node(head: &MessageHead, name: &str) -> Result<NodeId> {
     crate::security::signing::node_field(head, name)
 }
 fn object(head: &MessageHead) -> Result<ObjectId> {
-    let cache =
-        String::from_utf8(bytes(head, "racer-cache")?).map_err(|_| Error::InvalidRequest)?;
+    let cache = p::field(head, "racer-cache")?;
+    p::uuid(&cache)?;
     if cache.is_empty() || cache.len() > 256 {
         return Err(Error::InvalidRequest);
     }
@@ -65,7 +65,7 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
     })
 }
 fn etag(head: &MessageHead) -> Result<StrongEtag> {
-    StrongEtag::parse(&bytes(head, "racer-etag")?)
+    StrongEtag::parse(p::field(head, "racer-etag")?.as_bytes())
 }
 fn version(head: &MessageHead) -> Result<ObjectVersion> {
     Ok(ObjectVersion {

@@ -102,6 +102,16 @@ impl PeerClient for Requester {
                 )
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
+            let capabilities = self
+                .handshake
+                .negotiate_at(next, request.route.membership, &scope)
+                .await?;
+            if let super::wire::Operation::Page { page, .. } = &request.operation {
+                let proposed = self.rails.select(&route, page)?;
+                // No transfer-scoped session is installed by a capability-only
+                // handshake. Selection therefore safely falls back to HTTP.
+                let _plan = self.transfers.select(proposed, capabilities, None);
+            }
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
             let response = self.exchange(signed, &scope).await?;
             scope.check()?;

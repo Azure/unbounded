@@ -141,6 +141,54 @@ impl PeerServer {
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
             let received = self.io.receive_head(connection, scope).await?;
+            let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
+                n.checked_add(h.name.len())
+                    .and_then(|n| n.checked_add(h.value.len()))
+                    .ok_or(Error::InvalidRequest)
+            })?;
+            let _head_reservation = self.admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                head_bytes
+                    .checked_mul(3)
+                    .ok_or(Error::InvalidRequest)?
+                    .max(1),
+            )?;
+            if matches!(&received.value.start, crate::http::codec::StartLine::Request { method, target } if method == "POST" && target == "/racer/peer/v1/challenge")
+            {
+                use crate::{
+                    http::codec::{MessageHead, StartLine},
+                    security::protocol as p,
+                };
+                if received.value.content_length()? != Some(0) {
+                    return Err(Error::InvalidRequest);
+                }
+                let value = p::field(&received.value, "racer-probe")?;
+                if value.len() > 512 {
+                    return Err(Error::InvalidRequest);
+                }
+                let _permit = self
+                    .admission
+                    .reserve(None, ResourceClass::ControlProgress, 1)?;
+                let probe = p::decode_binary(value.as_bytes())?;
+                let bytes = self
+                    .handshake
+                    .as_ref()
+                    .ok_or(Error::InvalidConfiguration)?
+                    .respond_probe(&probe)?;
+                let mut head = MessageHead {
+                    start: StartLine::Response { status: 200 },
+                    headers: Vec::new(),
+                };
+                p::push(&mut head, "content-length", bytes.len());
+                let mut buffer = self.io.buffer(bytes.len())?;
+                buffer.bytes_mut()?.copy_from_slice(&bytes);
+                let sent = self.io.send_head(received.connection, head, scope).await?;
+                let sent = self.io.write_body(sent.connection, buffer, scope).await?;
+                let mut connection = sent.lease;
+                connection.finish_exchange()?;
+                return Ok(connection);
+            }
             let (authentication, length) = WireCodec::decode(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);

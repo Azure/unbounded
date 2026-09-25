@@ -31,8 +31,8 @@ impl WireBuffer {
             _reservation: reservation,
         })
     }
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        self.bytes.into_vec()
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
+        (self.bytes.into_vec(), self._reservation)
     }
 }
 impl crate::runtime::reactor::sealed::Sealed for WireBuffer {}
@@ -63,6 +63,46 @@ impl Transfers {
     pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
         self.wire = Some((admission, codec));
         self
+    }
+    pub fn exchange_probe<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        probe: Vec<u8>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Vec<u8>> {
+        Box::pin(async move {
+            use crate::http::codec::{MessageHead, StartLine};
+            use crate::security::protocol as p;
+            if probe.len() > 256 {
+                return Err(Error::InvalidRequest);
+            }
+            let mut head = MessageHead {
+                start: StartLine::Request {
+                    method: "POST".into(),
+                    target: "/racer/peer/v1/challenge".into(),
+                },
+                headers: Vec::new(),
+            };
+            p::push(&mut head, "content-length", 0);
+            p::push_binary(&mut head, "racer-probe", &probe);
+            let connection = self.http.checkout(&endpoint, scope).await?;
+            let response = self.io.exchange_head(connection, head, scope).await?;
+            if !matches!(response.value.start, StartLine::Response { status: 200 }) {
+                return Err(Error::Unauthorized);
+            }
+            let body = self
+                .io
+                .collect_body(
+                    response.connection,
+                    crate::security::session::MAX_CHALLENGE_REPLY,
+                    scope,
+                )
+                .await?;
+            let bytes = body.buffer.bytes()?.to_vec();
+            let mut connection = body.lease;
+            connection.finish_exchange()?;
+            Ok(bytes)
+        })
     }
     /// Route selection alone never authorizes RDMA. A matching, live authenticated
     /// single-use session and transfer-scoped grant are both required.
@@ -176,22 +216,47 @@ impl Transfers {
         Box::pin(async move {
             scope.check()?;
             let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let head_size = std::iter::once(request.authentication.original.as_ref())
+                .chain(request.authentication.hops.iter())
+                .try_fold(0usize, |total, signed| {
+                    signed.head.headers.iter().try_fold(total, |n, h| {
+                        n.checked_add(h.value.len() + h.name.len())
+                            .ok_or(Error::InvalidRequest)
+                    })
+                })?;
+            let _head_reservation = admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                head_size
+                    .checked_mul(3)
+                    .ok_or(Error::InvalidRequest)?
+                    .max(1),
+            )?;
             let head = WireCodec::encode(&request.authentication, false, 0)?;
             let connection = self.http.checkout(&endpoint, scope).await?;
             let sent = self.io.send_head(connection, head, scope).await?;
             let received = self.io.receive_head(sent.connection, scope).await?;
             let (authentication, length) = WireCodec::decode(received.value, true)?;
             let mut connection = received.connection;
-            let body = if length == 0 {
-                Vec::new()
+            let (body, _staging_reservation) = if length == 0 {
+                (Vec::new(), None)
             } else {
-                let buffer = WireBuffer::new(admission, length)?;
-                let completion = self.io.read_body(connection, buffer, scope).await?;
-                if completion.bytes != length {
-                    return Err(Error::Io);
+                let mut buffer = WireBuffer::new(admission, length)?;
+                let mut offset = 0;
+                while offset < length {
+                    let completion = self
+                        .io
+                        .read_body_range(connection, buffer, offset..length, scope)
+                        .await?;
+                    if completion.bytes == 0 || completion.bytes > length - offset {
+                        return Err(Error::Io);
+                    }
+                    offset += completion.bytes;
+                    connection = completion.lease;
+                    buffer = completion.buffer;
                 }
-                connection = completion.lease;
-                completion.buffer.into_vec()
+                let (bytes, reservation) = buffer.into_parts();
+                (bytes, Some(reservation))
             };
             scope.check()?;
             let response = codec.response(authentication, body, scope)?;

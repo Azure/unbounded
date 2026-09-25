@@ -34,6 +34,11 @@ pub struct Handshake {
     cache: RefCell<HashMap<NodeId, (Capabilities, Instant)>>,
     capacity: usize,
     http: Option<(Rc<super::PeerNetwork>, Rc<super::transfer::Transfers>)>,
+    discovery: Option<(
+        Rc<crate::security::keyring::Keyring>,
+        Rc<crate::security::certificates::Certificates>,
+        Rc<crate::security::replay::ReplayWindow>,
+    )>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
@@ -49,7 +54,21 @@ impl Handshake {
             cache: RefCell::new(HashMap::new()),
             capacity: 36,
             http: None,
+            discovery: None,
         }
+    }
+    pub fn with_discovery(
+        mut self,
+        keys: Rc<crate::security::keyring::Keyring>,
+        certificates: Rc<crate::security::certificates::Certificates>,
+        replay: Rc<crate::security::replay::ReplayWindow>,
+    ) -> Self {
+        self.discovery = Some((keys, certificates, replay));
+        self
+    }
+    pub fn respond_probe(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let (keys, _, replay) = self.discovery.as_ref().ok_or(Error::InvalidConfiguration)?;
+        crate::security::session::respond(keys, replay, bytes)?.encode()
     }
     pub fn with_http(
         mut self,
@@ -104,6 +123,24 @@ impl Handshake {
             use crate::security::{protocol as p, signing::signed_digest};
             scope.check()?;
             let (network, transfers) = self.http.as_ref().ok_or(Error::InvalidConfiguration)?;
+            if let Some((_, certificates, _)) = &self.discovery {
+                let probe = crate::security::session::ChallengeProbe::new(
+                    network.local.clone(),
+                    peer.clone(),
+                )?;
+                let reply = transfers
+                    .exchange_probe(
+                        network.endpoint(membership, peer)?,
+                        probe.request_bytes(),
+                        scope,
+                    )
+                    .await?;
+                let challenge = probe.verify(
+                    certificates,
+                    crate::security::session::ChallengeReply::decode(&reply)?,
+                )?;
+                self.signatures.install_peer_challenge(challenge)?;
+            }
             let mut head = MessageHead {
                 start: StartLine::Request {
                     method: "POST".into(),
@@ -115,7 +152,7 @@ impl Handshake {
             p::push(&mut head, "racer-kind", "handshake");
             p::push(&mut head, "racer-wire-version", super::wire::VERSION);
             p::push(&mut head, "racer-membership", membership.0);
-            p::push_binary(&mut head, "racer-receiver", peer.0.as_bytes());
+            p::push(&mut head, "racer-receiver", &peer.0);
             p::push_binary(
                 &mut head,
                 "racer-session-challenge",
@@ -197,11 +234,7 @@ impl Handshake {
         p::push(&mut response, "racer-kind", "handshake-response");
         p::push(&mut response, "racer-wire-version", super::wire::VERSION);
         p::push(&mut response, "racer-membership", membership.0);
-        p::push_binary(
-            &mut response,
-            "racer-receiver",
-            verified.peer.node().0.as_bytes(),
-        );
+        p::push(&mut response, "racer-receiver", &verified.peer.node().0);
         p::push_binary(&mut response, "racer-request-binding", &binding);
         p::push_binary(
             &mut response,
@@ -227,6 +260,7 @@ impl Handshake {
     }
     pub fn invalidate(&self, peer: &NodeId) {
         self.cache.borrow_mut().remove(peer);
+        self.signatures.remove_peer_challenge(peer);
     }
     /// Legacy callers must use negotiate_scoped to preserve their request deadline.
     pub fn negotiate<'a>(&'a self, peer: &'a NodeId) -> Operation<'a, Capabilities> {
