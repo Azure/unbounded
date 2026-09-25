@@ -17,10 +17,15 @@ pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a 
     if values.next().is_some() {
         return Err(Error::BadGateway);
     }
-    // HTTP OWS is semantic whitespace only for nonopaque fields. Credentials
-    // have already passed raw grammar validation and must remain byte-exact.
+    // Preserve canonical numeric fields before decimal/range validation, just as
+    // opaque context preserves exact bytes. The codec removed only separator SP;
+    // trimming here would accept forbidden padding in expiry, lengths, or ranges.
     Ok(value.map(|value| {
-        if name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case("Racer-Metadata")
+        if name.eq_ignore_ascii_case("Authorization")
+            || name.eq_ignore_ascii_case("Racer-Metadata")
+            || name.eq_ignore_ascii_case("Racer-Expires-At")
+            || name.eq_ignore_ascii_case("Content-Length")
+            || name.eq_ignore_ascii_case("Content-Range")
         {
             value
         } else {
@@ -191,6 +196,53 @@ pub(super) fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::http::codec::Header;
+
+    #[test]
+    fn numeric_headers_reject_padding_before_any_normalization() {
+        use crate::{
+            http::codec::Codec,
+            model::identity::{CacheId, CacheKey},
+        };
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        for (name, canonical) in [
+            ("Racer-Expires-At", "0"),
+            ("Content-Length", "1"),
+            ("Content-Range", "bytes 0-0/1"),
+        ] {
+            for (prefix, suffix) in [("", ""), (" ", ""), ("", " "), ("\t", ""), ("", "\t")] {
+                let fields = [
+                    ("Content-Length", "1"),
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Range", "bytes 0-0/1"),
+                    ("ETag", "\"v\""),
+                    ("Racer-Expires-At", "0"),
+                ];
+                let mut raw = String::from("HTTP/1.1 206 Partial Content\r\n");
+                for (field, value) in fields {
+                    if field == name {
+                        raw.push_str(&format!("{field}: {prefix}{canonical}{suffix}\r\n"));
+                    } else {
+                        raw.push_str(&format!("{field}: {value}\r\n"));
+                    }
+                }
+                raw.push_str("\r\n");
+                let result = Codec::new(32768, 1)
+                    .decode_head(raw.as_bytes())
+                    .map_err(|_| Error::BadGateway)
+                    .and_then(|head| {
+                        super::super::metadata::validate_bootstrap(&head.unwrap().0, &object)
+                    });
+                if prefix.is_empty() && suffix.is_empty() {
+                    assert_eq!(result.unwrap().1, 1);
+                } else {
+                    assert_eq!(result, Err(Error::BadGateway), "{name}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn all_sdk_singletons_reject_case_insensitive_duplicates() {

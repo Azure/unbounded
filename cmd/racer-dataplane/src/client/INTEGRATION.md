@@ -32,6 +32,11 @@ retain a fenced, poisoned lease for zero-body 400/431 responses; outer transport
 failures remain terminal. The codec preserves raw opaque header bytes and
 requires exactly one separator space.
 
+The listener passes the parser's configured cap to this raw framing operation.
+`RequestParser::parse` consumes an already framed head; it cannot recover its
+original wire length from decoded fields. Its decoded-input bound is separate
+from the wire cap and does not assume optional whitespace on unknown headers.
+
 Owned tests cover SDK parsing/headers, exact head limits, actual UDS permissions
 and lifecycle, keepalive removal, single-budget accept fairness, nonempty range
 delivery, late acquisition truncation, status mapping, and immutable metadata

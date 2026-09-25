@@ -308,7 +308,7 @@ async fn serve_connection(
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;
         let received = io
-            .receive_request_head_limited(connection, &idle_scope, super::request::MAX_HEAD_BYTES)
+            .receive_request_head_limited(connection, &idle_scope, parser.header_limit())
             .await?;
         connection = received.connection;
         if retired.get() {
@@ -1011,6 +1011,72 @@ mod tests {
             assert!(text.ends_with("\r\n\r\n"));
         }
         assert_eq!(fixture.reads.calls.get(), 0);
+    }
+
+    #[test]
+    fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
+        for limit in [512, super::super::request::MAX_HEAD_BYTES] {
+            let mut fixture = Fixture::new();
+            fixture.listeners.parser = RequestParser::new(limit);
+            fixture.reconcile(&[definition()]).unwrap();
+            for separator in ["", " ", "\t", "  "] {
+                let fields = format!(
+                    "Connection: close\r\nX:{separator}{}\r\n",
+                    "x".repeat(
+                        limit
+                            - request("HEAD", &format!("Connection: close\r\nX:{separator}\r\n"))
+                                .len()
+                    )
+                );
+                let raw = request("HEAD", &fields);
+                assert_eq!(raw.len(), limit);
+                let mut socket = fixture.connect();
+                socket.write_all(&raw).unwrap();
+                let output = fixture.receive(&mut socket, true);
+                assert!(output.starts_with(b"HTTP/1.1 200 "));
+            }
+            let admitted = fixture.reads.calls.get();
+            // Exhaust the raw cap on an unterminated head. Decoded value bytes
+            // alone would fit; only framing can reject this before dispatch.
+            let mut raw = request("HEAD", &format!("X:{}\r\n", "x".repeat(limit)));
+            raw.truncate(limit);
+            let mut socket = fixture.connect();
+            socket.write_all(&raw).unwrap();
+            let output = fixture.receive(&mut socket, true);
+            assert!(output.starts_with(b"HTTP/1.1 431 "));
+            assert_eq!(fixture.reads.calls.get(), admitted);
+        }
+    }
+
+    #[test]
+    fn actual_uds_configured_head_limit_counts_received_bytes() {
+        let mut fixture = Fixture::new();
+        let limit = 512;
+        fixture.listeners.parser = RequestParser::new(limit);
+        fixture.reconcile(&[definition()]).unwrap();
+        for separator in ["", " ", "\t", " \t"] {
+            let prefix = request("HEAD", &format!("X:{separator}"));
+            // Replace the request helper's final CRLF with field data and the
+            // complete terminator. Unknown-field whitespace stays on the wire.
+            let mut exact = prefix[..prefix.len() - 2].to_vec();
+            exact.resize(limit - 4, b'x');
+            exact.extend_from_slice(b"\r\n\r\n");
+            let mut socket = fixture.connect();
+            socket.write_all(&exact).unwrap();
+            let reply = fixture.receive(&mut socket, false);
+            assert!(reply.starts_with(b"HTTP/1.1 200 "));
+            drop(socket);
+
+            // This is the first limit bytes of a limit+1-byte head: the final
+            // LF lies beyond the configured cap, so framing must reject it.
+            exact.insert(exact.len() - 4, b'x');
+            exact.truncate(limit);
+            let mut socket = fixture.connect();
+            socket.write_all(&exact).unwrap();
+            let reply = fixture.receive(&mut socket, true);
+            assert!(reply.starts_with(b"HTTP/1.1 431 "));
+        }
+        assert_eq!(fixture.reads.calls.get(), 4);
     }
 
     #[test]

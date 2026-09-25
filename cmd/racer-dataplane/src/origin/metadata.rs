@@ -103,27 +103,21 @@ mod tests {
             b"-1",
             b"+1",
             b" 1",
+            b"1 ",
+            b"\t1",
+            b"1\t",
             b"1.0",
             b"9223372036854775808",
         ] {
             assert_eq!(protocol::decimal(invalid), Err(Error::BadGateway));
-            if invalid == b" 1" {
-                assert_eq!(
-                    validate(&head(invalid, invalid, b"\"v\""), &object())
-                        .unwrap()
-                        .length,
-                    1
-                );
-            } else {
-                assert_eq!(
-                    validate(&head(b"1", invalid, b"\"v\""), &object()),
-                    Err(Error::BadGateway)
-                );
-                assert_eq!(
-                    validate(&head(invalid, b"0", b"\"v\""), &object()),
-                    Err(Error::BadGateway)
-                );
-            }
+            assert_eq!(
+                validate(&head(b"1", invalid, b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+            assert_eq!(
+                validate(&head(invalid, b"0", b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
         }
         for etag in [b"v".as_slice(), b"W/\"v\"", b"*", b"\"v\", \"w\""] {
             assert_eq!(
@@ -175,5 +169,25 @@ mod tests {
             validate_bootstrap(&response, &object()),
             Err(Error::BadGateway)
         );
+    }
+
+    #[test]
+    fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
+        use crate::http::codec::Codec;
+        for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
+            );
+            let (head, _) = Codec::new(32768, 0)
+                .decode_head(raw.as_bytes())
+                .unwrap()
+                .unwrap();
+            let result = validate(&head, &object());
+            if expiry == "0" {
+                assert_eq!(result.unwrap().expires_at.0, UNIX_EPOCH);
+            } else {
+                assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
+            }
+        }
     }
 }

@@ -66,6 +66,10 @@ impl RequestParser {
             header_limit: header_limit.min(MAX_HEAD_BYTES),
         }
     }
+    /// Apply this cap to raw HTTP framing before calling the semantic parser.
+    pub(crate) fn header_limit(&self) -> usize {
+        self.header_limit
+    }
     pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
         self.parse_detailed(cache, head)
             .map_err(|error| match error {
@@ -75,9 +79,10 @@ impl RequestParser {
             })
     }
 
-    /// Codec must validate the raw head before normalizing ordinary HTTP OWS.
+    /// Codec must validate the raw head and its byte limit before calling this.
     /// In particular, context fields must have exactly one separator space and
-    /// must not have their value trimmed by the codec.
+    /// must not have their value trimmed by the codec. Decoded fields cannot
+    /// reconstruct wire length: unknown fields need not have a separator SP.
     pub fn parse_detailed(
         &self,
         cache: &CacheId,
@@ -86,7 +91,9 @@ impl RequestParser {
         let StartLine::Request { method, target } = head.start else {
             return Err(Error::InvalidRequest.into());
         };
-        let mut size = method.len().saturating_add(target.len()).saturating_add(14);
+        // Bound manually constructed input data as well, without pretending this
+        // is a wire-length check. Framing owns start-line/colon/OWS/CRLF accounting.
+        let mut decoded_bytes = method.len().saturating_add(target.len());
         let mut seen = HashSet::new();
         let mut host = None;
         let mut pin = None;
@@ -94,11 +101,10 @@ impl RequestParser {
         let mut metadata = None;
         let mut authorization = None;
         for header in head.headers {
-            size = size
+            decoded_bytes = decoded_bytes
                 .saturating_add(header.name.len())
-                .saturating_add(header.value.len())
-                .saturating_add(4);
-            if size > self.header_limit {
+                .saturating_add(header.value.len());
+            if decoded_bytes > self.header_limit {
                 return Err(RequestError::HeaderLimit);
             }
             if header.name.is_empty()
@@ -169,7 +175,7 @@ impl RequestParser {
                 _ => {}
             }
         }
-        if size > self.header_limit {
+        if decoded_bytes > self.header_limit {
             return Err(RequestError::HeaderLimit);
         }
         if host != Some(true) {
@@ -448,6 +454,38 @@ mod tests {
     }
 
     #[test]
+    fn raw_head_limit_is_independent_of_unknown_field_whitespace() {
+        let codec = Codec::new(MAX_HEAD_BYTES, 0);
+        for separator in ["", " ", "\t", "  ", " \t"] {
+            for trailing in ["", " ", "\t"] {
+                for length in [MAX_HEAD_BYTES - 1, MAX_HEAD_BYTES, MAX_HEAD_BYTES + 1] {
+                    let prefix = format!(
+                        "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Empty:\r\nX-Padding:{separator}",
+                        "0".repeat(64)
+                    );
+                    let mut raw = prefix.into_bytes();
+                    raw.resize(length - trailing.len() - 4, b'x');
+                    raw.extend_from_slice(trailing.as_bytes());
+                    raw.extend_from_slice(b"\r\n\r\n");
+                    if length > MAX_HEAD_BYTES {
+                        assert!(matches!(
+                            codec.decode_head(&raw),
+                            Err(Error::HeaderTooLarge)
+                        ));
+                    } else {
+                        let (head, consumed) = codec.decode_head(&raw).unwrap().unwrap();
+                        assert_eq!(consumed, length);
+                        assert!(
+                            parse(head).is_ok(),
+                            "separator={separator:?}, trailing={trailing:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sdk_raw_head_preserves_non_utf8_and_rejects_normalization() {
         let codec = Codec::new(MAX_HEAD_BYTES, 0);
         let mut raw = format!(
@@ -481,6 +519,38 @@ mod tests {
                 Ok(None) => false,
             };
             assert!(rejected, "opaque separator/OWS was normalized");
+        }
+    }
+
+    #[test]
+    fn raw_head_limit_does_not_assume_unknown_header_whitespace() {
+        for separator in ["", " ", "\t", "  ", " \t"] {
+            for trailing in ["", " ", "\t"] {
+                for limit in [512, MAX_HEAD_BYTES] {
+                    let parser = RequestParser::new(limit);
+                    let codec = Codec::new(parser.header_limit(), 0);
+                    let prefix = format!(
+                        "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
+                        "0".repeat(64)
+                    );
+                    let suffix = format!("{trailing}\r\nY:\r\n\r\n");
+                    for length in [limit - 1, limit, limit + 1] {
+                        let raw = format!(
+                            "{prefix}{}{suffix}",
+                            "x".repeat(length - prefix.len() - suffix.len())
+                        );
+                        assert_eq!(raw.len(), length);
+                        let decoded = codec.decode_head(raw.as_bytes());
+                        if length > limit {
+                            assert!(matches!(decoded, Err(Error::HeaderTooLarge)));
+                        } else {
+                            let (head, consumed) = decoded.unwrap().unwrap();
+                            assert_eq!(consumed, length);
+                            assert!(parser.parse(&CacheId("uid".into()), head).is_ok());
+                        }
+                    }
+                }
+            }
         }
     }
 }
