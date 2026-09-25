@@ -1,10 +1,12 @@
-# Racer controller scaffold
+# Racer controller implementation status
 
-This is a compiling API scaffold, not an operational controller. `LoadConfig`,
-reconciliation, persistence, issuance, TLS setup, codecs, and publication admission
-return `ErrUnimplemented`. The executable exits unsuccessfully before Kubernetes
-access. Constructors only wire dependencies; they open no files or listeners and
-start no goroutines. Reserved HTTP handlers return 503, never fake authentication.
+Phases 1-4 implement configuration, bounded codecs, membership/catalog calculation,
+one-shot initialization, durable publication CAS, issuer/shared-key rotation, and
+certificate issuance. Token authentication, TLS serving, and managed workload
+construction remain fail-closed, so this is not yet an operational HTTPS service.
+The `initialize` command performs Kubernetes writes; normal startup validates
+existing durable state. Constructors only wire dependencies; they open no files
+or listeners and start no goroutines. Reserved HTTP handlers return 503.
 
 The [control API](../racer-dataplane/CONTROL_API.md) is shared with the Rust
 dataplane. The [design](../../designs/racer-control-plane.md) describes intended
@@ -21,8 +23,12 @@ behavior and implementation order.
 
 There is no Kubernetes abstraction, custom queue/leader-election framework,
 per-node Secret, enrollment ledger, or goal-state checkpoint store. Only the
-version ConfigMap, shared keyring Secret, and controller issuer Secret are durable
-controller state, alongside the normal leader Lease and managed workload.
+version ConfigMap (including its one-way credential initialization claim), shared
+keyring Secret, and controller issuer Secret are durable controller state, alongside
+the permanent installation ConfigMap, normal leader Lease, and managed workload.
+See the design's Phase 3 initialization protocol and Phase 4 recovery/handoff
+sections before provisioning an installation. Lost established state never
+authorizes automatic reinitialization.
 
 ## Checks
 

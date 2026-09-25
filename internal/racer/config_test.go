@@ -13,17 +13,21 @@ import (
 func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 	cfg := testConfig(t)
 	for name, mutate := range map[string]func(*Config){
-		"cluster":                  func(c *Config) { c.Cluster = "" },
-		"namespace":                func(c *Config) { c.Namespace = "../namespace" },
-		"missing marker name":      func(c *Config) { c.InstallationConfigMapName = "" },
-		"aliased durable objects":  func(c *Config) { c.InstallationConfigMapName = c.VersionConfigMapName },
-		"zero port":                func(c *Config) { c.PeerPort = 0 },
-		"unbounded polls":          func(c *Config) { c.Limits.MaxPolls = 0 },
-		"unbounded writes":         func(c *Config) { c.Limits.MaxConcurrentWrites = 0 },
-		"unbounded bootstrap":      func(c *Config) { c.Limits.MaxConcurrentBootstrap = 0 },
-		"unbounded headers":        func(c *Config) { c.Limits.HeaderBytes = 0 },
-		"unbounded write duration": func(c *Config) { c.Limits.WriteTimeout = 0 },
-		"unbounded shutdown":       func(c *Config) { c.Limits.ShutdownTimeout = 0 },
+		"cluster":                    func(c *Config) { c.Cluster = "" },
+		"namespace":                  func(c *Config) { c.Namespace = "../namespace" },
+		"missing marker name":        func(c *Config) { c.InstallationConfigMapName = "" },
+		"aliased durable objects":    func(c *Config) { c.InstallationConfigMapName = c.VersionConfigMapName },
+		"aliased credential secrets": func(c *Config) { c.IssuerSecretName = c.KeyringSecretName },
+		"no preparation":             func(c *Config) { c.Rotation.PrepareFor = 0 },
+		"short overlap":              func(c *Config) { c.Rotation.RetainFor = wire.CertificateLifetime - 1 },
+		"short interval":             func(c *Config) { c.Rotation.Interval = c.Rotation.PrepareFor - 1 },
+		"zero port":                  func(c *Config) { c.PeerPort = 0 },
+		"unbounded polls":            func(c *Config) { c.Limits.MaxPolls = 0 },
+		"unbounded writes":           func(c *Config) { c.Limits.MaxConcurrentWrites = 0 },
+		"unbounded bootstrap":        func(c *Config) { c.Limits.MaxConcurrentBootstrap = 0 },
+		"unbounded headers":          func(c *Config) { c.Limits.HeaderBytes = 0 },
+		"unbounded write duration":   func(c *Config) { c.Limits.WriteTimeout = 0 },
+		"unbounded shutdown":         func(c *Config) { c.Limits.ShutdownTimeout = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			invalid := cfg

@@ -91,5 +91,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)
 	}
 
+	if c.IssuerSecretName == c.KeyringSecretName || c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < wire.CertificateLifetime || c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
+		return fmt.Errorf("credential names or rotation policy: %w", wire.InvalidRequest)
+	}
+
 	return nil
 }

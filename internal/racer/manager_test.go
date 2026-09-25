@@ -26,6 +26,10 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("rotation and issuance must share the issuer")
 	}
 
+	if a.Keyring.Lifecycle != a.Lifecycle || a.Server.Lifecycle != a.Lifecycle {
+		t.Fatal("issuer and serving must share the leader readiness gate")
+	}
+
 	if a.Topology.Accepted == nil || !a.Server.NeedLeaderElection() {
 		t.Fatal("missing local accepted state or leader-scoped server")
 	}
@@ -49,7 +53,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
 			want := error(ErrUnimplemented)
-			if name == "topology" || name == "run" {
+			if name == "topology" || name == "keyring" || name == "run" {
 				want = wire.InvalidRequest
 			}
 

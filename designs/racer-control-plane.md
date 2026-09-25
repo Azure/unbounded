@@ -8,9 +8,10 @@ compute placement/routes locally, and serve disposable encrypted cache pages.
 
 This document describes intended behavior. Phase 1 bounded codecs, canonical
 hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
-reconciliation, and Phase 3 initialization/publication lifecycle are implemented.
-Issuer/rotation, bootstrap, TLS serving, and workload construction remain fail-closed
-stubs. The initialize-only command is operational; normal invocation validates
+reconciliation, Phase 3 initialization/publication lifecycle, and Phase 4 issuer
+and shared-key rotation are implemented. Token bootstrap, certificate request
+authentication, TLS serving, and workload construction remain fail-closed stubs.
+The initialize-only command is operational; normal invocation validates
 recovery state but cannot yet start an operational HTTPS service.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
@@ -191,7 +192,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 2. Implement pure membership/catalog reconciliation, including cold-start rules (complete).
 3. Implement explicit initialization, version CAS, immutable publication install,
    manager startup enqueue, and leadership cancellation (complete).
-4. Implement issuer/shared-key Secret rotation, including failure recovery.
+4. Implement issuer/shared-key Secret rotation, including failure recovery (complete).
 5. Implement token bootstrap and mTLS serving with adversarial identity tests.
 6. Implement the managed workload and Rust identity/TLS/projection boundaries.
 7. Exercise envtest integration, failover, rotation, and bounded fanout.
@@ -242,10 +243,76 @@ composition tests; do not add tests that merely enumerate every placeholder.
   even for empty lists. Sources/workers are leader-scoped; cache synchronization
   precedes worker execution. Pod `spec.nodeName` is indexed; predicates ignore
   readiness/unrelated inputs and map relevant events to one singleton key.
-  Workload and keyring reconciliation bodies remain Phase 6 and Phase 4 work.
+  Workload reconciliation remains Phase 6 work; keyring is implemented in Phase 4.
 
 Targeted fake-client and race tests cover initialization crash ordering, ambiguous
 responses, CAS conflicts, cancellation before writes/install, counter transitions,
 immutable ownership, readiness, and 256 simultaneous poll wakeups. This is not an
 envtest election/real-apiserver immutability test or a 100,000-node capacity claim;
 those integration/load checks remain Phase 7.
+
+## Phase 4 durable protocol and handoff
+
+- `KeyringReconciler` reads the installation/version objects, ClusterCaches, and
+  both credential Secrets through `APIReader`. It uses resource-version CAS and
+  singleton `RequeueAfter` deadlines, with no rotation goroutine or acknowledgments.
+  Conflicts restart from authoritative inputs. Cancellation is terminal and checked
+  before every write; failures reset `Lifecycle.SetIssuerReady(false)`.
+- Credential initialization CAS-adds the one-way
+  `racer.unbounded-cloud.io/credentials` annotation to the existing version
+  ConfigMap, binding the two Secret names and initial root fingerprint. Topology
+  preserves it. Only that successful invocation may create the issuer and common
+  Secrets, in that order. The same claim is attached to both Secrets. An ambiguous
+  claim/Create response is recovered only if both valid Secrets exist. A consumed
+  claim with either Secret missing fails closed, including incomplete first-time
+  initialization; it requires explicit new-cluster rebootstrap. Missing/corrupt
+  version or installation objects never authorize credential creation. Renaming
+  configured Secrets does not authorize a new credential lineage. As with Phase 3,
+  privileged deletion of the claim or stale backup restoration is not recovery.
+- The controller-only issuer Secret stores `issuer.json`: root DER and PKCS#8
+  Ed25519 private material indexed by SHA-256 root fingerprint, plus a pending
+  root reference. The common Secret stores bounded `bundle.json` and controller
+  `rotation.json` metadata. No node identity/private key or deployment HTTPS trust
+  is included. Only `bundle.json` is a dataplane wire contract.
+- Rotation metadata persists the next rotation, preparation deadline, selected
+  active/prepared issuer fingerprints, retirement deadlines for roots and scoped
+  cache-key IDs, and earliest next transition. Both cache-key purposes rotate.
+  Initial cache keys are active immediately; replacements are prepared before
+  activation. Caches added during an existing preparation retain their initial
+  active keys until the next cycle. Removed cache UIDs lose their key scopes;
+  recreation receives unrelated keys.
+- Before staging, encode the complete overlapping candidate under the 512 KiB
+  limit, including its incremented generation. Then persist new private issuer
+  material first and publish its root and prepared cache keys in one common-Secret
+  CAS. An interrupted staging write reuses the pending private issuer. Activation
+  changes cache states and the selected signing issuer in the common Secret alone,
+  so that Secret is the signing authority. Retiring material remains for the full
+  configured overlap after actual activation, at least the 24-hour leaf lifetime.
+  Pruning removes common trust first, private material second. Failures between
+  these writes leave recoverable extra private material, not dangling trust.
+- Deadlines are not reset on replay/restart and missed rotations are not replayed
+  in a loop. Long downtime that exhausts a prepared root cancels that unused
+  preparation and stages fresh material with a full preparation delay. Expired
+  active issuers remain unready until activation recovers usable signing state.
+  Generation exhaustion, malformed state, missing material, and size overflow
+  fail closed without resetting generation or overwriting corrupt state.
+- `Issuer.Issue(ctx, NodeIdentity, wire.BootstrapRequest)` verifies Ed25519 CSR
+  proof of possession and response bounds, discards requested names/extensions,
+  and signs a 24-hour client-auth/digital-signature leaf with the resolved cluster
+  and Node URI. It returns a leaf-first public chain and enrollment correlation.
+  Phase 5 must first obtain `NodeIdentity` from live token authorization, including
+  its authorization expiration, and gate issuance on leadership. There is no
+  enrollment receipt ledger. `AuthenticateCertificate` remains Phase 5 work.
+- `Issuer.TrustRoots(ctx)` returns a new owned pool from authoritative committed
+  credentials, distinct from deployment HTTPS server trust. Phase 5 must use fresh
+  trust for TLS admission and reverify chain, usage, identity, validity, and live
+  authorization on every snapshot request; pooled TLS `VerifiedChains` alone
+  cannot authorize retired roots. Phase 5 uses the existing `Lifecycle.Wait(ctx)`
+  and `SetServingReady` hooks, and must cancel serving on leadership loss.
+
+Phase 4 fake-client/race tests cover initialization and rotation write boundaries,
+ambiguous responses, restart deadlines, multiple retiring generations, private
+material cleanup, expired preparation, conflicts/cancellation, authoritative reads,
+lost/corrupt durable state, catalog churn, overlap overflow, certificate identity,
+proof-of-possession rejection, trust retirement, and concurrent issuance. Real
+API-server/election and projection integration remain Phase 7 verification.
