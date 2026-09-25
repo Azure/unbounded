@@ -7,10 +7,10 @@ Kubernetes is the authority for desired state. Rust nodes receive full publicati
 compute placement/routes locally, and serve disposable encrypted cache pages.
 
 This document describes intended behavior. Phase 1 bounded codecs, canonical
-hashing, and shared Go/Rust contract vectors are implemented. Other operational
-methods remain fail-closed stubs; composition, controller registration, API
-declarations, and reserved 503 routes are also implemented. The executable cannot
-start an operational service.
+hashing, and shared Go/Rust contract vectors and Phase 2 pure membership/catalog
+reconciliation are implemented. Other operational methods remain fail-closed stubs;
+composition, controller registration, API declarations, and reserved 503 routes are
+also implemented. The executable cannot start an operational service.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -77,6 +77,24 @@ relaxes restart continuity in exchange for eliminating derived-state checkpoints
 Failover may change placement and cause cold fills. Never import an untrusted
 dataplane's remembered membership as controller authority.
 
+The pure `ReconcileMembers` helper returns candidate accepted history and diagnostics
+without mutating inputs. The topology controller must install that history only
+after committing the candidate publication. Annotation attributes are accepted as
+one unit, independently of the endpoint: a malformed annotation preserves the
+previous attributes while a valid new endpoint can still replace the old one, and
+valid annotation changes can take effect during a Pod gap. Identical rail mappings
+are deduplicated; conflicting mappings for the same rail ID reject the attributes.
+Missing annotations reset to defaults. Missing managed DaemonSets are endpoint gaps.
+Callers supply installation-namespace Pods and the current managed DaemonSet UID;
+endpoint selection checks the `apps/v1` DaemonSet controller owner reference.
+
+`BuildCatalog` returns a UID-sorted catalog or rejects the whole candidate. It
+defaults socket mode to 0660, preserves explicit zero permissions, and delegates
+canonical path validation to the wire package. Nodes and caches remain present
+until absent from the input lists (or explicitly excluded for Nodes); only Pod
+endpoint selection filters deletion timestamps. Complete publication byte bounds
+and canonical hashes are checked by `wire.ContentHashes` before version assignment.
+
 ## Authentication
 
 Two HTTPS endpoints only:
@@ -120,7 +138,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 ## Implementation order
 
 1. Implement bounded codecs/canonical hashing and cross-language contract vectors (complete).
-2. Implement pure membership/catalog reconciliation, including cold-start rules.
+2. Implement pure membership/catalog reconciliation, including cold-start rules (complete).
 3. Implement explicit initialization, version CAS, immutable publication install,
    manager startup enqueue, and leadership cancellation.
 4. Implement issuer/shared-key Secret rotation, including failure recovery.

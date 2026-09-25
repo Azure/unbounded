@@ -90,6 +90,24 @@ func DecodePublication(r io.Reader) (Publication, error) {
 	return canonicalPublication(v), nil
 }
 
+// DecodeRails decodes a Node annotation using the strict JSON contract, bounded
+// by Kubernetes' total annotation size limit. Repeated rail IDs are preserved for
+// the membership reconciler to deduplicate or reject conflicting mappings.
+func DecodeRails(r io.Reader) ([]Rail, error) {
+	var rails []Rail
+	if err := decode(r, 256*1024, &rails); err != nil {
+		return nil, err
+	}
+
+	for _, rail := range rails {
+		if !validRail(rail) {
+			return nil, InvalidRequest
+		}
+	}
+
+	return rails, nil
+}
+
 type bundleJSON struct {
 	SchemaVersion  uint32     `json:"schema_version"`
 	Cluster        ClusterID  `json:"cluster"`

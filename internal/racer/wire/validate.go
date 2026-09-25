@@ -33,6 +33,13 @@ func validUUID(s string) bool {
 	return true
 }
 
+// ValidUUID checks canonical Kubernetes identities before constructing wire state.
+func ValidUUID(s string) bool { return validUUID(s) }
+
+func validRail(r Rail) bool {
+	return r.Fabric != "" && utf8.ValidString(r.Fabric) && !strings.ContainsAny(r.Fabric, "\x00\r\n")
+}
+
 func validateHeader(version uint32, cluster ClusterID) error {
 	if version != SchemaVersion {
 		return UnsupportedVersion
@@ -187,7 +194,7 @@ func validatePublication(v Publication, counters bool) error {
 
 		rails := map[uint16]bool{}
 		for _, r := range m.Rails {
-			if rails[r.Rail] || r.Fabric == "" || !utf8.ValidString(r.Fabric) || strings.ContainsAny(r.Fabric, "\x00\r\n") {
+			if rails[r.Rail] || !validRail(r) {
 				return InvalidRequest
 			}
 
