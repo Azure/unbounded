@@ -31,6 +31,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "transition.rs"]
+mod transition;
+pub use transition::PreparedListeners;
+
 struct BoundListener {
     definition: CacheDefinition,
     listener: UnixListener,
@@ -38,12 +42,13 @@ struct BoundListener {
     device: u64,
     inode: u64,
     retired: Rc<Cell<bool>>,
+    basename: RefCell<String>,
 }
 
 impl Drop for BoundListener {
     fn drop(&mut self) {
         self.retired.set(true);
-        let path = anchored(&self.directory).join("socket");
+        let path = anchored(&self.directory).join(self.basename.borrow().as_str());
         if let Ok(metadata) = fs::symlink_metadata(&path) {
             if metadata.file_type().is_socket()
                 && metadata.dev() == self.device
@@ -56,6 +61,7 @@ impl Drop for BoundListener {
 }
 
 struct Active {
+    cache: CacheId,
     retired: Rc<Cell<bool>>,
     idle: Rc<Cell<bool>>,
     cancellation: Cancellation,
@@ -68,9 +74,11 @@ pub struct ClientListeners {
     responses: Rc<Responses>,
     io: Rc<HttpIo>,
     admission: Rc<Admission>,
-    listeners: RefCell<BTreeMap<CacheId, BoundListener>>,
+    listeners: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
+    preparing: Rc<Cell<bool>>,
+    cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
     active: RefCell<VecDeque<Active>>,
-    accepting: Cell<bool>,
+    accepting: Rc<Cell<bool>>,
     accept_cursor: Cell<usize>,
     accept_turn: Cell<bool>,
     root: PathBuf,
@@ -90,9 +98,11 @@ impl ClientListeners {
             responses,
             io,
             admission,
-            listeners: RefCell::new(BTreeMap::new()),
+            listeners: Rc::new(RefCell::new(BTreeMap::new())),
+            preparing: Rc::new(Cell::new(false)),
+            cleanup: Rc::new(RefCell::new(VecDeque::new())),
             active: RefCell::new(VecDeque::new()),
-            accepting: Cell::new(true),
+            accepting: Rc::new(Cell::new(true)),
             accept_cursor: Cell::new(0),
             accept_turn: Cell::new(true),
             root: PathBuf::from("/run/racer"),
@@ -105,44 +115,33 @@ impl ClientListeners {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            scope.check()?;
-            crate::control::caches::validate_definitions(caches)?;
-            if !self.accepting.get() {
-                return Err(Error::Unavailable);
-            }
-            let mut listeners = self.listeners.borrow_mut();
-            listeners.retain(|id, old| {
-                caches
-                    .iter()
-                    .any(|new| &new.id == id && new.name == old.definition.name)
-            });
-            for cache in caches {
-                scope.check()?;
-                if let Some(old) = listeners.get_mut(&cache.id) {
-                    if old.definition.socket_mode != cache.socket_mode {
-                        let path = anchored(&old.directory).join("socket");
-                        let metadata = fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
-                        if metadata.dev() != old.device
-                            || metadata.ino() != old.inode
-                            || !metadata.file_type().is_socket()
-                        {
-                            return Err(Error::Io);
-                        }
-                        set_socket_mode(&old.directory, old.device, old.inode, cache.socket_mode)?;
-                        old.definition = cache.clone();
-                    }
-                } else {
-                    listeners.insert(cache.id.clone(), bind(&self.root, cache.clone())?);
-                }
-            }
-            // Removal stops new admission. Existing responses finish under their
-            // original budgets, then their connections close before another read.
+            self.prepare(caches, scope).await?.commit();
+            self.cleanup.borrow_mut().clear();
             Ok(())
         })
+    }
+
+    /// Perform all fallible filesystem work before synchronous publication.
+    /// Dropping the returned transition restores the last-good owned paths.
+    pub fn prepare<'a>(
+        &'a self,
+        caches: &'a [CacheDefinition],
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PreparedListeners> {
+        transition::prepare(self, caches, scope)
     }
     /// Called by the owning I/O worker alongside reactor completion polling.
     /// Work is bounded across accepts and futures; no background executor exists.
     pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
+        let mut cleaned = 0;
+        // Commit only retires owners; pathname cleanup runs on worker polling.
+        if budget != 0 {
+            if let Some(listener) = self.cleanup.borrow_mut().pop_front() {
+                drop(listener);
+                cleaned = 1;
+            }
+        }
+        let budget = budget.saturating_sub(cleaned);
         let mut worked = 0;
         let waker = futures::task::noop_waker();
         let mut context = Context::from_waker(&waker);
@@ -173,12 +172,12 @@ impl ClientListeners {
             worked += 1;
         }
         if !self.accepting.get() {
-            return Ok(worked);
+            return Ok(worked + cleaned);
         }
         let listeners = self.listeners.borrow();
         let count = listeners.len();
         if count == 0 {
-            return Ok(worked);
+            return Ok(worked + cleaned);
         }
         let maximum = self.admission.limits().client_connections.get();
         // Reserve some acceptance opportunity even when all active readers wait.
@@ -228,6 +227,7 @@ impl ClientListeners {
                         .await
                     });
                     self.active.borrow_mut().push_back(Active {
+                        cache,
                         retired,
                         idle,
                         cancellation,
@@ -242,16 +242,85 @@ impl ClientListeners {
         }
         self.accept_cursor
             .set((self.accept_cursor.get() + attempts) % count);
-        Ok(worked)
+        Ok(worked + cleaned)
     }
 
     pub fn active_connections(&self) -> usize {
         self.active.borrow().len()
     }
 
+    pub fn active_connections_for(&self, cache: &CacheId) -> usize {
+        self.active
+            .borrow()
+            .iter()
+            .filter(|active| &active.cache == cache)
+            .count()
+    }
+
+    /// Stop this cache's admission without filesystem I/O. Outstanding responses
+    /// finish normally unless cancel_cache is also called.
+    pub fn stop_cache(&self, cache: &CacheId) {
+        if let Some(listener) = self.listeners.borrow_mut().remove(cache) {
+            listener.retired.set(true);
+            self.cleanup.borrow_mut().push_back(listener);
+        }
+        for active in self
+            .active
+            .borrow()
+            .iter()
+            .filter(|active| &active.cache == cache)
+        {
+            active.retired.set(true);
+        }
+    }
+
+    /// Signal every accepted generation for this UID and retain its completion
+    /// owners until the worker polls them out.
+    pub fn cancel_cache(&self, cache: &CacheId) -> Result<()> {
+        self.stop_cache(cache);
+        for active in self
+            .active
+            .borrow()
+            .iter()
+            .filter(|active| &active.cache == cache)
+        {
+            active.cancellation.cancel()?;
+        }
+        Ok(())
+    }
+
+    pub fn drain_cache<'a>(
+        &'a self,
+        cache: &'a CacheId,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            self.stop_cache(cache);
+            std::future::poll_fn(|cx| {
+                if let Err(error) = scope.check() {
+                    let _ = self.cancel_cache(cache);
+                    return Poll::Ready(Err(error));
+                }
+                if let Err(error) = self.poll_budgeted(64) {
+                    return Poll::Ready(Err(error));
+                }
+                if self.active_connections_for(cache) == 0 {
+                    Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await
+        })
+    }
+
     pub fn stop_admission(&self) {
         self.accepting.set(false);
-        self.listeners.borrow_mut().clear();
+        for (_, listener) in std::mem::take(&mut *self.listeners.borrow_mut()) {
+            listener.retired.set(true);
+            self.cleanup.borrow_mut().push_back(listener);
+        }
     }
 
     pub fn drain<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -426,11 +495,11 @@ fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
     }
 }
 
-fn bind(root: &Path, definition: CacheDefinition) -> Result<BoundListener> {
+fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<BoundListener> {
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
     let directory = child_directory(&cache, b"client")?;
-    let path = anchored(&directory).join("socket");
+    let path = anchored(&directory).join(basename);
     // Never unlink an existing socket, even if it appears stale: it is not ours.
     let listener = UnixListener::bind(&path).map_err(|_| Error::Io)?;
     let metadata = fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
@@ -441,6 +510,7 @@ fn bind(root: &Path, definition: CacheDefinition) -> Result<BoundListener> {
         device: metadata.dev(),
         inode: metadata.ino(),
         retired: Rc::new(Cell::new(false)),
+        basename: RefCell::new(basename.into()),
     };
     bound
         .listener
@@ -451,22 +521,37 @@ fn bind(root: &Path, definition: CacheDefinition) -> Result<BoundListener> {
         bound.device,
         bound.inode,
         bound.definition.socket_mode,
+        basename,
     )?;
     Ok(bound)
 }
 
-fn set_socket_mode(directory: &File, device: u64, inode: u64, mode: u32) -> Result<()> {
+fn set_socket_mode(
+    directory: &File,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    basename: &str,
+) -> Result<()> {
     // Pin the final inode too: a replacement symlink must not redirect chmod.
     let socket = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(anchored(directory).join("socket"))
+        .open(anchored(directory).join(basename))
         .map_err(|_| Error::Io)?;
     let metadata = socket.metadata().map_err(|_| Error::Io)?;
     if metadata.dev() != device || metadata.ino() != inode || !metadata.file_type().is_socket() {
         return Err(Error::Io);
     }
+    #[cfg(test)]
+    if FAIL_CHMOD.with(|fail| fail.replace(false)) {
+        return Err(Error::Io);
+    }
     fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(mode)).map_err(|_| Error::Io)
+}
+#[cfg(test)]
+thread_local! {
+    static FAIL_CHMOD: Cell<bool> = const { Cell::new(false) };
 }
 #[cfg(test)]
 mod tests {
@@ -1166,6 +1251,252 @@ mod tests {
             let output = fixture.receive(&mut socket, true);
             assert!(output.starts_with(b"HTTP/1.1 502"));
         }
+    }
+
+    #[test]
+    fn prepared_transition_rolls_back_bind_chmod_and_drop() {
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let inode = fs::metadata(fixture.socket()).unwrap().ino();
+        let mut changed = definition();
+        changed.socket_mode = 0o660;
+        let mut added = definition();
+        added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
+        added.name = "blocked".into();
+        added.client_socket = "/run/racer/blocked/client/socket".into();
+        added.origin_socket = "/run/racer/blocked/origin/socket".into();
+        fs::write(fixture.root.0.join("blocked"), b"foreign").unwrap();
+        assert!(
+            futures::executor::block_on(
+                fixture
+                    .listeners
+                    .prepare(&[changed.clone(), added], &scope())
+            )
+            .is_err()
+        );
+        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o600
+        );
+        FAIL_CHMOD.with(|fail| fail.set(true));
+        assert!(
+            futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
+                .is_err()
+        );
+        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o600
+        );
+        let prepared =
+            futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
+                .unwrap();
+        assert_ne!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o660
+        );
+        assert!(matches!(
+            futures::executor::block_on(fixture.listeners.prepare(&[], &scope())),
+            Err(Error::Overloaded)
+        ));
+        drop(prepared);
+        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        let mut socket = fixture.connect();
+        socket.write_all(&request("HEAD", "")).unwrap();
+        assert!(
+            fixture
+                .receive(&mut socket, false)
+                .starts_with(b"HTTP/1.1 200")
+        );
+        let prepared =
+            futures::executor::block_on(fixture.listeners.prepare(&[changed], &scope())).unwrap();
+        prepared.commit();
+        fixture.pump(16);
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o660
+        );
+        assert!(fixture.receive(&mut socket, true).is_empty());
+    }
+
+    #[test]
+    fn abandoned_prepare_future_removes_temporary_socket() {
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let inode = fs::metadata(fixture.socket()).unwrap().ino();
+        let mut changed = definition();
+        changed.socket_mode = 0o660;
+        let definitions = [changed];
+        let scope = scope();
+        let mut future = fixture.listeners.prepare(&definitions, &scope);
+        let waker = futures::task::noop_waker();
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+        drop(future);
+        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(!fixture.listeners.preparing.get());
+    }
+
+    #[test]
+    fn prepared_rename_failure_restores_already_exchanged_paths() {
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let inode = fs::metadata(fixture.socket()).unwrap().ino();
+        let mut changed = definition();
+        changed.socket_mode = 0o660;
+        let mut added = definition();
+        added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
+        added.name = "added".into();
+        added.client_socket = "/run/racer/added/client/socket".into();
+        added.origin_socket = "/run/racer/added/origin/socket".into();
+        transition::FAIL_RENAME_AFTER.with(|count| count.set(Some(1)));
+        assert!(
+            futures::executor::block_on(fixture.listeners.prepare(&[changed, added], &scope()))
+                .is_err()
+        );
+        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(fixture.root.0.join("added/client"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let mut socket = fixture.connect();
+        socket
+            .write_all(&request("HEAD", "Connection: close\r\n"))
+            .unwrap();
+        assert!(
+            fixture
+                .receive(&mut socket, true)
+                .starts_with(b"HTTP/1.1 200")
+        );
+    }
+
+    #[test]
+    fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let origin = fixture.root.0.join("example/origin");
+        fs::create_dir(&origin).unwrap();
+        fs::write(origin.join("socket"), b"origin").unwrap();
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000002".into());
+        let prepared = futures::executor::block_on(
+            fixture.listeners.prepare(&[replacement.clone()], &scope()),
+        )
+        .unwrap();
+        prepared.commit();
+        fixture.pump(16);
+        let inode = fs::metadata(fixture.socket()).unwrap().ino();
+        assert!(
+            fixture
+                .listeners
+                .listeners
+                .borrow()
+                .contains_key(&replacement.id)
+        );
+        replacement.socket_mode = 0o660;
+        let prepared =
+            futures::executor::block_on(fixture.listeners.prepare(&[replacement], &scope()))
+                .unwrap();
+        fs::remove_file(fixture.socket()).unwrap();
+        fs::write(fixture.socket(), b"foreign").unwrap();
+        drop(prepared);
+        assert_eq!(fs::read(fixture.socket()).unwrap(), b"foreign");
+        assert_eq!(fs::read(origin.join("socket")).unwrap(), b"origin");
+        assert!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .any(|entry| entry.unwrap().metadata().unwrap().ino() == inode)
+        );
+    }
+
+    #[test]
+    fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
+        struct Waiting(Rc<Cell<usize>>);
+        impl ReadService for Waiting {
+            fn read<'a>(
+                &'a self,
+                _: ClientRequest,
+                scope: &'a RequestScope,
+            ) -> Operation<'a, ReadResponse> {
+                Box::pin(async move {
+                    self.0.set(self.0.get() + 1);
+                    std::future::poll_fn(|_| match scope.check() {
+                        Ok(()) => Poll::Pending,
+                        Err(error) => Poll::Ready(Err(error)),
+                    })
+                    .await
+                })
+            }
+        }
+        let mut fixture = Fixture::new();
+        let calls = Rc::new(Cell::new(0));
+        fixture.listeners.reads = Rc::new(Waiting(calls.clone()));
+        let mut other = definition();
+        other.id = CacheId("00000000-0000-4000-8000-000000000002".into());
+        other.name = "other".into();
+        other.client_socket = "/run/racer/other/client/socket".into();
+        other.origin_socket = "/run/racer/other/origin/socket".into();
+        fixture.reconcile(&[definition(), other.clone()]).unwrap();
+        let mut socket = fixture.connect();
+        socket.write_all(&request("HEAD", "")).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            fixture.listeners.active_connections_for(&definition().id),
+            1
+        );
+        fixture.listeners.cancel_cache(&definition().id).unwrap();
+        assert!(
+            fixture
+                .receive(&mut socket, true)
+                .starts_with(b"HTTP/1.1 503")
+        );
+        futures::executor::block_on(fixture.listeners.drain_cache(&definition().id, &scope()))
+            .unwrap();
+        assert_eq!(
+            fixture.listeners.active_connections_for(&definition().id),
+            0
+        );
+        assert!(fixture.listeners.listeners.borrow().contains_key(&other.id));
+        assert!(fixture.root.0.join("other/client/socket").exists());
     }
 
     #[test]
