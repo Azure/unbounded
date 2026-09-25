@@ -959,7 +959,7 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
             assert_eq!(reactor.in_flight(), 1);
-            let operation = if abandon {
+            let mut operation = if abandon {
                 drop(operation);
                 None
             } else {
@@ -971,13 +971,17 @@ mod tests {
             // drain is a completion fence, not a blocking shutdown call. The
             // driver must keep polling CQEs until the outstanding send is fenced.
             drive(&reactor, reactor.drain()).unwrap();
-            if let Some(operation) = operation {
+            if let Some(operation) = operation.take() {
                 assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
             }
+            drop(operation);
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
             assert_eq!(admission.used(ResourceClass::Pipe), 0);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
+            // The reactor's own ring allocation remains admitted until drop.
+            drop(delivery);
+            drop(reactor);
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(scope.check(), Ok(()));
         }
@@ -1062,5 +1066,25 @@ mod tests {
             assert_eq!(admission.used(ResourceClass::Pipe), 0);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
+    }
+
+    #[test]
+    fn unpolled_http_delivery_closes_connection_and_releases_admission() {
+        let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+        let page = page(&admission, b"abc".to_vec());
+        let weak = Arc::downgrade(&page.inner);
+        let reader = delivery.attach(page, slice(0, 3)).unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        connection.tx_remaining = Some(3);
+        let scope = scope();
+        let operation = delivery.finish_to(reader, connection, &scope);
+        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        drop(operation);
+        assert_eq!(reactor.in_flight(), 0);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
     }
 }

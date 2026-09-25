@@ -19,6 +19,7 @@ use std::{
 
 /// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
 /// units, so total pipe capacity is bounded by Limits::pipes * MAX_PIPE_BYTES.
+/// Spliced bytes retained by sockets are subject to socket buffer limits instead.
 pub const MAX_PIPE_BYTES: usize = 64 * 1024;
 
 pub struct PipePool {
