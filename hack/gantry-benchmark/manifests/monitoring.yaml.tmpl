@@ -59,6 +59,9 @@ spec:
       nodeSelector:
         kubernetes.io/os: {{ .NodeOS }}
         kubernetes.io/arch: {{ .NodeArch }}
+        {{- with .NodePool }}
+        agentpool: {{ . }}
+        {{- end }}
       tolerations:
         - operator: Exists
       containers:

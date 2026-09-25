@@ -155,6 +155,7 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		MonitoringLabel: b.config.KPSRelease,
 		NodeOS:          strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
 		NodeArch:        strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
+		NodePool:        b.config.NodePool,
 		ProxyImage:      b.config.ProxyImage,
 		ACRLoginServer:  b.config.ACRLoginServer,
 		RunID:           runID,
@@ -344,6 +345,7 @@ type proxyManifestData struct {
 	MonitoringLabel string
 	NodeOS          string
 	NodeArch        string
+	NodePool        string
 	ProxyImage      string
 	ACRLoginServer  string
 	RunID           string

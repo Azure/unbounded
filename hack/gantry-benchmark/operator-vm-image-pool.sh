@@ -281,6 +281,7 @@ SCRIPT
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
           hack/cmd/gantry-benchmark/config.go
+          hack/cmd/gantry-benchmark/enable.go
           hack/cmd/gantry-benchmark/gantry_only.go
           hack/cmd/gantry-benchmark/hosts_routing.go
           hack/cmd/gantry-benchmark/main.go
