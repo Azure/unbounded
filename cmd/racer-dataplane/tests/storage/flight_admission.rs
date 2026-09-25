@@ -258,7 +258,10 @@ fn buffer_waiters_cannot_consume_downstream_flights_across_workers_and_volumes()
     assert_eq!(pool.invariant_snapshot().flights, 127);
     // The final owner fill completes, including slab publication, without
     // canceling any higher-rank waiter or borrowing another rank's capacity.
-    let fault = caches[0].page(&meta, 0, deadline).unwrap();
+    let mut fault = caches[0].page(&meta, 0, deadline).unwrap();
+    // This contract checks published-file ownership, including release of the
+    // receive slot before testing every protected forwarding rank again.
+    fault.early_fallback = true;
     let value = resolve(&mut caches[0], &mut rings[0], &mut owner, fault);
     assert_eq!(pool.invariant_snapshot().flights, 127);
     let before = starts.get();

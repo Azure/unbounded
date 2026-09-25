@@ -102,7 +102,7 @@ func TestNewRacerInitializationAndNilBackend(t *testing.T) {
 	}
 }
 
-func racerUDS(t *testing.T, handler http.Handler) *sdk.Client {
+func racerUDS(t *testing.T, handler http.Handler, options ...sdk.ClientOptions) *sdk.Client {
 	t.Helper()
 	// Short workspace-local paths also work inside a deeply nested worktree.
 	dir, err := os.MkdirTemp(".", ".racer-test-")
@@ -127,7 +127,12 @@ func racerUDS(t *testing.T, handler http.Handler) *sdk.Client {
 
 	go func() { _ = server.Serve(ln) }()
 
-	client, err := sdk.NewClient(path, sdk.ClientOptions{Timeout: 5 * time.Second})
+	opt := sdk.ClientOptions{Timeout: 5 * time.Second}
+	if len(options) != 0 {
+		opt = options[0]
+	}
+
+	client, err := sdk.NewClient(path, opt)
 	if err != nil {
 		t.Fatal(err)
 	}

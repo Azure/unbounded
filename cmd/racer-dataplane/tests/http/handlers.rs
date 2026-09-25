@@ -53,6 +53,8 @@ use http::cache_responses::accept;
 mod hop_admission;
 #[path = "mixed_version.rs"]
 mod mixed_version;
+#[path = "page_pipeline.rs"]
+mod page_pipeline;
 #[path = "peer_recovery.rs"]
 mod peer_recovery;
 #[path = "product.rs"]
