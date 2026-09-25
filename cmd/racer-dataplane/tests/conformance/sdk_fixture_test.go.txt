@@ -1,0 +1,149 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package racersdk
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+)
+
+// Compiled against the actual SDK with go test -overlay. Only the private socket
+// seam is used; all request construction, parsing, and streaming is production SDK.
+func TestRustWireClientFixture(t *testing.T) {
+	size, err := strconv.ParseInt(os.Getenv("RACER_CONFORMANCE_SIZE"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := ParseCacheName("conformance")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := newClient(ClientConfig{Cache: cache, MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	metadata, err := ParseAdapterMetadata("opaque,  bytes\xff")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authorization, err := ParseAuthorization("fixture credential\x80")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fetch, err := NewFetchContext(metadata, authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	value, err := client.Get(ctx, Request{Context: fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer value.Close()
+
+	snapshot := value.Metadata()
+	if int64(snapshot.Size) != size || snapshot.ETag.String() != `"v"` || snapshot.ExpiresAt.UnixMilli() != 0 {
+		t.Fatal("wrong initial metadata")
+	}
+
+	sink := &rustWireSink{}
+	count, err := value.WriteTo(sink)
+	if err != nil || count != size || sink.offset != size {
+		t.Fatalf("stream count=%d offset=%d error=%v", count, sink.offset, err)
+	}
+
+	if value.Metadata() != snapshot {
+		t.Fatal("continuation changed initial metadata")
+	}
+
+	var one [1]byte
+	if n, err := value.Read(one[:]); n != 0 || err != io.EOF {
+		t.Fatal("missing terminal EOF")
+	}
+}
+
+type rustWireSink struct{ offset int64 }
+
+func (w *rustWireSink) Write(p []byte) (int, error) {
+	for i, b := range p {
+		if b != byte((w.offset+int64(i))%251) {
+			return i, fmt.Errorf("incorrect byte at %d", w.offset+int64(i))
+		}
+	}
+
+	w.offset += int64(len(p))
+
+	return len(p), nil
+}
+
+// The Rust raw peer selects callback outcomes by key; the SDK owns every wire
+// response, body probe, and connection abort. The fixture supplies only data.
+func TestRustWireOriginFixture(t *testing.T) {
+	cache, err := ParseCacheName("conformance")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	go func() {
+		var stop [1]byte
+		_, _ = os.Stdin.Read(stop[:])
+		cancel()
+	}()
+
+	tag, err := ParseETag(`"v"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = serveOrigin(ctx, OriginConfig{Cache: cache}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+		m := Metadata{Size: 3, ETag: tag, ExpiresAt: time.UnixMilli(0)}
+		if r.Context().Metadata().ForOrigin() != "opaque,  bytes\xff" || r.Context().Authorization().ForOrigin() != "fixture credential\x80" {
+			return Metadata{}, nil, fmt.Errorf("changed context")
+		}
+
+		switch r.Key()[0] {
+		case 1:
+			m.Size = 0
+		case 2:
+			return m, io.NopCloser(bytes.NewReader([]byte("ab"))), nil
+		case 3:
+			return m, io.NopCloser(bytes.NewReader([]byte("abcd"))), nil
+		case 4:
+			return m, nil, NewOriginError(ErrorNotFound, nil)
+		case 5:
+			return m, nil, NewOriginError(ErrorUnauthorized, nil)
+		case 6:
+			return m, nil, NewOriginError(ErrorForbidden, nil)
+		case 7:
+			return m, nil, NewOriginError(ErrorUnavailable, nil)
+		}
+
+		if r.Operation() == OperationHead || m.Size == 0 {
+			return m, nil, nil
+		}
+
+		return m, io.NopCloser(bytes.NewReader([]byte("abc"))), nil
+	}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	if ctx.Err() == nil {
+		t.Fatal(err)
+	}
+}
