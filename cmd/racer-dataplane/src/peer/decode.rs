@@ -128,6 +128,9 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         destination: node(head, "racer-route-destination")?,
         visited,
         remaining_links,
+        remaining_attempts: p::number(head, "racer-route-attempts")?
+            .try_into()
+            .map_err(|_| Error::InvalidRequest)?,
         deadline: p::decode_deadline(p::number(head, "racer-route-deadline")?)?,
     })
 }
@@ -272,6 +275,7 @@ impl LogicalCodec for SecurityCodec {
                     "unavailable" => PeerResponse::Unavailable,
                     "overloaded" => PeerResponse::Overloaded,
                     "origin-rejected" => PeerResponse::OriginRejected,
+                    "origin-forbidden" => PeerResponse::OriginForbidden,
                     _ => return Err(Error::InvalidRequest),
                 }
             }

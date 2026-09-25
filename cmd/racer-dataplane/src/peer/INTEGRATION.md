@@ -49,6 +49,13 @@ typed authenticated challenge. No unsigned capability or challenge grants servic
 
 ## Current transport boundary
 
+Security budget schema now requires `racer-route-attempts` (canonical u32) on every
+original/request hop; decoder transfers it to `RouteBudget.remaining_attempts`.
+Relays preserve/decrease, never refill; CopyOnly is zero. Application signed
+`origin-forbidden`/403 and `origin-rejected`/401 remain distinct within the outer
+200 envelope. See `designs/racer-peer-security.md` for exact credit rules and the
+security review requirements for native setup/grant/completion bindings and fences.
+
 Page, metadata, and copy-only requests use actual pooled HTTP. Page bodies preserve
 ciphertext; AEAD verification belongs to the receiving read coordinator. Relay
 verification preserves the original and every hop signature in both directions.

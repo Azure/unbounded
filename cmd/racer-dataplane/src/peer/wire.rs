@@ -55,6 +55,7 @@ pub enum PeerResponse {
     Unavailable,
     Overloaded,
     OriginRejected,
+    OriginForbidden,
 }
 
 /// Owned, unverified wire input/output. The original and all forwarding signatures

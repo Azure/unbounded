@@ -19,9 +19,21 @@ use crate::{
     },
     topology::rails::TransportPlan,
 };
+use std::time::{Duration, Instant};
 
 fn recoverable(error: Error) -> bool {
     matches!(error, Error::Unavailable | Error::Io | Error::Overloaded)
+}
+fn native_scope(scope: &RequestScope) -> RequestScope {
+    let mut bounded = scope.clone();
+    bounded.deadline.0 = bounded
+        .deadline
+        .0
+        .min(Instant::now() + Duration::from_secs(5));
+    bounded
+}
+fn native_failure(error: Error, scope: &RequestScope) -> bool {
+    scope.check().is_ok() && (recoverable(error) || error == Error::DeadlineExceeded)
 }
 
 #[cfg(test)]
@@ -91,6 +103,29 @@ mod tests {
     }
     #[test]
     fn real_socket_signed_offer_falls_back_when_local_provider_is_unavailable() {
+        fallback_roundtrip(false);
+    }
+    #[test]
+    fn real_socket_sender_failure_requires_signed_fallback_before_ciphertext() {
+        fallback_roundtrip(true);
+    }
+    fn fallback_roundtrip(sender_failure: bool) {
+        offer_fallback(sender_failure);
+    }
+    #[test]
+    fn native_subdeadline_preserves_parent_deadline_and_cancellation() {
+        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let native = native_scope(&scope);
+        assert!(native.deadline.0 <= scope.deadline.0);
+        assert!(native_failure(Error::DeadlineExceeded, &scope));
+        assert!(!native_failure(Error::Unauthorized, &scope));
+        scope.cancel().unwrap();
+        assert_eq!(native.check(), Err(Error::Cancelled));
+        assert!(!native_failure(Error::DeadlineExceeded, &scope));
+    }
+    fn offer_fallback(failed: bool) {
+        let sender_failure = failed;
         let signers = super::super::tests::signers();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -209,6 +244,54 @@ mod tests {
             let (auth, _) = WireCodec::decode(received.value, true)?;
             let mut original = binding.clone();
             original.response = [0; 32];
+            if sender_failure {
+                let (verified, _) = binding.verify(
+                    &signers[0],
+                    signers[2].node(),
+                    offer,
+                    &[Phase::Offer],
+                    &signed_digest(&accept)?,
+                    0,
+                    &scope,
+                )?;
+                let mut connection = received.connection;
+                connection.finish_exchange()?;
+                let setup = binding.sign(
+                    &signers[0],
+                    signers[2].node(),
+                    Phase::Setup,
+                    &signed_digest(&verified.signed)?,
+                    0,
+                    vec![
+                        extension(SETUP_HEADER, p::binary(&[1; 32]).into_bytes()),
+                        extension(SETUP_BINDING_HEADER, p::binary(&[2; 32]).into_bytes()),
+                    ],
+                )?;
+                let setup_digest = signed_digest(&setup)?;
+                connection = receiver.write_control(connection, setup, &scope).await?;
+                let failed = receiver.read_control(connection, true, &scope).await?;
+                let (mut connection, signed) = failed;
+                let (failed, _) = binding.verify(
+                    &signers[0],
+                    signers[2].node(),
+                    signed,
+                    &[Phase::Failed],
+                    &setup_digest,
+                    0,
+                    &scope,
+                )?;
+                connection.finish_exchange()?;
+                return receiver
+                    .receive_fallback(
+                        connection,
+                        auth,
+                        &binding,
+                        signers[2].node(),
+                        signed_digest(&failed.signed)?,
+                        &scope,
+                    )
+                    .await;
+            }
             receiver
                 .receive_native(
                     received.connection,
@@ -229,6 +312,30 @@ mod tests {
                 .await?;
             let mut connection = sent.connection;
             connection.finish_exchange()?;
+            if sender_failure {
+                let (connection, setup) = sender.read_control(connection, false, &scope).await?;
+                let (setup, _) = binding.verify(
+                    &signers[2],
+                    signers[0].node(),
+                    setup,
+                    &[Phase::Setup],
+                    &previous,
+                    0,
+                    &scope,
+                )?;
+                let (mut connection, _) = sender
+                    .failed_then_fallback(
+                        connection,
+                        &response,
+                        &binding,
+                        signers[0].node(),
+                        signed_digest(&setup.signed)?,
+                        &scope,
+                    )
+                    .await?;
+                connection.finish_exchange()?;
+                return Ok(());
+            }
             let (connection, fallback) = sender.read_control(connection, false, &scope).await?;
             let (verified, phase) = binding.verify(
                 &signers[2],
@@ -273,6 +380,270 @@ mod tests {
         }
         assert_eq!(admission.used(ResourceClass::Registered), 0);
     }
+    #[cfg(feature = "rdma")]
+    #[test]
+    #[ignore = "requires real ABI v2 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
+    fn native_provider_signed_setup_grant_write_completion_roundtrip() {
+        use crate::rdma::{
+            device::FabricPort,
+            lifecycle::{NativeService, pair},
+        };
+        use crate::topology::{
+            membership::{Member, Membership},
+            rails::{RailId, RailMapping},
+        };
+        let device = std::env::var("RACER_RDMA_TEST_DEVICE").expect("select real device");
+        let port = std::env::var("RACER_RDMA_TEST_PORT")
+            .expect("select port")
+            .parse()
+            .unwrap();
+        let text = std::env::var("RACER_RDMA_TEST_GID").expect("32 lowercase hex GID digits");
+        assert_eq!(text.len(), 32);
+        let mut gid = [0; 16];
+        for (i, b) in gid.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let signers = super::super::tests::signers();
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(true).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let mappings = vec![RailMapping {
+            rail: RailId(7),
+            fabric: "test-provider".into(),
+            numa_node: None,
+        }];
+        let associations = vec![FabricPort {
+            fabric: "test-provider".into(),
+            device,
+            port,
+            gid: Some(gid),
+        }];
+        let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let make = |signatures: Rc<Signatures>| {
+            let (io, port) = pair(2).unwrap();
+            let devices = Rc::new(Devices::new(Rc::new(Verbs)));
+            devices.attach(io).unwrap();
+            let sessions = Rc::new(Sessions::new(devices.clone(), 2));
+            let rdma = Rc::new(RdmaTransfer::new(
+                sessions.clone(),
+                Rc::new(RegisteredPool::new(devices.clone(), admission.clone())),
+                Rc::new(Permissions),
+            ));
+            let http = Rc::new(HttpIo::with_admission(
+                reactor.clone(),
+                Codec::new(
+                    super::super::wire::MAX_ENVELOPE_HEAD,
+                    crate::model::range::PAGE_BYTES + 16,
+                ),
+                admission.clone(),
+            ));
+            let transfer = Transfers::new(
+                Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+                http,
+                Some(rdma),
+            )
+            .with_wire(
+                admission.clone(),
+                Rc::new(super::super::wire::SecurityCodec::new(
+                    admission.clone(),
+                    Rc::new(BufferPool::new(admission.clone())),
+                )),
+            )
+            .with_native(signatures, sessions);
+            (devices, NativeService::new(port), transfer)
+        };
+        let (receive_devices, mut receive_engine, receiver) = make(signers[0].clone());
+        let (send_devices, mut send_engine, sender) = make(signers[2].clone());
+        let mut activate = std::pin::pin!(async {
+            futures::try_join!(
+                receive_devices.activate(
+                    mappings.clone(),
+                    associations.clone(),
+                    &admission,
+                    4096,
+                    &scope
+                ),
+                send_devices.activate(
+                    mappings.clone(),
+                    associations.clone(),
+                    &admission,
+                    4096,
+                    &scope
+                )
+            )
+        });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        loop {
+            if let Poll::Ready(result) = std::future::Future::poll(activate.as_mut(), &mut cx) {
+                result.expect("native provider activation must succeed");
+                break;
+            }
+            receive_engine.poll_budgeted(8).unwrap();
+            send_engine.poll_budgeted(8).unwrap();
+        }
+        let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: cache.clone(),
+                key: CacheKey([9; 32]),
+            },
+            etag: StrongEtag::parse(b"\"provider\"").unwrap(),
+        };
+        let envelope = PageEnvelope {
+            page: PageId {
+                version: version.clone(),
+                number: PageNumber(0),
+            },
+            key_id: KeyId([2; 16]),
+            nonce: Nonce([3; 24]),
+            plaintext_length: 128,
+            ciphertext_length: 144,
+        };
+        let page = BufferPool::new(admission.clone())
+            .ciphertext(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 144)
+                    .unwrap(),
+                envelope,
+                vec![0x5a; 144],
+            )
+            .unwrap();
+        let response = PeerResponse::Page {
+            metadata: ObjectMetadata {
+                version,
+                length: 128,
+                expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            },
+            ciphertext: page,
+        };
+        let mut head = p::response_head(
+            &response,
+            &[4; 32],
+            &[signers[0].node().clone(), signers[2].node().clone()],
+        )
+        .unwrap();
+        p::push(&mut head, "racer-receiver", &signers[0].node().0);
+        let response = SignedResponse {
+            authentication: ForwardedHead {
+                original: Arc::new(signers[2].sign(head).unwrap()),
+                hops: vec![],
+            },
+            response,
+        };
+        let binding = Binding {
+            request: [4; 32],
+            response: [0; 32],
+            transfer: TransferId([6; 16]),
+            membership: 1,
+            deadline: p::encode_deadline(scope.deadline).unwrap(),
+            rail: RailId(7),
+        };
+        let accept = binding
+            .sign(
+                &signers[0],
+                signers[2].node(),
+                Phase::Accept,
+                &[0; 32],
+                0,
+                vec![],
+            )
+            .unwrap();
+        let accept_wire = super::super::wire::encode_signed(&accept).unwrap();
+        let network = super::super::PeerNetwork::new(signers[2].node().clone(), 1).unwrap();
+        network
+            .install(Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    [0, 2]
+                        .into_iter()
+                        .map(|i| Member {
+                            node: signers[i].node().clone(),
+                            shares: std::num::NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                            rails: mappings.clone(),
+                            alignment_enabled: true,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
+        let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
+        let receive = async {
+            let initial = MessageHead {
+                start: StartLine::Request {
+                    method: "POST".into(),
+                    target: "/test".into(),
+                },
+                headers: vec![extension("content-length", b"0".to_vec())],
+            };
+            let sent = receiver.io.send_head(a, initial, &scope).await?;
+            let mut offered = receiver.io.receive_head(sent.connection, &scope).await?;
+            let control = native::detach(&mut offered.value)?.ok_or(Error::Unavailable)?;
+            let (auth, length) = WireCodec::decode(offered.value, true)?;
+            assert_eq!(length, 0, "provider test requires native offer");
+            receiver
+                .receive_native(
+                    offered.connection,
+                    auth,
+                    binding.clone(),
+                    accept,
+                    signers[2].node().clone(),
+                    control,
+                    &scope,
+                )
+                .await
+        };
+        let send = async {
+            let received = sender.io.receive_head(b, &scope).await?;
+            let (verified, _) = binding.verify(
+                &signers[2],
+                signers[0].node(),
+                super::super::wire::decode_signed(&accept_wire)?,
+                &[Phase::Accept],
+                &[0; 32],
+                0,
+                &scope,
+            )?;
+            let (mut conn, sent) = sender
+                .send_native(
+                    received.connection,
+                    &response,
+                    (binding.clone(), verified),
+                    &network,
+                    &scope,
+                )
+                .await?;
+            assert!(sent);
+            conn.finish_exchange()?;
+            Ok::<(), Error>(())
+        };
+        let mut exchange = std::pin::pin!(async { futures::try_join!(receive, send) });
+        let (result, ()) = loop {
+            if let Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), &mut cx) {
+                break result.expect("native provider roundtrip");
+            }
+            receive_engine.poll_budgeted(8).unwrap();
+            send_engine.poll_budgeted(8).unwrap();
+            reactor.poll_budgeted(128).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        };
+        match result.response {
+            PeerResponse::Page { ciphertext, .. } => assert_eq!(ciphertext.bytes(), &[0x5a; 144]),
+            _ => panic!("expected page"),
+        }
+        assert_eq!(
+            sender.native_completed.get(),
+            1,
+            "HTTP fallback cannot pass a native success test"
+        );
+        assert_eq!(sender.native_fallbacks.get(), 0);
+        assert_eq!(receiver.native_completions.get(), 1);
+    }
 }
 async fn fence(session: &crate::rdma::session::SessionLease, scope: &RequestScope) -> Result<()> {
     let cancellation = scope.cancellation.subscribe()?;
@@ -302,6 +673,13 @@ impl Transfers {
             return Ok((connection, false));
         };
         let (mut binding, accept) = admitted;
+        let mut bounded_scope = scope.clone();
+        bounded_scope.deadline.0 = bounded_scope
+            .deadline
+            .0
+            .min(crate::security::protocol::decode_deadline(binding.deadline)?.0);
+        let scope = &bounded_scope;
+        scope.check()?;
         let peer = accept.peer.node();
         let path = crate::security::protocol::decode_nodes(
             crate::security::protocol::field(
@@ -404,12 +782,13 @@ impl Transfers {
         }
         let descriptor =
             AuthenticatedDescriptor::from_verified(&grant, &session, binding.transfer)?;
+        let native_deadline = native_scope(scope);
         let complete = match rdma
-            .send_to(&session, ciphertext.clone(), descriptor, scope)
+            .send_to(&session, ciphertext.clone(), descriptor, &native_deadline)
             .await
         {
             Ok(complete) => complete,
-            Err(error) if recoverable(error) => {
+            Err(error) if native_failure(error, scope) => {
                 fence(&session, scope).await?;
                 return self
                     .failed_then_fallback(connection, response, &binding, peer, previous, scope)
@@ -448,6 +827,8 @@ impl Transfers {
         }
         let finish = binding.sign(signatures, peer, Phase::Finish, &previous, 0, vec![])?;
         connection = self.write_control(connection, finish, scope).await?;
+        #[cfg(test)]
+        self.native_completed.set(self.native_completed.get() + 1);
         Ok((connection, true))
     }
     async fn failed_then_fallback(
@@ -493,6 +874,8 @@ impl Transfers {
         previous: [u8; 32],
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
+        #[cfg(test)]
+        self.native_fallbacks.set(self.native_fallbacks.get() + 1);
         scope.check()?;
         let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
         let PeerResponse::Page { ciphertext, .. } = &response.response else {
@@ -649,7 +1032,7 @@ impl Transfers {
     ) -> Result<SignedResponse> {
         let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
         let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
-        let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, _) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
         binding.response = native::envelope_digest(&authentication)?;
         let (offer, _) = binding.verify(
             signatures,
@@ -718,9 +1101,10 @@ impl Transfers {
             }
             Err(error) => return Err(error),
         };
-        if let Err(error) = session.wait_ready(scope).await {
+        let native_deadline = native_scope(scope);
+        if let Err(error) = session.wait_ready(&native_deadline).await {
             fence(&session, scope).await?;
-            if recoverable(error) {
+            if native_failure(error, scope) {
                 return self
                     .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
                     .await;
@@ -737,10 +1121,10 @@ impl Transfers {
             }
             Err(error) => return Err(error),
         };
-        if let Err(error) = grant.wait_bound(scope).await {
+        if let Err(error) = grant.wait_bound(&native_deadline).await {
             fence(&session, scope).await?;
             drop(grant);
-            if recoverable(error) {
+            if native_failure(error, scope) {
                 return self
                     .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
                     .await;
@@ -777,12 +1161,20 @@ impl Transfers {
                 .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
                 .await;
         }
+        let native_deadline = native_scope(scope);
         let page = match rdma
-            .finish_receive(&session, grant, &completed, envelope, admission, scope)
+            .finish_receive(
+                &session,
+                grant,
+                &completed,
+                envelope,
+                admission,
+                &native_deadline,
+            )
             .await
         {
             Ok(page) => page,
-            Err(error) if recoverable(error) => {
+            Err(error) if native_failure(error, scope) => {
                 fence(&session, scope).await?;
                 return self
                     .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
@@ -790,6 +1182,9 @@ impl Transfers {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        self.native_completions
+            .set(self.native_completions.get() + 1);
         let done = binding.sign(signatures, &peer, Phase::Done, &previous, 0, vec![])?;
         previous = signed_digest(&done)?;
         connection = self.write_control(connection, done, scope).await?;
@@ -824,7 +1219,6 @@ impl Transfers {
             &crate::security::protocol::response_head(&response, &request_digest, &path)?,
             false,
         )?;
-        let _ = codec;
         Ok(SignedResponse {
             authentication,
             response,

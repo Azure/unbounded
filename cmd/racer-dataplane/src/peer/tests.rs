@@ -123,6 +123,7 @@ fn request(admission: &Admission, attempt: u8) -> PeerRequest {
         destination: NodeId(C.into()),
         visited: vec![NodeId(A.into())],
         remaining_links: 4,
+        remaining_attempts: 0,
         deadline: scope.deadline,
     };
     let origin = PeerOriginContext {

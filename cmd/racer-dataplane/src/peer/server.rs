@@ -341,6 +341,7 @@ impl PeerServer {
                 Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,
                 Err(Error::Overloaded) => PeerResponse::Overloaded,
                 Err(Error::Unauthorized) => PeerResponse::OriginRejected,
+                Err(Error::OriginForbidden) => PeerResponse::OriginForbidden,
                 Err(Error::Unavailable | Error::Io | Error::MissingKey | Error::CorruptRecord) => {
                     PeerResponse::Unavailable
                 }

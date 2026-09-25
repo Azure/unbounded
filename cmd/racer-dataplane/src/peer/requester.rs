@@ -132,24 +132,30 @@ impl PeerTransport for Requester {
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(budget.membership, &next)?;
-            let plan = if let super::wire::Operation::Page { page, .. } = &request.request.operation
-            {
-                let search = super::search_budget(budget, &network.local)?;
-                let route = self
-                    .paths
-                    .shortest_async(
-                        network.membership(budget.membership)?,
-                        &network.local,
-                        &search,
-                    )
-                    .await?;
-                if route.nodes.get(1) != Some(&next) {
-                    return Err(Error::Unavailable);
+            let mut plan =
+                if let super::wire::Operation::Page { page, .. } = &request.request.operation {
+                    let search = super::search_budget(budget, &network.local)?;
+                    let route = self
+                        .paths
+                        .shortest_async(
+                            network.membership(budget.membership)?,
+                            &network.local,
+                            &search,
+                        )
+                        .await?;
+                    if route.nodes.get(1) != Some(&next) {
+                        return Err(Error::Unavailable);
+                    }
+                    self.rails.select(&route, page)?
+                } else {
+                    crate::topology::rails::TransportPlan::Http
+                };
+            if matches!(plan, crate::topology::rails::TransportPlan::Rdma { .. }) {
+                let capabilities = self.handshake.negotiate(&next).await?;
+                if !capabilities.rdma || !capabilities.scoped_grants {
+                    plan = crate::topology::rails::TransportPlan::Http;
                 }
-                self.rails.select(&route, page)?
-            } else {
-                crate::topology::rails::TransportPlan::Http
-            };
+            }
             self.transfers
                 .exchange_planned(endpoint, request, plan, &scope)
                 .await

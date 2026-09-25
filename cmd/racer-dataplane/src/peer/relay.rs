@@ -102,6 +102,7 @@ impl Relay {
                 destination: budget.destination.clone(),
                 visited,
                 remaining_links,
+                remaining_attempts: budget.remaining_attempts,
                 deadline: budget.deadline,
             };
             let outbound = self

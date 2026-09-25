@@ -46,6 +46,12 @@ impl IoBuffer for WireBuffer {
 }
 
 pub struct Transfers {
+    #[cfg(test)]
+    pub(super) native_completions: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) native_completed: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) native_fallbacks: std::cell::Cell<usize>,
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
     pub(super) rdma: Option<Rc<RdmaTransfer>>,
@@ -58,6 +64,12 @@ pub struct Transfers {
 impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
+            #[cfg(test)]
+            native_completions: std::cell::Cell::new(0),
+            #[cfg(test)]
+            native_completed: std::cell::Cell::new(0),
+            #[cfg(test)]
+            native_fallbacks: std::cell::Cell::new(0),
             http,
             io,
             rdma,

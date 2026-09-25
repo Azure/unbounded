@@ -2,9 +2,9 @@
 
 This peer-owned extension uses `Signatures::sign/verify` without a separate signing
 algorithm or signature-base encoder. `protocol::agrees` enforces exact application
-fields for each state. Security review has not been independently completed; the
-available session tools provide no agent messaging API. This document records the
-implemented schema for that review rather than claiming external approval.
+fields for each state. The security owner reviewed the live schema and typed
+consumers; see `designs/racer-peer-security.md`, "Native setup/grant/completion
+security review," for the validation contract and verification requirements.
 
 Every control has `content-length`, `racer-kind: payload-v1-<state>`, receiver, and:
 
@@ -59,6 +59,12 @@ terminal fallback, but no native grant is reused and no new native write is issu
 All future native attempts allocate a fresh ID, QP, and window. Authentication,
 deadline, and cancellation failures close the attempt without fallback.
 
+Native connect/bind/write/invalidate waits use a local five-second subdeadline,
+clamped to the original request deadline. A native subdeadline failure can select
+HTTP only while the original scope remains live and after the terminal fence.
+The paired worker must continue polling attempt futures and native progress so
+deadlines wake even when a provider has stopped producing completions.
+
 ## Review points
 
 - The payload-envelope digest is domain-separated and contains only security-owned
@@ -70,3 +76,13 @@ deadline, and cancellation failures close the attempt without fallback.
   activation can veto membership, never invent a mapping.
 - Failed control sockets close the attempt; logical acquisition policy owns any
   later retry and retains original budget/deadline constraints.
+
+## Provider-gated verification
+
+The ignored `native_provider_signed_setup_grant_write_completion_roundtrip` test
+activates the real native lifecycle on both ends, exchanges signed controls over
+a real Unix socket, and requires native completion counters on both sides. HTTP
+fallback cannot satisfy it. Run with `--all-features --ignored --exact` and the
+fully qualified `peer::native_io::tests::` test name after setting
+`RACER_RDMA_TEST_DEVICE`, `RACER_RDMA_TEST_PORT`, `RACER_RDMA_TEST_GID` (32 hex
+digits), and the administrator library path for the built ABI v2 adapter.
