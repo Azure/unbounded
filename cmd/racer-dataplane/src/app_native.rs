@@ -58,16 +58,15 @@ impl NativePairs {
     }
 }
 impl Application {
+    /// Trusted startup associations, not a report of activated hardware or rails.
+    pub fn fabric_ports(&self) -> &[FabricPort] {
+        &self.fabric_ports
+    }
+
     /// Trusted physical associations only. Rail IDs and alignment remain exclusively
     /// controller-owned. No I/O, native discovery, or extra threads are created.
     pub fn with_fabric_ports(mut self, ports: Vec<FabricPort>) -> Result<Self> {
-        if ports.len() > 64
-            || ports
-                .iter()
-                .any(|p| p.fabric.is_empty() || p.device.is_empty() || p.port == 0)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
+        crate::config::validate_fabric_ports(&ports)?;
         self.fabric_ports = ports;
         Ok(self)
     }

@@ -218,14 +218,32 @@ Native operation requires all of:
 5. Authenticated controller rail/alignment membership plus trusted local
    `FabricPort` associations and sufficient registered slot budget.
 
-**Current executable limit:** `Application::assemble` initializes an empty
-fabric-port list (`src/app.rs:165-171`), and `src/main.rs:15-17` does not call
-`with_fabric_ports`. `src/app_native.rs:80-83` therefore leaves native activation
-off in this entry point even with the image feature and environment flag.
-The trusted programmatic hook is `src/app_native.rs:60-73`; there is currently
-no environment path for those associations. Packaging does not invent a mapping
-from NIC ordering to controller fabric labels. HTTP remains available when
-native prerequisites are absent or incompatible.
+Supply trusted local associations with exactly one of these environment options:
+
+- `RACER_FABRIC_PORTS`: inline JSON array, at most 4096 bytes, no literal control
+  characters. Example (replace with verified local values):
+  `[{"fabric":"fabric-a","device":"mlx5_0","port":1,"gid":"fe800000000000000000000000001234"}]`.
+- `RACER_FABRIC_PORTS_FILE`: absolute path to an operator-managed read-only regular
+  JSON file, for example `/etc/racer/native/ports.json`, at most 65536 bytes.
+  Mount a ConfigMap/projected file readable by UID 65532; projection symlinks and
+  JSON newlines are supported. Keep it separate from writable identity/slab paths.
+  The file is read once before startup; restart to apply changes.
+
+Both default to absent; both set together or an empty value/file fails startup.
+`[]` explicitly supplies no associations. At most 64 entries are accepted, with
+required `fabric`, `device`, and integer `port` (1-255), plus optional `gid`
+(omitted/null or 32 lowercase hex digits, nonzero and nonmulticast). Device names
+are 1-63 ASCII bytes, start alphanumeric, and contain only alphanumerics, `_`,
+`.`, or `-`, without `..`. Fabric labels are opaque UTF-8, 1-4096 bytes, without
+controls or surrounding ASCII spaces. Duplicate fabrics/physical ports and unknown
+or duplicate fields fail startup. See [CONFIGURATION.md](CONFIGURATION.md) for
+the full validation and trust contract.
+
+The executable forwards these associations to `Application::with_fabric_ports`.
+They constrain discovered physical ports against authenticated published rails;
+they never supply rail IDs/alignment or infer fabric labels from device names.
+An optional GID pins the discovered value, not a configurable GID table index.
+HTTP remains available when native prerequisites are absent or incompatible.
 
 Follow [native/README.md](native/README.md) for explicitly gated provider tests.
 A real-libibverbs compile or no-device test validates linkage/fallback only.

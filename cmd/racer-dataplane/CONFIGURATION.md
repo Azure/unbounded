@@ -1,7 +1,9 @@
 # Dataplane configuration
 
-`Config::from_env()` parses the settings below and calls `Config::validate()`.
+`Config::from_env()` parses base settings and calls `Config::validate()`.
 Both are side-effect-free with respect to files, sockets, pools, and threads.
+The executable uses `Config::from_env_with_fabric_ports()` to additionally load
+trusted native associations, including a projected file when explicitly selected.
 Malformed settings return `Error::InvalidConfiguration` without including values
 in diagnostics. Optional settings default only when absent; empty is invalid.
 Integers are unsigned decimal with no sign, whitespace, or unit suffix. Byte
@@ -57,6 +59,59 @@ sentinel. Do not replace it with the node name, a random UUID, or an environment
 alignment come from accepted controller membership. Other unrelated environment
 variables are ignored. CPU/cpuset/quota discovery belongs to runtime
 `AffinityPlan`; config neither reads CPU files nor overrides allowed CPUs.
+
+## Trusted local native associations
+
+| Environment variable | Default | Contract |
+| --- | --- | --- |
+| `RACER_FABRIC_PORTS` | Absent (no associations) | JSON array, at most 4096 bytes with no literal control characters |
+| `RACER_FABRIC_PORTS_FILE` | Absent | Absolute path to a read-only operator-managed JSON file, at most 65536 bytes |
+
+The two sources are mutually exclusive, even if either value is empty. An empty
+environment value or file is invalid; `[]` explicitly selects no associations.
+The file path follows the lexical path rules above and must not contain or live
+inside the identity or slab directories. It must resolve to a readable regular
+file. Kubernetes projection symlinks are supported; one opened descriptor is read
+once before application startup, with a hard byte cap even if the file grows.
+JSON whitespace/newlines are allowed in files. Changes require process restart.
+Mount the file read-only, readable by the runtime UID, with write access limited
+to trusted deployment administrators. It is local physical configuration, not a
+controller publication or a source of rail/alignment authority.
+
+Example inline value (replace every association with verified local values):
+
+```sh
+export RACER_FABRIC_PORTS='[{"fabric":"fabric-a","device":"mlx5_0","port":1,"gid":"fe800000000000000000000000001234"}]'
+```
+
+Each entry accepts exactly `fabric`, `device`, `port`, and optional `gid`:
+
+- `fabric`: nonempty opaque UTF-8 label, at most 4096 bytes, no control characters
+  or leading/trailing ASCII spaces. Compared exactly to authenticated membership;
+  labels are never inferred from NIC names, GIDs, or enumeration order.
+- `device`: 1-63 ASCII bytes; first character alphanumeric, remaining characters
+  alphanumeric, `_`, `.`, or `-`; `..` is forbidden. This is the native device name.
+- `port`: JSON integer from 1 through 255.
+- `gid`: optional (omitted or `null` means no GID pin), exactly 32 lowercase hex
+  digits in network byte order; zero and multicast GIDs are invalid. A configured
+  GID pins matching against discovery; it does not select a GID table index. The
+  current adapter discovers index zero. Discovery must still be unambiguous when
+  the pin is omitted.
+
+At most 64 entries are accepted. Duplicate fabric labels and repeated physical
+`(device, port)` pairs are rejected even when their GIDs differ. Unknown or
+duplicate JSON fields, invalid numeric types, and malformed/trailing JSON fail
+startup with `InvalidConfiguration`, including when RDMA is disabled. File read
+errors also fail startup rather than silently discarding an explicit mapping.
+
+Main forwards associations through `Application::with_fabric_ports`. Activation
+still requires the Rust `rdma` feature, `RACER_ENABLE_RDMA=true`, native resources
+and quota, and authenticated local rail/alignment membership. Native matching
+requires exactly one association and discovered port for each published fabric,
+including GID and published NUMA constraints. Extra unpublished associations do
+not create rails. Missing or incompatible hardware/publication retains HTTP
+fallback. `Config::from_env()` alone does not load these separate associations;
+embedders must explicitly supply them to the builder.
 
 ## Storage and timeouts
 
@@ -130,6 +185,8 @@ recheck them after partitioning and reduce the pair count if needed):
 
 1. Call `Config::from_env` (or `validate` for programmatically constructed config)
    before creating resources. Preserve all existing `Config` fields.
+   The executable instead calls `from_env_with_fabric_ports`, then forwards the
+   returned associations to `Application::with_fabric_ports` before `run`.
 2. Discover and validate `AffinityPlan`, including actual CPU pairs, quotas, and
    thread accounting. Eight is a total thread default, not eight worker pairs.
 3. On the sole control owner, validate trust and recover or bootstrap the signing
