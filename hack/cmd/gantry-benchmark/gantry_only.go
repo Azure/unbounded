@@ -241,6 +241,14 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 		return err
 	}
 
+	if state.ArtifactStreaming {
+		if err := b.prepareArtifactStreaming(ctx, state, gantryImage); err != nil {
+			return err
+		}
+
+		state.ArtifactStreamingPrepared = true
+	}
+
 	state.StandaloneGantry = true
 	state.BaselineImage = ""
 	state.GantryColdImage = gantryImage
@@ -257,6 +265,135 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("prepared standalone Gantry image for %s using random payload %s\n", state.RunID, payloadSHA))
+
+	return nil
+}
+
+func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmarkState, imageReference string) error {
+	if b.config.GantryACRName == "" {
+		return fmt.Errorf("BENCHMARK_ARTIFACT_STREAMING requires GANTRY_ACR_NAME")
+	}
+
+	repository, digest, err := splitImageReference(imageReference, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("resolve Artifact Streaming image: %w", err)
+	}
+	if !strings.HasPrefix(digest, "sha256:") {
+		return fmt.Errorf("Artifact Streaming image must be digest-pinned: %s", imageReference)
+	}
+	image := repository + "@" + digest
+
+	updateOutput, err := b.runArtifactStreamingCommand(ctx,
+		"update",
+		"--name", b.config.GantryACRName,
+		"--repository", state.WorkloadRepository,
+		"--enable-streaming", "true",
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
+	}
+	if err := requireArtifactStreamingSucceeded(updateOutput); err != nil {
+		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
+	}
+
+	createOutput, err := b.runArtifactStreamingCommand(ctx,
+		"create",
+		"--name", b.config.GantryACRName,
+		"--image", image,
+		"--no-wait",
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+	}
+	operation, err := parseArtifactStreamingOperation(createOutput)
+	if err != nil {
+		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+	}
+	if operation.Status == "Succeeded" {
+		return nil
+	}
+	if operation.ID == "" {
+		return fmt.Errorf("convert image %s for Artifact Streaming: operation has no ID and status %q", image, operation.Status)
+	}
+	operationID := operation.ID
+
+	writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationID, operation.Status))
+
+	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(b.config.ArtifactStreamingPoll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("Artifact Streaming conversion %s did not complete within %s", operationID, b.config.ArtifactStreamingTimeout)
+		case <-ticker.C:
+			statusOutput, err := b.runArtifactStreamingCommand(ctx,
+				"operation", "show",
+				"--name", b.config.GantryACRName,
+				"--repository", repository,
+				"--id", operationID,
+				"--only-show-errors",
+				"--output", "json",
+			)
+			if err != nil {
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationID, err)
+			}
+
+			operation, err = parseArtifactStreamingOperation(statusOutput)
+			if err != nil {
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationID, err)
+			}
+			writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationID, operation.Status))
+
+			switch operation.Status {
+			case "Succeeded":
+				return nil
+			case "Failed", "Canceled", "Cancelled":
+				return fmt.Errorf("Artifact Streaming conversion %s ended with status %s", operationID, operation.Status)
+			}
+		}
+	}
+}
+
+func (b *benchmark) runArtifactStreamingCommand(ctx context.Context, args ...string) ([]byte, error) {
+	commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	commandArgs := append([]string{"acr", "artifact-streaming"}, args...)
+
+	return b.commands.Run(commandContext, nil, "az", commandArgs...)
+}
+
+type artifactStreamingOperation struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+func parseArtifactStreamingOperation(output []byte) (artifactStreamingOperation, error) {
+	var operation artifactStreamingOperation
+	if err := json.Unmarshal(output, &operation); err != nil {
+		return artifactStreamingOperation{}, fmt.Errorf("decode operation: %w", err)
+	}
+
+	return operation, nil
+}
+
+func requireArtifactStreamingSucceeded(output []byte) error {
+	operation, err := parseArtifactStreamingOperation(output)
+	if err != nil {
+		return err
+	}
+	if operation.Status != "Succeeded" {
+		return fmt.Errorf("operation status is %q, want Succeeded", operation.Status)
+	}
 
 	return nil
 }
@@ -603,6 +740,13 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 
 	if state.Status != "preflight-passed" {
 		return fmt.Errorf("benchmark state is %q, run preflight before run-gantry", state.Status)
+	}
+
+	if state.ArtifactStreaming != b.config.ArtifactStreaming {
+		return fmt.Errorf("benchmark Artifact Streaming state=%t does not match BENCHMARK_ARTIFACT_STREAMING=%t", state.ArtifactStreaming, b.config.ArtifactStreaming)
+	}
+	if state.NodePool != b.config.NodePool {
+		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
 	}
 
 	if err := b.requireLock(ctx, state.RunID); err != nil {

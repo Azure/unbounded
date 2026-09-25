@@ -63,6 +63,9 @@ server = "http://%s:5002"
 	case hostsModeGantry:
 		if state.GantryRoutingStrategy == gantryRoutingFailOpen {
 			fallbackServer := "https://" + registry
+			if state.ArtifactStreaming {
+				fallbackServer = "http://127.0.0.1:8578"
+			}
 
 			if state.usesProxy() {
 				if state.ProxyClusterIP == "" {

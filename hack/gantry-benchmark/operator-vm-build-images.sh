@@ -32,9 +32,12 @@ if [[ -f "$image_state" ]]; then
     # shellcheck source=/dev/null
     . "$image_state"
     if [[ "$GANTRY_IMAGE" == "$gantry_login/gantry@sha256:"* &&
-      "$BASELINE_PROBE_IMAGE" == "$baseline_login/gantry-deploy-probe@sha256:"* ]]; then
-      jq -cn --arg gantry_image "$GANTRY_IMAGE" --arg baseline_probe_image "$BASELINE_PROBE_IMAGE" \
-        '{gantry_image:$gantry_image,baseline_probe_image:$baseline_probe_image}' | \
+      "$BASELINE_PROBE_IMAGE" == "$baseline_login/gantry-deploy-probe@sha256:"* &&
+      ( "$BENCHMARK_ARTIFACT_STREAMING" != true || "${GANTRY_NODE_CONFIG_IMAGE:-}" == "$gantry_login/gantry-node-config@sha256:"* ) ]]; then
+      jq -cn --arg gantry_image "$GANTRY_IMAGE" \
+        --arg gantry_node_config_image "${GANTRY_NODE_CONFIG_IMAGE:-}" \
+        --arg baseline_probe_image "$BASELINE_PROBE_IMAGE" \
+        '{gantry_image:$gantry_image,gantry_node_config_image:$gantry_node_config_image,baseline_probe_image:$baseline_probe_image}' | \
         sed 's/^/DEPLOYMENT_IMAGES_JSON=/'
       exit 0
     fi
@@ -71,6 +74,16 @@ podman build --isolation chroot --platform linux/amd64 \
 gantry_digest_file=/var/lib/gantry-benchmark/gantry-deploy.digest
 podman push --digestfile "$gantry_digest_file" "$gantry_tag" >>"$log_file" 2>&1
 gantry_digest=$(tr -d '[:space:]' <"$gantry_digest_file")
+
+gantry_node_config_digest=""
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+  gantry_node_config_tag="$gantry_login/gantry-node-config:benchmark-$source_short"
+  podman build --isolation chroot --platform linux/amd64 \
+    --tag "$gantry_node_config_tag" --file images/gantry-node-config/Containerfile . >>"$log_file" 2>&1
+  gantry_node_config_digest_file=/var/lib/gantry-benchmark/gantry-node-config-deploy.digest
+  podman push --digestfile "$gantry_node_config_digest_file" "$gantry_node_config_tag" >>"$log_file" 2>&1
+  gantry_node_config_digest=$(tr -d '[:space:]' <"$gantry_node_config_digest_file")
+fi
 podman logout "$gantry_login" >>"$log_file" 2>&1
 
 registry_login "$baseline_acr" "$baseline_login"
@@ -83,14 +96,21 @@ probe_digest=$(tr -d '[:space:]' <"$probe_digest_file")
 podman logout "$baseline_login" >>"$log_file" 2>&1
 
 GANTRY_IMAGE="$gantry_login/gantry@$gantry_digest"
+GANTRY_NODE_CONFIG_IMAGE=""
+if [[ -n "$gantry_node_config_digest" ]]; then
+  GANTRY_NODE_CONFIG_IMAGE="$gantry_login/gantry-node-config@$gantry_node_config_digest"
+fi
 BASELINE_PROBE_IMAGE="$baseline_login/gantry-deploy-probe@$probe_digest"
 cat >"$image_state" <<IMAGES
 SOURCE_REVISION='$source_revision'
 GANTRY_IMAGE='$GANTRY_IMAGE'
+GANTRY_NODE_CONFIG_IMAGE='$GANTRY_NODE_CONFIG_IMAGE'
 BASELINE_PROBE_IMAGE='$BASELINE_PROBE_IMAGE'
 IMAGES
 chmod 0600 "$image_state"
 
-jq -cn --arg gantry_image "$GANTRY_IMAGE" --arg baseline_probe_image "$BASELINE_PROBE_IMAGE" \
-  '{gantry_image:$gantry_image,baseline_probe_image:$baseline_probe_image}' | \
+jq -cn --arg gantry_image "$GANTRY_IMAGE" \
+  --arg gantry_node_config_image "$GANTRY_NODE_CONFIG_IMAGE" \
+  --arg baseline_probe_image "$BASELINE_PROBE_IMAGE" \
+  '{gantry_image:$gantry_image,gantry_node_config_image:$gantry_node_config_image,baseline_probe_image:$baseline_probe_image}' | \
   sed 's/^/DEPLOYMENT_IMAGES_JSON=/'
