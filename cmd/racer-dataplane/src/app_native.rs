@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub(super) struct NativePairs {
-    ports: Mutex<HashMap<WorkerId, (Option<IoPort>, Option<NativePort>)>>,
+    ports: Mutex<HashMap<WorkerId, NativePair>>,
 }
+type NativePair = (Option<IoPort>, Option<NativePort>);
 impl NativePairs {
     pub(super) fn prepare(
         &self,

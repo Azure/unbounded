@@ -13,15 +13,14 @@ acceptance checklist. Test totals in that log are attributed owner observations;
 the documentation auditor did not rerun the suites. See
 `designs/racer-production-validation.md` for the inspected coverage and limits.
 
-**Open blocker: multiworker membership retirement.** Each worker retains the shared
-membership in both its application deque and its worker-local network, but cleanup
-requires a global strong count of exactly two
-(`cmd/racer-dataplane/src/app.rs:910-930`). With two workers the idle count is at
-least four, so neither worker can retire first. This is an ownership-based inference
-requiring a regression test, not an observed test failure. Continued membership
-changes exhaust the bounded network table, whose install returns `Overloaded`
-(`cmd/racer-dataplane/src/peer.rs:41-54`). Fix and verify version churn beyond
-capacity, including retained request leases, before treating integration as done.
+**Resolved: multiworker membership retirement.** The audit found that a fixed
+global reference count could not retire memberships installed on several workers.
+`update_memberships` now serializes per-object structural-reference accounting
+across workers, including workers that skip publications. Publication and request
+leases still prevent retirement (`cmd/racer-dataplane/src/app.rs:1139-1171`). The
+regression `multiworker_memberships_retire_after_request_leases_and_reuse_capacity`
+holds an old request lease, then advances beyond the two-entry table capacity and
+exercises a publication installed on only one worker.
 
 Current application fixtures include separate-thread startup, a real two-pair
 WorkerGroup retirement/checkpoint cut, late-driver removal/rollback, and accepted
@@ -47,6 +46,69 @@ and production fixtures exercise metadata and version behavior
 copy is introduced here.
 
 ## Ownership and historical handoffs
+
+- Final integrator to active app editor: membership slot-capacity correction is
+  still absent at app.rs:617 (`retained_snapshots.get()` without +1) despite prior
+  passing component churn checks. Please include it before your app commit. Your
+  current churn test uses manually built PeerNetworks and cannot verify application
+  composition capacity. No other source changes requested by this final owner.
+
+- Final integrator committed documentation/formatting as `49160105`. Only active
+  app lifecycle/native test edits and audit docs remain. Please finish and commit
+  the app source set; send no more repeated full suites, as final verification
+  will run once after that commit. Current-plus-retained network capacity is the
+  remaining identified source issue. Preserve original branch SDK work; it is
+  still clean at `66ac6b83` and final cherry-pick excludes `61666a71`.
+
+- App lifecycle completion (2026-09-25): combined prior delegated app work is
+  preserved and completed. Cache generations require every worker's preparation;
+  removals pause ingress, retain rollback on rejected publication, install all
+  worker memory/writer tombstones, asynchronously invalidate both checkpoint slots,
+  and resume only after all removal acknowledgments. Capacity rejection precedes
+  the pause; superseding an uncommitted removal can retain the old cache. Retired
+  UIDs remain fenced for the process lifetime. Key retirement additionally waits
+  for retained read drivers, crypto/kernel/native completions and the last key
+  lease. Only the control worker prepares and binds listeners on resume. Startup
+  continuously drives prepared listeners during control retries. Shutdown waits
+  for active retirement checkpoint/native futures before publishing its cut.
+  Tests: 492 all-feature library tests passed, 6 hardware-gated ignored; 2 binary
+  tests passed; all-feature/all-target check passed. Focused app tests passed 17,
+  with 1 hardware-gated ignored. Includes real two-pair TLS startup/retirement,
+  central recovery/cut, late fills, failed publication rollback, nonempty-cache
+  non-listener resume, and multiworker membership churn with retained leases.
+  Remaining limitations: retirement pauses unrelated caches and diagnostics;
+  tombstone exhaustion requires restart; allocation failure after cache acceptance
+  retains the pause and retries. Recovery/checkpoint publication filesystem work
+  remains synchronous. Actual Go-controller interoperability and provider-backed
+  RDMA retirement are not established by these application fixtures. Strict Clippy
+  is blocked by warnings in other component paths; owned app warnings are fixed.
+
+- Final integrator additional membership review: SnapshotStore retained_limit is
+  an OLD-generation count (`control/snapshot.rs:136`), but PeerNetwork is constructed
+  with only retained_limit total slots (`app.rs` PeerNetwork::new). With two leased
+  old versions, publication of a third fits SnapshotStore but network.install fails
+  Overloaded and kills the worker. Active app editor: fund current plus retained
+  generations (checked +1), and extend churn test to hold old leases at the limit.
+
+- Final integrator: latest full settled-source run passed 490 library, 2 binary,
+  18 conformance, 6 production tests. Concurrent build artifact replacement caused
+  six doctest missing-rlib failures; immediate isolated `cargo test --all-features
+  --doc --quiet` passed all 31. Native no-device 3/3 and default build passed.
+  Active app editor must resolve the newly audited multiworker membership reference
+  count bug with a churn/held-lease regression before its commit. Please record
+  completion here, then yield app sources. Final cherry-pick remains this session's.
+
+- App read-only recheck after membership/capacity fixes: `cargo test --lib app::
+  --all-features` passed 17, ignored 1 hardware case. The new multiworker membership
+  lease/capacity regression passes. Central structural-reference accounting in
+  `update_memberships` replaces the prior fixed-count blocker; audit prose above
+  should be refreshed by final doc owner. Tests also pass superseded removal and
+  non-listener worker resume. Full-suite totals above predate these three additions.
+
+- App read-only doctest verification: `cargo test --doc --all-features` passed all
+  31 tests (6 ordinary compile/run and 25 compile-fail ownership contracts).
+  App handoff remains in effect; the active retirement editor owns combined app
+  commit, final integrator owns final formatting/suite/cherry-pick. No tests removed.
 
 - App read-only full verification: `cargo test --all-targets --all-features` passed
   488 library + 2 executable + 18 client/origin conformance + 6 production graph

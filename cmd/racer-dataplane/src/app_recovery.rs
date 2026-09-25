@@ -188,6 +188,41 @@ mod tests {
                 .sequence,
             1
         );
+        let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
+        let object = crate::model::identity::ObjectId {
+            cache: crate::model::identity::CacheId(crate::security::identity::tests::CACHE.into()),
+            key: crate::model::identity::CacheKey([9; 32]),
+        };
+        let owner = node.workers.metadata_owner(&object).unwrap();
+        let shard = oversized
+            .shards
+            .iter_mut()
+            .find(|s| s.worker == owner)
+            .unwrap();
+        for version in 0..5 {
+            shard
+                .index
+                .metadata
+                .push(crate::model::metadata::VersionMetadata {
+                    version: crate::model::identity::ObjectVersion {
+                        object: object.clone(),
+                        etag: crate::model::identity::StrongEtag::test_value(&version.to_string()),
+                    },
+                    length: 0,
+                });
+        }
+        assert_eq!(
+            select(
+                vec![oversized, image(1, &[WorkerId(0), WorkerId(1)])],
+                &geometry,
+                &node.workers,
+                4,
+                &keys
+            )
+            .unwrap()
+            .sequence,
+            1
+        );
         assert!(
             select(
                 vec![image(2, &[WorkerId(0)])],

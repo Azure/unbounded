@@ -20,7 +20,7 @@ use crate::{
         enrollment::Enrollment,
         secrets::SecretWatcher,
         snapshot::{PublishedState, SnapshotStore},
-        transport::{ControlTransport, ReactorControlIo},
+        transport::ReactorControlIo,
     },
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::HttpPool},
@@ -31,7 +31,7 @@ use crate::{
     },
     origin::client::{Origin, OriginClient},
     peer::{
-        handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
+        PeerNetwork, handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
         transfer::Transfers,
     },
     rdma::{
@@ -93,12 +93,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "app_caches.rs"]
+mod caches;
 #[path = "app_health.rs"]
 mod health;
 #[path = "app_native.rs"]
 mod native;
 #[path = "app_recovery.rs"]
 mod recovery;
+#[path = "app_retirement.rs"]
+mod retirement;
 
 pub struct Application {
     config: Arc<Config>,
@@ -121,11 +125,15 @@ pub struct NodeState {
     recovery: Mutex<recovery::RecoveryCut>,
     observations: health::Observations,
     native: native::NativePairs,
+    cache_cut: Mutex<caches::CacheCut>,
+    retirement: Arc<retirement::Retirement>,
+    membership_owners: Mutex<std::collections::HashMap<usize, usize>>,
 }
 #[derive(Default)]
 struct CheckpointCut {
     shards: Vec<ShardImage>,
     result: Option<Result<()>>,
+    publishing: bool,
 }
 impl Default for NodeState {
     fn default() -> Self {
@@ -148,6 +156,9 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: health::Observations::default(),
             native: native::NativePairs::default(),
+            cache_cut: Mutex::new(caches::CacheCut::default()),
+            retirement: Arc::new(retirement::Retirement::new(count)),
+            membership_owners: Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -268,63 +279,59 @@ fn bootstrap(
     let admission = Rc::new(Admission::new(limits.clone()));
     let reactor = Rc::new(Reactor::new(admission));
     let io = Rc::new(ReactorControlIo::new(reactor.clone()));
-    let transport = ControlTransport::new(ControlEndpoint {
-        url: config.control_endpoint.clone(),
-        trust_bundle: config.trust_bundle.clone(),
-    });
-    transport.attach_io(io);
-    // read_bundle only parses the projection. It does not install node-bound keys.
     let unresolved = Rc::new(Keyring::new(
         config.cluster.clone(),
         NodeId(String::new()),
         node.keys.clone(),
     ));
-    let projection = SecretWatcher::new(config.secret_directory.clone(), unresolved);
-    projection.attach_reactor(reactor.clone());
-    let enrollment = Enrollment::new(
+    let projection = SecretWatcher::new(config.secret_directory.clone(), unresolved.clone());
+    let enrollment = Rc::new(Enrollment::new(
         config.cluster.clone(),
         config.service_account_token.clone(),
         config.identity_directory.clone(),
+    ));
+    let control = ControlClient::new(
+        ControlEndpoint {
+            url: config.control_endpoint.clone(),
+            trust_bundle: config.trust_bundle.clone(),
+        },
+        enrollment,
+        unresolved,
+        projection,
+        Rc::new(SnapshotStore::new(
+            config.cluster.clone(),
+            node.publications.clone(),
+            config.limits.retained_snapshots.get(),
+        )),
+        Rc::new(CacheRegistry),
     );
-    enrollment.attach_reactor(reactor.clone());
+    control.attach_io(io);
     let mut operation = Box::pin(async {
-        let bundle = projection.read_bundle_async(startup).await?;
-        enrollment.set_peer_trust_roots(bundle.peer_trust_roots.clone())?;
-        let identity = match enrollment.load_identity_async(startup).await? {
-            Some(identity) => identity,
-            None => {
-                let request = enrollment.prepare(startup).await?;
-                let bytes = crate::control::wire::encode_enrollment_request(&request)?;
-                let connection = transport.bootstrap(startup).await?;
-                let token = enrollment.read_token_async(startup).await?;
-                let response = connection
-                    .request(
-                        "POST",
-                        crate::control::wire::BOOTSTRAP_PATH,
-                        Some(&token),
-                        &bytes,
-                        crate::control::wire::MAX_ENROLLMENT_BYTES,
+        let identity = loop {
+            match control.start(startup).await {
+                Ok(identity) => break identity,
+                Err(
+                    Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded,
+                ) => {
+                    startup.check()?;
+                    let io = ReactorControlIo::new(reactor.clone());
+                    crate::control::transport::ControlIo::sleep(
+                        &io,
+                        control.next_attempt().unwrap_or_else(Instant::now),
                         startup,
                     )
                     .await?;
-                if response.status != 200 {
-                    return Err(Error::Unauthorized);
                 }
-                enrollment
-                    .accept_response_async(
-                        crate::control::wire::decode_enrollment_response(&response.body)?,
-                        startup,
-                    )
-                    .await?
+                Err(error) => return Err(error),
             }
         };
-        let keys = Keyring::new(
+        let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
             identity.node().clone(),
             node.keys.clone(),
-        );
-        keys.install(bundle)?;
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        ));
+        keys.register_retirement_barriers(node.retirement.clone())?;
+        control.bind_keyring(keys)?;
         Ok(identity.node().clone())
     });
     let waker = futures::task::noop_waker();
@@ -447,6 +454,17 @@ pub struct WorkerApplication {
     memory: Rc<MemoryCache>,
     caches: Vec<crate::control::caches::CacheDefinition>,
     slab_directory: std::path::PathBuf,
+    prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
+    cache_prepare_task: Option<Operation<'static, ()>>,
+    cache_preparing_generation: u64,
+    control_scope: Option<RequestScope>,
+    retiring: bool,
+    retirement_registered: bool,
+    retirement_native_started: bool,
+    retirement_scope: Option<RequestScope>,
+    retirement_native: Option<Operation<'static, ()>>,
+    retirement_resume: Option<Operation<'static, ()>>,
+    retirement_checkpoint: Option<Operation<'static, ()>>,
 }
 
 impl WorkerApplication {
@@ -747,6 +765,17 @@ impl WorkerApplication {
             memory,
             caches: Vec::new(),
             slab_directory: config.slab_directory.clone(),
+            prepared_listeners: Rc::new(std::cell::RefCell::new(None)),
+            cache_prepare_task: None,
+            cache_preparing_generation: 0,
+            control_scope: None,
+            retiring: false,
+            retirement_registered: false,
+            retirement_native_started: false,
+            retirement_scope: None,
+            retirement_native: None,
+            retirement_resume: None,
+            retirement_checkpoint: None,
         })
     }
 
@@ -779,7 +808,8 @@ impl WorkerApplication {
                 .ok_or(Error::InvalidConfiguration)?
                 .clone();
             node.prepared.fetch_add(1, Ordering::Release);
-            if let Some(control) = &self.control {
+            self.attach_cache_adapter();
+            if let Some(control) = self.control.clone() {
                 let identity = control.start(startup).await?;
                 if identity.node() != self.keys.node() {
                     return Err(Error::Unauthorized);
@@ -788,7 +818,13 @@ impl WorkerApplication {
                 // Accept a complete compatible first snapshot before any listener.
                 while self.snapshots.current().is_err() {
                     startup.check()?;
-                    match control.progress(startup).await {
+                    let mut progress = control.progress(startup);
+                    let result = std::future::poll_fn(|cx| {
+                        self.poll_cache_preparation(cx)?;
+                        progress.as_mut().poll(cx)
+                    })
+                    .await;
+                    match result {
                         Ok(_) => (),
                         Err(
                             Error::Io
@@ -810,6 +846,7 @@ impl WorkerApplication {
             }
             std::future::poll_fn(|cx| {
                 startup.check()?;
+                self.poll_cache_preparation(cx)?;
                 if STOP_REQUESTED.load(Ordering::Relaxed) {
                     return Poll::Ready(Err(Error::Cancelled));
                 }
@@ -852,27 +889,38 @@ impl WorkerApplication {
 
     async fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
         let snapshot = self.snapshots.current()?;
+        if !self.actual_rails.is_empty() {
+            let compatible = snapshot
+                .membership
+                .member(self.keys.node())
+                .is_ok_and(|member| {
+                    member.alignment_enabled
+                        && self.actual_rails.iter().all(|actual| {
+                            member.rails.iter().any(|published| {
+                                published.rail == actual.rail
+                                    && published.fabric == actual.fabric
+                                    && published
+                                        .numa_node
+                                        .is_none_or(|numa| actual.numa_node == Some(numa))
+                            })
+                        })
+                });
+            if !compatible {
+                if let Some(devices) = &self.devices {
+                    devices.close();
+                }
+                self.actual_rails.clear();
+            }
+        }
+        let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
+        update_memberships(
+            &self.network,
+            &mut self.memberships,
+            &node.membership_owners,
+            &snapshot.membership,
+        )?;
         if self.snapshot_sequence == Some(snapshot.sequence) {
             return Ok(());
-        }
-        // Retire only network references with no outstanding request lease.
-        self.memberships.retain(|membership| {
-            if membership.version != snapshot.membership.version
-                && Arc::strong_count(membership) == 2
-            {
-                self.network.retire(membership.version);
-                false
-            } else {
-                true
-            }
-        });
-        if !self
-            .memberships
-            .iter()
-            .any(|m| m.version == snapshot.membership.version)
-        {
-            self.network.install(snapshot.membership.clone())?;
-            self.memberships.push_back(snapshot.membership.clone());
         }
         for old in &self.caches {
             if !snapshot.caches.iter().any(|new| new.id == old.id) {
@@ -880,11 +928,7 @@ impl WorkerApplication {
                 self.store.writer.remove_cache(&old.id)?;
             }
         }
-        if self.control.is_some() {
-            self.clients
-                .reconcile(&snapshot.caches, current_scope)
-                .await?;
-        }
+        current_scope.check()?;
         self.caches = snapshot.caches.clone();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
@@ -892,7 +936,7 @@ impl WorkerApplication {
 
     async fn checkpoint(&self, deadline: &RequestScope) -> Result<()> {
         let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let image = match self.store.checkpoint.snapshot_shard().await {
+        let mut image = match self.store.checkpoint.snapshot_shard().await {
             Ok(image) => image,
             Err(error) => {
                 node.checkpoint
@@ -902,33 +946,49 @@ impl WorkerApplication {
                 return Err(error);
             }
         };
+        image.index.entries.retain(|(page, entry)| {
+            self.keys
+                .lease(
+                    Some(&page.version.object.cache),
+                    entry.key_id,
+                    KeyPurpose::Page,
+                )
+                .is_ok()
+        });
         node.checkpoint
             .lock()
             .map_err(|_| Error::Unavailable)?
             .shards
             .push(image);
+        let mut publication: Option<Operation<'_, ()>> = None;
         let result = std::future::poll_fn(|cx| {
+            if let Some(publish) = publication.as_mut() {
+                if let Poll::Ready(result) = std::pin::Pin::as_mut(publish).poll(cx) {
+                    node.checkpoint
+                        .lock()
+                        .map_err(|_| Error::Unavailable)?
+                        .result = Some(result);
+                    return Poll::Ready(result);
+                }
+                return Poll::Pending;
+            }
             let mut cut = node.checkpoint.lock().map_err(|_| Error::Unavailable)?;
             if let Some(result) = cut.result {
                 return Poll::Ready(result);
+            }
+            if cut.publishing {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             if let Err(error) = deadline.check() {
                 cut.result = Some(Err(error));
                 return Poll::Ready(Err(error));
             }
             if self.worker == node.control_worker && cut.shards.len() == node.count {
+                cut.publishing = true;
                 let shards = std::mem::take(&mut cut.shards);
                 drop(cut);
-                let mut publication = self.store.checkpoint.publish(shards);
-                let result = match publication.as_mut().poll(cx) {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => Err(Error::InvalidConfiguration),
-                };
-                node.checkpoint
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?
-                    .result = Some(result);
-                return Poll::Ready(result);
+                publication = Some(self.store.checkpoint.publish(shards));
             }
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -944,6 +1004,20 @@ impl WorkerApplication {
         }
         let budget = work_budget.min(64);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        if self.stopping {
+            for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
+                if let Some(result) = poll_task(task, &mut cx) {
+                    result?;
+                }
+            }
+        }
+        if !self.stopping && self.poll_retirement(&mut cx)? {
+            self.observe_health()?;
+            return Ok(());
+        }
+        if !self.stopping {
+            self.poll_cache_preparation(&mut cx)?;
+        }
         if let Some(result) = poll_task(&mut self.diagnostic_task, &mut cx) {
             if !self.stopping {
                 result?;
@@ -976,8 +1050,8 @@ impl WorkerApplication {
                 result?;
             }
         }
-        if let Some(result) = poll_task(&mut self.writer_task, &mut cx) {
-            if !matches!(
+        if let Some(result) = poll_task(&mut self.writer_task, &mut cx)
+            && !matches!(
                 result,
                 Err(Error::Io
                     | Error::Unavailable
@@ -985,9 +1059,9 @@ impl WorkerApplication {
                     | Error::MissingKey
                     | Error::Cancelled
                     | Error::DeadlineExceeded)
-            ) {
-                result?;
-            }
+            )
+        {
+            result?;
         }
         if self.writer_task.is_none() && self.store.writer.pending_count() != 0 {
             let writer = self.store.writer.clone();
@@ -997,29 +1071,8 @@ impl WorkerApplication {
             }));
         }
         if !self.stopping {
-            if let Some(result) = poll_task(&mut self.control_task, &mut cx) {
-                if !matches!(
-                    result,
-                    Err(Error::Io
-                        | Error::Unavailable
-                        | Error::Overloaded
-                        | Error::DeadlineExceeded)
-                ) {
-                    result?;
-                }
-            }
-            if self.control_task.is_none() {
-                if let Some(control) = &self.control {
-                    let control = control.clone();
-                    let turn = scope(crate::control::wire::POLL_WAIT + Duration::from_secs(10))?;
-                    self.control_task = Some(Box::pin(async move {
-                        control.progress(&turn).await.map(|_| ())
-                    }));
-                }
-            }
+            self.poll_control(&mut cx)?;
             let current_scope = scope(self.timeout)?;
-            // Reconciliation currently performs only bounded synchronous staging;
-            // retain a future if that contract becomes asynchronous.
             let mut refresh = Box::pin(self.refresh_snapshot(&current_scope));
             match refresh.as_mut().poll(&mut cx) {
                 Poll::Ready(result) => result?,
@@ -1030,6 +1083,28 @@ impl WorkerApplication {
         Ok(())
     }
 
+    fn poll_control(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if let Some(result) = poll_task(&mut self.control_task, cx)
+            && !matches!(
+                result,
+                Err(Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded)
+            )
+        {
+            result?;
+        }
+        if self.control_task.is_none()
+            && let Some(control) = &self.control
+        {
+            let control = control.clone();
+            let turn = scope(crate::control::wire::POLL_WAIT + Duration::from_secs(10))?;
+            self.control_scope = Some(turn.clone());
+            self.control_task = Some(Box::pin(async move {
+                control.progress(&turn).await.map(|_| ())
+            }));
+        }
+        Ok(())
+    }
+
     pub fn shutdown<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             if let Some(endpoint) = &mut self.endpoint {
@@ -1037,7 +1112,19 @@ impl WorkerApplication {
             }
             self.endpoint.take();
             self.store.checkpoint.finish_snapshot();
-            self.memberships.clear();
+            if let Some(node) = &self.node {
+                let mut owners = node
+                    .membership_owners
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?;
+                for membership in self.memberships.drain(..) {
+                    self.network.retire(membership.version);
+                    if let Some(count) = owners.get_mut(&(Arc::as_ptr(&membership) as usize)) {
+                        *count -= 1;
+                    }
+                }
+                owners.retain(|_, count| *count != 0);
+            }
             self.started = false;
             self.telemetry
                 .health
@@ -1045,6 +1132,40 @@ impl WorkerApplication {
             Ok(())
         })
     }
+}
+
+fn update_memberships(
+    network: &PeerNetwork,
+    memberships: &mut VecDeque<crate::topology::membership::MembershipLease>,
+    owners: &Mutex<std::collections::HashMap<usize, usize>>,
+    current: &crate::topology::membership::MembershipLease,
+) -> Result<()> {
+    // Each installed worker owns exactly two structural references: its queue and
+    // its network. Serialize their accounting across workers; all other references
+    // are publication or request leases and prevent retirement.
+    let mut owners = owners.lock().map_err(|_| Error::Unavailable)?;
+    memberships.retain(|membership| {
+        let count = owners
+            .get_mut(&(Arc::as_ptr(membership) as usize))
+            .expect("installed membership owner");
+        if membership.version != current.version && Arc::strong_count(membership) == 2 * *count {
+            network.retire(membership.version);
+            *count -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    owners.retain(|_, count| *count != 0);
+    if !memberships
+        .iter()
+        .any(|membership| membership.version == current.version)
+    {
+        network.install(current.clone())?;
+        memberships.push_back(current.clone());
+        *owners.entry(Arc::as_ptr(current) as usize).or_default() += 1;
+    }
+    Ok(())
 }
 
 fn poll_task(
@@ -1096,9 +1217,14 @@ impl WorkerService for WorkerApplication {
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.stopping = true;
-        self.telemetry
-            .health
-            .transition(crate::telemetry::health::State::Draining)?;
+        self.cache_prepare_task.take();
+        self.prepared_listeners.borrow_mut().take();
+        self.retirement_resume.take();
+        if self.telemetry.health.state()? != crate::telemetry::health::State::Stopped {
+            self.telemetry
+                .health
+                .transition(crate::telemetry::health::State::Draining)?;
+        }
         self.clients.stop_admission();
         if let Some(endpoint) = &self.endpoint {
             endpoint.stop_admission();
@@ -1125,29 +1251,25 @@ impl WorkerService for WorkerApplication {
             let mut flights_done = false;
             let mut first_error = None;
             std::future::poll_fn(|cx| {
-                if deadline.check().is_err() {
-                    if let Err(error) = self.store.writer.cancel_pending_writes() {
-                        first_error.get_or_insert(error);
-                    }
+                if deadline.check().is_err()
+                    && let Err(error) = self.store.writer.cancel_pending_writes()
+                {
+                    first_error.get_or_insert(error);
                 }
                 if let Err(error) = self.poll_services(64) {
                     first_error.get_or_insert(error);
                 }
-                if !clients_done {
-                    if let Poll::Ready(result) = client_drain.as_mut().poll(cx) {
-                        if let Err(error) = result {
-                            first_error.get_or_insert(error);
-                        }
-                        clients_done = true;
+                if !clients_done && let Poll::Ready(result) = client_drain.as_mut().poll(cx) {
+                    if let Err(error) = result {
+                        first_error.get_or_insert(error);
                     }
+                    clients_done = true;
                 }
-                if !flights_done {
-                    if let Poll::Ready(result) = flight_drain.as_mut().poll(cx) {
-                        if let Err(error) = result {
-                            first_error.get_or_insert(error);
-                        }
-                        flights_done = true;
+                if !flights_done && let Poll::Ready(result) = flight_drain.as_mut().poll(cx) {
+                    if let Err(error) = result {
+                        first_error.get_or_insert(error);
                     }
+                    flights_done = true;
                 }
                 if let Some(endpoint) = &mut self.endpoint {
                     let mut drain = endpoint.drain(&deadline);
@@ -1165,6 +1287,8 @@ impl WorkerService for WorkerApplication {
                     && self.peer_task.is_none()
                     && self.writer_task.is_none()
                     && self.store.writer.is_idle()
+                    && self.retirement_native.is_none()
+                    && self.retirement_checkpoint.is_none()
                 {
                     Poll::Ready(())
                 } else {
@@ -1211,6 +1335,10 @@ impl WorkerService for WorkerApplication {
         WorkerApplication::shutdown(self, scope)
     }
 }
+
+#[cfg(test)]
+#[path = "app_integration_tests.rs"]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1292,6 +1420,60 @@ mod tests {
         shared::<NodeState>();
     }
 
-    // Implement startup rollback, control owner fanout, all-shard checkpoints,
-    // multi-worker dispatch, and shutdown with active I/O alongside lifecycle code.
+    #[test]
+    fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
+        use crate::{model::identity::MembershipVersion, topology::membership::Membership};
+        let owners = Mutex::new(std::collections::HashMap::new());
+        let publication = crate::control::wire::decode_publication(include_bytes!(
+            "control/testdata/publication.json"
+        ))
+        .unwrap();
+        let local = publication.members[0].node.clone();
+        let networks = [
+            PeerNetwork::new(local.clone(), 2).unwrap(),
+            PeerNetwork::new(local, 2).unwrap(),
+        ];
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        let membership = |version| {
+            Arc::new(
+                Membership::validate(MembershipVersion(version), publication.members.clone())
+                    .unwrap(),
+            )
+        };
+        let first = membership(1);
+        for worker in 0..2 {
+            update_memberships(&networks[worker], &mut queues[worker], &owners, &first).unwrap();
+        }
+        let request = first.clone();
+        drop(first);
+        let mut current = membership(2);
+        for worker in 0..2 {
+            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
+            assert!(networks[worker].membership(MembershipVersion(1)).is_ok());
+        }
+        drop(request);
+        for worker in 0..2 {
+            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
+            assert!(networks[worker].membership(MembershipVersion(1)).is_err());
+        }
+        for version in 3..20 {
+            current = membership(version);
+            for worker in 0..2 {
+                update_memberships(&networks[worker], &mut queues[worker], &owners, &current)
+                    .unwrap();
+                assert_eq!(queues[worker].len(), 1);
+            }
+            assert_eq!(owners.lock().unwrap().len(), 1);
+        }
+        // Only one worker installs an intermediate publication. Ownership is
+        // counted per installed object, never inferred from the worker total.
+        current = membership(20);
+        update_memberships(&networks[0], &mut queues[0], &owners, &current).unwrap();
+        current = membership(21);
+        for worker in [1, 0] {
+            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
+            assert_eq!(queues[worker].len(), 1);
+        }
+        assert_eq!(owners.lock().unwrap().len(), 1);
+    }
 }
