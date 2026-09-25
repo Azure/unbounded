@@ -340,6 +340,10 @@ async fn serve_connection(
                 return Ok(());
             }
         };
+        if let Err(error) = scope.check() {
+            responses.send_error(connection, error, scope).await?;
+            return Ok(());
+        }
         if response.metadata.version.object != object {
             responses
                 .send_error(connection, Error::BadGateway, scope)
@@ -846,6 +850,60 @@ mod tests {
             assert!(head.contains(&format!("content-length: {expected_length}\r\n")));
             assert!(head.contains(&format!("content-range: {expected_range}\r\n")));
             assert_eq!(&output[end..], expected_body);
+        }
+    }
+
+    #[test]
+    fn actual_uds_empty_bootstrap_and_cancelled_success() {
+        struct Empty(bool);
+        impl ReadService for Empty {
+            fn read<'a>(
+                &'a self,
+                request: ClientRequest,
+                scope: &'a RequestScope,
+            ) -> Operation<'a, ReadResponse> {
+                Box::pin(async move {
+                    if self.0 {
+                        scope.cancel()?;
+                    }
+                    Ok(ReadResponse {
+                        metadata: ObjectMetadata {
+                            version: ObjectVersion {
+                                object: request.origin.object,
+                                etag: StrongEtag::parse(b"\"\"")?,
+                            },
+                            length: 0,
+                            expires_at: ExpiresAt(UNIX_EPOCH),
+                        },
+                        range: None,
+                        body: None,
+                    })
+                })
+            }
+        }
+        let mut fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        for cancelled in [false, true] {
+            fixture.listeners.reads = Rc::new(Empty(cancelled));
+            let mut socket = fixture.connect();
+            socket
+                .write_all(&request(
+                    "GET",
+                    "Range: bytes=0-16777215\r\nConnection: close\r\n",
+                ))
+                .unwrap();
+            let output = fixture.receive(&mut socket, true);
+            let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
+            let status = if cancelled { 503 } else { 200 };
+            assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
+            assert!(text.contains("content-length: 0\r\n"));
+            assert!(!text.contains("content-range:"));
+            assert!(text.ends_with("\r\n\r\n"));
+            if !cancelled {
+                assert!(text.contains("etag: \"\"\r\n"));
+                assert!(text.contains("racer-expires-at: 0\r\n"));
+                assert!(text.contains("content-type: application/octet-stream\r\n"));
+            }
         }
     }
 
