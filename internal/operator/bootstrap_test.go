@@ -215,6 +215,7 @@ func TestCRDEstablishedRejectsDeletingCRD(t *testing.T) {
 
 func TestRequiredCRDNames(t *testing.T) {
 	want := [...]string{
+		"clustercaches.racer.unbounded-cloud.io",
 		"machines.unbounded-cloud.io",
 		"machineoperations.unbounded-cloud.io",
 		"sites.unbounded-cloud.io",

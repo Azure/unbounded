@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/components/tokenrefresher"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -96,6 +97,7 @@ func DefaultRegistry() *component.Registry {
 			netcomponent.New(),
 			machina.New(),
 			gantry.New(),
+			racer.New(),
 			tokenrefresher.New(),
 		},
 		Site: []component.SiteComponent{

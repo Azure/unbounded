@@ -11,6 +11,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	racermanifests "github.com/Azure/unbounded/deploy/racer"
 	tokenrefreshermanifests "github.com/Azure/unbounded/deploy/token-refresher"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -25,6 +26,7 @@ func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 		"machina":         machinamanifests.Manifests,
 		"net":             netmanifests.Manifests,
 		"gantry":          gantrymanifests.Manifests,
+		"racer":           racermanifests.Manifests,
 		"token-refresher": tokenrefreshermanifests.Manifests,
 	}
 

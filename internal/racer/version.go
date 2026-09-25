@@ -170,6 +170,18 @@ func (r *TopologyReconciler) readVersion(ctx context.Context) (*corev1.ConfigMap
 	return cm, v, err
 }
 
+// ValidateInstallation checks the same durable marker and counter binding that
+// normal controller startup requires, without modifying either object.
+func ValidateInstallation(ctx context.Context, reader client.Reader, namespace, cluster string) error {
+	r := &TopologyReconciler{APIReader: reader, Config: Config{
+		Namespace: namespace, Cluster: wire.ClusterID(cluster),
+		InstallationConfigMapName: "racer-installation", VersionConfigMapName: "racer-version",
+	}}
+	_, _, err := r.readVersion(ctx)
+
+	return err
+}
+
 // CommitVersion mints the only installable type after a resource-version CAS.
 // Even unchanged content is CAS-confirmed; its counters and bytes remain identical.
 func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
