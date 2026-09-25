@@ -2,6 +2,33 @@
 
 Read owner coordinates only this directory. Integration owns application and errors.
 
+## Verification results
+
+
+Pressure audit fix: Fill::reserve_progress retries once after discarding only
+unsubmitted disposable writes and evicting idle memory. Busy reader/ciphertext
+leases and submitted writes remain pinned. If only dirty quota remains exhausted,
+admit the read without persistence. Direct-I/O staging overload also gets one idle
+reclamation retry; metadata entry-count saturation cannot fail valid delivery.
+Three sequential full-page pressure regressions pass in debug and release: 8/12
+distinct 16 MiB pages under two-page plaintext capacity, with an independent reader
+held throughout, bounded plaintext/ciphertext/dirty accounting, and zero charges
+after final release/eviction. Candidate persistence enqueue reserves staging before
+acceptance; its Overloaded/Unavailable/Io outcomes remain disposable.
+
+`python3 src/read/check-component.py` from cmd/racer-dataplane initially passed 62
+read tests. A strengthened real-crypto cancellation assertion now reports 61 passed,
+1 failed: canceled_supplier_retains_crypto_fence_before_replacement_origin_work.
+This reproduces the required completion fence contract below: an accepted crypto
+job remains outstanding while early cancellation return permits a replacement
+origin call. Keep this test intact; runtime must fix the accepted completion wait.
+It compiles unchanged production dependency modules, excluding only app and
+telemetry roots whose concurrent test changes blocked Cargo's whole-crate harness.
+The tests include actual page crypto jobs through the production engine,
+origin coalescing, pending candidate ciphertext retention, origin-forbidden retry,
+and dropped supplier completion fencing. No production adapter is replaced by the
+component runner. Full Cargo verification remains required by integration.
+
 ## Blocking signed budget handoff (peer/security/topology owners)
 
 Add `remaining_attempts: u32` to topology::paths::RouteBudget, include it in signed
@@ -18,17 +45,11 @@ Read delegates are separate CLI processes. Do not use concurrent opencode run
 --session to send steering to a running delegate: that starts another writer for
 the same files. Add coordination notes here; the read parent consolidates delegates.
 
-Latest shared check: owned read modules compile; integration app.rs:92 must replace
-Arc::new(WorkerDirectory) with WorkerDirectory::new(Arc<WorkerMap>, Vec<WorkerId>,
-queue_capacity). Install each directory endpoint after Coordinator assembly and
-poll WorkerEndpoint along with flights; coordinate final delegate API below.
-Security currently needs memory PlaintextBuffer::into_parts (external owner).
-
-Update: cargo check --lib --all-features passes. Test compilation currently blocked
-by app composition test Result unwraps (app.rs:865-904). Memory test visibility is
-resolved. Read tests now include real crypto-engine driven origin fill/coalescing,
-pending ciphertext reuse, independent credential rejection retry, and cancellation
-generation fencing in fill_tests.rs, but cannot execute until app test compile fixes.
+Construct WorkerDirectory with its immutable Arc<WorkerMap>, worker IDs, and queue
+capacity. Install each directory endpoint after Coordinator assembly and poll
+WorkerEndpoint along with flights. cargo check --lib --all-features passed during
+integration; whole-crate test compilation remains blocked by app composition test
+Result unwraps. The focused runner above executes read tests independently.
 Candidate route visited starts empty: topology validates prior senders excluding
 the current sender and forwarding adds it. Starting with self would reject every
 outbound request as a loop.
@@ -74,10 +95,10 @@ queue overload. drivers::spawn remains convenience for unsubmitted operations.
 
 ## Origin and peer resource handoffs
 
-Origin owner: Fill reserves full progress before acquisition. Add
+Origin owner implemented the reserved operation used by Fill:
 `Origin::page_reserved(authority, context, page, Reservation, scope)` so OriginClient
 uses the supplied plaintext reservation rather than reserving a second full page.
-Keep page() as the convenience wrapper for independent callers. Fill will use the
+Keep page() as the convenience wrapper for independent callers. Fill uses the
 reserved operation. Default implementations for test doubles may release the
 reservation before calling page(), but production must consume it into the buffer.
 

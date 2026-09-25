@@ -90,8 +90,13 @@ impl Origin for TestOrigin {
             if self.reject_once.replace(false) {
                 return Err(Error::OriginForbidden);
             }
-            let mut plaintext = self.buffers.plaintext(reservation, 3)?;
-            plaintext.bytes_mut()?.copy_from_slice(b"abc");
+            let length = self.metadata.immutable().page_length(page)? as usize;
+            let mut plaintext = self.buffers.plaintext(reservation, length)?;
+            if length == 3 {
+                plaintext.bytes_mut()?.copy_from_slice(b"abc");
+            } else {
+                plaintext.bytes_mut()?.fill(page.number.0 as u8);
+            }
             Ok(OriginPage {
                 metadata: self.metadata.clone(),
                 plaintext,
@@ -109,9 +114,21 @@ struct Fixture {
     membership: MembershipLease,
     page: PageId,
     scope: RequestScope,
+    directory: std::path::PathBuf,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 fn fixture() -> Fixture {
-    let config = crate::test_support::cluster::config(false);
+    fixture_with(3, None)
+}
+fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fixture {
+    let mut config = crate::test_support::cluster::config(false);
+    if let Some(limits) = limits {
+        config.limits = limits;
+    }
     let worker = WorkerId(0);
     let admission = Rc::new(Admission::new(config.limits.clone()));
     let buffers = Rc::new(BufferPool::new(admission.clone()));
@@ -119,13 +136,25 @@ fn fixture() -> Fixture {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let index = Rc::new(Index::new(worker, 16));
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!(
+            "read-fill-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
     let slabs = Rc::new(Slabs::new(
         worker,
-        "unused-fill-test".into(),
+        directory.clone(),
         reactor,
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
     ));
+    slabs.set_admission(admission.clone());
+    slabs
+        .open_now()
+        .expect("read fixture filesystem supports direct slab alignment");
     let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
         clock,
@@ -163,7 +192,7 @@ fn fixture() -> Fixture {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
         },
-        length: 3,
+        length,
         expires_at: ExpiresAt(std::time::UNIX_EPOCH),
     };
     let page = PageId {
@@ -187,7 +216,7 @@ fn fixture() -> Fixture {
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.
-    let directory = Arc::new(
+    let metadata_owner = Arc::new(
         WorkerDirectory::new(
             Arc::new(WorkerMap::new(vec![worker]).unwrap()),
             vec![worker],
@@ -207,9 +236,10 @@ fn fixture() -> Fixture {
         crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
         credentials,
         admission,
-        metadata_owner: directory,
+        metadata_owner,
     });
     Fixture {
+        directory,
         fill,
         origin,
         crypto,
@@ -217,8 +247,11 @@ fn fixture() -> Fixture {
         context,
         membership,
         page,
-        scope: RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
-            .unwrap(),
+        scope: RequestScope::new(
+            RequestId([1; 16]),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap(),
     }
 }
 fn drive<T>(
@@ -328,6 +361,91 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 }
 
 #[test]
+fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
+    use crate::model::range::PAGE_BYTES;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * (PAGE_BYTES as usize + 16)).unwrap();
+    limits.dirty_bytes = std::num::NonZeroUsize::new(2 * (PAGE_BYTES as usize + 16)).unwrap();
+    let mut f = fixture_with(8 * PAGE_BYTES, Some(limits.clone()));
+    let mut pinned = None;
+    for number in 0..8 {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let result = drive(
+            f.fill.acquire(
+                page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(result.plaintext.bytes().len(), PAGE_BYTES as usize);
+        assert_eq!(result.plaintext.bytes()[0], number as u8);
+        if number == 0 {
+            pinned = Some(result.plaintext.clone());
+        }
+        assert_eq!(pinned.as_ref().unwrap().bytes()[0], 0);
+        drop(result);
+        assert!(
+            f.fill.dependencies.admission.used(ResourceClass::Plaintext)
+                <= limits.plaintext_bytes.get()
+        );
+        assert!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext)
+                <= limits.ciphertext_bytes.get()
+        );
+        assert!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::DirtyCiphertext)
+                <= limits.dirty_bytes.get()
+        );
+    }
+    assert_eq!(
+        f.origin.calls.get(),
+        8,
+        "byte capacity must not permanently block idle-cache misses"
+    );
+    assert!(
+        f.fill.dependencies.memory.get(&f.page).unwrap().is_some(),
+        "independent reader protected its cached page"
+    );
+    drop(pinned);
+    f.fill.dependencies.writer.discard_unsubmitted();
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::Ciphertext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::DirtyCiphertext),
+        0
+    );
+}
+
+#[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
     let mut f = fixture();
     f.origin.reject_once.set(true);
@@ -373,6 +491,12 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.origin.calls.get(), 1);
+    super::super::drivers::poll(&mut cx, 64);
+    assert_eq!(
+        f.crypto.outstanding(),
+        1,
+        "origin bytes accepted for crypto before cancellation"
+    );
     drop(first);
     let mut second = f.fill.acquire(
         f.page.clone(),
@@ -387,7 +511,171 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
         1,
         "retry cannot overlap retained crypto completion"
     );
+    // Reap no crypto here: a cancellation notification must not stand in for its
+    // accepted completion even when the detached read driver is polled again.
+    super::super::drivers::poll(&mut cx, 64);
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(
+        f.origin.calls.get(),
+        1,
+        "accepted crypto must fence replacement election"
+    );
     let result = drive(second, &mut f.engine, &f.crypto).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
     assert_eq!(f.origin.calls.get(), 2);
+}
+
+#[test]
+fn sequential_full_pages_reclaim_idle_bytes_but_preserve_independent_reader() {
+    use crate::model::range::PAGE_BYTES;
+    use std::num::NonZeroUsize;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = NonZeroUsize::new(3 * (PAGE_BYTES as usize + 16)).unwrap();
+    limits.dirty_bytes = NonZeroUsize::new(PAGE_BYTES as usize + 16).unwrap();
+    let mut f = fixture_with(8 * PAGE_BYTES, Some(limits.clone()));
+    let mut held = None;
+    for number in 0..8 {
+        let mut page = f.page.clone();
+        page.number = PageNumber(number);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let result = drive(
+            f.fill.acquire(
+                page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(result.plaintext.bytes().len(), PAGE_BYTES as usize);
+        assert!(
+            result
+                .plaintext
+                .bytes()
+                .iter()
+                .all(|byte| *byte == number as u8)
+        );
+        if number == 0 {
+            held = Some(result.plaintext.clone());
+        }
+        assert_eq!(held.as_ref().unwrap().bytes()[0], 0);
+        assert!(
+            f.fill.dependencies.admission.used(ResourceClass::Plaintext)
+                <= limits.plaintext_bytes.get()
+        );
+        assert!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext)
+                <= limits.ciphertext_bytes.get()
+        );
+        assert!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::DirtyCiphertext)
+                <= limits.dirty_bytes.get()
+        );
+        drop(result);
+        f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    }
+    assert_eq!(f.origin.calls.get(), 8);
+    drop(held);
+    f.fill.dependencies.writer.discard_unsubmitted();
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::Ciphertext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::DirtyCiphertext),
+        0
+    );
+}
+
+#[test]
+fn sequential_full_pages_reclaim_idle_bytes_and_preserve_a_busy_reader() {
+    use crate::model::range::PAGE_BYTES;
+    use std::num::NonZeroUsize;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = NonZeroUsize::new(3 * (PAGE_BYTES as usize + 16)).unwrap();
+    limits.dirty_bytes = NonZeroUsize::new(2 * (PAGE_BYTES as usize + 16)).unwrap();
+    // Byte pressure must occur far earlier than the entry-count eviction policy.
+    limits.metadata_entries = NonZeroUsize::new(128).unwrap();
+    let mut f = fixture_with(12 * PAGE_BYTES, Some(limits));
+    let mut held = None;
+    for number in 0..12 {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+        let result = drive(
+            f.fill.acquire(
+                page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(result.plaintext.bytes().len(), PAGE_BYTES as usize);
+        assert_eq!(result.plaintext.bytes()[0], number as u8);
+        if number == 0 {
+            held = Some(result);
+        } else {
+            drop(result);
+        }
+        let admission = &f.fill.dependencies.admission;
+        for class in [
+            ResourceClass::Plaintext,
+            ResourceClass::Ciphertext,
+            ResourceClass::DirtyCiphertext,
+        ] {
+            assert!(admission.used(class) <= admission.limit(class));
+        }
+        assert_eq!(held.as_ref().unwrap().plaintext.bytes()[0], 0);
+    }
+    assert_eq!(f.origin.calls.get(), 12);
+    drop(held);
+    f.fill.dependencies.writer.discard_unsubmitted();
+    f.fill.dependencies.flights.poll_budgeted(128).unwrap();
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::Ciphertext),
+        0
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::DirtyCiphertext),
+        0
+    );
 }

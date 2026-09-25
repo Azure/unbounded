@@ -205,6 +205,7 @@ impl CandidatePolicy {
                 .iter()
                 .position(|node| node == &self.node)
                 .ok_or(Error::Unauthorized)?;
+            let mut transient = false;
             for destination in candidates.ordered.iter().skip(rank + 1) {
                 match self
                     .request(
@@ -218,16 +219,22 @@ impl CandidatePolicy {
                     )
                     .await
                 {
-                    Ok(response) => {
-                        if classify(response.response(), operation)?.is_none() {
-                            return Ok(Some(response));
+                    Ok(response) => match classify(response.response(), operation)? {
+                        None => return Ok(Some(response)),
+                        Some(ProbeOutcome::Unreachable | ProbeOutcome::Overloaded) => {
+                            transient = true
                         }
-                    }
-                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => continue,
+                        Some(_) => {}
+                    },
+                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => transient = true,
                     Err(error) => return Err(error),
                 }
             }
-            Ok(None)
+            if transient {
+                Err(Error::Unavailable)
+            } else {
+                Ok(None)
+            }
         })
     }
 
@@ -270,6 +277,19 @@ impl CandidatePolicy {
         let response = self.peers.request(request, scope).await?;
         scope.check()?;
         Ok(response)
+    }
+
+    pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
+        if authority.predecessor_evidence.iter().any(|outcome| {
+            matches!(
+                outcome,
+                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+            )
+        }) {
+            Error::Unavailable
+        } else {
+            Error::VersionUnavailable
+        }
     }
 }
 
@@ -780,5 +800,31 @@ mod tests {
             ));
             assert_eq!(peers.calls.borrow().len(), 1);
         });
+    }
+    #[test]
+    fn origin_version_miss_cannot_claim_absence_when_predecessor_was_unreachable() {
+        let membership = membership();
+        let ranked = Placement::new(8)
+            .rank(membership.clone(), &object(), PageNumber(0))
+            .unwrap();
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let policy = policy(ranked.ordered[1].clone(), peers);
+        let mut authority = OriginAuthority {
+            membership,
+            node: ranked.ordered[1].clone(),
+            object: object(),
+            page: PageNumber(0),
+            predecessor_evidence: vec![ProbeOutcome::Unreachable],
+            rank: 1,
+        };
+        assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
+        authority.predecessor_evidence = vec![ProbeOutcome::CopyMiss];
+        assert_eq!(
+            policy.origin_miss_error(&authority),
+            Error::VersionUnavailable
+        );
     }
 }

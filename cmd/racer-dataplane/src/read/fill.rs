@@ -58,6 +58,29 @@ pub struct Fill {
     dependencies: FillDependencies,
 }
 impl Fill {
+    /// One bounded reclamation pass, then one retry. Submitted writes and reader
+    /// leases remain owned; only disposable queued writes and idle cache entries
+    /// are released. Scanning at most the bounded cache avoids pressure spin loops.
+    fn reserve_progress(
+        &self,
+        cache: &crate::model::identity::CacheId,
+        persist: bool,
+    ) -> Result<crate::runtime::admission::FillReservation> {
+        match self.dependencies.admission.reserve_fill(cache, persist) {
+            Ok(reservation) => Ok(reservation),
+            Err(Error::Overloaded) => {
+                self.dependencies.writer.discard_unsubmitted();
+                self.dependencies.memory.evict_idle(usize::MAX)?;
+                match self.dependencies.admission.reserve_fill(cache, persist) {
+                    Err(Error::Overloaded) if persist => {
+                        self.dependencies.admission.reserve_fill(cache, false)
+                    }
+                    result => result,
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub fn new(dependencies: FillDependencies) -> Self {
         dependencies
             .candidates
@@ -287,16 +310,30 @@ impl Fill {
         if !self.dependencies.candidates.is_candidate(&candidates) {
             return Err(Error::Unauthorized);
         }
-        let ciphertext = self.dependencies.admission.reserve(
-            Some(&page.version.object.cache),
-            ResourceClass::Ciphertext,
-            PAGE_BYTES as usize + 16,
-        )?;
-        let dirty = self.dependencies.admission.reserve(
+        let reserve = || {
+            self.dependencies.admission.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Ciphertext,
+                PAGE_BYTES as usize + 16,
+            )
+        };
+        let ciphertext = match reserve() {
+            Err(Error::Overloaded) => {
+                self.dependencies.writer.discard_unsubmitted();
+                self.dependencies.memory.evict_idle(usize::MAX)?;
+                reserve()?
+            }
+            result => result?,
+        };
+        let dirty = match self.dependencies.admission.reserve(
             Some(&page.version.object.cache),
             ResourceClass::DirtyCiphertext,
             PAGE_BYTES as usize + 16,
-        )?;
+        ) {
+            Ok(reservation) => Some(reservation),
+            Err(Error::Overloaded) => None,
+            Err(error) => return Err(error),
+        };
         let (plaintext, ciphertext) = self
             .dependencies
             .crypto
@@ -308,7 +345,7 @@ impl Fill {
             ciphertext,
         };
         result.validate_for(page)?;
-        self.publish(result.clone(), Some(dirty), scope).await?;
+        self.publish(result.clone(), dirty, scope).await?;
         Ok(result)
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -368,10 +405,7 @@ impl Fill {
         let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Atomically reserve progress, including dirty capacity on candidates,
         // before touching transport. Retrying a bad local copy releases this batch.
-        let mut reservation = self
-            .dependencies
-            .admission
-            .reserve_fill(&context.object.cache, persist)?;
+        let mut reservation = self.reserve_progress(&context.object.cache, persist)?;
         let local = self.dependencies.writer.copy_only(page)?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
@@ -379,6 +413,17 @@ impl Fill {
                 Ok(Some((copy, token))) => (Some(copy), Some(token)),
                 Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
                     (None, None)
+                }
+                Err(Error::Overloaded) => {
+                    self.dependencies.writer.discard_unsubmitted();
+                    self.dependencies.memory.evict_idle(usize::MAX)?;
+                    match self.dependencies.disk.read_with_token(page, scope).await {
+                        Ok(Some((copy, token))) => (Some(copy), Some(token)),
+                        Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
+                            (None, None)
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => return Err(error),
             },
@@ -395,10 +440,7 @@ impl Fill {
                     }
                     drop(reservation.ciphertext);
                     drop(reservation.dirty);
-                    reservation = self
-                        .dependencies
-                        .admission
-                        .reserve_fill(&context.object.cache, persist)?;
+                    reservation = self.reserve_progress(&context.object.cache, persist)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -473,7 +515,9 @@ impl Fill {
                             .candidates
                             .remaining_copy(&candidates, context, &operation, scope, budget)
                             .await?
-                            .ok_or(Error::VersionUnavailable)?;
+                            .ok_or_else(|| {
+                                self.dependencies.candidates.origin_miss_error(&authority)
+                            })?;
                         self.decrypt(
                             page,
                             response_copy(response.response(), page)?,
@@ -535,7 +579,10 @@ impl Fill {
                 return Err(Error::CorruptRecord);
             }
         }
-        self.dependencies.memory.publish(result.clone())?;
+        match self.dependencies.memory.publish(result.clone()) {
+            Ok(()) | Err(Error::Overloaded) => {}
+            Err(error) => return Err(error),
+        }
         // A descriptor catalog is an optimization. Every retained page owns its
         // immutable descriptor even when the catalog mailbox/capacity is saturated.
         match self
@@ -723,6 +770,12 @@ mod tests {
         client: Rc<crate::runtime::crypto::CryptoClient>,
         membership: MembershipLease,
         page: PageId,
+        directory: std::path::PathBuf,
+    }
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
     }
     fn rig() -> Rig {
         use crate::{
@@ -749,13 +802,20 @@ mod tests {
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
         let index = Rc::new(Index::new(WorkerId(0), 16));
         let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("read-fill-inline-{}", std::process::id()));
         let slabs = Rc::new(Slabs::new(
             WorkerId(0),
-            "unused".into(),
+            directory.clone(),
             reactor,
             1024 * 1024 * 1024,
             64 * 1024 * 1024,
         ));
+        slabs.set_admission(admission.clone());
+        slabs
+            .open_now()
+            .expect("read fixture filesystem supports direct slab alignment");
         let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
         let disk = Rc::new(StoreReader::new(
             eviction,
@@ -781,7 +841,7 @@ mod tests {
             calls: std::cell::Cell::new(0),
             reject: std::cell::Cell::new(false),
         });
-        let directory = Arc::new(
+        let metadata_owner = Arc::new(
             crate::read::dispatch::WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],
@@ -801,7 +861,7 @@ mod tests {
             crypto: Rc::new(PageCrypto::new(keys, client.clone())),
             credentials,
             admission,
-            metadata_owner: directory,
+            metadata_owner,
         }));
         let membership = Arc::new(
             Membership::validate(
@@ -827,6 +887,7 @@ mod tests {
             number: PageNumber(0),
         };
         Rig {
+            directory,
             fill,
             origin,
             engine,

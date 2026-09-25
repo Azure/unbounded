@@ -553,7 +553,7 @@ impl MetadataService {
                             .candidates
                             .remaining_copy(&candidates, context, &operation, scope, budget)
                             .await?
-                            .ok_or(Error::VersionUnavailable)?;
+                            .ok_or_else(|| self.candidates.origin_miss_error(&authority))?;
                         match response.response() {
                             PeerResponse::Metadata(metadata) => {
                                 crate::origin::metadata::MetadataReply {
