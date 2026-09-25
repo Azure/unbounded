@@ -32,10 +32,15 @@ handoff and retained reactor-backed retirement checkpoint operation are implemen
 `cmd/racer-dataplane/src/app_retirement.rs:369-394`); their earlier compiler-blocker
 notes are also historical.
 
-The actual Go control server remains a scaffold: TLS/start/readiness return pending
-errors (`internal/racer/server.go:34-42`), and bootstrap/snapshot handlers always
-return unavailable (`55-66`). Rust TLS-fixture coverage does not establish actual
-Go-controller interoperability.
+Subsequent integration context: the original `racer-v2` branch at `c1c33a95`
+implements TokenReview authentication and enrollment
+(`internal/racer/bootstrap.go:32-113`, `154-167`), HTTPS serving
+(`internal/racer/server.go:123-178`), and authenticated snapshot delivery
+(`internal/racer/server.go:374-482`). These citations refer to that original-branch
+commit, not the older isolated dataplane baseline. This supersedes the scaffold
+status in the historical handoffs below. Rust TLS-fixture coverage still does not
+establish deployed Go-controller/dataplane interoperability; that acceptance gate
+remains unverified.
 
 `CLIENT_ORIGIN_API.md` is absent in this worktree. After cherry-pick, correct the
 original copy's stale implementation-status clauses at lines 5-7, 18, and 78-79;

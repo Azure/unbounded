@@ -154,10 +154,15 @@ coverage, not a deployed control-server churn test.
 1. Exercise deployed Go SDK reads through the binary's actual client listeners,
    populated-cache control-driven publication/removal, and restart with persisted
    payload. The component/lifecycle fixtures above establish narrower contracts.
-   The repository's Go control server is still a scaffold:
-   `internal/racer/server.go:34-42` (repository-relative) returns pending errors for
-   TLS/start/readiness, and its handlers always return unavailable (`55-66`). The
-   Rust TLS fixture therefore does not establish actual Go-controller interoperability.
+   Subsequent integration context: the original `racer-v2` branch at `c1c33a95`
+   implements TokenReview authentication and enrollment
+   (`internal/racer/bootstrap.go:32-113`, `154-167`), HTTPS serving
+   (`internal/racer/server.go:123-178`), and authenticated snapshot delivery
+   (`internal/racer/server.go:374-482`). These repository-relative citations refer
+   to that original-branch commit, not the older isolated dataplane baseline.
+   The controller implementation supersedes the earlier scaffold claim; the Rust
+   TLS fixture still does not establish deployed Go-controller/dataplane
+   interoperability, which remains unverified by this validation record.
 2. Record real native-provider execution separately from fallback/no-device checks,
    then validate multi-host RNIC operation and fault behavior in the deployment
    environment.

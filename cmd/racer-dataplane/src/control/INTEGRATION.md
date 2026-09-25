@@ -139,9 +139,15 @@ The Unicode-fabric mismatch was reported and fixed by the topology owner in
 `d141c08f`. Control did not edit topology files. The Go Unicode fixture remains
 the cross-language regression contract.
 
-End-to-end Go control server interoperability remains unavailable while that server
-is a stub. The real loopback rustls fixture verifies transport but is not a
-controller end-to-end test. Both the retained test-only readiness driver and a real
+Subsequent integration context: the original `racer-v2` branch at `c1c33a95`
+implements TokenReview authentication and enrollment
+(`internal/racer/bootstrap.go:32-113`, `154-167`), HTTPS serving
+(`internal/racer/server.go:123-178`), and authenticated snapshot delivery
+(`internal/racer/server.go:374-482`). These repository-relative citations refer
+to that original-branch commit, not the older isolated dataplane baseline.
+Deployed Go-controller/dataplane interoperability remains unverified by these
+tests. The real loopback rustls fixture verifies transport but is not a controller
+end-to-end test. Both the retained test-only readiness driver and a real
 `ReactorControlIo` TLS fixture are tested. Real io_uring tests executed successfully
 on this implementation host; restricted kernels skip only ENOSYS/EPERM/EACCES at
 ring setup and report that explicitly. Filesystem tests interrupt each persistence
