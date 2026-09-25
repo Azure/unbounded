@@ -111,7 +111,7 @@ func (b *benchmark) gantryPodNodes(ctx context.Context, revision string) (map[st
 		ctx,
 		nil,
 		"kubectl", "-n", b.config.GantryNamespace,
-		"get", "pods", "-l", "app.kubernetes.io/name="+b.config.GantryDaemonSet,
+		"get", "pods", "-l", b.config.gantryAgentSelector(),
 		"-o", "json",
 	)
 	if err != nil {
