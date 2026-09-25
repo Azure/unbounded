@@ -272,13 +272,34 @@ impl PeerServer {
             let scope = super::request_scope(request.request(), scope)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let _membership = network.membership(request.request().route.membership)?;
+            let previous = request
+                .forwarders()
+                .last()
+                .unwrap_or(request.origin())
+                .node();
+            network.endpoint(request.request().route.membership, previous)?;
             if request.request().route.destination != network.local {
-                return self.relay.forward(request, &scope).await;
+                let binding = request.binding().clone();
+                return match self.relay.forward(request, &scope).await {
+                    Ok(response) => Ok(response),
+                    Err(Error::Overloaded) => self
+                        .forwarding
+                        .sign_response(&binding, PeerResponse::Overloaded),
+                    Err(
+                        Error::Unavailable
+                        | Error::Io
+                        | Error::HopBudgetExhausted
+                        | Error::IncompatibleMembership,
+                    ) => {
+                        scope.check()?;
+                        self.forwarding
+                            .sign_response(&binding, PeerResponse::Unavailable)
+                    }
+                    Err(error) => Err(error),
+                };
             }
             let binding = request.binding().clone();
-            let reservation = self
-                .admission
-                .reserve(None, ResourceClass::ControlProgress, 1);
+            let reservation = self.admission.reserve(None, ResourceClass::Waiter, 1);
             let _reservation = match reservation {
                 Ok(reservation) => reservation,
                 Err(Error::Overloaded) => {

@@ -37,7 +37,8 @@ const B: &str = "00000002-1111-4111-8111-111111111111";
 const C: &str = "00000003-1111-4111-8111-111111111111";
 const CACHE: &str = "cccccccc-1111-4111-8111-111111111111";
 const CLUSTER: &str = "dddddddd-1111-4111-8111-111111111111";
-fn signers() -> Vec<Rc<Signatures>> {
+type Discovery = (Rc<Keyring>, Rc<Certificates>, Rc<ReplayWindow>);
+fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -45,6 +46,7 @@ fn signers() -> Vec<Rc<Signatures>> {
     let ca = ca_params.self_signed(&ca_key).unwrap();
     let roots = vec![ca.der().to_vec()];
     let mut signers = Vec::new();
+    let mut discovery = Vec::new();
     for name in [A, B, C] {
         let pending = PendingIdentity::generate().unwrap();
         let bytes = pending.export_pkcs8_for_persistence().unwrap();
@@ -87,12 +89,14 @@ fn signers() -> Vec<Rc<Signatures>> {
         .unwrap();
         keys.install_signing_identity(Arc::new(identity)).unwrap();
         let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-        signers.push(Rc::new(Signatures::new(
-            keys,
-            certificates,
-            Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 100)),
-        )));
+        let replay = Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 100));
+        discovery.push((keys.clone(), certificates.clone(), replay.clone()));
+        signers.push(Rc::new(Signatures::new(keys, certificates, replay)));
     }
+    (signers, discovery)
+}
+fn signers() -> Vec<Rc<Signatures>> {
+    let (signers, _) = identities();
     for signer in &signers {
         for peer in &signers {
             signer
@@ -398,6 +402,369 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
             .response(),
         PeerResponse::VersionUnavailable
     ));
+}
+
+#[test]
+fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
+    use crate::{
+        http::{
+            codec::{Codec, MessageHead, StartLine},
+            io::HttpIo,
+            pool::HttpPool,
+        },
+        runtime::reactor::Reactor,
+        security::{protocol as p, signing::signed_digest},
+        topology::membership::{Member, Membership},
+    };
+    let signers = signers();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(HttpIo::with_admission(
+        reactor.clone(),
+        Codec::new(65536, 16777232),
+        admission.clone(),
+    ));
+    let transfers = Rc::new(transfer::Transfers::new(
+        Rc::new(HttpPool::new(reactor, admission, 2)),
+        io,
+        None,
+    ));
+    let network = Rc::new(PeerNetwork::new(NodeId(C.into()), 2).unwrap());
+    network
+        .install(Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                [A, C]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| Member {
+                        node: NodeId((*name).into()),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
+                        rails: vec![],
+                        alignment_enabled: false,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let handshake =
+        handshake::Handshake::new(signers[2].clone(), None).with_http(network, transfers);
+    let mut head = MessageHead {
+        start: StartLine::Request {
+            method: "POST".into(),
+            target: "/racer/peer/v1/handshake".into(),
+        },
+        headers: vec![],
+    };
+    p::push(&mut head, "content-length", 0);
+    p::push(&mut head, "racer-kind", "handshake");
+    p::push(&mut head, "racer-wire-version", wire::VERSION);
+    p::push(&mut head, "racer-membership", 1);
+    p::push(&mut head, "racer-receiver", C);
+    p::push_binary(
+        &mut head,
+        "racer-session-challenge",
+        &signers[0].challenge().unwrap(),
+    );
+    let signed = signers[0].sign(head).unwrap();
+    let binding = signed_digest(&signed).unwrap();
+    let reply = handshake.respond(signed).unwrap();
+    assert_eq!(
+        p::decode_binary(
+            p::field(&reply.head, "racer-request-binding")
+                .unwrap()
+                .as_bytes()
+        )
+        .unwrap(),
+        binding
+    );
+    assert_eq!(p::number(&reply.head, "racer-membership").unwrap(), 1);
+    assert_eq!(p::number(&reply.head, "racer-rdma").unwrap(), 0);
+    let mut tampered = reply;
+    tampered
+        .head
+        .headers
+        .iter_mut()
+        .find(|h| h.name == "racer-rdma")
+        .unwrap()
+        .value = b"1".to_vec();
+    assert!(signers[0].verify(tampered).is_err());
+}
+
+#[test]
+fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
+    use crate::topology::{
+        health::LinkHealth,
+        membership::{Member, Membership},
+        paths::Paths,
+    };
+    struct Destination {
+        auth: Forwarding,
+        fail: bool,
+    }
+    impl requester::PeerTransport for Destination {
+        fn exchange<'a>(
+            &'a self,
+            request: wire::SignedRequest,
+            scope: &'a RequestScope,
+        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+            Box::pin(async move {
+                scope.check()?;
+                if self.fail {
+                    return Err(Error::Io);
+                }
+                let admitted = self.auth.verify_request(request)?;
+                assert_eq!(admitted.request().route.remaining_links, 3);
+                assert_eq!(
+                    admitted
+                        .request()
+                        .origin
+                        .authorization
+                        .as_ref()
+                        .unwrap()
+                        .ciphertext,
+                    vec![5; 32]
+                );
+                self.auth
+                    .sign_response(admitted.binding(), PeerResponse::Miss)
+            })
+        }
+    }
+    for fail in [false, true] {
+        let signers = signers();
+        let origin = Forwarding::new(signers[0].clone());
+        let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let network = Rc::new(PeerNetwork::new(NodeId(B.into()), 1).unwrap());
+        network
+            .install(Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    [A, B, C]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| Member {
+                            node: NodeId((*n).into()),
+                            shares: std::num::NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                            rails: vec![],
+                            alignment_enabled: false,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let relay = relay::Relay::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 1, 1000)),
+            forwarding.clone(),
+            Rc::new(Destination {
+                auth: Forwarding::new(signers[2].clone()),
+                fail,
+            }),
+            admission.clone(),
+        )
+        .with_network(network);
+        let local = request(&admission, 9);
+        let scope = local.origin.scope().clone();
+        let (signed, binding) = origin.sign_request_to(local, signers[1].node()).unwrap();
+        let ingress = forwarding.verify_request(signed).unwrap();
+        let result = futures::executor::block_on(relay.forward(ingress, &scope));
+        if fail {
+            assert!(matches!(result, Err(Error::Io)));
+        } else {
+            let response = result.unwrap();
+            assert_eq!(response.authentication.hops.len(), 1);
+            assert!(matches!(
+                origin
+                    .verify_response(response, &binding)
+                    .unwrap()
+                    .response(),
+                PeerResponse::Miss
+            ));
+        }
+        assert_eq!(admission.used(ResourceClass::Relay), 0);
+    }
+}
+
+#[test]
+fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
+    use super::requester::PeerClient;
+    use crate::{
+        http::{
+            codec::Codec,
+            io::HttpIo,
+            pool::{ConnectionLease, HttpPool},
+        },
+        runtime::reactor::Reactor,
+        topology::{
+            health::LinkHealth,
+            membership::{Member, Membership},
+            paths::Paths,
+            rails::Rails,
+        },
+    };
+    use std::{
+        net::TcpListener,
+        os::fd::OwnedFd,
+        task::{Context, Poll},
+    };
+    struct NeverTransport;
+    impl requester::PeerTransport for NeverTransport {
+        fn exchange<'a>(
+            &'a self,
+            _: wire::SignedRequest,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+            Box::pin(async { panic!("direct request must not relay") })
+        }
+    }
+    struct Local;
+    impl server::LocalPageService for Local {
+        fn serve_peer<'a>(
+            &'a self,
+            request: wire::VerifiedRequest,
+            scope: &'a RequestScope,
+        ) -> crate::error::Operation<'a, PeerResponse> {
+            Box::pin(async move {
+                scope.check()?;
+                assert_eq!(
+                    request
+                        .request()
+                        .origin
+                        .authorization
+                        .as_ref()
+                        .unwrap()
+                        .ciphertext,
+                    vec![5; 32]
+                );
+                Ok(PeerResponse::Miss)
+            })
+        }
+    }
+    let (signers, discovery) = identities();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(HttpIo::with_admission(
+        reactor.clone(),
+        Codec::new(
+            wire::MAX_ENVELOPE_HEAD,
+            crate::model::range::PAGE_BYTES + 16,
+        ),
+        admission.clone(),
+    ));
+    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
+    let codec = Rc::new(codec(&admission));
+    let transfers = Rc::new(
+        transfer::Transfers::new(pool, io.clone(), None)
+            .with_wire(admission.clone(), codec.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, C]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Member {
+                    node: NodeId((*n).into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: if i == 1 {
+                        address.to_string()
+                    } else {
+                        "127.0.0.1:9000".into()
+                    },
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let source_network = Rc::new(PeerNetwork::new(NodeId(A.into()), 1).unwrap());
+    let destination_network = Rc::new(PeerNetwork::new(NodeId(C.into()), 1).unwrap());
+    source_network.install(membership.clone()).unwrap();
+    destination_network.install(membership).unwrap();
+    let source_handshake = Rc::new(
+        handshake::Handshake::new(signers[0].clone(), None)
+            .with_http(source_network.clone(), transfers.clone())
+            .with_discovery(
+                discovery[0].0.clone(),
+                discovery[0].1.clone(),
+                discovery[0].2.clone(),
+            ),
+    );
+    let destination_handshake = Rc::new(
+        handshake::Handshake::new(signers[2].clone(), None)
+            .with_http(destination_network.clone(), transfers.clone())
+            .with_discovery(
+                discovery[2].0.clone(),
+                discovery[2].1.clone(),
+                discovery[2].2.clone(),
+            ),
+    );
+    let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000));
+    let relay = Rc::new(
+        relay::Relay::new(
+            paths.clone(),
+            destination_auth.clone(),
+            Rc::new(NeverTransport),
+            admission.clone(),
+        )
+        .with_network(destination_network.clone()),
+    );
+    let server = server::PeerServer::new(
+        io,
+        destination_auth,
+        admission.clone(),
+        Rc::new(Local),
+        relay,
+    )
+    .with_network(destination_network)
+    .with_wire(codec)
+    .with_handshake(destination_handshake);
+    let requester = requester::Requester::new(
+        paths,
+        Rc::new(Rails),
+        Rc::new(Forwarding::new(signers[0].clone())),
+        source_handshake,
+        transfers,
+    )
+    .with_network(source_network);
+    let local = request(&admission, 1);
+    let scope = local.origin.scope().clone();
+    let server_work = async {
+        let fd = reactor
+            .accept(Rc::new(OwnedFd::from(listener)), &scope)
+            .await?;
+        let connection = ConnectionLease::from_accepted(fd, &admission)?;
+        let connection = server.serve_connection(connection, &scope).await?;
+        let connection = server.serve_connection(connection, &scope).await?;
+        server.serve_connection(connection, &scope).await?;
+        Ok::<(), Error>(())
+    };
+    let exchange = async { futures::try_join!(requester.request(local, &scope), server_work) };
+    let mut exchange = std::pin::pin!(exchange);
+    let mut context = Context::from_waker(futures::task::noop_waker_ref());
+    let (response, ()) = loop {
+        if let Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), &mut context) {
+            break result.unwrap();
+        }
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+    assert!(matches!(response.response(), PeerResponse::Miss));
 }
 
 #[test]

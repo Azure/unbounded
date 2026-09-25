@@ -70,6 +70,12 @@ impl PeerNetwork {
         node: &NodeId,
     ) -> Result<crate::http::pool::Endpoint> {
         let membership = self.membership(version)?;
+        if !crate::topology::graph::Graph::new(membership.clone())
+            .neighbors(&self.local)?
+            .contains(node)
+        {
+            return Err(Error::InvalidRequest);
+        }
         let member = membership
             .members()
             .iter()

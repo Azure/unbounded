@@ -110,8 +110,8 @@ impl Handshake {
         prepared.finish(&verified)
     }
 
-    /// Receiver challenges must first be authenticated by the security/control
-    /// session API. This exchange then proves capabilities and exact correlation.
+    /// Discover the receiver challenge using the security-owned fresh-probe
+    /// protocol, then prove capabilities and exact request correlation.
     pub fn negotiate_at<'a>(
         &'a self,
         peer: &'a NodeId,

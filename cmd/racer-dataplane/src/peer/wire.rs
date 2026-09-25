@@ -98,7 +98,7 @@ pub trait LogicalCodec {
 }
 pub use super::decode::SecurityCodec;
 
-/// Versioned HTTP envelope. Original signed heads are embedded byte-for-byte using
+/// Versioned HTTP envelope. Signed header values and signatures are preserved using
 /// the HTTP codec; this wrapper is framing only and is never a signing authority.
 pub struct WireCodec;
 impl WireCodec {
