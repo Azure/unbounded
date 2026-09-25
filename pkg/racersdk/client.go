@@ -104,7 +104,7 @@ func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	v := &Value{client: c, ctx: ctx, cancel: cancel, request: r}
+	v := &Value{client: c, ctx: ctx, cancel: cancel, request: r, finished: make(chan struct{})}
 	c.mu.Lock()
 	if c.closed || c.transport == nil {
 		c.mu.Unlock()

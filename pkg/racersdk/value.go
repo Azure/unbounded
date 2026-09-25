@@ -22,6 +22,7 @@ type Value struct {
 	stop      func() bool
 	body      io.ReadCloser
 	terminal  error
+	finished  chan struct{}
 	slot      bool
 	metadata  Metadata
 	request   OriginRequest
@@ -51,13 +52,24 @@ func closeBody(body io.Closer) {
 func (v *Value) finish(err error) {
 	v.mu.Lock()
 	if v.terminal != nil {
+		done := v.finished
 		v.mu.Unlock()
+
+		if done != nil {
+			<-done
+		}
+
 		return
+	}
+
+	if v.finished != nil {
+		defer close(v.finished)
 	}
 
 	v.terminal = err
 	body, slot, stop := v.body, v.slot, v.stop
 	v.body, v.slot, v.stop = nil, false, nil
+	v.request = OriginRequest{}
 	v.mu.Unlock()
 
 	if stop != nil {
@@ -115,7 +127,9 @@ func (v *Value) Read(p []byte) (int, error) {
 		}
 
 		v.continued = true
+		v.mu.Lock()
 		r := v.request
+		v.mu.Unlock()
 		r.operation, r.pin = OperationPinned, v.metadata.ETag
 		r.byteRange = Range{kind: RangeClosed, first: uint64(PageSize), last: uint64(v.metadata.Size) - 1}
 

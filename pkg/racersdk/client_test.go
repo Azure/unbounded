@@ -244,6 +244,7 @@ func TestClientPendingHeadersCanceled(t *testing.T) {
 func TestClientRawResponses(t *testing.T) {
 	valid := string(rawResponse(206, "Content-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n"))
 	for _, wire := range []string{
+		"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n",
 		strings.Replace(valid, "Content-Length: 1", "Content-Length: 1\r\nContent-Length: 1", 1),
 		strings.Replace(valid, "Content-Length: 1", "Content-Length: 1\r\nTransfer-Encoding: chunked", 1),
 		strings.Replace(valid, "Content-Length: 1", "Content-Length: 1\r\nContent-Encoding: identity", 1),
@@ -280,8 +281,16 @@ func TestClientRawResponses(t *testing.T) {
 			}()
 
 			c := testClient(t, path, 1)
+
 			_, err = c.Get(context.Background(), Request{})
-			assertKind(t, err, ErrorProtocol)
+			if !strings.HasSuffix(wire, "\r\n\r\n") {
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatal("truncated head cause lost", err)
+				}
+			} else {
+				assertKind(t, err, ErrorProtocol)
+			}
+
 			<-done
 		})
 	}
@@ -417,5 +426,122 @@ func TestClientContinuationFailures(t *testing.T) {
 				t.Fatal("snapshot changed")
 			}
 		})
+	}
+}
+
+func TestClientContinuationCloseAndContext(t *testing.T) {
+	for _, closeClient := range []bool{false, true} {
+		t.Run(strconv.FormatBool(closeClient), func(t *testing.T) {
+			entered := make(chan struct{})
+			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("If-Match") == "" {
+					streamResponse(w, 0, int64(PageSize), int64(PageSize)+1, `"v"`)
+					return
+				}
+
+				close(entered)
+				<-r.Context().Done()
+			}))
+			c := testClient(t, path, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			v, err := c.Get(ctx, Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			done := make(chan error, 1)
+
+			go func() { _, err := v.WriteTo(io.Discard); done <- err }()
+
+			<-entered
+
+			if closeClient {
+				if err := c.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cancel()
+			}
+
+			select {
+			case err := <-done:
+				if closeClient {
+					assertKind(t, err, ErrorClosed)
+				} else if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("continuation blocked")
+			}
+		})
+	}
+}
+
+func TestClientConfigAndValidation(t *testing.T) {
+	for _, config := range []ClientConfig{{}, {Cache: CacheName{value: "test"}, MaxConnections: -1}, {Cache: CacheName{value: "test"}, DialTimeout: -1}, {Cache: CacheName{value: "test"}, ResponseHeaderTimeout: -1}, {Cache: CacheName{value: "test"}, IdleConnTimeout: -1}} {
+		_, err := NewClient(config)
+		assertKind(t, err, ErrorInvalidArgument)
+	}
+
+	c := testClient(t, filepath.Join(socketDir(t), "missing"), 1)
+	_, err := c.Get(nil, Request{}) //nolint:staticcheck // Exercise the public nil-context validation contract.
+	assertKind(t, err, ErrorInvalidArgument)
+	_, err = c.Get(context.Background(), Request{Context: FetchContext{authorization: Authorization{value: "bad\nvalue"}}})
+	assertKind(t, err, ErrorInvalidArgument)
+	_, err = c.Get(context.Background(), Request{})
+	assertKind(t, err, ErrorIO)
+
+	var value Value
+
+	_, err = value.Read(make([]byte, 1))
+	assertKind(t, err, ErrorClosed)
+}
+
+func TestClientHeaderTimeout(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "test"}, ResponseHeaderTimeout: 20 * time.Millisecond}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(c)
+
+	_, err = c.Get(context.Background(), Request{})
+	if err == nil {
+		t.Fatal("header timeout ignored")
+	}
+
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatal("timeout cause lost", err)
+	}
+}
+
+func TestClientConcurrentCloseWaitsForCleanup(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { streamResponse(w, 0, 1, 1, `"v"`) }))
+	for range 20 {
+		c := testClient(t, path, 1)
+
+		v, err := c.Get(context.Background(), Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Go(func() { _ = v.Close() })
+		wg.Go(func() { _ = c.Close() })
+
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(c.slots) != 0 {
+			t.Error("Close returned before capacity release")
+		}
+
+		wg.Wait()
 	}
 }

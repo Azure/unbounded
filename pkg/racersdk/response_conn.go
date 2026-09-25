@@ -6,6 +6,7 @@ package racersdk
 import (
 	"bufio"
 	"errors"
+	"io"
 	"net"
 	"sync"
 )
@@ -69,7 +70,7 @@ func (c *responseConn) Read(p []byte) (int, error) {
 	head, err := readRawHead(c.reader, true)
 	if err != nil {
 		var typed *Error
-		if errors.As(err, &typed) && typed.Kind() == ErrorProtocol {
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &typed) && typed.Kind() == ErrorProtocol {
 			return c.reject(p, err)
 		}
 
