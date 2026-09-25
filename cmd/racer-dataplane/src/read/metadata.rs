@@ -40,7 +40,7 @@ const MAX_WAITERS: usize = 64;
 const MAX_REFRESH_ATTEMPTS: usize = 8;
 const MAX_BOOTSTRAP_ATTEMPTS: usize = 3;
 const DEFAULT_ATTEMPTS: u32 = 32;
-const DEFAULT_LINKS: u8 = 32;
+const DEFAULT_LINKS: u8 = 96;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RefreshKey {
@@ -515,6 +515,9 @@ impl MetadataService {
                 PeerResponse::Metadata(metadata) => metadata.clone(),
                 PeerResponse::OriginRejected => {
                     return Err(RefreshFailure::Rejected(Error::OriginRejected));
+                }
+                PeerResponse::OriginForbidden => {
+                    return Err(RefreshFailure::Rejected(Error::OriginForbidden));
                 }
                 PeerResponse::VersionUnavailable => return Err(Error::VersionUnavailable.into()),
                 PeerResponse::Overloaded => return Err(Error::Overloaded.into()),

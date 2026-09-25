@@ -46,7 +46,28 @@ pub struct Coordinator {
     credentials: Rc<CredentialCrypto>,
 }
 pub(crate) fn default_budget(scope: &RequestScope) -> AcquisitionBudget {
-    AcquisitionBudget::new(scope.deadline.0, 32, 8)
+    AcquisitionBudget::new(scope.deadline.0, 32, 96)
+}
+pub(crate) fn inherited_budget(
+    route: &crate::topology::paths::RouteBudget,
+    scope: &RequestScope,
+) -> Result<AcquisitionBudget> {
+    scope.check()?;
+    if route.remaining_links > 8 || route.remaining_links == 0 || route.visited.is_empty() {
+        return Err(Error::HopBudgetExhausted);
+    }
+    let mut budget = AcquisitionBudget::new(
+        scope.deadline.0.min(route.deadline.0),
+        route.remaining_attempts,
+        route
+            .remaining_links
+            .checked_sub(1)
+            .ok_or(Error::HopBudgetExhausted)?,
+    );
+    if route.remaining_links > 4 {
+        budget.note_route_failure();
+    }
+    Ok(budget)
 }
 impl Coordinator {
     pub fn new(
@@ -322,11 +343,7 @@ impl LocalPageService for Coordinator {
                     if membership.version != request.route.membership {
                         return Err(Error::IncompatibleMembership);
                     }
-                    let mut budget = AcquisitionBudget::new(
-                        effective.deadline.0,
-                        32,
-                        request.route.remaining_links,
-                    );
+                    let mut budget = inherited_budget(&request.route, &effective)?;
                     let context = self.open_context(request.origin)?;
                     match operation {
                         PeerOperation::Page {
@@ -397,7 +414,8 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
     match error {
         Error::VersionUnavailable => Ok(PeerResponse::VersionUnavailable),
         Error::Overloaded => Ok(PeerResponse::Overloaded),
-        Error::OriginRejected | Error::OriginForbidden => Ok(PeerResponse::OriginRejected),
+        Error::OriginRejected => Ok(PeerResponse::OriginRejected),
+        Error::OriginForbidden => Ok(PeerResponse::OriginForbidden),
         Error::Unavailable | Error::HopBudgetExhausted | Error::DeadlineExceeded => {
             Ok(PeerResponse::Unavailable)
         }
@@ -407,6 +425,46 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
+        let now = std::time::Instant::now();
+        let scope = RequestScope::new(
+            crate::model::identity::RequestId([1; 16]),
+            now + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut route = crate::topology::paths::RouteBudget {
+            membership: crate::model::identity::MembershipVersion(1),
+            request: scope.request,
+            attempt: AttemptId([2; 16]),
+            destination: crate::model::identity::NodeId("destination".into()),
+            visited: vec![crate::model::identity::NodeId("sender".into())],
+            remaining_links: 1,
+            remaining_attempts: 0,
+            deadline: scope.deadline,
+        };
+        let mut budget = inherited_budget(&route, &scope).unwrap();
+        assert_eq!(budget.remaining_links(), 0);
+        assert_eq!(
+            budget.begin_attempt(now, scope.deadline.0),
+            Err(Error::Unavailable)
+        );
+        route.remaining_links = 8;
+        route.remaining_attempts = 3;
+        route.deadline.0 = now + std::time::Duration::from_secs(5);
+        let mut budget = inherited_budget(&route, &scope).unwrap();
+        assert_eq!(budget.route_links(), 7);
+        assert_eq!(
+            budget.begin_attempt(now, scope.deadline.0),
+            Ok(route.deadline.0)
+        );
+        assert_eq!(budget.remaining_attempts(), 2);
+        route.remaining_links = 0;
+        assert!(matches!(
+            inherited_budget(&route, &scope),
+            Err(Error::HopBudgetExhausted)
+        ));
+    }
     use crate::model::{
         identity::{CacheId, CacheKey, ObjectVersion, StrongEtag},
         metadata::ExpiresAt,
@@ -465,7 +523,7 @@ mod tests {
         ));
         assert!(matches!(
             peer_error(Error::OriginForbidden),
-            Ok(PeerResponse::OriginRejected)
+            Ok(PeerResponse::OriginForbidden)
         ));
         assert!(matches!(
             peer_error(Error::Overloaded),

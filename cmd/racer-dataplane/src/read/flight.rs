@@ -145,7 +145,8 @@ pub struct AcquisitionBudget {
     deadline: Instant,
     attempts: u32,
     links: u8,
-    charged_links: u8,
+    charged_links: u16,
+    failed_route: bool,
 }
 impl AcquisitionBudget {
     pub fn new(deadline: Instant, attempts: u32, links: u8) -> Self {
@@ -154,6 +155,7 @@ impl AcquisitionBudget {
             attempts,
             links,
             charged_links: 0,
+            failed_route: false,
         }
     }
 
@@ -173,7 +175,7 @@ impl AcquisitionBudget {
             .links
             .checked_sub(links)
             .ok_or(Error::HopBudgetExhausted)?;
-        self.charged_links += links;
+        self.charged_links = self.charged_links.saturating_add(u16::from(links));
         Ok(())
     }
 
@@ -182,7 +184,7 @@ impl AcquisitionBudget {
     pub fn refund_links(&mut self, links: u8) -> Result<()> {
         let charged = self
             .charged_links
-            .checked_sub(links)
+            .checked_sub(u16::from(links))
             .ok_or(Error::InvalidRequest)?;
         let available = self.links.checked_add(links).ok_or(Error::InvalidRequest)?;
         self.charged_links = charged;
@@ -200,6 +202,33 @@ impl AcquisitionBudget {
         self.links
     }
 
+    /// Both normal and failure ceilings draw from credits allocated by ingress.
+    /// Observing failure changes the per-attempt ceiling, never adds credits.
+    pub fn route_links(&self) -> u8 {
+        self.links.min(if self.failed_route { 8 } else { 4 })
+    }
+    pub fn note_route_failure(&mut self) {
+        self.failed_route = true;
+    }
+
+    /// Consume an owned child's unused credits exactly once. Do not reconstruct a
+    /// default budget or refund uncertain work after a lost remote response.
+    pub fn reunite(&mut self, child: Self) -> Result<()> {
+        let attempts = self
+            .attempts
+            .checked_add(child.attempts)
+            .ok_or(Error::InvalidRequest)?;
+        let links = self
+            .links
+            .checked_add(child.links)
+            .ok_or(Error::InvalidRequest)?;
+        self.deadline = self.deadline.min(child.deadline);
+        self.attempts = attempts;
+        self.links = links;
+        self.failed_route |= child.failed_route;
+        Ok(())
+    }
+
     /// Move credits into an independently owned worker/range child. Failure is
     /// atomic; neither fanout nor a worker transfer can mint original credits.
     pub fn partition(&mut self, attempts: u32, links: u8) -> Result<Self> {
@@ -213,7 +242,9 @@ impl AcquisitionBudget {
             .ok_or(Error::HopBudgetExhausted)?;
         self.attempts = remaining_attempts;
         self.links = remaining_links;
-        Ok(Self::new(self.deadline, attempts, links))
+        let mut child = Self::new(self.deadline, attempts, links);
+        child.failed_route = self.failed_route;
+        Ok(child)
     }
 
     pub fn transfer(&mut self) -> Self {
@@ -224,6 +255,7 @@ impl AcquisitionBudget {
             attempts,
             links,
             charged_links: std::mem::take(&mut self.charged_links),
+            failed_route: self.failed_route,
         }
     }
 
@@ -250,7 +282,7 @@ impl AcquisitionBudget {
             .ok_or(Error::HopBudgetExhausted)?;
         self.attempts -= 1;
         self.links = remaining;
-        self.charged_links += links;
+        self.charged_links = self.charged_links.saturating_add(u16::from(links));
         Ok(deadline)
     }
 }
@@ -1155,6 +1187,29 @@ fn validate_context(page: &PageId, context: &OriginContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failure_ceiling_is_inherited_without_allocating_additional_links() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut original = AcquisitionBudget::new(deadline, 16, 24);
+        assert_eq!(original.route_links(), 4);
+        original
+            .begin_peer_attempt(Instant::now(), deadline, 4)
+            .unwrap();
+        original.note_route_failure();
+        assert_eq!(original.route_links(), 8);
+        let mut child = original.partition(5, 8).unwrap();
+        assert_eq!(child.route_links(), 8);
+        child
+            .begin_peer_attempt(Instant::now(), deadline, 8)
+            .unwrap();
+        original.reunite(child).unwrap();
+        assert_eq!(original.remaining_links(), 12);
+        assert_eq!(original.remaining_attempts(), 14);
+        assert_eq!(original.deadline(), deadline);
+        let moved = original.transfer();
+        assert_eq!(moved.route_links(), 8);
+        assert_eq!(original.remaining_links(), 0);
+    }
     use crate::model::identity::{
         CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag,
     };

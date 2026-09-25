@@ -182,11 +182,16 @@ impl RangeStream {
                     version: self.metadata.version.clone(),
                     number,
                 };
-                let slots = (self.range.last_page().0 - number.0 + 1)
-                    .min((self.window_pages - self.ready.len()) as u64)
-                    .min(u64::from(u32::MAX)) as u32;
-                let attempts = self.budget.remaining_attempts().div_ceil(slots);
-                let links = u32::from(self.budget.remaining_links()).div_ceil(slots) as u8;
+                // Keep enough credit in each admitted page for the full candidate
+                // chain. Smaller concurrency is preferable to splitting a route
+                // below its four-link normal allowance. Credits are still bounded
+                // by the one ingress budget, not replenished as the window slides.
+                let remaining = self.range.last_page().0 - number.0 + 1;
+                let attempts = self.budget.remaining_attempts().min(8);
+                let links = self.budget.remaining_links().min(16);
+                if !self.ready.is_empty() && remaining > 0 && (attempts == 0 || links < 4) {
+                    break;
+                }
                 let child = self.budget.partition(attempts, links)?;
                 let result = self.directory.start_page(
                     page,
@@ -274,16 +279,7 @@ fn poll_window(
     }
 }
 fn return_credits(budget: &mut AcquisitionBudget, remaining: AcquisitionBudget) -> Result<()> {
-    let attempts = budget
-        .remaining_attempts()
-        .checked_add(remaining.remaining_attempts())
-        .ok_or(Error::CorruptRecord)?;
-    let links = budget
-        .remaining_links()
-        .checked_add(remaining.remaining_links())
-        .ok_or(Error::CorruptRecord)?;
-    *budget = AcquisitionBudget::new(budget.deadline().min(remaining.deadline()), attempts, links);
-    Ok(())
+    budget.reunite(remaining)
 }
 impl Drop for RangeStream {
     fn drop(&mut self) {

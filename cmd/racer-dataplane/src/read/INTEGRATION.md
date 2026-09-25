@@ -1,128 +1,89 @@
 # Read implementation handoffs
 
-Read owner coordinates only this directory. Integration owns application and errors.
+Read owns this directory and read.rs. Other component owners implement the
+runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams.
 
-## Verification results
+## Integrated routing and budgets
 
-
-Pressure audit fix: Fill::reserve_progress retries once after discarding only
-unsubmitted disposable writes and evicting idle memory. Busy reader/ciphertext
-leases and submitted writes remain pinned. If only dirty quota remains exhausted,
-admit the read without persistence. Direct-I/O staging overload also gets one idle
-reclamation retry; metadata entry-count saturation cannot fail valid delivery.
-Three sequential full-page pressure regressions pass in debug and release: 8/12
-distinct 16 MiB pages under two-page plaintext capacity, with an independent reader
-held throughout, bounded plaintext/ciphertext/dirty accounting, and zero charges
-after final release/eviction. Candidate persistence enqueue reserves staging before
-acceptance; its Overloaded/Unavailable/Io outcomes remain disposable.
-
-`python3 src/read/check-component.py` from cmd/racer-dataplane initially passed 62
-read tests. A strengthened real-crypto cancellation assertion now reports 61 passed,
-1 failed: canceled_supplier_retains_crypto_fence_before_replacement_origin_work.
-This reproduces the required completion fence contract below: an accepted crypto
-job remains outstanding while early cancellation return permits a replacement
-origin call. Keep this test intact; runtime must fix the accepted completion wait.
-It compiles unchanged production dependency modules, excluding only app and
-telemetry roots whose concurrent test changes blocked Cargo's whole-crate harness.
-The tests include actual page crypto jobs through the production engine,
-origin coalescing, pending candidate ciphertext retention, origin-forbidden retry,
-and dropped supplier completion fencing. No production adapter is replaced by the
-component runner. Full Cargo verification remains required by integration.
-
-## Blocking signed budget handoff (peer/security/topology owners)
-
-Add `remaining_attempts: u32` to topology::paths::RouteBudget, include it in signed
-canonical peer request encoding/decoding, preserve/decrease across forwarding.
-Read candidate policy reserves a child acquisition attempt allowance before a
-remote Acquire; destination Coordinator must consume that allowance rather than
-create 32 fresh attempts. CopyOnly gets zero acquisition attempts. Conservative
-charging may discard unused allowance when the response lacks a signed credit
-receipt; it must never mint fresh credits. This field is needed for the requested
-full original budgets across nodes. Add PeerResponse::OriginForbidden and sign its
-distinct 403 outcome rather than collapsing it into OriginRejected/401.
-
-Read delegates are separate CLI processes. Do not use concurrent opencode run
---session to send steering to a running delegate: that starts another writer for
-the same files. Add coordination notes here; the read parent consolidates delegates.
-
-Construct WorkerDirectory with its immutable Arc<WorkerMap>, worker IDs, and queue
-capacity. Install each directory endpoint after Coordinator assembly and poll
-WorkerEndpoint along with flights. cargo check --lib --all-features passed during
-integration; whole-crate test compilation remains blocked by app composition test
-Result unwraps. The focused runner above executes read tests independently.
-Candidate route visited starts empty: topology validates prior senders excluding
-the current sender and forwarding adds it. Starting with self would reject every
-outbound request as a loop.
-
-- CandidatePolicy keeps its existing constructor. Fill::new installs its shared
-  CredentialCrypto through CandidatePolicy::set_credentials. Metadata is composed
-  after Fill and uses the same policy. resolve_with_budget takes candidates,
-  context, operation, scope, and mutable AcquisitionBudget. It returns either a
-  verified copy/acquisition response or scoped origin authority. Noncandidates
-  request Acquire from ranked candidates; candidates probe predecessors CopyOnly.
-- Flight budget needs remaining_attempts(), remaining_links(), deadline(), and
-  refund_links(u8) for reserving a route before transport and reconciling a verified
-  completed route. Failed exchanges conservatively retain the full route debit.
-- Metadata exposes resolve_with_budget/bootstrap_with_budget. Existing convenience
-  entry points create one initial budget, never reset it inside retry loops.
-- Integration supplies OriginRejected (401) and OriginForbidden (403), each a
-  caller-only origin failure. Peer authentication stays Unauthorized and terminal.
-- Integration must install/poll bounded WorkerDirectory endpoints on each worker
-  and drive shared Flights completions even when requesting futures disappear.
-- Client owner retains ReadKind::Head and supplies HeadPinned { etag: StrongEtag }
-  for pinned SDK HEAD. Coordinator must handle these distinct variants.
-- Error::OriginForbidden joins OriginRejected as a caller-only origin failure;
+- Signed initial requests carry `visited=[local]`. `peer::search_budget` removes
+  that local sender before topology search; topology and signing intentionally
+  consume different representations. Never send an empty signed visited list.
+- Ingress allocates one aggregate allowance: 32 attempts and 96 forwarded links.
+  Four is the normal per-route ceiling; observed failure permits up to eight from
+  the already allocated allowance. This changes a ceiling, not remaining credits.
+- `RouteBudget.remaining_attempts` is signed, decoded, and preserved by forwarding.
+  CandidatePolicy removes a remote Acquire allowance from the original budget
+  before submission. CopyOnly carries zero acquisition credits. Failed/unknown
+  remote completions cannot refund credits. No signed response credit receipt is
+  implemented, so unused remote allowance is conservatively spent.
+- Destination Coordinator uses the signed attempt allowance and deducts the final
+  incoming link exactly once. It never creates a new default allowance.
+- Metadata, bootstrap, owned drivers, worker handoffs, and range fanout transfer or
+  partition the original budget. Sliding-window children receive at most eight
+  attempts and sixteen aggregate links; completed local children return only their
+  remaining owned credits. Failure mode and the tighter deadline survive handoff.
+- `PeerResponse::OriginForbidden` is separate from OriginRejected, including signed
+  outcome encoding and read mapping. Both fail only the credential supplier;
   Unauthorized remains a terminal peer authentication failure.
+- Membership and candidate authority are resolved for each elected caller. Only
+  ranked candidates can mint origin authority. Predecessor probes are CopyOnly;
+  noncandidates request Acquire through peers. Origin 412 plus an unreachable
+  permitted copy remains transient Unavailable, not proof of version absence.
 
-These are interface requirements, not assertions that external owners already
-implemented them. Tests and final integration reports identify unresolved edges.
+## Completion and memory ownership
 
-## Flight delegate integration request (updated)
+`read::drivers` is a bounded worker-local round-robin owner. Fill transfers the
+leader, retained FlightOperation, charged context, and original budget into an
+owned driver. Dropping ingress detaches the waiter and requests cancellation;
+accepted work remains owned until completion. Flights::poll_with_context drives
+these tasks outside the flight-table borrow, including during drain.
 
-Fill now uses read::drivers, a bounded worker-local round-robin future owner. Flight
-delegate: call `super::drivers::poll(cx, work_budget)` from worker poll/drain paths
-outside any RefCell table borrow; use noop_waker_ref for poll_budgeted if needed.
-Fill moves a leader, retained operation
-token, an owned sealed/opened origin context, a transferred original budget, and
-scope into this future. Its oneshot reply returns remaining budget to a live caller;
-if the caller disappears its credits disappear too. The driver completes its
-operation token before publishing/failing. Never drop accepted drivers on shutdown.
-There is no need to implement a second spawn_driver queue in Flights.
-Security implements open_charged -> ChargedOriginContext (Deref OriginContext).
-Use this owner for all retained driver contexts. drivers::reserve() yields a Permit BEFORE retaining any
-FlightOperation; Permit::submit cannot fail, avoiding a leaked completion token on
-queue overload. drivers::spawn remains convenience for unsubmitted operations.
+Origin, peer, disk, and crypto methods returning after accepted submission must
+fence their actual completions before returning cancellation. The runtime owner
+fixed CryptoClient's early cancellation return. The strengthened regression
+`canceled_supplier_retains_crypto_fence_before_replacement_origin_work` now passes.
+Never substitute buffer retention or a timeout for that completion fence.
 
-## Origin and peer resource handoffs
+CredentialCrypto::open_charged returns a quota-owning context. Driver queue permits
+are acquired before retaining a FlightOperation; submission is infallible after
+reservation. No credential-bearing context enters a completed flight or cache.
 
-Origin owner implemented the reserved operation used by Fill:
-`Origin::page_reserved(authority, context, page, Reservation, scope)` so OriginClient
-uses the supplied plaintext reservation rather than reserving a second full page.
-Keep page() as the convenience wrapper for independent callers. Fill uses the
-reserved operation. Default implementations for test doubles may release the
-reservation before calling page(), but production must consume it into the buffer.
+Fill::reserve_progress performs one bounded reclamation pass on overload: discard
+only unsubmitted disposable writes, evict idle memory, retry admission. Busy
+reader/ciphertext leases and submitted writes remain pinned. Dirty-only saturation
+permits memory-only completion. Local disk staging gets one reclamation retry;
+writer enqueue staging overload is disposable and never fails plaintext delivery.
 
-Peer owner: preserve OriginForbidden separately from OriginRejected on signed
-responses. Full request accounting needs request_with_budget or a verified route
-consumption receipt: attempts consumed at candidates must not reset at destination,
-and completed forwarding link consumption must reconcile with the parent budget.
-Current candidate code conservatively charges the permitted route before sending,
-so failed responses cannot refund unknown link consumption.
+## Composition interfaces
 
-Metadata owner: Fill now implements publish_bootstrap_with_context(origin_page,
-membership, context, scope, budget). It joins the same page flight, supplies the
-prefetch only if elected, encrypts once, validates full identity/length, and persists
-only on candidates. Do not call the old proposed publish_bootstrap without context.
+- WorkerDirectory::new takes an immutable Arc<WorkerMap>, worker IDs, and bounded
+  queue capacity. Install each endpoint after local Coordinator assembly and poll
+  WorkerEndpoint alongside Flights. Drain accepted commands before changing maps.
+- Fill::new installs the shared CredentialCrypto on CandidatePolicy. Metadata uses
+  the same policy and budget-aware resolve/bootstrap paths.
+- Origin::page_reserved consumes the fill's plaintext reservation, avoiding a
+  second full-page reservation. OriginClient implements this production path.
+- Fill::publish_bootstrap_with_context(origin_page, membership, context, scope,
+  budget) joins the shared page-zero flight. Only an elected supplier encrypts the
+  prefetch; an existing acquisition wins. Empty objects allocate no page.
+- Client keeps ReadKind::Head and HeadPinned { etag }; coordinator maps these to
+  fresh and pinned metadata respectively. Pinned range 416 uses selected length.
 
-## Required completion fence contract
+## Verification
 
-Retained read drivers mark their FlightOperation complete only when awaited origin,
-peer, disk and crypto operations return. Those operations MUST NOT return a
-cancellation/deadline error after submission until their accepted I/O/crypto work
-is actually reaped. Runtime CryptoClient::execute currently checks scope before
-consuming an accepted completion (runtime/crypto.rs around 400); change accepted
-waiters to keep polling until completion, then return the cancellation error.
-The same requirement applies to submitted reactor operations. Dropping an ingress
-future never drops the retained read driver; safe late returns make generation
-drain exact without global worker fences. Retaining buffers alone is insufficient
-if an early returned error lets read elect a new origin acquisition.
+All 70 integrated release read tests pass, including real TCP candidate requests through
+production Requester, handshake, Forwarding, and PeerServer. They check signed
+visited state, inherited attempts, final-link debit, and distinct OriginForbidden.
+The crypto-fence and sequential full-page pressure regressions pass. Pressure tests
+acquire 8/12 full 16 MiB pages under a two-page plaintext budget with page zero held
+by another reader; all accounting is bounded and returns to zero after release.
+
+`cargo check --all-targets --all-features` passes with an unrelated integration-test
+dead-field warning. Whole-application production tests currently fail during
+fixture setup at tests/production_dataplane.rs:181: installing the decoded static
+control/testdata/bundle.json returns InvalidConfiguration before read admission.
+Integration owns fixing that fixture and rerunning its three end-to-end tests.
+
+`python3 src/read/check-component.py` remains a focused runner for unchanged
+production modules excluding application/telemetry roots. It is not a replacement
+for the integrated Cargo tests above.

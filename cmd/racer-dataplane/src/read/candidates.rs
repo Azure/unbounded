@@ -93,7 +93,7 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
     ) -> Operation<'a, CandidateResolution> {
         Box::pin(async move {
-            let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 8);
+            let mut budget = super::serve::default_budget(scope);
             self.resolve_with_budget(candidates, context, operation, scope, &mut budget)
                 .await
         })
@@ -131,7 +131,7 @@ impl CandidatePolicy {
             let mut saw_transient = false;
             let mut saw_version = false;
             let count = rank.unwrap_or(candidates.ordered.len());
-            for destination in &candidates.ordered[..count] {
+            for (index, destination) in candidates.ordered[..count].iter().enumerate() {
                 let mode = if rank.is_some() {
                     FetchMode::CopyOnly
                 } else {
@@ -146,6 +146,7 @@ impl CandidatePolicy {
                         mode,
                         scope,
                         budget,
+                        (count - index) as u32,
                     )
                     .await
                 {
@@ -158,15 +159,20 @@ impl CandidatePolicy {
                                 ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
                             );
                             evidence.push(outcome);
+                            if saw_transient {
+                                budget.note_route_failure();
+                            }
                         }
                     },
                     Err(Error::Unavailable | Error::Io) => {
                         evidence.push(ProbeOutcome::Unreachable);
                         saw_transient = true;
+                        budget.note_route_failure();
                     }
                     Err(Error::Overloaded) => {
                         evidence.push(ProbeOutcome::Overloaded);
                         saw_transient = true;
+                        budget.note_route_failure();
                     }
                     Err(error) => return Err(error),
                 }
@@ -216,6 +222,7 @@ impl CandidatePolicy {
                         FetchMode::CopyOnly,
                         scope,
                         budget,
+                        1,
                     )
                     .await
                 {
@@ -226,7 +233,10 @@ impl CandidatePolicy {
                         }
                         Some(_) => {}
                     },
-                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => transient = true,
+                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => {
+                        transient = true;
+                        budget.note_route_failure();
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -247,15 +257,26 @@ impl CandidatePolicy {
         mode: FetchMode,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
+        remaining_candidates: u32,
     ) -> Result<VerifiedResponse> {
         scope.check()?;
         // Reserve the complete permitted route before sending. Lost responses cannot
         // refund an unknown number of forwarded links. No retry gets fresh credits.
-        let links = budget.remaining_links().min(4);
+        let links = budget.route_links();
         if links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
         let deadline = budget.begin_peer_attempt(Instant::now(), scope.deadline.0, links)?;
+        let attempts = if matches!(mode, FetchMode::Acquire) {
+            // Reserve remote acquisition credits from the same original call.
+            // Without a signed response receipt unused remote credits stay spent.
+            let credits = budget
+                .remaining_attempts()
+                .div_ceil(remaining_candidates.max(1));
+            budget.partition(credits, 0)?.remaining_attempts()
+        } else {
+            0
+        };
         let mut bytes = [0; 16];
         getrandom::getrandom(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
@@ -269,8 +290,9 @@ impl CandidatePolicy {
                 request: scope.request,
                 attempt,
                 destination: destination.clone(),
-                visited: Vec::new(),
+                visited: vec![self.node.clone()],
                 remaining_links: links,
+                remaining_attempts: attempts,
                 deadline: Deadline(deadline),
             },
         };
@@ -342,6 +364,7 @@ fn classify(response: &PeerResponse, operation: &PeerOperation) -> Result<Option
         PeerResponse::Unavailable => Ok(Some(ProbeOutcome::Unreachable)),
         PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
         PeerResponse::OriginRejected => Err(Error::OriginRejected),
+        PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
         PeerResponse::Page {
             metadata,
             ciphertext,
@@ -373,6 +396,56 @@ fn classify(response: &PeerResponse, operation: &PeerOperation) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
+        struct Routes(RefCell<Vec<(u8, u32)>>);
+        impl PeerClient for Routes {
+            fn request<'a>(
+                &'a self,
+                request: PeerRequest,
+                _: &'a RequestScope,
+            ) -> Operation<'a, VerifiedResponse> {
+                self.0.borrow_mut().push((
+                    request.route.remaining_links,
+                    request.route.remaining_attempts,
+                ));
+                Box::pin(async { Err(Error::Unavailable) })
+            }
+        }
+        let (membership, placement, context, scope, credentials) = fixture();
+        let peers = Rc::new(Routes(RefCell::new(Vec::new())));
+        let policy = CandidatePolicy::new(NodeId("outside".into()), placement, peers.clone());
+        policy.set_credentials(credentials);
+        let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
+        let result = futures::executor::block_on(
+            policy.resolve_with_budget(
+                policy
+                    .candidates(membership, &context.object, PageNumber(0))
+                    .unwrap(),
+                &context,
+                PeerOperation::Metadata {
+                    object: context.object.clone(),
+                    selector: MetadataSelector::Fresh,
+                    mode: FetchMode::Acquire,
+                },
+                &scope,
+                &mut budget,
+            ),
+        );
+        assert!(matches!(result, Err(Error::Unavailable)));
+        let routes = peers.0.borrow();
+        assert_eq!(
+            routes.iter().map(|(links, _)| *links).collect::<Vec<_>>(),
+            vec![4, 8, 8]
+        );
+        assert_eq!(
+            routes.iter().map(|(_, credits)| *credits).sum::<u32>()
+                + routes.len() as u32
+                + budget.remaining_attempts(),
+            16
+        );
+        assert_eq!(budget.remaining_links(), 4);
+    }
     use crate::model::{
         identity::{CacheId, CacheKey, ObjectVersion, StrongEtag},
         metadata::{ExpiresAt, ObjectMetadata},
@@ -544,7 +617,7 @@ mod tests {
         });
         let policy = CandidatePolicy::new(NodeId("outside".into()), placement, peer.clone());
         policy.set_credentials(credentials);
-        let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 12);
+        let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(
             policy.resolve_with_budget(
                 policy
@@ -753,7 +826,7 @@ mod tests {
                 authorization: None,
             };
             let scope = scope();
-            let mut budget = AcquisitionBudget::new(scope.deadline.0, 3, 12);
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
             let operation = PeerOperation::Metadata {
                 object: object(),
                 selector: MetadataSelector::Fresh,
