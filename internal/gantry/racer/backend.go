@@ -50,7 +50,8 @@ func (b *Backend) Open(ctx context.Context, ref ifaces.OriginRef) (*sdk.Object, 
 	return view.Open(ctx, target)
 }
 
-// Quarantine rejects a corrupt target for one minute, bounded to 1024 targets.
+// Quarantine rejects a target with a mismatched metadata identity for one minute,
+// bounded to 1024 targets. Payload forwarding does not verify content hashes.
 func (b *Backend) Quarantine(ref ifaces.OriginRef) {
 	target, err := Target(ref)
 	if err != nil {

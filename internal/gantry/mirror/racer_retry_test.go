@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -72,13 +71,13 @@ func TestRacerPinnedRetryCompletesVerifiedObject(t *testing.T) {
 	}))
 	up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
 	finished := make(chan sdk.TransferStats, 1)
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(stats sdk.TransferStats, _ bool, err error) {
+	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(stats sdk.TransferStats, _ bool, err error) {
 		if err != nil {
 			t.Error(err)
 		}
 
 		finished <- stats
-	}, nil))
+	}))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()

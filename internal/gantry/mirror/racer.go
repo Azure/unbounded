@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
@@ -19,9 +18,10 @@ import (
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// NewRacer builds a Racer-backend Server with an explicit registry contract.
+// NewRacer builds a Racer-backend Server with an explicit authentication challenger.
+// Content is read exclusively through backend, including node-local content.
 // A nil backend fails requests until Racer is available.
-func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantryracer.Registry, backend *gantryracer.Backend, opts ...Option) *Server {
+func NewRacer(cfg *config.Config, auth AuthenticationChallenger, backend *gantryracer.Backend, opts ...Option) *Server {
 	limit := cfg.RacerMaxConcurrentTransfers
 	if limit <= 0 {
 		limit = 64
@@ -33,14 +33,11 @@ func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantr
 		manifestObservations: make(chan struct{}, 16),
 	}
 	// Install state before applying caller options, including Racer callbacks.
-	opts = append([]Option{func(s *Server) { s.racer = state }}, opts...)
-
-	return newServer(cfg, store, registry, opts...)
+	return configureServer(&Server{auth: auth, racer: state}, cfg, opts...)
 }
 
-// WithRacerMetrics registers Racer forwarding metrics. The legacy fallback
-// callback is retained for compatibility but is never called.
-func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), _ func()) Option {
+// WithRacerMetrics registers Racer forwarding metrics.
+func WithRacerMetrics(stream func(sdk.TransferStats, bool, error)) Option {
 	return func(s *Server) {
 		if s.racer != nil {
 			s.racer.onStream = stream
@@ -192,7 +189,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	if !partial {
 		s.fireMirrorResponseCompleted(ref.Digest, ref.Kind, "racer")
 		s.fireLiveStreamCompleted(ref.Digest)
-		s.firePrefetch(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
+		s.notifyManifestServed(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
 	}
 }
 
@@ -243,52 +240,7 @@ func writeRacerError(w http.ResponseWriter, err error) {
 }
 
 func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64, partial, invalid bool) {
-	value := r.Header.Get("Range")
-	if r.Header.Get("If-Range") != "" && r.Header.Get("If-Range") != etag {
-		return 0, size, false, false
-	}
+	decision := sdk.DecideRange(r.Header, sdk.Metadata{Size: size, ETag: etag})
 
-	if !strings.HasPrefix(value, "bytes=") || strings.Contains(value, ",") {
-		return 0, size, false, false
-	}
-
-	left, right, ok := strings.Cut(strings.TrimPrefix(value, "bytes="), "-")
-	if !ok || size == 0 {
-		return 0, 0, false, true
-	}
-
-	decimal := func(value string) (int64, error) {
-		if value == "" || strings.IndexFunc(value, func(c rune) bool { return c < '0' || c > '9' }) >= 0 {
-			return 0, errors.New("invalid range")
-		}
-
-		return strconv.ParseInt(value, 10, 64)
-	}
-	if left == "" {
-		n, err := decimal(right)
-		if err != nil || n == 0 {
-			return 0, 0, false, true
-		}
-
-		n = min(n, size)
-
-		return size - n, n, true, false
-	}
-
-	start, err := decimal(left)
-	if err != nil || start >= size {
-		return 0, 0, false, true
-	}
-
-	end := size - 1
-	if right != "" {
-		end, err = decimal(right)
-		if err != nil || end < start {
-			return 0, 0, false, true
-		}
-
-		end = min(end, size-1)
-	}
-
-	return start, end - start + 1, true, false
+	return decision.Offset, decision.Length, decision.StatusCode == http.StatusPartialContent, decision.StatusCode == http.StatusRequestedRangeNotSatisfiable
 }

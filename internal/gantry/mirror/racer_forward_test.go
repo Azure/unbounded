@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -97,13 +96,13 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 			up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 1)}
 
 			var (
-				fallbacks, streams, completed int
-				streamErr                     error
+				streams, completed int
+				streamErr          error
 			)
 
 			cfg := reviewConfig()
 			cfg.RacerMaxConcurrentTransfers = 1
-			server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client},
+			server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client},
 				mirror.WithRacerMetrics(func(_ sdk.TransferStats, partial bool, err error) {
 					streams++
 					streamErr = err
@@ -111,7 +110,7 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 					if !partial {
 						t.Error("lost partial outcome")
 					}
-				}, func() { fallbacks++ }),
+				}),
 				mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 			recorder := httptest.NewRecorder()
 
@@ -151,8 +150,8 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 			}
 
 			if mode == "unsupported-hijack" || mode == "failed-hijack" {
-				if fallbacks != 0 || len(up.seen) != 0 || streams != 0 || completed != 0 || recorder.Code != http.StatusServiceUnavailable {
-					t.Fatal("pre-hijack failure bypassed Racer", fallbacks, streams, completed, recorder.Code)
+				if len(up.seen) != 0 || streams != 0 || completed != 0 || recorder.Code != http.StatusServiceUnavailable {
+					t.Fatal("pre-hijack failure bypassed Racer", len(up.seen), streams, completed, recorder.Code)
 				}
 
 				for _, header := range []string{"Content-Range", "Connection", "ETag", "Accept-Ranges", "Docker-Content-Digest", "Content-Length"} {
@@ -160,8 +159,8 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 						t.Error("forwarding header leaked into error", header)
 					}
 				}
-			} else if fallbacks != 0 || len(up.seen) != 0 || streams != 1 || streamErr == nil || completed != 0 || fault.closes == 0 || recorder.Body.Len() != 0 {
-				t.Fatal("ownership failure substituted fallback or leaked connection", fallbacks, streams, streamErr, completed, fault.closes)
+			} else if len(up.seen) != 0 || streams != 1 || streamErr == nil || completed != 0 || fault.closes == 0 || recorder.Body.Len() != 0 {
+				t.Fatal("ownership failure substituted fallback or leaked connection", len(up.seen), streams, streamErr, completed, fault.closes)
 			}
 
 			if mode != "drain-during-hijack" {
@@ -208,11 +207,11 @@ func TestRacerDrainInterruptsHijackedStream(t *testing.T) {
 	}))
 	up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
 
-	var fallbacks, completed int
+	var completed int
 
 	results := make(chan error, 1)
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client},
-		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { results <- err }, func() { fallbacks++ }),
+	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client},
+		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { results <- err }),
 		mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 	finished := make(chan struct{})
 	handler := server.Handler()
@@ -250,7 +249,7 @@ func TestRacerDrainInterruptsHijackedStream(t *testing.T) {
 		t.Fatal("drain did not cancel upstream")
 	}
 
-	if err := <-results; err == nil || fallbacks != 0 || completed != 0 || len(up.seen) != 0 {
-		t.Fatal("drain reported completion or used fallback", err, fallbacks, completed)
+	if err := <-results; err == nil || completed != 0 || len(up.seen) != 0 {
+		t.Fatal("drain reported completion or used fallback", err, len(up.seen), completed)
 	}
 }

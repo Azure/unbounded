@@ -30,7 +30,8 @@ func TestRacerClientSocketReadinessIsLocalAndFailsClosed(t *testing.T) {
 		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp("", "racer-client-readiness-")
+	// Keep the UDS path below 108 bytes with a worktree-local TMPDIR.
+	dir, err := os.MkdirTemp("", "rc-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +120,7 @@ func TestRacerOriginStartupReadinessAndCollision(t *testing.T) {
 		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp("", "racer-origin-")
+	dir, err := os.MkdirTemp("", "ro-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +245,7 @@ func TestRacerSocketReadinessExactStatusAndTarget(t *testing.T) {
 		t.Skip("Linux socket directory permissions")
 	}
 
-	dir, err := os.MkdirTemp("", "racer-readiness-")
+	dir, err := os.MkdirTemp("", "rr-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +312,7 @@ func TestRacerRejectsDirectCoordProtocol(t *testing.T) {
 			// a containerd daemon or creating Racer's production UDS paths.
 			cfg.ContainerdSocket = ""
 
-			err := runRacerAgent(t.Context(), cfg, nil, nil, nil, nil, &phase9Metrics{}, nil, logger)
+			err := runRacerAgent(t.Context(), cfg, nil, nil, nil, nil, nil, &phase9Metrics{}, nil, logger)
 			if err == nil || !strings.Contains(err.Error(), "containerd content store is unavailable") {
 				t.Fatalf("startup did not reach the containerd check independently of libp2p: %v", err)
 			}

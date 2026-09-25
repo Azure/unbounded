@@ -99,12 +99,18 @@ func TestOriginLocalFirstAndMetadata(t *testing.T) {
 	local := &localFixture{body: []byte("payload")}
 	o := &Origin{Local: local, Registries: map[string]bool{ref.Registry: true}}
 
-	meta, err := o.Stat(t.Context(), target, nil)
-	if err != nil || meta.Size != 7 || meta.ETag != `"`+ref.Digest.Hex()+`"` || meta.ContentType != "application/vnd.oci.image.index.v1+json" || meta.TTL == nil || *meta.TTL != MetadataTTL || local.opens != 0 {
-		t.Fatal(meta, err)
+	resolved, err := o.ResolveRange(t.Context(), target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolved.Close()
+
+	meta := resolved.Metadata()
+	if meta.Size != 7 || meta.ETag != `"`+ref.Digest.Hex()+`"` || meta.ContentType != "application/vnd.oci.image.index.v1+json" || meta.TTL == nil || *meta.TTL != MetadataTTL || local.opens != 0 {
+		t.Fatal(meta)
 	}
 
-	body, err := o.OpenRange(t.Context(), target, meta.ETag, 2, 3, nil)
+	body, err := resolved.OpenRange(t.Context(), 2, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,21 +122,33 @@ func TestOriginLocalFirstAndMetadata(t *testing.T) {
 		t.Fatal(string(got), err)
 	}
 
-	if _, err := o.OpenRange(t.Context(), target, `"wrong"`, 0, 7, nil); !errors.Is(err, sdk.ErrVersionChanged) {
+	handler, err := sdk.NewRangeOrigin(o)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := o.OpenRange(t.Context(), target, meta.ETag, 6, 3, nil); !errors.Is(err, sdk.ErrVersionChanged) {
+	r := httptest.NewRequest(http.MethodGet, target, nil)
+	r.Header.Set("If-Match", `"wrong"`)
+	r.Header.Set("Range", "bytes=0-6")
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusPreconditionFailed || w.Body.Len() != 0 || local.opens != 1 {
+		t.Fatal("wrong validator opened payload", w.Code, w.Body.String(), local.opens)
+	}
+
+	if _, err := resolved.OpenRange(t.Context(), 6, 3); !errors.Is(err, sdk.ErrVersionChanged) {
 		t.Fatal(err)
 	}
 
-	if _, err := o.Stat(t.Context(), "/not-a-target", nil); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := o.ResolveRange(t.Context(), "/not-a-target", nil); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal(err)
 	}
 
 	local.unavailable = true
 
-	if _, err := o.Stat(t.Context(), target, nil); err == nil {
+	if _, err := o.ResolveRange(t.Context(), target, nil); err == nil {
 		t.Fatal("unavailable local must not become registry miss")
 	}
 }
@@ -270,17 +288,23 @@ func TestOriginMixedLocalRegistryMediaType(t *testing.T) {
 			registry := metadataRegistry{ifaces.OriginMetadata{Ref: resolved, Size: 7, ContentType: tc.registryType}}
 			store := &Origin{Registry: registry, Registries: map[string]bool{ref.Registry: true}}
 
-			remote, err := store.Stat(t.Context(), target, nil)
+			remoteRange, err := store.ResolveRange(t.Context(), target, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+
+			remote := remoteRange.Metadata()
+			_ = remoteRange.Close()
 
 			store.Local = &localFixture{body: []byte("payload"), mediaType: tc.localType}
 
-			local, err := store.Stat(t.Context(), target, nil)
+			localRange, err := store.ResolveRange(t.Context(), target, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+
+			local := localRange.Metadata()
+			_ = localRange.Close()
 
 			if local.ContentType != tc.want || remote.ContentType != tc.want || local.Size != remote.Size || local.ETag != remote.ETag {
 				t.Fatal(local, remote)

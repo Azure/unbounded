@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
@@ -32,7 +33,7 @@ import (
 // runRacerAgent deliberately starts no libp2p host, DHT, transfer client/server,
 // chair client/server, coordinator, advertiser, or content-selection machinery.
 // Direct coordination has no listener; Racer owns peer discovery and transport.
-func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Registry, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
+func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginRangePuller, auth mirror.AuthenticationChallenger, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -92,9 +93,9 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		}
 	}()
 
-	server := mirror.NewRacer(c, local, origin, &gantryracer.Backend{Client: client},
-		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
-		mirror.WithRacerMetrics(onRacerStream, nil),
+	server := mirror.NewRacer(c, auth, &gantryracer.Backend{Client: client},
+		mirror.WithLogger(logger), mirror.WithStartupReadinessGate(),
+		mirror.WithRacerMetrics(onRacerStream),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
@@ -104,10 +105,9 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 			progress.completed(d)
 			p2.mirrorCompletedAt.WithLabelValues(kind, source).SetToCurrentTime()
 		}),
-		mirror.WithOriginStreamMetrics(func(k string) { p9.originStreamStarted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamCompleted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamFailed.WithLabelValues(k).Inc() }),
 		// Demand-only: observe committed manifests, without speculative registry
 		// downloads or chair work competing with Racer's page fetch ownership.
-		mirror.WithLayerPrefetcher(newLayerPrefetcher(nil, local, logger, progress.observeManifest)),
+		mirror.WithManifestObserver(newManifestObserver(local, logger, progress.observeManifest)),
 	)
 
 	stopMirror, err := server.ListenAndServe(c.MirrorListen)

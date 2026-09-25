@@ -167,7 +167,7 @@ func TestPageRetryTerminalResponses(t *testing.T) {
 			defer s.Close()
 
 			_, err = s.WriteTo(io.Discard)
-			if err == nil || gets.Load() != 1 || s.conn != nil || len(c.streamPool.idle) != 0 {
+			if err == nil || gets.Load() != 1 || s.page.conn != nil || len(c.streamPool.idle) != 0 {
 				t.Fatal("retried terminal failure or retained connection", err, gets.Load())
 			}
 
@@ -253,7 +253,7 @@ func TestPageRetryHintAndTotalDeadline(t *testing.T) {
 				deadline, _ := ctx.Deadline()
 
 				streamDeadline, _ := s.ctx.Deadline()
-				if (!errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &timeout) || !timeout.Timeout())) || gets.Load() != 2 || time.Since(start) > time.Second || s.conn != nil || len(c.streamPool.idle) != 0 || deadline != streamDeadline {
+				if (!errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &timeout) || !timeout.Timeout())) || gets.Load() != 2 || time.Since(start) > time.Second || s.page.conn != nil || len(c.streamPool.idle) != 0 || deadline != streamDeadline {
 					t.Fatal(err, gets.Load(), time.Since(start))
 				}
 			}
@@ -313,7 +313,7 @@ func TestPageRetryCumulativeHintBudget(t *testing.T) {
 	err = s.Prepare()
 
 	var status *HTTPError
-	if !errors.As(err, &status) || status.StatusCode != 503 || gets.Load() != 3 || time.Since(start) < 4*time.Second || time.Since(start) > 6*time.Second || s.conn != nil {
+	if !errors.As(err, &status) || status.StatusCode != 503 || gets.Load() != 3 || time.Since(start) < 4*time.Second || time.Since(start) > 6*time.Second || s.page.conn != nil {
 		t.Fatal("hint budget reset, ignored, or lost terminal status", err, gets.Load(), time.Since(start))
 	}
 }
@@ -380,7 +380,7 @@ func TestPageRetryClientTimeoutAndContextCancel(t *testing.T) {
 
 			select {
 			case err := <-done:
-				if err == nil || time.Since(start) > time.Second || s.conn != nil || len(c.streamPool.idle) != 0 {
+				if err == nil || time.Since(start) > time.Second || s.page.conn != nil || len(c.streamPool.idle) != 0 {
 					t.Fatal(err)
 				}
 

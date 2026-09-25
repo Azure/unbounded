@@ -365,7 +365,7 @@ func TestSpliceLazyPipe(t *testing.T) {
 		}
 
 		if size > 0 {
-			if _, err := s.conn.reader.Peek(int(size)); err != nil {
+			if _, err := s.page.conn.reader.Peek(int(size)); err != nil {
 				t.Fatal(err)
 			}
 		}

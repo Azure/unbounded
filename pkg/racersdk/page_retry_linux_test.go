@@ -97,7 +97,7 @@ func TestPageRetryConcurrentCloseReleasesResources(t *testing.T) {
 	}
 
 	_ = s.Close()
-	if s.conn != nil || len(c.streamPool.idle) != 0 || len(c.streamPool.pipes.idle) != 0 || gets.Load() != 2 || s.Stats().SpliceBytes == 0 {
+	if s.page.conn != nil || len(c.streamPool.idle) != 0 || len(c.streamPool.pipes.idle) != 0 || gets.Load() != 2 || s.Stats().SpliceBytes == 0 {
 		t.Fatal("retained failed connection/pipe or replayed page", gets.Load(), s.Stats())
 	}
 }

@@ -188,7 +188,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		return 0, nil, false
 	}
 
-	s.operation = "downstream_socket"
+	s.page.operation = "downstream_socket"
 	if err != nil {
 		return 0, s.fail(err), true
 	}
@@ -226,37 +226,20 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 	var total int64
 
 	for {
-		if s.closed {
-			return total, net.ErrClosed, true
-		}
-
-		if s.err != nil {
-			return total, s.err, true
-		}
-
-		if err := s.ctx.Err(); err != nil {
-			return total, s.fail(err), true
-		}
-
-		if s.offset == s.end {
-			err := s.finish()
-			if err == io.EOF {
-				err = nil
-			}
-
-			reusable = err == nil
+		if done, err := s.readState(); done || err != nil {
+			reusable = done
 
 			return total, err, true
 		}
 
-		if err := s.nextPage(); err != nil {
-			return total, s.fail(err), true
+		if err := s.prepareRead(); err != nil {
+			return total, err, true
 		}
 
-		remaining := s.pageEnd - s.offset
+		remaining := s.page.pageEnd - s.offset
 		// Drain only bytes the HTTP header reader already consumed. Do not
 		// read another buffer from the socket before switching to splice.
-		buffered := min(int64(s.conn.reader.Buffered()), remaining)
+		buffered := min(int64(s.page.conn.reader.Buffered()), remaining)
 		if buffered > 0 {
 			length := min(buffered, int64(len(*buf)))
 
@@ -265,24 +248,19 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 				return total, err, true
 			}
 
-			s.operation = "downstream_write"
-			written, writeErr := conn.Write((*buf)[:n])
+			written, writeErr := s.writeBuffered(conn, (*buf)[:n])
 
 			total += int64(written)
-			if writeErr == nil && written != n {
-				writeErr = io.ErrShortWrite
-			}
-
 			if writeErr != nil {
-				return total, s.fail(writeErr), true
+				return total, writeErr, true
 			}
 
 			continue
 		}
 
-		s.operation = "page_socket"
+		s.page.operation = "page_socket"
 
-		source, ok := s.conn.Conn.(*net.UnixConn)
+		source, ok := s.page.conn.Conn.(*net.UnixConn)
 		if !ok {
 			return total, s.fail(ErrProtocol), true
 		}
@@ -293,7 +271,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		if p == nil {
-			s.operation = "splice_pipe"
+			s.page.operation = "splice_pipe"
 
 			p, err = pool.pipes.get()
 			if err != nil {
@@ -301,7 +279,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 			}
 		}
 
-		s.operation = "page_body"
+		s.page.operation = "page_body"
 		n, err := spliceReady(r, false, p.fd[1], int(min(remaining, int64(p.capacity), splicePipeSize)), &s.stats)
 		p.buffered += n
 
@@ -314,7 +292,7 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 		}
 
 		for p.buffered > 0 {
-			s.operation = "downstream_write"
+			s.page.operation = "downstream_write"
 			written, err := spliceReady(raw, true, p.fd[0], int(p.buffered), &s.stats)
 			total += written
 			s.offset += written

@@ -233,6 +233,22 @@ not a replacement for explicit idle cleanup. There is no `sync.Pool` of FDs.
 
 ## Request-scoped range origins
 
+`DecideRange(headers, metadata) RangeDecision` shares the GET range policy used
+by SDK origins and Gantry's Racer mirror. The decision contains `Offset`, `Length`,
+and `StatusCode` (200, 206, or 416); metadata must have a nonnegative size. Evaluate
+other preconditions first. HEAD bypasses this helper and ignores Range/If-Range.
+The helper neither opens payloads nor modifies headers.
+
+One satisfiable byte range returns 206, including suffix and open-ended forms.
+The `bytes` unit is case-insensitive; endpoints are unsigned 64-bit numbers and
+are clipped to the object size before conversion. Malformed, reversed, multipart,
+repeated Range fields, and values exceeding unsigned 64-bit limits are ignored,
+returning the full object with 200. Valid but unsatisfiable ranges return 416,
+including zero-length suffixes and valid ranges on empty objects. A present
+If-Range allows a range only for one matching strong ETag (outer spaces/tabs are
+trimmed); mismatches, weak tags, dates, empty values, and repeated fields select
+the full object. A 416 decision has zero offset/length and must not open a body.
+
 `NewRangeOrigin(store ResolvedRangeStore)` requires:
 
 ```go
