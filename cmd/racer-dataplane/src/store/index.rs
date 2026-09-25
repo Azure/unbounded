@@ -100,6 +100,16 @@ impl Index {
     pub fn lookup(&self, page: &PageId) -> Result<Option<IndexedPage>> {
         Ok(self.state.borrow().pages.get(page).cloned())
     }
+    /// Allocation-free capacity preflight, not a slot reservation. Replacements
+    /// remain admissible at capacity; new pages require an existing free slot.
+    pub fn preflight_capacity(&self, page: &PageId) -> Result<()> {
+        let state = self.state.borrow();
+        if state.pages.contains_key(page) || state.pages.len() < self.page_capacity.get() {
+            Ok(())
+        } else {
+            Err(Error::Overloaded)
+        }
+    }
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
@@ -439,6 +449,36 @@ mod tests {
             .remove_if_matches(&page, &replacement.location)
             .unwrap();
         assert!(index.version(&page.version).unwrap().is_none());
+    }
+    #[test]
+    fn capacity_preflight_allows_replacement_and_reopens_only_after_removal() {
+        let index = Index::new(WorkerId(0), 1);
+        index.set_page_capacity(1).unwrap();
+        let (page, entry) = indexed(descriptor("first", 17), 0);
+        let (other, other_entry) = indexed(descriptor("other", 17), 1);
+        assert_eq!(index.preflight_capacity(&page), Ok(()));
+        assert_eq!(index.preflight_capacity(&other), Ok(()));
+        assert!(index.snapshot().unwrap().entries.is_empty());
+        index.publish(page.clone(), entry.clone()).unwrap();
+        assert_eq!(index.preflight_capacity(&page), Ok(()));
+        assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
+        // Preflight did not reserve a slot or bypass final publish validation.
+        assert_eq!(
+            index.publish(other.clone(), other_entry.clone()),
+            Err(Error::Overloaded)
+        );
+        let (_, replacement) = indexed(entry.metadata, 2);
+        index.publish(page.clone(), replacement.clone()).unwrap();
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            replacement.location
+        );
+        assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
+        index
+            .remove_if_matches(&page, &replacement.location)
+            .unwrap();
+        assert_eq!(index.preflight_capacity(&other), Ok(()));
+        index.publish(other, other_entry).unwrap();
     }
     #[test]
     fn restore_is_atomic_and_drops_freshness() {

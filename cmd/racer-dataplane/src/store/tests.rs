@@ -233,6 +233,171 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     assert!(matches!(f.enqueue(f.copy(4, 3)), Err(Error::MissingKey)));
 }
+
+fn segment_images(
+    f: &Fixture,
+) -> Vec<(
+    segment::SegmentId,
+    segment::Generation,
+    segment::SegmentState,
+    u64,
+)> {
+    f.store
+        .writer
+        .segments_for_test()
+        .snapshot()
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.generation, s.state, s.used_bytes))
+        .collect()
+}
+
+#[test]
+fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_io() {
+    let f = Fixture::new();
+    let alignment = futures::executor::block_on(f.store.open()).unwrap();
+    let index = f.store.writer.index();
+    index.set_page_capacity(1).unwrap();
+    // Both pages can enqueue while the one index slot is still free.
+    f.enqueue(f.copy(1, 64)).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    assert_eq!(f.store.writer.pending_count(), 2);
+    assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
+    assert!(f.admission.used(ResourceClass::Ciphertext) > 160);
+
+    // Seed a completed mapping to deterministically saturate the index before
+    // progress, without initializing the reactor or submitting any payload I/O.
+    let retained = f.copy(3, 64);
+    let retained_id = retained.ciphertext.envelope().page.clone();
+    let append = f
+        .store
+        .writer
+        .segments_for_test()
+        .append(alignment.extent(0, 512).unwrap().length())
+        .unwrap();
+    let location = index::RecordLocation {
+        segment: append.segment.id(),
+        generation: append.segment.generation(),
+        location: append.location,
+    };
+    index
+        .publish(
+            retained_id.clone(),
+            index::IndexedPage {
+                location: location.clone(),
+                metadata: retained.metadata.immutable(),
+                key_id: retained.ciphertext.envelope().key_id,
+            },
+        )
+        .unwrap();
+    drop((retained, append));
+    let before = segment_images(&f);
+    let request = scope();
+    let mut progress = f.store.writer.progress(2, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_eq!(progress.as_mut().poll(&mut cx), Poll::Ready(Ok(2)));
+    drop(progress);
+    assert_eq!(segment_images(&f), before);
+    assert_eq!(
+        index.lookup(&retained_id).unwrap().unwrap().location,
+        location
+    );
+    assert_eq!(f.store.writer.discarded_count(), 2);
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+
+    assert!(matches!(f.enqueue(f.copy(4, 64)), Err(Error::Overloaded)));
+    let mut malformed = f.copy(5, 64);
+    malformed.metadata.length = 0;
+    assert_eq!(
+        format::RecordCodec.logical_length(&malformed),
+        Err(Error::CorruptRecord)
+    );
+    // Capacity rejection precedes even header validation/length calculation.
+    assert!(matches!(f.enqueue(malformed), Err(Error::Overloaded)));
+    assert_eq!(segment_images(&f), before);
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
+#[test]
+fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().expect("storage test requires io_uring");
+    let index = f.store.writer.index();
+    index.set_page_capacity(1).unwrap();
+    let first = f.copy(1, 64);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy(2, 64);
+    let second_id = second.ciphertext.envelope().page.clone();
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    let request = scope();
+    let mut progress = f.store.writer.progress(1, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(progress.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    assert_eq!(
+        futures::executor::block_on(f.store.writer.progress(1, &request)),
+        Err(Error::Overloaded)
+    );
+    assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
+    let original = index.lookup(&first_id).unwrap().unwrap().location;
+    let before = segment_images(&f);
+
+    // The second queued page must finish synchronously without another append
+    // or reactor submission now that the first page occupies the only slot.
+    let mut progress = f.store.writer.progress(1, &request);
+    assert_eq!(progress.as_mut().poll(&mut cx), Poll::Ready(Ok(1)));
+    drop(progress);
+    assert_eq!(segment_images(&f), before);
+    assert!(index.lookup(&second_id).unwrap().is_none());
+    assert_eq!(index.lookup(&first_id).unwrap().unwrap().location, original);
+    assert_eq!(f.store.writer.discarded_count(), 1);
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+
+    f.enqueue(f.copy(1, 64)).unwrap();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    let replacement = index.lookup(&first_id).unwrap().unwrap().location;
+    assert_ne!(replacement, original);
+    assert_eq!(replacement.generation, original.generation);
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    let read = drive(&f.reactor, f.store.reader.read(&first_id, &request))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.ciphertext.bytes(), &[1; 80]);
+    drop(read);
+    assert!(matches!(f.enqueue(f.copy(2, 64)), Err(Error::Overloaded)));
+    index.remove_if_matches(&first_id, &replacement).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    assert!(index.lookup(&second_id).unwrap().is_some());
+    assert!(index.lookup(&first_id).unwrap().is_none());
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
 #[test]
 fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     let f = Fixture::new();

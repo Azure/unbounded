@@ -130,6 +130,8 @@ impl StoreWriter {
         if self.closed.get() {
             return Err(Error::Unavailable);
         }
+        self.index
+            .preflight_capacity(&page.ciphertext.envelope().page)?;
         let logical = RecordCodec.logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.slabs.owns_reservation(&dirty)
@@ -312,6 +314,10 @@ impl StoreWriter {
         page: &CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<()> {
+        // Enqueue does not reserve slots: earlier queued pages may fill the index.
+        // Production has one writer per index, and progress holds Busy across this
+        // await through publication, so no other writer can consume a free slot.
+        self.index.preflight_capacity(id)?;
         let alignment = self.slabs.alignment()?;
         let disk_bytes = alignment
             .extent(0, RecordCodec.logical_length(page)?)?
