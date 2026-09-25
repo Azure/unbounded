@@ -59,6 +59,31 @@ func TestRenderProxyManifest(t *testing.T) {
 	}
 }
 
+func TestRenderMonitoringManifestSelectsBenchmarkPool(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
+	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
+		Namespace:       "gantry-benchmark",
+		GantryNamespace: "gantry-system",
+		MonitoringLabel: "kps",
+		NodeOS:          "linux",
+		NodeArch:        "amd64",
+		NodePool:        "stream",
+		RunID:           "run-1",
+	})
+	if err != nil {
+		t.Fatalf("renderManifest: %v", err)
+	}
+
+	if !strings.Contains(string(rendered), "agentpool: stream") {
+		t.Fatalf("streaming monitoring manifest does not select the benchmark pool")
+	}
+}
+
 // The Gantry PodMonitor lives outside the proxy template because direct mode
 // installs no proxy but still needs gantry_benchmark-labeled agent samples.
 func TestRenderMonitoringManifest(t *testing.T) {
@@ -83,6 +108,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 
 	if strings.Contains(string(rendered), "{{") {
 		t.Fatalf("rendered manifest contains an unresolved template expression")
+	}
+	if strings.Contains(string(rendered), "agentpool:") {
+		t.Fatalf("classic monitoring manifest unexpectedly selects a node pool")
 	}
 
 	if !strings.Contains(string(rendered), `targetLabel: gantry_benchmark`) ||
