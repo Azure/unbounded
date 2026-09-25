@@ -201,6 +201,7 @@ func TestLookaheadCancellationAndAbandonment(t *testing.T) {
 					defer cancel()
 
 					page := scriptedPage{body: "abcdefgh"}
+
 					switch phase {
 					case "headers":
 						page.beforeHeaders = func(*http.Request) { <-ctx.Done() }
@@ -590,4 +591,93 @@ func TestLookaheadConcurrentCloseAndStats(t *testing.T) {
 			t.Fatal("Close did not join")
 		}
 	}
+}
+
+func TestLookaheadResidualHeaderWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := lookaheadScript(t, t.Context(),
+			scriptedPage{body: "12345678", beforeHeaders: func(*http.Request) { time.Sleep(time.Second) }},
+			scriptedPage{body: "abcdefgh", beforeHeaders: func(*http.Request) { time.Sleep(5 * time.Second) }})
+		dst := &delayedWriter{delay: 2 * time.Second}
+		n, err := s.WriteTo(dst)
+
+		stats := s.Stats()
+		if err != nil || n != 16 || dst.String() != "12345678abcdefgh" || stats.PageHeaderWait != 4*time.Second || stats.ForwardDuration != 4*time.Second {
+			t.Fatal("overlap counted as consumer wait", n, err, stats)
+		}
+	})
+}
+
+func TestLookaheadRetryExhaustion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pages := []scriptedPage{{body: "12345678"}}
+		for range pageRetries + 1 {
+			pages = append(pages, scriptedPage{status: 503})
+		}
+
+		s := lookaheadScript(t, t.Context(), pages...)
+		dst := &delayedWriter{delay: 5 * time.Second}
+		n, err := s.WriteTo(dst)
+		stats, f := s.Stats(), s.Failure()
+
+		var status *HTTPError
+		if !errors.As(err, &status) || status.StatusCode != 503 || n != 8 || dst.String() != "12345678" || stats.PageRequests != 6 || stats.PageRetries != 4 || stats.PageHeaderWait != 0 || f.PageOffset != PageSize || f.Offset != PageSize {
+			t.Fatal(n, err, stats, f)
+		}
+	})
+}
+
+func TestLookaheadStaleSocketNotReplayed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := lookaheadScript(t, t.Context(), scriptedPage{body: "12345678"})
+		client, server := net.Pipe()
+		_ = server.Close()
+		pool := s.object.client.streamPool
+		pool.idle = append([]*streamConn{{Conn: client, reader: bufio.NewReader(client), parser: bufio.NewReader(nil), idle: time.Now()}}, pool.idle...)
+
+		if err := s.Prepare(); err != nil {
+			t.Fatal(err)
+		}
+
+		synctest.Wait()
+
+		var out bytes.Buffer
+
+		n, err := s.WriteTo(&out)
+
+		stats, f := s.Stats(), s.Failure()
+		if err == nil || n != 8 || out.String() != "12345678" || stats.PageRequests != 2 || stats.PageRetries != 0 || f.Operation != "page_request" || f.PageOffset != PageSize || f.Offset != PageSize {
+			t.Fatal("replayed stale socket", n, err, stats, f)
+		}
+	})
+}
+
+func TestLookaheadAdoptedBodyKeepsFullDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		s := lookaheadScript(t, ctx,
+			scriptedPage{body: "12345678", beforeHeaders: func(*http.Request) { time.Sleep(time.Second) }},
+			scriptedPage{body: "abcdefgh", beforeBody: func() { <-ctx.Done() }})
+		if err := s.Prepare(); err != nil {
+			t.Fatal(err)
+		}
+
+		deadline, _ := s.ctx.Deadline()
+
+		futureDeadline, _ := s.future.page.ctx.Deadline()
+		if deadline != futureDeadline {
+			t.Fatal("future refreshed deadline")
+		}
+
+		dst := &delayedWriter{delay: time.Second}
+		start := time.Now()
+		n, err := s.WriteTo(dst)
+
+		var timeout net.Error
+		if (!errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &timeout) || !timeout.Timeout())) || n != 8 || time.Since(start) != 4*time.Second || s.future != nil || s.conn != nil || len(s.object.client.streamPool.speculative) != 0 {
+			t.Fatal("adopted body outlived deadline", n, err, s.Failure())
+		}
+	})
 }
