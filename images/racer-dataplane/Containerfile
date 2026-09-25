@@ -1,0 +1,61 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
+# Build on the target platform: both Rust and the verbs adapter use its ABI.
+FROM ${RUST_IMAGE} AS builder
+ARG RACER_NATIVE_RDMA=false
+WORKDIR /src
+
+RUN case "$RACER_NATIVE_RDMA" in \
+        true) apt-get update && apt-get install -y --no-install-recommends \
+            libibverbs-dev pkg-config && rm -rf /var/lib/apt/lists/* ;; \
+        false) ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac
+
+# Copy only build inputs, never host target trees or deployment credentials.
+COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock ./
+COPY cmd/racer-dataplane/src ./src
+COPY cmd/racer-dataplane/native/rdma.c ./native/rdma.c
+COPY images/racer-dataplane/build-native.sh ./build-native.sh
+RUN set -eu; \
+    mkdir -p /out/usr/local/bin /out/usr/local/lib; \
+    if [ "$RACER_NATIVE_RDMA" = true ]; then \
+        cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma; \
+        sh ./build-native.sh native/rdma.c /out/usr/local/lib/libracer_rdma.so.1; \
+    else \
+        cargo build --locked --release --bin racer-dataplane --no-default-features; \
+    fi; \
+    install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
+
+FROM ${RUNTIME_IMAGE}
+ARG RACER_NATIVE_RDMA=false
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.title="racer-dataplane" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+RUN set -eu; \
+    case "$RACER_NATIVE_RDMA" in \
+        true) set -- libibverbs1 ibverbs-providers ;; \
+        false) set -- ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /run/racer /var/lib/racer/identity /var/lib/racer/slabs; \
+    chown -R 65532:65532 /run/racer /var/lib/racer; \
+    chmod 0700 /var/lib/racer/identity /var/lib/racer/slabs
+COPY --from=builder /out/ /
+COPY LICENSE NOTICE /usr/share/licenses/racer-dataplane/
+RUN ldconfig
+USER 65532:65532
+WORKDIR /
+# Peer HTTP and loopback diagnostics. Client/origin traffic uses mounted UDS paths.
+EXPOSE 7443 9090
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/racer-dataplane"]

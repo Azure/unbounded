@@ -9,6 +9,16 @@ RACER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 RACER_CLUSTER_ID ?=
 RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+# Rust dataplane packaging is independent of the Go controller scaffold.
+RACER_CARGO ?= cargo
+RACER_DATAPLANE_BIN ?= bin/racer-dataplane
+RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
+RACER_NATIVE_RDMA ?= false
+RACER_NATIVE_LIB ?= bin/libracer_rdma.so.1
+RACER_PREFIX ?= /usr/local
+RACER_LIBDIR ?= $(RACER_PREFIX)/lib
+RACER_RUST_IMAGE ?= docker.io/library/rust:1.96.0-bookworm
+RACER_RUNTIME_IMAGE ?= docker.io/library/debian:bookworm-slim
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
@@ -360,6 +370,14 @@ help: ## Show this help
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
+	@echo "Racer:"
+	@echo "  racer-controller-build           Build the Go controller scaffold"
+	@echo "  racer-test | racer-generate | racer-manifests  Check/generate/render Racer scaffolds"
+	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
+	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
+	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
+	@echo "  image-racer-dataplane-local       Build local image (RACER_NATIVE_RDMA=false|true)"
+	@echo ""
 	@echo "Common variables (override with VAR=value):"
 	@echo "  VERSION=$(VERSION)"
 	@echo "  GIT_COMMIT=$(GIT_COMMIT)"
@@ -552,12 +570,38 @@ racer-controller-build: ## Build the Racer controller scaffold without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
+.PHONY: racer-dataplane-build racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+racer-dataplane-build: ## Build the locked Rust release binary; optionally enable the RDMA loader
+	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac
+	$(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --bin racer-dataplane \
+		--no-default-features $(if $(filter true,$(RACER_NATIVE_RDMA)),--features rdma)
+	install -D -m 0755 "$(RACER_CARGO_TARGET_DIR)/release/racer-dataplane" "$(RACER_DATAPLANE_BIN)"
+
+racer-dataplane-native-build: ## Compile against installed libibverbs headers and libraries
+	CC="$(CC)" sh images/racer-dataplane/build-native.sh \
+		cmd/racer-dataplane/native/rdma.c "$(RACER_NATIVE_LIB)"
+
+racer-dataplane-native-install: racer-dataplane-native-build ## Stage or install the optional native library
+	install -D -m 0755 "$(RACER_NATIVE_LIB)" "$(DESTDIR)$(RACER_LIBDIR)/libracer_rdma.so.1"
+
+image-racer-dataplane-local: ## Build the Racer dataplane image locally (single-arch)
+	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac
+	$(CONTAINER_ENGINE) build \
+		--build-arg RUST_IMAGE="$(RACER_RUST_IMAGE)" \
+		--build-arg RUNTIME_IMAGE="$(RACER_RUNTIME_IMAGE)" \
+		--build-arg RACER_NATIVE_RDMA="$(RACER_NATIVE_RDMA)" \
+		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
+		-f ./images/racer-dataplane/Containerfile .
+	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
+
 racer-test: ## Check Racer Go and Rust scaffolds
 	$(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
 	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
 	cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-	cargo check --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
-	cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
+	cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
+	cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	$(GOCMD) generate ./api/racer/v1alpha1
