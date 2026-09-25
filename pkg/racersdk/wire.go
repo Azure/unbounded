@@ -436,7 +436,7 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 	return result, nil
 }
 
-// metadataHeaders is shared by the future origin writer. Validate before
+// metadataHeaders constructs the origin writer's metadata fields. Validate before
 // UnixMilli (which otherwise silently overflows); the result contains no context.
 func metadataHeaders(m Metadata) (http.Header, error) {
 	if err := m.Validate(); err != nil {

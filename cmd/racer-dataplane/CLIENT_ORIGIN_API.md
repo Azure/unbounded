@@ -1,8 +1,9 @@
 # Racer client and origin API (v1)
 
-This is the approved implementation contract for the Go SDK and Rust dataplane,
-not a description of working endpoints. The Rust parser, origin calls, and stream
-coordinator still return `Unimplemented` (`src/client/request.rs:32-34`,
+This is the approved implementation contract for the Go SDK and Rust dataplane.
+The [Go SDK](../../pkg/racersdk/doc.go) implements the client and origin boundaries;
+this does not establish live Rust interoperability. The Rust parser, origin calls,
+and stream coordinator still return `Unimplemented` (`src/client/request.rs:32-34`,
 `src/origin/client.rs:46-64`, `src/read/serve.rs:61-68`). Paths in source citations
 here are relative to this directory. See the [SDK design](../../designs/racer-sdk.md)
 for public Go types, resource defaults, ownership, and implementation acceptance.
@@ -170,5 +171,6 @@ bytes for header delimiters or build another page buffer. `MaxHeaderBytes` alone
 is not an exact 32 KiB wire-head limit. Conformance tests must use raw Unix peers,
 not only `httptest` handlers, to catch parser normalization and automatic error
 body behavior. Runtime/parser-generated errors must also have empty bodies when
-a response can be sent safely. This guard is a required implementation task, not
-an assertion that stock `net/http` enforces every rule above.
+a response can be sent safely. The Go SDK implements the guards in
+`pkg/racersdk/response_conn.go` and `pkg/racersdk/origin_conn.go` (repository-relative
+paths); stock `net/http` alone does not enforce every rule above.

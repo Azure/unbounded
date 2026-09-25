@@ -3,10 +3,12 @@
 ## Scope and evidence
 
 Approved design for a standard-library-only `pkg/racersdk`: a concurrent streaming
-client and a single-callback origin server. This document and the normative
-[client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md) define the
-contract. Step 2 implements validated types and private protocol helpers; client
-and origin lifecycles follow in step 3. SDK packages must not import `cmd/` packages.
+client and a single-callback origin server, now implemented. This document and the
+normative [client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md)
+define the contract. Validated types, protocol guards, and client/origin lifecycles are in
+`pkg/racersdk`; see its [package guide](../pkg/racersdk/doc.go) and
+[examples](../pkg/racersdk/example_test.go) for usage. Independent integration and
+performance verification remain step 5. SDK packages must not import `cmd/` packages.
 
 Evidence read in implementation, test, then prose order (Rust paths below are
 relative to `cmd/racer-dataplane/`):
@@ -33,8 +35,7 @@ relative to `cmd/racer-dataplane/`):
 
 ## Minimal public surface
 
-These are the target public signatures and semantic constraints. Step 2 supplies
-the value types; the client and origin entry points are still pending:
+These are the implemented public signatures and semantic constraints:
 
 ```go
 type Key [32]byte
@@ -93,8 +94,8 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
   invalid. Range accessors expose immutable kind/bounds, not setters. Only the
   server constructs OriginRequest, after wire validation. The callback can resolve
   the whole-page request against the selected metadata; the SDK checks it again.
-- Metadata is a value snapshot: total object size even for a partial Value, not
-  remaining bytes. Validate Size <= MaxInt64, strong ETag, and nonnegative expiry
+- Metadata is a value snapshot: total object size even after partial consumption,
+  not remaining bytes. Validate Size <= MaxInt64, strong ETag, and nonnegative expiry
   representable as signed 64-bit Unix milliseconds. Require millisecond precision
   (reject sub-millisecond time rather than silently changing it); serialize in UTC.
   Metadata returned from a Value is a copy. Expiry is an admission hint, not a local
@@ -233,7 +234,7 @@ or the underlying error obtained via Unwrap.
 ## Implementation steps and files
 
 1. **Contract:** review the API, wire grammar, defaults, and acceptance
-   below. The source remains a nonoperational scaffold.
+   below. The Rust dataplane remains a nonoperational scaffold.
 2. **Types and protocol:** add `pkg/racersdk/doc.go`, `types.go`, `range.go`,
    `errors.go`, `wire.go`, `wire_conn.go`, and corresponding focused tests. Implement
    validated private values, safe formatting, range math, metadata/status parsing,
@@ -281,15 +282,12 @@ The step 2 implementation exposes these package-private seams for client/origin:
   its source nor probes beyond the HTTP frame. Callback EOF probing/final-byte
   holdback belongs in the origin implementation, not this framing reader.
 
-These are building blocks, not an installed transport guard. When integrating a
-stdlib Transport, validate each raw response head before replaying it to net/http;
-advance only by its validated body length, using the known request method for HEAD.
-Reject informational responses before Transport can consume them. On the origin
-side validate raw heads before net/http can normalize them or emit its own error
-bodies. Parsed Header maps alone cannot enforce context separator whitespace or
-duplicate Content-Length. Raw validation is mandatory even if semantic validation
-is also applied to parsed objects. Connection wrappers must account for sequential
-request/response boundaries and read-ahead without adding an object/page buffer.
+The installed guards in `pkg/racersdk/response_conn.go` and `origin_conn.go` use
+these building blocks before net/http normalization. They validate raw heads and
+account for sequential request/response boundaries and read-ahead without adding
+an object/page buffer. Parsed Header maps alone cannot enforce context separator
+whitespace or duplicate Content-Length; raw validation remains mandatory even
+when semantic validation is also applied to parsed objects.
 
 ### Acceptance checks
 
@@ -330,4 +328,5 @@ request/response boundaries and read-ahead without adding an object/page buffer.
   no hardware-independent absolute throughput promise is made.
 - Run `make fmt`, focused Go tests/race tests, and project lint for implementation
   commits. Run benchmarks with `go test ./pkg/racersdk -run '^$' -bench . -benchmem`.
-  Step 1 needs documentation/link/whitespace review, not tests of nonexistent Go.
+  Documentation examples with Output run as Go tests; deployment-only examples
+  are compile-checked without requiring Rust or `/run/racer` permissions.
