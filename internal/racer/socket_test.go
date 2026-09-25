@@ -11,7 +11,14 @@ import (
 )
 
 func TestPrepareSocketDirectory(t *testing.T) {
-	root := t.TempDir()
+	// t.TempDir includes the full test name, which can exceed sockaddr_un's
+	// pathname bound even with a short project-local TMPDIR.
+	root, err := os.MkdirTemp("", "rs-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 
 	const mode = os.ModeSetgid | 0o770
 	if err := os.Chmod(root, mode); err != nil {

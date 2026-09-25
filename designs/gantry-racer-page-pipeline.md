@@ -289,3 +289,163 @@ or an unavailable prerequisite. The full hardware RDMA, strict kTLS, throughput,
 and combined kind/Go pipeline lanes were not run in phase 3; phase 4 owns combined
 verification. These tests establish ordering and ownership, not production
 throughput improvement.
+
+## Phase 4: combined verification
+
+Integration commit: `a66ee991`. Phase 4 did not delegate further. The parent owns
+the independent production review and parent-branch merge.
+
+### Added acceptance coverage
+
+- `internal/gantry/mirror/racer_pipeline_test.go:47`: real TCP Gantry mirror,
+  real UDS SDK with the production `PageLookahead: true` option, and deterministic
+  HTTP fixture. The current body is gated until the next GET arrives, so a
+  sequential implementation cannot pass. Checks pinned authorization/encoding,
+  exact cross-page range, bytes, digest/ETag/type headers, pre-body 503 retry,
+  forbidden/version/truncated later responses without replay, and final stats.
+  Ten disconnects exceed the eight speculative slots, with both upstream
+  requests canceled before reuse and Gantry admission restricted to one transfer.
+- `internal/gantry/mirror/racer_pipeline_test.go:226`: a patterned 64 MiB + 31
+  byte object, full SHA-256 verification and twelve concurrent cross-page range
+  consumers, exact status/length and SDK byte/request accounting. The HTTP fixture
+  uses `http.ServeContent`; it does not duplicate SDK scheduling or validation.
+- `cmd/racer-dataplane/tests/http/page_pipeline.rs:14`: actual origin TCP,
+  production cache/handler/server and UDS client, eight physical pool slots.
+  Slab token admission is paused before the request. Exact 206 headers and bytes
+  arrive with one early-buffer decision, zero completed payload writes and no
+  additional slab operations. After releasing storage, background polling
+  completes publication and the second response records file service. Shutdown
+  verifies all physical pool slots recovered. This complements the existing
+  submitted-send/write cancellation ownership tests; it does not call SEND on a
+  preconstructed buffer as a substitute for exercising the handler.
+- `tests/storage/flight_admission.rs:261` now explicitly selects file readiness
+  for its published-file/rank-capacity contract. Its former immediate File
+  assertion failed under the approved early-buffer semantics.
+- `internal/racer/socket_test.go:14` uses a short temporary name. Go's full test
+  name in `t.TempDir` exceeded the 107-byte UDS limit even under the project-local
+  `/home/azureuser/code/unbounded/tmp` directory. No production socket validation
+  changed.
+
+### Environment and bounded commands
+
+Commands ran from this worktree. Go used `GOTOOLCHAIN=go1.26.6`,
+`TMPDIR=/home/azureuser/code/unbounded/tmp`, and `GOTMPDIR="$PWD/tmp"`.
+Rust runtime used the same short TMPDIR, `RACER_REQUIRE_URING=1` and
+`RUST_TEST_THREADS=2`. Host kernel: `7.0.0-30-generic`; vendored OpenSSL reported
+`3.6.3 9 Jun 2026`. Required io_uring tests executed, rather than skipping.
+
+Go commands (all passed after the socket-fixture correction):
+
+```sh
+timeout -k 5s 120s go test ./pkg/racersdk/... ./internal/gantry/... ./cmd/gantry/... -count=1 -timeout=90s
+timeout -k 5s 120s go test -race ./pkg/racersdk/... ./internal/gantry/... ./cmd/gantry/... -count=1 -timeout=90s
+timeout -k 5s 120s go test -race ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./cmd/racer-loadgen/... -count=1 -timeout=90s
+timeout -k 5s 60s go test -race ./internal/racer/... -count=1 -timeout=45s
+timeout -k 5s 60s go test -race ./internal/gantry/mirror -run '^TestRacerPipelineBoundaries$' -count=5 -timeout=45s
+timeout -k 5s 60s go test -race ./internal/gantry/mirror -run '^TestRacerPipeline' -count=1 -timeout=45s
+```
+
+The broader Racer Go command initially failed only `TestPrepareSocketDirectory`;
+its other packages passed. The focused full `internal/racer` race rerun passed
+after the short-name correction. The final mirror rerun includes the added
+status and total-byte assertions.
+
+Both crates compiled with `timeout -k 5s 180s cargo test --manifest-path
+cmd/racer-{dataplane,controlplane}/Cargo.toml --locked --all-targets --no-run`,
+each using its respective `/home/azureuser/code/unbounded/cmd/racer-*/target`
+as `CARGO_TARGET_DIR`. Dataplane executable snapshots are `tmp/phase4-rust-tests`,
+`tmp/phase4-rust-main`, `tmp/phase4-rust-crypto`, and `tmp/phase4-rust-http`.
+Snapshots avoid replacement by concurrent main-checkout builds.
+
+The complete default dataplane library test inventory was executed in bounded
+partitions. Each command below has prefix `timeout -k 5s 120s
+tmp/phase4-rust-tests`; omitted tests were either run separately or are the two
+explicit failures listed below. Child helpers ignored in outer suites execute
+under their owning wrapper where applicable.
+
+| Arguments | Result |
+| --- | --- |
+| `allocator:: buffers:: cache:: --skip creation_recovery_and_replacement_share_setup_accounting` | 104 passed, 5 ignored |
+| `control:: --skip topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors --skip production_compiler_product_snapshots` | 69 passed, 2 ignored |
+| `handlers:: http_client:: http_server:: --skip page_pipeline --nocapture` | 67 passed, 16 ignored |
+| `--exact handlers::tests::page_pipeline::early_handler_delivers_http_before_storage_then_serves_written_file --nocapture` | 1 passed |
+| `runtime:: --nocapture` | 35 passed, 3 ignored |
+| `--skip allocator:: --skip buffers:: --skip cache:: --skip control:: --skip handlers:: --skip http_client:: --skip http_server:: --skip runtime:: --skip product_v1_corpus_preserves_membership_ownership_and_rejects_malformed --skip actual_rust_compiler_snapshots_prepare_and_retain_last_good` | 159 passed, 6 ignored |
+
+Three compiler-conformance tests initially failed because direct execution did
+not provide this run's compiler export. All three passed through the existing
+harness with fresh production compiler receipts, after:
+
+```sh
+timeout -k 5s 180s python3 hack/scripts/racer-test.py --build-timeout 150 --test-timeout 120 compile controlplane dataplane
+timeout -k 5s 120s python3 hack/scripts/racer-test.py --test-timeout 60 selected dataplane control::product_routing::tests::production_compiler_product_snapshots
+timeout -k 5s 120s python3 hack/scripts/racer-test.py --test-timeout 60 selected dataplane conformance::product_v1_corpus_preserves_membership_ownership_and_rejects_malformed
+timeout -k 5s 120s python3 hack/scripts/racer-test.py --test-timeout 60 selected dataplane endpoint_tests::actual_rust_compiler_snapshots_prepare_and_retain_last_good
+```
+
+These harness commands used `RACER_CARGO_TARGET_DIR` and
+`RACER_CONTROLPLANE_CARGO_TARGET_DIR` pointing to the caches above. Dataplane
+main: 14 passed, 3 ignored; both default benchmark executables: zero tests,
+successful execution, each under `timeout -k 5s 60s`. Dataplane doctests:
+`timeout -k 5s 120s cargo test --manifest-path cmd/racer-dataplane/Cargo.toml
+--locked --doc`: 73 passed, including 69 compile-fail ownership contracts.
+
+The control-plane all-target command under 120 seconds passed lib (30, 2
+ignored), main (0), core (14), placement (7, 1 ignored), placement_export (1),
+runtime (17), and security (17), then hit the external deadline in service.
+Service alone also exceeded 120 seconds, so it was partitioned using the emitted
+`target/debug/deps/service-661ceece5d83a0d9` executable:
+
+- `timeout -k 5s 120s <service> --skip canceled_committed_route_publication_retries --skip canceled_route_publication_retries_and_repairs_removed_label`: 15 passed.
+- `timeout -k 5s 120s <service> canceled_committed_route_publication_retries canceled_route_publication_retries_and_repairs_removed_label`: 2 passed.
+- `timeout -k 5s 120s cargo test --manifest-path cmd/racer-controlplane/Cargo.toml --locked --doc`: passed, zero doctests.
+
+Thus every default control-plane target completed across bounded runs. The
+existing unused `Publication::published` test-support warning remains.
+
+### TLS artifact diagnosis and remaining failures
+
+The previously reported `tests/http/tls.rs:21` failure was **not valid baseline
+source evidence**. Both saved phase-3 executables linked a stale native shim
+from the shared build cache. `objdump -d --disassemble=racer_tls_configure
+tmp/phase3-rust-tests` shows unconditional `SSL_OP_ENABLE_KTLS` and no use of the
+second argument. Worktree source `src/tls_native.c:62-66` instead clears the bit
+and enables it conditionally. The freshly rebuilt executable's disassembly
+contains that clear and branch; no TLS source was changed. `OPENSSL_CONF=/dev/null`
+did not fix the old executable. Rebuilding the native artifact did.
+
+Both commands now pass with real offload required:
+
+```sh
+RACER_REQUIRE_KTLS=1 timeout -k 5s 60s tmp/phase4-rust-tests --exact http_server::tests::tls_transport::encrypted_http_kernel_integration --nocapture
+RACER_REQUIRE_KTLS=1 timeout -k 5s 60s tmp/phase4-rust-tests --exact tls::tests::tls13_key_update_with_actual_ktls --nocapture
+```
+
+Two unrelated default dataplane tests still fail, including when rerun together
+under `timeout -k 5s 60s tmp/phase3-baseline-tests`:
+
+- `allocator::setup_tests::slab_io_setup::creation_recovery_and_replacement_share_setup_accounting`: `tests/storage/slab_io_setup.rs:41`, actual `(25, 90112)`, expected `(13, 40960)`.
+- `control::tests::topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors`: `tests/control/configuration.rs:68`, actual `503`, expected `502`.
+
+Their identical failures in the saved baseline are recorded, with the caveat
+above about that executable's native TLS artifact. They are not counted as
+passing or suppressed in source. Default dataplane aggregate: 438 passed,
+2 failed, 32 ignored across partitions, plus 14 main tests and 73 doctests.
+
+### Formatting and scope of evidence
+
+Passed `timeout -k 5s 120s make fmt` separately with
+`GO_PACKAGE_PATTERNS=./internal/gantry/mirror/... GO_PACKAGE_DIRS=./internal/gantry/mirror`
+and `GO_PACKAGE_PATTERNS=./internal/racer/... GO_PACKAGE_DIRS=./internal/racer`.
+Both reported zero lint issues. Passed `timeout -k 5s 60s make racer-fmt-check`
+and `git diff --check`.
+
+The full live Gantry + Go SDK + Rust dataplane + control-plane deployment was
+not run. The accepted local minimum is covered by two real-socket integrations:
+Gantry/SDK with a deterministic Racer-protocol fixture, and the production Rust
+origin/cache/HTTP/UDS path with storage paused. These tests do not establish
+production throughput, end-to-end deployed latency, hardware RDMA behavior,
+opt-in NUMA placement, scale campaigns, or the ignored production-duration
+timing lanes. No throughput improvement is claimed. Phase-4 core acceptance is
+implemented; parent merge readiness is conditional on the independent review
+and explicit acknowledgment of the two remaining baseline-suite failures.

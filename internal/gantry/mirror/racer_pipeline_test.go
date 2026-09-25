@@ -266,7 +266,13 @@ func TestRacerPipelineFullDigestAndConcurrentRanges(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 
 		_ = resp.Body.Close()
-		if err != nil || !bytes.Equal(body, want) || resp.ContentLength != int64(len(want)) || resp.Header.Get("Docker-Content-Digest") != d.String() {
+
+		status := http.StatusOK
+		if partial {
+			status = http.StatusPartialContent
+		}
+
+		if err != nil || resp.StatusCode != status || !bytes.Equal(body, want) || resp.ContentLength != int64(len(want)) || resp.Header.Get("Docker-Content-Digest") != d.String() {
 			t.Error("incorrect pipelined payload", err, len(body), resp.Header)
 		}
 
@@ -283,9 +289,15 @@ func TestRacerPipelineFullDigestAndConcurrentRanges(t *testing.T) {
 
 	workers.Wait()
 
-	for range 13 {
+	for i := range 13 {
 		result := pipelineReceive(t, results)
-		if result.err != nil || result.stats.PageRequests != 2 || result.stats.PageRetries != 0 {
+
+		length := int64(len(data))
+		if i != 0 {
+			length = 48
+		}
+
+		if result.err != nil || result.partial != (i != 0) || result.stats.PageRequests != 2 || result.stats.PageRetries != 0 || result.stats.SpliceBytes+result.stats.BufferedBytes != length {
 			t.Fatal(result)
 		}
 	}
