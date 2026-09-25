@@ -144,3 +144,148 @@ golangci-lint 2.11.4 was built with Go 1.26.5. Selecting the module's Go 1.26.6
 resolved it. Rust instrumentation and test controls above were inspected, not
 changed or executed in this phase; these results do not claim real-kernel Rust
 or combined pipeline coverage.
+
+## Phase 3 implementation handoff
+
+Implementation commit: `2b292fb4` (`perf(racer): serve admitted pages with
+pool-bounded early buffers`). This phase owns only `cmd/racer-dataplane` Rust
+files and this tracked design. The SDK/Gantry work was committed concurrently
+by its owner. No subagent API was available in the phase 3 harness.
+
+### Readiness and physical ownership
+
+- `cache.rs:2078-2125` still completes full receive/semantic/CRC validation and
+  bounded slab admission before reaching `Loading::Publishing`. That state
+  prefers `ReadLease::ready()` and otherwise attempts the early budget
+  (`cache.rs:2299-2335`). There is no cut-through and no new payload copy.
+- `buffers.rs:311-313,758-778` bounds early retention to
+  `min(N / 2, N.saturating_sub(4))` **physical slots per NUMA pool**. Four-slot
+  minimum pools therefore use write-before-forward; the default eight-slot pool
+  allows four early slots. This conservative policy preserves four demand slots
+  and at least half of larger pools. It is not a per-cache or per-worker quota.
+- The slot flag and NUMA atomic counter charge a shared page once, including
+  coalesced consumers, local lookups, cross-worker `ComputeRead` capabilities,
+  and replica writes. Release occurs only at the final slot-reference decrement
+  (`buffers.rs:352-368`). Cancellation, eviction, cache shutdown, and logical
+  response completion cannot return the permit while any kernel/compute/flight
+  owner remains. Slab completion alone does not release slow-reader ownership.
+- Forwarding rank selection uses demand capacity after subtracting the early
+  limit (`buffers.rs:412-417`, `cache.rs:1873-1877,2457-2462`). Keeping the old
+  N-1 rank would let one slow reader block all new highest-rank demand. Four
+  demand slots preserve the existing minimum-pool three-hop contract.
+- A denied consumer records one budget fallback and waits for a file without
+  repeatedly competing for permits. Local hits use the same gate. Flight
+  consumers retain the charged terminal buffer, then perform their own local
+  admission and file-first selection. No unbounded terminal-value directory is
+  introduced. Retired unpublished fallback leases fail locally instead of
+  waiting for a write that eviction prevented (`cache.rs:2311-2334`).
+- A real multi-page regression exposed completed SEND_ZC notification owners
+  retained by an idle body writer while the next page waited for receive space.
+  `handlers.rs:1593-1598` now reaps those completions through
+  `http_server.rs:1256-1260` before attempting prefetch. Terminal notifications,
+  not the early send result, still govern resource retirement.
+- UDS buffer bodies use ordinary SEND, not SEND_ZC
+  (`http_server.rs:1727-1740`). Early UDS delivery trades the written-hit
+  file/splice path for a kernel socket copy from the existing immutable buffer.
+  TCP buffers use SEND_ZC; TLS retains its existing encrypted transport behavior.
+  Written hits continue to return File values for splice/sendfile dispatch.
+- `allocator/checkpoint.rs:125-139` sets `written` only after exact successful
+  payload-write completion. A later disk error cannot retract bytes already
+  delivered successfully, and cannot falsely publish an unwritten file. Existing
+  shard poisoning and containment remain authoritative; checkpoint durability
+  is still separate from both response readiness and payload-write completion.
+
+### Fixed-series measurements
+
+`metrics.rs:38-81,244-273,559-583` adds:
+
+- `racer_dataplane_page_serve_total{decision="early_buffer|file|budget_fallback"}`:
+  per-consumer decisions, not bytes successfully sent. Fallback counts once before
+  waiting and can be followed by a file decision. Explicit RDMA materialization
+  retains its existing behavior and is not counted as a File response.
+- `racer_dataplane_page_stage_total` and
+  `racer_dataplane_page_stage_seconds_total`, with fixed `stage` and `outcome`
+  labels. Stages are `receive_buffer`, `fill_validation`, `admission`,
+  `consumer_ready`, and `payload_write`. The first four observe producer work,
+  not every joined consumer; `fill_validation` includes upstream fill plus
+  checksum queue and validation. `consumer_ready` starts after admission.
+  Interrupted producer stages report `incomplete`; successful transitions report
+  `completed`. Payload-write timing is per admitted local extent from admission
+  to exact successful write collection, including queueing, and reports only
+  completed writes. Its incomplete series remains zero; storage failures use the
+  existing quarantine/failure counters. No duration is checkpoint durability.
+
+These use worker-private counters and periodic snapshot publication. No
+per-request labels, polling timers, or shared gauge summation were added.
+
+### Deterministic coverage
+
+- `tests/storage/early_serving.rs:33,89,138,176`: paused-storage early delivery,
+  shared/local consumers, pointer identity/no copy, CRC retention, sticky budget
+  fallback, demand capacity, incomplete/invalid receive and rejected admission.
+- `tests/storage/early_serving.rs:210,257,386`: actual UDS delivery while slab
+  submission is paused; canceled submitted send and abandoned submitted write
+  retain the early budget until driver shutdown/collection proves quiescence.
+- `tests/storage/early_serving.rs:300,322`: retired fallback termination and
+  asynchronous checksum plus cross-cache single-flight replica admission.
+- `tests/storage/buffer_lifetimes.rs:11,51,83`: tiny/default pool limits,
+  cross-thread completion, terminal consumers, and concurrent worker admission.
+- `tests/storage/allocator.rs:46`: injected publication-completion EIO keeps
+  delivered immutable bytes valid, poisons the shard, and never sets FileReady.
+- Existing persistence/recovery fixtures explicitly select write-before-forward
+  so their disk assertions continue to test storage. Their independent reads now
+  allow independent completion turns rather than assuming simultaneous CQEs.
+  Existing identity, authorization, precondition, four-buffer multi-hop, and
+  multi-page TCP tests run against the production early-serving policy.
+
+### Verification commands and results
+
+All paths below are worktree-relative unless absolute. Test runs use
+`TMPDIR="$PWD/tmp" RUST_TEST_THREADS=2 RACER_REQUIRE_URING=1`; io_uring was
+available and required, not silently skipped. Compilation reused
+`CARGO_TARGET_DIR=/home/azureuser/code/unbounded/cmd/racer-dataplane/target`.
+The library executable was copied to `tmp/phase3-rust-tests` before runtime
+checks because concurrent main-checkout builds replace the shared-cache binary.
+One apparent fast compilation after a main-checkout build returned the baseline
+binary; its one-test early filter result was discarded, the owning Rust source
+was updated, and the worktree was rebuilt and verified with all 14 early tests.
+
+- `timeout -k 5s 180s cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run`:
+  passed, library, main and both default benchmark targets compiled.
+- `timeout -k 5s 60s tmp/phase3-rust-tests early_ --nocapture`:
+  14 passed, no ignored (13 new contracts plus one existing RDMA state test).
+- `timeout -k 5s 120s tmp/phase3-rust-tests cache::tests:: --nocapture`:
+  25 passed, two child helpers ignored in the outer suite and executed/passed by
+  their wrapper tests. This run preceded the final additional write-owner test,
+  which passed in the 14-test filter above.
+- `timeout -k 5s 60s tmp/phase3-rust-tests buffers::tests:: --nocapture`:
+  15 passed. The subsequent four-demand-slot adjustment was rechecked by the
+  early filter and saturated handler suite.
+- `timeout -k 5s 120s tmp/phase3-rust-tests allocator::tests:: --nocapture`:
+  32 passed, one throughput benchmark ignored.
+- `timeout -k 5s 120s tmp/phase3-rust-tests handlers::tests:: --nocapture`:
+  36 passed, five ignored (four subprocess helpers executed by wrappers, one
+  production-duration rotation lane intentionally not run).
+- `timeout -k 5s 60s tmp/phase3-rust-tests metrics::tests:: --nocapture`:
+  nine passed, including fixed stage/decision series and periodic publication.
+- `timeout -k 5s 120s tmp/phase3-rust-tests http_server::tests:: --skip encrypted_http_kernel_integration --nocapture`:
+  11 passed, five child helpers ignored in the outer suite; applicable wrappers
+  executed their children, including UDS slab replacement and lifecycle tests.
+- `timeout -k 5s 120s cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --doc`:
+  73 passed (four ordinary and 69 compile-fail ownership contracts).
+- `timeout -k 5s 60s make racer-dataplane-fmt-check`: passed, including explicitly
+  included tests. `git diff --check`: passed.
+- `GOTOOLCHAIN=go1.26.6 TMPDIR="$PWD/tmp" GOTMPDIR="$PWD/tmp" timeout -k 5s 120s make fmt GO_PACKAGE_PATTERNS=./internal/version/... GO_PACKAGE_DIRS=./internal/version`:
+  passed, zero issues and no Go changes. This scopes the required formatter away
+  from the concurrent SDK/Gantry owner's files.
+
+Known baseline failure: running the complete HTTP-server filter or the exact
+`http_server::tests::tls_transport::encrypted_http_kernel_integration` test fails
+at `tests/http/tls.rs:21` (kTLS TX counter 4 versus expected 2). Rebuilding the
+unchanged main checkout at `97febafe` with its own manifest, snapshotting its
+executable as `tmp/phase3-baseline-tests`, and running the same exact test under
+`timeout -k 5s 60s` reproduces the identical failure. It is not counted as passed
+or an unavailable prerequisite. The full hardware RDMA, strict kTLS, throughput,
+and combined kind/Go pipeline lanes were not run in phase 3; phase 4 owns combined
+verification. These tests establish ordering and ownership, not production
+throughput improvement.
