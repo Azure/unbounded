@@ -751,6 +751,9 @@ pub(crate) mod tests {
         mut observe: impl FnMut(&Fault<Fake>, &Fake),
     ) -> (TestValue, bool) {
         fault.buffered = true;
+        // This fixture exercises disk materialization and recovery explicitly.
+        // Early-serving contracts use poll_value directly in early_serving.rs.
+        fault.early_fallback = true;
         let mut disk = false;
         loop {
             observe(&fault, upstream);
@@ -778,4 +781,11 @@ pub(crate) mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/storage/cache_backpressure.rs"
     ));
+    mod early_serving {
+        use super::*;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/storage/early_serving.rs"
+        ));
+    }
 }

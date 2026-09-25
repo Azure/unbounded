@@ -197,7 +197,13 @@ fn peer_crc_rejection_leaves_no_cached_value_and_allows_healthy_refetch() {
                         };
                         assert_eq!(actual.to_bytes(), record.to_bytes());
                     } else {
-                        assert!(matches!(value, cache::CachedValue::File(_)));
+                        match value {
+                            cache::CachedValue::Buffer(bytes) => {
+                                assert_eq!(bytes.as_slice(), b"abc");
+                            }
+                            cache::CachedValue::File(file) => assert_eq!(file.info().len, 3),
+                            _ => panic!("payload expected"),
+                        }
                     }
                 }
             }

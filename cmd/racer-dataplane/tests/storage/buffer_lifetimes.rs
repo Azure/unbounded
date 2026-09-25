@@ -6,6 +6,112 @@ use super::*;
 fn key(value: u8) -> Key {
     Key::new([value; 32])
 }
+
+#[test]
+fn early_budget_is_physical_shared_and_survives_all_completion_owners() {
+    for (slots, limit) in [(1, 0), (3, 0), (4, 0), (5, 1), (8, 4)] {
+        let pool = io_test_pool(slots);
+        let other = pool.test_other_worker();
+        assert_eq!(pool.demand_capacity(), slots - limit);
+        let mut held = Vec::new();
+        for _ in 0..limit {
+            let buffer = other.private_fill().unwrap().publish(1).unwrap();
+            assert!(buffer.try_early());
+            held.push(buffer);
+        }
+        let denied = pool.private_fill().unwrap().publish(1).unwrap();
+        assert!(!denied.try_early());
+        // Even the highest local forwarding rank can start with all early
+        // permits held. The probe above already owns this rank's demand slot.
+        if pool.demand_capacity() > 1 {
+            drop(
+                pool.stage_reserved(key(7), pool.demand_capacity() - 2)
+                    .unwrap(),
+            );
+        }
+        if let Some(buffer) = held.pop() {
+            let clone = buffer.clone();
+            let completion = buffer.compute_read();
+            assert!(clone.try_early(), "coalesced consumers share a slot charge");
+            drop((buffer, clone));
+            assert!(
+                !denied.try_early(),
+                "driver owner outlives logical cancellation"
+            );
+            std::thread::spawn(move || drop(completion)).join().unwrap();
+            assert!(denied.try_early());
+        }
+        drop((held, denied));
+        assert_eq!(pool.node.early.load(Ordering::Acquire), 0);
+        pool.assert_recovered();
+    }
+}
+
+#[test]
+fn early_terminal_flight_retains_budget_after_producer_and_consumer_cancellation() {
+    let pool = io_test_pool(5);
+    let mut producer = pool.network_flight(scope(1)).unwrap();
+    let mut consumer = pool.network_flight(scope(1)).unwrap();
+    assert!(matches!(
+        producer.poll(Waker::noop()),
+        NetworkProgress::Produce
+    ));
+    assert!(matches!(
+        consumer.poll(Waker::noop()),
+        NetworkProgress::Pending
+    ));
+    let buffer = pool.private_fill().unwrap().publish(1).unwrap();
+    assert!(buffer.try_early());
+    producer.finish(Ok(&buffer));
+    drop((producer, buffer));
+    let next = pool.private_fill().unwrap().publish(1).unwrap();
+    assert!(!next.try_early());
+    let NetworkProgress::Ready(Ok(shared)) = consumer.poll(Waker::noop()) else {
+        panic!()
+    };
+    assert!(shared.try_early());
+    let driver = shared.compute_read();
+    drop((consumer, shared));
+    assert!(!next.try_early());
+    drop(driver);
+    assert!(next.try_early());
+    drop(next);
+    pool.assert_recovered();
+}
+
+#[test]
+fn early_budget_concurrent_workers_cannot_oversubscribe() {
+    let pool = io_test_pool(5);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let link = pool.test_link();
+            let barrier = barrier.clone();
+            let admitted = admitted.clone();
+            std::thread::spawn(move || {
+                let pool = link.for_worker();
+                let buffer = pool.private_fill().unwrap().publish(0).unwrap();
+                barrier.wait();
+                if buffer.try_early() {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                }
+                barrier.wait();
+                barrier.wait();
+                drop(buffer);
+            })
+        })
+        .collect();
+    barrier.wait();
+    barrier.wait();
+    assert_eq!(admitted.load(Ordering::Acquire), 1);
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(pool.node.early.load(Ordering::Acquire), 0);
+    pool.assert_recovered();
+}
 fn scope(value: u8) -> NetworkFlightKey {
     NetworkFlightKey {
         value: [value; 32],

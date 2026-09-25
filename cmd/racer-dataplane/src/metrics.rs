@@ -35,7 +35,48 @@ const RESOURCE_SITES: [&str; 8] = [
 const DISK_CACHE_EVICTIONS: usize = RESOURCE_BASE + RESOURCE_SITES.len();
 const ALLOCATOR_COUNTER_BASE: usize = DISK_CACHE_EVICTIONS + 1;
 const ALLOCATOR_STATE_BASE: usize = ALLOCATOR_COUNTER_BASE + 5;
-const COUNT: usize = ALLOCATOR_STATE_BASE + 11;
+const PAGE_SERVE_BASE: usize = ALLOCATOR_STATE_BASE + 11;
+const PAGE_STAGE_BASE: usize = PAGE_SERVE_BASE + 3;
+const COUNT: usize = PAGE_STAGE_BASE + 5 * 2 * 2;
+const PAGE_STAGES: [&str; 5] = [
+    "receive_buffer",
+    "fill_validation",
+    "admission",
+    "consumer_ready",
+    "payload_write",
+];
+#[derive(Clone, Copy)]
+pub(crate) enum PageStage {
+    ReceiveBuffer,
+    FillValidation,
+    Admission,
+    ConsumerReady,
+    PayloadWrite,
+}
+/// Transition-level timing, including cancellation/failure as incomplete work.
+pub(crate) struct PageTimer {
+    metrics: Local,
+    stage: PageStage,
+    start: Instant,
+    completed: bool,
+}
+impl PageTimer {
+    pub(crate) fn finish(mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for PageTimer {
+    fn drop(&mut self) {
+        self.metrics
+            .page_stage(self.stage, self.start, self.completed);
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum PageServe {
+    EarlyBuffer,
+    File,
+    BudgetFallback,
+}
 const ALLOCATOR_PHASES: [&str; 6] = [
     "none",
     "writes",
@@ -202,6 +243,28 @@ impl Default for Local {
     }
 }
 impl Local {
+    pub(crate) fn page_timer(&self, stage: PageStage) -> PageTimer {
+        PageTimer {
+            metrics: self.clone(),
+            stage,
+            start: crate::environment::now(),
+            completed: false,
+        }
+    }
+    pub(crate) fn page_stage(&self, stage: PageStage, start: Instant, completed: bool) {
+        let index = PAGE_STAGE_BASE + stage as usize * 4 + usize::from(completed) * 2;
+        self.add(index, 1);
+        self.add(
+            index + 1,
+            crate::environment::now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
+    pub(crate) fn page_serve(&self, decision: PageServe) {
+        self.add(PAGE_SERVE_BASE + decision as usize, 1);
+    }
     /// A scrape only holds this lock to clone the immutable snapshot. Workers
     /// never wait for it; contention leaves the previous view until the next tick.
     pub(crate) fn publish_peers(&self, peers: Vec<PeerState>) {
@@ -492,6 +555,31 @@ impl Registry {
             ),
         ] {
             writeln!(out, "# HELP racer_dataplane_{name} {help}\n# TYPE racer_dataplane_{name} counter\nracer_dataplane_{name} {value}").unwrap();
+        }
+        writeln!(out, "# HELP racer_dataplane_page_stage_total Producer stage observations; incomplete includes cancellation and failure. Payload write counts successful completions only.\n# TYPE racer_dataplane_page_stage_total counter\n# HELP racer_dataplane_page_stage_seconds_total Aggregate producer stage time; payload write is admission to write completion, not durable checkpoint.\n# TYPE racer_dataplane_page_stage_seconds_total counter").unwrap();
+        for (stage, name) in PAGE_STAGES.iter().enumerate() {
+            for (outcome, label) in ["incomplete", "completed"].iter().enumerate() {
+                let index = PAGE_STAGE_BASE + stage * 4 + outcome * 2;
+                writeln!(
+                    out,
+                    "racer_dataplane_page_stage_total{{stage=\"{name}\",outcome=\"{label}\"}} {}",
+                    totals[index]
+                )
+                .unwrap();
+                writeln!(out, "racer_dataplane_page_stage_seconds_total{{stage=\"{name}\",outcome=\"{label}\"}} {:.9}", totals[index + 1] as f64 / 1e9).unwrap();
+            }
+        }
+        writeln!(out, "# HELP racer_dataplane_page_serve_total Consumer page decisions; budget_fallback counts once before waiting for a written file, not a terminal response.\n# TYPE racer_dataplane_page_serve_total counter").unwrap();
+        for (index, decision) in ["early_buffer", "file", "budget_fallback"]
+            .iter()
+            .enumerate()
+        {
+            writeln!(
+                out,
+                "racer_dataplane_page_serve_total{{decision=\"{decision}\"}} {}",
+                totals[PAGE_SERVE_BASE + index]
+            )
+            .unwrap();
         }
         writeln!(out, "# HELP racer_dataplane_allocator_payload_rejections_total Rejected insert_payload attempts by local capacity check; retries count again. Excludes invalid input and quarantined allocators; filesystem_headroom includes failed filesystem capacity queries.\n# TYPE racer_dataplane_allocator_payload_rejections_total counter").unwrap();
         for (index, reason) in ["pending_limit", "filesystem_headroom", "extent_unavailable"]

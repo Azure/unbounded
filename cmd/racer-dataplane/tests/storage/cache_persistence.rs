@@ -703,11 +703,10 @@ mod persistence {
             match cache.poll_fault(fault, ring, &mut upstream).unwrap() {
                 Progress::Ready(bytes) => {
                     assert_eq!(bytes.as_slice(), b"abc");
-                    let Progress::Ready(shared) =
-                        cache.poll_fault(waiter, ring, &mut upstream).unwrap()
-                    else {
-                        panic!()
-                    };
+                    // Independent materializations need not complete in the
+                    // same reactor turn. Keep driving the surviving reader.
+                    let (shared, disk) = resolve_checked(&mut cache, ring, &mut upstream, waiter);
+                    assert!(disk);
                     assert_eq!(shared.as_slice(), bytes.as_slice());
                     break;
                 }

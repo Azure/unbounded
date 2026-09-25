@@ -492,6 +492,7 @@ struct Allocation {
 }
 
 struct PayloadExtent {
+    admitted: Option<std::time::Instant>,
     publication: Cell<Option<(&'static str, std::time::Instant, Option<u64>)>>,
     allocation: Rc<Allocation>,
     info: ValueInfo,
@@ -550,6 +551,9 @@ pub struct ReadLease {
     value: Rc<PayloadExtent>,
 }
 impl ReadLease {
+    pub(crate) fn same_value(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.value, &other.value)
+    }
     pub(crate) fn diagnostic(&self) -> serde_json::Value {
         let stage = self.value.publication.get();
         serde_json::json!({"written":self.value.written.get(),"file_offset":self.value.allocation.offset(),"len":self.value.info.len,
@@ -1000,6 +1004,7 @@ impl Allocator {
             .or(checksum)
             .unwrap_or_else(|| crc64(buffer.as_slice()));
         let value = Rc::new(PayloadExtent {
+            admitted: Some(crate::environment::now()),
             publication: Cell::new(Some(("pending", crate::environment::now(), None))),
             allocation,
             info,

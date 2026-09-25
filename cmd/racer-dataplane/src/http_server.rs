@@ -1253,6 +1253,11 @@ pub enum BodyProgress {
 #[must_use]
 pub struct BodyWriter(Response);
 impl BodyWriter {
+    /// Retire completed zero-copy sends even while the next page is waiting for
+    /// receive capacity. Notifications retain pool slots until collected.
+    pub(crate) fn reap(&mut self, ring: &mut Ring) -> io::Result<()> {
+        self.0.reap(ring)
+    }
     pub fn remaining(&self) -> u64 {
         self.0.remaining
     }

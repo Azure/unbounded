@@ -661,6 +661,7 @@ fn populated_two_tib_memory_child() {
                 metadata(n, 1)
             } else {
                 Entry::Payload(Rc::new(PayloadExtent {
+                    admitted: None,
                     publication: Cell::new(None),
                     allocation: a.space.allocate(Class::Payload).unwrap(),
                     info: ValueInfo {
@@ -743,6 +744,7 @@ fn populated_target_shard_structural_footprint_fits_accounting() {
             )
         } else {
             Entry::Payload(Rc::new(PayloadExtent {
+                admitted: None,
                 publication: Cell::new(None),
                 allocation: a.space.allocate(Class::Payload).unwrap(),
                 info: ValueInfo {

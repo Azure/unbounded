@@ -124,6 +124,13 @@ impl Storage for RingIo<'_> {
             IoTicket::Page(t) => self.ring.take_page(t)?.map(|c| exact(c.result, PAGE_SIZE)),
             IoTicket::Value(t, value) => self.ring.take_write(t)?.map(|c| {
                 exact(c.result, value.info.len)?;
+                if let Some(start) = value.admitted {
+                    self.ring.metrics().page_stage(
+                        crate::metrics::PageStage::PayloadWrite,
+                        start,
+                        true,
+                    );
+                }
                 value.written.set(true);
                 value
                     .publication

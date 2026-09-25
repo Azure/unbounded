@@ -5,6 +5,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_pipeline_metrics_are_fixed_and_published_once() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.page_serve(PageServe::EarlyBuffer);
+            local.page_serve(PageServe::BudgetFallback);
+            local.page_timer(PageStage::Admission).finish();
+            drop(local.page_timer(PageStage::FillValidation));
+        }
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_page_serve_total{decision=\"early_buffer\"} 0\n")
+        );
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        assert!(text.contains("racer_dataplane_page_serve_total{decision=\"early_buffer\"} 2\n"));
+        assert!(text.contains(
+            "racer_dataplane_page_stage_total{stage=\"admission\",outcome=\"completed\"} 2\n"
+        ));
+        assert!(text.contains(
+            "racer_dataplane_page_stage_total{stage=\"fill_validation\",outcome=\"incomplete\"} 2\n"
+        ));
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("racer_dataplane_page_"))
+                .count(),
+            23
+        );
+        for local in &locals {
+            local.publish();
+        }
+        assert_eq!(text, registry.render());
+    }
+
+    #[test]
     fn storage_metrics_have_fixed_series_and_do_not_change_readiness() {
         use crate::control::StorageResult;
         let updates = Arc::new(crate::control::Updates::default());
@@ -306,7 +345,7 @@ mod tests {
             let mut names = std::collections::BTreeSet::new();
             for sample in text.lines().filter(|s| !s.starts_with('#')) {
                 let (name, value) = sample.rsplit_once(' ').unwrap();
-                value.parse::<u64>().unwrap();
+                assert!(value.parse::<f64>().unwrap().is_finite());
                 assert!(names.insert(name.to_owned()), "duplicate series: {name}");
             }
             names

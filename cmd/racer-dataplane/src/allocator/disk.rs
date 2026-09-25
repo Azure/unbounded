@@ -219,6 +219,7 @@ fn load_node(
                         )?;
                         mark(used, allocation.page(), PAYLOAD_PAGES)?;
                         Entry::Payload(Rc::new(PayloadExtent {
+                            admitted: None,
                             publication: Cell::new(None),
                             allocation,
                             info,

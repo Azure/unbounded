@@ -41,6 +41,55 @@ fn key(n: u64) -> Key {
     key[..8].copy_from_slice(&n.to_be_bytes());
     key
 }
+
+#[test]
+fn early_buffer_survives_publication_error_without_false_file_readiness() {
+    struct Failing;
+    impl checkpoint::Storage for Failing {
+        type Ticket = checkpoint::IoTicket;
+        fn submit(
+            &mut self,
+            job: checkpoint::Job,
+        ) -> Result<Self::Ticket, uring::Rejected<checkpoint::Job>> {
+            let checkpoint::Job::Value(value) = job else {
+                panic!()
+            };
+            Ok(checkpoint::IoTicket::Detached(value))
+        }
+        fn complete(&mut self, _: &mut Self::Ticket) -> io::Result<Option<io::Result<()>>> {
+            Ok(Some(Err(io::Error::from_raw_os_error(libc::EIO))))
+        }
+    }
+    let (_fixture, mut slab) = Fixture::new();
+    let mut allocator = allocator(&mut slab);
+    let pool = buffers::io_test_pool(5);
+    let mut fill = pool.private_fill().unwrap();
+    fill.as_mut_slice()[..3].copy_from_slice(b"abc");
+    let buffer = fill.publish_checked(3, crc64(b"abc")).unwrap();
+    allocator
+        .insert_payload(key(1), buffer.clone(), None)
+        .unwrap();
+    let lease = allocator.lookup(&key(1), 0).unwrap();
+    assert!(buffer.try_early());
+    assert!(allocator.progress(&mut Failing, 1).unwrap());
+    assert!(allocator.progress(&mut Failing, 1).is_err());
+    assert!(allocator.is_failed());
+    assert!(lease.ready().is_none());
+    assert!(allocator.lookup(&key(1), 0).is_none());
+    assert_eq!(
+        buffer.as_slice(),
+        b"abc",
+        "already delivered validated bytes remain valid"
+    );
+    let probe = pool.private_fill().unwrap().publish(0).unwrap();
+    assert!(!probe.try_early());
+    drop((allocator, lease));
+    assert!(!probe.try_early());
+    drop(buffer);
+    assert!(probe.try_early());
+    drop(probe);
+    pool.assert_recovered();
+}
 fn metadata(n: u64, expires: u64) -> Metadata {
     Metadata {
         content_type: crate::metadata::ContentType::new(

@@ -1001,6 +1001,9 @@ pub struct Fault<U: Upstream> {
     generation: u64,
     freshness: Rc<invalidation::Freshness>,
     buffered: bool,
+    early_fallback: bool,
+    stage: Option<crate::metrics::PageTimer>,
+    produced: bool,
     _admission: FaultAdmission,
     resource_retries: usize,
     resource_polls: usize,
@@ -1530,6 +1533,9 @@ impl Cache {
             generation: freshness.generation.get(),
             freshness,
             buffered: false,
+            early_fallback: false,
+            stage: None,
+            produced: false,
             _admission: FaultAdmission(self.active_faults.clone()),
             resource_retries: 0,
             resource_polls: 0,
@@ -1587,8 +1593,15 @@ impl Cache {
         fault: &mut Fault<U>,
         ring: &Ring,
         reserve: usize,
+        receive: bool,
     ) -> Result<Option<Fill>> {
         let deadline = fault.deadline();
+        if receive && fault.stage.is_none() {
+            fault.stage = Some(
+                ring.metrics()
+                    .page_timer(crate::metrics::PageStage::ReceiveBuffer),
+            );
+        }
         let wait = fault.buffer_wait.get_or_insert_with(|| {
             ring.pool()
                 .wait_stage_reserved(Key::new(fault.key), reserve, deadline)
@@ -1597,6 +1610,11 @@ impl Cache {
             std::task::Poll::Pending => Ok(None),
             std::task::Poll::Ready(result) => {
                 fault.buffer_wait = None;
+                if result.is_ok()
+                    && let Some(timer) = fault.stage.take()
+                {
+                    timer.finish();
+                }
                 result.map(Some).map_err(Into::into)
             }
         }
@@ -1668,6 +1686,11 @@ impl Cache {
         ring: &mut Ring,
         upstream: &mut U,
     ) -> Result<()> {
+        fault.produced = true;
+        fault.stage = Some(
+            self.metrics
+                .page_timer(crate::metrics::PageStage::FillValidation),
+        );
         fault.classify(&self.metrics, crate::metrics::Outcome::Miss);
         if fault.route == Route::Select {
             // Size cannot authorize origin access. The adapter admits client
@@ -1849,7 +1872,7 @@ impl Cache {
                 }
                 let reserve = upstream.flight_reserve(
                     ring.pool().flight_capacity(),
-                    matches!(fault.spec, Spec::Page(_)).then(|| ring.pool().capacity()),
+                    matches!(fault.spec, Spec::Page(_)).then(|| ring.pool().demand_capacity()),
                 )?;
                 match ring.pool().network_flight_reserved(scope.clone(), reserve) {
                     Ok(lease) => fault.network = Some(lease),
@@ -1951,6 +1974,7 @@ impl Cache {
         let polled_state = fault.diagnostic_state();
         let state = std::mem::replace(&mut fault.state, Loading::Done);
         let acquiring = matches!(state, Loading::Acquire);
+        let admitting = matches!(state, Loading::Admitting(_));
         let result = self.step(&mut fault, state, ring, upstream);
         // Adapters may do synchronous work; completion never extends the budget.
         if crate::environment::now() >= fault.deadline {
@@ -2052,6 +2076,15 @@ impl Cache {
                 Ok(Progress::Pending { fault, work })
             }
             Ok(Step::Ready(buffer)) => {
+                if fault.produced && !admitting && !matches!(fault.state, Loading::Materialized) {
+                    if let Some(timer) = fault.stage.take() {
+                        timer.finish();
+                    }
+                    fault.stage = Some(
+                        self.metrics
+                            .page_timer(crate::metrics::PageStage::Admission),
+                    );
+                }
                 if !matches!(fault.state, Loading::Materialized) {
                     if let Err(error) = self.admit(&fault, &buffer, PageCrc::Compute) {
                         if matches!(&error, Error::Admission(e) if e.kind() == io::ErrorKind::WouldBlock)
@@ -2073,6 +2106,15 @@ impl Cache {
                         .allocator
                         .lookup(&fault.key, now())
                     {
+                        if fault.produced {
+                            if let Some(timer) = fault.stage.take() {
+                                timer.finish();
+                            }
+                            fault.stage = Some(
+                                self.metrics
+                                    .page_timer(crate::metrics::PageStage::ConsumerReady),
+                            );
+                        }
                         fault.state = Loading::Publishing(lease);
                         return Ok(Progress::Pending {
                             fault,
@@ -2089,7 +2131,21 @@ impl Cache {
                 }
                 Ok(Progress::Ready(CachedValue::Buffer(buffer)))
             }
+            Ok(Step::Early(buffer)) => {
+                if let Some(timer) = fault.stage.take() {
+                    timer.finish();
+                }
+                self.metrics
+                    .page_serve(crate::metrics::PageServe::EarlyBuffer);
+                if let Some(mut flight) = fault.network.take() {
+                    flight.finish(Ok(&buffer));
+                }
+                Ok(Progress::Ready(CachedValue::Buffer(buffer)))
+            }
             Ok(Step::File(file)) => {
+                if let Some(timer) = fault.stage.take() {
+                    timer.finish();
+                }
                 if file.info().kind != Kind::Payload || file.info().len != fault.len() {
                     return Err(Self::finish_failure(
                         &mut fault,
@@ -2108,6 +2164,7 @@ impl Cache {
                         work: runnable(),
                     })
                 } else {
+                    self.metrics.page_serve(crate::metrics::PageServe::File);
                     Ok(Progress::Ready(CachedValue::File(file)))
                 }
             }
@@ -2129,6 +2186,7 @@ impl Cache {
         ring: &mut Ring,
         upstream: &mut U,
     ) -> Result<Progress<Fault<U>, CachedValue>> {
+        fault.stage.take();
         fault.diagnose(upstream, ring, &error, "candidate_failure", None);
         if matches!(
             error.evidence().reason(),
@@ -2239,8 +2297,31 @@ impl Cache {
             }
             Loading::Admitting(buffer) => return Ok(Step::Ready(buffer)),
             Loading::Publishing(lease) => {
+                // File readiness and early-buffer eligibility are separate facts.
                 if let Some(file) = lease.ready() {
                     return Ok(Step::File(file));
+                }
+                if !fault.early_fallback {
+                    if let Some(buffer) = lease.buffer() {
+                        if buffer.try_early() {
+                            return Ok(Step::Early(buffer));
+                        }
+                    }
+                    // A denied consumer waits for the file, rather than racing
+                    // for newly released budget on every reactor poll.
+                    fault.early_fallback = true;
+                    self.metrics
+                        .page_serve(crate::metrics::PageServe::BudgetFallback);
+                }
+                // Explicit eviction/replacement can retire a pending value before
+                // submission. Such a lease will never become ready; fail locally
+                // rather than pinning it until the caller's deadline.
+                if !self.shards[fault.shard.0]
+                    .allocator
+                    .lookup(&fault.key, now())
+                    .is_some_and(|current| lease.same_value(&current))
+                {
+                    return Err(busy("pending payload retired"));
                 }
                 fault.state = Loading::Publishing(lease);
                 return Ok(Step::Pending(match ring.slab_deadline() {
@@ -2258,7 +2339,7 @@ impl Cache {
                 if !fault.buffered {
                     return Ok(Step::File(file));
                 }
-                match Self::poll_buffer(fault, ring, 0)? {
+                match Self::poll_buffer(fault, ring, 0, false)? {
                     Some(fill) => match file.read(ring, fill) {
                         Ok(ticket) => fault.state = Loading::Materializing(ticket, file),
                         Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {
@@ -2376,9 +2457,9 @@ impl Cache {
                 let reserve = if fault.route == Route::Backend {
                     0
                 } else {
-                    upstream.receive_reserve(ring.pool().capacity())?
+                    upstream.receive_reserve(ring.pool().demand_capacity())?
                 };
-                match Self::poll_buffer(fault, ring, reserve)? {
+                match Self::poll_buffer(fault, ring, reserve, true)? {
                     Some(fill) => {
                         self.start_origin(fault, fill, ring, upstream)?;
                     }
@@ -2444,9 +2525,16 @@ impl Cache {
             Loading::RetryPeer { exchange } => {
                 // Preserve the continuation across pressure;
                 // never hand the old authority to a new transport destination.
-                let reserve = upstream.receive_reserve(ring.pool().capacity())?;
-                match Self::poll_buffer(fault, ring, reserve)? {
+                let reserve = upstream.receive_reserve(ring.pool().demand_capacity())?;
+                if fault.buffer_wait.is_none() {
+                    fault.stage.take();
+                }
+                match Self::poll_buffer(fault, ring, reserve, true)? {
                     Some(fill) => {
+                        fault.stage = Some(
+                            self.metrics
+                                .page_timer(crate::metrics::PageStage::FillValidation),
+                        );
                         let (authority, destination) = fill.split_destination();
                         let exchange = upstream.resume_peer(
                             exchange,
@@ -2583,6 +2671,7 @@ enum Step {
     File(allocator::FileValue),
     Pending(Work),
     Ready(Buffer),
+    Early(Buffer),
 }
 
 #[cfg(test)]

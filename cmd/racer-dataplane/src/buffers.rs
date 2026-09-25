@@ -294,6 +294,7 @@ struct SlotInfo {
     value: Option<Key>,
     checksum: Option<u64>,
     len: Option<usize>,
+    early: bool,
 }
 struct Slot {
     refs: Padded<AtomicUsize>,
@@ -304,8 +305,12 @@ struct Node {
     slots: Box<[Slot]>,
     free: Mutex<Free>,
     flights: NetworkFlights,
+    early: AtomicUsize,
 }
 impl Node {
+    fn early_limit(&self) -> usize {
+        (self.slots.len() / 2).min(self.slots.len().saturating_sub(4))
+    }
     fn new(
         config: Config,
         node: NumaNodeId,
@@ -333,6 +338,7 @@ impl Node {
                 })
                 .collect(),
             free: Mutex::new(Free::new(count)),
+            early: AtomicUsize::new(0),
             flights: NetworkFlights {
                 registry: Mutex::new(HashMap::new()),
                 count: Arc::new(AtomicUsize::new(0)),
@@ -348,6 +354,11 @@ impl Node {
         // available under the free-list lock, which synchronizes the next allocation.
         // Acquire observes all other holders' releases before recycling memory.
         if self.slots[index].refs.0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Charge the physical slot until every owner is quiescent, including
+            // slab writes, detached flight results and canceled driver operations.
+            if std::mem::take(&mut self.slots[index].info.0.lock().unwrap().early) {
+                self.early.fetch_sub(1, Ordering::AcqRel);
+            }
             let wakes = {
                 let mut free = self.free.lock().unwrap();
                 free.slots.push(index);
@@ -399,6 +410,11 @@ impl WorkerPool {
     pub(crate) fn capacity(&self) -> usize {
         self.node.slots.len()
     }
+    /// Freeze forwarding ranks against capacity that slow early readers cannot
+    /// retain. Otherwise a rank of N-1 could stall behind just one early reader.
+    pub(crate) fn demand_capacity(&self) -> usize {
+        self.capacity() - self.node.early_limit()
+    }
     pub fn numa_node_id(&self) -> NumaNodeId {
         self.node.mapping.node
     }
@@ -438,6 +454,7 @@ impl WorkerPool {
             value,
             checksum: None,
             len: None,
+            early: false,
         };
         slot.refs.0.store(1, Ordering::Relaxed);
         Fill {
@@ -735,6 +752,28 @@ pub struct Buffer {
     len: usize,
 }
 impl Buffer {
+    /// Account unique physical slots, shared across workers, volumes and consumers.
+    /// At least four slots (and at least half the pool) remain outside slow-reader
+    /// retention. Tiny pools disable early serving. No payload allocation or copy.
+    pub(crate) fn try_early(&self) -> bool {
+        let node = &self.handle.node;
+        let mut info = self.handle.slot().info.0.lock().unwrap();
+        if info.early {
+            return true;
+        }
+        let limit = node.early_limit();
+        if node
+            .early
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        info.early = true;
+        true
+    }
     pub(crate) fn matches_key(&self, key: Key) -> bool {
         self.handle.matches_key(key)
     }

@@ -1591,6 +1591,11 @@ impl Task {
         }
     }
     fn prefetch(&mut self, cache: &mut Cache, ring: &mut Ring) -> cache::Result<Work> {
+        // A ranked receive may require every unreserved slot. Completed early
+        // SEND_ZC owners must retire before waiting for the next page to arrive.
+        if let Response::Writer(writer) = &mut self.response {
+            writer.reap(ring)?;
+        }
         if self.peer
             || matches!(
                 self.response,
