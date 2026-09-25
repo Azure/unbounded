@@ -180,6 +180,10 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let verified = auth[1]
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
+    assert_eq!(
+        verified.request().origin.reservation.cache(),
+        Some(&CacheId(CACHE.into()))
+    );
     let reverse = verified.binding().clone();
     let mut budget = verified.request().route.clone();
     budget.visited.push(signers[1].node().clone());

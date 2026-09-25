@@ -124,7 +124,7 @@ impl LogicalCodec for SecurityCodec {
         if length > p::MAX_HEAD {
             return Err(Error::InvalidRequest);
         }
-        let reservation =
+        let _decode_reservation =
             self.admission
                 .reserve(None, ResourceClass::RequestContext, length.max(1))?;
         let mode = match p::field(head, "racer-mode")?.as_str() {
@@ -133,6 +133,11 @@ impl LogicalCodec for SecurityCodec {
             _ => return Err(Error::InvalidRequest),
         };
         let object = object(head)?;
+        let reservation = self.admission.reserve(
+            Some(&object.cache),
+            ResourceClass::RequestContext,
+            length.checked_add(512).ok_or(Error::InvalidRequest)?,
+        )?;
         let operation = match p::field(head, "racer-operation")?.as_str() {
             "page" => Operation::Page {
                 page: PageId {
