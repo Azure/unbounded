@@ -523,7 +523,16 @@ SCRIPT
     (($# == 0)) || { usage >&2; exit 2; }
     script=$(cat <<'SCRIPT'
 set -Eeuo pipefail
-systemctl stop gantry-benchmark-operator.service
+systemctl stop gantry-benchmark-operator.service || true
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
+export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
+if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state >/dev/null 2>&1 ||
+  kubectl -n "${GANTRY_NAMESPACE:-gantry-system}" get configmap gantry-benchmark-lock >/dev/null 2>&1; then
+  cd "$BENCHMARK_REPO_ROOT"
+  make -C hack/gantry-benchmark disable
+fi
 systemctl show gantry-benchmark-operator.service \
   --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus --no-pager
 SCRIPT
