@@ -223,3 +223,42 @@ security tests. It uses the built Cargo dependency artifacts, generates only an
 in-memory test crate, and replaces no cryptography, buffers, queues, or other
 production component with a fake. The component runner is not an end-to-end startup
 or deployment test.
+
+## Implemented public integration surface
+
+- `PendingIdentity::{generate,recover,csr_der,accept,export_pkcs8_for_persistence}`
+  and `SigningIdentity::{from_pkcs8,tls_certified_key,sign,certificate_chain}`:
+  control owns durable storage and issuance transport; security validates identity.
+- `Keyring::{install,install_identity,install_signing_identity,signing_identity}`
+  stage/activate shared material and independently rotate local signing identities.
+  Identity installation is atomic with respect to current peer-trust publication.
+- `KeyLease::reference()` exposes the cache/key/purpose identity for fences without
+  exposing material. `Keyring::{register_retirement_barriers,pending_retirements,retire}`
+  connect application-wide local eviction/fencing to key erasure. Retire returns
+  unavailable while a barrier or lease is outstanding; the control owner retries
+  with bounded scheduling. No controller acknowledgment is involved.
+- `PageCryptoEngine::process` consumes an owned runtime job into an owned completion;
+  the `CryptoService` implementation drives the real bounded runtime handoff.
+- `CredentialCrypto::{seal,open,open_charged}` retains charged context ownership.
+  Both open methods return `ChargedOriginContext`, which dereferences to the raw
+  origin context and must live through origin I/O. Only verified ingress may reach
+  credential opening; successful decryption does not grant origin-fetch authority.
+- `protocol::{request_head,response_head,route_headers,agrees,encode_deadline,decode_deadline}`
+  and `signing::{signature_base,signed_digest}` are the peer encoding authority.
+- `Forwarding::{sign_request_to,verify_request,sign_response,verify_response,append_request,append_response}`
+  preserve private verified wrappers, exact bindings, and full forwarding chains.
+- `ChallengeProbe`, `ChallengeReply::{encode,decode}`, `session::respond`, and
+  `Signatures::install_peer_challenge` establish authenticated restart challenges.
+
+Verification at security handoff: 43 security unit tests, nine security doctests,
+and ten peer integration tests passed through Cargo; all-feature library check
+passed. The component runner also passed 43 security tests while application tests
+were transiently uncompilable.
+
+Remaining application integration at handoff: no production registration of
+`RetirementBarriers` or retirement-driver call was present, so omitted-key material
+is retained fail-closed after stopping new leases. The peer decoder still needed
+the cache-scoped context reservation fix described above. These are not silently
+treated as successful retirement or successful credential opening. Full deployment
+bootstrap, cluster rotation, storage/NIC retirement and load testing remain broader
+integration verification, beyond the component tests.
