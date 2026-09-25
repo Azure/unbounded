@@ -178,7 +178,7 @@ func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig,
 			}
 		}
 
-		writeOriginError(w, status, metadata)
+		writeOriginErrorResponse(w, status, metadata)
 	}
 	committed := false
 
@@ -372,7 +372,7 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-func writeOriginError(w http.ResponseWriter, status int, metadata Metadata) {
+func writeOriginErrorResponse(w http.ResponseWriter, status int, metadata Metadata) {
 	for name := range w.Header() {
 		w.Header().Del(name)
 	}

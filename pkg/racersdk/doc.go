@@ -117,6 +117,29 @@
 // ctx.Err(); it does not wait for noncooperative callbacks, whose slots remain
 // occupied until they return. Late-returned bodies are still closed.
 //
+// # Testing with a fake Racer
+//
+// NewFakeClient(origin) returns (*Client, func(), error). Register its cleanup with
+// t.Cleanup or defer it in examples. The returned Client and its Values use the real
+// SDK transport and validation path. Private loopback servers run the real origin
+// request, metadata, pin, body-length, EOF, and cancellation checks, plus a fake
+// sequential page scheduler for continuations larger than 16 MiB. No /run directory,
+// Racer process, endpoint configuration, or testing-package dependency is required.
+//
+// Each Get fetches a fresh bootstrap. The fake forwards FetchContext on every page,
+// keeps bounded streaming buffers, and never caches objects. It does not model
+// Racer caching, distributed scheduling, retries, or performance, and passing fake
+// tests does not establish real Racer compatibility. Callback failures before a
+// response starts preserve their HTTP classification; failures on later pages of
+// an already-started continuation abort the stream and leave a partial byte count.
+//
+// Cleanup is idempotent and safe concurrently. It closes the Client and both
+// servers, cancels active work, and releases listeners and connections. Calling
+// Client.Close alone still requires cleanup to release the harness. Origin must
+// honor cancellation and supply interruptible bodies just as with ServeOrigin;
+// cleanup does not wait for noncooperative callbacks, and closes late-returned
+// bodies. Client and origin resource defaults apply to the fake too.
+//
 // The examples with Output run without Rust or /run permissions. Examples marked
 // deployment-only are compile-checked and require provisioned Unix endpoints to
 // run. The Go SDK is implemented; the repository's Rust dataplane is still a
