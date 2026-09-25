@@ -1,4 +1,4 @@
-# Racer dataplane scaffold
+# Racer dataplane
 
 One Rust package containing the node dataplane. `app.rs` composes worker-local
 services; the binary enters through configuration and the application lifecycle.
@@ -13,12 +13,16 @@ cargo check --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-f
 cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
 ```
 
-This is an API scaffold, not a functioning cache. Constructors connect dependencies
-without opening files, accepting requests, or spawning threads. Operational methods
-return `Error::Unimplemented`; the executable exits unsuccessfully at configuration
-loading. No mock security, storage, network, or data-path success is provided.
-The `rdma` feature reserves native adapter integration and currently links no verbs
-library. There are no third-party dependencies yet.
+Constructors connect dependencies without opening files, accepting requests, or
+spawning threads. Activation is explicit through the application lifecycle. See
+[configuration](CONFIGURATION.md) for environment variables, resource limits, and
+startup requirements. Linux io_uring and direct-I/O-capable storage are required.
+
+The optional `rdma` feature loads the separately built native libibverbs adapter.
+See [native adapter](native/README.md) for installation and provider tests. Missing
+devices or incompatible capabilities select HTTP. Native DMA and teardown behavior
+must be verified on the deployment's provider; no usable type-2B device was available
+in the implementation test environment.
 
 ## Implementation contracts
 
@@ -37,13 +41,13 @@ library. There are no third-party dependencies yet.
   cluster rail contract or deterministic page-to-rail selection.
   The `Sync` factory builds separate I/O and crypto services on their pinned
   threads. Group APIs specify start, concurrent drain, shutdown, and join,
-  including partial-start rollback; operational lifecycle remains fail-closed.
+   including partial-start rollback.
   `runtime::crypto` defines owned Send jobs/completions, generation/sequence IDs,
   key leases, original deadlines/cancellation, and a non-cloneable pair-bound
   permit reserving both job and completion space before enqueue. Rejection returns
   ownership. Completion consumption releases capacity, including for canceled or
   abandoned waiters. Wakeable polling and bounded quanta must permit single-CPU
-  progress. Queue allocation, wakeups, cancellation fencing, and AEAD are pending.
+   progress. Completion capacity is reserved before a crypto job is accepted.
   I/O-local `PageCrypto` selects a key lease and submits owned inputs via its
   runtime's `CryptoClient`; the paired `PageCryptoEngine` cannot access the Rc
   service graph. Output reservations move to jobs, rather than borrowing a fill's
@@ -81,9 +85,8 @@ library. There are no third-party dependencies yet.
   and acquisition generation fence stale publication/failure/drain callbacks.
   The worker lifecycle retains the same flight table as Fill and exposes bounded
   polling/drain hooks for cleanup after request futures disappear.
-  Operational registration, election, wakeups, Drop cleanup, resource accounting,
-  and completion-driven drain remain fail-closed. Pure budget/identity validation
-  and compile contracts establish the scaffold, not an operational flight engine.
+   Registration, election, wakeups, Drop cleanup, and completion-driven drain are
+   exercised by behavioral tests in `read`, including resource-pressure cases.
 - Per-cache UDS paths are exactly `/run/racer/<cache name>/client/socket` and
   `/run/racer/<cache name>/origin/socket`. Racer owns the client listener; the
   application adapter owns the origin listener. Separate endpoint directories let
@@ -101,9 +104,8 @@ library. There are no third-party dependencies yet.
   generate a fresh cryptographic nonce and bind the credential domain, key ID,
   request/attempt, object, and exact opaque metadata in canonical AAD. The facade
   shares worker admission; each envelope owns its request-context reservation and
-  original cancellation/deadline through transport completion. Bounded allocation,
-  nonce generation, canonicalization, zeroization, and credential AEAD remain
-  fail-closed implementation work; compile/API tests establish ownership only.
+   original cancellation/deadline through transport completion. Allocation is
+   admitted before sealing, and secret-bearing buffers are zeroized on release.
   `SignedRequest` and `SignedResponse` own the logical message plus its original
   signed head and ordered forwarding heads. `Forwarding` signs/verifies complete
   envelopes and appends request/response hops without replacing the original.
@@ -113,9 +115,10 @@ library. There are no third-party dependencies yet.
   `RequestBinding`, minted by request signing/verification, retains the exact
   original request head/signature and is required for response signing/verification.
   `PeerTransport` exchanges owned signed envelopes, including through relays.
-  Canonical field agreement, original/hop signatures, replay/identity checks,
-  response correlation, route consumption, and reverse-path I/O remain fail-closed
-  implementation work. These API states do not implement authentication.
+   Canonical field agreement, original/hop signatures, replay/identity checks,
+   response correlation, and route consumption are checked before verified types
+   can be constructed. The versioned profile is documented in
+   `designs/racer-peer-security.md` at the repository root.
 - `store` accepts only encrypted pages. Slabs require `O_DIRECT` with discovered
   address/offset/length alignment. Aligned padded record lengths differ from
   authenticated ciphertext lengths. Padding is initialized and never delivered.
@@ -143,8 +146,8 @@ library. There are no third-party dependencies yet.
   fencing. HTTP heads transfer/return connection ownership and require owned byte
   staging; bodies consume owned buffers and return them with the connection lease.
   Shared/borrowed body slices require explicit bounded staging. Slab operations
-  consume a segment lease alongside the aligned buffer. Submission, staging,
-  cancellation accounting, and shutdown fencing remain fail-closed stubs.
+   consume a segment lease alongside the aligned buffer. Cancellation requests do
+   not release those resources before the corresponding completion fences.
 - `control` publishes immutable accepted snapshots and coherent key bundles.
   Bootstrap returns the local node certificate directly; common Secret bundles
   contain only peer trust and cache keys. Token-authenticated bootstrap also renews
@@ -154,9 +157,15 @@ library. There are no third-party dependencies yet.
 - `test_support` is test-only. Inline test sections identify the owning contracts;
   implement behavioral tests with each feature, rather than tests of placeholders.
 
-Wire canonicalization, key/path encoding, exact status policy, placement hash/score
-arithmetic, replay restart protocol, checkpoint encoding/publication order, concrete
-resource budgets, and RDMA mechanics remain explicit implementation specifications.
-Module documentation describes intended completed behavior, not existing behavior.
-Choose vetted libraries for crypto, HTTP, io_uring, and verbs when implementing
-those boundaries. Replace fail-closed stubs with tested vertical slices.
+## Protocol and verification references
+
+- `CLIENT_ORIGIN_API.md`: approved SDK and origin-adapter wire contract.
+- `src/topology/ALGORITHM_V1.md`: deterministic placement and routing profile.
+- `designs/racer-peer-security.md`: authenticated peer and encryption profile.
+- `designs/racer-store-protocol.md`: record/checkpoint formats and recovery rules.
+- `designs/racer-sdk-conformance.md`: independent wire and Go SDK checks.
+
+The `designs/` paths above are relative to the repository root. Component
+`INTEGRATION.md` files describe ownership and lifecycle APIs. Passing component
+tests does not establish deployment interoperability or hardware DMA guarantees;
+run the combined suite and applicable native-provider tests for a release.

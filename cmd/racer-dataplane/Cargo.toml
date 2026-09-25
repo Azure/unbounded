@@ -7,7 +7,7 @@ description = "Racer node-local read-through cache dataplane"
 
 [features]
 default = []
-# Enables the optional verbs adapter surface. Hardware/library selection is pending.
+# Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
 rdma = []
 
 [dependencies]

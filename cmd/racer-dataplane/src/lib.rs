@@ -1,10 +1,10 @@
 //! Racer's worker-owned dataplane and its composition boundaries.
 //!
-//! Constructors assemble dependencies only. Operational entry points return
-//! `Error::Unimplemented` until their contracts are implemented. In particular,
-//! no scaffold operation authenticates, decrypts, publishes, or reports readiness.
+//! Constructors assemble dependencies without operational side effects. Worker
+//! lifecycle methods activate reactor-owned I/O, authenticated control and peer
+//! transports, encrypted storage, and bounded read coordination.
 
-// Ownership fields document the final graph before operations consume them.
+// Component APIs also expose lifecycle and diagnostic hooks to embedders.
 #![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 

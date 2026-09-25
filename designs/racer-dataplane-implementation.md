@@ -67,6 +67,33 @@ and require explicit application polling.
 
 ## Verification
 
+### Integration audit gates
+
+- Application owner: parent unblocked composition test compilation by unwrapping
+  both `WorkerApplication::assemble` results. Pre-start `poll_budgeted(0)` returns
+  `Unavailable`; assert the fail-closed pre-start contract, not success.
+- Runtime owner: combined test run found startup/drain races in
+  `later_pair_allocation_failure_stops_and_joins_started_pair` (missing shutdown)
+  and `owned_start_drains_and_joins_both_pinned_local_services` (`Unavailable`).
+- Store owner: accepted dirty staging must use completion admission after stop;
+  expired unsubmitted dirty copies must be discarded without stranding drain.
+- Read owner: call safe idle memory eviction on byte-pressure admission failures;
+  count-only eviction cannot recover exhausted page-byte budgets.
+- Application owner: expected dirty-copy pressure/I/O failures are disposable cache
+  failures, not node-fatal errors. Serialize omitted-key retirement across all worker
+  memory, late fills, writer, crypto/transport fences, checkpoint invalidation, then
+  acknowledge registered keyring barriers. Cache removal also retires memory.
+- Application owner: select one node-wide checkpoint generation, validate exact
+  worker set/current ownership and all capacities/keys, then distribute shards.
+  Independent per-worker selection can restore inconsistent generations.
+- RDMA owner/application: configure explicit native rail mappings before advertising
+  availability; individual session expiration must fail that transfer and allow
+  HTTP fallback without stopping unrelated workers.
+- Control/native lifecycle: regular-file reads/fsync and native registration/QP
+  destruction are synchronous today. Do not describe those paths as nonblocking;
+  move accepted filesystem I/O onto the reactor and provision native resources
+  outside request turns with lifetime-safe completion ownership.
+
 Each owner adds meaningful success, failure, and edge tests and runs targeted checks.
 The integration owner runs formatting, all-target/all-feature checks, tests, real
 socket and storage exercises, and audits remaining placeholders and unreachable
