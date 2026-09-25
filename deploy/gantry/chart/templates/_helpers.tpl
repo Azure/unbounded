@@ -51,9 +51,34 @@ app.kubernetes.io/name: gantry
 {{ include "gantry.managerLabel" . }}
 {{- end }}
 
-{{- define "gantry.nodeConfigHosts" -}}
+{{- define "gantry.nodeConfigDefaultHosts" -}}
 # Managed by the Gantry Helm chart.
 [host."http://127.0.0.1:5000"]
 	capabilities = ["pull", "resolve"]
 	dial_timeout = "200ms"
+{{- end }}
+
+{{- define "gantry.nodeConfigRegistryHosts" -}}
+# Managed by the Gantry Helm chart.
+server = "https://{{ .name }}"
+
+[host."http://127.0.0.1:5000"]
+	capabilities = ["pull", "resolve"]
+	dial_timeout = "200ms"
+
+# Preserve AKS Artifact Streaming when Gantry is unavailable.
+[host."http://127.0.0.1:8578"]
+	capabilities = ["pull", "resolve"]
+{{- end }}
+
+{{- define "gantry.nodeConfigPayload" -}}
+{{- if .Values.gantry.artifactStreaming.enabled -}}
+{{- range $index, $registry := .Values.gantry.upstreamRegistries }}
+hosts-{{ $index }}.toml: |
+  {{- include "gantry.nodeConfigRegistryHosts" $registry | nindent 2 }}
+{{- end }}
+{{- else }}
+hosts.toml: |
+  {{- include "gantry.nodeConfigDefaultHosts" . | nindent 2 }}
+{{- end }}
 {{- end }}
