@@ -87,6 +87,7 @@ impl<B: IoBuffer> IoBuffer for BufferRange<B> {
 pub struct HttpIo {
     reactor: Rc<Reactor>,
     codec: super::codec::Codec,
+    send_body_limit: u64,
     admission: Option<Rc<Admission>>,
 }
 /// A completed head operation, including the still-exclusively-owned connection.
@@ -113,6 +114,7 @@ impl HttpIo {
     pub fn new(reactor: Rc<Reactor>, codec: super::codec::Codec) -> Self {
         Self {
             reactor,
+            send_body_limit: codec.body_limit(),
             codec,
             admission: None,
         }
@@ -126,9 +128,25 @@ impl HttpIo {
     ) -> Self {
         Self {
             reactor,
+            send_body_limit: codec.body_limit(),
             codec,
             admission: Some(admission),
         }
+    }
+    /// Local client responses stream an entire object range rather than one page.
+    /// Only sending permits SDK-sized ranges; receiving retains the page cap.
+    /// These are framing limits; body storage remains page-window admitted.
+    pub fn for_clients(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Self {
+        let mut io = Self::with_admission(
+            reactor,
+            super::codec::Codec::new(
+                admission.limits().header_bytes.get(),
+                crate::model::range::PAGE_BYTES + 16,
+            ),
+            admission,
+        );
+        io.send_body_limit = i64::MAX as u64;
+        io
     }
     pub fn buffer(&self, length: usize) -> Result<OwnedBuffer> {
         OwnedBuffer::new(
@@ -143,6 +161,7 @@ impl HttpIo {
         Self {
             reactor: self.reactor.clone(),
             codec: self.codec.limited(header_limit),
+            send_body_limit: self.send_body_limit,
             admission: self.admission.clone(),
         }
     }
@@ -278,7 +297,8 @@ impl HttpIo {
                 return Err(Error::InvalidRequest);
             }
             connection.begin_io();
-            let length = self.framing(&head, connection.request_is_head)?;
+            let length =
+                Self::framing_with_limit(&head, connection.request_is_head, self.send_body_limit)?;
             connection.close |= head.closes_connection()?;
             if let StartLine::Request { method, .. } = &head.start {
                 connection.request_is_head = method == "HEAD";
@@ -536,6 +556,13 @@ impl HttpIo {
         })
     }
     fn framing(&self, head: &MessageHead, request_is_head: bool) -> Result<u64> {
+        Self::framing_with_limit(head, request_is_head, self.codec.body_limit())
+    }
+    fn framing_with_limit(
+        head: &MessageHead,
+        request_is_head: bool,
+        body_limit: u64,
+    ) -> Result<u64> {
         let length = head.content_length()?;
         let body = match head.start {
             StartLine::Request { .. } => length.unwrap_or(0),
@@ -550,7 +577,7 @@ impl HttpIo {
             StartLine::Response { .. } if request_is_head => 0,
             StartLine::Response { .. } => length.ok_or(Error::InvalidRequest)?,
         };
-        if body > self.codec.body_limit() {
+        if body > body_limit {
             return Err(Error::InvalidRequest);
         }
         Ok(body)
@@ -644,6 +671,127 @@ mod tests {
     fn drain(reactor: &Reactor) {
         drive(reactor, reactor.drain()).unwrap();
         assert_eq!(reactor.in_flight(), 0);
+    }
+    #[test]
+    fn client_constructor_streams_beyond_page_cap_with_bounded_staging() {
+        let (admission, reactor, _, scope) = setup();
+        let io = HttpIo::for_clients(reactor.clone(), admission.clone()).capped(4096);
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        peer.write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
+        let length = 2 * crate::model::range::PAGE_BYTES as usize + 113;
+        let thread = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                peer.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            assert_eq!(
+                head,
+                format!("HTTP/1.1 200 \r\nContent-Length: {length}\r\n\r\n").as_bytes()
+            );
+            let mut chunk = [0; 8192];
+            let mut remaining = length;
+            while remaining != 0 {
+                let count = remaining.min(chunk.len());
+                peer.read_exact(&mut chunk[..count]).unwrap();
+                assert!(chunk[..count].iter().all(|byte| *byte == 91));
+                remaining -= count;
+            }
+        });
+        let mut connection = drive(
+            &reactor,
+            io.send_head(received.connection, response(length), &scope),
+        )
+        .unwrap()
+        .connection;
+        assert_eq!(connection.finish_exchange(), Err(Error::InvalidRequest));
+        let mut buffer = io.buffer(8192).unwrap();
+        buffer.bytes_mut().unwrap().fill(91);
+        let mut remaining = length;
+        while remaining != 0 {
+            let count = remaining.min(8192);
+            let completed = drive(
+                &reactor,
+                io.write_body_range(connection, buffer, 0..count, &scope),
+            )
+            .unwrap();
+            assert_eq!(completed.bytes, count);
+            buffer = completed.buffer;
+            connection = completed.lease;
+            remaining -= count;
+            assert_eq!(
+                admission.used(ResourceClass::RequestContext),
+                baseline + 8192
+            );
+        }
+        connection.finish_exchange().unwrap();
+        assert!(connection.is_reusable());
+        assert!(matches!(
+            drive(
+                &reactor,
+                io.write_body_range(connection, buffer, 0..1, &scope)
+            ),
+            Err(Error::InvalidRequest)
+        ));
+        thread.join().unwrap();
+        drain(&reactor);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+    #[test]
+    fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
+        let (admission, reactor, _, scope) = setup();
+        let page_limit = crate::model::range::PAGE_BYTES + 16;
+        let page_io = HttpIo::with_admission(
+            reactor.clone(),
+            Codec::new(4096, page_limit),
+            admission.clone(),
+        );
+        let client_io = HttpIo::for_clients(reactor.clone(), admission.clone()).capped(4096);
+        for io in [&page_io, &client_io] {
+            assert_eq!(
+                io.framing(&response(page_limit as usize), false),
+                Ok(page_limit)
+            );
+            for start in ["HTTP/1.1 200 OK", "GET /test HTTP/1.1"] {
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                write!(
+                    peer,
+                    "{start}\r\nContent-Length: {}\r\n\r\n",
+                    page_limit + 1
+                )
+                .unwrap();
+                assert!(matches!(
+                    drive(&reactor, io.receive_head(connection, &scope)),
+                    Err(Error::InvalidRequest)
+                ));
+            }
+        }
+        for (io, length) in [
+            (&page_io, page_limit + 1),
+            (&client_io, i64::MAX as u64 + 1),
+        ] {
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            assert!(matches!(
+                drive(
+                    &reactor,
+                    io.send_head(connection, response(length as usize), &scope)
+                ),
+                Err(Error::InvalidRequest)
+            ));
+        }
+        drain(&reactor);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
     fn real_socket_fragmentation_read_ahead_and_owned_ranges() {

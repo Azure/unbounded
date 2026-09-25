@@ -694,8 +694,9 @@ impl WorkerApplication {
             .with_wire(wire)
             .with_handshake(handshake)
             .with_transfers(transfers)
-            .with_reactor(reactor),
+            .with_reactor(reactor.clone()),
         );
+        let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
         let responses = Rc::new(Responses::new(io.clone(), delivery));
         let clients = Rc::new(ClientListeners::new(
             dispatcher.clone(),
