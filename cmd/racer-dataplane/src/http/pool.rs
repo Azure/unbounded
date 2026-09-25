@@ -8,6 +8,10 @@ pub enum Endpoint {
     Unix(PathBuf),
     Peer(String),
 }
+/// Exclusive socket/pool lease. Submitted operations retain the whole lease in
+/// the reactor through the final fence, not just a borrowed or copied raw FD.
+/// On cancellation/error, fence before closing; only a fully consumed, healthy
+/// connection may return to the pool. Dropping a waiter is not a reuse signal.
 pub struct ConnectionLease {
     fd: OwnedFd,
     reusable: bool,

@@ -4,7 +4,13 @@
 //! Geometry must fit a padded full page and header without crossing segments.
 //! Partial completions are failures unless a remaining aligned operation is valid.
 //! Never scan/zero payloads at startup or claim fsync durability.
-use super::direct::{AlignedBuffer, DirectAlignment, DirectExtent};
+//! Transfer each segment lease with its buffer and an owned slab FD reference to
+//! the reactor. Neither future drop nor cancellation permits segment reuse before
+//! the final fence. Validate that the lease covers the location before submission.
+use super::{
+    direct::{AlignedBuffer, DirectAlignment, DirectExtent},
+    segment::SegmentLease,
+};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SlabId(pub u64);
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +53,7 @@ impl Slabs {
         &'a self,
         _location: SlabLocation,
         _buffer: AlignedBuffer,
+        _lease: SegmentLease,
         _scope: &'a RequestScope,
     ) -> Operation<'a, AlignedBuffer> {
         deferred("slab.read_direct")
@@ -55,6 +62,7 @@ impl Slabs {
         &'a self,
         _location: SlabLocation,
         _buffer: AlignedBuffer,
+        _lease: SegmentLease,
         _scope: &'a RequestScope,
     ) -> Operation<'a, AlignedBuffer> {
         deferred("slab.write_direct")

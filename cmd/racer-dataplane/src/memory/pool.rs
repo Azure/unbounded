@@ -10,10 +10,12 @@ pub struct BufferPool {
     admission: Rc<Admission>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
+/// Fixed-size owned backing stays at the same address when this owner moves.
 pub struct PlaintextBuffer {
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
     reservation: Reservation,
 }
+impl crate::runtime::reactor::sealed::Sealed for PlaintextBuffer {}
 impl crate::runtime::reactor::IoBuffer for PlaintextBuffer {
     fn bytes(&self) -> Result<&[u8]> {
         pending("pool.plaintext_bytes")

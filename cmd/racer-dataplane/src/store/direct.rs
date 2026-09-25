@@ -16,6 +16,8 @@ pub struct DirectAlignment {
     offset: u64,
     length: usize,
 }
+/// Exclusive owner of a fixed allocation and its quota, independent of futures.
+/// Moving this handle must not move the allocation; no borrowed/inline backing.
 pub struct AlignedBuffer {
     allocation: NonNull<u8>,
     layout: Layout,
@@ -41,6 +43,7 @@ impl DirectAlignment {
 }
 // The allocation constructor is fail-closed until a correct allocator, Drop, and
 // completion-lifetime implementation exist. No placeholder unsafe dereference.
+impl crate::runtime::reactor::sealed::Sealed for AlignedBuffer {}
 impl IoBuffer for AlignedBuffer {
     fn bytes(&self) -> Result<&[u8]> {
         pending("direct.bytes")

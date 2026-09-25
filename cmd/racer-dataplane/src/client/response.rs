@@ -22,10 +22,10 @@ impl Responses {
     }
     pub fn send<'a>(
         &'a self,
-        _connection: &'a mut ConnectionLease,
+        _connection: ConnectionLease,
         _response: ReadResponse,
         _scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
+    ) -> Operation<'a, ConnectionLease> {
         deferred("client.send")
     }
 }

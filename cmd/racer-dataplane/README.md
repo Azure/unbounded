@@ -52,6 +52,18 @@ library. There are no third-party dependencies yet.
 - `memory`, `runtime`, and `rdma` retain leases until all applicable kernel/NIC
   fences finish, including cancellation. Disk persistence is bounded and async;
   failed dirty writes may be discarded.
+  `IoBuffer` is sealed and requires `'static`, exclusively owned, address-stable
+  backing plus its quota reservation: fixed boxed staging bytes or an aligned
+  allocation, never borrowed slices or inline arrays. Before submitting I/O, the
+  reactor must put buffers, owned FD references, and connection/segment leases in
+  its in-flight table, independently of the waiting future. Future drop abandons
+  the result; release/reuse requires original and cancellation completion fences,
+  including during shutdown. `Completion<B, L>` returns the buffer and lease after
+  fencing. HTTP heads transfer/return connection ownership and require owned byte
+  staging; bodies consume owned buffers and return them with the connection lease.
+  Shared/borrowed body slices require explicit bounded staging. Slab operations
+  consume a segment lease alongside the aligned buffer. Submission, staging,
+  cancellation accounting, and shutdown fencing remain fail-closed stubs.
 - `control` publishes immutable accepted snapshots and coherent key bundles.
   One selected worker owns control enrollment; worker handles share node-wide
   snapshot, key-epoch, and replay roots. Bounded dispatch routes work to page owners.
