@@ -959,8 +959,48 @@ mod tests {
             Err(Error::Overloaded)
         ));
         drain(&reactor);
-        pool.expire_idle();
         assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+    #[test]
+    fn dropped_checkout_and_destroyed_pool_release_quota_only_after_connect_fence() {
+        for (cancel_before_drop, submit_before_drop) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let (admission, reactor, _, scope) = setup();
+            reactor.init().unwrap();
+            let baseline = admission.used(ResourceClass::RequestContext);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
+            let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
+            let mut future = pool.checkout(&endpoint, &scope);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(reactor.in_flight(), 1);
+            if submit_before_drop {
+                reactor.poll_budgeted(32).unwrap();
+            }
+            if cancel_before_drop {
+                scope.cancel().unwrap();
+            }
+            drop(future);
+            drop(pool);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert_eq!(reactor.in_flight(), 1);
+            drain(&reactor);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+            assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+            // No pool or pool sweep exists to release this charge. Prove it
+            // returned to admission rather than being intentionally leaked.
+            let charge = admission
+                .reserve(
+                    None,
+                    ResourceClass::Connection,
+                    admission.limits().client_connections.get(),
+                )
+                .unwrap();
+            drop(charge);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
     }
     #[test]
     fn cancelled_receive_retains_resources_until_completion_and_reports_cancelled() {

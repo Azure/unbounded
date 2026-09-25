@@ -7,8 +7,8 @@ when staging is needed. All constructors are side-effect-free.
 The worker must drive the same reactor's `poll_budgeted` and wait/wakeup loop.
 `recv` and `send` must retain the full owned buffer and ConnectionLease through
 original/cancellation completion, independently of waiting future lifetime.
-`connect` uses owned SocketAddress::Inet/Unix. Peer endpoints are numeric socket
-addresses; this component never performs blocking DNS resolution.
+`connect_with_lease` uses owned SocketAddress::Inet/Unix. Peer endpoints are numeric
+socket addresses; this component never performs blocking DNS resolution.
 
 ## Endpoint APIs
 
@@ -18,6 +18,10 @@ addresses; this component never performs blocking DNS resolution.
 - `receive_head_limited(connection, scope, header_limit)` enforces a smaller cap
   before allocation. Codec limits never exceed 32 KiB. SDK semantic field/ETag
   limits remain the endpoint adapter's responsibility.
+- Raw head size includes the received start line, separators and CRLF bytes up to
+  the terminating CRLFCRLF, excluding read-ahead. `Codec::decode_head` returns that
+  exact consumed byte count. Semantic parsers must not reconstruct it from decoded
+  values: optional separator spaces on unknown fields make that inaccurate.
 - Client request ingress uses `receive_request_head_limited(connection, scope,
   header_limit) -> Operation<HeadCompletion<Result<MessageHead>>>`. An outer error
   closes the socket (I/O/cancellation/resource failure). Inner InvalidRequest or
@@ -50,7 +54,7 @@ staging allocations are zeroized. Consumed head bytes are scrubbed before keepin
 body read-ahead. `Codec::encode_head` retains its existing Vec return signature;
 direct users must wrap its result in zeroize::Zeroizing when it contains secrets.
 
-## Pool lifecycle and remaining runtime handoff
+## Pool lifecycle and completion ownership
 
 Pool capacity includes connecting/leased sockets; healthy idle sockets consume
 connection quota too. Exhaustion returns Overloaded immediately, without hidden
@@ -59,14 +63,13 @@ idle timeout. Call `invalidate(endpoint)` on endpoint-generation changes and
 `expire_idle()` from lifecycle polling. `close()` stops checkout and closes idle
 sockets, while active operations retain their owners.
 
-The current runtime `connect(fd,address,scope)` owns the FD/address but no generic
-lease. A dropped connect quarantines its admission/slot until the retained FD
-dies; `expire_idle()` reaps it. Normal shutdown drains the reactor, then reaps the
-pool. If pool destruction precedes that fence, bounded quarantined accounting
-owners are deliberately retained rather than released early. The precise missing
-runtime API is `connect_with_lease<L: 'static>(fd, address, lease, scope) ->
-Operation<L>`; adopting it removes that exceptional retention. Send/receive
-already have the required lease API. No successful connection or I/O is mocked.
+Checkout moves the entire ConnectionLease into runtime
+`connect_with_lease<L: 'static>(fd, address, lease, scope) -> Operation<L>`.
+The reactor retains the FD, address, quota and connection slot through original
+and cancellation completions. Dropping the checkout future and pool does not
+release quota early: completion releases it without a pool-reaping pass or leak.
+Send/receive use the same completion-owned lease policy. No successful connection
+or I/O is mocked.
 
 ## Component verification
 

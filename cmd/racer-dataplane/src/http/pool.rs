@@ -39,7 +39,6 @@ struct Entry {
 }
 struct PoolState {
     entries: HashMap<Endpoint, Entry>,
-    quarantine: Vec<(Weak<OwnedFd>, Reservation, Endpoint)>,
     next_generation: u64,
     closed: bool,
 }
@@ -125,16 +124,6 @@ impl Drop for ConnectionLease {
             return;
         };
         let mut state = state.borrow_mut();
-        if Rc::strong_count(&self.fd) > 1 {
-            if let Some(reservation) = self.reservation.take() {
-                state.quarantine.push((
-                    Rc::downgrade(&self.fd),
-                    reservation,
-                    target.endpoint.clone(),
-                ));
-                return;
-            }
-        }
         let closed = state.closed;
         if let Some(entry) = state.entries.get_mut(&target.endpoint) {
             entry.active = entry.active.saturating_sub(1);
@@ -191,7 +180,6 @@ impl HttpPool {
             idle_timeout,
             state: Rc::new(RefCell::new(PoolState {
                 entries: HashMap::new(),
-                quarantine: Vec::new(),
                 next_generation: 0,
                 closed: false,
             })),
@@ -256,25 +244,16 @@ impl HttpPool {
             let reservation = self.admission.reserve(None, ResourceClass::Connection, 1)?;
             let (fd, address) = create_socket(endpoint)?;
             let connection = ConnectionLease::new(Rc::new(fd), reservation, slot.0.take());
-            // The runtime retains the FD and address through cancellation. A
-            // dropped checkout never places this unfinished socket in idle.
+            // Retain socket, admission and pool slot in the reactor through the
+            // original/cancellation fences, even after both future and pool drop.
             self.reactor
-                .connect(connection.fd.clone(), address, scope)
-                .await?;
-            Ok(connection)
+                .connect_with_lease(connection.socket(), address, connection, scope)
+                .await
         })
     }
     pub fn expire_idle(&self) {
         let now = Instant::now();
         let mut state = self.state.borrow_mut();
-        let pending = std::mem::take(&mut state.quarantine);
-        for (fd, reservation, endpoint) in pending {
-            if fd.strong_count() != 0 {
-                state.quarantine.push((fd, reservation, endpoint));
-            } else if let Some(entry) = state.entries.get_mut(&endpoint) {
-                entry.active = entry.active.saturating_sub(1);
-            }
-        }
         state.entries.retain(|_, entry| {
             entry
                 .idle
@@ -307,16 +286,6 @@ impl HttpPool {
 impl Drop for HttpPool {
     fn drop(&mut self) {
         self.close();
-        self.expire_idle();
-        // The legacy runtime connect API retains only an FD, not its quota lease.
-        // If shutdown violates explicit pool drain ordering, retaining bounded
-        // charges is safer than releasing admission while a connect remains live.
-        // connect_with_lease eliminates this exceptional quarantine path.
-        for (fd, reservation, _) in self.state.borrow_mut().quarantine.drain(..) {
-            if fd.strong_count() != 0 {
-                std::mem::forget(reservation);
-            }
-        }
     }
 }
 
@@ -450,13 +419,16 @@ mod tests {
     }
     #[test]
     fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
-        // Real kernel cancellation is covered in io::tests. This tests the
-        // separate pool accounting fence when a connect retains only its FD.
+        use super::super::io::OwnedBuffer;
+        use crate::model::identity::RequestId;
+        use std::task::{Context, Poll};
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = HttpPool::new(reactor, admission.clone(), 1);
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
         let endpoint = Endpoint::Peer("127.0.0.1:1".into());
         pool.state.borrow_mut().entries.insert(
             endpoint.clone(),
@@ -467,9 +439,8 @@ mod tests {
             },
         );
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let fd: Rc<OwnedFd> = Rc::new(socket.into());
         let connection = ConnectionLease::new(
-            fd.clone(),
+            Rc::new(socket.into()),
             admission
                 .reserve(None, ResourceClass::Connection, 1)
                 .unwrap(),
@@ -479,11 +450,23 @@ mod tests {
                 generation: 1,
             }),
         );
-        drop(connection);
-        pool.expire_idle();
+        let scope =
+            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
+        let staging = OwnedBuffer::new(&admission, 4096).unwrap();
+        let mut receive = reactor.recv(connection.socket(), staging, connection, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(receive.as_mut().poll(&mut cx), Poll::Pending));
+        drop(receive);
+        drop(pool);
         assert_eq!(admission.used(ResourceClass::Connection), 1);
-        drop(fd);
-        pool.expire_idle();
+        assert!(admission.used(ResourceClass::RequestContext) >= baseline + 4096);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reactor.in_flight() != 0 {
+            assert!(Instant::now() < deadline);
+            reactor.poll_budgeted(32).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
         assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     }
 }
