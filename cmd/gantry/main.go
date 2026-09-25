@@ -684,10 +684,11 @@ func runAgent(args []string) error {
 		urlPolicy := streamingapi.URLPolicy{AllowedHostSuffixes: c.ArtifactStreamingAllowedHostSuffixes}
 
 		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingapi.Options{
-			URLPolicy:    urlPolicy,
-			SelfPeerID:   ifaces.NodeID(disco.PeerID().String()),
-			StartupGated: true,
-			Logger:       logger,
+			URLPolicy:              urlPolicy,
+			ResolveCanonicalOrigin: newCanonicalOriginResolver(c.UpstreamRegistries),
+			SelfPeerID:             ifaces.NodeID(disco.PeerID().String()),
+			StartupGated:           true,
+			Logger:                 logger,
 			Metrics: streamingapi.MetricsHooks{
 				OnRequest: func(source, outcome string, duration time.Duration, bytes int64) {
 					streamingMetrics.requests.WithLabelValues(source, outcome).Inc()

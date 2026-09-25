@@ -43,7 +43,8 @@ const (
 )
 
 type Options struct {
-	URLPolicy URLPolicy
+	URLPolicy              URLPolicy
+	ResolveCanonicalOrigin func(OriginURL) (OriginURL, bool)
 
 	// PeerLookupTimeout and MaxPeerAttempts fall back to defaults when zero.
 	PeerLookupTimeout time.Duration
@@ -209,6 +210,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+	}
+
+	if origin.Canonical {
+		resolved, ok := OriginURL{}, false
+		if s.opts.ResolveCanonicalOrigin != nil {
+			resolved, ok = s.opts.ResolveCanonicalOrigin(origin)
+		}
+		if !ok {
+			http.Error(w, "canonical origin unavailable", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		origin = resolved
 	}
 
 	body, total, contentType, err := s.origin.FetchRange(r.Context(), origin, requested)
