@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,12 +28,13 @@ type streamConn struct {
 // body reader would corrupt its framing and reuse state. Both pools are shared
 // by authorization views; credentials are written afresh for every request.
 type streamPool struct {
-	pipes    splicePipePool
-	mu       sync.Mutex
-	idle     []*streamConn
-	endpoint string
-	limit    int
-	timeout  time.Duration
+	pipes       splicePipePool
+	mu          sync.Mutex
+	idle        []*streamConn
+	endpoint    string
+	limit       int
+	timeout     time.Duration
+	speculative chan struct{}
 }
 
 func (p *streamPool) get(ctx context.Context) (*streamConn, error) {
@@ -146,6 +148,9 @@ type Stream struct {
 	pageOffset           int64
 	statusCode           int
 	failure              *StreamFailure
+	future               *pageFuture
+	requests             atomic.Int64
+	retries              atomic.Int64
 }
 
 // TransferStats distinguishes actual kernel splice traffic from buffered
@@ -177,7 +182,16 @@ func (s *Stream) Stats() TransferStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.stats
+	stats := s.stats
+	stats.PageRequests = s.requests.Load()
+
+	stats.PageRetries = s.retries.Load()
+	if s.future != nil {
+		stats.PageRequests += s.future.page.requests.Load()
+		stats.PageRetries += s.future.page.retries.Load()
+	}
+
+	return stats
 }
 
 // Prepare fetches and validates the first page's headers without consuming its
@@ -223,7 +237,7 @@ func (o *Object) Stream(ctx context.Context) (*Stream, error) {
 
 // ReadRange opens [offset, offset+length), rejecting out-of-bounds intervals.
 // Requests are lazy and pinned by If-Match to Open's HEAD snapshot. Consumption
-// is sequential, with one active page request per stream.
+// is ordered, with at most one additional page prepared when lookahead is enabled.
 // Close is required even when a caller stops reading early.
 func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, error) {
 	if offset < 0 || length < 0 || offset > o.meta.Size || length > o.meta.Size-offset {
@@ -285,7 +299,19 @@ func (s *Stream) nextPage() error {
 
 	defer func() { s.stats.PageHeaderWait += time.Since(started) }()
 
-	return s.preparePageWithRetry()
+	if s.future != nil {
+		s.release(!s.responseClose)
+
+		if err := s.takeFuture(); err != nil {
+			return err
+		}
+	} else if err := s.preparePageWithRetry(); err != nil {
+		return err
+	}
+
+	s.startFuture()
+
+	return nil
 }
 
 func (s *Stream) preparePage() error {
@@ -331,7 +357,8 @@ func (s *Stream) preparePage() error {
 
 	s.operation = "page_request"
 
-	s.stats.PageRequests++
+	s.requests.Add(1)
+
 	if err := r.Write(s.conn); err != nil {
 		return err
 	}
@@ -340,6 +367,10 @@ func (s *Stream) preparePage() error {
 
 	resp, err := s.conn.response(r)
 	if err != nil {
+		if err == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
+
 		return err
 	}
 
@@ -380,6 +411,7 @@ func (s *Stream) fail(err error) error {
 
 	s.err = err
 	s.release(false)
+	s.discardFuture()
 
 	return err
 }
@@ -444,6 +476,7 @@ func (s *Stream) Close() error {
 
 	s.closed = true
 	s.release(false)
+	s.discardFuture()
 
 	return nil
 }

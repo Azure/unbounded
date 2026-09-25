@@ -35,7 +35,14 @@ Zero leaves the deadline to the operation's context; negative values are rejecte
 Each client retains at most eight idle sockets in each of its HTTP and raw
 streaming pools. Origin-data views share those pools. Idle capacity does not
 limit active requests: callers control the number of concurrent operations.
-Each stream issues one page request at a time, without speculative prefetch.
+By default each stream issues one page request at a time. Set
+`ClientOptions.PageLookahead: true` to prepare one next page on a separate raw UDS
+connection after the current page's headers validate. Gantry enables this option.
+The client and all its origin-data views share eight speculative permits. Each
+stream holds at most one, including while a validated response awaits consumption.
+Permit acquisition never blocks: when exhausted, the stream proceeds sequentially.
+Foreground requests do not need a permit. With A active streams and S speculative
+slots, active raw sockets are bounded by `A + min(A, S)`; here S is eight.
 
 ## Sequential reads and explicit splice
 
@@ -64,10 +71,17 @@ later-page HTTP failure remains visible even after forwarding cleanup cancels
 the stream. Client-facing Racer 503 responses do not expose peer breaker history;
 these samples cannot establish the failure that originally opened a breaker.
 
-Streams fetch aligned 64 MiB pages sequentially with `If-Match`. Payload scratch
-space is bounded independently of page/object size: a pooled 32 KiB buffer,
-8 KiB socket/header buffers, and, on Linux, at most one forwarding pipe per
-active socket `WriteTo`. A pipe is acquired lazily after the buffered prefix;
+Streams forward aligned 64 MiB pages in order with `If-Match`. With lookahead,
+only the next page's headers are prepared concurrently; there is no speculative
+body reader, extra forwarding pipe, or page-sized Go buffer. Any body read-ahead
+stays in that socket's bounded reader, and socket backpressure bounds unread
+payload. The next page retains the same immutable object, exact range, credentials,
+and full-stream deadline. A failed future page is reported only when needed, after
+the earlier page has been forwarded; it never cancels or replays an earlier page.
+Payload scratch space is bounded independently of page/object size: a pooled
+32 KiB buffer, 8 KiB socket/header buffers per checked-out socket, and, on Linux,
+at most one forwarding pipe per active socket `WriteTo`.
+A pipe is acquired lazily after the buffered prefix;
 empty and entirely buffered transfers create no pipe and issue no pipe syscalls.
 New pipes request 1 MiB with best-effort `F_SETPIPE_SZ`, then use `F_GETPIPE_SZ`
 to discover their actual capacity. Denied enlargement retains the default
@@ -87,7 +101,11 @@ syscalls/forwarded bytes. Read-ahead bytes and portable copies appear in
 and `PageRetries` counts those that retry a rejected pre-body response. HEAD and
 connection failures before request writing are excluded. `PageHeaderWait` is
 consumption-path time preparing headers, including connection setup, validation,
-retry backoff, and failed attempts. `ForwardDuration` is active `WriteTo` time
+retry backoff, and failed attempts. For a speculative page, it counts only the
+consumer's remaining wait, excluding preparation overlapped with forwarding or
+caller idle time. Requests and retries include dispatched speculative attempts,
+even when abandoned; snapshots may include background attempts after `Prepare`.
+`ForwardDuration` is active `WriteTo` time
 outside that preparation: it includes upstream body waits, downstream
 backpressure, and forwarding/cleanup work. It does not isolate downstream socket
 blocking. Both durations exclude HEAD and caller idle time; header wait includes
@@ -159,6 +177,11 @@ write deadline to the present; close the downstream after failure. Arbitrary
 non-socket writers must provide their own cancellation for a blocked Write.
 Only fully consumed valid responses are pooled. Failed/abandoned responses are
 closed. Streams do not automatically retry stale idle sockets or version errors.
+Close and terminal forwarding errors cancel and join speculative work, discard
+abandoned responses, and release its permit before returning. Context cancellation
+also closes a parked future response and releases the permit even if no further
+consumption occurs. Always Close a stream abandoned after Prepare; without a
+deadline or cancellation, its current and future sockets remain owned by it.
 
 ### Bounded transient page recovery
 
@@ -180,7 +203,9 @@ five-second cumulative per-page wait budget or remaining stream deadline cause
 the original HTTP error to be returned; hints are never shortened. All attempts
 retain the original stream context/deadline, including ClientOptions.Timeout.
 Close and context cancellation interrupt retry waits and dispose of active
-sockets/pipes. No retry refreshes the total budget or adds parallel fanout.
+sockets/pipes. No retry refreshes the total budget or adds parallel attempts for
+the same page. Lookahead uses this same retry policy independently for the future
+page; it cannot replay a consumed body or change the pinned snapshot.
 
 Recovered transient statuses do not populate Failure(); it describes the first
 terminal failure. Exhaustion still returns an error and records its final page

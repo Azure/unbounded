@@ -56,7 +56,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		return err
 	}
 
-	client, err := sdk.NewClient(clientSocket, sdk.ClientOptions{Timeout: c.PeerFetchTimeout})
+	client, err := sdk.NewClient(clientSocket, sdk.ClientOptions{Timeout: c.PeerFetchTimeout, PageLookahead: true})
 	if err != nil {
 		return err
 	}

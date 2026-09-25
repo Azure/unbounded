@@ -19,6 +19,10 @@ type ClientOptions struct {
 	// leaves the deadline to the operation's context. For sequential streams it
 	// bounds the whole stream, including all page requests and downstream writes.
 	Timeout time.Duration
+	// PageLookahead prepares at most one next page while forwarding the current
+	// page. A client and all its origin-data views share eight speculative slots;
+	// saturation falls back to sequential progress without waiting for a slot.
+	PageLookahead bool
 }
 
 // Client is reusable and safe for concurrent use. Construct it with NewClient.
@@ -45,7 +49,12 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 	const idle = 8
 
 	c := &Client{endpoint: "http://localhost", header: make(http.Header)}
+
 	c.streamPool = &streamPool{endpoint: endpoint, limit: idle, timeout: options.Timeout}
+	if options.PageLookahead {
+		c.streamPool.speculative = make(chan struct{}, idle)
+	}
+
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	// This pool always dials the configured local socket, never an HTTP proxy.
 	c.owned = &http.Transport{
