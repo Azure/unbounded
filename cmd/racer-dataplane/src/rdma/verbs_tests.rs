@@ -82,13 +82,27 @@ unsafe extern "C" fn window_free(p: *mut c_void) -> c_int {
     }
     0
 }
-unsafe extern "C" fn bind(_: *mut c_void, _: *mut c_void, _: *mut c_void, _: u32, _: u64) -> c_int {
+unsafe extern "C" fn bind(
+    _: *mut c_void,
+    _: *mut c_void,
+    _: *mut c_void,
+    _: u32,
+    _: u64,
+    _: u32,
+) -> c_int {
     0
 }
 unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
     0
 }
-unsafe extern "C" fn write(_: *mut c_void, _: *mut c_void, _: u64, _: u32, _: u64) -> c_int {
+unsafe extern "C" fn write(
+    _: *mut c_void,
+    _: *mut c_void,
+    _: u64,
+    _: u32,
+    _: u64,
+    _: u32,
+) -> c_int {
     if FAULTS.with_borrow(|f| f.post_fails) {
         5
     } else {
@@ -116,7 +130,7 @@ impl Drop for Quota {
         event("quota");
     }
 }
-fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
+pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
     FAULTS.with_borrow_mut(|f| *f = Faults::default());
     let api = Rc::new(Api {
         library: None,
@@ -157,8 +171,16 @@ fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
     let region = Region::new(device, 32, Box::new(Quota(charged.clone()))).unwrap();
     (qp, region, charged)
 }
-fn complete(id: u64, status: u32, opcode: u32) {
+pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
     FAULTS.with_borrow_mut(|f| f.cq.push_back(Completion { id, status, opcode }));
+}
+pub(crate) fn fail_stop(fail: bool) {
+    FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
+}
+pub(crate) fn fresh_fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
+    let (qp, region, charged) = fixture();
+    let fresh = QueuePairHandle::new(qp.device.clone()).unwrap();
+    (fresh, region, charged)
 }
 
 #[test]

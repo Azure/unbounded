@@ -2,5 +2,5 @@
 //! verification while other component owners are editing the crate concurrently.
 #[path = "../src/error.rs"]
 mod error;
-#[path = "../src/rdma/verbs.rs"]
+#[path = "../src/rdma/backend.rs"]
 mod verbs;

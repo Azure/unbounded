@@ -36,7 +36,7 @@ struct racer_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* The v1 quota/alignment profile pins 4 KiB base pages. Other page-size hosts
  * select HTTP rather than under-accounting registered physical memory. */
-uint32_t racer_rdma_abi(void) { return sysconf(_SC_PAGESIZE) == 4096 ? 1 : 0; }
+uint32_t racer_rdma_abi(void) { return sysconf(_SC_PAGESIZE) == 4096 ? 2 : 0; }
 
 /* Returns the total count, including ports beyond capacity. Only active ports
  * advertising type-2B MWs qualify. Actual allocation/bind is also checked. */
@@ -192,13 +192,14 @@ void *racer_rdma_window(struct racer_device *d, uint32_t *key) {
 }
 int racer_rdma_window_free(struct ibv_mw *mw) { return ibv_dealloc_mw(mw); }
 int racer_rdma_bind(struct racer_qp *q, struct ibv_mw *mw, struct racer_mr *m,
-                    uint32_t key, uint64_t id) {
+                    uint32_t key, uint64_t id, uint32_t length) {
+    if (!length || length > m->length) return EINVAL;
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = id; wr.opcode = IBV_WR_BIND_MW; wr.send_flags = IBV_SEND_SIGNALED;
     wr.bind_mw.mw = mw; wr.bind_mw.rkey = key;
     wr.bind_mw.bind_info.mr = m->mr;
     wr.bind_mw.bind_info.addr = (uintptr_t)m->bytes;
-    wr.bind_mw.bind_info.length = m->length;
+    wr.bind_mw.bind_info.length = length;
     wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_WRITE;
     return ibv_post_send(q->qp, &wr, &bad);
 }
@@ -209,8 +210,9 @@ int racer_rdma_invalidate(struct racer_qp *q, uint32_t key, uint64_t id) {
     return ibv_post_send(q->qp, &wr, &bad);
 }
 int racer_rdma_write(struct racer_qp *q, struct racer_mr *m, uint64_t address,
-                     uint32_t key, uint64_t id) {
-    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes, .length = m->length, .lkey = m->mr->lkey };
+                     uint32_t key, uint64_t id, uint32_t length) {
+    if (!length || length > m->length) return EINVAL;
+    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes, .length = length, .lkey = m->mr->lkey };
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = id; wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED; wr.sg_list = &sge; wr.num_sge = 1;

@@ -123,6 +123,17 @@ pub(crate) fn signed_value(head: &VerifiedHead, name: &str, bound: usize) -> Res
 }
 
 impl Sessions {
+    #[cfg(test)]
+    pub(crate) fn track_test(&self, qp: Rc<QueuePairHandle>) {
+        self.live.borrow_mut().push((NodeId("test".into()), qp));
+    }
+    pub fn register_driver(&self, waker: &std::task::Waker) {
+        self.devices.register_driver(waker);
+    }
+    #[cfg(test)]
+    pub(crate) fn track_peer_test(&self, peer: NodeId, qp: Rc<QueuePairHandle>) {
+        self.live.borrow_mut().push((peer, qp));
+    }
     pub fn new(devices: Rc<Devices>, per_neighbor: usize) -> Self {
         Self {
             devices,
@@ -171,27 +182,59 @@ impl Sessions {
     }
     pub fn progress(&self) -> Result<usize> {
         let mut count = 0;
-        let mut failure = None;
         for (_, qp) in self.live.borrow().iter() {
             match qp.progress() {
                 Ok(n) => count += n,
-                Err(error) => failure = Some(error),
+                Err(_) => {
+                    let _ = qp.stop();
+                }
             }
         }
         self.live.borrow_mut().retain(|(_, qp)| !qp.stopped());
-        failure.map_or(Ok(count), Err)
+        // Errors belong to the attempt ticket. The paired native service keeps
+        // failed fences quarantined; neither a timeout nor CQ error is node-fatal.
+        Ok(count)
     }
     pub fn drain(&self) -> Operation<'_, ()> {
         Box::pin(async move {
             self.draining.set(true);
-            let mut failure = None;
-            for (_, qp) in self.live.borrow().iter() {
-                if let Err(error) = qp.stop() {
-                    failure = Some(error);
-                }
+            let qps: Vec<_> = self
+                .live
+                .borrow()
+                .iter()
+                .map(|(_, qp)| qp.clone())
+                .collect();
+            for qp in &qps {
+                qp.stop()?;
             }
-            self.live.borrow_mut().retain(|(_, qp)| !qp.stopped());
-            failure.map_or(Ok(()), Err)
+            for qp in qps {
+                futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
+            }
+            self.live.borrow_mut().clear();
+            self.devices.close();
+            Ok(())
+        })
+    }
+    /// Nonterminal accepted-operation cut for cache/key retirement. Call after
+    /// pausing affected producers; unrelated future sessions remain admissible.
+    /// The captured Rc owners survive request cancellation and are fenced on the
+    /// paired native role. A timeout never turns cancellation into successful DMA
+    /// release. Callers may keep driving unrelated HTTP while this awaits.
+    pub fn fence_cut(&self) -> Operation<'static, ()> {
+        let qps: Vec<_> = self
+            .live
+            .borrow()
+            .iter()
+            .map(|(_, qp)| qp.clone())
+            .collect();
+        Box::pin(async move {
+            for qp in &qps {
+                qp.stop()?;
+            }
+            for qp in qps {
+                futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
+            }
+            Ok(())
         })
     }
 }
@@ -243,6 +286,25 @@ impl Drop for SessionLease {
     }
 }
 impl SessionLease {
+    /// Connecting is genuinely asynchronous. Await this before preparing a
+    /// receive grant; send_to also waits internally.
+    pub fn wait_ready<'a>(
+        &'a self,
+        scope: &'a crate::runtime::deadline::RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let cancellation = scope.cancellation.subscribe()?;
+            futures::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                if let Err(error) = scope.check() {
+                    let _ = self.qp.stop();
+                    return std::task::Poll::Ready(Err(error));
+                }
+                self.qp.poll_connected(cx)
+            })
+            .await
+        })
+    }
     pub fn rail(&self) -> RailId {
         self.rail
     }

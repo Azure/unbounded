@@ -43,6 +43,9 @@ impl Drop for AbortOnDrop {
 }
 
 impl RdmaTransfer {
+    pub fn register_driver(&self, waker: &std::task::Waker) {
+        self.sessions.register_driver(waker);
+    }
     pub fn new(
         sessions: Rc<Sessions>,
         buffers: Rc<RegisteredPool>,
@@ -87,6 +90,7 @@ impl RdmaTransfer {
             if page.bytes().len() != page.envelope().ciphertext_length as usize {
                 return Err(Error::InvalidRange);
             }
+            session.wait_ready(scope).await?;
             session.claim()?;
             session.qp.expire_at(scope.deadline.0);
             let _abort = AbortOnDrop(session.qp.clone());
@@ -97,7 +101,9 @@ impl RdmaTransfer {
                 descriptor.descriptor.address,
                 descriptor.descriptor.scoped_key,
             )?;
+            let cancellation = scope.cancellation.subscribe()?;
             poll_fn(|cx| {
+                cancellation.register(cx.waker());
                 if let Err(error) = scope.check() {
                     return Poll::Ready(Err(error));
                 }
@@ -109,7 +115,7 @@ impl RdmaTransfer {
             .await?;
             // Source buffer is safe after its write CQE. Stop this single-use QP
             // before returning a control completion or admitting a fallback.
-            session.abort()?;
+            futures::future::poll_fn(|cx| session.qp.poll_stopped(cx)).await?;
             Ok(SendCompletion {
                 binding: session.binding(),
                 transfer: descriptor.descriptor.transfer,
@@ -158,6 +164,9 @@ impl RdmaTransfer {
     }
     pub fn drain(&self) -> Operation<'_, ()> {
         self.sessions.drain()
+    }
+    pub fn fence_cut(&self) -> Operation<'static, ()> {
+        self.sessions.fence_cut()
     }
     pub fn receive<'a>(
         &'a self,

@@ -1,5 +1,10 @@
 # Optional native RDMA adapter
 
+The audit-follow-up lifecycle and app activation contract is authoritative in
+[`INTEGRATION.md`](INTEGRATION.md). Native resources now live exclusively on the
+existing paired crypto role; I/O uses bounded completion mailboxes. The adapter
+requires private ABI v2 (library filename remains `libracer_rdma.so.1`).
+
 The Rust `rdma` feature dynamically loads `libracer_rdma.so.1`. Cargo needs no
 new dependency, native link flag, or `build.rs` change. Default and all-features
 builds work without verbs headers. Without the feature, adapter, usable device,
@@ -26,11 +31,12 @@ includes the rounded-up pinned final page.
 
 ## Integration contract
 
-- Keep constructors side-effect-free. During startup call `Verbs::discover`,
-  validate administrator Node rail mappings, and call `Devices::configure` with
-  exact `RailPort { rail, device, port, gid }` matches. Retain this `Rc<Devices>`
-  for the session and registered pools. Call `RdmaTransfer::ready(rail)` when
-  choosing transport. Discovery does not alter membership or invent rail IDs.
+- Keep constructors side-effect-free. Attach a lifecycle `IoPort` to `Devices`,
+  run `WithNative` around the existing crypto service, and await `Devices::activate`
+  with the authenticated local publication and trusted `FabricPort` associations.
+  Retain `Rc<Devices>` for the session and registered pools. Call
+  `RdmaTransfer::ready(rail)` when choosing transport. Discovery does not alter
+  membership, invent rail IDs, or infer opaque fabric names from hardware order.
 - The topology owner must validate the entire authenticated route and arrange
   worker affinity/local memory policy before enabling aligned rails. This adapter
   does not implement NUMA placement or choose GID indexes.
@@ -40,7 +46,8 @@ includes the rounded-up pinned final page.
   sender's setup and `racer-rdma-setup-binding` containing the remote offer's
   `binding_header_value()`. `PreparedSession::finish(&VerifiedHead)` checks the
   certified peer, exact offer acknowledgment, rail, endpoint bounds, and signed
-  components before RTR/RTS. Both sides must acknowledge; this is a two-sided
+  components before submitting RTR/RTS. Await `session.wait_ready(scope)` before
+  receiver admission. Both sides must acknowledge; this is a two-sided
   control exchange, not the old one-message `establish` API.
 - These header values are canonical padded base64. The current security profile
   signs all headers. Keep `racer-rdma-setup`, `racer-rdma-setup-binding`,
@@ -59,14 +66,15 @@ includes the rounded-up pinned final page.
   AEAD pipeline must authenticate it before publication/client delivery.
 - Every transfer uses a fresh QP and window. No reusable MR rkey is exported.
   Session count is capped per neighbor and across 36 neighbors; each QP has a
-  bounded CQ and pending table. Registered allocations are charged through
-  `Admission::reserve(ResourceClass::Registered)` and capped at 16 MiB + tag.
-  The receive copy separately reserves ciphertext quota.
+  bounded CQ and pending table. Registered allocations are preprovisioned and
+  charged with their staging buffers through `Admission::reserve(Registered)`.
+  The receive output separately reserves ciphertext quota.
 - Drive `Sessions::progress()` (or `RdmaTransfer::progress()`) on every I/O-worker
   reactor turn with active sessions, including when request futures were dropped.
-  Each QP polls at most 32 CQEs without blocking and wakes its waiters. Arrange a
-  bounded timer tick for deadlines. There is no internal executor or spin loop.
-- Drop/cancel invokes a terminal QP fence. Failed fences retain region, window,
+  Register the I/O driver. This path consumes completion mailboxes and checks
+  deadlines; the paired native service polls at most 32 CQEs per QP. Maintain the
+  runtime's bounded timer tick. There is no internal executor or spin loop.
+- Drop/cancel requests a terminal QP fence asynchronously. Failed fences retain region, window,
   PD, library and quota; a final failed teardown deliberately leaks these native
   resources rather than allowing late DMA into freed memory. A successful write
   CQE releases source DMA ownership; a bind CQE never releases receive ownership.
@@ -109,12 +117,11 @@ after invalidation instead of assuming an invalidation CQE fences admitted remot
 writes. This implementation does not provide reusable neighbor QP pooling; its
 single-use QPs favor an explicit terminal fence at the cost of setup overhead.
 
-Implementation-host verification: the native adapter built with `-Werror`, the
-standalone ownership suite passed (11 tests), and the real native no-device test
-passed. The production component graph passed all 16 RDMA tests, including real
-Ed25519 setup verification, tampering and replay rejection, with two explicitly
-gated native tests; the no-device test was then run explicitly and passed.
-Both `cargo check --lib --all-features` and
-`cargo check --lib --no-default-features` passed. The provider test was not run:
-this host had no usable type-2B port. Full crate test runs during implementation
-were blocked by concurrent application/telemetry compilation errors outside RDMA.
+Audit-follow-up verification: the native ABI v2 adapter built with `-Werror`.
+`cargo test --lib rdma:: --all-features` passed 25 tests, with four explicitly
+gated provider/no-device tests. Both real no-device tests then passed explicitly,
+including paired-role activation and reserved quota release. Both
+`cargo check --all-targets --all-features` and
+`cargo check --all-targets --no-default-features` passed. The two provider tests
+were not run: this host has no usable type-2B port. Native loopback, pooled
+readback, and stale-key rejection remain hardware validation requirements.

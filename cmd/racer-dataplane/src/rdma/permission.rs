@@ -136,7 +136,7 @@ impl Permissions {
             // Terminal destruction is deliberately used even after a successful
             // local invalidation. It fences writes already admitted by the RNIC.
             // A single-use QP prevents that fence from canceling unrelated pages.
-            grant.qp.stop()?;
+            futures::future::poll_fn(|cx| grant.qp.poll_stopped(cx)).await?;
             grant.buffer.take().ok_or(Error::InvalidRequest)
         })
     }
@@ -156,9 +156,9 @@ impl Grant {
         let buffer = self.buffer.as_ref().ok_or(Error::InvalidRequest)?;
         Ok(RemoteDescriptor {
             transfer: self.transfer,
-            address: buffer.region.address(),
+            address: self.window.address.get(),
             length: buffer.len() as u64,
-            scoped_key: self.window.key,
+            scoped_key: self.window.key.get(),
         })
     }
     pub fn header_value(&self) -> Result<Vec<u8>> {
@@ -167,20 +167,25 @@ impl Grant {
             .into_bytes())
     }
     pub fn wait_bound<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(poll_fn(move |cx| {
-            if let Err(error) = scope.check() {
-                let _ = self.qp.stop();
-                return Poll::Ready(Err(error));
-            }
-            if Instant::now() >= self.deadline.0 {
-                let _ = self.qp.stop();
-                return Poll::Ready(Err(Error::DeadlineExceeded));
-            }
-            if let Err(error) = self.qp.progress() {
-                return Poll::Ready(Err(error));
-            }
-            self.bound.poll(cx)
-        }))
+        Box::pin(async move {
+            let cancellation = scope.cancellation.subscribe()?;
+            poll_fn(move |cx| {
+                cancellation.register(cx.waker());
+                if let Err(error) = scope.check() {
+                    let _ = self.qp.stop();
+                    return Poll::Ready(Err(error));
+                }
+                if Instant::now() >= self.deadline.0 {
+                    let _ = self.qp.stop();
+                    return Poll::Ready(Err(Error::DeadlineExceeded));
+                }
+                if let Err(error) = self.qp.progress() {
+                    return Poll::Ready(Err(error));
+                }
+                self.bound.poll(cx)
+            })
+            .await
+        })
     }
     /// Receiver accepts completion only after the sender's successful write CQE
     /// has been attested in the signed control exchange. AEAD still authenticates
@@ -202,7 +207,9 @@ impl Grant {
             }
             self.bound.result().ok_or(Error::Unavailable)??;
             let invalidated = self.qp.invalidate(self.window.clone())?;
+            let cancellation = scope.cancellation.subscribe()?;
             poll_fn(|cx| {
+                cancellation.register(cx.waker());
                 if let Err(error) = scope.check() {
                     return Poll::Ready(Err(error));
                 }
@@ -215,7 +222,7 @@ impl Grant {
                 invalidated.poll(cx)
             })
             .await?;
-            self.qp.stop()?;
+            futures::future::poll_fn(|cx| self.qp.poll_stopped(cx)).await?;
             self.buffer.take().ok_or(Error::InvalidRequest)
         })
     }

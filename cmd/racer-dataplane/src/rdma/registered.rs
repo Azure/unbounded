@@ -1,12 +1,7 @@
 //! Registered allocations carry their physical quota through the terminal fence.
-use super::{
-    device::Devices,
-    session::SessionLease,
-    verbs::{DeviceHandle, Region},
-};
+use super::{device::Devices, session::SessionLease, verbs::Region};
 use crate::{
     error::{Error, Result},
-    model::limits::ResourceClass,
     runtime::admission::Admission,
     topology::rails::RailId,
 };
@@ -25,26 +20,17 @@ impl RegisteredPool {
     pub fn new(devices: Rc<Devices>, admission: Rc<Admission>) -> Self {
         Self { devices, admission }
     }
-    fn on_device(
-        &self,
-        device: Rc<DeviceHandle>,
-        rail: RailId,
-        length: usize,
-    ) -> Result<RegisteredLease> {
-        if length == 0 || length > MAX_CIPHERTEXT {
-            return Err(Error::InvalidRange);
-        }
-        let quota =
-            self.admission
-                .reserve(None, ResourceClass::Registered, registered_charge(length)?)?;
-        let region = Region::new(device, length, Box::new(quota))?;
-        Ok(RegisteredLease { region, rail })
-    }
-    pub fn acquire(&self, rail: RailId, length: usize) -> Result<RegisteredLease> {
-        self.on_device(self.devices.select(rail)?.handle, rail, length)
+    pub fn acquire(&self, _rail: RailId, _length: usize) -> Result<RegisteredLease> {
+        // Registered resources are preprovisioned and bound to a session slot.
+        Err(Error::Unavailable)
     }
     pub fn acquire_for(&self, session: &SessionLease, length: usize) -> Result<RegisteredLease> {
-        self.on_device(session.qp.device().clone(), session.rail(), length)
+        registered_charge(length)?;
+        let region = Region::acquire(&session.qp, length)?;
+        Ok(RegisteredLease {
+            region,
+            rail: session.rail(),
+        })
     }
 }
 
