@@ -296,6 +296,10 @@ func (c benchmarkConfig) gantryUpstreamEndpoint() string {
 	return "https://" + c.GantryACRLoginServer
 }
 
+func (c benchmarkConfig) gantryAgentSelector() string {
+	return "app.kubernetes.io/name=" + c.GantryDaemonSet + ",app.kubernetes.io/component=agent"
+}
+
 func (c benchmarkConfig) registryForPhase(phase proxyPhase) (phaseRegistry, error) {
 	if c.usesProxy() {
 		return phaseRegistry{

@@ -86,7 +86,8 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	}
 
 	if !strings.Contains(string(rendered), `targetLabel: gantry_benchmark`) ||
-		!strings.Contains(string(rendered), `- controller-revision-hash`) {
+		!strings.Contains(string(rendered), `- controller-revision-hash`) ||
+		!strings.Contains(string(rendered), `app.kubernetes.io/component: agent`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
 

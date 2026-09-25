@@ -280,11 +280,15 @@ SCRIPT
         fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
+          hack/cmd/gantry-benchmark/config.go
           hack/cmd/gantry-benchmark/gantry_only.go
           hack/cmd/gantry-benchmark/hosts_routing.go
           hack/cmd/gantry-benchmark/main.go
+          hack/cmd/gantry-benchmark/peer_telemetry.go
           hack/cmd/gantry-benchmark/preflight.go
+          hack/cmd/gantry-benchmark/results.go
           hack/cmd/gantry-benchmark/state.go
+          hack/gantry-benchmark/manifests/monitoring.yaml.tmpl
           hack/gantry-benchmark/operator-vm-run.sh
         )
         standalone_base_hashes_base64=$(
