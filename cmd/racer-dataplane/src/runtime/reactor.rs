@@ -21,6 +21,9 @@ use crate::{
     model::limits::ResourceClass,
 };
 use io_uring::{IoUring, opcode, squeue, types};
+// Control-owned filesystem extension; shares this reactor's completion fences.
+#[path = "filesystem.rs"]
+pub mod filesystem;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
