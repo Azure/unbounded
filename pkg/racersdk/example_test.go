@@ -55,7 +55,7 @@ func ExampleClient_Get() { //nolint:testableexamples // Requires the canonical /
 		panic(err)
 	}
 
-	// Sequential Read then WriteTo is allowed; this copies only the remainder.
+	// Copy after Read continues from the current position.
 	copied, err := io.Copy(io.Discard, value)
 	if err != nil {
 		fmt.Println("incomplete after bytes:", int64(n)+copied)

@@ -70,7 +70,7 @@ func pageForwarder(t *testing.T, path string, size int64) http.Handler {
 			return
 		}
 
-		first, last, err := requested.Resolve(ByteLength(size))
+		first, last, err := requested.resolve(ByteLength(size))
 		if err != nil {
 			t.Error(err)
 			return
@@ -181,7 +181,7 @@ func TestIntegrationOriginRoundTrip(t *testing.T) {
 			snapshot := value.Metadata()
 			sink := &offsetSink{}
 
-			n, err := value.WriteTo(sink)
+			n, err := io.Copy(sink, value)
 			if err != nil || n != size || sink.offset != size {
 				t.Fatalf("round trip: %d %v", n, err)
 			}

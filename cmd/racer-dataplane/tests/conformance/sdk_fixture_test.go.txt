@@ -63,7 +63,7 @@ func TestRustWireClientFixture(t *testing.T) {
 	}
 
 	sink := &rustWireSink{}
-	count, err := value.WriteTo(sink)
+	count, err := io.Copy(sink, value)
 	if err != nil || count != size || sink.offset != size {
 		t.Fatalf("stream count=%d offset=%d error=%v", count, sink.offset, err)
 	}

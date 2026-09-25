@@ -136,8 +136,14 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		panic(http.ErrAbortHandler)
 	}
 
-	last, err := io.ReadAll(io.LimitReader(source, 32*1024+1))
-	if err != nil || int64(len(last)) != min(remaining, 32*1024) {
+	last := make([]byte, min(remaining, 32*1024)+1)
+
+	n, err := io.ReadFull(source, last[:len(last)-1])
+	if err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	// Probe separately so an upstream UnexpectedEOF cannot pass as clean EOF.
+	if _, err := io.ReadFull(source, last[n:]); err != io.EOF {
 		panic(http.ErrAbortHandler)
 	}
 
@@ -145,7 +151,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		panic(http.ErrAbortHandler)
 	}
 
-	if _, err := w.Write(last); err != nil {
+	if _, err := w.Write(last[:n]); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 }

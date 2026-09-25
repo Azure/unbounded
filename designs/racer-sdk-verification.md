@@ -1,5 +1,50 @@
 # Racer SDK verification and measurements
 
+## Gantry-focused simplification
+
+Follow-up on 2026-09-25, based on `e03013e3`:
+
+- Removed `Value.WriteTo`, open-ended/suffix range constructors, and range-kind
+  accessors. Callers use `io.Copy` and retain ownership of `Value.Close`, including
+  on destination failure. `Range.Resolve` now enforces whole origin pages; Gantry
+  uses it instead of duplicating the page validator.
+- Outgoing client/fake requests build headers directly. Raw inbound validation
+  remains in place. `TestOutgoingHeaderBudget` checks maximum-size fields through
+  actual net/http serialization and parsing.
+- Gantry's digest-verified final chunk uses one exact allocation and a separate
+  EOF probe. Tests cover empty, below/exactly/above 32 KiB, multi-page, resumed,
+  truncated, failed, and digest-mismatched streams.
+
+Validation passed:
+
+- `go test ./pkg/racersdk ./internal/gantry/... ./cmd/gantry` on Go 1.27.1.
+- `GOTOOLCHAIN=go1.26.6 go test -race ./pkg/racersdk ./internal/gantry/... ./cmd/gantry`.
+- `make fmt` and `make lint` scoped to SDK, Gantry adapter/mirror, and agent
+  packages, using Go 1.26.6 for the installed linter; actionlint also passed.
+- `FuzzRange` for 10 seconds with four workers: 478,313 executions, no failures.
+- Rust `client_origin_conformance` opt-in `sdk_client` test with `RACER_SDK_ROOT`
+  pointing at the refactored worktree: client and origin UDS fixtures passed.
+
+Sequential before/after benchmarks used Go 1.27.1, Linux amd64, AMD EPYC 9V74,
+`GOMAXPROCS=2`, `-benchtime=1s -count=3`. These measure generated local UDS
+streams, not production storage or cluster throughput. Median results:
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| Pooled client, 4 KiB, Read32K | 86.85 us, 191 allocs, 17,697 B | 81.80 us, 171 allocs, 16,087 B |
+| Pooled client, 16 MiB, Read32K | 1,840 MB/s, 191 allocs | 1,836 MB/s, 171 allocs |
+| Origin, 4 KiB | 83.91 us, 164 allocs | 80.67 us, 164 allocs |
+| Origin, 16 MiB | 1,806 MB/s, 164 allocs | 1,763 MB/s, 164 allocs |
+
+A separate 1 GiB live-heap sample, including a slow destination, stayed below
+319 KiB total process live heap. The Read32K path allocated 31,936 bytes for the
+1 GiB transfer. These samples support bounded streaming, not a universal memory
+or throughput guarantee.
+
+## Original verification report
+
+The following measurements and API references, including WriteTo, are historical.
+
 Step 5, 2026-09-25. Linux amd64, Go 1.26.6, AMD EPYC 9V74,
 default GOMAXPROCS 48. Measurements are local generated-byte UDS streams, not
 storage, network, or Rust dataplane benchmarks. No new dependencies were added.

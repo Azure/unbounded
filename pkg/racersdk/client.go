@@ -119,7 +119,7 @@ func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
 	}
 
 	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationBootstrap, byteRange: bootstrapRange()}
-	if _, err := requestHead(r); err != nil {
+	if err := validateRequest(r); err != nil {
 		return nil, err
 	}
 
@@ -209,8 +209,7 @@ func (c *Client) Close() error {
 }
 
 func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, error) {
-	head, err := requestHead(r)
-	if err != nil {
+	if err := validateRequest(r); err != nil {
 		return Metadata{}, 0, err
 	}
 
@@ -232,8 +231,7 @@ func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, erro
 		return Metadata{}, 0, ioFailure("request", err)
 	}
 
-	req.Header = headHeaders(head)
-	req.Header.Del("Host")
+	req.Header = requestHeaders(r)
 	req.Header["User-Agent"] = nil
 
 	res, err := v.client.transport.RoundTrip(req)

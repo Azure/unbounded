@@ -156,8 +156,7 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 // response head is reconstructed from net/http only on this private fake hop;
 // Client still validates raw bytes on its ordinary responseConn path.
 func fakePage(ctx context.Context, transport *http.Transport, request OriginRequest, snapshot *Metadata) (*http.Response, wireResponse, error) {
-	head, err := requestHead(request)
-	if err != nil {
+	if err := validateRequest(request); err != nil {
 		return nil, wireResponse{}, err
 	}
 
@@ -166,8 +165,7 @@ func fakePage(ctx context.Context, transport *http.Transport, request OriginRequ
 		return nil, wireResponse{}, err
 	}
 
-	req.Header = headHeaders(head)
-	req.Header.Del("Host")
+	req.Header = requestHeaders(request)
 	req.Header["User-Agent"] = nil
 
 	res, err := transport.RoundTrip(req)
@@ -247,7 +245,7 @@ func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Tran
 			}
 
 			if request.operation == OperationPinned {
-				first, last, err := request.byteRange.Resolve(response.metadata.Size)
+				first, last, err := request.byteRange.resolve(response.metadata.Size)
 				if err != nil {
 					closeBody(res.Body)
 					writeOriginErrorResponse(w, 502, Metadata{})

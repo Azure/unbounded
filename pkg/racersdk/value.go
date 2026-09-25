@@ -12,7 +12,7 @@ import (
 const copyBufferSize = 32 * 1024
 
 // Value is a full immutable object stream. One goroutine may consume it using
-// Read or WriteTo (including sequential mixing); Metadata and Close may be called
+// Read (including through io.Copy); Metadata and Close may be called
 // concurrently. A Value must not be copied. Construct it with Client.Get.
 type Value struct {
 	mu        sync.Mutex
@@ -131,7 +131,7 @@ func (v *Value) Read(p []byte) (int, error) {
 		r := v.request
 		v.mu.Unlock()
 		r.operation, r.pin = OperationPinned, v.metadata.ETag
-		r.byteRange = Range{kind: RangeClosed, first: uint64(PageSize), last: uint64(v.metadata.Size) - 1}
+		r.byteRange = Range{present: true, first: uint64(PageSize), last: uint64(v.metadata.Size) - 1}
 
 		_, length, err := v.open(r, &v.metadata)
 		if err != nil {
@@ -176,50 +176,6 @@ func (v *Value) Read(p []byte) (int, error) {
 	}
 
 	return n, nil
-}
-
-// WriteTo streams through Read with one 32 KiB scratch buffer. It honors partial
-// destination writes and returns io.ErrShortWrite for a short write without an
-// error. Destination failures terminate the Value and release its resources.
-func (v *Value) WriteTo(w io.Writer) (int64, error) {
-	if w == nil {
-		err := failure(ErrorInvalidArgument, "write destination", nil)
-		v.finish(err)
-
-		return 0, err
-	}
-
-	buf := make([]byte, copyBufferSize)
-
-	var total int64
-
-	for {
-		n, err := v.Read(buf)
-		if n != 0 {
-			written, writeErr := w.Write(buf[:n])
-			if written < 0 || written > n {
-				written, writeErr = 0, io.ErrShortWrite
-			}
-
-			total += int64(written)
-			if writeErr == nil && written != n {
-				writeErr = io.ErrShortWrite
-			}
-
-			if writeErr != nil {
-				v.finish(ioFailure("write", writeErr))
-				return total, ioFailure("write", writeErr)
-			}
-		}
-
-		if err == io.EOF {
-			return total, nil
-		}
-
-		if err != nil {
-			return total, err
-		}
-	}
 }
 
 // Close cancels in-flight reads/continuation and closes without draining. It is

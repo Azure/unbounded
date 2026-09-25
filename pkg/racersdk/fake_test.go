@@ -85,7 +85,7 @@ func TestFakeClientPages(t *testing.T) {
 
 			sink := &offsetSink{}
 
-			n, err := value.WriteTo(sink)
+			n, err := io.Copy(sink, value)
 			if err != nil || n != int64(size) || sink.offset != int64(size) {
 				t.Fatal("stream mismatch", n, err)
 			}
@@ -198,7 +198,7 @@ func TestFakeClientContinuationErrors(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			n, err := v.WriteTo(io.Discard)
+			n, err := io.Copy(io.Discard, v)
 			if n != int64(failPage)*int64(PageSize) {
 				t.Fatal("incorrect partial byte count", n)
 			}
@@ -330,7 +330,11 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 				m := originMeta(3 * PageSize)
 				page, _ := r.Range()
 
-				first, _ := page.First()
+				first, _, err := page.Resolve(m.Size)
+				if err != nil {
+					return Metadata{}, nil, err
+				}
+
 				if first == ByteOffset(2*PageSize) {
 					if change == "pin" {
 						m.ETag = ETag{value: `"different"`}
@@ -352,7 +356,7 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			n, err := v.WriteTo(io.Discard)
+			n, err := io.Copy(io.Discard, v)
 			if n != 2*int64(PageSize) || !errors.Is(err, io.ErrUnexpectedEOF) {
 				t.Fatal("changed immutable version was accepted", n, err)
 			}

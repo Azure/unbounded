@@ -344,7 +344,7 @@ func TestOriginHeadPinAndRanges(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, _, err = resolvePage(page, racersdk.PageSize+3)
+		_, _, err = page.Resolve(racersdk.PageSize + 3)
 		requireKind(t, err, tc.kind)
 	}
 
@@ -354,7 +354,7 @@ func TestOriginHeadPinAndRanges(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		first, end, err := resolvePage(page, racersdk.PageSize+3)
+		first, end, err := page.Resolve(racersdk.PageSize + 3)
 		if err != nil || first != racersdk.ByteOffset(racersdk.PageSize) || end != racersdk.ByteOffset(racersdk.PageSize+2) {
 			t.Fatalf("final page = %d-%d, %v", first, end, err)
 		}

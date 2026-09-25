@@ -231,5 +231,5 @@ func (r OriginRequest) Key() Key                   { return r.key }
 func (r OriginRequest) Context() FetchContext      { return r.context }
 func (r OriginRequest) Operation() Operation       { return r.operation }
 func (r OriginRequest) Pin() (ETag, bool)          { return r.pin, r.pin.value != "" }
-func (r OriginRequest) Range() (Range, bool)       { return r.byteRange, r.byteRange.kind != 0 }
+func (r OriginRequest) Range() (Range, bool)       { return r.byteRange, r.byteRange.present }
 func (r OriginRequest) Format(s fmt.State, _ rune) { writeDiagnostic(s, "OriginRequest([redacted])") }

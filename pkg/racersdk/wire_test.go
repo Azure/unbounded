@@ -35,8 +35,7 @@ func TestRequestWire(t *testing.T) {
 		{"GET", "Range: bytes=0-16777215\r\n", OperationBootstrap, true},
 		{"GET", "Range: bytes=16777216-33554431\r\nIf-Match: \"a,b\\c\"\r\n", OperationPinned, true},
 		{"GET", "Range: bytes=0-1\r\nIf-Match: \"v\"\r\n", OperationPinned, true},
-		{"GET", "Range: bytes=-0\r\nIf-Match: \"v\"\r\n", OperationPinned, false},
-		{"GET", "Range: bytes=16777216-\r\nIf-Match: \"v\"\r\n", OperationPinned, false},
+		{"GET", "Range: bytes=16777216-50331647\r\nIf-Match: \"v\"\r\n", OperationPinned, false},
 	} {
 		head := rawRequest(tt.method, tt.fields+"Racer-Metadata: opaque,\xff value\r\nAuthorization: Bearer secret\r\n")
 
@@ -165,6 +164,45 @@ func TestRawHeaders(t *testing.T) {
 	}
 }
 
+func TestOutgoingHeaderBudget(t *testing.T) {
+	// The largest possible outgoing descriptor must fit without aggregate-size
+	// validation in Get. Exercise net/http serialization, not only requestHead.
+	r := OriginRequest{
+		operation: OperationPinned,
+		byteRange: Range{present: true, first: math.MaxInt64 - 1, last: math.MaxInt64},
+		pin:       ETag{value: `"` + strings.Repeat("v", maxFieldBytes-2) + `"`},
+		context: FetchContext{
+			metadata:      AdapterMetadata{value: strings.Repeat("m", maxFieldBytes)},
+			authorization: Authorization{value: strings.Repeat("a", maxFieldBytes)},
+		},
+	}
+	if err := validateRequest(r); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "http://racer"+objectPrefix+r.key.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header = requestHeaders(r)
+	req.Header["User-Agent"] = nil
+
+	var wire bytes.Buffer
+	if err := req.Write(&wire); err != nil {
+		t.Fatal(err)
+	}
+
+	if wire.Len() > maxHeadBytes {
+		t.Fatalf("outgoing head exceeds limit: %d", wire.Len())
+	}
+
+	got, err := parseRequestHead(wire.Bytes(), false)
+	if err != nil || got != r {
+		t.Fatalf("outgoing request failed round trip: %v", err)
+	}
+}
+
 func TestStdlibNormalizationRequiresRawValidation(t *testing.T) {
 	head := rawRequest("HEAD", "Authorization:  secret \r\nContent-Length: 0\r\nContent-Length: 0\r\n")
 
@@ -190,7 +228,7 @@ func TestResponseWire(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pinnedRange, err := FromRange(ByteOffset(PageSize))
+	pinnedRange, err := ClosedRange(ByteOffset(PageSize), ByteOffset(PageSize))
 	if err != nil {
 		t.Fatal(err)
 	}

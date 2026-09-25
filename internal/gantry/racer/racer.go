@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math"
 	"mime"
 	"net/url"
 	"strings"
@@ -227,7 +226,7 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 		return metadata, nil, nil
 	}
 
-	first, last, err := resolvePage(page, metadata.Size)
+	first, last, err := page.Resolve(metadata.Size)
 	if err != nil {
 		return metadata, nil, classifyError(err)
 	}
@@ -249,27 +248,6 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 	}
 
 	return metadata, &pageBody{Reader: io.LimitReader(body, int64(last-first)+1), upstream: body}, nil
-}
-
-func resolvePage(page racersdk.Range, size racersdk.ByteLength) (racersdk.ByteOffset, racersdk.ByteOffset, error) {
-	first, _ := page.First()
-	last, _ := page.Last()
-
-	nominalLast := first + racersdk.ByteOffset(min(uint64(racersdk.PageSize)-1, uint64(math.MaxInt64)-uint64(first)))
-	if page.Kind() != racersdk.RangeClosed || uint64(first)%uint64(racersdk.PageSize) != 0 || last > nominalLast {
-		return 0, 0, racersdk.NewOriginError(racersdk.ErrorInvalidArgument, nil)
-	}
-
-	start, end, err := page.Resolve(size)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if last != nominalLast && last != racersdk.ByteOffset(size-1) {
-		return 0, 0, racersdk.NewOriginError(racersdk.ErrorInvalidArgument, nil)
-	}
-
-	return start, end, nil
 }
 
 // pageBody limits the open-ended registry response to one Racer page. Close

@@ -146,7 +146,7 @@ func TestClientStreamingTranscript(t *testing.T) {
 				t.Fatal("metadata or eager continuation")
 			}
 
-			n, err := v.WriteTo(io.Discard)
+			n, err := io.Copy(io.Discard, v)
 			if err != nil || n != size {
 				t.Fatalf("stream: %d %v", n, err)
 			}
@@ -317,9 +317,13 @@ func TestClientFailuresAndCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := v.WriteTo(shortDestination{})
+	n, err := io.Copy(shortDestination{}, v)
 	if n != 5 || !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("short write: %d %v", n, err)
+	}
+	// The caller owns the Value, including after a destination failure.
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	v, err = c.Get(context.Background(), Request{})
@@ -345,7 +349,7 @@ func TestClientGetCloseRace(t *testing.T) {
 			wg.Go(func() {
 				v, err := c.Get(context.Background(), Request{})
 				if err == nil {
-					_, _ = v.WriteTo(io.Discard)
+					_, _ = io.Copy(io.Discard, v)
 					_ = v.Close()
 				}
 			})
@@ -404,7 +408,7 @@ func TestClientContinuationFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			n, err := v.WriteTo(io.Discard)
+			n, err := io.Copy(io.Discard, v)
 			if err == nil || n < int64(PageSize) || calls.Load() != 2 {
 				t.Fatalf("failure %d %v", n, err)
 			}
@@ -454,7 +458,7 @@ func TestClientContinuationCloseAndContext(t *testing.T) {
 
 			done := make(chan error, 1)
 
-			go func() { _, err := v.WriteTo(io.Discard); done <- err }()
+			go func() { _, err := io.Copy(io.Discard, v); done <- err }()
 
 			<-entered
 

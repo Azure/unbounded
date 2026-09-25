@@ -11,7 +11,8 @@
 // Client across requests and close it when its owner shuts down. Get takes a
 // Request containing a Key and optional FetchContext, and returns an owned Value
 // as soon as response headers have been validated. Always defer Value.Close.
-// Read into a caller-owned buffer, or use io.Copy, which calls Value.WriteTo.
+// Read into a caller-owned buffer, or use io.Copy. Close the Value even when a
+// destination write fails; io.Copy does not close its source.
 // Avoid io.ReadAll for large objects: it introduces caller-side object buffering.
 //
 // Get opens a fresh full-object stream with a page-zero bootstrap. After consuming
@@ -23,7 +24,7 @@
 // Empty objects have valid metadata and read as EOF.
 //
 // Client.Get and Client.Close are safe concurrently. A Value permits one consuming
-// goroutine using Read or WriteTo (sequential mixing is allowed); Metadata and
+// goroutine using Read, directly or through io.Copy; Metadata and
 // Close may run concurrently with consumption. Do not copy Clients or Values.
 // Close is idempotent, cancels SDK I/O, and closes bodies without draining unread
 // bytes. Client.Close also cancels pending Gets and all active Values. Cancellation
@@ -35,7 +36,7 @@
 // including zero, is valid. ParseETag requires a strong quoted tag; a zero ETag
 // means an absent request pin and is invalid response metadata. ByteLength and
 // ByteOffset distinguish sizes from positions, with wire values bounded by MaxInt64.
-// Range constructors and Range.Resolve serve origin adapters; Request deliberately
+// ClosedRange and Range.Resolve serve whole-page origin adapters; Request deliberately
 // exposes no caller-selectable range or pin.
 //
 // A zero FetchContext omits both fields. ParseAdapterMetadata, ParseAuthorization,
@@ -61,16 +62,16 @@
 // There is no total client stream timeout. Zero numeric config fields select
 // defaults, not unlimited operation; negative values are invalid. Bound caller
 // concurrency too: pending Get callers still consume application resources.
-// Read uses the caller's buffer; WriteTo and each active origin stream use 32 KiB
-// scratch buffers. SDK buffering is independent of object size and page count;
+// Read uses the caller's buffer; each active origin stream uses a 32 KiB
+// scratch buffer. SDK buffering is independent of object size and page count;
 // connection/request limits bound active framing and copying resources.
 //
 // Use errors.As with *Error for Kind, Operation, and optional StatusCode (zero
 // without a received HTTP status). Use errors.Is for preserved causes such as
-// context.Canceled, context.DeadlineExceeded, io.ErrUnexpectedEOF, or destination
-// write failures. Clean EOF remains io.EOF. Get success does not guarantee later
+// context.Canceled, context.DeadlineExceeded, or io.ErrUnexpectedEOF.
+// Clean EOF remains io.EOF. Get success does not guarantee later
 // reads will succeed: process n bytes even when Read returns an error, and treat
-// WriteTo's count as partial on failure. A failed Value is terminal; the SDK never
+// io.Copy's count as partial on failure. A failed Value is terminal; the SDK never
 // splices in a newer version or restarts a failed stream. Publish a copied object
 // only after successful completion. There is no SDK retry loop, although Go's
 // HTTP transport may replay an eligible read on a failed reused connection.
@@ -142,6 +143,6 @@
 //
 // The examples with Output run without Rust or /run permissions. Examples marked
 // deployment-only are compile-checked and require provisioned Unix endpoints to
-// run. The Go SDK is implemented; the repository's Rust dataplane is still a
-// scaffold, so these examples do not establish live Rust interoperability.
+// run. Rust interoperability is tested separately by the dataplane's opt-in SDK
+// conformance fixture; the examples alone do not establish interoperability.
 package racersdk

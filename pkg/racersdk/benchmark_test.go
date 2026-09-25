@@ -70,17 +70,17 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 }
 
 type benchmarkReader struct {
-	client  *Client
-	plain   *http.Transport
-	buffer  []byte
-	writeTo bool
-	size    int64
+	client *Client
+	plain  *http.Transport
+	buffer []byte
+	copyIO bool
+	size   int64
 }
 
 func newBenchmarkReader(b *testing.B, path, implementation, mode string, size int64, bufferSize int) *benchmarkReader {
 	b.Helper()
 
-	r := &benchmarkReader{size: size, writeTo: mode == "WriteTo", buffer: make([]byte, bufferSize)}
+	r := &benchmarkReader{size: size, copyIO: mode == "Copy", buffer: make([]byte, bufferSize)}
 
 	if implementation == "sdk" {
 		var err error
@@ -100,12 +100,8 @@ func newBenchmarkReader(b *testing.B, path, implementation, mode string, size in
 }
 
 func (r *benchmarkReader) copy(dst io.Writer, body io.Reader) (int64, error) {
-	if r.writeTo {
-		if value, ok := body.(*Value); ok {
-			return value.WriteTo(dst)
-		}
-		// Match the SDK's bounded scratch, with no Discard.ReaderFrom shortcut.
-		return io.CopyBuffer(struct{ io.Writer }{dst}, body, make([]byte, copyBufferSize))
+	if r.copyIO {
+		return io.Copy(struct{ io.Writer }{dst}, body)
 	}
 
 	return io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{body}, r.buffer)
@@ -183,7 +179,7 @@ func BenchmarkClientStream(b *testing.B) {
 					for _, mode := range []struct {
 						name  string
 						bytes int
-					}{{"Read4K", 4096}, {"Read32K", 32768}, {"Read256K", 262144}, {"WriteTo", 0}} {
+					}{{"Read4K", 4096}, {"Read32K", 32768}, {"Read256K", 262144}, {"Copy", 0}} {
 						b.Run(fmt.Sprintf("%s/fresh=%t/%s", implementation, fresh, mode.name), func(b *testing.B) {
 							r := newBenchmarkReader(b, path, implementation, mode.name, size, mode.bytes)
 							if err := r.read(io.Discard, false); err != nil {

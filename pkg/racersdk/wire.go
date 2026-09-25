@@ -40,51 +40,29 @@ func parseRange(s string) (Range, error) {
 	}
 
 	first, last, ok := strings.Cut(s[len("bytes="):], "-")
-	if !ok || first == "" && last == "" {
+	if !ok {
 		return Range{}, failure(ErrorInvalidArgument, "range", nil)
 	}
 
-	var (
-		a, b uint64
-		err  error
-	)
-
-	if first != "" {
-		a, err = decimal(first)
-		if err != nil {
-			return Range{}, failure(ErrorInvalidArgument, "range", nil)
-		}
+	a, err := decimal(first)
+	if err != nil {
+		return Range{}, failure(ErrorInvalidArgument, "range", nil)
 	}
 
-	if last != "" {
-		b, err = decimal(last)
-		if err != nil {
-			return Range{}, failure(ErrorInvalidArgument, "range", nil)
-		}
-	}
-
-	if first == "" {
-		return SuffixRange(ByteLength(b))
-	}
-
-	if last == "" {
-		return FromRange(ByteOffset(a))
+	b, err := decimal(last)
+	if err != nil {
+		return Range{}, failure(ErrorInvalidArgument, "range", nil)
 	}
 
 	return ClosedRange(ByteOffset(a), ByteOffset(b))
 }
 
 func rangeValue(r Range) string {
-	switch r.kind {
-	case RangeClosed:
-		return "bytes=" + strconv.FormatUint(r.first, 10) + "-" + strconv.FormatUint(r.last, 10)
-	case RangeFrom:
-		return "bytes=" + strconv.FormatUint(r.first, 10) + "-"
-	case RangeSuffix:
-		return "bytes=-" + strconv.FormatUint(r.last, 10)
-	default:
+	if !r.present {
 		return ""
 	}
+
+	return "bytes=" + strconv.FormatUint(r.first, 10) + "-" + strconv.FormatUint(r.last, 10)
 }
 
 type contentRange struct {
@@ -220,13 +198,13 @@ func parseRequestHead(head []byte, origin bool) (OriginRequest, error) {
 
 	switch req.Method {
 	case "HEAD":
-		if result.byteRange.kind != 0 {
+		if result.byteRange.present {
 			return OriginRequest{}, bad
 		}
 
 		result.operation = OperationHead
 	case "GET":
-		if result.byteRange.kind == 0 {
+		if !result.byteRange.present {
 			return OriginRequest{}, bad
 		}
 
@@ -251,55 +229,84 @@ func parseRequestHead(head []byte, origin bool) (OriginRequest, error) {
 	return result, nil
 }
 
-func bootstrapRange() Range { return Range{kind: RangeClosed, last: uint64(PageSize) - 1} }
+func bootstrapRange() Range { return Range{present: true, last: uint64(PageSize) - 1} }
 
-// requestHead constructs canonical wire bytes and checks the aggregate limit.
-// Callers build private operation descriptors; public Request has no pin/range.
-func requestHead(r OriginRequest) ([]byte, error) {
-	method := "GET"
-	if r.operation == OperationHead {
-		method = "HEAD"
-	}
-
+func validateRequest(r OriginRequest) error {
 	if r.operation < OperationHead || r.operation > OperationPinned {
-		return nil, failure(ErrorInvalidArgument, "request", nil)
+		return failure(ErrorInvalidArgument, "request", nil)
 	}
 	// Validate private values directly instead of serializing and reparsing with
 	// net/http. The latter allocates another buffered reader and header map on
 	// every request, including already validated origin requests.
 	if _, err := NewFetchContext(r.context.metadata, r.context.authorization); err != nil {
-		return nil, err
+		return err
 	}
 
 	if r.pin.value != "" {
 		if _, err := ParseETag(r.pin.value); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	switch r.operation {
 	case OperationHead:
-		if r.byteRange.kind != 0 {
-			return nil, failure(ErrorInvalidArgument, "request", nil)
+		if r.byteRange.present {
+			return failure(ErrorInvalidArgument, "request", nil)
 		}
 	case OperationBootstrap:
 		if r.pin.value != "" || r.byteRange != bootstrapRange() {
-			return nil, failure(ErrorInvalidArgument, "request", nil)
+			return failure(ErrorInvalidArgument, "request", nil)
 		}
 	case OperationPinned:
-		if r.pin.value == "" {
-			return nil, failure(ErrorInvalidArgument, "request", nil)
+		if r.pin.value == "" || !r.byteRange.present || r.byteRange.first > r.byteRange.last || r.byteRange.last > math.MaxInt64 {
+			return failure(ErrorInvalidArgument, "request", nil)
 		}
+	}
 
-		if _, err := parseRange(rangeValue(r.byteRange)); err != nil {
-			return nil, err
-		}
+	// Three variable fields, each bounded to 8 KiB, plus fixed framing and a
+	// two-int64 range fit below the 32 KiB aggregate limit. No serialization is
+	// needed to validate a request before capacity admission or network I/O.
+	return nil
+}
+
+func requestHeaders(r OriginRequest) http.Header {
+	h := make(http.Header, 4)
+
+	if r.byteRange.present {
+		h["Range"] = []string{rangeValue(r.byteRange)}
+	}
+
+	if r.pin.value != "" {
+		h["If-Match"] = []string{r.pin.value}
+	}
+
+	if r.context.metadata.value != "" {
+		h["Racer-Metadata"] = []string{r.context.metadata.value}
+	}
+
+	if r.context.authorization.value != "" {
+		h["Authorization"] = []string{r.context.authorization.value}
+	}
+
+	return h
+}
+
+// requestHead replays a validated origin request to net/http. Outgoing client
+// requests use requestHeaders directly instead of serializing and reparsing.
+func requestHead(r OriginRequest) ([]byte, error) {
+	if err := validateRequest(r); err != nil {
+		return nil, err
+	}
+
+	method := "GET"
+	if r.operation == OperationHead {
+		method = "HEAD"
 	}
 
 	var b strings.Builder
 	b.WriteString(method + " " + objectPrefix + r.key.String() + " HTTP/1.1\r\nHost: racer\r\n")
 
-	if r.byteRange.kind != 0 {
+	if r.byteRange.present {
 		b.WriteString("Range: " + rangeValue(r.byteRange) + "\r\n")
 	}
 
@@ -316,13 +323,8 @@ func requestHead(r OriginRequest) ([]byte, error) {
 	}
 
 	b.WriteString("\r\n")
-	head := []byte(b.String())
 
-	if len(head) > maxHeadBytes {
-		return nil, headFailure(false, true)
-	}
-
-	return head, nil
+	return []byte(b.String()), nil
 }
 
 type wireResponse struct {
@@ -446,7 +448,7 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 				return wireResponse{}, bad
 			}
 
-			first, last, err := request.byteRange.Resolve(cr.size)
+			first, last, err := request.byteRange.resolve(cr.size)
 			if err != nil || first != cr.first || last != cr.last {
 				return wireResponse{}, bad
 			}
@@ -500,7 +502,7 @@ func originResponse(request OriginRequest, m Metadata) (wireResponse, error) {
 		return wireResponse{}, failure(ErrorInvalidArgument, "origin operation", nil)
 	}
 
-	first, last, err := resolveOriginRange(request.byteRange, m.Size)
+	first, last, err := request.byteRange.Resolve(m.Size)
 	if err != nil {
 		return wireResponse{}, err
 	}

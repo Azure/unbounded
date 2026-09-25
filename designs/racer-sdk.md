@@ -11,8 +11,11 @@ define the contract. Validated types, protocol guards, and client/origin lifecyc
 performance verification are recorded in [the step 5 report](racer-sdk-verification.md).
 SDK packages must not import `cmd/` packages.
 
-Evidence read in implementation, test, then prose order (Rust paths below are
-relative to `cmd/racer-dataplane/`):
+Historical evidence from the original SDK design (Rust paths below are relative
+to `cmd/racer-dataplane/`). The dataplane has since implemented these boundaries;
+`tests/conformance/sdk.rs` now tests the actual Go client and origin against Rust
+HTTP framing and request/response validation. The scaffold observations below
+describe the original design baseline, not the current implementation:
 
 - `src/model/identity.rs:13-24` defines a 32-byte key and private strong tag, but
   tag parsing is a stub. `src/model/range.rs:6-19,29-39` defines 16 MiB pages and
@@ -59,7 +62,6 @@ func (c *Client) Get(ctx context.Context, request Request) (*Value, error)
 func (c *Client) Close() error
 func (v *Value) Metadata() Metadata
 func (v *Value) Read(p []byte) (int, error)
-func (v *Value) WriteTo(w io.Writer) (int64, error)
 func (v *Value) Close() error
 
 type Origin func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error)
@@ -81,18 +83,20 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
   OriginRequest, and AdapterMetadata is redacted, including `%v`, `%+v`, `%#v`;
   no serialization hooks expose credentials. The SDK never logs callback errors
   or raw headers.
-- `Range` has private state. `ClosedRange(ByteOffset, ByteOffset)`,
-  `FromRange(ByteOffset)`, and `SuffixRange(ByteLength)` return `(Range, error)`;
-  reject syntactic overflow/reversal during construction. Zero suffix is valid
-  syntax but unsatisfiable. Zero Range means unspecified. Public Request contains
+- `Range` has private state. `ClosedRange(ByteOffset, ByteOffset)` returns
+  `(Range, error)` and rejects syntactic overflow/reversal during construction.
+  `Resolve` validates whole-page alignment and returns bounds shortened at EOF.
+  Open-ended and suffix ranges are outside the SDK's Gantry-focused surface.
+  Zero Range means unspecified. Public Request contains
   only Key and Context; Get always opens a whole fresh stream. Pins, ranges, and
   HEAD remain wire operations for internal continuation and origin handling.
-  Public range constructors/accessors and Resolve support OriginRequest consumers.
-  Client.Get validates its request and aggregate wire-head size before I/O.
+  ClosedRange and Resolve support OriginRequest consumers.
+  Client.Get validates its request before I/O. Per-field bounds ensure the fixed
+  outgoing head fits the aggregate limit without serializing it for validation.
 - `OriginRequest` has private fields and value accessors `Key()`, `Context()`,
   `Operation()`, `Pin() (ETag, bool)`, and `Range() (Range, bool)`. `Operation` is a
   typed enum `OperationHead`, `OperationBootstrap`, `OperationPinned`; zero is
-  invalid. Range accessors expose immutable kind/bounds, not setters. Only the
+  invalid. Range exposes immutable resolved bounds, not setters. Only the
   server constructs OriginRequest, after wire validation. The callback can resolve
   the whole-page request against the selected metadata; the SDK checks it again.
 - Metadata is a value snapshot: total object size even after partial consumption,
@@ -126,12 +130,11 @@ For a fresh full-object Get:
 Continuation pin errors never fall back to a fresh version.
 The client holds at most one response body per Value, and no SDK-owned page buffer.
 `Read` reads directly into `p`; small stdlib framing buffers still exist.
-`WriteTo` uses a bounded reusable 32 KiB copy buffer, honors partial writes and
-`io.ErrShortWrite`, and never dispatches to a body fast path that bypasses boundary
-checks. Do not allocate arrays of page descriptors proportional to object size.
+Use standard `io.Copy` or `io.CopyBuffer` for copying; all reads retain the SDK's
+boundary checks. Do not allocate arrays of page descriptors proportional to object size.
 
 Client is safe for concurrent Get and Close. Value has one consuming goroutine
-(Read or WriteTo, including sequential mixing); Close may run concurrently and
+(Read, directly or through io.Copy); Close may run concurrently and
 must cancel a blocked read or continuation acquisition. Metadata access is safe
 concurrently. Get's ctx governs the entire Value, not only response headers.
 Each Value has a derived cancel function registered atomically with the client;
@@ -143,8 +146,8 @@ EOF, terminal errors, and Close all release capacity and request-scoped context.
 Close is idempotent; never drain an unread object to keep a socket alive. Aborted
 bodies are not reused. After explicit Close, consumption returns a typed closed
 error; an already observed clean EOF remains EOF. Preserve partial byte counts on
-errors, including WriteTo destination failures; a terminal failure cancels the
-Value. Callers should defer Close even when intending to read through EOF.
+errors; a terminal read failure cancels the Value. Callers must defer Close even
+when intending to read through EOF, including when io.Copy's destination fails.
 
 ## Origin ownership, limits, and deadlines
 
@@ -185,7 +188,7 @@ No root/socket override, custom transport, or global singleton:
 | `OriginConfig.SocketMode` | 0600; allow only permission bits, apply to the newly created socket, fail and clean up on chmod failure |
 
 Wire header limits are fixed constants, not configurable. Copy scratch space is
-32 KiB per active origin stream/WriteTo; use a hard-bounded pool or bounded active
+32 KiB per active origin stream; use a hard-bounded pool or bounded active
 allocation, not an unbounded free list. Connection and concurrency limits bound
 the parser buffers, goroutines, and body scratch. At the connection cap, stop
 accepting until capacity frees (the OS backlog is finite); an already accepted
@@ -234,8 +237,10 @@ or the underlying error obtained via Unwrap.
 
 ## Implementation steps and files
 
+The following steps describe the original implementation sequence.
+
 1. **Contract:** review the API, wire grammar, defaults, and acceptance
-   below. The Rust dataplane remains a nonoperational scaffold.
+   below. At that point the Rust dataplane was a nonoperational scaffold.
 2. **Types and protocol:** add `pkg/racersdk/doc.go`, `types.go`, `range.go`,
    `errors.go`, `wire.go`, `wire_conn.go`, and corresponding focused tests. Implement
    validated private values, safe formatting, range math, metadata/status parsing,
@@ -250,9 +255,8 @@ or the underlying error obtained via Unwrap.
 5. **Verification and performance:** add `integration_test.go` and
    `benchmark_test.go`. Exercise client against an origin shim/fake dataplane and
    raw peers. Document verification and performance results.
-   A real Rust compatibility claim requires implementing its still-stubbed codec,
-   parser, response writer, and origin validators in a separately scoped change;
-   a fake transport passing is not evidence that Racer itself serves data.
+   Real Rust compatibility is checked separately by the opt-in SDK conformance
+   fixture; a fake transport passing is not evidence that Racer itself serves data.
 
 ## Test and performance acceptance
 
@@ -318,7 +322,7 @@ when semantic validation is also applied to parsed objects.
   internal socket-path seam under the test temporary directory, not `/run/racer`.
 - Benchmarks use generated/discarded streams, not preallocated test objects:
   0, 4 KiB, P, and 1 GiB; concurrency 1 and 16; Read buffers 4 KiB/32 KiB/256 KiB
-  and WriteTo. Report throughput, allocs/op, allocated bytes/op, peak live heap,
+  and io.Copy. Report throughput, allocs/op, allocated bytes/op, peak live heap,
   and comparison to a bare stdlib Unix HTTP stream on the same host/toolchain.
   Warm pools separately. SDK allocations must not scale with read-call count,
   page count, or object length; live memory scales with configured concurrency
