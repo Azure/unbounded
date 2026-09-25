@@ -8,8 +8,10 @@
 #
 # Usage:
 #   ACR=<globally-unique-name> hack/scripts/gantry-streaming-aks.sh up
+#   hack/scripts/gantry-streaming-aks.sh cleanup-operator
 #   hack/scripts/gantry-streaming-aks.sh install
 #   hack/scripts/gantry-streaming-aks.sh verify
+#   hack/scripts/gantry-streaming-aks.sh uninstall
 #   hack/scripts/gantry-streaming-aks.sh down
 #
 # Environment:
@@ -21,6 +23,7 @@
 #   STREAM_NODES    default 2; peer reuse cannot be observed with fewer
 #   NODE_LABEL      default gantry-streaming=true
 #   NODE_VM_SIZE    default Standard_D4s_v5
+#   IMAGE_TAG        default current git describe; shared by both Gantry images
 #
 # Artifact streaming is an AKS/ACR preview feature and can only be enabled when
 # a node pool is created, never on an existing pool. The az flags below move
@@ -44,6 +47,8 @@ NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D4s_v5}"
 NAMESPACE="${NAMESPACE:-unbounded-system}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)}"
+IMAGE_TAG="${IMAGE_TAG//\//-}"
 
 log() { printf '\n== %s\n' "$*"; }
 die() {
@@ -81,8 +86,11 @@ cmd_up() {
 
 	log "AKS cluster $CLUSTER (long-running)"
 	if ! az aks show -n "$CLUSTER" -g "$RESOURCE_GROUP" >/dev/null 2>&1; then
+		# Overlay is pinned so the network profile carries a podCidr, which
+		# get-aks-cluster-cidrs.sh needs to build the 'site init' command.
 		az aks create -n "$CLUSTER" -g "$RESOURCE_GROUP" \
 			--node-count "$SYSTEM_NODES" --node-vm-size "$NODE_VM_SIZE" \
+			--network-plugin azure --network-plugin-mode overlay \
 			--attach-acr "$ACR" --generate-ssh-keys --only-show-errors >/dev/null
 	fi
 
@@ -102,6 +110,7 @@ cmd_up() {
 
 Cluster is up. Next:
 
+	hack/scripts/gantry-streaming-aks.sh cleanup-operator  # only after an operator install
   hack/scripts/gantry-streaming-aks.sh install
   hack/scripts/gantry-streaming-aks.sh verify
 
@@ -117,34 +126,89 @@ cmd_images() {
 	require_tools make
 	[ -n "$ACR" ] || die "set ACR to the registry holding the test images"
 
-	log "Building and pushing gantry and gantry-node-config to $ACR"
+	log "Building and pushing images to $ACR"
 	az acr login -n "$ACR" --only-show-errors >/dev/null
 	make -C "$REPO_ROOT" image-gantry-push image-gantry-node-config-push \
-		CONTAINER_REGISTRY="${ACR}.azurecr.io"
+		CONTAINER_REGISTRY="${ACR}.azurecr.io" VERSION="$IMAGE_TAG"
+}
+
+cmd_cleanup_operator() {
+	require_tools kubectl
+
+	local manager
+	manager="$(kubectl get priorityclass gantry-low \
+		-o jsonpath='{.metadata.annotations.gantry\.unbounded-cloud\.io/manager}' 2>/dev/null || true)"
+	if [ "$manager" = "helm" ]; then
+		die "refusing operator cleanup: Gantry is managed by Helm"
+	fi
+
+	if [ "$manager" != "unbounded-operator" ] && \
+		! kubectl -n "$NAMESPACE" get deployment/unbounded-operator >/dev/null 2>&1; then
+		die "no unbounded-operator installation found"
+	fi
+
+	log "Stopping unbounded-operator"
+	kubectl -n "$NAMESPACE" scale deployment/unbounded-operator --replicas=0 2>/dev/null || true
+
+	log "Restoring OverlayBD before removing operator-managed Gantry"
+	kubectl -n "$NAMESPACE" delete daemonset/gantry-overlaybd-config --ignore-not-found --wait=true --timeout=2m
+
+	log "Removing operator namespace and cluster-scoped resources"
+	kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=true --timeout=3m
+	kubectl delete clusterrole \
+		unbounded-operator unbounded-net-controller unbounded-net-node \
+		unbounded-net-status-viewer token-refresher --ignore-not-found
+	kubectl delete clusterrolebinding \
+		unbounded-operator unbounded-net-controller unbounded-net-node \
+		unbounded-net-kube-proxy token-refresher --ignore-not-found
+	kubectl delete apiservice \
+		v1alpha1.net.unbounded-cloud.io v1alpha3.unbounded-cloud.io --ignore-not-found
+	kubectl delete priorityclass gantry-low --ignore-not-found
+
+	local crds
+	crds="$(kubectl get crd -o name 2>/dev/null | grep -E '(\.unbounded-cloud\.io$)' || true)"
+	if [ -n "$crds" ]; then
+		printf '%s\n' "$crds" | xargs kubectl delete
+	fi
 }
 
 cmd_install() {
 	require_tools kubectl make
+	[ -n "$ACR" ] || die "set ACR to the registry holding the Gantry images"
 
-	local plugin="$REPO_ROOT/bin/kubectl-unbounded"
-	[ -x "$plugin" ] || make -C "$REPO_ROOT" kubectl-unbounded
-
-	log "Installing CRDs and unbounded-operator"
-	"$plugin" install
-
-	local sites
-	sites="$(kubectl get sites.unbounded-cloud.io -o name 2>/dev/null || true)"
-	[ -n "$sites" ] || die "no Site found; create one before enabling artifact streaming"
+	local helm="$REPO_ROOT/bin/helm"
+	[ -x "$helm" ] || make -C "$REPO_ROOT" install-helm
 
 	local key="${NODE_LABEL%%=*}"
 	local value="${NODE_LABEL#*=}"
-	local patch
-	patch="{\"spec\":{\"components\":{\"gantry\":{\"enabled\":true,\"artifactStreaming\":{\"enabled\":true,\"nodeSelector\":{\"${key}\":\"${value}\"}}}}}}"
+	local registry="${ACR}.azurecr.io"
 
-	for site in $sites; do
-		log "Enabling artifact streaming on $site"
-		kubectl patch "$site" --type=merge -p "$patch"
-	done
+	kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+	log "Installing Gantry with AKS Artifact Streaming"
+	"$helm" upgrade --install gantry "$REPO_ROOT/deploy/gantry/chart" \
+		--namespace "$NAMESPACE" \
+		--set-string "image.reference=${registry}/gantry:${IMAGE_TAG}" \
+		--set image.pullPolicy=Always \
+		--set-string "overlaybdConfig.image.reference=${registry}/gantry-node-config:${IMAGE_TAG}" \
+		--set overlaybdConfig.image.pullPolicy=Always \
+		--set-string "nodeSelector.${key}=${value}" \
+		--set overlaybdConfig.enabled=true \
+		--set-string "overlaybdConfig.nodeSelector.${key}=${value}" \
+		--set gantry.artifactStreaming.enabled=true \
+		--set-string "gantry.upstreamRegistries[0].name=${registry}" \
+		--set-string "gantry.upstreamRegistries[0].endpoint=http://127.0.0.1:8578?ns=${registry}" \
+		--wait --timeout 5m
+}
+
+cmd_uninstall() {
+	require_tools kubectl
+
+	local helm="$REPO_ROOT/bin/helm"
+	[ -x "$helm" ] || die "missing Helm binary: run 'make install-helm'"
+
+	log "Uninstalling Gantry"
+	"$helm" uninstall gantry --namespace "$NAMESPACE" --wait --timeout 3m
 }
 
 # gantry-overlaybd-config reports ready only once the host config and the
@@ -155,18 +219,22 @@ cmd_verify() {
 	log "Gantry agent rollout"
 	kubectl -n "$NAMESPACE" rollout status ds/gantry --timeout=5m
 
+	log "Containerd mirror configurator rollout"
+	kubectl -n "$NAMESPACE" rollout status ds/gantry-containerd-config --timeout=5m
+
 	log "OverlayBD configurator rollout"
 	kubectl -n "$NAMESPACE" rollout status ds/gantry-overlaybd-config --timeout=5m
 
 	log "Streaming metrics"
 	local pod
-	pod="$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=gantry \
+	pod="$(kubectl -n "$NAMESPACE" get pods \
+		-l 'app.kubernetes.io/name=gantry,app.kubernetes.io/component=agent' \
 		-o jsonpath='{.items[0].metadata.name}')"
 	[ -n "$pod" ] || die "no gantry pod found in $NAMESPACE"
 
 	kubectl -n "$NAMESPACE" port-forward "pod/$pod" 19095:9095 >/dev/null 2>&1 &
 	local forward=$!
-	trap 'kill "$forward" 2>/dev/null || true' EXIT
+	trap "kill '$forward' 2>/dev/null || true" EXIT
 
 	local attempt metrics
 	for attempt in $(seq 1 20); do
@@ -191,11 +259,13 @@ cmd_down() {
 case "${1:-}" in
 up) cmd_up ;;
 images) cmd_images ;;
+cleanup-operator) cmd_cleanup_operator ;;
 install) cmd_install ;;
 verify) cmd_verify ;;
+uninstall) cmd_uninstall ;;
 down) cmd_down ;;
 *)
-	echo "usage: $0 {up|images|install|verify|down}" >&2
+	echo "usage: $0 {up|images|cleanup-operator|install|verify|uninstall|down}" >&2
 	exit 2
 	;;
 esac
