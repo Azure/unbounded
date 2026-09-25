@@ -82,6 +82,70 @@ may consume but never extend link budget or deadline. Reverse hops bind the exac
 request and use the recorded reverse path. Authentication never grants origin-fill
 authority; the read candidate policy remains authoritative.
 
+### Signed acquisition-credit handoff
+
+`RouteBudget.remaining_attempts` is a u32, serialized as required canonical decimal
+`racer-route-attempts` in both original and forwarding heads. The original signed
+value is the immutable ceiling for that remote attempt. Every hop must be less than
+or equal to the immediately preceding signed balance, not merely below the original
+ceiling. Exact logical agreement includes the final effective balance. Missing,
+signed/leading-zero numbers and values above u32::MAX are rejected. No default
+credits are inferred for older heads that lack this field.
+
+CopyOnly carries zero acquisition credits. Acquire may carry zero (existing-copy
+lookup is still possible), but zero authorizes no origin acquisition. Read reserves
+and debits a child allowance before submission; destination inherits that allowance
+verbatim. Relays preserve it unless deliberately consuming credits. Neither response
+handling nor native fallback refunds credits: no signed credit receipt exists.
+The exact original signature digest already binds the response to its original
+attempt ceiling. A new request ID/signature alone is not permission for read policy
+to allocate additional credits.
+
+`PeerResponse::OriginForbidden` serializes `racer-outcome: origin-forbidden` with
+signed application `@status` 403. `OriginRejected` serializes `origin-rejected` with
+signed application status 401. Both have zero content length and retain exact
+request and reverse-hop bindings. Outcome or status substitution fails verification.
+The outer peer transport frame remains status 200 and contains the unchanged signed
+application head; it is not the application result. Client/origin mapping preserves
+403 versus 401 and neither outcome is a peer-authentication failure.
+
+### Native setup/grant/completion security review
+
+Reviewed the live closed schema in `peer/native.rs`, the bindings in
+`peer/native_io.rs`, and the typed consumers in `rdma/session.rs` and
+`rdma/permission.rs`. Peer ownership of native code remains unchanged. The required
+validation contract is:
+
+- Use the existing RFC 9421 signer and exact `protocol::agrees`; no native-specific
+  signature base. Check exact expected signer/receiver and allowed phase before
+  invoking any setup/grant/completion consumer.
+- Bind request and response to `payload-envelope` digests of the complete original
+  and hop chains, transfer ID, membership, rail, inherited absolute deadline, and
+  preceding signed control digest. The request digest now also binds attempt
+  credits through the original/hop signatures. Only initial accept allows zero
+  response/predecessor digests; never reset bindings during fallback.
+- `SetupParameters::from_verified` is only the binary shape/rail check. The native
+  state machine must additionally enforce node/QP nonce, reciprocal setup binding,
+  unchanged offer parameters in ready, and the published end-to-end rail/fabric.
+- Grants bind the exact live session and transfer, nonoverflowing address range,
+  exact signed page ciphertext length, and a transfer-scoped rkey. Never export a
+  reusable pool-wide rkey. Export only after the bind CQE. Remote assertions cannot
+  substitute for local provider readiness or local grant ownership.
+- Completion must match the live grant's exact session/transfer and its expected
+  predecessor. A signed completion does not itself prove NIC quiescence: local
+  invalidation/terminal fences still precede readback, buffer reuse, and HTTP
+  fallback. Authenticate AEAD before exposing any plaintext.
+- Fallback is transport-only. Preserve ciphertext, original request/response,
+  acquisition credits and deadline. Authentication/cancellation/expired original
+  deadline terminates the attempt. A shorter native subdeadline may fall back only
+  while the original scope is live and after terminal DMA fences.
+
+Native schema tests must include validly re-signed wrong setup/grant/completion
+fields (not only corrupted signatures), wrong predecessor/phase/transfer/session,
+descriptor length/address overflow, repeated grants/completions, fallback replay,
+and expired original deadlines. Hardware success and DMA-fence testing are separate
+from this schema review; this document does not claim those hardware tests ran.
+
 ## Freshness and admission
 
 Replay protection is node-wide, atomic across reactors, and bounded. Freshness uses

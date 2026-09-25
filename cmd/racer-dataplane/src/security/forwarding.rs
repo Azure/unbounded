@@ -226,6 +226,9 @@ impl Forwarding {
             true,
         )?;
         let mut route = RouteState::from_head(&auth.original.head)?;
+        if field(&auth.original.head, "racer-mode")? == "copy" && route.attempts != 0 {
+            return Err(Error::Unauthorized);
+        }
         if route.visited != [origin.node().clone()] {
             return Err(Error::Unauthorized);
         }
@@ -451,6 +454,7 @@ struct RouteState {
     destination: NodeId,
     visited: Vec<NodeId>,
     links: u64,
+    attempts: u32,
     deadline: u64,
 }
 impl RouteState {
@@ -470,6 +474,9 @@ impl RouteState {
             destination: node_field(head, "racer-route-destination")?,
             visited: protocol::decode_nodes(field(head, "racer-route-visited")?.as_bytes())?,
             links: number(head, "racer-route-links")?,
+            attempts: number(head, "racer-route-attempts")?
+                .try_into()
+                .map_err(|_| Error::Unauthorized)?,
             deadline: number(head, "racer-route-deadline")?,
         };
         if state.membership == 0
@@ -492,6 +499,7 @@ impl RouteState {
         visited.push(signer.clone());
         if self.links <= 1
             || next.links != self.links - 1
+            || next.attempts > self.attempts
             || next.deadline > self.deadline
             || next.membership != self.membership
             || next.request != self.request
@@ -537,6 +545,7 @@ fn check_hop(
         "racer-route-destination",
         "racer-route-visited",
         "racer-route-links",
+        "racer-route-attempts",
         "racer-route-deadline",
     ] {
         push(&mut expected, name, field(&hop.head, name)?);
@@ -666,6 +675,7 @@ mod tests {
                 destination: node(2),
                 visited: vec![node(0)],
                 remaining_links: 4,
+                remaining_attempts: 0,
                 deadline: scope.deadline,
             },
             origin: PeerOriginContext {
@@ -696,6 +706,7 @@ mod tests {
             destination: old.destination.clone(),
             visited,
             remaining_links: old.remaining_links - 1,
+            remaining_attempts: old.remaining_attempts,
             deadline: old.deadline,
         }
     }
@@ -798,6 +809,7 @@ mod tests {
             PeerResponse::Unavailable,
             PeerResponse::Overloaded,
             PeerResponse::OriginRejected,
+            PeerResponse::OriginForbidden,
         ] {
             let signed = receiver.sign_response(admitted.binding(), outcome).unwrap();
             // An authentic response cannot substitute for another signed attempt.
@@ -811,11 +823,221 @@ mod tests {
                     PeerResponse::VersionUnavailable => PeerResponse::VersionUnavailable,
                     PeerResponse::Unavailable => PeerResponse::Unavailable,
                     PeerResponse::Overloaded => PeerResponse::Overloaded,
+                    PeerResponse::OriginForbidden => PeerResponse::OriginForbidden,
                     _ => PeerResponse::OriginRejected,
                 },
             };
             assert!(sender.verify_response(substituted, &other).is_err());
             sender.verify_response(signed, &binding).unwrap();
+        }
+    }
+    #[test]
+    fn signed_attempt_ceiling_survives_decode_and_rejects_tamper_and_hop_refills() {
+        let signatures = network(4);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let acquire = |id| {
+            let mut logical = request(id);
+            if let Operation::Metadata { mode, .. } = &mut logical.operation {
+                *mode = FetchMode::Acquire;
+            }
+            logical.route.destination = node(3);
+            logical.route.remaining_attempts = 7;
+            logical
+        };
+        for value in ["4294967296", "-1", "01", "+1"] {
+            let mut head = protocol::request_head(&acquire(9)).unwrap();
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "racer-route-attempts")
+                .unwrap()
+                .value = value.as_bytes().to_vec();
+            assert!(RouteState::from_head(&head).is_err());
+        }
+        let mut maximum = acquire(9);
+        maximum.route.remaining_attempts = u32::MAX;
+        let (maximum, _) = f[0].sign_request_to(maximum, &node(1)).unwrap();
+        assert_eq!(
+            f[1].verify_request(maximum)
+                .unwrap()
+                .request()
+                .route
+                .remaining_attempts,
+            u32::MAX
+        );
+        let (mut tampered, _) = f[0].sign_request_to(acquire(10), &node(1)).unwrap();
+        tampered.request.route.remaining_attempts = 8;
+        assert!(f[1].verify_request(tampered).is_err());
+
+        let (outbound, _) = f[0].sign_request_to(acquire(11), &node(1)).unwrap();
+        let first = f[1].verify_request(outbound).unwrap();
+        let mut route = budget(&first);
+        route.remaining_attempts = 4;
+        let forwarded = f[1].append_request(first, &node(2), route).unwrap();
+        assert_eq!(
+            number(
+                &forwarded.authentication.original.head,
+                "racer-route-attempts"
+            )
+            .unwrap(),
+            7
+        );
+        assert_eq!(
+            number(
+                &forwarded.authentication.hops[0].head,
+                "racer-route-attempts"
+            )
+            .unwrap(),
+            4
+        );
+
+        // Real wire framing and canonical logical decode retain the effective
+        // balance independently of the immutable original signed ceiling.
+        use crate::peer::wire::{LogicalCodec, SecurityCodec, WireCodec};
+        let scope = forwarded.request.origin.scope().clone();
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let codec = SecurityCodec::new(
+            admission.clone(),
+            Rc::new(crate::memory::pool::BufferPool::new(admission)),
+        );
+        let (auth, _) = WireCodec::decode(
+            WireCodec::encode(&forwarded.authentication, false, 0).unwrap(),
+            false,
+        )
+        .unwrap();
+        let decoded = codec.request(auth, &scope).unwrap();
+        assert_eq!(decoded.request.route.remaining_attempts, 4);
+        let second = f[2].verify_request(decoded).unwrap();
+        let mut reduced = second.request().route.clone();
+        reduced.visited.push(node(2));
+        reduced.remaining_links -= 1;
+        reduced.remaining_attempts = 2;
+        let mut final_request = f[2].append_request(second, &node(3), reduced).unwrap();
+
+        // Re-sign a malicious hop: cryptographic validity cannot authorize a
+        // refill from 4 to 5 even though it is below the original ceiling of 7.
+        let mut forged = hop_head(
+            "request-hop",
+            &final_request.authentication.original,
+            &final_request.authentication.hops[0],
+        )
+        .unwrap();
+        let mut refill = final_request.request.route.clone();
+        refill.remaining_attempts = 5;
+        protocol::route_headers(&mut forged, &refill).unwrap();
+        push(&mut forged, "racer-receiver", &node(3).0);
+        let bad_hop = signatures[2].sign(forged).unwrap();
+        let genuine_hop = std::mem::replace(&mut final_request.authentication.hops[1], bad_hop);
+        final_request.request.route = refill;
+        let bad = SignedRequest {
+            authentication: ForwardedHead {
+                original: final_request.authentication.original.clone(),
+                hops: final_request
+                    .authentication
+                    .hops
+                    .iter()
+                    .map(clone_head)
+                    .collect(),
+            },
+            request: final_request.request,
+        };
+        assert!(f[3].verify_request(bad).is_err());
+        let mut auth = final_request.authentication;
+        auth.hops[1] = genuine_hop;
+        let decoded = codec.request(auth, &scope).unwrap();
+        let verified = f[3].verify_request(decoded).unwrap();
+        assert_eq!(verified.request().route.remaining_attempts, 2);
+
+        let mut copy = request(12);
+        copy.route.remaining_attempts = 1;
+        assert!(f[0].sign_request_to(copy, &node(1)).is_err());
+        // A forged but correctly signed CopyOnly original cannot hide credits by
+        // lowering them to zero in the effective route at a subsequent relay.
+        let mut copy = request(12);
+        let mut original_head = protocol::request_head(&copy).unwrap();
+        original_head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-route-attempts")
+            .unwrap()
+            .value = b"7".to_vec();
+        push(&mut original_head, "racer-receiver", &node(1).0);
+        let original = Arc::new(signatures[0].sign(original_head).unwrap());
+        copy.route.visited.push(node(1));
+        copy.route.remaining_links -= 1;
+        let mut hop = hop_head("request-hop", &original, &original).unwrap();
+        protocol::route_headers(&mut hop, &copy.route).unwrap();
+        push(&mut hop, "racer-receiver", &node(2).0);
+        let hop = signatures[1].sign(hop).unwrap();
+        assert!(
+            f[2].verify_request(SignedRequest {
+                authentication: ForwardedHead {
+                    original,
+                    hops: vec![hop]
+                },
+                request: copy
+            })
+            .is_err()
+        );
+        let mut exhausted = acquire(13);
+        exhausted.route.remaining_attempts = 0;
+        let (zero, _) = f[0].sign_request_to(exhausted, &node(1)).unwrap();
+        let zero = f[1].verify_request(zero).unwrap();
+        let mut refill = budget(&zero);
+        refill.remaining_attempts = 1;
+        assert!(f[1].append_request(zero, &node(2), refill).is_err());
+    }
+
+    #[test]
+    fn origin_forbidden_is_signed_403_and_cannot_substitute_rejected_401() {
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[2].clone());
+        let (signed, binding) = sender.sign_request(request(14)).unwrap();
+        let admitted = receiver.verify_request(signed).unwrap();
+        for (outcome, status, substitute) in [
+            (
+                PeerResponse::OriginForbidden,
+                403,
+                PeerResponse::OriginRejected,
+            ),
+            (
+                PeerResponse::OriginRejected,
+                401,
+                PeerResponse::OriginForbidden,
+            ),
+        ] {
+            let reply = receiver.sign_response(admitted.binding(), outcome).unwrap();
+            assert!(
+                matches!(reply.authentication.original.head.start,StartLine::Response{status:s} if s==status)
+            );
+            let bad = SignedResponse {
+                authentication: ForwardedHead {
+                    original: reply.authentication.original.clone(),
+                    hops: vec![],
+                },
+                response: substitute,
+            };
+            assert!(sender.verify_response(bad, &binding).is_err());
+            let mut bad_head = clone_head(&reply.authentication.original);
+            bad_head.head.start = StartLine::Response { status: 200 };
+            let bad = SignedResponse {
+                authentication: ForwardedHead {
+                    original: Arc::new(bad_head),
+                    hops: vec![],
+                },
+                response: if status == 403 {
+                    PeerResponse::OriginForbidden
+                } else {
+                    PeerResponse::OriginRejected
+                },
+            };
+            assert!(sender.verify_response(bad, &binding).is_err());
+            sender.verify_response(reply, &binding).unwrap();
         }
     }
     #[test]
@@ -1134,6 +1356,7 @@ mod tests {
                 destination: forwarded.request.route.destination.clone(),
                 visited: forwarded.request.route.visited.clone(),
                 remaining_links: forwarded.request.route.remaining_links,
+                remaining_attempts: forwarded.request.route.remaining_attempts,
                 deadline: forwarded.request.route.deadline,
             };
             let mut hop = clone_head(&forwarded.authentication.hops[0]);

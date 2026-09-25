@@ -188,6 +188,7 @@ pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> 
     push(head, "racer-route-destination", &route.destination.0);
     push(head, "racer-route-visited", nodes(&route.visited)?);
     push(head, "racer-route-links", route.remaining_links);
+    push(head, "racer-route-attempts", route.remaining_attempts);
     push(
         head,
         "racer-route-deadline",
@@ -263,6 +264,9 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         }
     };
     if op_object != &request.origin.object {
+        return Err(Error::InvalidRequest);
+    }
+    if matches!(mode, FetchMode::CopyOnly) && request.route.remaining_attempts != 0 {
         return Err(Error::InvalidRequest);
     }
     push(
@@ -363,6 +367,14 @@ pub fn response_head(
         PeerResponse::Unavailable => ("unavailable", 0),
         PeerResponse::Overloaded => ("overloaded", 0),
         PeerResponse::OriginRejected => ("origin-rejected", 0),
+        PeerResponse::OriginForbidden => ("origin-forbidden", 0),
+    };
+    head.start = StartLine::Response {
+        status: match response {
+            PeerResponse::OriginRejected => 401,
+            PeerResponse::OriginForbidden => 403,
+            _ => 200,
+        },
     };
     push(&mut head, "racer-outcome", outcome);
     push(&mut head, "content-length", length);
@@ -391,6 +403,7 @@ pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) 
                             | "racer-route-destination"
                             | "racer-route-visited"
                             | "racer-route-links"
+                            | "racer-route-attempts"
                             | "racer-route-deadline"
                     ))
             {

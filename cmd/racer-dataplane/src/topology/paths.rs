@@ -32,6 +32,8 @@ pub struct RouteBudget {
     pub destination: NodeId,
     pub visited: Vec<NodeId>,
     pub remaining_links: u8,
+    /// Acquisition credits transferred from the caller, never replenished by a hop.
+    pub remaining_attempts: u32,
     pub deadline: Deadline,
 }
 
@@ -63,6 +65,7 @@ impl RouteBudget {
             || forwarded.destination != expected.destination
             || forwarded.visited != expected.visited
             || forwarded.remaining_links != expected.remaining_links
+            || forwarded.remaining_attempts > expected.remaining_attempts
             || forwarded.deadline.0 > expected.deadline.0
         {
             return Err(Error::InvalidRequest);
@@ -426,6 +429,7 @@ mod tests {
             destination: membership.members()[to].node.clone(),
             visited: vec![],
             remaining_links: links,
+            remaining_attempts: 0,
             deadline: Deadline(Instant::now() + Duration::from_secs(60)),
         }
     }
@@ -618,6 +622,33 @@ mod tests {
         assert!(!route.nodes.contains(&members.members()[2].node));
         assert!(route.nodes.len() <= usize::from(remaining.remaining_links) + 1);
         assert_eq!(remaining.deadline.0, original.deadline.0);
+    }
+
+    #[test]
+    fn forwarding_preserves_or_spends_attempt_credits_without_refill() {
+        let members = membership(4);
+        let from = &members.members()[0].node;
+        let next = &members.members()[1].node;
+        let mut original = budget(&members, 3, 4);
+        original.remaining_attempts = u32::MAX;
+        let mut forwarded = original.forwarded(from, next).unwrap();
+        assert_eq!(forwarded.remaining_attempts, u32::MAX);
+        original.validate_forwarded(&forwarded, from, next).unwrap();
+        forwarded.remaining_attempts = 2;
+        original.validate_forwarded(&forwarded, from, next).unwrap();
+        original.remaining_attempts = 1;
+        assert_eq!(
+            original.validate_forwarded(&forwarded, from, next),
+            Err(Error::InvalidRequest)
+        );
+        original.remaining_attempts = 0;
+        forwarded.remaining_attempts = 0;
+        original.validate_forwarded(&forwarded, from, next).unwrap();
+        forwarded.remaining_attempts = 1;
+        assert_eq!(
+            original.validate_forwarded(&forwarded, from, next),
+            Err(Error::InvalidRequest)
+        );
     }
 
     #[test]

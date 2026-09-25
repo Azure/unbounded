@@ -1,5 +1,12 @@
 # Read implementation handoffs
 
+Security schema handoff: `racer-route-attempts` is required canonical u32 on the
+original and each hop. The original ceiling is immutable, every hop is nonincreasing,
+and final logical agreement is exact. CopyOnly requires zero; Acquire zero stays
+zero. Signed application origin-forbidden/403 and origin-rejected/401 remain
+distinct inside outer 200 framing. Native fallback neither mints nor refunds
+credits. See `designs/racer-peer-security.md` for the complete reviewed contract.
+
 Read owns this directory and read.rs. Other component owners implement the
 runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams.
 
