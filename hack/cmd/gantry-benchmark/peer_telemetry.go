@@ -48,9 +48,11 @@ type gantryPodDiagnosticMeasurement struct {
 }
 
 type gantryDiagnosticPhaseMeasurement struct {
-	Pods     []gantryPodDiagnosticMeasurement `json:"pods"`
-	Source   string                           `json:"source"`
-	Complete bool                             `json:"complete"`
+	Pods                                       []gantryPodDiagnosticMeasurement `json:"pods"`
+	Source                                     string                           `json:"source"`
+	Complete                                   bool                             `json:"complete"`
+	FinalLayerResponseTimestampsComplete       bool                             `json:"final_layer_response_timestamps_complete"`
+	MissingFinalLayerResponseTimestampPodNames []string                         `json:"missing_final_layer_response_timestamp_pod_names,omitempty"`
 }
 
 type gantryDiagnosticSnapshot struct {
@@ -233,7 +235,8 @@ func (b *benchmark) fetchGantryDiagnosticTimestamps(
 		revision,
 	)
 
-	raw, err := b.queryPrometheusRange(ctx, query, window, performanceTelemetryStep)
+	queryWindow := diagnosticTimestampQueryWindow(window, time.Now().UTC())
+	raw, err := b.queryPrometheusRange(ctx, query, queryWindow, performanceTelemetryStep)
 	if err != nil {
 		return nil, err
 	}
@@ -292,6 +295,14 @@ func (b *benchmark) fetchGantryDiagnosticTimestamps(
 	return result, nil
 }
 
+func diagnosticTimestampQueryWindow(eventWindow telemetryWindow, collectedAt time.Time) telemetryWindow {
+	if collectedAt.After(eventWindow.FinishedAt) {
+		eventWindow.FinishedAt = collectedAt
+	}
+
+	return eventWindow
+}
+
 func subtractGantryDiagnosticSnapshots(
 	before, after gantryDiagnosticSnapshot,
 	timestamps map[string]map[string]float64,
@@ -339,10 +350,14 @@ func subtractGantryDiagnosticSnapshots(
 		})
 	}
 
+	missingTimestamps := missingFinalLayerResponseTimestampPods(timestamps, after.PodNodes)
+
 	return gantryDiagnosticPhaseMeasurement{
-		Pods:     pods,
-		Source:   "per-pod Prometheus counter deltas and timestamp gauges",
-		Complete: len(pods) > 0,
+		Pods:                                 pods,
+		Source:                               "per-pod Prometheus counter deltas and timestamp gauges",
+		Complete:                             len(pods) > 0,
+		FinalLayerResponseTimestampsComplete: len(missingTimestamps) == 0,
+		MissingFinalLayerResponseTimestampPodNames: missingTimestamps,
 	}, nil
 }
 
@@ -357,10 +372,10 @@ func finalLayerResponseCompletedTimestamp(timestamps map[string]float64) float64
 	return latest
 }
 
-func requireFinalLayerResponseTimestamps(
+func missingFinalLayerResponseTimestampPods(
 	timestamps map[string]map[string]float64,
 	podNodes map[string]string,
-) error {
+) []string {
 	missing := make([]string, 0)
 
 	for pod := range podNodes {
@@ -369,18 +384,22 @@ func requireFinalLayerResponseTimestamps(
 		}
 	}
 
-	if len(missing) == 0 {
-		return nil
-	}
-
 	sort.Strings(missing)
 
-	return fmt.Errorf(
-		"final layer response completion timestamp missing for %d/%d Gantry pods: %s",
-		len(missing),
-		len(podNodes),
-		strings.Join(missing, ","),
-	)
+	return missing
+}
+
+func (b *benchmark) warnIncompleteFinalLayerResponseTimestamps(measurement gantryDiagnosticPhaseMeasurement) {
+	if measurement.FinalLayerResponseTimestampsComplete {
+		return
+	}
+
+	writeAll(b.stderr, fmt.Sprintf(
+		"warning: final layer response completion timestamp missing for %d/%d Gantry pods: %s; preserving successful benchmark result with incomplete diagnostic telemetry\n",
+		len(measurement.MissingFinalLayerResponseTimestampPodNames),
+		len(measurement.Pods),
+		strings.Join(measurement.MissingFinalLayerResponseTimestampPodNames, ","),
+	))
 }
 
 func (b *benchmark) fetchGantryPeerByteSnapshot(ctx context.Context, revision string) (peerByteSnapshot, error) {
