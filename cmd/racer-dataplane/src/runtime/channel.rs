@@ -107,11 +107,12 @@ impl<T> Sender<T> {
         let mut head = self.shared.head.0.load(Ordering::Relaxed);
         let tail = self.shared.tail.0.load(Ordering::Acquire);
         while head != tail {
-            unsafe {
-                (*self.shared.slots[head % self.shared.slots.len()].get()).assume_init_drop();
-            }
+            let item = unsafe {
+                (*self.shared.slots[head % self.shared.slots.len()].get()).assume_init_read()
+            };
             head = advance(head, self.shared.slots.len());
             self.shared.head.0.store(head, Ordering::Release);
+            drop(item);
         }
         true
     }
@@ -288,5 +289,31 @@ mod tests {
         assert!(receiver.poll_receive(&mut cx).is_pending());
         sender.close();
         assert_eq!(counter.0.load(Ordering::Relaxed), 3);
+    }
+    #[test]
+    fn orphan_cleanup_advances_before_panicking_destructor() {
+        use std::sync::atomic::AtomicUsize;
+        struct Panics(Arc<AtomicUsize>);
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    panic!("injected destructor failure");
+                }
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = bounded(1).unwrap();
+        assert!(sender.try_send(Panics(count.clone())).is_ok());
+        drop(receiver);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sender.discard_closed()))
+                .is_err()
+        );
+        drop(sender);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "orphan cannot be dropped twice"
+        );
     }
 }
