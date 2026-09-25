@@ -114,6 +114,21 @@ func TestParseOriginURLForms(t *testing.T) {
 	}
 }
 
+func TestParseCanonicalBlobURLIsPeerOnly(t *testing.T) {
+	t.Parallel()
+
+	raw := "https://app.azurecr.io/v2/team/app/blobs/sha256:" + testDigest
+	got, err := streaming.ParseOriginURL(raw, streaming.URLPolicy{
+		AllowedHostSuffixes: []string{".azurecr.io"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Digest.String() != "sha256:"+testDigest || !got.Canonical {
+		t.Fatalf("origin = %+v, want canonical digest", got)
+	}
+}
+
 func TestParseOriginURLRejectsUnsafeOrConflictingURL(t *testing.T) {
 	t.Parallel()
 

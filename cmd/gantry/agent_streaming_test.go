@@ -7,6 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/Azure/unbounded/internal/gantry/config"
+	"github.com/Azure/unbounded/internal/gantry/digest"
+	streamingapi "github.com/Azure/unbounded/internal/gantry/streaming"
 )
 
 func TestRouteNodeLocalHandlersPreservesRawStreamingTarget(t *testing.T) {
@@ -54,5 +58,46 @@ func TestRouteNodeLocalHandlersFallsBackToMirror(t *testing.T) {
 
 	if !mirrorCalled || response.Code != http.StatusOK {
 		t.Fatalf("called/status = %v/%d, want true/200", mirrorCalled, response.Code)
+	}
+}
+
+func TestCanonicalOriginResolverPreservesConfiguredEndpoint(t *testing.T) {
+	t.Parallel()
+
+	resolver := newCanonicalOriginResolver([]config.UpstreamRegistry{{
+		Name:     "app.azurecr.io",
+		Endpoint: "http://127.0.0.1:8578/proxy?ns=app.azurecr.io",
+	}})
+	d := digest.MustParse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	resolved, ok := resolver(streamingapi.OriginURL{
+		Raw:       "https://app.azurecr.io/v2/team/app/blobs/" + d.String(),
+		Digest:    d,
+		Canonical: true,
+	})
+	if !ok {
+		t.Fatal("canonical origin was not resolved")
+	}
+	want := "http://127.0.0.1:8578/proxy/v2/team/app/blobs/" + d.String() + "?ns=app.azurecr.io"
+	if resolved.Raw != want || resolved.Digest != d || resolved.Canonical {
+		t.Fatalf("resolved origin = %+v, want raw %q and signed-origin mode", resolved, want)
+	}
+}
+
+func TestCanonicalOriginResolverRejectsUnknownRegistry(t *testing.T) {
+	t.Parallel()
+
+	resolver := newCanonicalOriginResolver([]config.UpstreamRegistry{{
+		Name:     "app.azurecr.io",
+		Endpoint: "http://127.0.0.1:8578?ns=app.azurecr.io",
+	}})
+	d := digest.MustParse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	if _, ok := resolver(streamingapi.OriginURL{
+		Raw:       "https://other.azurecr.io/v2/team/app/blobs/" + d.String(),
+		Digest:    d,
+		Canonical: true,
+	}); ok {
+		t.Fatal("unknown registry resolved")
 	}
 }

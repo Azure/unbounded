@@ -141,7 +141,7 @@ func TestServerPrefersLocalCompleteBlob(t *testing.T) {
 	local := &rangeStoreStub{body: []byte("locl"), total: 10}
 	discovery := &discoveryStub{}
 	peer := &peerStub{}
-	origin := &originStub{}
+	origin := &originStub{body: []byte("help"), total: 10}
 
 	server, err := streaming.NewServer(local, discovery, peer, origin, streaming.Options{
 		URLPolicy:         streaming.URLPolicy{AllowedHostSuffixes: []string{".data.azurecr.io"}},
@@ -164,6 +164,69 @@ func TestServerPrefersLocalCompleteBlob(t *testing.T) {
 
 	if peer.calls != 0 || origin.calls != 0 {
 		t.Fatalf("peer=%d origin=%d, want zero", peer.calls, origin.calls)
+	}
+}
+
+func TestServerCanonicalRequestFallsBackThroughConfiguredOrigin(t *testing.T) {
+	t.Parallel()
+
+	origin := &originStub{body: []byte("help"), total: 10}
+	server, err := streaming.NewServer(
+		&rangeStoreStub{err: &ifaces.ErrNotFound{}},
+		&discoveryStub{},
+		&peerStub{},
+		origin,
+		streaming.Options{
+			URLPolicy: streaming.URLPolicy{AllowedHostSuffixes: []string{".azurecr.io"}},
+			ResolveCanonicalOrigin: func(origin streaming.OriginURL) (streaming.OriginURL, bool) {
+				return streaming.OriginURL{Raw: "http://127.0.0.1:8578/v2/team/app/blobs/" + origin.Digest.String() + "?ns=app.azurecr.io", Digest: origin.Digest}, true
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := "https://app.azurecr.io/v2/team/app/blobs/sha256:" + testDigest
+	req := httptest.NewRequest(http.MethodGet, streaming.HandlerPrefix+raw, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, req)
+
+	if response.Code != http.StatusPartialContent || response.Body.String() != "help" {
+		t.Fatalf("response = %d %q", response.Code, response.Body.String())
+	}
+	if origin.calls != 1 || origin.originRaw != "http://127.0.0.1:8578/v2/team/app/blobs/sha256:"+testDigest+"?ns=app.azurecr.io" {
+		t.Fatalf("origin calls = %d raw=%q", origin.calls, origin.originRaw)
+	}
+}
+
+func TestServerCanonicalRequestWithoutConfiguredOriginReturnsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	origin := &originStub{}
+	server, err := streaming.NewServer(
+		&rangeStoreStub{err: &ifaces.ErrNotFound{}},
+		&discoveryStub{},
+		&peerStub{},
+		origin,
+		streaming.Options{URLPolicy: streaming.URLPolicy{AllowedHostSuffixes: []string{".azurecr.io"}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := "https://app.azurecr.io/v2/team/app/blobs/sha256:" + testDigest
+	req := httptest.NewRequest(http.MethodGet, streaming.HandlerPrefix+raw, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, req)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response = %d, want 503", response.Code)
+	}
+	if origin.calls != 0 {
+		t.Fatalf("origin calls = %d, want zero", origin.calls)
 	}
 }
 

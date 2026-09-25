@@ -30,8 +30,9 @@ type URLPolicy struct {
 // OriginURL is a validated origin capability extracted from an OverlayBD
 // request. Raw is retained for the outbound request and must never be logged.
 type OriginURL struct {
-	Raw    string
-	Digest digest.Digest
+	Raw       string
+	Digest    digest.Digest
+	Canonical bool
 }
 
 // OriginURLFromRequest reconstructs and validates the URL embedded by
@@ -67,13 +68,19 @@ func ParseOriginURL(raw string, policy URLPolicy) (OriginURL, error) {
 	}
 
 	d, err := digestFromURL(u)
+	canonical := false
+	if err != nil {
+		d, err = canonicalDigestFromURL(u)
+		canonical = err == nil
+	}
 	if err != nil {
 		return OriginURL{}, err
 	}
 
 	return OriginURL{
-		Raw:    raw,
-		Digest: d,
+		Raw:       raw,
+		Digest:    d,
+		Canonical: canonical,
 	}, nil
 }
 
@@ -199,4 +206,34 @@ func digestFromURL(u *url.URL) (digest.Digest, error) {
 	}
 
 	return digest.Parse("sha256:" + found[0])
+}
+
+func canonicalDigestFromURL(u *url.URL) (digest.Digest, error) {
+	var zero digest.Digest
+
+	if u.RawQuery != "" {
+		return zero, fmt.Errorf("streaming origin: canonical blob URL must not contain a query")
+	}
+
+	segments := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	if len(segments) < 4 {
+		return zero, fmt.Errorf("streaming origin: canonical blob path required")
+	}
+
+	first, firstErr := url.PathUnescape(segments[0])
+	family, familyErr := url.PathUnescape(segments[len(segments)-2])
+	value, valueErr := url.PathUnescape(segments[len(segments)-1])
+	hex, ok := strings.CutPrefix(value, "sha256:")
+	if firstErr != nil || familyErr != nil || valueErr != nil || first != "v2" || family != "blobs" || !ok || !digestHexPattern.MatchString(hex) {
+		return zero, fmt.Errorf("streaming origin: canonical blob path required")
+	}
+
+	for _, segment := range segments[1 : len(segments)-2] {
+		repositoryPart, err := url.PathUnescape(segment)
+		if err != nil || repositoryPart == "" || strings.Contains(repositoryPart, "/") {
+			return zero, fmt.Errorf("streaming origin: invalid canonical repository path")
+		}
+	}
+
+	return digest.Parse("sha256:" + hex)
 }
