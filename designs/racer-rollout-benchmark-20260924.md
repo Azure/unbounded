@@ -1,5 +1,136 @@
 # Racer rollout and Gantry benchmark: September 24, 2026
 
+## Latest conclusion: September 25, working 80-GB workload and measured bottlenecks
+
+**The requested 80-GB image works on all 1,500 clients at 1/1.** The same-version
+30-minute observation completed **3,910 verified images with 27 failed attempts
+(0.686%), 173.778 GB/s completion goodput, and zero ordinary Gantry fallback**.
+Increasing to 2/2 raised goodput to **260.426 GB/s** but failures to **7.050%**;
+it did not meet the approximately 1% reliability gate. The parent restored
+**1/1**, the highest tested profile meeting that gate. No further escalation was
+needed to establish the working workload and identify its primary constraints.
+
+**Final state at 2026-09-25 03:10:19 UTC:** DP, Gantry and combined loadgen each
+**1,500/1,500 ready**, CP 2/2, operator 1/1, zero restarts in the current inventory
+([restored-one.json:2-44](../tmp/tlsbatch-live/scaling/restored-one.json)). DP is
+`2ae43d5e3636d96839e318528b6c4e05912b31ac`; CP, Gantry, operator, bootstrap and
+loadgen remain `5affe81ceef8535a1f2734fd461bfe03df258d67`.
+DP has **8 GiB memory, unlimited CPU, 8-GiB memlock and 50-GiB cache/slab**.
+Ordinary-node tuning is **2 I/O / 2 compute / 15 buffers per NUMA pool / 8 shards**;
+system-node tuning is 4/4/15/16. The combined client/local-origin fixture is
+**one 80,000,000,000-byte image, 80 unique decimal 1-GB layers**, a 30-minute image
+deadline and unlimited run duration. Current settings supersede the historical
+September 24 states below, which are preserved as observations at their times
+(`tmp/tlsbatch-live/runtime.json:19-80`; `RESULTS.md:16-36,43-46` in that directory).
+
+### Correction: five-minute zero completions did not establish acceptance failure
+
+The earlier `tmp/tlsbatch-live/RESULTS.md:8-10,138-142` observation of zero new
+completions was accurate for its five-minute window; interpreting that as failure
+of full-image operation was incorrect. **Complete-image cohorts take about
+11-14 minutes**, producing bursts separated by plateaus. The counter stayed at
+8,986 through approximately 01:53, then resumed; by 02:12 all 1,500 clients had
+completed on the active 2ae deployment. Actual 503/504/EOF failures remain real,
+but do not imply that every attempt fails. The long-window correction is
+[COMPLETE-IMAGE-TIMELINE.md:8-20,112-146,180-201](../tmp/tlsbatch-live/COMPLETE-IMAGE-TIMELINE.md).
+
+**Working operation predates the batching fix:** on 5affe, the stable
+23:31-00:01 window already recorded **2,985 complete images, seven failures,
+132.667 GB/s and successes on all 1,500 clients**. Later DP versions and recovery
+windows differ in cache/cohort history; neither first functionality nor a causal
+speedup is attributed to 2ae (`COMPLETE-IMAGE-TIMELINE.md:59-108`). Loadgen success
+requires size/SHA-256 validation of manifest, config and every layer, then the
+layer group's successful return (`cmd/racer-loadgen/image_load.go:152-245`).
+
+### Same-version scaling comparison
+
+These are **integer endpoint-counter deltas divided by the observed interval**,
+not means of five-minute rates. Both use DP 2ae and unchanged other components;
+only image/layer concurrency changed. The 2/2 interval had unchanged Pod UIDs,
+no restarts/resets, healthy scrapes and no in-window configuration changes.
+
+| Measurement | 1/1, Sep 25 01:53-02:23 UTC | 2/2, 02:35:53.156-03:06:03.373 UTC |
+| --- | ---: | ---: |
+| Interval | 1,800 seconds | 1,810.267316 seconds |
+| Complete verified images / failed attempts | **3,910 / 27** | **5,893 / 447** |
+| Failed fraction of completed attempts | **0.685801%** | **7.050473%** |
+| Full-image completion goodput, decimal GB/s | **173.777778** | **260.425627** |
+| Clients with a completed image | **1,500/1,500** | **1,495/1,500** |
+| Verified 1-GB layers/s | 166.165 | 306.526553 |
+| Ordinary Gantry fallback delta | **0** | **0** |
+
+Calculations: `goodput = complete_images * 80 / seconds` GB/s;
+`failure_percent = 100 * failed / (complete + failed)`. The goodput gain is
+**49.861294%**, at more than ten times the failure fraction. Endpoint counts
+exclude still-running attempts; completion goodput and contemporaneous layer-byte
+rates differ because of long, clustered attempts. A reported histogram p95 of
+600 seconds is not a useful tail estimate: no finite bucket extends above 600.
+Sources: [SCALING-RESULTS.md:12-76](../tmp/tlsbatch-live/SCALING-RESULTS.md),
+`scaling/baseline-raw-results.json:3-35`, `scaling/raw-results.json:3-37,97-105`.
+Restoration and spec-preservation receipts are in `SCALING-RESULTS.md:211-224`.
+
+### Primary constraints: storage service and cache turnover
+
+1. **Strongest evidence: storage-backed page-service latency, especially ddsv6
+   under 2/2.** That pool accounted for **327/447 failures (73.15%)**. Its sampled
+   device showed **48.69-ms await, average queue 84.87 and 83.05% I/O time**.
+   Error-selected diagnostics show noncanceled Gantry page-validation 503s and
+   DP **file-read** stalls: a **1-MiB read pending in submission/kernel for
+   1,006 ms**, with 2,232-ms accumulated read wait versus 27-ms socket wait.
+   This supports a storage-tail/admission-deadline constraint, not a proven
+   hardware IOPS ceiling or a claim that every sampled body failed
+   (`SCALING-RESULTS.md:81-115,153-205`).
+2. **Working 1/1 still churns the cache.** Four-pool direct samples showed DP
+   I/O PSI full **65.74-87.17%**, about **2,285 page fills and 2,284 disk evictions/s**
+   fleet-wide, and **172-228 MB/s reclaim** on sampled nodes. Near the 8-GiB
+   cgroup limit, about 7.3 GiB was file cache and 1.1 GiB anonymous memory. The
+   80-GB sequential pass exceeds both RAM residency and local payload capacity;
+   distributed hits still cause receiver-side writes. These are per-hop cache
+   events and short node samples, not an end-to-end hit ratio or uniform fleet
+   disk ceiling ([BOTTLENECKS-1-1.md:23-61](../tmp/tlsbatch-live/BOTTLENECKS-1-1.md)).
+3. **Scrub/readahead interference is plausible, not isolated.** The scrub code
+   allows a 64-MiB read per worker with a one-second cooldown after completion;
+   **128 MiB/s for two workers is a logical code cadence bound, not measured
+   background disk traffic**. ddsv6's **64-MiB readahead** is a configured value,
+   not proof each read transfers that much (`BOTTLENECKS-1-1.md:82-103`;
+   `cmd/racer-dataplane/src/cache.rs:88-129`, `src/allocator.rs:1127-1156`).
+4. **CPU quota and sampled network drops are not the primary measured limit.**
+   CPU throttling was zero; sampled interfaces had no drops/errors. Working 1/1
+   carried about **152.18 GB/s software-TLS traffic**, which establishes transport
+   work, **not a network/TLS throughput ceiling**. The 2/2 file-payload rate reached
+   258.310 GB/s. No hardware link-capacity percentage is inferred; the zero peer
+   response-byte metric still does not mean no peer payload
+   (`BOTTLENECKS-1-1.md:70-80,105-118`; `SCALING-RESULTS.md:117-151`).
+
+### Diagnostics and bounded fix scope
+
+The diagnostic progression separated local candidate expiry during publication
+or peer-body reads from relayed failures. Those records remain useful even
+though the earlier blanket acceptance conclusion is superseded
+(`tmp/tlsbatch-live/RESULTS.md:89-136`). DP **2ae** changes software-TLS filesystem
+read batches from 64 KiB to **1 MiB**, independently of the bounded TLS write
+quantum: a full 64-MiB page needs **64 rather than 1,024 serial file reads**.
+It retains one bounded read buffer per body without accumulating reads behind
+socket backpressure (`2ae43d5e:cmd/racer-dataplane/src/http_server.rs:1290-1294,1530-1545`).
+Its test crosses unaligned multi-batch boundaries, checks exact bytes and read
+counts, and exercises cancellation/extent release under queued I/O
+(`2ae43d5e:cmd/racer-dataplane/tests/http/tls.rs:661-817`). Successful image workflow
+[36082164238](https://github.com/Azure/unbounded/actions/runs/36082164238) and the
+deployed digest are recorded in `tmp/tlsbatch-live/RESULTS.md:7-19`.
+
+**Outcome:** working full-fleet 80-GB operation is established; the reliable
+tested profile is 1/1. Storage/cache-turnover efficiency and shared-path latency
+are the primary follow-up targets. The batching mechanism is verified in code
+and tests, but this sequence does not prove it created functionality already
+demonstrated on 5affe or isolate its performance contribution. The earlier raw
+1-GB-object regression likewise remains a separate, unretested workload.
+
+## Historical September 24 results and follow-ups
+
+The sections below retain their original time-scoped evidence, including the
+existing uncommitted 80-GB and resource-tuning follow-ups. Their historical
+"final" states are superseded by the September 25 state above.
+
 ## Final verdict
 
 The matched **4206056a** deployment completed the 1,500-client image comparison.
@@ -300,3 +431,97 @@ is claimed.**
 - Final live verification again found operator 1/1, CP 2/2, registry 1/1, and
   DP, Gantry, and image clients each 1,500/1,500 ready. Image clients remain at
   four concurrent images and three concurrent layers per image.
+
+## Follow-up: 80-GB image exceeding per-node cache
+
+At the user's request, the same 4206056a deployment was reconfigured to one
+**80,000,000,000-byte image**, comprising 80 unique 1-GB layers, with **eight
+concurrent images and eight concurrent layers per image** on each of 1,500
+clients. The image is 74.506 GiB, exceeding the unchanged 50-GiB node cache.
+Client limits remain 2 CPU/1 GiB; the image deadline is now 30 minutes.
+
+Catalog size and manifest digest were checked, and independent bounded warmup
+reads verified all 80 layers through Gantry. Under the requested fleet load,
+however, **no complete image succeeded**. At 16:49:33 UTC there were 473,338
+failed image attempts and 64 successful full-layer transfers since client restart.
+
+The final five-minute rate sample recorded:
+
+| Metric | Value |
+| --- | ---: |
+| Verified complete-image goodput | **0 B/s** |
+| Verified full-layer progress | 187.5 MB/s |
+| Failed images | 1,610.93/s |
+| Gantry aborted responses | 12,768.51/s |
+| Gantry fallback | 147.52/s |
+| Successful peer software-TLS file writes | 9.648 GB/s |
+| Received bytes including failed/partial transfers | 2.481 TB/s |
+
+The received-byte rate is **not goodput**. Repeated unexpected EOF errors
+coincided with busy/deadline responses and circuit-breaker rejection. The registry
+remained healthy with no OOM or restart. Exact causality is unresolved; the
+30-minute client deadline does not extend Racer's internal request deadlines.
+The saved range includes startup lookbacks and is a failure observation rather
+than a steady-state comparison.
+
+All 1,500 clients remain ready at **8/8**, with standard Linux/Site selectors and
+maxUnavailable 25. This supersedes the preceding final 4/3 workload state, not
+its historical measurements. Evidence and size-correct queries are retained in
+`tmp/racer-rollout-20260923/IMAGE80-RESULTS.md`, `image80-catalog.json`,
+`image80-warm-summary.json`, `image80-window.json`, and `image80-summary.json`.
+
+## Follow-up: automatic Racer resource tuning
+
+The user requested higher worker, shard, and buffer counts with low Kubernetes
+requests and no Racer CPU/memory limits. Commit
+`fef7d4a85e6543c1591cd2ce9c0b79102e5b95ec` implements host-budget-aware sizing.
+The operator, control plane, and dataplane were deployed from successful image
+workflow runs 36035583121, 36035583124, and 36035583139. The coordinated replacement
+started at approximately 17:41 UTC; the new operator resumed at 17:43:40 UTC.
+
+Live operator overrides request 250m CPU/512 MiB for each dataplane and 250m
+CPU/256 MiB for each control plane, without CPU/memory limits. Bootstrap requests
+100m CPU/128 MiB, also without limits. The memlock ceiling is 8 GiB and startup
+allowance is 600 seconds. Gantry and image-client resources were not changed.
+
+Initial live status captures, rather than sizing predictions, show:
+
+| Node type | I/O workers | Compute workers | Buffers per NUMA pool | Shards |
+| --- | ---: | ---: | ---: | ---: |
+| Worker | 2 | 2 | 16 | 8 |
+| System | 4 | 4 | 31 | 16 |
+
+The previous profile was one I/O worker, one compute worker, eight buffers, and
+four shards. Status reports no CPU quota. Worker-node buffer pools occupy 1 GiB;
+system-node pools occupy 1.9375 GiB. These are startup observations during fleet
+convergence, not a completed throughput comparison.
+
+The new worker layout uses `/var/lib/racer/cache-tuned-v1.slab`; the prior slab
+is retained. All 1,500 preflight disk receipts passed, with minimum free space
+77.166 GiB. Node cache intent remains 50 GiB, but fresh processes initially open
+10 GiB and receive the 50-GiB policy asynchronously. This introduces a cold-cache
+and storage-convergence phase. Existing CA state was retained. The workload
+remains one 80-GB image at 8/8 on all 1,500 clients.
+
+Evidence: `tmp/racer-rollout-20260923/tuning-cutover-timeline.jsonl`,
+`tuning-status-early-0.json`, `tuning-status-rollout-system-1350.json`, and
+`TUNING-DELEGATE-RESULTS.md`.
+
+At 17:48:08 UTC, operator 1/1, CP 2/2, DP 1,500/1,500, Gantry 1,500/1,500,
+and clients 1,500/1,500 were ready. Later status samples across worker and system
+pools confirmed the above tuning with fresh, applied 50-GiB storage; a small
+number of bounded diagnostic requests timed out. This was not a full-fleet
+storage-status census.
+
+The registry independently OOMKilled at 17:47:35 under its unchanged 4-GiB
+limit, then restarted. At 17:49:08, Prometheus scraped all 1,500 dataplanes and
+clients, but complete-image successes remained zero. The five-minute image
+error rate was 654.15/s, with zero verified layer goodput and approximately
+1.797 GB/s received bytes including failures. These lookbacks overlap the
+rollout, cold-cache initialization, and registry restart, so they do not measure
+the steady-state effect of the tuning. The tuning deployment is complete;
+80-GB complete-image throughput recovery is not established.
+
+Receipts: `tuning-poll-20260924T174808Z.json`,
+`tuning-status-settled-900.json`, `tuning-status-settled-1350.json`, and
+`tuning-measure-post-tuning-20260924T174908Z.json` in the same evidence directory.
