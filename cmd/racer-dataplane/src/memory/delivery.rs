@@ -780,10 +780,13 @@ mod tests {
         connection.tx_remaining = Some(3);
         let reader = delivery.attach(page.clone(), slice(0, 2)).unwrap();
         let scope = scope();
-        // A writable socket completes directly through the pipe without submitting
-        // a staging send. Stopping the reactor makes an accidental submission fail.
-        drive(&reactor, reactor.drain()).unwrap();
-        let connection = drive(&reactor, delivery.finish_to(reader, connection, &scope)).unwrap();
+        // A writable socket completes through the pipe before the reactor is driven.
+        let mut operation = delivery.finish_to(reader, connection, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(connection)) = operation.as_mut().poll(&mut cx) else {
+            panic!("writable HTTP socket did not complete synchronously");
+        };
+        assert_eq!(reactor.in_flight(), 0);
         assert_eq!(connection.tx_remaining, Some(1));
         assert!(!connection.is_reusable());
         let reader = delivery.attach(page, slice(2, 1)).unwrap();
@@ -938,6 +941,46 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         assert!(delivery.pipes.acquire().is_ok());
+    }
+
+    #[test]
+    fn reactor_drain_fences_pending_http_delivery_and_releases_all_leases() {
+        for abandon in [false, true] {
+            let (admission, reactor, delivery) = setup(1, Duration::from_secs(30));
+            let page = page(&admission, vec![0x5a; 512 * 1024]);
+            let weak = Arc::downgrade(&page.inner);
+            let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            small_send_buffer(&socket);
+            let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            connection.tx_remaining = Some(512 * 1024);
+            let scope = scope();
+            let mut operation = delivery.finish_to(reader, connection, &scope);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(reactor.in_flight(), 1);
+            let operation = if abandon {
+                drop(operation);
+                None
+            } else {
+                Some(operation)
+            };
+            assert!(weak.upgrade().is_some());
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            // drain is a completion fence, not a blocking shutdown call. The
+            // driver must keep polling CQEs until the outstanding send is fenced.
+            drive(&reactor, reactor.drain()).unwrap();
+            if let Some(operation) = operation {
+                assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
+            }
+            assert_eq!(reactor.in_flight(), 0);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+            assert_eq!(scope.check(), Ok(()));
+        }
     }
 
     #[test]
