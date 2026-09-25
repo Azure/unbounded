@@ -156,6 +156,17 @@ mod tests {
             number: PageNumber(number),
         }
     }
+
+    #[test]
+    fn golden_page_to_rail_vectors() {
+        let route = route(|_| {});
+        for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 7)] {
+            assert_eq!(
+                Rails.select(&route, &page(number)).unwrap(),
+                TransportPlan::Rdma { rail: RailId(rail) }
+            );
+        }
+    }
     fn route(change: impl FnOnce(&mut Vec<super::super::membership::Member>)) -> Route {
         let mut members: Vec<_> = (0..3)
             .map(|i| {

@@ -221,6 +221,86 @@ mod tests {
     };
 
     #[test]
+    fn golden_slot_and_weighted_ranking_vectors() {
+        let members = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                [1, 3, 6, 4]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, weight)| member(i, weight))
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let placement = Placement::new(3);
+        for (page, expected_slot, expected_order) in [
+            (0, 887_651, [1, 3, 2]),
+            (1, 348_931, [3, 2, 1]),
+            (u64::MAX, 665_200, [2, 1, 3]),
+        ] {
+            assert_eq!(slot(&object(), PageNumber(page)), expected_slot);
+            let ranking = placement
+                .rank(members.clone(), &object(), PageNumber(page))
+                .unwrap();
+            assert_eq!(ranking.ordered, expected_order.map(|i| member(i, 1).node));
+        }
+        for (sample, cost) in [
+            (0xe41095812e885f6f, 715_971_622),
+            (0xc4251196ce419070, 1_650_232_626),
+            (0x9322018f0806e768, 3_431_784_333),
+            (0xb379deaba20d903a, 2_200_536_977),
+        ] {
+            assert_eq!(exponential_cost(sample), cost);
+        }
+    }
+
+    #[test]
+    fn addition_removal_preserve_survivor_order_and_old_snapshot_rankings() {
+        let old = membership(12);
+        let mut added = old.members().to_vec();
+        added.push(member(12, 4));
+        let added = Arc::new(Membership::validate(MembershipVersion(2), added).unwrap());
+        let removed = Arc::new(
+            Membership::validate(MembershipVersion(3), old.members()[1..].to_vec()).unwrap(),
+        );
+        let placement = Placement::new(6);
+        for page in 0..100 {
+            let original = placement
+                .rank(old.clone(), &object(), PageNumber(page))
+                .unwrap()
+                .ordered;
+            let extended = placement
+                .rank(added.clone(), &object(), PageNumber(page))
+                .unwrap()
+                .ordered;
+            let survivors: Vec<_> = extended
+                .iter()
+                .filter(|node| **node != member(12, 1).node)
+                .cloned()
+                .collect();
+            assert_eq!(&original[..survivors.len()], survivors);
+            let reduced = placement
+                .rank(removed.clone(), &object(), PageNumber(page))
+                .unwrap()
+                .ordered;
+            let survivors: Vec<_> = original
+                .iter()
+                .filter(|node| **node != member(0, 1).node)
+                .cloned()
+                .collect();
+            assert_eq!(&reduced[..survivors.len()], survivors);
+            assert_eq!(
+                placement
+                    .rank(old.clone(), &object(), PageNumber(page))
+                    .unwrap()
+                    .ordered,
+                original
+            );
+        }
+    }
+
+    #[test]
     fn integer_log_edges_and_ties() {
         assert_eq!(exponential_cost(0), 64 << 32);
         assert_eq!(exponential_cost(u64::MAX), 1);

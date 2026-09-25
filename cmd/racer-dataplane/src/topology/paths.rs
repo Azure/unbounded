@@ -10,7 +10,7 @@ use crate::{
     runtime::deadline::Deadline,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{Arc, Weak},
@@ -114,6 +114,14 @@ pub struct Paths {
     capacity: usize,
     search_work: usize,
     cache: RefCell<PathCache>,
+    active_searches: Cell<usize>,
+}
+
+struct SearchAdmission<'a>(&'a Cell<usize>);
+impl Drop for SearchAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 impl Paths {
     pub fn new(health: Rc<LinkHealth>, capacity: usize, search_work: usize) -> Self {
@@ -122,6 +130,7 @@ impl Paths {
             capacity,
             search_work,
             cache: RefCell::new(PathCache::default()),
+            active_searches: Cell::new(0),
         }
     }
     pub fn shortest(
@@ -134,6 +143,7 @@ impl Paths {
         if let Some(route) = self.cached(&membership, &key) {
             return Ok(route);
         }
+        let _admission = self.admit_search()?;
         let mut search = Search::new(membership.members().len(), &key, self.search_work);
         while !search.step(256, budget.deadline)? {}
         let nodes = search.finish()?;
@@ -154,6 +164,7 @@ impl Paths {
             if let Some(route) = self.cached(&membership, &key) {
                 return Ok(route);
             }
+            let _admission = self.admit_search()?;
             let mut search = Search::new(membership.members().len(), &key, self.search_work);
             std::future::poll_fn(|cx| match search.step(256, budget.deadline) {
                 Ok(true) => Poll::Ready(Ok(())),
@@ -172,6 +183,16 @@ impl Paths {
             self.store(&membership, key, &nodes);
             Ok(route(membership, &nodes))
         })
+    }
+
+    fn admit_search(&self) -> Result<SearchAdmission<'_>> {
+        // Bound aggregate scratch memory as well as work per operation. Even a
+        // disabled route cache permits one cold computation at a time.
+        if self.active_searches.get() >= self.capacity.clamp(1, 8) {
+            return Err(Error::Overloaded);
+        }
+        self.active_searches.set(self.active_searches.get() + 1);
+        Ok(SearchAdmission(&self.active_searches))
     }
 
     fn key(
@@ -637,6 +658,82 @@ mod tests {
                 )
                 .unwrap_err(),
             Error::Overloaded
+        );
+    }
+
+    #[test]
+    fn filtered_paths_match_oracle_and_bound_no_path_results() {
+        let n = 401;
+        let members = membership(n);
+        for source in [0, 37, 211, 400] {
+            let health = Rc::new(LinkHealth::new(36));
+            let failed: Vec<_> = neighbor_positions(n, source)
+                .into_iter()
+                .step_by(2)
+                .collect();
+            for &neighbor in &failed {
+                health
+                    .observe_at(
+                        &members.members()[neighbor].node,
+                        LinkOutcome::Timeout,
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .unwrap();
+            }
+            let paths = Paths::new(health, 2, 100_000);
+            for destination in (0..n).step_by(7).filter(|to| *to != source) {
+                let forbidden: Vec<_> = [5, 18, 309]
+                    .into_iter()
+                    .filter(|i| *i != source && *i != destination)
+                    .collect();
+                for links in [1, 2, 4] {
+                    let mut request = budget(&members, destination, links);
+                    request.visited = forbidden
+                        .iter()
+                        .map(|&i| members.members()[i].node.clone())
+                        .collect();
+                    let actual =
+                        paths.shortest(members.clone(), &members.members()[source].node, &request);
+                    match oracle(n, source, destination, links, &forbidden, &failed) {
+                        Some(expected) => assert_eq!(
+                            actual.unwrap().nodes,
+                            expected
+                                .iter()
+                                .map(|&i| members.members()[i].node.clone())
+                                .collect::<Vec<_>>()
+                        ),
+                        None => assert_eq!(actual.unwrap_err(), Error::Unavailable),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cooperative_search_admission_cancellation_and_deadline() {
+        use std::task::Context;
+        let members = membership(100_000);
+        let paths = Paths::new(Rc::new(LinkHealth), 1, 150_000);
+        let source = &members.members()[0].node;
+        let request = budget(&members, 99_999, 4);
+        let mut operation = paths.shortest_async(members.clone(), source, &request);
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(operation.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            paths
+                .shortest(members.clone(), source, &request)
+                .unwrap_err(),
+            Error::Overloaded
+        );
+        drop(operation);
+        assert_eq!(paths.active_searches.get(), 0);
+        assert!(paths.shortest(members.clone(), source, &request).is_ok());
+        let key = paths.key(&members, source, &request).unwrap();
+        let mut search = Search::new(members.members().len(), &key, 150_000);
+        assert!(!search.step(1, request.deadline).unwrap());
+        assert_eq!(
+            search.step(1, Deadline(Instant::now())),
+            Err(Error::DeadlineExceeded)
         );
     }
 }
