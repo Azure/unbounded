@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! TLS 1.3 over OpenSSL's native socket BIO, including negotiated Linux kTLS.
+//! TLS 1.3 over OpenSSL's native socket BIO, requiring Linux kTLS in both directions.
 //!
 //! A session owns its socket. After a WANT result, poll the indicated direction
 //! and retry the operation. Application bytes must never bypass this session.
+//! Missing offload or a failed KeyUpdate permanently rejects the session.
 
 mod channel;
 pub use channel::TlsChannel;
@@ -549,32 +550,27 @@ impl TlsContext {
         certificate_pem: &[u8],
         private_key_pem: &[u8],
     ) -> io::Result<Self> {
-        Self::build(bundle, Some((certificate_pem, private_key_pem)), true)
+        Self::build(bundle, Some((certificate_pem, private_key_pem)))
     }
 
     /// Only for enrollment. Peer/server verification remains mandatory.
     pub fn bootstrap(bundle: &TrustBundle) -> io::Result<Self> {
-        Self::build(bundle, None, true)
+        Self::build(bundle, None)
     }
 
-    fn build(
-        bundle: &TrustBundle,
-        identity: Option<(&[u8], &[u8])>,
-        ktls: bool,
-    ) -> io::Result<Self> {
-        Self::build_inner(Some(bundle), identity, ktls)
+    fn build(bundle: &TrustBundle, identity: Option<(&[u8], &[u8])>) -> io::Result<Self> {
+        Self::build_inner(Some(bundle), identity)
     }
 
     /// Development benchmarks only: accept untrusted certificates with the expected identity.
     #[cfg(feature = "dev-bench")]
     pub(crate) fn benchmark(certificate: &[u8], key: &[u8]) -> io::Result<Self> {
-        Self::build_inner(None, Some((certificate, key)), true)
+        Self::build_inner(None, Some((certificate, key)))
     }
 
     fn build_inner(
         bundle: Option<&TrustBundle>,
         identity: Option<(&[u8], &[u8])>,
-        ktls: bool,
     ) -> io::Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(ssl_error)?;
         builder
@@ -601,13 +597,11 @@ impl TlsContext {
         }
         // Benchmark fidelity: benchmark() shares all record/cipher/kTLS settings
         // below. Only certificate trust differs, outside the measurement window.
-        // Prefer AES-GCM supported by kTLS; allow ChaCha20 for encrypted fallback.
+        // Restrict negotiation to TLS 1.3 AES-GCM supported by Linux kTLS.
         builder
-            .set_ciphersuites(
-                "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256",
-            )
+            .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")
             .map_err(ssl_error)?;
-        if unsafe { racer_tls_configure(builder.as_ptr().cast(), i32::from(ktls)) } != 1 {
+        if unsafe { racer_tls_configure(builder.as_ptr().cast()) } != 1 {
             return Err(ssl_error(openssl::error::ErrorStack::get()));
         }
         let mut local_expiry_unix = None;
@@ -683,7 +677,7 @@ struct NativeResult {
 }
 
 unsafe extern "C" {
-    fn racer_tls_configure(ctx: *mut c_void, ktls: i32) -> i32;
+    fn racer_tls_configure(ctx: *mut c_void) -> i32;
     fn racer_tls_set_fd(ssl: *mut c_void, fd: i32, server: i32) -> i32;
     fn racer_tls_handshake(ssl: *mut c_void) -> NativeResult;
     fn racer_tls_read(ssl: *mut c_void, buf: *mut u8, len: usize) -> NativeResult;
@@ -832,13 +826,25 @@ impl TlsSession {
         let result = unsafe { racer_tls_handshake(self.ssl.as_ptr().cast()) };
         match self.decode(result)? {
             TlsProgress::Complete(_) => {
-                // Mark failed before checking identity, so even a caller ignoring
-                // the authentication error cannot read or write application data.
+                // Latch rejection before checking offload and identity, so even
+                // a caller ignoring the error cannot retry or use application I/O.
                 self.failed = true;
                 if self.ssl.verify_result() != openssl::x509::X509VerifyResult::OK
                     || self.ssl.session_reused()
                 {
                     return Err(invalid("TLS peer verification or full handshake failed"));
+                }
+                let bits = unsafe { racer_tls_offload(self.ssl.as_ptr().cast()) };
+                self.offload = Offload {
+                    tx: bits & 1 != 0,
+                    rx: bits & 2 != 0,
+                };
+                if !self.offload.tx || !self.offload.rx {
+                    return Err(invalid(format!(
+                        "TLS requires actual TX and RX kTLS offload (TX={}, RX={}); \
+                         use a kTLS-capable Linux kernel and OpenSSL >= 3.5 built with enable-ktls",
+                        self.offload.tx, self.offload.rx,
+                    )));
                 }
                 let cert = self
                     .ssl
@@ -869,12 +875,7 @@ impl TlsSession {
                         self.peer = Some(actual);
                     }
                 }
-                let bits = unsafe { racer_tls_offload(self.ssl.as_ptr().cast()) };
                 self.peer_expiry_unix = Some(expiry(&cert)?);
-                self.offload = Offload {
-                    tx: bits & 1 != 0,
-                    rx: bits & 2 != 0,
-                };
                 self.counters.handshakes = 1;
                 self.counters.ktls_tx_connections = u64::from(self.offload.tx);
                 self.counters.ktls_rx_connections = u64::from(self.offload.rx);
