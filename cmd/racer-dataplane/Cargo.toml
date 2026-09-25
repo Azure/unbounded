@@ -11,5 +11,19 @@ default = []
 rdma = []
 
 [dependencies]
-# Choose vetted HTTP, crypto, io_uring, and verbs adapters at implementation time.
-# The API scaffold deliberately requires no runtime or native library dependencies.
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+futures = "0.3"
+getrandom = "0.2"
+httparse = "1"
+io-uring = "0.7"
+libc = "0.2"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+x509-parser = { version = "0.16", features = ["verify"] }
+zeroize = "1"
