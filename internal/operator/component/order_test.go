@@ -518,9 +518,9 @@ func TestExecuteRemovesInReverseOrder(t *testing.T) {
 
 	plan := NewPlan()
 	plan.Add(
-		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "storage", Site: "east"},
-		Operation{Kind: OpDelete, Object: serviceAccountObject("agent"), Component: "storage", Site: "east"},
-		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "storage", Site: "east"},
+		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "example", Site: "east"},
+		Operation{Kind: OpDelete, Object: serviceAccountObject("agent"), Component: "example", Site: "east"},
+		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "example", Site: "east"},
 	)
 
 	if _, err := env.Execute(t.Context(), plan); err != nil {
@@ -544,8 +544,8 @@ func TestExecuteFailedWorkloadDeleteGatesItsConfigDelete(t *testing.T) {
 
 	plan := NewPlan()
 	plan.Add(
-		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "storage", Site: "east"},
-		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "storage", Site: "east"},
+		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "example", Site: "east"},
+		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "example", Site: "east"},
 	)
 
 	result, err := env.Execute(t.Context(), plan)
@@ -563,7 +563,7 @@ func TestExecuteFailedWorkloadDeleteGatesItsConfigDelete(t *testing.T) {
 
 // TestExecuteSharedFailureGatesEveryContributingSite is a regression test.
 //
-// metalman and storage plan identical support RBAC for every Site, and it is
+// Per-Site components plan identical support RBAC for every Site, and it is
 // deduplicated so the write happens once. The failure was recorded against the
 // retained operation's Site alone, so every other Site went on to apply
 // workloads referencing a ServiceAccount that had never been created.
@@ -576,9 +576,9 @@ func TestExecuteSharedFailureGatesEveryContributingSite(t *testing.T) {
 		return Operation{
 			Kind:      OpApply,
 			Object:    serviceAccountObject("shared"),
-			Component: "storage",
+			Component: "example",
 			Site:      site,
-			SharedKey: "storage/shared/sa",
+			SharedKey: "example/shared/sa",
 		}
 	}
 
@@ -586,8 +586,8 @@ func TestExecuteSharedFailureGatesEveryContributingSite(t *testing.T) {
 	plan.Add(
 		shared("east"),
 		shared("west"),
-		Operation{Kind: OpApply, Object: daemonSetObject("agent-east"), Component: "storage", Site: "east"},
-		Operation{Kind: OpApply, Object: daemonSetObject("agent-west"), Component: "storage", Site: "west"},
+		Operation{Kind: OpApply, Object: daemonSetObject("agent-east"), Component: "example", Site: "east"},
+		Operation{Kind: OpApply, Object: daemonSetObject("agent-west"), Component: "example", Site: "west"},
 	)
 
 	result, err := env.Execute(t.Context(), plan)

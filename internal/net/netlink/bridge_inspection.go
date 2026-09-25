@@ -662,6 +662,7 @@ func newBridgeInspectionRouteSocketWithOperations(
 	}
 
 	closeOnError := true
+
 	defer func() {
 		if closeOnError {
 			socket.Close()

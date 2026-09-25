@@ -2040,6 +2040,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.mu.Unlock()
 
 	committed := false
+
 	defer func() {
 		if committed {
 			return

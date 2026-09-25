@@ -11,7 +11,6 @@ unbounded-kube is organized into several directories:
 - `api/` - where API definitions for custom resources are located.
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
-  - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -24,7 +23,6 @@ unbounded-kube is organized into several directories:
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unbounded-storage` - sources for the Rust unbounded-storage daemon. It has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the Go-oriented rules in this file largely do not apply there.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
@@ -74,7 +72,7 @@ unbounded-kube is organized into several directories:
   not `behaviour`, `initialise`, `labelled`, `catalogue`, `defence`, `judgement`. This applies to comments, doc
   strings, identifiers, user-facing strings, and Markdown, in every language in the repo.
   `make lint` catches the common cases in Go via `misspell`, but its dictionary is not exhaustive: it misses
-  `judgement` and `acknowledgement`, and it does not look at Rust, shell, TLA+, or Markdown at all. Treat it as
+  `judgement` and `acknowledgement`, and it does not look at shell or Markdown at all. Treat it as
   a backstop, not the rule.
   `make fmt` runs `golangci-lint --fix`, so `misspell` rewrites Go sources in place. When a British spelling is
   deliberate, it needs an exclusion in `.golangci.yaml` or the next `make fmt` will silently undo it.

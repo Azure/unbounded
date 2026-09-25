@@ -8,7 +8,6 @@ before:
     - make machina-manifests VERSION={{ .Tag }}
     - make token-refresher-manifests VERSION={{ .Tag }}
     - make net-manifests VERSION={{ .Tag }}
-    - make unbounded-storage-supervisor-manifests VERSION={{ .Tag }}
     - make unbounded-operator-manifests VERSION={{ .Tag }}
 
 builds:

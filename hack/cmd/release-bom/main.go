@@ -42,7 +42,6 @@ var releaseImageNames = []string{
 	"unbounded-net-controller",
 	"unbounded-net-node",
 	"unbounded-operator",
-	"unbounded-storage-supervisor",
 }
 
 type options struct {
@@ -218,8 +217,6 @@ func releaseArtifacts(tag string) []releaseArtifact {
 		{Name: "gantry-" + chartVersion + ".tgz", Integrity: "cosign-bundle", SignatureBundle: "gantry-" + chartVersion + ".tgz.bundle.json"},
 		{Name: "unbounded-manifests-" + tag + ".tar.gz", Integrity: "cosign-bundle", SignatureBundle: "unbounded-manifests-" + tag + ".tar.gz.bundle.json"},
 		{Name: "unbounded-operator-" + tag + ".yaml", Integrity: "cosign-bundle", SignatureBundle: "unbounded-operator-" + tag + ".yaml.bundle.json"},
-		{Name: "unbounded-storage-linux-amd64.tar.gz", Integrity: "sha256-and-cosign-bundle", SignatureBundle: "unbounded-storage-linux-amd64.tar.gz.bundle.json"},
-		{Name: "unbounded-storage-linux-arm64.tar.gz", Integrity: "sha256-and-cosign-bundle", SignatureBundle: "unbounded-storage-linux-arm64.tar.gz.bundle.json"},
 		{Name: "unbounded.yaml", Integrity: "contains-archive-sha256"},
 	}
 }
