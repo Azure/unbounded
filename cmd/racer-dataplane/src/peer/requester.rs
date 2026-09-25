@@ -5,7 +5,7 @@ use super::{
     wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
 };
 use crate::{
-    error::{Operation, deferred},
+    error::{Error, Operation},
     runtime::deadline::RequestScope,
     security::forwarding::Forwarding,
     topology::{paths::Paths, rails::Rails},
@@ -57,6 +57,7 @@ pub struct Requester {
     forwarding: Rc<Forwarding>,
     handshake: Rc<Handshake>,
     transfers: Rc<Transfers>,
+    network: Option<Rc<super::PeerNetwork>>,
 }
 impl Requester {
     pub fn new(
@@ -72,7 +73,12 @@ impl Requester {
             forwarding,
             handshake,
             transfers,
+            network: None,
         }
+    }
+    pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
+        self.network = Some(network);
+        self
     }
 }
 impl PeerClient for Requester {
@@ -80,19 +86,50 @@ impl PeerClient for Requester {
     /// using the binding retained from signing. Logical callers retain the proof.
     fn request<'a>(
         &'a self,
-        _request: PeerRequest,
-        _scope: &'a RequestScope,
+        request: PeerRequest,
+        scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
-        deferred("peer.request")
+        Box::pin(async move {
+            let scope = super::request_scope(&request, scope)?;
+            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let search_budget = super::search_budget(&request.route, &network.local)?;
+            let route = self
+                .paths
+                .shortest_async(
+                    network.membership(request.route.membership)?,
+                    &network.local,
+                    &search_budget,
+                )
+                .await?;
+            let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
+            let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
+            let response = self.exchange(signed, &scope).await?;
+            scope.check()?;
+            self.forwarding.verify_response(response, &binding)
+        })
     }
 }
 impl PeerTransport for Requester {
     fn exchange<'a>(
         &'a self,
-        _request: SignedRequest,
-        _scope: &'a RequestScope,
+        request: SignedRequest,
+        scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
-        deferred("peer.exchange")
+        Box::pin(async move {
+            let scope = super::request_scope(&request.request, scope)?;
+            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let budget = &request.request.route;
+            let signed_head = request
+                .authentication
+                .hops
+                .last()
+                .unwrap_or(&request.authentication.original);
+            let next = crate::security::signing::receiver(&signed_head.head)?;
+            // A signature selects the next receiver. Never reroute this envelope
+            // independently after signing, even if link health changes.
+            let endpoint = network.endpoint(budget.membership, &next)?;
+            self.transfers.exchange(endpoint, request, &scope).await
+        })
     }
 }
 #[cfg(test)]
