@@ -968,6 +968,7 @@ impl Ring {
         self.recv_bytes_range(fd, bytes, 0..len)
     }
     /// Buffered file read with owned storage retained through terminal completion.
+    #[cfg(test)]
     pub(crate) fn read_bytes(
         &mut self,
         fd: Descriptor,

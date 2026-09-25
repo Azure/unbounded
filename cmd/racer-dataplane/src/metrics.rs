@@ -466,11 +466,6 @@ impl Registry {
                 tls.ktls_rx_connections,
             ),
             (
-                "tls_encrypted_fallback_connections_total",
-                "Connections using encrypted userspace transmit records.",
-                tls.encrypted_fallback_connections,
-            ),
-            (
                 "tls_tx_bytes_total",
                 "Plaintext bytes encrypted by TLS for transmission.",
                 tls.tx_bytes,
@@ -484,11 +479,6 @@ impl Registry {
                 "tls_sendfile_bytes_total",
                 "File bytes sent with confirmed kernel TLS offload.",
                 tls.sendfile_bytes,
-            ),
-            (
-                "tls_fallback_sendfile_bytes_total",
-                "File bytes sent using bounded encrypted userspace fallback.",
-                tls.fallback_sendfile_bytes,
             ),
         ] {
             writeln!(out, "# HELP racer_dataplane_{name} {help}\n# TYPE racer_dataplane_{name} counter\nracer_dataplane_{name} {value}").unwrap();

@@ -37,9 +37,6 @@ impl TlsChannel {
             ("tls_write_or_admission", None)
         }
     }
-    pub(crate) fn ktls_tx(&self) -> bool {
-        self.session.offload().tx
-    }
     pub(crate) fn new(
         file: File,
         context: &super::TlsContext,
@@ -257,9 +254,6 @@ impl TlsChannel {
     }
     pub fn admits_new_request(&self) -> bool {
         self.ready && !self.expired()
-    }
-    pub(crate) fn record_fallback_sendfile_bytes(&mut self, bytes: usize) {
-        self.session.record_fallback_sendfile_bytes(bytes);
     }
 }
 impl Drop for TlsChannel {

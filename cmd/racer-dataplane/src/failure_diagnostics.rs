@@ -37,11 +37,6 @@ pub(crate) struct BodyTrace {
     pub remaining: u64,
     pub deadline: Instant,
     pub io: Option<IoState>,
-    pub last_read: Option<IoState>,
-    pub read_count: u64,
-    pub read_bytes: u64,
-    pub read_wait_ms: u128,
-    pub max_read_wait_ms: u128,
     pub file_wait_ms: u128,
     pub socket_wait_ms: u128,
     pub other_wait_ms: u128,
@@ -62,11 +57,6 @@ impl BodyTrace {
             remaining,
             deadline,
             io: None,
-            last_read: None,
-            read_count: 0,
-            read_bytes: 0,
-            read_wait_ms: 0,
-            max_read_wait_ms: 0,
             file_wait_ms: 0,
             socket_wait_ms: 0,
             other_wait_ms: 0,
@@ -79,7 +69,7 @@ impl BodyTrace {
         let now = crate::environment::now();
         let elapsed = now.saturating_duration_since(self.sampled_at).as_millis();
         match self.stage {
-            "file_read" | "splice_file" | "ktls_slab_rate" => self.file_wait_ms += elapsed,
+            "splice_file" | "ktls_slab_rate" => self.file_wait_ms += elapsed,
             "tls_socket_readiness"
             | "socket_send"
             | "buffer_send"
@@ -99,16 +89,6 @@ impl BodyTrace {
         self.io = io;
         self.sampled_at = now;
     }
-    pub(crate) fn read_completed(&mut self, io: Option<IoState>) {
-        if let Some(io) = io {
-            self.read_count += 1;
-            self.read_bytes += io.result.unwrap_or(0).max(0) as u64;
-            let wait = io.age_ms.saturating_sub(io.completion_age_ms.unwrap_or(0));
-            self.read_wait_ms += wait;
-            self.max_read_wait_ms = self.max_read_wait_ms.max(wait);
-            self.last_read = Some(io);
-        }
-    }
     pub(crate) fn record(
         &self,
         site: &'static str,
@@ -119,8 +99,7 @@ impl BodyTrace {
             "worker":std::thread::current().name(),"stage":self.stage,"stage_ms":now.saturating_duration_since(self.stage_since).as_millis(),
             "sent":self.sent,"remaining":self.remaining,"elapsed_ms":now.saturating_duration_since(self.started).as_millis(),
             "no_progress_ms":now.saturating_duration_since(self.last_progress).as_millis(),"deadline_remaining_ms":self.deadline.saturating_duration_since(now).as_millis(),
-            "snapshot_age_ms":now.saturating_duration_since(self.sampled_at).as_millis(),"io":self.io,"last_read":self.last_read,
-            "read_count":self.read_count,"read_bytes":self.read_bytes,"read_wait_ms":self.read_wait_ms,"max_read_wait_ms":self.max_read_wait_ms,
+            "snapshot_age_ms":now.saturating_duration_since(self.sampled_at).as_millis(),"io":self.io,
             "file_wait_ms":self.file_wait_ms,"socket_wait_ms":self.socket_wait_ms,"other_wait_ms":self.other_wait_ms,
             "error_kind":error.map(|e|format!("{:?}",e.kind())),"errno":error.and_then(|e|e.raw_os_error())})
     }
