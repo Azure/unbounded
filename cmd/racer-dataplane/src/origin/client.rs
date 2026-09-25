@@ -9,7 +9,10 @@ use super::{
     protocol,
 };
 use crate::{
-    control::snapshot::SnapshotStore,
+    control::{
+        caches::{CacheDefinition, canonical_socket_paths},
+        snapshot::SnapshotStore,
+    },
     error::{Error, Operation, Result},
     http::{
         codec::{Header, MessageHead, StartLine},
@@ -31,7 +34,10 @@ use crate::{
         reactor::{Completion, IoBuffer},
     },
 };
-use std::rc::Rc;
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 pub trait Origin {
     /// Consume the fill's atomically admitted plaintext budget.
     fn page_reserved<'a>(
@@ -74,6 +80,7 @@ pub struct OriginClient {
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
     buffers: Option<(Rc<Admission>, Rc<BufferPool>)>,
+    socket_root: PathBuf,
 }
 impl OriginClient {
     pub fn new(snapshots: Rc<SnapshotStore>, pool: Rc<HttpPool>, io: Rc<HttpIo>) -> Self {
@@ -82,6 +89,7 @@ impl OriginClient {
             pool,
             io,
             buffers: None,
+            socket_root: PathBuf::from("/run/racer"),
         }
     }
 
@@ -89,6 +97,28 @@ impl OriginClient {
     pub fn with_buffers(mut self, admission: Rc<Admission>, buffers: Rc<BufferPool>) -> Self {
         self.buffers = Some((admission, buffers));
         self
+    }
+
+    /// Remap canonical published endpoints to `<root>/<cache name>/origin/socket`.
+    /// The deployment root must be an absolute, lexically canonical directory path
+    /// without NUL, empty, `.` or `..` components. This performs no filesystem I/O;
+    /// the caller provisions and owns the directories (including any symlink policy).
+    /// The complete resolved endpoint is checked against Linux's 107-byte UDS cap.
+    pub fn with_socket_root(mut self, root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let bytes = root.as_os_str().as_encoded_bytes();
+        if !root.is_absolute()
+            || bytes.contains(&0)
+            || (bytes != b"/"
+                && bytes[1..]
+                    .split(|b| *b == b'/')
+                    .any(|part| part.is_empty() || part == b"." || part == b".."))
+            || root.join("a/origin/socket").as_os_str().len() > 107
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.socket_root = root;
+        Ok(self)
     }
 
     async fn bootstrap_at(
@@ -160,7 +190,7 @@ impl OriginClient {
             .iter()
             .find(|cache| cache.id == context.object.cache)
             .ok_or(Error::Unavailable)?;
-        Ok(Endpoint::Unix(cache.origin_socket.clone()))
+        Ok(Endpoint::Unix(resolve_socket(&self.socket_root, cache)?))
     }
 
     async fn metadata_at(
@@ -316,6 +346,22 @@ impl OriginClient {
             lease: connection,
         })
     }
+}
+
+fn resolve_socket(root: &Path, cache: &CacheDefinition) -> Result<PathBuf> {
+    // Keep publications canonical even when the local deployment root differs.
+    // Derive the suffix from the validated name, never an arbitrary supplied path.
+    let (client, origin) = canonical_socket_paths(&cache.name)?;
+    if cache.client_socket.as_os_str() != client.as_os_str()
+        || cache.origin_socket.as_os_str() != origin.as_os_str()
+    {
+        return Err(Error::InvalidRequest);
+    }
+    let endpoint = root.join(&cache.name).join("origin/socket");
+    if endpoint.as_os_str().len() > 107 {
+        return Err(Error::InvalidConfiguration);
+    }
+    Ok(endpoint)
 }
 impl Origin for OriginClient {
     fn page_reserved<'a>(

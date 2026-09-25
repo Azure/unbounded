@@ -84,6 +84,209 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
     )
 }
 
+fn published_client() -> (
+    OriginClient,
+    Rc<Admission>,
+    Rc<Reactor>,
+    crate::control::snapshot::SnapshotLease,
+) {
+    let (mut client, admission, reactor) = client();
+    let publication = crate::control::wire::decode_publication(include_bytes!(
+        "../control/testdata/publication.json"
+    ))
+    .unwrap();
+    client.snapshots = Rc::new(SnapshotStore::new(
+        publication.cluster.clone(),
+        Arc::new(PublishedState::default()),
+        2,
+    ));
+    let snapshot = client.snapshots.publish(publication).unwrap();
+    (client, admission, reactor, snapshot)
+}
+
+#[test]
+fn socket_root_is_lexical_and_preserves_canonical_publications() {
+    let (client, _, _, snapshot) = published_client();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    assert_eq!(
+        client.endpoint(&context).unwrap(),
+        Endpoint::Unix("/run/racer/cache-a/origin/socket".into())
+    );
+    let root = PathBuf::from("/nonexistent-racer-fixture-root");
+    let client = client.with_socket_root(root.clone()).unwrap();
+    assert_eq!(
+        client.endpoint(&context).unwrap(),
+        Endpoint::Unix(root.join("cache-a/origin/socket"))
+    );
+    assert_eq!(
+        snapshot.caches[0].origin_socket,
+        PathBuf::from("/run/racer/cache-a/origin/socket")
+    );
+    context.object.cache = CacheId("unknown".into());
+    assert_eq!(client.endpoint(&context), Err(Error::Unavailable));
+
+    for root in [
+        "", "relative", ".", "/a/../b", "/a/./b", "/a//b", "/a/", "//a", "/a\0b",
+    ] {
+        let (client, _, _) = self::client();
+        assert!(
+            matches!(
+                client.with_socket_root(root),
+                Err(Error::InvalidConfiguration)
+            ),
+            "{root:?}"
+        );
+    }
+    let (client, _, _) = self::client();
+    assert!(client.with_socket_root("/").is_ok());
+    let mut cache = snapshot.caches[0].clone();
+    for path in ["/elsewhere/socket", "/run/racer/cache-a/origin//socket"] {
+        cache.origin_socket = path.into();
+        assert_eq!(
+            resolve_socket(Path::new("/fixture"), &cache),
+            Err(Error::InvalidRequest)
+        );
+    }
+    cache = snapshot.caches[0].clone();
+    cache.name = "../escape".into();
+    assert_eq!(
+        resolve_socket(Path::new("/fixture"), &cache),
+        Err(Error::InvalidRequest)
+    );
+
+    let suffix = "/cache-a/origin/socket";
+    let root = PathBuf::from(format!("/{}", "x".repeat(107 - suffix.len() - 1)));
+    let (client, _, _, snapshot) = published_client();
+    let client = client.with_socket_root(root.clone()).unwrap();
+    assert_eq!(
+        resolve_socket(&client.socket_root, &snapshot.caches[0])
+            .unwrap()
+            .as_os_str()
+            .len(),
+        107
+    );
+    let too_long = PathBuf::from(format!("{}x", root.display()));
+    assert_eq!(
+        resolve_socket(&too_long, &snapshot.caches[0]),
+        Err(Error::InvalidConfiguration)
+    );
+    let (client, _, _) = self::client();
+    assert!(matches!(
+        client.with_socket_root(format!("/{}", "x".repeat(107))),
+        Err(Error::InvalidConfiguration)
+    ));
+}
+
+#[test]
+fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
+    use crate::{
+        peer::{
+            requester::PeerClient,
+            wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
+        },
+        read::candidates::{CandidatePolicy, CandidateResolution},
+        topology::placement::Placement,
+    };
+    use std::os::fd::AsRawFd;
+    struct NoPeers;
+    impl PeerClient for NoPeers {
+        fn request<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("rank-zero origin candidate must not probe peers")
+        }
+    }
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("origin-root-{}", std::process::id()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Directory(path.clone());
+    std::fs::create_dir_all(path.join("cache-a/origin")).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let root = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    let listener = UnixListener::bind(root.join("cache-a/origin/socket")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (client, admission, reactor, snapshot) = published_client();
+    let client = client.with_socket_root(root).unwrap();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    let candidates = Placement::new(2)
+        .rank(snapshot.membership.clone(), &context.object, PageNumber(0))
+        .unwrap();
+    let policy = CandidatePolicy::new(
+        candidates.ordered[0].clone(),
+        Rc::new(Placement::new(2)),
+        Rc::new(NoPeers),
+    );
+    let scope = scope();
+    let CandidateResolution::Origin(authority) = block_on(policy.resolve(
+        candidates,
+        &context,
+        PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        },
+        &scope,
+    ))
+    .unwrap() else {
+        panic!("origin authority required");
+    };
+    let mut wrong = OriginContext {
+        object: context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    wrong.object.key.0[0] ^= 1;
+    assert!(matches!(
+        block_on(client.metadata(&authority, &wrong, MetadataSelector::Fresh, &scope)),
+        Err(Error::Unauthorized)
+    ));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At:  1234\r\n\r\n").unwrap();
+    });
+    assert_eq!(
+        drive(
+            &reactor,
+            client.metadata(&authority, &context, MetadataSelector::Fresh, &scope)
+        )
+        .unwrap()
+        .metadata
+        .length,
+        3
+    );
+    assert!(matches!(
+        drive(
+            &reactor,
+            client.metadata(&authority, &context, MetadataSelector::Fresh, &scope)
+        ),
+        Err(Error::BadGateway)
+    ));
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
 fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
