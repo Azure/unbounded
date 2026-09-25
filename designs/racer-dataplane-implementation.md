@@ -43,6 +43,28 @@ and storage/NIC leases after request cancellation. Real implementations must not
 replace production operations with test fakes or unconditional success. Optional
 RDMA falls back to HTTP when native capabilities are unavailable.
 
+## Client/origin integration decisions
+
+The user explicitly confirmed `cmd/racer-dataplane/CLIENT_ORIGIN_API.md` as the
+approved client/origin contract. Read the copy on the original branch at
+`/home/azureuser/code/unbounded/cmd/racer-dataplane/CLIENT_ORIGIN_API.md` when the
+implementation worktree baseline does not contain it. Verify against the actual Go
+SDK and raw Unix sockets. Control-plane design does not replace this wire contract.
+
+Client retains `ReadKind::Head` and adds `HeadPinned { etag: StrongEtag }`.
+Read coordination must handle both variants. Shared `Error` now includes
+`MethodNotAllowed`, `HeaderTooLarge`, `Forbidden`, `NotFound`, `BadGateway`,
+`Internal`, `UnsatisfiableRangeWithLength(u64)`, `OriginRejected`, and
+`OriginForbidden`. Only the two origin-specific rejections may trigger caller-only
+flight failure and reelection; `Unauthorized` is not an origin retry signal.
+
+HTTP raw parsing must require exactly one separator space after `Authorization:`
+and `Racer-Metadata:`. Header decoding must reject a missing separator before it
+loses raw framing information. Client heads are bounded at 32 KiB; opaque fields
+and ETags at 8192 bytes. Origin keeps `OriginClient::new` and may add `with_buffers`
+for admitted body allocation. Client listeners expose accepted-connection futures
+and require explicit application polling.
+
 ## Verification
 
 Each owner adds meaningful success, failure, and edge tests and runs targeted checks.
