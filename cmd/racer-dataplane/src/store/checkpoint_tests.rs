@@ -9,6 +9,129 @@ use std::{
 };
 
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+#[test]
+fn async_retirement_rejects_frozen_cut_and_canceled_submission() {
+    use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
+    use std::time::{Duration, Instant};
+    let directory = Directory::new();
+    let (index, segments) = state(8);
+    let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
+    checkpoint.configure_geometry(geometry()).unwrap();
+    let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ))));
+    let scope = RequestScope::new(
+        crate::model::identity::RequestId([202; 16]),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    for slot in ["checkpoint.0", "checkpoint.1"] {
+        fs::write(directory.0.join(slot), b"retained cut").unwrap();
+    }
+    block_on(checkpoint.snapshot_shard()).unwrap();
+    assert!(matches!(
+        checkpoint.invalidate_persisted_async(reactor.clone(), scope.clone()),
+        Err(Error::Overloaded)
+    ));
+    checkpoint.finish_snapshot();
+    scope.cancel().unwrap();
+    assert_eq!(
+        block_on(
+            checkpoint
+                .invalidate_persisted_async(reactor.clone(), scope)
+                .unwrap()
+        ),
+        Err(Error::Cancelled)
+    );
+    assert_eq!(reactor.in_flight(), 0);
+    for slot in ["checkpoint.0", "checkpoint.1"] {
+        assert_eq!(fs::read(directory.0.join(slot)).unwrap(), b"retained cut");
+    }
+}
+
+#[test]
+fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
+    use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
+    use std::{
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+    let directory = Directory::new();
+    let (index, segments) = state(8);
+    let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
+    let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ))));
+    reactor.init().unwrap();
+    let scope = || {
+        RequestScope::new(
+            crate::model::identity::RequestId([201; 16]),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+    };
+    let drive = |mut operation: crate::error::Operation<'static, ()>| {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            reactor.poll_budgeted(16).unwrap();
+            if let Poll::Ready(result) = operation
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            {
+                break result;
+            }
+            assert!(Instant::now() < end);
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    };
+    for slot in ["checkpoint.0", "checkpoint.1"] {
+        fs::write(directory.0.join(slot), b"recoverable cut").unwrap();
+    }
+    let mut abandoned = checkpoint
+        .invalidate_persisted_async(reactor.clone(), scope())
+        .unwrap();
+    assert!(
+        abandoned
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    assert!(reactor.in_flight() > 0);
+    drop(abandoned);
+    let fence_reactor = reactor.clone();
+    drive(Box::pin(async move {
+        fence_reactor
+            .file_fence(crate::model::identity::RequestId([201; 16]))
+            .await
+    }))
+    .unwrap();
+    assert_eq!(reactor.in_flight(), 0);
+    drive(
+        checkpoint
+            .invalidate_persisted_async(reactor.clone(), scope())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!directory.0.join("checkpoint.0").exists());
+    assert!(!directory.0.join("checkpoint.1").exists());
+    drive(
+        checkpoint
+            .invalidate_persisted_async(reactor.clone(), scope())
+            .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
+    assert_eq!(
+        drive(
+            checkpoint
+                .invalidate_persisted_async(reactor.clone(), scope())
+                .unwrap()
+        ),
+        Err(Error::Io)
+    );
+    assert_eq!(reactor.in_flight(), 0);
+}
 static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Directory(PathBuf);
