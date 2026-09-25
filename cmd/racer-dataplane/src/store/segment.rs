@@ -356,4 +356,21 @@ mod tests {
         snap[0].used_bytes = 513;
         assert!(s.restore(snap).is_err());
     }
+    #[test]
+    fn generation_exhaustion_never_wraps_and_small_tails_are_sealed() {
+        let s = Segments::new(WorkerId(0), 1024);
+        s.configure(2048, 2, DirectAlignment::validate(512, 512, 512).unwrap())
+            .unwrap();
+        drop(s.append(512).unwrap());
+        let next = s.append(1024).unwrap();
+        assert_eq!(next.segment.id(), SegmentId(1));
+        drop(next);
+        assert_eq!(s.state(SegmentId(0)).unwrap(), SegmentState::Sealed);
+        let mut snapshot = s.snapshot().unwrap();
+        snapshot[0].generation = Generation(u64::MAX);
+        s.restore(snapshot).unwrap();
+        s.begin_evict(SegmentId(0)).unwrap();
+        assert_eq!(s.recycle(SegmentId(0)), Err(Error::Unavailable));
+        assert_eq!(s.snapshot().unwrap()[0].generation, Generation(u64::MAX));
+    }
 }

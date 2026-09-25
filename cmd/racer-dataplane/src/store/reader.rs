@@ -1,13 +1,16 @@
-//! Atomically lease indexed locations, read padded records, validate identity/generation.
-//!
-//! This layer returns opaque ciphertext. AEAD belongs to the fill worker; corruption
-//! invalidates only the matching mapping and becomes a miss, never plaintext.
-use super::{index::Index, segment::Segments, slab::Slabs};
+//! Lease a mapping before await, validate framing, and return original ciphertext.
+//! AEAD is owned by fill; a read token permits conditional invalidation on failure.
+use super::{
+    format::RecordCodec,
+    index::{Index, RecordLocation},
+    segment::Segments,
+    slab::Slabs,
+};
 use crate::{
-    error::{Operation, deferred},
+    error::{Error, Operation, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
-    model::identity::PageId,
-    runtime::deadline::RequestScope,
+    model::{identity::PageId, limits::ResourceClass},
+    runtime::{deadline::RequestScope, reactor::IoBuffer},
 };
 use std::rc::Rc;
 pub struct StoreReader {
@@ -17,12 +20,16 @@ pub struct StoreReader {
     slabs: Rc<Slabs>,
     buffers: Rc<BufferPool>,
 }
+#[derive(Clone)]
+pub struct ReadToken {
+    page: PageId,
+    location: RecordLocation,
+}
 impl StoreReader {
-    /// Descriptor lookup without slab I/O, including retained nonzero-page entries.
     pub fn metadata(
         &self,
         version: &crate::model::identity::ObjectVersion,
-    ) -> crate::error::Result<Option<crate::model::metadata::VersionMetadata>> {
+    ) -> Result<Option<crate::model::metadata::VersionMetadata>> {
         self.index.version(version)
     }
     pub fn new(
@@ -40,14 +47,109 @@ impl StoreReader {
             buffers,
         }
     }
+    pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
+        self.index.remove_if_matches(&token.page, &token.location)
+    }
+    pub fn read_with_token<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
+        Box::pin(async move {
+            scope.check()?;
+            let entry = match self.index.lookup(page)? {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+            let token = ReadToken {
+                page: page.clone(),
+                location: entry.location.clone(),
+            };
+            // Both checks happen without yielding, so eviction cannot interleave.
+            if self.segments.validate_location(&entry.location).is_err() {
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            let lease = match self
+                .segments
+                .lease(entry.location.segment, entry.location.generation)
+            {
+                Ok(l) => l,
+                Err(_) => {
+                    self.invalidate(&token)?;
+                    return Ok(None);
+                }
+            };
+            let buffer = self.slabs.allocate(
+                entry.location.location.extent.length(),
+                Some(&page.version.object.cache),
+            )?;
+            let buffer = match self
+                .slabs
+                .read(entry.location.location, buffer, lease, scope)
+                .await
+            {
+                Ok(b) => b,
+                Err(Error::Io | Error::CorruptRecord) => {
+                    self.invalidate(&token)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            let decoded = match RecordCodec.parse(&buffer, entry.location.location.extent) {
+                Ok(d) => d,
+                Err(_) => {
+                    self.invalidate(&token)?;
+                    return Ok(None);
+                }
+            };
+            if decoded.header.envelope.page != *page
+                || decoded.header.generation != entry.location.generation
+                || decoded.header.metadata != entry.metadata
+                || decoded.header.envelope.key_id != entry.key_id
+            {
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            // A concurrent retirement/removal must not resurrect a completed copy.
+            if self.index.lookup(page)?.is_none_or(|current| {
+                current.location != entry.location || current.key_id != entry.key_id
+            }) {
+                return Ok(None);
+            }
+            let reservation = self.slabs.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Ciphertext,
+                decoded.ciphertext.len(),
+            )?;
+            let ciphertext = self.buffers.ciphertext(
+                reservation,
+                decoded.header.envelope,
+                buffer.bytes()?[decoded.ciphertext].to_vec(),
+            )?;
+            self.clock.mark_read(entry.location.segment)?;
+            Ok(Some((
+                CiphertextCopy {
+                    metadata: entry.metadata.for_pin(),
+                    ciphertext,
+                },
+                token,
+            )))
+        })
+    }
     pub fn read<'a>(
         &'a self,
-        _page: &'a PageId,
-        _scope: &'a RequestScope,
+        page: &'a PageId,
+        scope: &'a RequestScope,
     ) -> Operation<'a, Option<CiphertextCopy>> {
-        deferred("store.read")
+        Box::pin(async move {
+            Ok(self
+                .read_with_token(page, scope)
+                .await?
+                .map(|(copy, _)| copy))
+        })
     }
 }
 #[cfg(test)]
-mod tests { /* Stale/torn headers, expected generation, key absence, completion races. */
+mod tests { /* Disk corruption and mapping replacement are covered in store integration tests. */
 }

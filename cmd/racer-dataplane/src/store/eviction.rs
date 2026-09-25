@@ -43,8 +43,9 @@ impl SegmentClock {
             return Err(Error::Unavailable);
         }
         let target = self.free_reserve.max(1).min(count);
+        let mut free = self.segments.free_count();
         for _ in 0..count.saturating_mul(2) {
-            if self.segments.free_count() >= target {
+            if free >= target {
                 return Ok(());
             }
             let hand = self.hand.get() % count;
@@ -64,11 +65,12 @@ impl SegmentClock {
                 self.index.remove_if_matches(&page, &location)?;
             }
             match self.segments.recycle(id) {
-                Ok(()) | Err(Error::Overloaded) => {}
+                Ok(()) => free += 1,
+                Err(Error::Overloaded) => {}
                 Err(e) => return Err(e),
             }
         }
-        if self.segments.free_count() >= target {
+        if free >= target {
             Ok(())
         } else {
             Err(Error::Overloaded)

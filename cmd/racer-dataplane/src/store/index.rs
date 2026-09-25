@@ -103,6 +103,7 @@ impl Index {
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        Self::validate_descriptor(&entry.metadata)?;
         entry.metadata.page_length(&page)?;
         let mut state = self.state.borrow_mut();
         Self::check_length(&state, &entry.metadata)?;
@@ -137,6 +138,7 @@ impl Index {
     /// Page-zero owner only. Supports metadata-only objects without a dirty page,
     /// slab allocation, encryption record, or ciphertext reservation.
     pub fn publish_version(&self, metadata: VersionMetadata) -> Result<()> {
+        Self::validate_descriptor(&metadata)?;
         let mut s = self.state.borrow_mut();
         Self::check_length(&s, &metadata)?;
         if self.metadata_capacity == 0 {
@@ -229,6 +231,13 @@ impl Index {
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
         snapshot.validate_metadata()?;
+        for m in snapshot
+            .metadata
+            .iter()
+            .chain(snapshot.entries.iter().map(|(_, e)| &e.metadata))
+        {
+            Self::validate_descriptor(m)?;
+        }
         if snapshot.entries.len() > self.page_capacity.get()
             || snapshot.metadata.len() > self.metadata_capacity
         {
@@ -290,6 +299,16 @@ impl Index {
             || s.metadata
                 .get(&m.version)
                 .is_some_and(|v| v.length != m.length)
+        {
+            return Err(Error::CorruptRecord);
+        }
+        Ok(())
+    }
+    fn validate_descriptor(m: &VersionMetadata) -> Result<()> {
+        if m.version.object.cache.0.is_empty()
+            || m.version.object.cache.0.len() > super::format::MAX_ID_BYTES
+            || m.version.etag.as_bytes().is_empty()
+            || m.version.etag.as_bytes().len() > super::format::MAX_ETAG_BYTES
         {
             return Err(Error::CorruptRecord);
         }

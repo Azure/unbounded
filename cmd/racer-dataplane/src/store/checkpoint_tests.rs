@@ -296,6 +296,25 @@ fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() 
 }
 
 #[test]
+fn overlapping_mappings_are_rejected_and_retirement_invalidates_both_slots() {
+    let mut bad = image(1);
+    let mut overlapping = bad.shards[0].index.entries[0].clone();
+    overlapping.0.version.object.key = CacheKey([8; 32]);
+    overlapping.1.metadata.version = overlapping.0.version.clone();
+    bad.shards[0].index.entries.push(overlapping);
+    assert!(CheckpointCodec.encode(&bad).is_err());
+    let directory = Directory::new();
+    let (index, segments) = state(8);
+    let checkpointer = Checkpointer::new(directory.0.clone(), index, segments);
+    block_on(checkpointer.publish(vec![shard()])).unwrap();
+    block_on(checkpointer.publish(vec![shard()])).unwrap();
+    checkpointer.invalidate_persisted().unwrap();
+    assert!(!directory.0.join("checkpoint.0").exists());
+    assert!(!directory.0.join("checkpoint.1").exists());
+    checkpointer.invalidate_persisted().unwrap();
+}
+
+#[test]
 fn alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_payload() {
     let directory = Directory::new();
     let (index, segments) = state(8);

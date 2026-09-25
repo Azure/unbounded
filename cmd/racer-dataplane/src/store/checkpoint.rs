@@ -85,6 +85,23 @@ impl Checkpointer {
         }
     }
 
+    /// Coordinator-only: invalidate both recoverable generations before releasing
+    /// a retired key. Serialize with all snapshot publication, including snapshots
+    /// already transferred from other workers. Payload files stay intact.
+    pub fn invalidate_persisted(&self) -> Result<()> {
+        if self.frozen.get() {
+            return Err(Error::Overloaded);
+        }
+        for name in CHECKPOINT_NAMES {
+            match fs::remove_file(self.directory.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(Error::Io),
+            }
+        }
+        Ok(())
+    }
+
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
     pub fn publish(&self, shards: Vec<ShardImage>) -> Operation<'_, ()> {

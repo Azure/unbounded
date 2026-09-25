@@ -32,6 +32,19 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// Cache-scoped filtering for production keyrings. Invoke before installation;
+    /// descriptors remain available for pins, but unavailable payloads do not.
+    pub fn filter_available_keys(
+        image: &mut CheckpointImage,
+        mut available: impl FnMut(&crate::model::identity::CacheId, KeyId) -> bool,
+    ) {
+        for shard in &mut image.shards {
+            shard
+                .index
+                .entries
+                .retain(|(page, entry)| available(&page.version.object.cache, entry.key_id));
+        }
+    }
     pub fn new(directory: PathBuf, index: Rc<Index>, segments: Rc<Segments>) -> Self {
         Self {
             directory,

@@ -19,6 +19,7 @@ pub struct AlignedBuffer {
     layout: Layout,
     length: usize,
     reservation: Reservation,
+    retained: Vec<std::rc::Rc<Reservation>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectExtent {
@@ -81,7 +82,14 @@ impl DirectAlignment {
         DirectExtent::checked(offset, length)
     }
     pub fn allocate(&self, length: usize, reservation: Reservation) -> Result<AlignedBuffer> {
-        if length == 0 || !length.is_multiple_of(self.length) || reservation.amount() < length {
+        if length == 0
+            || !length.is_multiple_of(self.length)
+            || reservation.amount() < length
+            || !matches!(
+                reservation.class(),
+                crate::model::limits::ResourceClass::Ciphertext
+            )
+        {
             return Err(Error::InvalidConfiguration);
         }
         let layout = Layout::from_size_align(length, self.memory)
@@ -93,6 +101,7 @@ impl DirectAlignment {
             layout,
             length,
             reservation,
+            retained: Vec::new(),
         })
     }
     pub fn check(&self, extent: DirectExtent, buffer: &AlignedBuffer) -> Result<()> {
@@ -107,6 +116,10 @@ impl DirectAlignment {
     }
 }
 impl AlignedBuffer {
+    /// Additional accounting whose lifetime must include submitted kernel access.
+    pub(crate) fn retain_charge(&mut self, charge: std::rc::Rc<Reservation>) {
+        self.retained.push(charge);
+    }
     pub fn len(&self) -> usize {
         self.length
     }

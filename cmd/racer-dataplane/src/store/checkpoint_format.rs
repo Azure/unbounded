@@ -141,6 +141,7 @@ impl ShardImage {
         segments.restore(self.segments.clone())?;
         let mut pages = HashSet::new();
         let mut versions = HashSet::new();
+        let mut extents = Vec::with_capacity(self.index.entries.len());
         for metadata in &self.index.metadata {
             validate_descriptor(metadata)?;
             if !versions.insert(&metadata.version) {
@@ -153,6 +154,18 @@ impl ShardImage {
                 return Err(Error::CorruptRecord);
             }
             segments.validate_location(&entry.location)?;
+            let extent = entry.location.location.extent;
+            extents.push((
+                extent.offset(),
+                extent
+                    .offset()
+                    .checked_add(extent.length() as u64)
+                    .ok_or(Error::CorruptRecord)?,
+            ));
+        }
+        extents.sort_unstable();
+        if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(Error::CorruptRecord);
         }
         Ok(())
     }
