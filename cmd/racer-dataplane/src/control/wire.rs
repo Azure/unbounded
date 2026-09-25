@@ -13,6 +13,11 @@ use std::time::Duration;
 mod codec;
 pub use codec::*;
 
+// Server contract vectors use an isolated reference codec, not the runtime codec.
+#[cfg(test)]
+#[path = "wire/codec.rs"]
+mod contract_codec;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 pub const SNAPSHOT_PATH: &str = "/v1/snapshot";

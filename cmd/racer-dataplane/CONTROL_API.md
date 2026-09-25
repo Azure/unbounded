@@ -2,8 +2,8 @@
 
 This is the contract for the Go controller and Rust dataplane. Types and service
 interfaces define the Rust enrollment, TLS publication, and credential lifecycle.
-The Rust dataplane implements these operations. The Go controller remains a
-scaffold; deployment requires a compatible operational control service.
+The Rust dataplane implements these operations independently of the server work.
+The Go controller implements bounded wire codecs and canonical content hashing.
 
 The [client and origin API](CLIENT_ORIGIN_API.md) defines the separate HTTP/1.1
 Unix-socket read contract. The [Go SDK design](../../designs/racer-sdk.md) specifies
@@ -59,6 +59,24 @@ invalid values, and unknown enum variants; ignore unknown object fields.
 Limits: bootstrap request/response 64 KiB, shared keyring bundle 512 KiB, publication
 64 MiB and 100,000 members. Enforce byte limits before allocating decoded state.
 
+Codec details: required fields cannot be absent or null; `numa_node` is optional
+but cannot be null. Empty collections encode as `[]`. Counters are positive,
+canonical decimal strings (no sign, leading zero, fraction, or exponent). Numeric
+fields are unsigned integer JSON tokens. Base64 must include canonical padding
+and zero padding bits, without whitespace. UUID syntax is checked for every
+identity; UUID version bits are not restricted. Reject invalid UTF-8, unpaired
+UTF-16 escapes, and JSON nesting deeper than 64 containers, including in ignored
+fields. Field names are case-sensitive, and escaped equivalents count as duplicate
+fields. Errors from codecs contain only protocol codes, never supplied values.
+
+DER codecs check CSR/certificate syntax and reject trailing DER. Proof of
+possession, certificate trust, expiry, key algorithm, and caller authorization
+remain the enrollment/TLS layer's responsibility. Rails have unique IDs per node
+and nonempty fabric names without NUL, CR, or LF. Endpoint ports are nonzero and
+IP zone identifiers are rejected. Cache names are lowercase DNS subdomains with
+labels of at most 63 bytes; each complete socket path is at most 107 bytes (plus
+the Linux pathname socket's NUL terminator). Socket modes contain only 0777 bits.
+
 Failures have `{ "code": "..." }`: 400 `invalid_request`, 401 `unauthenticated`,
 403 `forbidden`, 409 `conflict` (including a future cursor), 413 `too_large`,
 426 `unsupported_version`, 429 `overloaded`, or 503 `unavailable`. Back off on
@@ -88,6 +106,21 @@ serve uncommitted counters. Initial creation is explicit cluster initialization;
 missing established state must not silently recreate counters. No publication
 blobs, member history, or checkpoint chunks are persisted. Only the initialized
 leader serves; leadership loss closes connections and cancels long polls.
+
+Canonical content uses compact UTF-8 JSON, with no whitespace or trailing newline.
+The publication-content object's field order is `schema_version`, `cluster`,
+`members`, `caches`; the membership-content object omits `caches`. Neither object
+contains counters. Members sort by Node UID, caches by cache UID, and rails by
+numeric rail ID. Member field order is `node`, `shares`, `peer_endpoint`, `rails`,
+`alignment_enabled`; rail field order is `rail`, `fabric`, optional `numa_node`;
+cache field order is `id`, `name`, `client_socket`, `origin_socket`, `socket_mode`.
+JSON strings use short escapes for backspace, tab, newline, form feed, and carriage
+return; remaining control characters use lowercase `\u00xx`. Quote and backslash
+are escaped, as are U+2028/U+2029; other Unicode and `<`, `>`, `&` remain literal.
+Hashes are lowercase hexadecimal SHA-256 of those bytes. All member fields affect
+both hashes; cache-only changes affect only publication content. Input order and
+counter changes affect neither hash. Hashing accepts zero candidate counters so
+the controller can compare content before assigning committed versions.
 
 Snapshots are complete replacements; reconnects may skip intermediate updates.
 Validate bounds, identities, versions, paths, and resource availability before
@@ -140,6 +173,20 @@ decrypt received ciphertext but cannot encrypt new fills. Peer trust updates do
 not replace deployment bootstrap trust. Read one coherent projected generation;
 malformed updates retain the last valid bundle. Reject generation rollback or
 conflicting replay; equal generation with identical content is idempotent.
+
+Bundle JSON fields are `schema_version`, `cluster`, `generation`,
+`peer_trust_roots`, `cache_keys`. Each key object contains `cache`, `id` (16 bytes),
+`purpose`, `state`, and `material` (32 bytes). Key identity is scoped by cache and
+purpose; duplicate identities and duplicate trust-root DER are rejected. Each
+represented cache/purpose must have exactly one active key, alongside any prepared
+or retiring keys. An empty cache-key list is valid. Trust roots and bootstrap
+certificate chains must be nonempty. Bundle and chain array ordering is preserved;
+publication sorting does not apply to them. The Go bundle codec is the only JSON
+material encoder; ordinary key formatting and JSON never expose material.
+
+Shared executable contract vectors live in `internal/racer/wire/testdata/` and
+are consumed by both Go and Rust tests. Bundle keys there are synthetic all-zero
+or repeated-byte test values, and the certificate/CSR contain only public data.
 
 Stage replacements before activation, targeting daily rotation without waiting
 for acknowledgments. Missing previously installed keys initiate local retirement:

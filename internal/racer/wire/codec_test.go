@@ -12,7 +12,7 @@ import (
 )
 
 func TestBundleEncodingCannotBypassCodec(t *testing.T) {
-	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, ErrUnimplemented) {
+	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, UnsupportedVersion) {
 		t.Fatalf("standard encoder bypassed bundle validation: %v", err)
 	}
 }

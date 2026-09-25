@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package wire declares Racer's HTTPS/JSON and projected-keyring contracts.
-// Validation and codecs remain fail-closed scaffold operations.
+// Codecs validate bounded inputs before returning usable protocol state.
 package wire
 
 import "time"
@@ -110,7 +110,7 @@ type CacheKeyRef struct {
 type CacheKey struct {
 	Key      CacheKeyRef
 	State    KeyState
-	material [32]byte //nolint:unused // Reserved for the bounded secret codec; never expose material to satisfy scaffold lint.
+	material [32]byte
 }
 
 func (CacheKey) String() string   { return "<redacted cache key>" }

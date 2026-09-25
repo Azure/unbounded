@@ -6,9 +6,11 @@ One Go binary uses controller-runtime directly, with three replicas and one lead
 Kubernetes is the authority for desired state. Rust nodes receive full publications,
 compute placement/routes locally, and serve disposable encrypted cache pages.
 
-This document describes intended behavior. Operational methods are fail-closed
-stubs; only composition, controller registration, API declarations, and reserved
-503 routes are implemented. The executable cannot start an operational service.
+This document describes intended behavior. Phase 1 bounded codecs, canonical
+hashing, and shared Go/Rust contract vectors are implemented. Other operational
+methods remain fail-closed stubs; composition, controller registration, API
+declarations, and reserved 503 routes are also implemented. The executable cannot
+start an operational service.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -117,7 +119,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 
 ## Implementation order
 
-1. Implement bounded codecs/canonical hashing and cross-language contract vectors.
+1. Implement bounded codecs/canonical hashing and cross-language contract vectors (complete).
 2. Implement pure membership/catalog reconciliation, including cold-start rules.
 3. Implement explicit initialization, version CAS, immutable publication install,
    manager startup enqueue, and leadership cancellation.
