@@ -1087,4 +1087,33 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
     }
+
+    #[test]
+    fn tcp_http_delivery_survives_page_and_pipe_release_before_peer_reads() {
+        use std::net::{TcpListener, TcpStream};
+        let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let page = page(&admission, bytes.clone());
+        let weak = Arc::downgrade(&page.inner);
+        let reader = delivery.attach(page, slice(0, bytes.len() as u32)).unwrap();
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        connection.tx_remaining = Some(bytes.len() as u64);
+        let connection = drive(&reactor, delivery.finish_to(reader, connection, &scope())).unwrap();
+        assert_eq!(connection.tx_remaining, Some(0));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        let mut replacement = delivery.pipes.acquire().unwrap();
+        replacement.try_write(&[0xff; 4096]).unwrap();
+        let mut received = vec![0; bytes.len()];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, bytes);
+        drop(connection);
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
 }
