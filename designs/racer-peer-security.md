@@ -96,3 +96,40 @@ the local challenge. The challenge is not a sender-selected session identifier.
 
 Cross-owner transient verification blocker observed: `src/topology/graph.rs:90`
 had an extra closing brace during a security test build. Security does not edit it.
+
+### Plain-HTTP authenticated challenge discovery
+
+`security::session::ChallengeProbe::new(local, remote)` creates a one-use random
+outstanding probe valid for five monotonic seconds. Send `request_bytes()` unchanged
+(or standard-base64 framed). Receiver calls `session::respond(keys, replay, bytes)`
+after bounded handshake admission and returns `ChallengeReply` fields. Requester
+consumes the probe with `verify(certificates, reply)`, obtaining an
+`AuthenticatedChallenge`. Install its peer/challenge with the signing facade.
+Verification binds both Node UUIDs, the fresh requester nonce, receiver challenge,
+and responder certificate. This avoids any circular dependency on established HTTP
+message-signature sessions or an unavailable peer TLS channel. Discover both
+directions before bidirectional signed traffic. Probe responses grant no application
+or RDMA permission and allocate no receiver-side session state.
+
+### Security integration review requirements
+
+The identity and protocol submodules are now registered by the security parent.
+All production cluster and Node identifiers must be canonical lowercase UUID text,
+not just arbitrary alphanumeric path components. Tests must use canonical IDs.
+Certificate checks must require Ed25519 digital-signature usage and client-auth EKU
+and reject absent/mismatched usage; bounds apply to the total chain as well as each
+certificate. The certificate leaf must not be a CA.
+
+Signature challenge discovery is implemented in `security/session.rs` by the
+parent. Add a typed `Signatures::install_peer_challenge(AuthenticatedChallenge)`
+adapter when convenient; the existing explicitly authenticated install method is
+the lower-level integration entry point. Peer owner must use fresh probe verification
+before installing challenges.
+
+The signature profile maximum must agree with `peer::wire::MAX_SIGNED_HEAD` (64 KiB).
+Logical encoders validate bounded fields before allocation. Historical original
+signatures must also enforce freshness/deadline validity, while nonce insertion is
+only for the final receiver-addressed envelope. Immutable response descriptors must
+match the requested object/version/page, not only a self-consistent signed response.
+The canonical application target is `/racer/peer/v1`; the transport envelope uses
+`/racer/peer/v1/exchange`, with the original signed application head carried intact.
