@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -19,6 +19,7 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
 	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
 	@echo "  operator-vm-watch      Follow operator VM progress until completion"
+	@echo "  operator-vm-stop       Stop the active operator lifecycle and run cleanup"
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
 	@echo "  operator-vm-run-full   Start full lifecycle; optional ADOPT_* values reuse images"
 	@echo "  operator-vm-run-pool   Start Gantry-only using the next compatible pool image"
@@ -116,6 +117,9 @@ operator-vm-status: operator-vm-check
 
 operator-vm-watch: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh --follow
+
+operator-vm-stop: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh stop
 
 operator-vm-prebuild: operator-vm-check
 	@test -n "$(GANTRY_IMAGE_POOL_COUNT)" || { echo "GANTRY_IMAGE_POOL_COUNT is required" >&2; exit 2; }
@@ -245,12 +249,14 @@ prepare-gantry-standalone:
 
 prepare-gantry-standalone-adopt:
 	@test -n "$(GANTRY_ONLY_STANDALONE_IMAGE)" || { echo "GANTRY_ONLY_STANDALONE_IMAGE is required" >&2; exit 2; }
+	@test -n "$(GANTRY_ONLY_STANDALONE_STREAMING_IMAGE)" || { echo "GANTRY_ONLY_STANDALONE_STREAMING_IMAGE is required" >&2; exit 2; }
 	@test -n "$(GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256)" || { echo "GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 is required" >&2; exit 2; }
 	set -a; \
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone-adopt \
-		"$(GANTRY_ONLY_STANDALONE_IMAGE)" "$(GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256)"
+		"$(GANTRY_ONLY_STANDALONE_IMAGE)" "$(GANTRY_ONLY_STANDALONE_STREAMING_IMAGE)" \
+		"$(GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256)"
 
 prepare-gantry-adopt:
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }

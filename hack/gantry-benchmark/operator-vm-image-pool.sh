@@ -13,6 +13,7 @@ usage() {
 Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh full
   operator-vm-image-pool.sh standalone
+  operator-vm-image-pool.sh stop
   operator-vm-image-pool.sh fail-open
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
@@ -28,8 +29,9 @@ during a measured phase invalidate Azure telemetry.
 Set ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 together
 with "full" to reuse an existing digest-pinned image pair.
 
-Set GANTRY_ONLY_STANDALONE_IMAGE and GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256
-together with "standalone" to reuse an existing converted image.
+Set GANTRY_ONLY_STANDALONE_IMAGE, GANTRY_ONLY_STANDALONE_STREAMING_IMAGE, and
+GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 together with "standalone" to reuse an
+existing converted image.
 USAGE
 }
 
@@ -272,11 +274,12 @@ SCRIPT
       standalone)
         (($# == 0)) || { usage >&2; exit 2; }
         mode_config='GANTRY_ONLY_STANDALONE="true"'
-        if [[ -n "${GANTRY_ONLY_STANDALONE_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}" ]]; then
-          : "${GANTRY_ONLY_STANDALONE_IMAGE:?Set GANTRY_ONLY_STANDALONE_IMAGE with GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256}"
-          : "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 with GANTRY_ONLY_STANDALONE_IMAGE}"
-          printf -v mode_config '%s\nGANTRY_ONLY_STANDALONE_IMAGE=%q\nGANTRY_ONLY_STANDALONE_PAYLOAD_SHA256=%q' \
-            "$mode_config" "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
+        if [[ -n "${GANTRY_ONLY_STANDALONE_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}" ]]; then
+          : "${GANTRY_ONLY_STANDALONE_IMAGE:?Set GANTRY_ONLY_STANDALONE_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:?Set GANTRY_ONLY_STANDALONE_STREAMING_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 with the complete standalone adoption set}"
+          printf -v mode_config '%s\nGANTRY_ONLY_STANDALONE_IMAGE=%q\nGANTRY_ONLY_STANDALONE_STREAMING_IMAGE=%q\nGANTRY_ONLY_STANDALONE_PAYLOAD_SHA256=%q' \
+            "$mode_config" "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_STREAMING_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
         fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
@@ -514,6 +517,17 @@ systemctl show "$prune_service" --property=ActiveState --property=SubState --no-
 SCRIPT
 )
     script=${script/__PRUNE_WORKER_BASE64__/$prune_worker}
+    invoke_remote "$script"
+    ;;
+  stop)
+    (($# == 0)) || { usage >&2; exit 2; }
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+systemctl stop gantry-benchmark-operator.service
+systemctl show gantry-benchmark-operator.service \
+  --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus --no-pager
+SCRIPT
+)
     invoke_remote "$script"
     ;;
   prune-status)
