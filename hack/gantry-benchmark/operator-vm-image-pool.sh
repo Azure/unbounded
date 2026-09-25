@@ -27,6 +27,9 @@ during a measured phase invalidate Azure telemetry.
 
 Set ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 together
 with "full" to reuse an existing digest-pinned image pair.
+
+Set GANTRY_ONLY_STANDALONE_IMAGE and GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256
+together with "standalone" to reuse an existing converted image.
 USAGE
 }
 
@@ -269,10 +272,18 @@ SCRIPT
       standalone)
         (($# == 0)) || { usage >&2; exit 2; }
         mode_config='GANTRY_ONLY_STANDALONE="true"'
+        if [[ -n "${GANTRY_ONLY_STANDALONE_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}" ]]; then
+          : "${GANTRY_ONLY_STANDALONE_IMAGE:?Set GANTRY_ONLY_STANDALONE_IMAGE with GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256}"
+          : "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 with GANTRY_ONLY_STANDALONE_IMAGE}"
+          printf -v mode_config '%s\nGANTRY_ONLY_STANDALONE_IMAGE=%q\nGANTRY_ONLY_STANDALONE_PAYLOAD_SHA256=%q' \
+            "$mode_config" "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
+        fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
           hack/cmd/gantry-benchmark/gantry_only.go
+          hack/cmd/gantry-benchmark/hosts_routing.go
           hack/cmd/gantry-benchmark/main.go
+          hack/cmd/gantry-benchmark/preflight.go
           hack/cmd/gantry-benchmark/state.go
           hack/gantry-benchmark/operator-vm-run.sh
         )

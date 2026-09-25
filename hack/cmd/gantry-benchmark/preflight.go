@@ -111,7 +111,7 @@ func (b *benchmark) preflight(ctx context.Context) error {
 
 func (b *benchmark) checkArtifactStreaming(ctx context.Context, state benchmarkState) error {
 	for _, daemonSet := range []string{"gantry-containerd-config", "gantry-overlaybd-config"} {
-		if err := b.validateBenchmarkDaemonSet(ctx, daemonSet); err != nil {
+		if err := b.validateDaemonSet(ctx, b.config.GantryNamespace, daemonSet); err != nil {
 			return fmt.Errorf("validate Artifact Streaming %s: %w", daemonSet, err)
 		}
 	}
