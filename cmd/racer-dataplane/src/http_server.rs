@@ -1287,6 +1287,11 @@ impl BodyWriter {
     }
 }
 
+// Batch filesystem IO independently from the TLS write quantum. A 64 MiB page
+// otherwise requires 1024 serial file submissions even when resident. Keep one
+// bounded read allocation per body; never prefetch another while TLS owns bytes.
+const TLS_FILE_READ: usize = 1024 * 1024;
+
 /// Sends a chunk, handles short transfers, and drains notifications as needed.
 #[must_use]
 pub struct SendingBody {
@@ -1525,14 +1530,16 @@ impl SendingBody {
                                 if let Some(d) = &mut self.diagnostic {
                                     d.read_completed(diagnostic);
                                 }
-                                let len = transfer(done.result?, chunk.range.len().min(64 * 1024))?;
+                                let len =
+                                    transfer(done.result?, chunk.range.len().min(TLS_FILE_READ))?;
                                 self.tls_read = None;
                                 self.tls_bytes = Some((done.resource, 0..len));
                             }
                             if self.tls_bytes.is_none() {
                                 match ring.read_bytes(
                                     self.tls_file.as_ref().unwrap().clone().into(),
-                                    vec![0; chunk.range.len().min(64 * 1024)].into_boxed_slice(),
+                                    vec![0; chunk.range.len().min(TLS_FILE_READ)]
+                                        .into_boxed_slice(),
                                     value.offset() + chunk.range.start as u64,
                                 ) {
                                     Ok(ticket) => {
