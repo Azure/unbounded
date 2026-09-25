@@ -53,7 +53,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
 			want := error(ErrUnimplemented)
-			if name == "topology" || name == "keyring" || name == "run" {
+			if name == "topology" || name == "keyring" || name == "server" || name == "run" {
 				want = wire.InvalidRequest
 			}
 

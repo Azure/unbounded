@@ -256,6 +256,78 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 // AuthenticateCertificate requires a verified chain, the client-auth usage,
 // cluster-scoped Node URI SAN, current validity, and authorization. Recheck on
 // every poll: an existing TLS connection must not bypass certificate expiry.
-func AuthenticateCertificate(_ context.Context, _ client.Reader, _ Config, _ *tls.ConnectionState) (NodeIdentity, error) {
-	return NodeIdentity{}, pending("certificates.authenticate")
+func AuthenticateCertificate(ctx context.Context, reader client.Reader, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	if state == nil || !state.HandshakeComplete || len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	leaf := state.PeerCertificates[0]
+
+	now := time.Now()
+	if leaf.IsCA || leaf.KeyUsage != x509.KeyUsageDigitalSignature || len(leaf.ExtKeyUsage) != 1 || leaf.ExtKeyUsage[0] != x509.ExtKeyUsageClientAuth || len(leaf.UnknownExtKeyUsage) != 0 || now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	if _, ok := leaf.PublicKey.(ed25519.PublicKey); !ok {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	if len(leaf.URIs) != 1 {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	uri := leaf.URIs[0]
+
+	node := wire.NodeID(strings.TrimPrefix(uri.Path, "/node/"))
+	if !wire.ValidUUID(string(node)) || uri.String() != "spiffe://"+uri.Host+"/node/"+string(node) {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	if uri.Host != string(cfg.Cluster) {
+		return NodeIdentity{}, wire.Forbidden
+	}
+
+	if reader == nil {
+		return NodeIdentity{}, wire.Unavailable
+	}
+
+	roots, err := (&Issuer{APIReader: reader, Config: cfg}).TrustRoots(ctx)
+	if err != nil {
+		return NodeIdentity{}, wire.Unavailable
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, cert := range state.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+
+	chains, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	if err != nil {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	expires := leaf.NotAfter
+	for _, cert := range chains[0] {
+		if cert.NotAfter.Before(expires) {
+			expires = cert.NotAfter
+		}
+	}
+
+	if err := authorizeNode(ctx, reader, cfg, node); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	if !time.Now().Before(expires) {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: expires}, nil
 }

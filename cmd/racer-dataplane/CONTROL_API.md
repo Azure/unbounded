@@ -3,7 +3,8 @@
 This is the contract for the Go controller and Rust dataplane. Types and service
 interfaces define the Rust enrollment, TLS publication, and credential lifecycle.
 The Rust dataplane implements these operations independently of the server work.
-The Go controller implements bounded wire codecs and canonical content hashing.
+The Go controller implements bounded wire codecs, canonical content hashing,
+token bootstrap, and HTTPS/mTLS serving.
 
 The [client and origin API](CLIENT_ORIGIN_API.md) defines the separate HTTP/1.1
 Unix-socket read contract. The [Go SDK design](../../designs/racer-sdk.md) specifies

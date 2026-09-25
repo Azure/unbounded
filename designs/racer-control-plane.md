@@ -8,11 +8,11 @@ compute placement/routes locally, and serve disposable encrypted cache pages.
 
 This document describes intended behavior. Phase 1 bounded codecs, canonical
 hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
-reconciliation, Phase 3 initialization/publication lifecycle, and Phase 4 issuer
-and shared-key rotation are implemented. Token bootstrap, certificate request
-authentication, TLS serving, and workload construction remain fail-closed stubs.
-The initialize-only command is operational; normal invocation validates
-recovery state but cannot yet start an operational HTTPS service.
+reconciliation, Phase 3 initialization/publication lifecycle, Phase 4 issuer
+and shared-key rotation, and Phase 5 token bootstrap/authenticated HTTPS serving
+are implemented. Workload construction remains a fail-closed Phase 6 stub.
+The initialize-only command and leader-scoped HTTPS service are operational;
+deployment must provide serving TLS files and the managed dataplane workload.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -193,7 +193,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 3. Implement explicit initialization, version CAS, immutable publication install,
    manager startup enqueue, and leadership cancellation (complete).
 4. Implement issuer/shared-key Secret rotation, including failure recovery (complete).
-5. Implement token bootstrap and mTLS serving with adversarial identity tests.
+5. Implement token bootstrap and mTLS serving with adversarial identity tests (complete).
 6. Implement the managed workload and Rust identity/TLS/projection boundaries.
 7. Exercise envtest integration, failover, rotation, and bounded fanout.
 
@@ -235,7 +235,7 @@ composition tests; do not add tests that merely enumerate every placeholder.
   Phase 5 calls `Lifecycle.Wait(ctx)` before listener startup, then
   `SetServingReady(true)` when accepting authenticated connections, resetting on
   shutdown. `Server.Ready` delegates to all lifecycle gates plus publications.
-  `Server.Start` remains fail-closed pending TLS implementation. Controller
+  `Server.Start` implements these gates in Phase 5. Controller
   reconciliation currently has no per-reconcile timeout; committed publications
   retain that leader-derived context. Do not introduce a short-lived reconcile
   timeout without separately supplying the full leadership context for serving.
@@ -302,7 +302,7 @@ those integration/load checks remain Phase 7.
   and Node URI. It returns a leaf-first public chain and enrollment correlation.
   Phase 5 must first obtain `NodeIdentity` from live token authorization, including
   its authorization expiration, and gate issuance on leadership. There is no
-  enrollment receipt ledger. `AuthenticateCertificate` remains Phase 5 work.
+  enrollment receipt ledger. `AuthenticateCertificate` is implemented in Phase 5.
 - `Issuer.TrustRoots(ctx)` returns a new owned pool from authoritative committed
   credentials, distinct from deployment HTTPS server trust. Phase 5 must use fresh
   trust for TLS admission and reverify chain, usage, identity, validity, and live
@@ -316,3 +316,59 @@ material cleanup, expired preparation, conflicts/cancellation, authoritative rea
 lost/corrupt durable state, catalog churn, overlap overflow, certificate identity,
 proof-of-possession rejection, trust retirement, and concurrent issuance. Real
 API-server/election and projection integration remain Phase 7 verification.
+
+## Phase 5 serving and authorization handoff
+
+- `Bootstrap.Authenticate` sends the exact bearer token to TokenReview with the
+  `racer-control` audience and requires that audience in the authenticated result.
+  Only TokenReview's exact ServiceAccount username/UID and singleton bound Pod
+  extras establish caller identity. APIReader checks the live Pod UID, assignment,
+  nonterminal/nonterminating state, ServiceAccount UID, current configured
+  DaemonSet controller owner name/UID, and live nonexcluded Node UID. Optional
+  TokenReview Node extras must agree when present. Pod readiness/IP is not an
+  authentication prerequisite. The authenticated token's JWT `exp` only bounds
+  issuance authorization; raw JWT identities are never used. `Enroll` caps its
+  context by that expiration and delegates Ed25519 CSR proof/signing to `Issue`.
+- `AuthenticateCertificate` requires TLS-verified evidence and independently
+  verifies the presented chain against fresh authoritative `TrustRoots` on every
+  request. It checks current chain validity, Ed25519/digital-signature/client-auth
+  usage, one exact cluster/Node URI, live Node UID/exclusion, and a live authorized
+  Pod of the current managed DaemonSet and ServiceAccount. Node certificates bind
+  Node UIDs rather than Pod UIDs, so replacement authorized Pods on the same Node
+  can continue using a locally persisted valid identity. UID-only certificates
+  currently require an authoritative Node list followed by a namespace-scoped Pod
+  list filtered by `spec.nodeName`; Phase 7 must measure this API load.
+- `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
+  the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
+  and verifies optional client certificates using fresh roots per handshake, and
+  disables session tickets. Bootstrap recovery omits an expired certificate.
+  HTTPS server certificate files are loaded at startup; deployment certificate
+  replacement requires a controller restart. Peer root rotation remains live.
+- Only exact POST `/v1/bootstrap` and GET `/v1/snapshot` routes are admitted.
+  Alternate methods/paths, encoded path aliases, unknown/duplicate/noncanonical
+  query parameters, snapshot bodies, and bootstrap media/encoding mismatches fail
+  with protocol errors. No ServeMux redirects or implicit HEAD endpoint exists.
+  Errors contain only bounded wire codes; 429/503 include `Retry-After: 1`.
+- HTTP admission holds one slot per Node and a global poll bound through response
+  flush, in addition to `Publications.Wait`'s waiting admission. Handshakes' trust
+  reads, request authorization and enrollment share bounded authentication slots;
+  slow snapshot writes have separate bounded slots. Saturation rejects immediately.
+  Long polls are capped by the earliest verified-chain expiration and reauthorize
+  after waiting, before writing. Expiration can return a bounded 401 recovery error.
+  Snapshot bytes use `WriteTo` with bounded scratch and request cancellation checks.
+- `Limits.WriteTimeout` bounds authentication/API calls, bootstrap body reading and
+  issuance, header/handshake reading, and response writes. Each snapshot write gets
+  a fresh window capped by certificate expiration. HTTP parser header limits are
+  supplemented by application header accounting. The standard library may reject
+  malformed/oversized HTTP framing before routing. Leadership cancellation cancels
+  requests, closes listeners and active/idle connections immediately, withdraws
+  readiness, and bounds shutdown by `Limits.ShutdownTimeout`. Connection context
+  tracks the raw transport so write deadlines/cancellation also close TCP directly;
+  TLS close-notify cannot extend a blocked write past its admission deadline.
+
+Phase 5 tests include real TLS enrollment/snapshots, strict errors/routes/bounds,
+live UID/ownership/audience attacks, pooled trust retirement and expiry, disabled
+resumption, expired-identity recovery, poll expiration/cancellation, write-completion
+admission, API/body deadlines, listener startup/readiness and leadership shutdown.
+Scaffold composition tests remain; Phase 6 owns workload/Rust integration and
+Phase 7 owns real API-server/election, projection, and capacity verification.

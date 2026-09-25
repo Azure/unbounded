@@ -1,12 +1,13 @@
 # Racer controller implementation status
 
-Phases 1-4 implement configuration, bounded codecs, membership/catalog calculation,
+Phases 1-5 implement configuration, bounded codecs, membership/catalog calculation,
 one-shot initialization, durable publication CAS, issuer/shared-key rotation, and
-certificate issuance. Token authentication, TLS serving, and managed workload
-construction remain fail-closed, so this is not yet an operational HTTPS service.
+certificate issuance, TokenReview bootstrap, and operational leader-scoped HTTPS/mTLS
+serving. Managed workload construction remains a fail-closed Phase 6 stub.
 The `initialize` command performs Kubernetes writes; normal startup validates
 existing durable state. Constructors only wire dependencies; they open no files
-or listeners and start no goroutines. Reserved HTTP handlers return 503.
+or listeners and start no goroutines. HTTP readiness requires synchronized inputs,
+usable credentials, a committed publication, and an accepting TLS listener.
 
 The [control API](../racer-dataplane/CONTROL_API.md) is shared with the Rust
 dataplane. The [design](../../designs/racer-control-plane.md) describes intended
@@ -27,7 +28,7 @@ version ConfigMap (including its one-way credential initialization claim), share
 keyring Secret, and controller issuer Secret are durable controller state, alongside
 the permanent installation ConfigMap, normal leader Lease, and managed workload.
 See the design's Phase 3 initialization protocol and Phase 4 recovery/handoff
-sections before provisioning an installation. Lost established state never
+sections and Phase 5 serving handoff before provisioning an installation. Lost established state never
 authorizes automatic reinitialization.
 
 ## Checks
@@ -43,8 +44,11 @@ Run `make fmt` before committing. Generated deepcopy/CRD files are regenerated,
 never hand-edited. Behavioral and interoperability tests accompany implementation
 of each boundary; scaffold tests verify actual composition and fail-closed entry.
 
-Manifests declare the intended deployment but the scaffold cannot become ready.
+Manifests declare the intended deployment; workload reconciliation is Phase 6 work.
 Deployment must supply the namespace, `racer-controller-tls` serving Secret, and
 `racer-bootstrap-trust` ConfigMap with `ca.crt`. The serving certificate must cover
 the configured service DNS name. These public trust/server TLS inputs are separate
 from the controller-managed node issuer. No sample private keys are shipped.
+The serving files are loaded at startup, so replacing deployment TLS certificates
+requires a controller restart. Rotating node issuer roots are read live. Bootstrap
+recovery must omit expired client certificates; snapshot always requires mTLS.
