@@ -18,6 +18,13 @@ addresses; this component never performs blocking DNS resolution.
 - `receive_head_limited(connection, scope, header_limit)` enforces a smaller cap
   before allocation. Codec limits never exceed 32 KiB. SDK semantic field/ETag
   limits remain the endpoint adapter's responsibility.
+- Client request ingress uses `receive_request_head_limited(connection, scope,
+  header_limit) -> Operation<HeadCompletion<Result<MessageHead>>>`. An outer error
+  closes the socket (I/O/cancellation/resource failure). Inner InvalidRequest or
+  HeaderTooLarge returns the fenced ConnectionLease for an empty 400/431 response.
+  The returned connection is poisoned, all rejected staging/read-ahead is erased,
+  and finish_exchange cannot authorize reuse. Send the error response then drop
+  the lease. A response start line on this request-only API is InvalidRequest.
 - `read_body` and `read_body_range(connection, buffer, Range<usize>, scope)` return
   partial reads and never consume bytes beyond the framed Content-Length. Callers
   loop over Completion.bytes to fill an exact range. Empty destinations for an

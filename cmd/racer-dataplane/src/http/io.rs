@@ -157,10 +157,40 @@ impl HttpIo {
     /// Client/origin adapters use 32 KiB even if another protocol raises its cap.
     pub fn receive_head_limited<'a>(
         &'a self,
-        mut connection: ConnectionLease,
+        connection: ConnectionLease,
         scope: &'a RequestScope,
         header_limit: usize,
     ) -> Operation<'a, HeadCompletion<MessageHead>> {
+        Box::pin(async move {
+            let completed = self
+                .receive_head_outcome(connection, scope, header_limit, false)
+                .await?;
+            Ok(HeadCompletion {
+                connection: completed.connection,
+                value: completed.value?,
+            })
+        })
+    }
+    /// Request ingress with recoverable parsing failures. The outer error means
+    /// I/O, cancellation, or resource failure and closes the connection. An inner
+    /// InvalidRequest/HeaderTooLarge returns a fenced, poisoned connection on
+    /// which the server may send an empty 400/431 response, then close it.
+    /// All rejected bytes are zeroized and no unread data is retained for reuse.
+    pub fn receive_request_head_limited<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+        header_limit: usize,
+    ) -> Operation<'a, HeadCompletion<Result<MessageHead>>> {
+        self.receive_head_outcome(connection, scope, header_limit, true)
+    }
+    fn receive_head_outcome<'a>(
+        &'a self,
+        mut connection: ConnectionLease,
+        scope: &'a RequestScope,
+        header_limit: usize,
+        request_only: bool,
+    ) -> Operation<'a, HeadCompletion<Result<MessageHead>>> {
         Box::pin(async move {
             scope.check()?;
             if connection.rx_remaining.is_some_and(|n| n != 0) {
@@ -172,14 +202,35 @@ impl HttpIo {
             let mut used = 0;
             if let Some((ahead, range)) = connection.read_ahead.take() {
                 if range.len() > buffer.bytes.len() {
-                    return Err(Error::HeaderTooLarge);
+                    drop(ahead);
+                    drop(buffer);
+                    return Ok(rejected_head(connection, Error::HeaderTooLarge));
                 }
                 used = range.len();
                 buffer.bytes[..used].copy_from_slice(&ahead.bytes[range]);
             }
             loop {
-                if let Some((head, end)) = codec.decode_head(&buffer.bytes[..used])? {
-                    let length = self.framing(&head, connection.request_is_head)?;
+                let decoded = match codec.decode_head(&buffer.bytes[..used]) {
+                    Ok(decoded) => decoded,
+                    Err(error @ (Error::InvalidRequest | Error::HeaderTooLarge)) => {
+                        drop(buffer);
+                        return Ok(rejected_head(connection, error));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some((head, end)) = decoded {
+                    if request_only && !matches!(head.start, StartLine::Request { .. }) {
+                        drop(buffer);
+                        return Ok(rejected_head(connection, Error::InvalidRequest));
+                    }
+                    let length = match self.framing(&head, connection.request_is_head) {
+                        Ok(length) => length,
+                        Err(error @ (Error::InvalidRequest | Error::HeaderTooLarge)) => {
+                            drop(buffer);
+                            return Ok(rejected_head(connection, error));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     connection.close |= head.closes_connection()?;
                     if let StartLine::Request { method, .. } = &head.start {
                         connection.request_is_head = method == "HEAD";
@@ -193,7 +244,7 @@ impl HttpIo {
                     }
                     return Ok(HeadCompletion {
                         connection,
-                        value: head,
+                        value: Ok(head),
                     });
                 }
                 let end = buffer.bytes.len();
@@ -505,6 +556,21 @@ impl HttpIo {
         Ok(body)
     }
 }
+fn rejected_head(
+    mut connection: ConnectionLease,
+    error: Error,
+) -> HeadCompletion<Result<MessageHead>> {
+    connection.poison();
+    connection.read_ahead = None;
+    // Unknown framing must not be declared consumed. This prevents successful
+    // finish_exchange even if the caller sends its error response successfully.
+    connection.rx_remaining = None;
+    connection.request_is_head = false;
+    HeadCompletion {
+        connection,
+        value: Err(error),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +648,8 @@ mod tests {
     #[test]
     fn real_socket_fragmentation_read_ahead_and_owned_ranges() {
         let (admission, reactor, io, scope) = setup();
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
         let thread = std::thread::spawn(move || {
@@ -610,7 +678,7 @@ mod tests {
         drop(bytes);
         thread.join().unwrap();
         drain(&reactor);
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
@@ -725,6 +793,8 @@ mod tests {
     #[test]
     fn truncation_and_future_drop_do_not_recycle_live_buffers() {
         let (admission, reactor, io, scope) = setup();
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
         peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort")
@@ -743,7 +813,7 @@ mod tests {
         drop(future);
         scope.cancel().unwrap();
         drain(&reactor);
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
@@ -895,6 +965,8 @@ mod tests {
     #[test]
     fn cancelled_receive_retains_resources_until_completion_and_reports_cancelled() {
         let (admission, reactor, io, scope) = setup();
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
         let mut future = io.receive_head(connection, &scope);
@@ -904,6 +976,69 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         assert!(matches!(drive(&reactor, future), Err(Error::Cancelled)));
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+    }
+    #[test]
+    fn raw_request_head_errors_return_fenced_socket_for_empty_400_and_431() {
+        for oversized in [false, true] {
+            let (admission, reactor, _, scope) = setup();
+            let io = HttpIo::with_admission(
+                reactor.clone(),
+                Codec::new(32 * 1024, 1024),
+                admission.clone(),
+            );
+            reactor.init().unwrap();
+            let baseline = admission.used(ResourceClass::RequestContext);
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let raw = if oversized {
+                let mut raw = b"GET / HTTP/1.1\r\nAuthorization: ".to_vec();
+                raw.resize(super::super::codec::MAX_HEAD_BYTES, b'x');
+                raw
+            } else {
+                b"GET / HTTP/1.1\r\nAuthorization:secret\r\nContent-Length: 4\r\n\r\nbody".to_vec()
+            };
+            peer.write_all(&raw).unwrap();
+            let expected = if oversized {
+                Error::HeaderTooLarge
+            } else {
+                Error::InvalidRequest
+            };
+            let mut outcome = drive(
+                &reactor,
+                io.receive_request_head_limited(connection, &scope, 32 * 1024),
+            )
+            .unwrap();
+            assert!(matches!(outcome.value, Err(error) if error == expected));
+            assert_eq!(reactor.in_flight(), 0);
+            assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+            assert!(outcome.connection.read_ahead.is_none());
+            assert!(!outcome.connection.is_reusable());
+            assert_eq!(
+                outcome.connection.finish_exchange(),
+                Err(Error::InvalidRequest)
+            );
+            let status = if oversized { 431 } else { 400 };
+            let mut head = response(0);
+            head.start = StartLine::Response { status };
+            head.headers.push(Header {
+                name: "Connection".into(),
+                value: b"close".to_vec(),
+            });
+            let mut sent = drive(&reactor, io.send_head(outcome.connection, head, &scope)).unwrap();
+            assert!(!sent.connection.is_reusable());
+            assert_eq!(
+                sent.connection.finish_exchange(),
+                Err(Error::InvalidRequest)
+            );
+            let expected =
+                format!("HTTP/1.1 {status} \r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let mut wire = vec![0; expected.len()];
+            peer.read_exact(&mut wire).unwrap();
+            assert_eq!(wire, expected.as_bytes());
+            drop(sent);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
     }
 }
