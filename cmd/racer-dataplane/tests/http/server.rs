@@ -369,6 +369,68 @@ mod tests {
     }
 
     #[test]
+    fn body_diagnostic_distinguishes_uncollected_file_read_and_socket_send() {
+        let Some(mut ring) = crate::conformance::kernel_ring(2, Default::default()) else {
+            return;
+        };
+        let (connection, mut peer) = connected(&mut ring);
+        peer.write_all(b"GET /redacted HTTP/1.1\r\nHost: cache\r\n\r\n")
+            .unwrap();
+        let request = request(&mut ring, connection);
+        let writer = body_writer(&mut ring, request, 3);
+        response_headers(&mut peer);
+        let chunk = BodyChunk::new(buffer(&ring, 1, 3), 0..3).unwrap();
+        let mut body = writer.send(chunk).unwrap();
+        body.set_diagnostic(serde_json::json!({"key":"c".repeat(64)}));
+        let file = File::new(std::fs::File::open("/dev/zero").unwrap().into());
+        let read = ring
+            .read_bytes(file.into(), vec![0; 3].into_boxed_slice(), 0)
+            .unwrap();
+        body.tls_read = Some(read);
+        drive(&mut ring, |r| {
+            let complete =
+                r.diagnostic(body.tls_read.as_ref().unwrap()).unwrap().state == "complete";
+            Ok(if complete {
+                Progress::Ready(())
+            } else {
+                pending(true, None)
+            })
+        })
+        .unwrap();
+        body.observe_diagnostic(&ring);
+        let record = body.diagnostic.as_ref().unwrap().record("test", None);
+        assert_eq!(record["stage"], "file_read");
+        assert_eq!(record["io"]["state"], "complete");
+        let mut read = body.tls_read.take().unwrap();
+        ring.take_bytes(&mut read).unwrap().unwrap().result.unwrap();
+        body.small = Some(
+            ring.send_bytes(
+                body.response
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .control
+                    .file
+                    .clone()
+                    .into(),
+                vec![1; 1].into_boxed_slice(),
+            )
+            .unwrap(),
+        );
+        body.observe_diagnostic(&ring);
+        assert_eq!(body.diagnostic.as_ref().unwrap().stage, "socket_send");
+        body.response.as_ref().unwrap().deadline.cap(Instant::now());
+        assert_eq!(
+            body.poll(&mut ring, 1).err().unwrap().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(body.diagnostic.as_ref().unwrap().emitted);
+        drop(body);
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+    }
+
+    #[test]
     fn kernel_integration() {
         cache_responses::kernel_child(
             "http_server::tests::kernel_child",

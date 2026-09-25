@@ -19,6 +19,7 @@ impl Handler {
         let deadline = request.deadline().min(crate::environment::now() + TIMEOUT);
         let response_deadline = request.response_deadline();
         let mut task = Task {
+            body_context: None,
             _cache_use: (!self.maintenance).then(|| cache.use_guard()),
             upstream: self.upstream.routed(None),
             response: Response::Request(request),

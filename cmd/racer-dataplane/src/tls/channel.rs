@@ -23,6 +23,20 @@ pub struct TlsChannel {
     ready: bool,
 }
 impl TlsChannel {
+    pub(crate) fn write_diagnostic(
+        &self,
+        ring: &Ring,
+    ) -> (&'static str, Option<crate::failure_diagnostics::IoState>) {
+        if let Some(t) = &self.write_ready {
+            ("tls_socket_readiness", ring.diagnostic(t))
+        } else if let Some(t) = &self.readiness {
+            ("tls_handshake_readiness", ring.diagnostic(t))
+        } else if self.slab_wait.is_some() {
+            ("ktls_slab_rate", None)
+        } else {
+            ("tls_write_or_admission", None)
+        }
+    }
     pub(crate) fn ktls_tx(&self) -> bool {
         self.session.offload().tx
     }

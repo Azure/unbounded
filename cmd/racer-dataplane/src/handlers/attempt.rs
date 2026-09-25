@@ -5,6 +5,22 @@
 use super::*;
 
 impl Provider {
+    pub(super) fn body_context(
+        &self,
+        key: [u8; 32],
+        checksum: Option<crate::metadata::Checksum>,
+        offset: Option<u64>,
+    ) -> Option<serde_json::Value> {
+        let key = hex(&key);
+        if !crate::failure_diagnostics::selected(&key) {
+            return None;
+        }
+        let route=self.active.as_ref().map(|s| { let s=s.borrow(); let c=&s.cursor;
+            serde_json::json!({"identity":hex(&c.identity),"candidate":self.routing.as_ref().map(|r|r.destination(c)),"candidate_ordinal":c.attempt,"path":c.path,"position":c.position,"owner_slot":c.owner}) });
+        Some(
+            serde_json::json!({"key":key,"checksum":checksum.map(|c|hex(&c.0)),"offset":offset,"volume":self.volume,"flight":self.flight,"route":route}),
+        )
+    }
     pub(super) fn attempt(&mut self, context: String) -> cache::Result<Option<Attempt>> {
         let (Some(state), Some(routing), Some(peer)) = (&self.active, &self.routing, &self.peer)
         else {

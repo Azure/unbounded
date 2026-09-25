@@ -141,7 +141,28 @@ impl Task {
                     // for inline metadata, registered buffers, and file bodies.
                     let chunk =
                         http::BodyChunk::value(buffer, start..start + len).map_err(|e| e.error)?;
-                    self.response = Response::Body(writer.send(chunk).map_err(|e| e.error)?);
+                    let mut body = writer.send(chunk).map_err(|e| e.error)?;
+                    let context = if self.peer {
+                        self.body_context.take()
+                    } else {
+                        self.metadata.as_ref().and_then(|meta| {
+                            meta.page_key(offset).ok().and_then(|key| {
+                                self.upstream
+                                    .body_context(key, Some(meta.checksum()), Some(offset))
+                            })
+                        })
+                    };
+                    if let Some(mut context) = context {
+                        // Client Task's provider belongs to metadata; page
+                        // providers have already completed. Do not misattribute
+                        // the sent page to the metadata route/flight.
+                        if !self.peer {
+                            context["route"] = serde_json::Value::Null;
+                            context["flight"] = serde_json::Value::Null;
+                        }
+                        body.set_diagnostic(context);
+                    }
+                    self.response = Response::Body(body);
                     return Ok(Progress::Pending(runnable()));
                 }
                 self.response = Response::Writer(writer);

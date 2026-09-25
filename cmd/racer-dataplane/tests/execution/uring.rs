@@ -17,6 +17,12 @@ fn fill(pool: &WorkerPool, key: u8) -> Fill {
 }
 fn request(resource: Resource, opcode: u8, abandoned: bool) -> Request {
     Request {
+        created: Instant::now(),
+        submitted: Some(Instant::now()),
+        completed: None,
+        diagnostic_offset: 0,
+        diagnostic_len: 0,
+        diagnostic_flags: 0,
         slab_pending: None,
         slab_charge: None,
         metric_traffic: None,

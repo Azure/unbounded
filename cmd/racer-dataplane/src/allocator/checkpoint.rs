@@ -50,7 +50,14 @@ impl Storage for RingIo<'_> {
                     WIDE,
                     value.allocation.clone(),
                 ) {
-                    Ok(ticket) => Ok(IoTicket::Punch(ticket, value)),
+                    Ok(ticket) => {
+                        value.publication.set(Some((
+                            "punch",
+                            crate::environment::now(),
+                            Some(ticket.diagnostic_id()),
+                        )));
+                        Ok(IoTicket::Punch(ticket, value))
+                    }
                     Err(error) => Err(uring::Rejected {
                         error,
                         resource: Job::Value(value),
@@ -81,7 +88,14 @@ impl Storage for RingIo<'_> {
                 match self.ring.take_punch(t)? {
                     None => return Ok(None),
                     Some(Err(error)) => return Ok(Some(Err(error))),
-                    Some(Ok(())) => *ticket = IoTicket::Detached(value.clone()),
+                    Some(Ok(())) => {
+                        value.publication.set(Some((
+                            "write_admission",
+                            crate::environment::now(),
+                            None,
+                        )));
+                        *ticket = IoTicket::Detached(value.clone());
+                    }
                 }
                 self.complete(ticket)?
             }
@@ -94,6 +108,11 @@ impl Storage for RingIo<'_> {
                     FileOffset::new(value.allocation.offset()).unwrap(),
                 ) {
                     Ok(t) => {
+                        value.publication.set(Some((
+                            "write",
+                            crate::environment::now(),
+                            Some(t.diagnostic_id()),
+                        )));
                         self.ring.retain(&t, value.allocation.clone());
                         *ticket = IoTicket::Value(t, value.clone());
                         None
@@ -106,6 +125,9 @@ impl Storage for RingIo<'_> {
             IoTicket::Value(t, value) => self.ring.take_write(t)?.map(|c| {
                 exact(c.result, value.info.len)?;
                 value.written.set(true);
+                value
+                    .publication
+                    .set(Some(("written", crate::environment::now(), None)));
                 value.buffer.borrow_mut().take();
                 Ok(())
             }),

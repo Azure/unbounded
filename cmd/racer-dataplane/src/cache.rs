@@ -1028,6 +1028,12 @@ pub struct Fault<U: Upstream> {
     candidate_deadline: Option<Instant>,
 }
 impl<U: Upstream> Fault<U> {
+    pub(crate) fn page_offset(&self) -> Option<u64> {
+        match &self.spec {
+            Spec::Page(p) => Some(p.offset),
+            _ => None,
+        }
+    }
     fn diagnostic_state(&self) -> &'static str {
         match &self.state {
             Loading::Metadata(_) => "metadata_publish",
@@ -1050,6 +1056,7 @@ impl<U: Upstream> Fault<U> {
     fn diagnose(
         &self,
         upstream: &U,
+        ring: &Ring,
         error: &Error,
         site: &'static str,
         polled_state: Option<&'static str>,
@@ -1057,6 +1064,18 @@ impl<U: Upstream> Fault<U> {
         let now = crate::environment::now();
         upstream.diagnose_failure(
             crate::failure_diagnostics::CacheFailure {
+                publication: match &self.state {
+                    Loading::Publishing(lease) => {
+                        let mut value = lease.diagnostic();
+                        value["io"] = serde_json::json!(
+                            value["ticket"]
+                                .as_u64()
+                                .and_then(|id| ring.diagnostic_id(id))
+                        );
+                        Some(value)
+                    }
+                    _ => None,
+                },
                 key: peer_wire::hex(&self.key),
                 checksum: self.representation_checksum().map(|c| peer_wire::hex(&c.0)),
                 offset: match &self.spec {
@@ -1158,6 +1177,9 @@ pub struct Metadata {
     context: Context,
 }
 impl Metadata {
+    pub(crate) fn page_key(&self, offset: u64) -> Result<[u8; 32]> {
+        Ok(*self.record.page(&self.object, offset)?.key())
+    }
     pub fn content_type(&self) -> Option<&[u8]> {
         self.record.content_type.as_bytes()
     }
@@ -1708,7 +1730,7 @@ impl Cache {
         }
         self.bind(ring)?;
         if crate::environment::now() >= fault.deadline {
-            fault.diagnose(upstream, &Error::Timeout, "caller_before_poll", None);
+            fault.diagnose(upstream, ring, &Error::Timeout, "caller_before_poll", None);
             return Err(Error::Timeout);
         }
         if let Spec::Page(page) = &fault.spec {
@@ -1896,6 +1918,7 @@ impl Cache {
                                 {
                                     fault.diagnose(
                                         upstream,
+                                        ring,
                                         &error,
                                         "shared_candidate_expiry",
                                         None,
@@ -1916,7 +1939,13 @@ impl Cache {
                 Loading::Upstream { .. } | Loading::MetadataExchange(_)
             )
         {
-            fault.diagnose(upstream, &Error::Timeout, "candidate_before_step", None);
+            fault.diagnose(
+                upstream,
+                ring,
+                &Error::Timeout,
+                "candidate_before_step",
+                None,
+            );
             return Err(Error::Timeout);
         }
         let polled_state = fault.diagnostic_state();
@@ -1927,6 +1956,7 @@ impl Cache {
         if crate::environment::now() >= fault.deadline {
             fault.diagnose(
                 upstream,
+                ring,
                 result.as_ref().err().unwrap_or(&Error::Timeout),
                 "caller_after_step",
                 Some(polled_state),
@@ -1942,6 +1972,7 @@ impl Cache {
             // Private expiry relinquishes the producer lease to a surviving consumer.
             fault.diagnose(
                 upstream,
+                ring,
                 result.as_ref().err().unwrap_or(&Error::Timeout),
                 "candidate_after_step",
                 Some(polled_state),
@@ -2009,7 +2040,7 @@ impl Cache {
                 })
             }
             Err(error) => {
-                fault.diagnose(upstream, &error, "step_failure", Some(polled_state));
+                fault.diagnose(upstream, ring, &error, "step_failure", Some(polled_state));
                 let error = Self::finish_failure(&mut fault, error);
                 self.candidate_failed(fault, error, ring, upstream)
             }
@@ -2098,7 +2129,7 @@ impl Cache {
         ring: &mut Ring,
         upstream: &mut U,
     ) -> Result<Progress<Fault<U>, CachedValue>> {
-        fault.diagnose(upstream, &error, "candidate_failure", None);
+        fault.diagnose(upstream, ring, &error, "candidate_failure", None);
         if matches!(
             error.evidence().reason(),
             crate::outcome::PeerReason::Unauthorized | crate::outcome::PeerReason::Forbidden

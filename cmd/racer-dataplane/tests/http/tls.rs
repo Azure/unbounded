@@ -562,6 +562,9 @@ mod tls_transport {
                         )
                         .unwrap(),
                     ));
+                    if let Task::Body(body) = task {
+                        body.set_diagnostic(serde_json::json!({"key":"b".repeat(64),"offset":0}));
+                    }
                     pending(true, None)
                 }
                 Progress::Ready(BodyProgress::Done(done)) => {
@@ -593,13 +596,27 @@ mod tls_transport {
             .insert_payload([92; 32], buffer(ring, 92, BUFFER_SIZE), None)
             .unwrap();
         let lease = allocator.lookup(&[92; 32], 0).unwrap();
+        assert_eq!(lease.diagnostic()["stage"], "pending");
+        let mut saw_publication_io = false;
         let value = drive(ring, |ring| {
             let work = allocator.poll(ring, 16)?;
+            let publication = lease.diagnostic();
+            if let Some(id) = publication["ticket"].as_u64() {
+                let io = ring.diagnostic_id(id).unwrap();
+                assert!(matches!(
+                    publication["stage"].as_str(),
+                    Some("punch" | "write")
+                ));
+                assert!(matches!(io.opcode, 17 | 5));
+                saw_publication_io = true;
+            }
             Ok(lease
                 .ready()
                 .map_or(Progress::Pending(work), Progress::Ready))
         })
         .unwrap();
+        assert!(saw_publication_io);
+        assert_eq!(lease.diagnostic()["stage"], "written");
         drive(ring, |ring| {
             let work = allocator.poll(ring, 16)?;
             Ok(if allocator.is_idle() {
@@ -645,9 +662,29 @@ mod tls_transport {
             )
             .unwrap();
         let before = crate::tls::global_counters();
+        let mut saw_read = false;
+        let mut saw_completed_read = false;
+        let mut saw_rate_queued = false;
         let mut response = drive(ring, |ring| {
             let mut work = allocator.poll(ring, 4)?;
             work.merge(server.poll(ring, 4)?);
+            for slot in &server.slots {
+                if let Some(Task::Body(body)) = &slot.task {
+                    let d = body.diagnostic.as_ref().unwrap();
+                    if d.stage == "file_read" {
+                        saw_read = true;
+                        assert_eq!(d.io.as_ref().unwrap().opcode, 22);
+                        assert!(d.io.as_ref().unwrap().len <= 65536);
+                        saw_rate_queued |= d.io.as_ref().unwrap().state == "rate_queued";
+                        let record =
+                            d.record("test", Some(&io::Error::from(io::ErrorKind::TimedOut)));
+                        assert_eq!(record["stage"], "file_read");
+                        assert_eq!(record["error_kind"], "TimedOut");
+                        assert!(record["io"]["offset"].as_u64().unwrap() >= 13);
+                    }
+                    saw_completed_read |= d.read_count > 0;
+                }
+            }
             Ok(match get.poll(ring, 4)? {
                 Progress::Pending(mut pending) => {
                     pending.merge(work);
@@ -658,6 +695,13 @@ mod tls_transport {
         })
         .unwrap();
         assert_eq!(response.body(), vec![92; 192 * 1024 + 7]);
+        if !ktls {
+            assert!(saw_read);
+            assert!(saw_completed_read);
+            if limited {
+                assert!(saw_rate_queued);
+            }
+        }
         if limited {
             assert_eq!(counter("bytes_total") - bytes_before, 192 * 1024 + 7);
             assert!(counter("operations_total") - ops_before >= 4);

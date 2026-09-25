@@ -303,6 +303,9 @@ pub struct Ticket<O: Operation> {
     _op: PhantomData<O>,
 }
 impl<O: Operation> Ticket<O> {
+    pub(crate) fn diagnostic_id(&self) -> u64 {
+        self.id
+    }
     /// Request cancellation on abandonment, retried by the ring under SQ pressure.
     /// The resource remains retained until the target's terminal completion.
     pub(crate) fn cancel_on_drop(mut self) -> Self {
@@ -346,6 +349,12 @@ enum State {
     Complete(i32),
 }
 struct Request {
+    created: Instant,
+    submitted: Option<Instant>,
+    completed: Option<Instant>,
+    diagnostic_offset: u64,
+    diagnostic_len: u64,
+    diagnostic_flags: u32,
     slab_pending: Option<Box<SlabPending>>,
     slab_charge: Option<crate::slab_io::Charge>,
     metric_traffic: Option<crate::metrics::Traffic>,
@@ -729,6 +738,16 @@ impl Ring {
         });
         let queued = slab_pending.is_some();
         slot.request = Some(Request {
+            created: crate::environment::now(),
+            submitted: (!queued).then(crate::environment::now),
+            completed: None,
+            diagnostic_offset: if sqe.opcode == 30 { sqe.addr } else { sqe.off },
+            diagnostic_len: if sqe.opcode == 17 {
+                sqe.addr
+            } else {
+                u64::from(sqe.len)
+            },
+            diagnostic_flags: sqe.op_flags,
             slab_pending,
             slab_charge: None,
             metric_traffic: None,

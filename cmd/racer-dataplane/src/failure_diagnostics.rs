@@ -11,6 +11,128 @@ use std::{
 };
 
 #[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct IoState {
+    pub ticket: u64,
+    pub opcode: u8,
+    pub offset: u64,
+    pub len: u64,
+    pub flags: u32,
+    pub state: &'static str,
+    pub age_ms: u128,
+    pub submitted_age_ms: Option<u128>,
+    pub completion_age_ms: Option<u128>,
+    pub result: Option<i32>,
+    pub ring_used: usize,
+    pub slab_queued: usize,
+}
+
+/// One bounded context per selected response chunk; no payload or credentials.
+pub(crate) struct BodyTrace {
+    pub context: serde_json::Value,
+    pub started: Instant,
+    pub last_progress: Instant,
+    pub stage_since: Instant,
+    pub stage: &'static str,
+    pub sent: u64,
+    pub remaining: u64,
+    pub deadline: Instant,
+    pub io: Option<IoState>,
+    pub last_read: Option<IoState>,
+    pub read_count: u64,
+    pub read_bytes: u64,
+    pub read_wait_ms: u128,
+    pub max_read_wait_ms: u128,
+    pub file_wait_ms: u128,
+    pub socket_wait_ms: u128,
+    pub other_wait_ms: u128,
+    pub sampled_at: Instant,
+    pub emitted: bool,
+    pub slow_reported: bool,
+}
+impl BodyTrace {
+    pub(crate) fn new(context: serde_json::Value, deadline: Instant, remaining: u64) -> Self {
+        let now = crate::environment::now();
+        Self {
+            context,
+            started: now,
+            last_progress: now,
+            stage_since: now,
+            stage: "body_start",
+            sent: 0,
+            remaining,
+            deadline,
+            io: None,
+            last_read: None,
+            read_count: 0,
+            read_bytes: 0,
+            read_wait_ms: 0,
+            max_read_wait_ms: 0,
+            file_wait_ms: 0,
+            socket_wait_ms: 0,
+            other_wait_ms: 0,
+            sampled_at: now,
+            emitted: false,
+            slow_reported: false,
+        }
+    }
+    pub(crate) fn observe(&mut self, stage: &'static str, remaining: u64, io: Option<IoState>) {
+        let now = crate::environment::now();
+        let elapsed = now.saturating_duration_since(self.sampled_at).as_millis();
+        match self.stage {
+            "file_read" | "splice_file" | "ktls_slab_rate" => self.file_wait_ms += elapsed,
+            "tls_socket_readiness"
+            | "socket_send"
+            | "buffer_send"
+            | "send_zc"
+            | "splice_socket" => self.socket_wait_ms += elapsed,
+            _ => self.other_wait_ms += elapsed,
+        }
+        if remaining < self.remaining {
+            self.sent += self.remaining - remaining;
+            self.last_progress = now;
+        }
+        self.remaining = remaining;
+        if stage != self.stage {
+            self.stage = stage;
+            self.stage_since = now;
+        }
+        self.io = io;
+        self.sampled_at = now;
+    }
+    pub(crate) fn read_completed(&mut self, io: Option<IoState>) {
+        if let Some(io) = io {
+            self.read_count += 1;
+            self.read_bytes += io.result.unwrap_or(0).max(0) as u64;
+            let wait = io.age_ms.saturating_sub(io.completion_age_ms.unwrap_or(0));
+            self.read_wait_ms += wait;
+            self.max_read_wait_ms = self.max_read_wait_ms.max(wait);
+            self.last_read = Some(io);
+        }
+    }
+    pub(crate) fn record(
+        &self,
+        site: &'static str,
+        error: Option<&std::io::Error>,
+    ) -> serde_json::Value {
+        let now = crate::environment::now();
+        serde_json::json!({"event":"racer_body_stall","context":self.context,"site":site,
+            "worker":std::thread::current().name(),"stage":self.stage,"stage_ms":now.saturating_duration_since(self.stage_since).as_millis(),
+            "sent":self.sent,"remaining":self.remaining,"elapsed_ms":now.saturating_duration_since(self.started).as_millis(),
+            "no_progress_ms":now.saturating_duration_since(self.last_progress).as_millis(),"deadline_remaining_ms":self.deadline.saturating_duration_since(now).as_millis(),
+            "snapshot_age_ms":now.saturating_duration_since(self.sampled_at).as_millis(),"io":self.io,"last_read":self.last_read,
+            "read_count":self.read_count,"read_bytes":self.read_bytes,"read_wait_ms":self.read_wait_ms,"max_read_wait_ms":self.max_read_wait_ms,
+            "file_wait_ms":self.file_wait_ms,"socket_wait_ms":self.socket_wait_ms,"other_wait_ms":self.other_wait_ms,
+            "error_kind":error.map(|e|format!("{:?}",e.kind())),"errno":error.and_then(|e|e.raw_os_error())})
+    }
+    pub(crate) fn report(&mut self, site: &'static str, error: Option<&std::io::Error>) {
+        if !self.emitted {
+            self.emitted = true;
+            emit(self.record(site, error));
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Failure {
     pub reason: String,
     pub cause: Option<String>,
@@ -48,6 +170,7 @@ impl Failure {
 
 #[derive(serde::Serialize)]
 pub struct CacheFailure {
+    pub publication: Option<serde_json::Value>,
     pub key: String,
     pub checksum: Option<String>,
     pub offset: Option<u64>,
@@ -191,6 +314,42 @@ pub(crate) fn selected(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn body_record_retains_first_read_and_partial_progress_without_raw_error() {
+        let mut d = BodyTrace::new(
+            serde_json::json!({"key":"a".repeat(64)}),
+            Instant::now() + Duration::from_secs(10),
+            100,
+        );
+        let io = IoState {
+            ticket: 7,
+            opcode: 22,
+            offset: 4096,
+            len: 64,
+            flags: 0,
+            state: "complete",
+            age_ms: 80,
+            submitted_age_ms: Some(70),
+            completion_age_ms: Some(5),
+            result: Some(64),
+            ring_used: 2,
+            slab_queued: 0,
+        };
+        d.read_completed(Some(io.clone()));
+        d.observe("file_read", 100, Some(io));
+        assert_eq!(d.sent, 0);
+        d.observe("tls_socket_readiness", 36, None);
+        let record = d.record(
+            "body_poll_error",
+            Some(&std::io::Error::other("secret-target?token=password")),
+        );
+        assert_eq!(record["sent"], 64);
+        assert_eq!(record["remaining"], 36);
+        assert_eq!(record["read_wait_ms"], 75);
+        assert_eq!(record["max_read_wait_ms"], 75);
+        assert_eq!(record["last_read"]["offset"], 4096);
+        assert!(!record.to_string().contains("secret"));
+    }
     #[test]
     fn production_page_key_uses_hashed_catalog_universe() {
         use crate::cache::{Namespace, PeerDescriptor, PeerPage};

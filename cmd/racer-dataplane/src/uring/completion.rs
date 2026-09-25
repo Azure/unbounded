@@ -29,6 +29,7 @@ impl Request {
             charge.finish(res.max(0) as usize);
         }
         self.state = State::Complete(res);
+        self.completed = Some(crate::environment::now());
         Ok(true)
     }
 
@@ -42,6 +43,7 @@ impl Request {
             pending.io.waited(pending.since);
         }
         self.state = State::Complete(-libc::ECANCELED);
+        self.completed = Some(crate::environment::now());
         true
     }
 
@@ -52,6 +54,7 @@ impl Request {
             pending.io.waited(pending.since);
         }
         raw.push(pending.sqe);
+        self.submitted = Some(crate::environment::now());
         self.slab_charge = Some(charge);
         self.slab_pending = None;
     }

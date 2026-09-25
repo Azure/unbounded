@@ -492,6 +492,7 @@ struct Allocation {
 }
 
 struct PayloadExtent {
+    publication: Cell<Option<(&'static str, std::time::Instant, Option<u64>)>>,
     allocation: Rc<Allocation>,
     info: ValueInfo,
     // Kept until the write completes. New lookups can use the immutable bytes.
@@ -549,6 +550,11 @@ pub struct ReadLease {
     value: Rc<PayloadExtent>,
 }
 impl ReadLease {
+    pub(crate) fn diagnostic(&self) -> serde_json::Value {
+        let stage = self.value.publication.get();
+        serde_json::json!({"written":self.value.written.get(),"file_offset":self.value.allocation.offset(),"len":self.value.info.len,
+            "stage":stage.map(|s|s.0),"stage_ms":stage.map(|s|crate::environment::now().saturating_duration_since(s.1).as_millis()),"ticket":stage.and_then(|s|s.2)})
+    }
     pub fn ready(&self) -> Option<FileValue> {
         self.value.written.get().then(|| FileValue {
             file: self.value.allocation.space._file.clone(),
@@ -994,6 +1000,7 @@ impl Allocator {
             .or(checksum)
             .unwrap_or_else(|| crc64(buffer.as_slice()));
         let value = Rc::new(PayloadExtent {
+            publication: Cell::new(Some(("pending", crate::environment::now(), None))),
             allocation,
             info,
             buffer: RefCell::new(Some(buffer.clone())),

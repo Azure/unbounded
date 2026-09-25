@@ -1273,6 +1273,7 @@ impl BodyWriter {
             });
         }
         Ok(SendingBody {
+            diagnostic: None,
             tls_read: None,
             tls_bytes: None,
             tls_file: None,
@@ -1289,6 +1290,7 @@ impl BodyWriter {
 /// Sends a chunk, handles short transfers, and drains notifications as needed.
 #[must_use]
 pub struct SendingBody {
+    diagnostic: Option<crate::failure_diagnostics::BodyTrace>,
     tls_read: Option<Ticket<Bytes>>,
     tls_bytes: Option<(Box<[u8]>, std::ops::Range<usize>)>,
     // Retain the same descriptor across OpenSSL WANT retries.
@@ -1309,6 +1311,15 @@ struct FileChunk {
     read: crate::uring::File,
     write: crate::uring::File,
 }
+impl Drop for SendingBody {
+    fn drop(&mut self) {
+        if let Some(d) = &mut self.diagnostic {
+            // Outer Server expiry and shutdown can drop a task without polling
+            // its body again. Report the last bounded snapshot with its age.
+            d.report("body_drop", None);
+        }
+    }
+}
 struct FileSend {
     source: crate::allocator::FileSource,
     read: crate::uring::File,
@@ -1319,8 +1330,88 @@ struct FileSend {
     readiness: Option<Ticket<crate::uring::Control>>,
 }
 impl SendingBody {
+    pub(crate) fn set_diagnostic(&mut self, mut context: serde_json::Value) {
+        if let Some(crate::cache::CachedValue::File(file)) =
+            self.chunk.as_ref().map(|chunk| &chunk.buffer)
+        {
+            context["file_offset"] = serde_json::json!(file.offset());
+            context["file_len"] = serde_json::json!(file.info().len);
+        }
+        if let Some(response) = &self.response {
+            context["transport"] = serde_json::json!(if response
+                .connection
+                .tls
+                .as_ref()
+                .is_some_and(|t| t.ktls_tx())
+            {
+                "ktls"
+            } else if response.connection.tls.is_some() {
+                "tls"
+            } else {
+                "plain"
+            });
+            self.diagnostic = Some(crate::failure_diagnostics::BodyTrace::new(
+                context,
+                response.deadline.get(),
+                response.remaining,
+            ));
+        }
+    }
+    fn observe_diagnostic(&mut self, ring: &Ring) {
+        let Some(d) = &mut self.diagnostic else {
+            return;
+        };
+        let Some(r) = &self.response else { return };
+        let (stage, io) = if let Some(t) = &self.tls_read {
+            ("file_read", ring.diagnostic(t))
+        } else if let Some(t) = &self.small {
+            ("socket_send", ring.diagnostic(t))
+        } else if let Some(t) = &self.buffered {
+            ("buffer_send", ring.diagnostic(t))
+        } else if let Some(t) = &self.ticket {
+            ("send_zc", ring.diagnostic(t))
+        } else if let Some(tls) = &r.connection.tls {
+            tls.write_diagnostic(ring)
+        } else if let Some(file) = &r.file {
+            if let Some(t) = &file.readiness {
+                ("splice_readiness", ring.diagnostic(t))
+            } else if let Some(t) = &file.ticket {
+                (
+                    if file.draining {
+                        "splice_socket"
+                    } else {
+                        "splice_file"
+                    },
+                    ring.diagnostic(t),
+                )
+            } else {
+                ("splice_admission", None)
+            }
+        } else {
+            ("body_admission", None)
+        };
+        d.deadline = r.deadline.get();
+        d.observe(stage, r.remaining, io);
+    }
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<BodyProgress>> {
+        self.observe_diagnostic(ring);
         let result = self.poll_inner(ring, budget);
+        self.observe_diagnostic(ring);
+        if let Some(d) = &mut self.diagnostic {
+            if let Err(error) = &result {
+                d.report("body_poll_error", Some(error));
+            } else if matches!(result, Ok(Progress::Ready(_))) {
+                d.emitted = true;
+            } else if !d.slow_reported
+                && (crate::environment::now().saturating_duration_since(d.last_progress)
+                    >= Duration::from_secs(1)
+                    || crate::environment::now().saturating_duration_since(d.started)
+                        >= Duration::from_secs(5))
+            {
+                d.slow_reported = true;
+                crate::failure_diagnostics::emit(d.record("body_slow", None));
+            }
+        }
         if result.is_err() {
             self.response.take();
             self.chunk.take();
@@ -1424,9 +1515,16 @@ impl SendingBody {
                         }
                         if !tls.ktls_tx() {
                             if let Some(ticket) = &mut self.tls_read {
+                                let diagnostic = self
+                                    .diagnostic
+                                    .as_ref()
+                                    .and_then(|_| ring.diagnostic(ticket));
                                 let Some(done) = ring.take_bytes(ticket)? else {
                                     return Ok(pending(false, Some(r.deadline.get())));
                                 };
+                                if let Some(d) = &mut self.diagnostic {
+                                    d.read_completed(diagnostic);
+                                }
                                 let len = transfer(done.result?, chunk.range.len().min(64 * 1024))?;
                                 self.tls_read = None;
                                 self.tls_bytes = Some((done.resource, 0..len));

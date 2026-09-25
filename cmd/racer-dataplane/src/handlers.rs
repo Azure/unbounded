@@ -498,6 +498,7 @@ impl Upstream for Provider {
         crate::failure_diagnostics::emit(
             serde_json::json!({"event":"racer_page_failure","volume":self.volume,
             "worker":std::thread::current().name(),"flight":self.flight,"cache":fault,"route":route,"peer":peer,"backend":backend,
+            "attempt":error.attempt_failure().map(|failure|&failure.route.context),
             "hops":chain.hops,"work":chain.work,"rank":self.receive_rank,"suppressed":suppressed,
             "failure":crate::failure_diagnostics::Failure::from_error(error)}),
         );
@@ -1542,6 +1543,7 @@ struct PendingHead {
 /// ```
 #[must_use]
 pub struct Task {
+    body_context: Option<serde_json::Value>,
     // Includes streaming gaps with resolved metadata but no current Fault.
     // Rejected maintenance requests never acquire a cache-use guard.
     _cache_use: Option<Rc<()>>,
@@ -1707,10 +1709,34 @@ impl Handler {
                     }
                 }
                 Initial::Peer(fault) => {
+                    let body_identity = (
+                        *fault.key(),
+                        fault.representation_checksum(),
+                        fault.page_offset(),
+                    );
                     let identity = fault.representation_checksum();
                     let content_type = fault.content_type();
                     match cache.poll_value(fault, ring, &mut task.upstream) {
                         Ok(cache::Progress::Ready(buffer)) => {
+                            task.body_context = task.upstream.body_context(
+                                body_identity.0,
+                                body_identity.1,
+                                body_identity.2,
+                            );
+                            if let (Some(context), Response::Request(request)) =
+                                (&mut task.body_context, &task.response)
+                            {
+                                // Only retain the validated fixed-width wire nonce, never headers.
+                                if let Ok(Some(attempt)) =
+                                    text(request.headers(), "x-racer-attempt")
+                                {
+                                    if attempt.len() == 96
+                                        && attempt.bytes().all(|b| b.is_ascii_hexdigit())
+                                    {
+                                        context["attempt"] = serde_json::json!(attempt);
+                                    }
+                                }
+                            }
                             task.end = buffer.len() as u64;
                             let checksum = format!(
                                 "{:016x}",

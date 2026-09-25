@@ -175,6 +175,7 @@ mod uds_slab {
         let before_ops = counter(&io, "operations_total");
         let before_waits = counter(&io, "waits_total");
         let mut cancel_send = queue(&mut old_ring, cancel_writer, canceled);
+        cancel_send.set_diagnostic(serde_json::json!({"key":"a".repeat(64),"offset":0}));
         let mut old_send = queue(&mut old_ring, old_writer, surviving);
         let mut new_send = queue(&mut new_ring, new_writer, replacement);
         // Deliberately exceed the old ~31 ms admission race window. This pause
@@ -188,6 +189,19 @@ mod uds_slab {
             "neither inode has a separate burst"
         );
         assert!(old_ring.slab_deadline().is_some() && new_ring.slab_deadline().is_some());
+        assert!(matches!(
+            cancel_send.poll(&mut old_ring, 1).unwrap(),
+            Progress::Pending(_)
+        ));
+        let diagnostic = cancel_send
+            .diagnostic
+            .as_ref()
+            .unwrap()
+            .record("test", None);
+        assert_eq!(diagnostic["stage"], "splice_file");
+        assert_eq!(diagnostic["io"]["state"], "rate_queued");
+        assert_eq!(diagnostic["sent"], 0);
+        assert!(diagnostic["io"]["age_ms"].as_u64().unwrap() >= 100);
 
         // Publish a different inode while old HTTP owners are live. Runtime
         // fencing is covered separately; this verifies the transport/file lease
