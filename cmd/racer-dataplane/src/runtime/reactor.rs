@@ -648,6 +648,19 @@ impl Reactor {
         address: SocketAddress,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
+        self.connect_with_lease(fd, address, (), scope)
+    }
+
+    /// Transfer the complete connection/admission owner before submission. Return
+    /// it only after the original and any cancellation CQE are fenced. A dropped
+    /// connect future cannot return its endpoint slot or quota prematurely.
+    pub fn connect_with_lease<'a, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        address: SocketAddress,
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, L> {
         Box::pin(async move {
             let (address, len) = encode_address(address)?;
             let sqe = opcode::Connect::new(
@@ -659,7 +672,7 @@ impl Reactor {
             self.submit(sqe, scope, false, move |result| {
                 drop((fd, address));
                 result?.value()?;
-                Ok(())
+                Ok(lease)
             })?
             .await
         })
@@ -1101,6 +1114,50 @@ mod tests {
     }
 
     #[test]
+    fn connecting_lease_survives_abandonment_until_kernel_fence() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        assert!(fd >= 0);
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        let weak = Rc::downgrade(&fd);
+        let drops = Rc::new(Cell::new(0));
+        let quota = reactor
+            .admission
+            .reserve(None, ResourceClass::Connection, 1)
+            .unwrap();
+        let scope = scope();
+        let mut operation = reactor.connect_with_lease(
+            fd,
+            SocketAddress::Inet(listener.local_addr().unwrap()),
+            (Lease(drops.clone()), quota),
+            &scope,
+        );
+        assert!(poll(&mut operation).is_pending());
+        drop(operation);
+        assert_eq!(
+            drops.get(),
+            0,
+            "dropped future cannot release connecting admission"
+        );
+        assert!(weak.upgrade().is_some());
+        assert_eq!(reactor.admission.used(ResourceClass::Connection), 1);
+        drive(&reactor, reactor.drain()).unwrap();
+        assert_eq!(drops.get(), 1);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(reactor.admission.used(ResourceClass::Connection), 0);
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
     fn fence_waiters_sleep_until_both_cqes_and_unregister_on_drop() {
         for cancel_first in [false, true] {
             let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
@@ -1510,6 +1567,120 @@ mod tests {
             drive(&reactor, reactor.send(right, buffer(b"x"), (), &scope)),
             Err(Error::Io)
         ));
+    }
+
+    #[test]
+    fn real_connect_lease_survives_cqes_until_result_is_consumed() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let request = scope();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let weak = Rc::downgrade(&fd);
+        let drops = Rc::new(Cell::new(0));
+        let quota = reactor
+            .admission
+            .reserve(None, ResourceClass::Connection, 1)
+            .unwrap();
+        let mut connect = reactor.connect_with_lease(
+            fd,
+            SocketAddress::Inet(listener.local_addr().unwrap()),
+            (Lease(drops.clone()), quota),
+            &request,
+        );
+        assert!(poll(&mut connect).is_pending());
+        assert!(weak.upgrade().is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reactor.in_flight() != 0 {
+            assert!(Instant::now() < deadline);
+            reactor.poll_budgeted(1).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        // A completed but unconsumed reply must still quarantine the endpoint slot.
+        assert_eq!(drops.get(), 0);
+        assert_eq!(reactor.admission.used(ResourceClass::Connection), 1);
+        let Poll::Ready(Ok(lease)) = poll(&mut connect) else {
+            panic!("connect did not return its lease");
+        };
+        drop(connect);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(reactor.admission.used(ResourceClass::Connection), 1);
+        drop(lease);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(reactor.admission.used(ResourceClass::Connection), 0);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn real_connect_lease_is_quarantined_after_cancel_and_error() {
+        for (cancel, invalid_family) in [(true, false), (false, true)] {
+            let Some(reactor) = kernel_reactor(2) else {
+                return;
+            };
+            let request = scope();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            // An AF_UNIX socket with an Inet address deterministically fails in
+            // the kernel, without racing another listener for an unused TCP port.
+            let raw = unsafe {
+                libc::socket(
+                    if invalid_family {
+                        libc::AF_UNIX
+                    } else {
+                        libc::AF_INET
+                    },
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                )
+            };
+            assert!(raw >= 0);
+            let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            let weak = Rc::downgrade(&fd);
+            let drops = Rc::new(Cell::new(0));
+            let quota = reactor
+                .admission
+                .reserve(None, ResourceClass::Connection, 1)
+                .unwrap();
+            let mut connect = reactor.connect_with_lease(
+                fd,
+                SocketAddress::Inet(listener.local_addr().unwrap()),
+                (Lease(drops.clone()), quota),
+                &request,
+            );
+            assert!(poll(&mut connect).is_pending());
+            if cancel {
+                request.cancel().unwrap();
+            }
+            assert_eq!(drops.get(), 0);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(reactor.admission.used(ResourceClass::Connection), 1);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while reactor.in_flight() != 0 {
+                assert!(Instant::now() < deadline);
+                reactor.poll_budgeted(1).unwrap();
+                if reactor.in_flight() != 0 {
+                    // Includes the interval between original and cancel CQEs
+                    // when a cancel SQE wins the race against connect completion.
+                    assert_eq!(drops.get(), 0);
+                    assert!(weak.upgrade().is_some());
+                    assert_eq!(reactor.admission.used(ResourceClass::Connection), 1);
+                }
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            let expected = if cancel { Error::Cancelled } else { Error::Io };
+            assert!(matches!(poll(&mut connect), Poll::Ready(Err(error)) if error == expected));
+            assert_eq!(drops.get(), 1);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(reactor.admission.used(ResourceClass::Connection), 0);
+        }
     }
 
     #[test]
