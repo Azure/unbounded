@@ -152,11 +152,11 @@ if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true && -n "${GANTRY_ONLY_BASELINE_R
   exit 2
 fi
 standalone_adoption_values=0
-for value in "${GANTRY_ONLY_STANDALONE_IMAGE:-}" "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}"; do
+for value in "${GANTRY_ONLY_STANDALONE_IMAGE:-}" "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:-}" "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}"; do
   [[ -z "$value" ]] || standalone_adoption_values=$((standalone_adoption_values + 1))
 done
-if ((standalone_adoption_values != 0 && standalone_adoption_values != 2)); then
-  echo "GANTRY_ONLY_STANDALONE_IMAGE and GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 must be set together" >&2
+if ((standalone_adoption_values != 0 && standalone_adoption_values != 3)); then
+  echo "GANTRY_ONLY_STANDALONE_IMAGE, GANTRY_ONLY_STANDALONE_STREAMING_IMAGE, and GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 must be set together" >&2
   exit 2
 fi
 if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
@@ -199,7 +199,7 @@ make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 log "enabled benchmark $run_id"
 if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
-  if ((standalone_adoption_values == 2)); then
+  if ((standalone_adoption_values == 3)); then
     write_progress "prepare" "adopting an existing standalone Gantry image"
   else
     write_progress "prepare" "generating a standalone Gantry image with no baseline"
@@ -227,7 +227,7 @@ fi
 needs_baseline_credentials=false
 needs_gantry_credentials=false
 if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
-  [[ "$standalone_adoption_values" == 2 ]] || needs_gantry_credentials=true
+  [[ "$standalone_adoption_values" == 3 ]] || needs_gantry_credentials=true
 elif [[ -z "${ADOPT_BASELINE_IMAGE:-}" ]]; then
   if [[ -z "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
     needs_baseline_credentials=true
@@ -267,9 +267,10 @@ if [[ "$needs_baseline_credentials" == true || "$needs_gantry_credentials" == tr
 fi
 
 if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
-  if ((standalone_adoption_values == 2)); then
+  if ((standalone_adoption_values == 3)); then
     GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone-adopt \
-      "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
+      "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_STREAMING_IMAGE" \
+      "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
   else
     GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone
   fi
