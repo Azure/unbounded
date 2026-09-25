@@ -51,6 +51,22 @@ func TestRenderHosts(t *testing.T) {
 	}
 }
 
+func TestArtifactStreamingDoesNotMutateHostsRouting(t *testing.T) {
+	runner := &recordingRunner{}
+	benchmark := &benchmark{commands: runner}
+	state := benchmarkState{ArtifactStreaming: true}
+
+	if err := benchmark.installHosts(context.Background(), state, hostsModeGantry); err != nil {
+		t.Fatalf("installHosts: %v", err)
+	}
+	if err := benchmark.restoreHosts(context.Background(), state); err != nil {
+		t.Fatalf("restoreHosts: %v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("streaming routing executed %d commands", len(runner.commands))
+	}
+}
+
 func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	const registry = "gantry.azurecr.io"
 

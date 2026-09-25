@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -14,6 +14,7 @@ help: ## Show benchmark targets
 	@echo "  deploy       Idempotently deploy the complete benchmark stack"
 	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
 	@echo "  deploy-scale Resize the existing AKS node pool and wait for Ready nodes"
+	@echo "  deploy-recreate-pool  Replace the streaming worker pool with cold nodes"
 	@echo "  deploy-status  Report deployment readiness without mutation"
 	@echo "  operator-vm-check      Validate operator VM scripts"
 	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
@@ -105,6 +106,9 @@ deploy-plan: operator-vm-check
 
 deploy-scale: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh scale "$(DEPLOY_CONFIG)"
+
+deploy-recreate-pool: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh recreate-pool "$(DEPLOY_CONFIG)"
 
 deploy-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh status "$(DEPLOY_CONFIG)"

@@ -129,6 +129,10 @@ func (s benchmarkState) registryForHosts(mode hostsMode) (string, error) {
 }
 
 func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode hostsMode) error {
+	if state.ArtifactStreaming {
+		return nil
+	}
+
 	content, err := renderHosts(state, mode)
 	if err != nil {
 		return err
@@ -282,6 +286,10 @@ exec sleep 2147483647
 }
 
 func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) error {
+	if state.ArtifactStreaming {
+		return nil
+	}
+
 	if _, err := b.commands.Run(
 		ctx,
 		nil,
