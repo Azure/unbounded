@@ -4,8 +4,9 @@
 
 Approved design for a standard-library-only `pkg/racersdk`: a concurrent streaming
 client and a single-callback origin server. This document and the normative
-[client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md) are step 1;
-no Go implementation is included. SDK packages must not import `cmd/` packages.
+[client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md) define the
+contract. Step 2 implements validated types and private protocol helpers; client
+and origin lifecycles follow in step 3. SDK packages must not import `cmd/` packages.
 
 Evidence read in implementation, test, then prose order (Rust paths below are
 relative to `cmd/racer-dataplane/`):
@@ -32,7 +33,8 @@ relative to `cmd/racer-dataplane/`):
 
 ## Minimal public surface
 
-These are implementation signatures and semantic constraints, not existing APIs:
+These are the target public signatures and semantic constraints. Step 2 supplies
+the value types; the client and origin entry points are still pending:
 
 ```go
 type Key [32]byte
@@ -48,8 +50,6 @@ type Metadata struct {
 type Request struct {
     Key     Key
     Context FetchContext
-    Pin     ETag
-    Range   Range
 }
 
 func NewClient(config ClientConfig) (*Client, error)
@@ -82,12 +82,11 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
 - `Range` has private state. `ClosedRange(ByteOffset, ByteOffset)`,
   `FromRange(ByteOffset)`, and `SuffixRange(ByteLength)` return `(Range, error)`;
   reject syntactic overflow/reversal during construction. Zero suffix is valid
-  syntax but unsatisfiable. Zero Range means unspecified. Zero Pin plus zero Range
-  requests the whole fresh object. A valid Pin requires a nonzero Range; any other
-  combination fails locally. This permits direct pinned closed/open/suffix reads
-  without adding HEAD or page APIs. Client.Get revalidates exported Request fields
-  and aggregate wire-head size before I/O; individually valid fields may exceed
-  the total head limit when combined.
+  syntax but unsatisfiable. Zero Range means unspecified. Public Request contains
+  only Key and Context; Get always opens a whole fresh stream. Pins, ranges, and
+  HEAD remain wire operations for internal continuation and origin handling.
+  Public range constructors/accessors and Resolve support OriginRequest consumers.
+  Client.Get validates its request and aggregate wire-head size before I/O.
 - `OriginRequest` has private fields and value accessors `Key()`, `Context()`,
   `Operation()`, `Pin() (ETag, bool)`, and `Range() (Range, bool)`. `Operation` is a
   typed enum `OperationHead`, `OperationBootstrap`, `OperationPinned`; zero is
@@ -122,8 +121,7 @@ For a fresh full-object Get:
 4. End with EOF only after the full expected count. Do not open a continuation
    for a one-page object. Closing before page zero ends never fetches the remainder.
 
-A directly pinned Request issues one GET with the chosen range and no bootstrap;
-its metadata defines the immutable total size. Pin errors never fall back to fresh.
+Continuation pin errors never fall back to a fresh version.
 The client holds at most one response body per Value, and no SDK-owned page buffer.
 `Read` reads directly into `p`; small stdlib framing buffers still exist.
 `WriteTo` uses a bounded reusable 32 KiB copy buffer, honors partial writes and
@@ -234,30 +232,66 @@ or the underlying error obtained via Unwrap.
 
 ## Implementation steps and files
 
-Each later step gets a separate subagent and commit in an isolated worktree; the
-parent integrates by cherry-pick. No nested subagents. Step 1 changes only this
-design, the v1 contract, and its link from CONTROL_API.md.
-
-1. **Contract (this step):** review the API, wire grammar, defaults, and acceptance
+1. **Contract:** review the API, wire grammar, defaults, and acceptance
    below. The source remains a nonoperational scaffold.
 2. **Types and protocol:** add `pkg/racersdk/doc.go`, `types.go`, `range.go`,
    `errors.go`, `wire.go`, `wire_conn.go`, and corresponding focused tests. Implement
    validated private values, safe formatting, range math, metadata/status parsing,
    bounded raw-head validation, and shared canonical vectors.
-3. **Streaming client:** add `client.go`, `value.go`, `client_test.go`, and
-   `value_test.go`. Implement bounded Unix transport, bootstrap/continuation,
-   direct pins, buffer-independent streaming, ownership, and cancellation races.
-4. **Origin server:** add `origin.go`, `origin_test.go`, and Unix lifecycle helpers
-   if needed. Implement the callback, raw-wire enforcement, bounded admission,
-   deadlines, body ownership/probing, safe socket cleanup, and late-error aborts.
-5. **Integration and performance acceptance:** add `integration_test.go`,
-   `benchmark_test.go`, and `example_test.go`. Exercise client against an origin
-   shim/fake dataplane and raw peers. Document results and examples in package docs.
+3. **Client and origin:** add `client.go`, `value.go`, `origin.go`, corresponding
+   tests, and Unix lifecycle helpers as needed. Implement bounded Unix transport,
+   bootstrap/continuation, buffer-independent streaming, ownership, cancellation,
+   the callback, raw-wire enforcement, bounded admission, deadlines, body probing,
+   safe socket cleanup, and late-error aborts.
+4. **Package documentation and examples:** document the public API, streaming and
+   callback ownership, credentials, deadlines, and errors; add `example_test.go`.
+5. **Verification and performance:** add `integration_test.go` and
+   `benchmark_test.go`. Exercise client against an origin shim/fake dataplane and
+   raw peers. Document verification and performance results.
    A real Rust compatibility claim requires implementing its still-stubbed codec,
    parser, response writer, and origin validators in a separately scoped change;
    a fake transport passing is not evidence that Racer itself serves data.
 
 ## Test and performance acceptance
+
+### Private protocol integration interface
+
+The step 2 implementation exposes these package-private seams for client/origin:
+
+- `readRawHead(*bufio.Reader, response)` reads at most 32 KiB and runs
+  `validateRawHead`. Preserve that same buffered reader across head, body, and
+  sequential messages; it can contain read-ahead. Never scan body bytes for a
+  header delimiter. Any head error requires connection closure. The connection
+  owner supplies deadlines/cancellation and must release credential-bearing head
+  buffers after use. No pooled buffer retains context.
+- `parseRequestHead(head, origin)` returns the private fields of `OriginRequest`.
+  `origin=true` enforces page shape; selected-size validation follows the callback.
+  `requestHead` constructs a canonical head from that private operation descriptor.
+  Bootstrap uses `bootstrapRange()`. The public Request remains Key/Context only.
+- `parseResponseHead(head, request, snapshot)` returns `wireResponse` metadata,
+  inclusive bounds, and actual body length (zero for HEAD). The optional initial
+  snapshot checks immutable tag/size, allowing refreshed expiry. Protocol error
+  responses return typed errors after validating their empty framing.
+- `originResponse(request, metadata)` validates successful callback metadata, pin,
+  and whole-page bounds. `metadataHeaders`, `contentRangeValue`, `callbackStatus`,
+  and `originStatus` support the writer. The server still owns callback-body
+  contracts and the selected-size requirement for callback 416 errors.
+- `frameReader` bounds a streaming HTTP body, preserves final-byte I/O errors, and
+  reports short EOF through `errors.Is(err, io.ErrUnexpectedEOF)`. It neither closes
+  its source nor probes beyond the HTTP frame. Callback EOF probing/final-byte
+  holdback belongs in the origin implementation, not this framing reader.
+
+These are building blocks, not an installed transport guard. When integrating a
+stdlib Transport, validate each raw response head before replaying it to net/http;
+advance only by its validated body length, using the known request method for HEAD.
+Reject informational responses before Transport can consume them. On the origin
+side validate raw heads before net/http can normalize them or emit its own error
+bodies. Parsed Header maps alone cannot enforce context separator whitespace or
+duplicate Content-Length. Raw validation is mandatory even if semantic validation
+is also applied to parsed objects. Connection wrappers must account for sequential
+request/response boundaries and read-ahead without adding an object/page buffer.
+
+### Acceptance checks
 
 - Table tests and fuzzing for keys/names/ETags, expiry precision/overflow, private
   type zero values, ranges at 0, P-1, P, P+1, and MaxInt64; never panic or allocate
@@ -267,7 +301,7 @@ design, the v1 contract, and its link from CONTROL_API.md.
   chunking/compression, unknown status/redirect, HEAD/body rules, and empty errors.
   Cover normalization by Go's parser, not just Header.Get-based validation.
 - Client request transcripts for empty, short page, exactly one page, multi-page,
-  direct closed/open/suffix pins, unchanged credentials, and lazy cancellation.
+  unchanged credentials, and lazy cancellation.
   Verify at most two GETs for full reads regardless of page count; no HEAD preflight.
   Verify pin/size mismatch, 412/503, short body, late failure, expiry during read,
   partial destination writes, and EOF semantics. Document overlong HTTP detection
