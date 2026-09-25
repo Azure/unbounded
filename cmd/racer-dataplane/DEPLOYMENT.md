@@ -245,6 +245,26 @@ they never supply rail IDs/alignment or infer fabric labels from device names.
 An optional GID pins the discovered value, not a configurable GID table index.
 HTTP remains available when native prerequisites are absent or incompatible.
 
+Malformed explicit mappings fail configuration validation even with
+`RACER_ENABLE_RDMA=false`. The file loader requires a regular file and reads at
+most 65537 bytes to detect overflow; it follows projection symlinks but does not
+verify mount permissions or resolve lexical path separation. The deployment must
+enforce the read-only mount and keep its target separate from writable state.
+
+On a host with zero usable type-2B ports, verify the actual adapter and application
+fallback explicitly from the repository root:
+
+```sh
+make -C cmd/racer-dataplane/native
+LD_LIBRARY_PATH="$PWD/cmd/racer-dataplane/native" \
+  cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --lib --all-features \
+  native_no_device -- --ignored
+```
+
+These tests require a loaded ABI2 adapter and zero discovered usable ports. They
+check unavailable native readiness and quota release, not successful hardware
+transfers or an end-to-end HTTP request.
+
 Follow [native/README.md](native/README.md) for explicitly gated provider tests.
 A real-libibverbs compile or no-device test validates linkage/fallback only.
 Neither proves DMA, invalidation/fencing, multi-host routing, or NUMA behavior on
