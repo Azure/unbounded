@@ -7,20 +7,12 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"reflect"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
-
-var ErrUnimplemented = errors.New("racer operation is not implemented")
-
-func Pending(operation string) error {
-	return fmt.Errorf("%s: %w", operation, ErrUnimplemented)
-}
 
 // Error returns only a protocol code, never input or secret material.
 func (c ErrorCode) Error() string { return string(c) }

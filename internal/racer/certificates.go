@@ -177,7 +177,7 @@ func (i *Issuer) now() time.Time {
 }
 
 // TrustRoots returns a newly owned pool from authoritative committed credentials.
-// Phase 5 must call this for TLS admission and again on each snapshot request;
+// Serving calls this for TLS admission and again on each snapshot request;
 // cached TLS VerifiedChains alone cannot authorize a retired issuer.
 // This pool is unrelated to deployment-provided HTTPS server trust.
 func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {

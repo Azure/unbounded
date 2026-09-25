@@ -563,10 +563,10 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-generate racer-manifests
-racer-controller: racer-test racer-controller-build ## Test and build the Racer controller scaffold
+.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-scale racer-generate racer-manifests
+racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
 
-racer-controller-build: ## Build the Racer controller scaffold without lint/test
+racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
@@ -596,17 +596,28 @@ image-racer-dataplane-local: ## Build the Racer dataplane image locally (single-
 		-f ./images/racer-dataplane/Containerfile .
 	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
 
-racer-test: ## Check Racer Go and Rust scaffolds
-	$(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+racer-server-test: ## Lint and race-test the Racer server and deployment contracts
+	$(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
+	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
+
+racer-test: racer-server-test ## Check Racer server and committed Rust contracts
 	cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
 	cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
 	cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
 
+racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/racer-envtest
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" $(GOTEST) -race ./internal/racer -run '^TestEnvtestServer$$' -count=1 -v -timeout=3m
+
+racer-scale: ## Measure 100,000-member reconciliation and publication waiters (not HTTPS capacity)
+	@mkdir -p tmp/racer-scale
+	TMPDIR="$(CURDIR)/tmp/racer-scale" RACER_SCALE=1 GOMAXPROCS=8 $(GOTEST) ./internal/racer -run '^TestServerScale$$' -count=1 -v -timeout=3m
+
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	$(GOCMD) generate ./api/racer/v1alpha1
 
-racer-manifests: ## Render Racer controller scaffold manifests
+racer-manifests: ## Render Racer controller manifests
 	@mkdir -p deploy/racer/rendered/crd
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir deploy/racer --output-dir deploy/racer/rendered \

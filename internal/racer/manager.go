@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer implements the Racer publication lifecycle using controller-runtime
-// directly. Constructors compose only; credential and serving operations remain
-// fail-closed until their contracts are implemented and tested.
+// Package racer implements the Racer server using controller-runtime directly.
+// Constructors compose only; serving requires initialized, leader-owned state.
 package racer
 
 import (
@@ -101,21 +100,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                        scheme,
-		LeaderElection:                true,
-		LeaderElectionID:              "racer-controller",
-		LeaderElectionNamespace:       cfg.Namespace,
-		LeaderElectionReleaseOnCancel: false,
-		Metrics:                       metricsserver.Options{BindAddress: cfg.MetricsAddress},
-		HealthProbeBindAddress:        cfg.ProbeAddress,
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Pod{}:       {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
-			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
-			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
-			&appsv1.DaemonSet{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
-		}},
-	})
+	mgr, err := ctrl.NewManager(restConfig, managerOptions(cfg, scheme))
 	if err != nil {
 		return err
 	}
@@ -132,4 +117,22 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	return mgr.Start(ctx)
+}
+
+func managerOptions(cfg Config, scheme *runtime.Scheme) ctrl.Options {
+	return ctrl.Options{
+		Scheme:                        scheme,
+		LeaderElection:                true,
+		LeaderElectionID:              "racer-controller",
+		LeaderElectionNamespace:       cfg.Namespace,
+		LeaderElectionReleaseOnCancel: false,
+		Metrics:                       metricsserver.Options{BindAddress: cfg.MetricsAddress},
+		HealthProbeBindAddress:        cfg.ProbeAddress,
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Pod{}:       {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+			&appsv1.DaemonSet{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+		}},
+	}
 }

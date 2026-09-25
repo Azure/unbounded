@@ -1,4 +1,4 @@
-# Racer control-plane scaffold
+# Racer control-plane server
 
 ## Scope and status
 
@@ -10,7 +10,8 @@ This document describes intended behavior. Phase 1 bounded codecs, canonical
 hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
 reconciliation, Phase 3 initialization/publication lifecycle, Phase 4 issuer
 and shared-key rotation, Phase 5 token bootstrap/authenticated HTTPS serving,
-and Phase 6 server-side managed workload reconciliation are implemented.
+and Phase 6 server-side managed workload reconciliation are implemented. Phase 7
+server integration and bounded publication/reconciliation measurements are complete.
 The initialize-only command and leader-scoped HTTPS service are operational;
 deployment must provide serving TLS files, bootstrap server trust, and a compatible
 dataplane image. The repository's Rust dataplane remains a runtime scaffold;
@@ -186,8 +187,9 @@ enums before acceptance. Unknown object fields are ignored. Do not substitute th
 default Go JSON decoder for these validation requirements. The bundle codec alone
 handles secret key material. Socket paths are derived and length-checked.
 
-Serving 100,000 long polls/full snapshots from one leader is a target, not a tested
-capacity claim. Validate fanout and reconciliation cost during implementation.
+Serving 100,000 HTTPS long polls/full snapshots from one leader remains a target,
+not a tested capacity claim. Phase 7 measured 100,000 publication waiters and
+100,000-member reconciliation separately from live HTTPS/API authorization below.
 
 ## Implementation order
 
@@ -198,7 +200,8 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 4. Implement issuer/shared-key Secret rotation, including failure recovery (complete).
 5. Implement token bootstrap and mTLS serving with adversarial identity tests (complete).
 6. Implement server-side managed workload reconciliation and deployment wiring (complete).
-7. Exercise envtest integration, failover, rotation, and bounded fanout.
+7. Exercise envtest integration, failover, rotation, and bounded fanout (server-only complete;
+   measured limits and remaining deployment/client validation are listed below).
 
 Each step replaces stubs with meaningful success/failure/edge tests. Keep scaffold
 composition tests; do not add tests that merely enumerate every placeholder.
@@ -250,9 +253,9 @@ composition tests; do not add tests that merely enumerate every placeholder.
 
 Targeted fake-client and race tests cover initialization crash ordering, ambiguous
 responses, CAS conflicts, cancellation before writes/install, counter transitions,
-immutable ownership, readiness, and 256 simultaneous poll wakeups. This is not an
-envtest election/real-apiserver immutability test or a 100,000-node capacity claim;
-those integration/load checks remain Phase 7.
+immutable ownership, readiness, and 256 simultaneous poll wakeups. Phase 7 adds
+real-apiserver immutability/election and 100,000 publication waiters; neither suite
+establishes 100,000-node HTTPS capacity.
 
 ## Phase 4 durable protocol and handoff
 
@@ -318,7 +321,8 @@ ambiguous responses, restart deadlines, multiple retiring generations, private
 material cleanup, expired preparation, conflicts/cancellation, authoritative reads,
 lost/corrupt durable state, catalog churn, overlap overflow, certificate identity,
 proof-of-possession rejection, trust retirement, and concurrent issuance. Real
-API-server/election and projection integration remain Phase 7 verification.
+API-server/election verification is covered by Phase 7. Kubelet projection is a
+deployment integration check and is not exercised by envtest.
 
 ## Phase 5 serving and authorization handoff
 
@@ -340,7 +344,7 @@ API-server/election and projection integration remain Phase 7 verification.
   Node UIDs rather than Pod UIDs, so replacement authorized Pods on the same Node
   can continue using a locally persisted valid identity. UID-only certificates
   currently require an authoritative Node list followed by a namespace-scoped Pod
-  list filtered by `spec.nodeName`; Phase 7 must measure this API load.
+  list filtered by `spec.nodeName`; Phase 7 measures this API load below.
 - `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
   and verifies optional client certificates using fresh roots per handshake, and
@@ -374,7 +378,8 @@ live UID/ownership/audience attacks, pooled trust retirement and expiry, disable
 resumption, expired-identity recovery, poll expiration/cancellation, write-completion
 admission, API/body deadlines, listener startup/readiness and leadership shutdown.
 Scaffold composition tests remain; Phase 6 owns server-side workload wiring and
-Phase 7 owns real API-server/election, projection, and capacity verification.
+Phase 7 verifies the real API-server/election and measures capacity constraints.
+Projection requires a kubelet and remains deployment verification.
 
 ## Phase 6 server-only workload and deployment handoff
 
@@ -420,5 +425,150 @@ Phase 6 tests cover workload creation from startup enqueue, drift repair/no-op,
 ownership rejection, conflict/create-race recovery, cancellation after reads,
 credential/storage/affinity contracts, and rendered deployment/RBAC consistency.
 These are fake-client and render tests, not a claim of a working Rust client or
-end-to-end dataplane deployment. Real API-server defaulting/admission, election,
-projected-token rotation, and node filesystem integration remain Phase 7 checks.
+end-to-end dataplane deployment. Phase 7 now verifies real API-server
+defaulting/admission and election. Kubelet projected-token rotation and node
+filesystem integration remain deployment checks; the client runtime is out of scope.
+
+## Phase 7 server verification and measurements
+
+### Reproducible checks
+
+Use Go 1.26.6 and repository-local envtest assets. `make racer-server-test` runs
+server, wire, and manifest contract suites under the race detector plus lint.
+`make racer-envtest KUBEBUILDER_ASSETS=<absolute-repository-path>` explicitly runs
+the real control plane and fails if assets cannot execute. `make racer-scale`
+sets `RACER_SCALE=1`, `GOMAXPROCS=8`, and executes the scale suite without race
+instrumentation. Both targets place runtime temporary files inside this worktree.
+`cmd/racer-controller/README.md` documents asset setup and operational initialization.
+
+`internal/racer/integration_test.go` exercises Kubernetes 1.37.0 etcd/apiserver with
+the generated ClusterCache CRD. Assertions cover:
+
+- Concurrent initializers contend on real marker resourceVersion CAS: exactly one
+  wins. The server rejects rollback of consumed immutable data and removal of
+  immutability. Ambiguous counter Create outcomes recover only when the bound
+  counters actually exist. A concurrent metadata write after the authoritative
+  version read causes a real API-server 409; no install token escapes. Cancellation
+  between commit and install rejects the publication.
+- Real Secret writes interrupted after private staging, after common activation,
+  and before private pruning recover in fresh applications. Pending issuer material,
+  bundle generation, deadlines, cache-key overlap, and trust-before-private pruning
+  survive these boundaries. The broader before/after-write matrix remains in the
+  existing unit/race tests.
+- Two real managers use production options and all three reconcilers. Only election
+  durations and bound addresses are shortened/isolated for the test; release-on-cancel
+  remains false. Readiness probes distinguish leader/follower. Empty input startup
+  creates the DaemonSet, real admission defaults do not cause a write loop, and a
+  watched privilege mutation is repaired.
+- Real Pod-bound TokenRequest credentials pass real TokenReview over HTTPS;
+  wrong-audience tokens fail. The returned identity uses the API-assigned Node UID.
+  The managed Pod becomes published through the informer, and mTLS snapshot serving
+  uses that certificate. A pooled connection observes live Node exclusion.
+- A transport fault rejects only the leader's Lease renewal writes. The real elector
+  loses leadership, manager exits, readiness withdraws, an authenticated pending poll
+  terminates without snapshot data, and the old TCP listener closes. The follower
+  acquires the expired Lease and serves the same counters with the existing client
+  certificate. Normal manager cancellation also withdraws readiness and publication
+  authority. The measured failover below uses test durations 4s/2s/500ms, not the
+  production manager defaults.
+
+The whole server call path was reviewed: both HTTP routes reach implemented code.
+Unused `Server.Poll`/`ParseCursor` scaffold methods and their `Pending` error helpers
+were removed. Existing composition tests/functions and committed wire vectors are
+retained. No client runtime was added. Production manager options are shared with
+integration tests; no new module dependencies or storage protocol changes were needed.
+
+### Publication and reconciliation scale
+
+Measurements on Linux amd64, Go 1.26.6, `GOMAXPROCS=8`, using
+`TestServerScale`: one managed Pod per Node, two rails per Node, and 16 caches.
+Input list/watch responses are synthetic; the controller-runtime informer cache,
+Pod field index, safe deep copies, full `TopologyReconciler.Reconcile`, canonical
+hashing, and encoding are real. Version persistence uses the fake client, so these
+times exclude apiserver latency, watch ingestion/startup, and durable storage cost.
+They include 100,000 indexed Pod queries at the largest size.
+
+| Members | Cold reconcile | Unchanged reconcile | Allocated bytes (cold) | Publication bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 24.140268 ms | 24.287835 ms | 21,322,144 | 216,638 |
+| 10,000 | 280.400074 ms | 239.813666 ms | 230,600,040 | 2,146,202 |
+| 100,000 | 2.823713048 s | 2.936335556 s | 2,356,837,080 | 21,503,748 |
+
+Allocated bytes are total allocation traffic, not peak/live heap. Even unchanged
+reconciliation rebuilds and hashes the full candidate. Singleton coalescing prevents
+one full rebuild for every input event, but this remains substantial CPU/GC work.
+This fixture demonstrates approximately linear scaling, not a bound for arbitrary
+annotations, catalog sizes, or event rates.
+
+The waiter test prepares a second full-size publication, admits 100,000 concurrent
+goroutines through the production `Publications.Wait`, rejects the next identity
+and a duplicate identity, installs once, and verifies every result is the exact
+same committed pointer and admission returns to zero. Both old/new encodings remain
+live. It measures registration, broadcast/delivery, heap, and goroutine stacks,
+not TLS connections, authorization, response writes, or network transfer:
+
+- Admission: 351.471643 ms; `Install` broadcast: 126.662294 ms.
+- All 100,000 waiters delivered: 279.626321 ms from installation start.
+- Parked heap delta: 161,741,360 bytes; stack delta: 409,534,464 bytes.
+- Next encoding: 21,500,803 bytes (changed shares, empty catalog).
+- Total scale test: 10.470 s. Two garbage collections clear temporary encoding
+  pools before the waiter baseline; memory deltas are not process RSS or peak usage.
+
+The same complete scale suite also passed under `-race` in 70.453 s. At 100,000
+members, race-instrumented cold/unchanged reconciliation took 17.151336473 s /
+16.843947661 s; all 100,000 waiters received the shared pointer in 1.219179561 s.
+Race timings are correctness instrumentation results, not production performance.
+
+### Live HTTPS/API authorization cost
+
+The envtest measurement uses the actual HTTPS handler with a real certificate and
+an instrumented authoritative client; the connection is warmed first. Ten sequential
+snapshot requests each perform two authorization passes. Each pass reads installation,
+version, issuer, and common Secret state, lists Nodes and assigned Pods, and gets
+the DaemonSet and ServiceAccount. This is **16 API requests and two full Node lists
+per response**, plus four trust reads on a new TLS handshake. Source:
+`internal/racer/server.go:374` and `:65`, `internal/racer/certificates.go:116`
+and `:259`, and `internal/racer/authorization.go:64`.
+
+A race-instrumented run with envtest QPS=1000/burst=2000 measured:
+
+| Live Nodes | Snapshots | Elapsed | API requests | Node lists | API response bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 10 | 246.773746 ms | 160 | 20 | 273,340 |
+| 1,001 | 10 | 966.947811 ms | 160 | 20 | 7,058,860 |
+
+That standalone race envtest run passed in 15.532 s (14.45 s inside the test),
+including a 4.647877135 s forced-Lease-loss-to-authenticated-recovery interval with
+unchanged sequence/membership 2/2. The final full relevant race suite, including
+the added real workload-drift and normal-cancellation assertions, passed:
+`internal/racer` 27.873 s, `internal/racer/wire` 17.342 s, and `deploy/racer`
+1.093 s; API and controller command packages compiled with no test files. Targeted
+`make fmt` and lint reported zero issues. Manifest rendering and controller build
+also passed. These elapsed values are observations from this host, not guarantees.
+
+The added Nodes are excluded from membership but still appear in authoritative
+Node lists. Response-byte totals count API bodies, not TLS framing. This is a small
+sequential cost measurement, not a throughput or concurrent HTTPS capacity result.
+At 100,000 clients polling every 30 seconds, the current algorithm would require
+about 53,333 API requests/s and 666.7 million Node entries/s when the cluster also
+has 100,000 Nodes, before reconnects and changes. Those are arithmetic extrapolations,
+not measured achieved rates. Production capacity at that size is unverified and
+the full-list authorization path is a known scaling limitation. Changing live
+authorization lookup/freshness needs a separately reviewed server design.
+
+Full snapshot distribution also sends one copy over the network per recipient:
+the measured 21.5 MB publication would require about 2.15 TB per 100,000-recipient
+update. Shared in-process bytes do not remove that bandwidth cost. Authentication
+and response-write concurrency are bounded at 32 and 128 by default; saturation
+returns 429 rather than creating unbounded work.
+
+### Scope boundary
+
+Envtest has no scheduler, DaemonSet controller, kubelet, or Service routing. Pods
+are created/assigned explicitly in integration tests. The envtest clients use test
+admin credentials; shipped RBAC has manifest contract coverage, not a restricted
+ServiceAccount deployment test. Actual kubelet token renewal,
+Secret projection/reload, host filesystem permissions, and end-to-end dataplane
+operation remain unverified. Rust control-client runtime, local identity management,
+and transport are explicitly out of scope. This server-only Phase 7 does not claim
+those components work or that one leader sustains 100,000 authenticated HTTPS polls.
