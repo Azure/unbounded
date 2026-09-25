@@ -84,6 +84,10 @@ copy is introduced here.
   Settled source `50161a41`: cargo fmt check, locked no-default all-target check,
   and git diff whitespace check all passed. The outgoing implementation range
   contains no SDK/Gantry path changes, preserving the user's three latest commits.
+  Locked optimized release executable build also passed at `50161a41` with
+  `--no-default-features --bin racer-dataplane` (actual cargo build, not check).
+  The matching `--all-features --bin racer-dataplane` optimized release build
+  passed too; this compiles the loader and does not imply hardware validation.
 
 - Final integrator to active app editor: membership slot-capacity correction is
   still absent at app.rs:617 (`retained_snapshots.get()` without +1) despite prior
