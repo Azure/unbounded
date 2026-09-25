@@ -113,8 +113,7 @@ func TestRacerFailuresNeverBypass(t *testing.T) {
 									_, _ = w.Write(data)
 								}))
 								up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 16)}
-								local := fakes.NewCache()
-								local.Put(d, data) // Local content must also go through Racer's origin.
+								// No direct store dependency exists to bypass Racer on failure.
 
 								cfg := reviewConfig()
 								cfg.RacerMetadataTimeout = 100 * time.Millisecond
@@ -122,7 +121,7 @@ func TestRacerFailuresNeverBypass(t *testing.T) {
 
 								var fallbacks, completed int
 
-								server := mirror.NewRacer(cfg, local, up, &gantryracer.Backend{Client: client},
+								server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client},
 									mirror.WithRacerMetrics(nil, func() { fallbacks++ }),
 									mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 
@@ -211,7 +210,7 @@ func TestRacerRefusedSocketNeverBypasses(t *testing.T) {
 			defer client.CloseIdleConnections()
 
 			up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
-			server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client})
+			server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client})
 
 			method, kind, _ := strings.Cut(mode, "/")
 			if kind != "manifests" {
@@ -230,7 +229,7 @@ func TestRacerRefusedSocketNeverBypasses(t *testing.T) {
 
 func TestRacerUnavailableRejectsCloseDelimitedGET(t *testing.T) {
 	up := &metadataOnlyRegistry{authorizationCapturingOrigin{seen: make(chan string, 1)}}
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, nil)
+	server := mirror.NewRacer(reviewConfig(), up, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v2/repo/blobs/"+digestOf(nil).String(), nil)
 	req.Proto, req.ProtoMinor = "HTTP/1.0", 0
 	w := httptest.NewRecorder()
@@ -256,7 +255,7 @@ func TestRacerInvalidClientRangeDoesNotFetch(t *testing.T) {
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 	}))
 	up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client})
+	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client})
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/v2/repo/blobs/"+d.String(), nil)
 	r.Header.Set("Range", "bytes=999-1000")
@@ -288,7 +287,7 @@ func TestRacerTruncatedBodyAbortsAfterHeaders(t *testing.T) {
 	var completed, fallbacks int
 
 	result := make(chan error, 1)
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client},
+	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client},
 		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { result <- err }, func() { fallbacks++ }),
 		mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 	finished := make(chan struct{})
@@ -338,8 +337,7 @@ func TestRacerAndDirectBackendDigestSuccess(t *testing.T) {
 					var server *mirror.Server
 
 					if backend == "racer" {
-						store.Put(d, []byte("must not serve local content directly"))
-						server = mirror.NewRacer(cfg, store, up, &gantryracer.Backend{Client: client})
+						server = mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client})
 					} else {
 						server = mirror.New(cfg, store, up)
 					}

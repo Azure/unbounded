@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -103,7 +102,7 @@ func TestRacerForwardOwnershipBoundary(t *testing.T) {
 
 			cfg := reviewConfig()
 			cfg.RacerMaxConcurrentTransfers = 1
-			server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client},
+			server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client},
 				mirror.WithRacerMetrics(func(_ sdk.TransferStats, partial bool, err error) {
 					streams++
 					streamErr = err
@@ -211,7 +210,7 @@ func TestRacerDrainInterruptsHijackedStream(t *testing.T) {
 	var fallbacks, completed int
 
 	results := make(chan error, 1)
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client},
+	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client},
 		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { results <- err }, func() { fallbacks++ }),
 		mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 	finished := make(chan struct{})

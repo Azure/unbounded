@@ -11,8 +11,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 )
 
-// buildOriginClients constructs the two origin.Client instances the
-// agent needs:
+// buildPullOriginClient and buildMirrorOriginClient keep distinct origin.Client
+// lifecycles in direct mode. Racer needs only the mirror client:
 //
 // - puller: used by runOriginPull / please_pull / direct-origin-fallback background
 // ingest. Wired with the legacy p2p_origin_pull_* metric hooks
@@ -39,11 +39,11 @@ import (
 // pull-arithmetic invariants honest while leaving the mirror's
 // live-stream path free to use the asymmetric "started / completed /
 // failed / commit-observed" counters that match its actual lifecycle.
-func buildOriginClients(
+func buildPullOriginClient(
 	c *config.Config,
 	inst *phase1Metrics,
 	logger *slog.Logger,
-) (puller, mirror *origin.Client, bgSuccess func(kind string, bytes int64), bgDownstreamFailure func(kind, class string), err error) {
+) (puller *origin.Client, bgSuccess func(kind string, bytes int64), bgDownstreamFailure func(kind, class string), err error) {
 	bgSuccess = func(kind string, _ int64) {
 		inst.originPullSuccess.WithLabelValues(kind).Inc()
 	}
@@ -99,18 +99,24 @@ func buildOriginClients(
 		),
 	)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("origin: %w", err)
+		return nil, nil, nil, fmt.Errorf("origin: %w", err)
 	}
 
-	mirror, err = origin.New(c,
+	return puller, bgSuccess, bgDownstreamFailure, nil
+}
+
+// buildMirrorOriginClient constructs the live origin client without background
+// pull-arithmetic hooks, also used by Racer's node-local range origin and auth.
+func buildMirrorOriginClient(c *config.Config, inst *phase1Metrics, logger *slog.Logger) (*origin.Client, error) {
+	mirror, err := origin.New(c,
 		origin.WithLogger(logger),
 		origin.WithByteMetrics(func(kind string, bytes int64) {
 			inst.originBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
 	)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("mirror origin: %w", err)
+		return nil, fmt.Errorf("mirror origin: %w", err)
 	}
 
-	return puller, mirror, bgSuccess, bgDownstreamFailure, nil
+	return mirror, nil
 }

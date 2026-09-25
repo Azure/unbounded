@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -142,7 +141,7 @@ func TestRacerPipelineBoundaries(t *testing.T) {
 			registry := &metadataOnlyRegistry{}
 			cfg := reviewConfig()
 			cfg.RacerMaxConcurrentTransfers = 1
-			server := mirror.NewRacer(cfg, fakes.NewCache(), registry, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
+			server := mirror.NewRacer(cfg, registry, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
 				results <- pipelineResult{s, p, err}
 			}, nil))
 			finished := make(chan struct{}, 1)
@@ -236,7 +235,7 @@ func TestRacerPipelineFullDigestAndConcurrentRanges(t *testing.T) {
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 	}), sdk.ClientOptions{Timeout: 10 * time.Second, PageLookahead: true})
 	results := make(chan pipelineResult, 16)
-	server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), &metadataOnlyRegistry{}, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
+	server := mirror.NewRacer(reviewConfig(), &metadataOnlyRegistry{}, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
 		results <- pipelineResult{s, p, err}
 	}, nil))
 

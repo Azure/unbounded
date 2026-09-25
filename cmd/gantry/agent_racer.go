@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
@@ -32,7 +33,7 @@ import (
 // runRacerAgent deliberately starts no libp2p host, DHT, transfer client/server,
 // chair client/server, coordinator, advertiser, or content-selection machinery.
 // Direct coordination has no listener; Racer owns peer discovery and transport.
-func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Registry, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
+func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginRangePuller, auth mirror.AuthenticationChallenger, reg *metrics.Registry, inst *phase1Metrics, p2 *phase2Metrics, p9 *phase9Metrics, progress *layerProgressTracker, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -92,7 +93,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin gantryracer.Reg
 		}
 	}()
 
-	server := mirror.NewRacer(c, local, origin, &gantryracer.Backend{Client: client},
+	server := mirror.NewRacer(c, auth, &gantryracer.Backend{Client: client},
 		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
 		mirror.WithRacerMetrics(onRacerStream, nil),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),

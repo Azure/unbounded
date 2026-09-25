@@ -19,9 +19,10 @@ import (
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// NewRacer builds a Racer-backend Server with an explicit registry contract.
+// NewRacer builds a Racer-backend Server with an explicit authentication challenger.
+// Content is read exclusively through backend, including node-local content.
 // A nil backend fails requests until Racer is available.
-func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantryracer.Registry, backend *gantryracer.Backend, opts ...Option) *Server {
+func NewRacer(cfg *config.Config, auth AuthenticationChallenger, backend *gantryracer.Backend, opts ...Option) *Server {
 	limit := cfg.RacerMaxConcurrentTransfers
 	if limit <= 0 {
 		limit = 64
@@ -33,9 +34,7 @@ func NewRacer(cfg *config.Config, store ifaces.LocalContentStore, registry gantr
 		manifestObservations: make(chan struct{}, 16),
 	}
 	// Install state before applying caller options, including Racer callbacks.
-	opts = append([]Option{func(s *Server) { s.racer = state }}, opts...)
-
-	return newServer(cfg, store, registry, opts...)
+	return configureServer(&Server{auth: auth, racer: state}, cfg, opts...)
 }
 
 // WithRacerMetrics registers Racer forwarding metrics. The legacy fallback

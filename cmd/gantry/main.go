@@ -157,7 +157,7 @@ func runAgent(args []string) error {
 	// Origin clients (+ live-stream split). See agent_origin.go
 	// for the full rationale of the two-client split and the
 	// background-success / downstream-failure closure shapes.
-	pullOriginClient, mirrorOriginClient, backgroundOriginSuccess, backgroundOriginDownstreamFailure, err := buildOriginClients(c, inst, logger)
+	mirrorOriginClient, err := buildMirrorOriginClient(c, inst, logger)
 	if err != nil {
 		return err
 	}
@@ -166,7 +166,12 @@ func runAgent(args []string) error {
 	defer cancel()
 
 	if c.ContentBackend == "racer" {
-		return runRacerAgent(ctx, c, mirrorOriginClient, reg, inst, p2, p9, layerProgress, logger)
+		return runRacerAgent(ctx, c, mirrorOriginClient, mirrorOriginClient, reg, inst, p2, p9, layerProgress, logger)
+	}
+
+	pullOriginClient, backgroundOriginSuccess, backgroundOriginDownstreamFailure, err := buildPullOriginClient(c, inst, logger)
+	if err != nil {
+		return err
 	}
 
 	// - libp2p Host + DHT.

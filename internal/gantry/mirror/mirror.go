@@ -644,15 +644,9 @@ func WithStartupReadinessGate() Option {
 // New builds a direct-backend Server bound to the local content store and origin.
 // Use NewRacer to construct a Racer-backend Server.
 func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
-	return newServer(cfg, store, origin, opts...)
-}
-
-func newServer(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
 	s := &Server{
-		cfg:                  cfg,
 		store:                store,
 		origin:               origin,
-		logger:               slog.Default().With(slog.String("subsystem", "mirror")),
 		staleProviders:       map[providerDigestKey]time.Time{},
 		suspiciousProviders:  map[providerDigestKey]time.Time{},
 		unavailableProviders: map[string]time.Time{},
@@ -663,6 +657,14 @@ func newServer(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces
 	if auth, ok := origin.(AuthenticationChallenger); ok {
 		s.auth = auth
 	}
+
+	return configureServer(s, cfg, opts...)
+}
+
+// configureServer applies shared HTTP configuration after backend initialization.
+func configureServer(s *Server, cfg *config.Config, opts ...Option) *Server {
+	s.cfg = cfg
+	s.logger = slog.Default().With(slog.String("subsystem", "mirror"))
 
 	for _, opt := range opts {
 		opt(s)

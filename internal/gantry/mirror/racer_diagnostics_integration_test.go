@@ -15,7 +15,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -83,7 +82,7 @@ func TestRacerFailureDiagnosticPhases(t *testing.T) {
 			}))
 			logs := &diagnosticRecords{}
 			up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
-			server := mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+			server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client}, mirror.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 			finished := make(chan struct{})
 
 			m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

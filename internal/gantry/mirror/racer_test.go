@@ -21,7 +21,6 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
@@ -42,6 +41,10 @@ func (*authorizationCapturingOrigin) OpenRange(context.Context, ifaces.OriginRef
 	return nil, &ifaces.OriginRangeUnsupportedError{Reason: "fixture only serves full objects"}
 }
 
+func (*authorizationCapturingOrigin) AuthenticationChallenge(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
 type metadataOnlyRegistry struct {
 	authorizationCapturingOrigin
 }
@@ -59,7 +62,7 @@ func TestNewRacerInitializationAndNilBackend(t *testing.T) {
 
 	var fallbacks, misses int
 
-	server := mirror.NewRacer(cfg, fakes.NewCache(), registry, nil,
+	server := mirror.NewRacer(cfg, registry, nil,
 		mirror.WithStartupReadinessGate(),
 		mirror.WithMetrics(nil, func() { misses++ }),
 		mirror.WithRacerMetrics(nil, func() { fallbacks++ }))
@@ -200,7 +203,7 @@ func TestRacerRawMirrorSpliceAndQuarantine(t *testing.T) {
 
 	var completed atomic.Int64
 
-	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: cache},
+	server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: cache},
 		mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) { results <- result{s, p, err} }, nil),
 		mirror.WithLiveStreamCompletedHook(func(_ digest.Digest) { completed.Add(1) }))
 
@@ -378,7 +381,7 @@ func TestRacerRegistryRangeOriginAndFallback(t *testing.T) {
 
 			client := racerUDS(t, handler)
 
-			m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), registry, &gantryracer.Backend{Client: client}).Handler())
+			m := httptest.NewServer(mirror.NewRacer(cfg, registry, &gantryracer.Backend{Client: client}).Handler())
 			defer m.Close()
 
 			r, err := http.NewRequestWithContext(t.Context(), "GET", m.URL+"/v2/repo/blobs/"+d.String(), nil)
@@ -429,11 +432,10 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	cfg := config.NewDefault()
 	cfg.ContentBackend = "racer"
 	cfg.UpstreamRegistries = []config.UpstreamRegistry{{Name: "registry.example"}}
-	local := fakes.NewCache()
-	local.Put(d, data)
+	// Local content cannot be supplied to the Racer mirror constructor.
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 4)}
 
-	m := httptest.NewServer(mirror.NewRacer(cfg, local, up, nil).Handler())
+	m := httptest.NewServer(mirror.NewRacer(cfg, up, nil).Handler())
 	defer m.Close()
 
 	for _, tc := range []struct {
@@ -470,7 +472,7 @@ func TestRacerRoutingAndFallbackIntegrity(t *testing.T) {
 	// Even available registry bytes must not bypass an unavailable Racer backend.
 	corrupt := &authorizationCapturingOrigin{body: bytes.Repeat([]byte("x"), len(data)), seen: make(chan string, 1)}
 
-	bad := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), corrupt, nil).Handler())
+	bad := httptest.NewServer(mirror.NewRacer(cfg, corrupt, nil).Handler())
 	defer bad.Close()
 
 	resp, err := bad.Client().Get(bad.URL + "/v2/repo/blobs/" + d.String())
@@ -516,7 +518,7 @@ func TestRacerOutageAndEmptyObject(t *testing.T) {
 
 			var fallbacks atomic.Int64
 
-			server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallbacks.Add(1) }))
+			server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallbacks.Add(1) }))
 
 			m := httptest.NewServer(server.Handler())
 			defer m.Close()

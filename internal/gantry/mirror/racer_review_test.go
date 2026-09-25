@@ -20,7 +20,6 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	sdk "github.com/Azure/unbounded/pkg/racersdk"
@@ -69,7 +68,7 @@ func TestRacerColdPagePreparationExceedsMetadataBudget(t *testing.T) {
 
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 1)}
 
-	m := httptest.NewServer(mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallback.Add(1) })).Handler())
+	m := httptest.NewServer(mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallback.Add(1) })).Handler())
 	defer m.Close()
 
 	resp, err := m.Client().Get(m.URL + "/v2/repo/blobs/" + d.String())
@@ -111,7 +110,7 @@ func TestRacerAuthoritativeMetadataContentType(t *testing.T) {
 			}))
 			up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
 
-			m := httptest.NewServer(mirror.NewRacer(reviewConfig(), fakes.NewCache(), up, &gantryracer.Backend{Client: client}).Handler())
+			m := httptest.NewServer(mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client}).Handler())
 			defer m.Close()
 
 			kind := "manifests"
@@ -167,7 +166,7 @@ func TestRacerStalledDownstreamDeadlineAndAdmission(t *testing.T) {
 		}
 	}))
 	up := &authorizationCapturingOrigin{seen: make(chan string, 4)}
-	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client})
+	server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client})
 	finished := make(chan struct{}, 4)
 	handler := server.Handler()
 
@@ -280,7 +279,7 @@ func TestRacerDisconnectCancelsLaterPage(t *testing.T) {
 	cfg.RacerMaxConcurrentTransfers = 1
 	up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
 	stats := make(chan sdk.TransferStats, 1)
-	server := mirror.NewRacer(cfg, fakes.NewCache(), up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, _ bool, _ error) { stats <- s }, nil))
+	server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, _ bool, _ error) { stats <- s }, nil))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()
