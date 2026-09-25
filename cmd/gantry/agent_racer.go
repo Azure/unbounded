@@ -52,7 +52,7 @@ func runRacerAgent(c *config.Config, logger *slog.Logger) error {
 	}
 
 	return serveRacerAgent(ctx, c, logger, cache, racerAgentDeps{
-		client: client, serveOrigin: racersdk.ServeOrigin, probe: probeRacerSocket,
+		client: client, serveOrigin: serveGantryRacerOrigin, probe: probeRacerSocket,
 	})
 }
 

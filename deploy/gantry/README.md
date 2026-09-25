@@ -123,10 +123,14 @@ canonical paths to the Gantry process:
 | `/run/racer/gantry/client/socket` | Racer serves this Unix socket; Gantry's SDK client connects to it. |
 | `/run/racer/gantry/origin/socket` | Gantry's SDK origin server creates this Unix socket; Racer connects to it for registry reads. |
 
-Create the parent directories before starting Gantry. The SDK neither creates
-nor changes them. Directories and their ancestors must not be symlinks or
-writable by untrusted peers. Gantry needs write access to the origin directory
-and permission to connect to the client socket. The origin socket uses SDK
+Mount an existing `/run/racer` directory before starting Gantry. Gantry creates
+missing `gantry` and `gantry/origin` directories with mode `0755` (subject to the
+process umask), so it can start before Racer creates the client endpoint. It
+preserves existing directory modes and never removes existing socket paths.
+The SDK itself neither creates nor changes parent directories. Directories and
+their ancestors must not be symlinks or writable by untrusted peers. Gantry needs
+write access to create missing directories and its origin socket, and permission
+to connect to the client socket. The origin socket uses SDK
 default mode `0600`, so arrange compatible process identities and mount
 visibility for Racer to connect. An existing origin path, including a stale
 socket, is refused; investigate and remove stale artifacts during provisioning
