@@ -190,7 +190,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 	if !partial {
 		s.fireMirrorResponseCompleted(ref.Digest, ref.Kind, "racer")
 		s.fireLiveStreamCompleted(ref.Digest)
-		s.firePrefetch(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
+		s.notifyManifestServed(r.Context(), ref.Kind, ref.Registry, ref.Repository, ref.Digest)
 	}
 }
 

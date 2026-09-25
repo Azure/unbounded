@@ -108,7 +108,7 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginRa
 		mirror.WithOriginStreamMetrics(func(k string) { p9.originStreamStarted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamCompleted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamFailed.WithLabelValues(k).Inc() }),
 		// Demand-only: observe committed manifests, without speculative registry
 		// downloads or chair work competing with Racer's page fetch ownership.
-		mirror.WithLayerPrefetcher(newLayerPrefetcher(nil, local, logger, progress.observeManifest)),
+		mirror.WithManifestObserver(newManifestObserver(local, logger, progress.observeManifest)),
 	)
 
 	stopMirror, err := server.ListenAndServe(c.MirrorListen)

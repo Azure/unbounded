@@ -441,7 +441,7 @@ func runAgent(args []string) error {
 	// without a chair namespace keeps the direct mirror path.
 	var (
 		coldStartResolver mirror.ColdStartResolver
-		layerPrefetcher   mirror.LayerPrefetcher
+		manifestObserver  = newManifestObserver(cstore, logger, layerProgress.observeManifest)
 	)
 
 	if chairManager != nil {
@@ -474,17 +474,13 @@ func runAgent(args []string) error {
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
+		manifestObserver = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chairs", chairs.Count),
 			slog.Int("seeds", c.ChairSeedCount),
 		)
 	} else {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
-	}
-
-	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -630,7 +626,7 @@ func runAgent(args []string) error {
 			p9.staleProviderFiltered.Add(float64(n))
 		}),
 		mirror.WithColdStart(coldStartResolver),
-		mirror.WithLayerPrefetcher(layerPrefetcher),
+		mirror.WithManifestObserver(manifestObserver),
 		mirror.WithNF5(nf5Ctrl),
 		// the design doc negative-cache integration for the mirror's direct-
 		// origin path (hardening). Before this
@@ -1330,29 +1326,30 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
 }
 
-// layerPrefetchAdapter implements mirror.LayerPrefetcher: after a
-// manifest serve it reads the manifest body back from cache, extracts
-// the child layer/config digests, filters out digests already in the
-// local cache, and asks the cold-start resolver to issue batched
-// please_pull RPCs grouped by selected chair holder.
-//
-// The implementation runs in a goroutine spawned by the mirror; it
-// MUST NOT panic. All errors are logged at DEBUG.
+// layerPrefetchAdapter consumes parsed children in direct mode, filtering local
+// content before asking the cold-start resolver to seed the remaining digests.
 type layerPrefetchAdapter struct {
-	resolver   manifestPrefetchResolver
+	resolver manifestPrefetchResolver
+	cache    ifaces.LocalContentStore
+	logger   *slog.Logger
+}
+
+// committedManifestHandler shares the local commit retry and parsing path for
+// progress observation and direct-mode prefetch. The mirror runs it asynchronously.
+type committedManifestHandler struct {
 	cache      ifaces.LocalContentStore
 	logger     *slog.Logger
-	onManifest func(digest.Digest, []manifest.TypedChild)
+	onManifest func(context.Context, string, string, digest.Digest, []manifest.TypedChild)
 }
 
 type manifestPrefetchResolver interface {
 	PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []coldstart.ChildDigest, registry, repository string) error
 }
 
-// maxManifestBytes caps the size of a manifest body the prefetcher
+// maxManifestBytes caps the size of a committed manifest body the handler
 // is willing to parse. OCI Distribution recommends manifests stay
 // well under 4 MiB; a body larger than that almost certainly indicates
-// a misconfigured upstream (or attack), and we'd rather skip prefetch
+// a misconfigured upstream (or attack), and we'd rather skip observation
 // than allocate a multi-MB buffer per manifest serve.
 const maxManifestBytes int64 = 4 * 1024 * 1024
 
@@ -1410,20 +1407,43 @@ func newLayerPrefetcher(
 	cache ifaces.LocalContentStore,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
-) mirror.LayerPrefetcher {
-	return &layerPrefetchAdapter{
-		resolver:   r,
-		cache:      cache,
-		logger:     logger.With(slog.String("subsystem", "prefetch")),
-		onManifest: onManifest,
+) mirror.ManifestObserver {
+	prefetcher := &layerPrefetchAdapter{
+		resolver: r,
+		cache:    cache,
+		logger:   logger.With(slog.String("subsystem", "prefetch")),
+	}
+
+	return &committedManifestHandler{
+		cache:  cache,
+		logger: logger.With(slog.String("subsystem", "manifest")),
+		onManifest: func(ctx context.Context, registry, repository string, d digest.Digest, children []manifest.TypedChild) {
+			if onManifest != nil {
+				onManifest(d, children)
+			}
+
+			prefetcher.prefetchChildren(ctx, registry, repository, d, children)
+		},
+	}
+}
+
+// newManifestObserver only reports committed manifest children. It has no
+// resolver or child-presence checks and cannot initiate speculative downloads.
+func newManifestObserver(cache ifaces.LocalContentStore, logger *slog.Logger, observe func(digest.Digest, []manifest.TypedChild)) mirror.ManifestObserver {
+	return &committedManifestHandler{
+		cache:  cache,
+		logger: logger.With(slog.String("subsystem", "manifest")),
+		onManifest: func(_ context.Context, _, _ string, d digest.Digest, children []manifest.TypedChild) {
+			observe(d, children)
+		},
 	}
 }
 
 // openManifest reads the manifest body from the shared content store. Under
 // live stream-through the mirror proxies the body straight to containerd, so
 // it only appears once containerd commits it; retry briefly rather than
-// dropping the prefetch and losing cold-start seeding entirely.
-func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest) (io.ReadCloser, error) {
+// dropping progress observation or direct-mode cold-start seeding.
+func (p *committedManifestHandler) openManifest(ctx context.Context, d digest.Digest) (io.ReadCloser, error) {
 	const attempts = 8
 
 	delay := 100 * time.Millisecond
@@ -1456,19 +1476,15 @@ func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest
 	return nil, lastErr
 }
 
-func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil && p.onManifest == nil {
-		return
-	}
-	// Use a fresh deadline so the prefetch survives the request
-	// context that just finished; cap at 30s so a stuck prefetch
-	// can't pin a goroutine forever.
+func (p *committedManifestHandler) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	// The mirror detaches request cancellation while preserving delegated
+	// credentials. Bound both loading and consumption with one fresh deadline.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	rc, err := p.openManifest(ctx, manifestDigest)
 	if err != nil {
-		p.logger.Debug("prefetch: manifest not in cache",
+		p.logger.Debug("manifest not in cache",
 			slog.String("digest", manifestDigest.String()),
 			slog.Any("err", err),
 		)
@@ -1480,7 +1496,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 	_ = rc.Close() //nolint:errcheck // best-effort close
 
 	if err != nil {
-		p.logger.Debug("prefetch: manifest read failed",
+		p.logger.Debug("manifest read failed",
 			slog.String("digest", manifestDigest.String()),
 			slog.Any("err", err),
 		)
@@ -1490,7 +1506,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 
 	if int64(len(body)) >= maxManifestBytes {
 		// Likely truncated; refuse to parse.
-		p.logger.Debug("prefetch: manifest exceeds size cap",
+		p.logger.Debug("manifest exceeds size cap",
 			slog.String("digest", manifestDigest.String()),
 			slog.Int64("cap", maxManifestBytes),
 		)
@@ -1500,7 +1516,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 
 	children, err := manifest.TypedChildren(body)
 	if err != nil {
-		p.logger.Debug("prefetch: manifest parse failed",
+		p.logger.Debug("manifest parse failed",
 			slog.String("digest", manifestDigest.String()),
 			slog.Any("err", err),
 		)
@@ -1508,11 +1524,11 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if p.onManifest != nil {
-		p.onManifest(manifestDigest, children)
-	}
+	p.onManifest(ctx, registry, repository, manifestDigest, children)
+}
 
-	if len(children) == 0 || p.resolver == nil {
+func (p *layerPrefetchAdapter) prefetchChildren(ctx context.Context, registry, repository string, manifestDigest digest.Digest, children []manifest.TypedChild) {
+	if len(children) == 0 {
 		// Image index or no children - nothing to fan out.
 		return
 	}

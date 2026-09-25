@@ -102,7 +102,7 @@ func (s *prefetchSpy) waitForCount(n int, d time.Duration) int {
 
 // newPrefetchFixture builds a self-contained mirror httptest setup
 // wired to a prefetchSpy. Mirrors newFixture but uses
-// WithLayerPrefetcher.
+// WithManifestObserver.
 func newPrefetchFixture(t *testing.T, blobs map[digest.Digest][]byte, spy *prefetchSpy) *fixture {
 	t.Helper()
 
@@ -156,7 +156,7 @@ func newPrefetchFixture(t *testing.T, blobs map[digest.Digest][]byte, spy *prefe
 		t.Fatal(err)
 	}
 
-	m := mirror.New(cfg, c, oc, mirror.WithLayerPrefetcher(spy))
+	m := mirror.New(cfg, c, oc, mirror.WithManifestObserver(spy))
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
 
@@ -395,7 +395,7 @@ func TestMirror_Prefetch_FiresOnPeerServedManifestWithLiveStreamThrough(t *testi
 		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithPeerBudgets(time.Second, time.Second, 2),
-		mirror.WithLayerPrefetcher(spy),
+		mirror.WithManifestObserver(spy),
 	)
 	ts := httptest.NewServer(m.Handler())
 

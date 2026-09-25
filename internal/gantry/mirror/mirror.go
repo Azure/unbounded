@@ -95,13 +95,8 @@ type Server struct {
 	// always returns 5xx.
 	nf5 *DirectOriginFallbackController
 
-	// Speculative layer prefetcher (the design doc detailed-design L332 / architecture
-	// L180). When set, every successful manifest serve fires a
-	// fire-and-forget OnManifestServed callback so the prefetcher can
-	// parse the body, group child digests by HRW rank-0 puller, and
-	// issue batched please_pull RPCs before containerd asks for the
-	// layers. Nil-safe.
-	prefetcher LayerPrefetcher
+	// Optional asynchronous observation of successful manifest serves.
+	manifestObserver ManifestObserver
 
 	// tunables (zero values fall back to package defaults).
 	peerLookupBudget time.Duration
@@ -608,22 +603,18 @@ func WithNF5(c *DirectOriginFallbackController) Option {
 	return func(s *Server) { s.nf5 = c }
 }
 
-// LayerPrefetcher is the speculative wire-level optimization hook
-// (the design doc detailed-design.md L332 / architecture.md L180). After the
-// mirror serves a manifest successfully the mirror invokes
-// OnManifestServed in a goroutine so an implementation can fetch
-// the just-cached manifest body, parse it, identify child
-// layer/config digests, group them by selected seed holder, and issue batched
-// please_pull RPCs to warm the cluster before containerd
-// asks for the layers. The mirror never waits for the callback to
-// return; failures are the prefetcher's to log.
-type LayerPrefetcher interface {
+// ManifestObserver receives successful digest-addressed manifest GET serves.
+// The callback runs asynchronously with detached request cancellation and the
+// delegated registry credential. A served response may precede the local commit;
+// observers that read local content must account for that delay. Implementations
+// own their deadlines and error logging. Racer bounds concurrent observations.
+type ManifestObserver interface {
 	OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest)
 }
 
-// WithLayerPrefetcher wires a speculative layer prefetcher. Nil-safe.
-func WithLayerPrefetcher(p LayerPrefetcher) Option {
-	return func(s *Server) { s.prefetcher = p }
+// WithManifestObserver wires a manifest-served observer. Nil-safe.
+func WithManifestObserver(observer ManifestObserver) Option {
+	return func(s *Server) { s.manifestObserver = observer }
 }
 
 // WithStartupReadinessGate opts the mirror into the the startup
@@ -914,9 +905,9 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackServed:
 			// Live stream-through proxies the body straight to containerd, so a
 			// served manifest reaches the shared content store on containerd's
-			// commit rather than ours. The prefetcher waits for it there, so this
+			// commit rather than ours. The observer waits for it there, so this
 			// must fire in both modes or cold-start seeding never runs.
-			s.firePrefetch(ctx, kind, upstream, repo, d)
+			s.notifyManifestServed(ctx, kind, upstream, repo, d)
 
 			return
 		case peerFallbackPartial:
@@ -993,7 +984,7 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 			return true
 		}
 
-		s.firePrefetch(ctx, kind, upstream, repo, d)
+		s.notifyManifestServed(ctx, kind, upstream, repo, d)
 
 		written, err := io.Copy(w, br)
 		s.fireMirrorBytesServed(kind, "cache", written)
@@ -1062,7 +1053,7 @@ func (s *Server) serveStartedLocalHit(ctx context.Context, w http.ResponseWriter
 	}
 
 	s.bumpCacheHit()
-	s.firePrefetch(ctx, kind, upstream, repo, d)
+	s.notifyManifestServed(ctx, kind, upstream, repo, d)
 
 	written, complete, err := stream.append(rc, d, size)
 	s.fireMirrorBytesServed(kind, "cache", written)
@@ -1346,7 +1337,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// the deduplication promise of the step 7 specifically for
 		// the cold-start-exhausted path that just escalated to origin.
 		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
-		s.firePrefetch(ctx, kind, upstream, repo, d)
+		s.notifyManifestServed(ctx, kind, upstream, repo, d)
 		// Bytes streamed AND committed: this is the canonical
 		// mirror-direct origin-pull success. Fire AFTER commit
 		// (not after Copy) so a commit failure correctly leaves
@@ -2647,13 +2638,10 @@ func (s *Server) isUnavailablePeerInWindow(addr string, now time.Time) bool {
 	return true
 }
 
-// firePrefetch invokes the LayerPrefetcher (if any) in a goroutine
-// when kind is a manifest. The mirror does NOT wait for the
-// callback; the prefetcher's job is to read the manifest body from
-// cache and dispatch batched please_pull RPCs entirely in the
-// background.
-func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
-	if s.prefetcher == nil || kind != ifaces.KindManifest {
+// notifyManifestServed notifies the manifest observer in the background. The
+// observer determines whether to report progress only or also prefetch in direct mode.
+func (s *Server) notifyManifestServed(ctx context.Context, kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
+	if s.manifestObserver == nil || kind != ifaces.KindManifest {
 		return
 	}
 
@@ -2663,7 +2651,7 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 			go func() {
 				defer func() { <-s.racer.manifestObservations }()
 
-				s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
+				s.manifestObserver.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 			}()
 		default:
 		}
@@ -2673,7 +2661,7 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 
 	// The callback outlives the HTTP request, so detach cancellation while
 	// retaining only the delegated registry credential.
-	go s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
+	go s.manifestObserver.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 }
 
 // reAdvertiseDigest does a fire-and-forget dht.Provide(d) in a
