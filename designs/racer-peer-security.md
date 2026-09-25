@@ -111,6 +111,10 @@ message-signature sessions or an unavailable peer TLS channel. Discover both
 directions before bidirectional signed traffic. Probe responses grant no application
 or RDMA permission and allocate no receiver-side session state.
 
+`ChallengeReply::encode/decode` provides the bounded canonical binary reply framing
+(64 KiB maximum, eight DER certificates, exactly one Ed25519 signature). Use these
+methods rather than duplicating a challenge-reply codec in peer transport.
+
 ### Security integration review requirements
 
 The identity and protocol submodules are now registered by the security parent.
@@ -133,3 +137,21 @@ only for the final receiver-addressed envelope. Immutable response descriptors m
 match the requested object/version/page, not only a self-consistent signed response.
 The canonical application target is `/racer/peer/v1`; the transport envelope uses
 `/racer/peer/v1/exchange`, with the original signed application head carried intact.
+
+Current compiler integration requests:
+
+- Application: replace unit `KeyEpochs` construction with `KeyEpochs::default()`.
+- Security/peer immutable signed heads use `Arc<SignedHead>` rather than `Rc` so
+  verified requests can cross owned worker mailboxes. Service graphs remain `Rc`.
+  Peer `WireCodec` must construct `Arc` for its preserved original.
+- Read origin servicing must retain `ChargedOriginContext` for the entire async
+  origin operation. It dereferences to `OriginContext`; never detach uncharged raw
+  credentials from it. Security will not make `OriginContext` fields public beyond
+  the model's existing interface or bypass reservation ownership.
+
+Keyring validation review: equal-generation identical content is idempotent; lower
+generation or changed equal-generation content fails. Generation zero fails. Exactly
+one active key per represented cache/purpose is required, while a removed scope can
+be absent. A removed key must stop new leases immediately, then await registered
+retirement fences and existing leases. Reappearing retired IDs cannot resurrect old
+material. Retirement is retryable and must retain material if barriers are absent.
