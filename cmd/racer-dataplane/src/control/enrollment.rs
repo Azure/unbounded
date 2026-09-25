@@ -9,8 +9,9 @@ use crate::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +21,9 @@ pub struct Enrollment {
     token_path: PathBuf,
     identity_directory: PathBuf,
     roots: RefCell<Vec<Vec<u8>>>,
+    reactor: RefCell<Option<Rc<crate::runtime::reactor::Reactor>>>,
+    busy: Cell<bool>,
+    previous: Cell<Option<crate::model::identity::RequestId>>,
 }
 /// Non-exportable signing identity. Do not share private keys through cluster Secrets.
 #[derive(Clone)]
@@ -54,6 +58,28 @@ struct PersistedIdentity {
     pending: PendingIdentity,
     response: String,
 }
+struct TransactionGuard<'a>(&'a Cell<bool>);
+impl Drop for TransactionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+fn token(b: &[u8]) -> Result<Zeroizing<String>> {
+    let token = Zeroizing::new(
+        std::str::from_utf8(b)
+            .map_err(|_| Error::Unauthorized)?
+            .trim()
+            .to_owned(),
+    );
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(token)
+}
 impl Enrollment {
     pub fn new(cluster: ClusterId, token_path: PathBuf, identity_directory: PathBuf) -> Self {
         Self {
@@ -61,18 +87,211 @@ impl Enrollment {
             token_path,
             identity_directory,
             roots: RefCell::new(Vec::new()),
+            reactor: RefCell::new(None),
+            busy: Cell::new(false),
+            previous: Cell::new(None),
         }
     }
     /// Persist a fresh private key and retry-stable request before submission.
     /// All issuance uses the projected token, including renewal at 16 hours.
     pub fn prepare<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, EnrollmentRequest> {
         Box::pin(async move {
-            scope.check()?;
-            self.prepare_now()
+            let r = self.reactor()?;
+            let (_guard, scope) = self.begin(&r, scope).await?;
+            let dir =
+                super::async_files::directory(&r, &self.identity_directory, true, true, &scope)
+                    .await?;
+            match super::async_files::read_at(
+                &r,
+                &dir,
+                "pending.json",
+                wire::MAX_ENROLLMENT_BYTES,
+                true,
+                &scope,
+            )
+            .await
+            {
+                Ok(b) => {
+                    r.file_sync(dir.clone(), &scope).await?;
+                    return self.request(&decode_pending(&b)?);
+                }
+                Err(Error::MissingKey) => (),
+                Err(e) => return Err(e),
+            }
+            let pending = self.generate()?;
+            let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
+            super::async_files::atomic_write(&r, &dir, "pending.json", &encoded, &scope).await?;
+            self.request(&pending)
+        })
+    }
+    pub fn attach_reactor(&self, reactor: Rc<crate::runtime::reactor::Reactor>) {
+        *self.reactor.borrow_mut() = Some(reactor);
+    }
+    fn reactor(&self) -> Result<Rc<crate::runtime::reactor::Reactor>> {
+        self.reactor
+            .borrow()
+            .clone()
+            .ok_or(Error::InvalidConfiguration)
+    }
+    async fn begin<'a>(
+        &'a self,
+        r: &crate::runtime::reactor::Reactor,
+        scope: &RequestScope,
+    ) -> Result<(TransactionGuard<'a>, RequestScope)> {
+        scope.check()?;
+        if self.busy.replace(true) {
+            return Err(Error::Overloaded);
+        }
+        let guard = TransactionGuard(&self.busy);
+        if let Some(id) = self.previous.get() {
+            r.file_fence(id).await?;
+        }
+        let mut scope = scope.clone();
+        let mut id = [0; 16];
+        getrandom::getrandom(&mut id).map_err(|_| Error::Io)?;
+        scope.request = crate::model::identity::RequestId(id);
+        self.previous.set(Some(scope.request));
+        Ok((guard, scope))
+    }
+    pub fn read_token_async<'a>(
+        &'a self,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Zeroizing<String>> {
+        Box::pin(async move {
+            let r = self.reactor()?;
+            let b = super::async_files::read_path(
+                &r,
+                &self.token_path,
+                wire::MAX_ENROLLMENT_BYTES,
+                scope,
+            )
+            .await?;
+            token(&b)
         })
     }
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
+    }
+    pub fn accept_response_async<'a>(
+        &'a self,
+        response: EnrollmentResponse,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, LocalSigningIdentity> {
+        Box::pin(async move {
+            use super::async_files as af;
+            let r = self.reactor()?;
+            let (_guard, scope) = self.begin(&r, scope).await?;
+            let dir = af::directory(&r, &self.identity_directory, false, true, &scope).await?;
+            match af::read_at(
+                &r,
+                &dir,
+                "identity.json",
+                wire::MAX_ENROLLMENT_BYTES * 3,
+                true,
+                &scope,
+            )
+            .await
+            {
+                Ok(b) => {
+                    let old: PersistedIdentity = serde_json::from_value(wire::strict_json(
+                        &b,
+                        wire::MAX_ENROLLMENT_BYTES * 3,
+                    )?)
+                    .map_err(|_| Error::CorruptRecord)?;
+                    let old = wire::decode_enrollment_response(
+                        &STANDARD
+                            .decode(&old.response)
+                            .map_err(|_| Error::CorruptRecord)?,
+                    )?;
+                    if old.cluster != response.cluster || old.node != response.node {
+                        return Err(Error::Unauthorized);
+                    }
+                }
+                Err(Error::MissingKey) => (),
+                Err(e) => return Err(e),
+            }
+            let bytes = af::read_at(
+                &r,
+                &dir,
+                "pending.json",
+                wire::MAX_ENROLLMENT_BYTES,
+                true,
+                &scope,
+            )
+            .await?;
+            let pending = decode_pending(&bytes)?;
+            self.request(&pending)?;
+            let identity = self.validate(&pending, &response)?;
+            let persisted = PersistedIdentity {
+                pending,
+                response: STANDARD.encode(wire::encode_enrollment_response(&response)?),
+            };
+            let bytes = Zeroizing::new(serde_json::to_vec(&persisted).map_err(|_| Error::Io)?);
+            af::atomic_write(&r, &dir, "identity.json", &bytes, &scope).await?;
+            af::remove(&r, &dir, "pending.json", &scope).await?;
+            Ok(identity)
+        })
+    }
+    pub fn load_identity_async<'a>(
+        &'a self,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<LocalSigningIdentity>> {
+        Box::pin(async move {
+            use super::async_files as af;
+            let r = self.reactor()?;
+            let (_guard, scope) = self.begin(&r, scope).await?;
+            let dir = match af::directory(&r, &self.identity_directory, false, true, &scope).await {
+                Ok(dir) => dir,
+                Err(Error::MissingKey) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let bytes = match af::read_at(
+                &r,
+                &dir,
+                "identity.json",
+                wire::MAX_ENROLLMENT_BYTES * 3,
+                true,
+                &scope,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(Error::MissingKey) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let p: PersistedIdentity =
+                serde_json::from_value(wire::strict_json(&bytes, wire::MAX_ENROLLMENT_BYTES * 3)?)
+                    .map_err(|_| Error::CorruptRecord)?;
+            let response = wire::decode_enrollment_response(
+                &STANDARD
+                    .decode(&p.response)
+                    .map_err(|_| Error::CorruptRecord)?,
+            )?;
+            match self.validate(&p.pending, &response) {
+                Ok(identity) => {
+                    r.file_sync(dir.clone(), &scope).await?;
+                    match af::read_at(
+                        &r,
+                        &dir,
+                        "pending.json",
+                        wire::MAX_ENROLLMENT_BYTES,
+                        true,
+                        &scope,
+                    )
+                    .await
+                    {
+                        Ok(b) if decode_pending(&b)?.enrollment == identity.enrollment.0 => {
+                            af::remove(&r, &dir, "pending.json", &scope).await?
+                        }
+                        Ok(_) | Err(Error::MissingKey) => (),
+                        Err(e) => return Err(e),
+                    }
+                    Ok(Some(identity))
+                }
+                Err(Error::Unauthorized) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
     }
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<()> {
         verifier(&roots)?;
@@ -81,28 +300,21 @@ impl Enrollment {
     }
     /// Reread the projected token on every attempt; never retain it in a DTO.
     pub fn read_token(&self) -> Result<Zeroizing<String>> {
+        if self.reactor.borrow().is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         // Kubernetes token paths normally pass through a projection symlink. Opening
         // once pins one complete token file across atomic directory replacement.
         let b = Zeroizing::new(files::read_path(
             &self.token_path,
             wire::MAX_ENROLLMENT_BYTES,
         )?);
-        let token = Zeroizing::new(
-            std::str::from_utf8(&b)
-                .map_err(|_| Error::Unauthorized)?
-                .trim()
-                .to_owned(),
-        );
-        if token.is_empty()
-            || !token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(Error::Unauthorized);
-        }
-        Ok(token)
+        token(&b)
     }
     pub fn prepare_now(&self) -> Result<EnrollmentRequest> {
+        if self.reactor.borrow().is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         if !wire::valid_uuid(&self.cluster.0) {
             return Err(Error::InvalidConfiguration);
         }
@@ -111,6 +323,15 @@ impl Enrollment {
             Ok(b) => return self.request(&decode_pending(&Zeroizing::new(b))?),
             Err(Error::MissingKey) => (),
             Err(e) => return Err(e),
+        }
+        let pending = self.generate()?;
+        let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
+        files::atomic_write(&dir, "pending.json", &encoded)?;
+        self.request(&pending)
+    }
+    fn generate(&self) -> Result<PendingIdentity> {
+        if !wire::valid_uuid(&self.cluster.0) {
+            return Err(Error::InvalidConfiguration);
         }
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|_| Error::Io)?;
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
@@ -136,9 +357,7 @@ impl Enrollment {
             private_key: STANDARD.encode(key.serialize_der()),
             csr: STANDARD.encode(csr.der()),
         };
-        let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
-        files::atomic_write(&dir, "pending.json", &encoded)?;
-        self.request(&pending)
+        Ok(pending)
     }
     fn request(&self, p: &PendingIdentity) -> Result<EnrollmentRequest> {
         if p.cluster != self.cluster.0 {
@@ -180,6 +399,9 @@ impl Enrollment {
     /// Verify server-authenticated response correlation, chain/SAN/validity, and
     /// local key pairing, then persist the node identity. Never trust CSR SANs.
     pub fn accept_response(&self, response: EnrollmentResponse) -> Result<LocalSigningIdentity> {
+        if self.reactor.borrow().is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         let dir = files::directory(&self.identity_directory, false, true)?;
         match files::read_at(&dir, "identity.json", wire::MAX_ENROLLMENT_BYTES * 3, true) {
             Ok(bytes) => {
@@ -219,6 +441,9 @@ impl Enrollment {
         Ok(identity)
     }
     pub fn load_identity(&self) -> Result<Option<LocalSigningIdentity>> {
+        if self.reactor.borrow().is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         let dir = match files::directory(&self.identity_directory, false, true) {
             Ok(d) => d,
             Err(Error::MissingKey) => return Ok(None),

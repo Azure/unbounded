@@ -46,6 +46,7 @@ pub struct ControlClient {
     projection_error: Cell<Option<Error>>,
     renewal_error: Cell<Option<Error>>,
     renew_next: Cell<Option<Instant>>,
+    startup_bundle: RefCell<Option<wire::KeyringBundle>>,
 }
 struct Busy<'a>(&'a Cell<bool>);
 struct ActiveTurn<'a>(&'a RefCell<Option<RequestScope>>);
@@ -103,6 +104,7 @@ impl ControlClient {
             projection_error: Cell::new(None),
             renewal_error: Cell::new(None),
             renew_next: Cell::new(None),
+            startup_bundle: RefCell::new(None),
         }
     }
     /// Reads the projected token at submission; retries reuse the same request ID.
@@ -118,7 +120,7 @@ impl ControlClient {
             }
             let body = wire::encode_enrollment_request(request)?;
             let connection = self.transport.bootstrap(scope).await?;
-            let token = self.enrollment.read_token()?;
+            let token = self.enrollment.read_token_async(scope).await?;
             let response = connection
                 .request(
                     "POST",
@@ -199,6 +201,10 @@ impl ControlClient {
     }
     /// Runtime must attach its owner-local reactor adapter before start.
     pub fn attach_io(&self, io: Rc<dyn ControlIo>) {
+        if let Some(reactor) = io.reactor() {
+            self.enrollment.attach_reactor(reactor.clone());
+            self.secrets.attach_reactor(reactor);
+        }
         self.transport.attach_io(io);
     }
     pub fn attach_cache_lifecycle(&self, lifecycle: Rc<dyn super::caches::CacheLifecycle>) {
@@ -240,9 +246,12 @@ impl ControlClient {
             return Err(Error::Unauthorized);
         }
         self.secrets.bind_keyring(keys.clone());
-        self.secrets.reload_now()?;
+        if let Some(bundle) = self.startup_bundle.borrow().as_ref() {
+            self.secrets.install(bundle.clone())?;
+        }
         let signing = identity.signing_identity(&keys.peer_trust_roots()?)?;
         keys.install_signing_identity(signing)?;
+        self.startup_bundle.borrow_mut().take();
         *self.keys.borrow_mut() = keys;
         Ok(())
     }
@@ -278,21 +287,23 @@ impl ControlClient {
     }
     async fn start_inner(&self, scope: &RequestScope) -> Result<LocalSigningIdentity> {
         self.transport.io()?;
-        let bundle = self.secrets.read_bundle()?;
+        let bundle = self.secrets.read_bundle_async(scope).await?;
         if &bundle.cluster != self.enrollment.cluster() {
             return Err(Error::Unauthorized);
         }
         self.enrollment
             .set_peer_trust_roots(bundle.peer_trust_roots.clone())?;
-        let identity = match self.enrollment.load_identity()? {
+        let identity = match self.enrollment.load_identity_async(scope).await? {
             Some(i) => i,
             None => {
                 let request = self.enrollment.prepare(scope).await?;
                 self.enrollment
-                    .accept_response(self.enroll(&request, scope).await?)?
+                    .accept_response_async(self.enroll(&request, scope).await?, scope)
+                    .await?
             }
         };
         *self.identity.borrow_mut() = Some(identity.clone());
+        *self.startup_bundle.borrow_mut() = Some(bundle);
         self.started.set(true);
         self.next.set(Some(Instant::now()));
         Ok(identity)
@@ -303,8 +314,12 @@ impl ControlClient {
         if keys.node() != identity.node() || keys.cluster() != identity.cluster() {
             return Err(Error::Unauthorized);
         }
-        self.secrets.reload_now()?;
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)
+        if let Some(bundle) = self.startup_bundle.borrow().as_ref() {
+            self.secrets.install(bundle.clone())?;
+        }
+        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        self.startup_bundle.borrow_mut().take();
+        Ok(())
     }
     pub fn identity(&self) -> Option<LocalSigningIdentity> {
         self.identity.borrow().clone()
@@ -350,7 +365,7 @@ impl ControlClient {
     }
     async fn advance(&self, scope: &RequestScope) -> Result<()> {
         // A malformed projection retains the installed epoch and does not stop polls.
-        match self.secrets.reload_now() {
+        match self.secrets.reload_async(scope).await {
             Ok((_, roots)) => {
                 self.enrollment.set_peer_trust_roots(roots)?;
                 self.projection_error.set(None);
@@ -403,6 +418,7 @@ impl ControlClient {
             .await?
         {
             SnapshotResponse::Updated(publication) => {
+                scope.check()?;
                 // Validate before acceptance; event delivery is infallible after this.
                 super::caches::validate_definitions(&publication.caches)?;
                 let transition = self
@@ -422,7 +438,10 @@ impl ControlClient {
     async fn renew(&self, scope: &RequestScope) -> Result<()> {
         let request = self.enrollment.prepare(scope).await?;
         let response = self.enroll(&request, scope).await?;
-        let identity = self.enrollment.accept_response(response)?;
+        let identity = self
+            .enrollment
+            .accept_response_async(response, scope)
+            .await?;
         if self
             .identity
             .borrow()

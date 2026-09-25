@@ -17,6 +17,21 @@ use std::{
 /// Runtime adapter: readiness registration must retain the FD until deregistration.
 /// Dropping a wait cancels its registration. Timers and DNS run on the sole owner.
 pub trait ControlIo {
+    /// Production supplies the same owner-local reactor for filesystem and TLS.
+    fn reactor(&self) -> Option<Rc<crate::runtime::reactor::Reactor>> {
+        None
+    }
+    fn read_file<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+        limit: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
+        Box::pin(async move {
+            let reactor = self.reactor().ok_or(Error::InvalidConfiguration)?;
+            super::async_files::read_path(&reactor, path, limit, scope).await
+        })
+    }
     fn resolve<'a>(
         &'a self,
         host: &'a str,
@@ -43,6 +58,9 @@ impl ReactorControlIo {
     }
 }
 impl ControlIo for ReactorControlIo {
+    fn reactor(&self) -> Option<Rc<crate::runtime::reactor::Reactor>> {
+        Some(self.reactor.clone())
+    }
     fn resolve<'a>(
         &'a self,
         host: &'a str,
@@ -204,8 +222,9 @@ impl ControlTransport {
             }
             let endpoint = endpoint(&self.endpoint.url)?;
             let io = self.io()?;
-            let trust =
-                super::files::read_path(&self.endpoint.trust_bundle, wire::MAX_BUNDLE_BYTES)?;
+            let trust = io
+                .read_file(&self.endpoint.trust_bundle, wire::MAX_BUNDLE_BYTES, scope)
+                .await?;
             let mut roots = rustls::RootCertStore::empty();
             for cert in rustls_pemfile::certs(&mut trust.as_slice()) {
                 roots
@@ -731,6 +750,16 @@ mod tests {
     /// calls poll from within a future; this drives real loopback TLS fixtures.
     struct FixtureIo;
     impl ControlIo for FixtureIo {
+        fn read_file<'a>(
+            &'a self,
+            path: &'a std::path::Path,
+            limit: usize,
+            _: &'a RequestScope,
+        ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
+            Box::pin(async move {
+                super::super::files::read_path(path, limit).map(zeroize::Zeroizing::new)
+            })
+        }
         fn resolve<'a>(
             &'a self,
             _: &'a str,
@@ -771,9 +800,20 @@ mod tests {
     }
     #[test]
     fn real_server_auth_and_mutual_tls_chunked_response() {
+        tls_fixture(None);
+    }
+    #[test]
+    fn real_ring_server_auth_and_mutual_tls() {
+        let Some(r) = testing::reactor() else {
+            return;
+        };
+        tls_fixture(Some(r));
+    }
+    fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>) {
         let d = testing::Directory::new();
         let (ca, ca_key) = testing::ca();
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let cert = params.signed_by(&server_key, &ca, &ca_key).unwrap();
@@ -848,12 +888,23 @@ mod tests {
             }
         });
         let transport = ControlTransport::new(ControlEndpoint {
-            url: format!("https://localhost:{port}"),
+            url: format!("https://127.0.0.1:{port}"),
             trust_bundle: trust,
         });
-        transport.attach_io(Rc::new(FixtureIo));
+        if let Some(r) = &reactor {
+            transport.attach_io(Rc::new(ReactorControlIo::new(r.clone())));
+        } else {
+            transport.attach_io(Rc::new(FixtureIo));
+        }
         let scope = testing::scope();
-        let first = futures::executor::block_on(async {
+        let run = |future: Operation<'_, HttpResponse>| {
+            if let Some(r) = &reactor {
+                testing::drive(r, future)
+            } else {
+                futures::executor::block_on(future)
+            }
+        };
+        let first = run(Box::pin(async {
             transport
                 .bootstrap(&scope)
                 .await?
@@ -866,16 +917,16 @@ mod tests {
                     &scope,
                 )
                 .await
-        })
+        }))
         .unwrap();
         assert_eq!(first.body, b"{}");
-        let second = futures::executor::block_on(async {
+        let second = run(Box::pin(async {
             transport
                 .authenticated(&identity, &scope)
                 .await?
                 .request("GET", wire::SNAPSHOT_PATH, None, &[], 65536, &scope)
                 .await
-        })
+        }))
         .unwrap();
         assert_eq!(second.status, 200);
         assert_eq!(second.body, b"{}");

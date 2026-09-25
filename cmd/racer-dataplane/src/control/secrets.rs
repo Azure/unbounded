@@ -14,6 +14,7 @@ pub struct SecretWatcher {
     directory: PathBuf,
     keys: RefCell<Rc<Keyring>>,
     accepted: RefCell<Option<(BundleGeneration, [u8; 32], Vec<Vec<u8>>)>>,
+    reactor: RefCell<Option<Rc<crate::runtime::reactor::Reactor>>>,
 }
 impl SecretWatcher {
     pub fn new(directory: PathBuf, keys: Rc<Keyring>) -> Self {
@@ -21,6 +22,7 @@ impl SecretWatcher {
             directory,
             keys: RefCell::new(keys),
             accepted: RefCell::new(None),
+            reactor: RefCell::new(None),
         }
     }
     /// Load common bundle.json from one coherent projected generation; malformed
@@ -30,10 +32,15 @@ impl SecretWatcher {
     pub fn reload<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, BundleGeneration> {
         Box::pin(async move {
             scope.check()?;
-            self.reload_now().map(|(generation, _)| generation)
+            self.reload_async(scope)
+                .await
+                .map(|(generation, _)| generation)
         })
     }
     pub fn read_bundle(&self) -> Result<KeyringBundle> {
+        if self.reactor.borrow().is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         let bytes = zeroize::Zeroizing::new(files::projected_file(
             &self.directory,
             "bundle.json",
@@ -41,12 +48,44 @@ impl SecretWatcher {
         )?);
         wire::decode_bundle(&bytes)
     }
+    pub fn attach_reactor(&self, reactor: Rc<crate::runtime::reactor::Reactor>) {
+        *self.reactor.borrow_mut() = Some(reactor);
+    }
+    pub async fn read_bundle_async(&self, scope: &RequestScope) -> Result<KeyringBundle> {
+        let r = self
+            .reactor
+            .borrow()
+            .clone()
+            .ok_or(Error::InvalidConfiguration)?;
+        let bytes = super::async_files::projected_file(
+            &r,
+            &self.directory,
+            "bundle.json",
+            wire::MAX_BUNDLE_BYTES,
+            scope,
+        )
+        .await?;
+        wire::decode_bundle(&bytes)
+    }
+    pub async fn reload_async(
+        &self,
+        scope: &RequestScope,
+    ) -> Result<(BundleGeneration, Vec<Vec<u8>>)> {
+        let bundle = self.read_bundle_async(scope).await?;
+        scope.check()?;
+        self.install(bundle)
+    }
     pub fn bind_keyring(&self, keys: Rc<Keyring>) {
         *self.keys.borrow_mut() = keys;
         *self.accepted.borrow_mut() = None;
     }
     pub fn reload_now(&self) -> Result<(BundleGeneration, Vec<Vec<u8>>)> {
-        let mut bundle = self.read_bundle()?;
+        self.install(self.read_bundle()?)
+    }
+    pub(crate) fn install(
+        &self,
+        mut bundle: KeyringBundle,
+    ) -> Result<(BundleGeneration, Vec<Vec<u8>>)> {
         bundle.peer_trust_roots.sort();
         bundle.cache_keys.sort_by(|a, b| {
             (&a.key.cache.0, a.key.purpose as u8, a.key.id.0).cmp(&(

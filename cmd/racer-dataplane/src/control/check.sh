@@ -7,7 +7,7 @@ crate="$root/cmd/racer-dataplane"
 cargo build --manifest-path "$crate/Cargo.toml" --lib
 deps="$crate/target/debug/deps"
 args=(--extern "racer_dataplane=$crate/target/debug/libracer_dataplane.rlib")
-for name in rcgen rustls serde_json libc futures sha2; do
+for name in rcgen rustls serde_json libc futures sha2 zeroize io_uring; do
     matches=("$deps/lib$name"-*.rlib)
     if [[ ${#matches[@]} != 1 || ! -f "${matches[0]}" ]]; then
         printf 'Expected one compiled dependency for %s\n' "$name" >&2

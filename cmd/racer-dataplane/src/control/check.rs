@@ -91,6 +91,20 @@ fn go_rejection_vectors_when_available() {
 
 struct Io;
 impl transport::ControlIo for Io {
+    fn read_file<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+        limit: usize,
+        _: &'a runtime::deadline::RequestScope,
+    ) -> error::Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
+        Box::pin(async move {
+            let bytes = std::fs::read(path).map_err(|_| error::Error::Io)?;
+            if bytes.len() > limit {
+                return Err(error::Error::Overloaded);
+            }
+            Ok(zeroize::Zeroizing::new(bytes))
+        })
+    }
     fn resolve<'a>(
         &'a self,
         _: &'a str,

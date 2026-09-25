@@ -18,8 +18,10 @@ pub(super) async fn resolve(
     scope: &RequestScope,
 ) -> Result<Vec<SocketAddr>> {
     scope.check()?;
-    // Bounded synchronous configuration reads; DNS network operations never block.
-    let config = super::files::read_path(std::path::Path::new("/etc/resolv.conf"), 64 * 1024)?;
+    // Configuration and network I/O both use the owner-local reactor.
+    let config = io
+        .read_file(std::path::Path::new("/etc/resolv.conf"), 64 * 1024, scope)
+        .await?;
     let text = std::str::from_utf8(&config).map_err(|_| Error::InvalidConfiguration)?;
     let mut servers = Vec::new();
     let mut search = Vec::new();
