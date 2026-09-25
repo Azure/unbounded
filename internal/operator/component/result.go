@@ -4,8 +4,8 @@
 // Package component defines the extension contract for the unbounded operator.
 // A component is a unit of desired state the operator reconciles for Sites.
 // Implementations satisfy either ClusterComponent (cluster-wide singletons such
-// as net and machina) or SiteComponent (per-Site units such as metalman and
-// storage) and are assembled into a Registry the SiteReconciler drives. Adding a
+// as net and machina) or SiteComponent (per-Site units such as metalman)
+// and are assembled into a Registry the SiteReconciler drives. Adding a
 // component is a matter of implementing one interface and registering it; the
 // reconcile loop, status conditions, ordering, and the Site-less pass are all
 // driven from the registry.

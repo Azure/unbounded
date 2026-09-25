@@ -272,7 +272,7 @@ func newSchedulingSet() *schedulingSet {
 //
 // This is the whole reason scheduling is handled separately: NodeSelectorTerms
 // carries no patchMergeKey, so a merge would replace the operator's terms
-// outright. metalman and storage rely on a mandatory per-Site node affinity, so
+// outright. metalman relies on a mandatory per-Site node affinity, so
 // replacing it would let two Sites' workloads schedule onto the same nodes.
 func (s *schedulingSet) absorb(patch map[string]any) error {
 	for _, path := range schedulingPaths {

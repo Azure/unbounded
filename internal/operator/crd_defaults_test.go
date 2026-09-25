@@ -162,7 +162,7 @@ func findSiteCRD(t *testing.T) *apiextensionsv1.CustomResourceDefinition {
 //
 // So if Site ever became namespaced, ListSites would quietly return only the
 // Sites in the operator's namespace. Every other Site would lose its per-Site
-// metalman and storage workloads, the cluster components would conclude they
+// metalman workloads, the cluster components would conclude they
 // were disabled, and nothing anywhere would report a problem. That is a
 // cluster-wide outage produced by a one-line marker change in another package,
 // which is why it is asserted here rather than left to a code comment.

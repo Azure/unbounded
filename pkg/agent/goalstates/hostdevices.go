@@ -29,7 +29,7 @@ const (
 	infinibandDir = "/dev/infiniband"
 	// rdmaCMMiscDevPath is the kernel-published major:minor for the RDMA-CM
 	// misc device. systemd-nspawn needs the corresponding /dev/infiniband/rdma_cm
-	// node bind-mounted for libfabric's verbs/RDMA-CM path.
+	// node bind-mounted for workloads using RDMA-CM.
 	rdmaCMMiscDevPath = "/sys/class/misc/rdma_cm/dev"
 )
 

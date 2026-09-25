@@ -191,6 +191,7 @@ func TestStartHealthServerCNIGuardFailsReadinessButNotLiveness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status request failed: %v", err)
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	var status NodeStatusResponse
@@ -237,6 +238,7 @@ func TestStatusFallbackUsesCurrentEnvNodeName(t *testing.T) {
 	h := &nodeHealthState{informersSynced: []cache.InformerSynced{func() bool { return true }}}
 
 	h.setBootstrapSnapshot("node-fallback", "", "", nil, false)
+
 	go startHealthServer(port, h)
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)

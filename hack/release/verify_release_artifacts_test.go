@@ -113,10 +113,6 @@ func declaredArtifacts() []any {
 			"name":            "unbounded-manifests-" + verifyTag + ".tar.gz",
 			"signatureBundle": "unbounded-manifests-" + verifyTag + ".tar.gz.bundle.json",
 		},
-		map[string]any{
-			"name":            "unbounded-storage-linux-amd64.tar.gz",
-			"signatureBundle": "unbounded-storage-linux-amd64.tar.gz.bundle.json",
-		},
 		map[string]any{"name": "unbounded.yaml"},
 	}
 }
@@ -127,8 +123,6 @@ func declaredAssetNames() []string {
 		"gantry-9.9.9.tgz", "gantry-9.9.9.tgz.bundle.json",
 		"unbounded-manifests-" + verifyTag + ".tar.gz",
 		"unbounded-manifests-" + verifyTag + ".tar.gz.bundle.json",
-		"unbounded-storage-linux-amd64.tar.gz",
-		"unbounded-storage-linux-amd64.tar.gz.bundle.json",
 		"unbounded.yaml",
 	}
 }
@@ -586,13 +580,13 @@ func TestVerifierSkipsChecksumsWhenNoBinaryIsUsed(t *testing.T) {
 // TestVerifierRejectsAReleaseMissingADeclaredArtifact is the regression guard
 // for a draft that lost assets. The deploy consumes only a subset of artifacts
 // a release declares; nothing looked at the rest, so a release could publish
-// without its storage tarballs, its checksums or unbounded.yaml.
+// without its manifests tarball, its checksums or unbounded.yaml.
 func TestVerifierRejectsAReleaseMissingADeclaredArtifact(t *testing.T) {
 	requireVerifier(t)
 	t.Parallel()
 
 	for _, missing := range []string{
-		"unbounded-storage-linux-amd64.tar.gz",
+		"unbounded-manifests-" + verifyTag + ".tar.gz",
 		"unbounded.yaml",
 		"checksums.txt",
 	} {
@@ -612,12 +606,12 @@ func TestVerifierRejectsAMissingSignatureBundleAsset(t *testing.T) {
 	requireVerifier(t)
 	t.Parallel()
 
-	r := newRelease(t).withoutAsset("unbounded-storage-linux-amd64.tar.gz.bundle.json")
+	r := newRelease(t).withoutAsset("unbounded-manifests-" + verifyTag + ".tar.gz.bundle.json")
 
 	output, code := r.run(nil)
 
 	requireCode(t, code, 1, output)
-	requireContains(t, output, "unbounded-storage-linux-amd64.tar.gz.bundle.json")
+	requireContains(t, output, "unbounded-manifests-"+verifyTag+".tar.gz.bundle.json")
 }
 
 // TestVerifierReportsEveryMissingArtifactAtOnce keeps a half-uploaded draft
@@ -633,7 +627,6 @@ func TestVerifierReportsEveryMissingArtifactAtOnce(t *testing.T) {
 
 	requireCode(t, code, 1, output)
 	requireContains(t, output, "unbounded-manifests-"+verifyTag+".tar.gz")
-	requireContains(t, output, "unbounded-storage-linux-amd64.tar.gz")
 	requireContains(t, output, "unbounded.yaml")
 }
 

@@ -46,6 +46,7 @@ func TestWebSocketDetailsWakeWhilePublicationPending(t *testing.T) {
 				if err != nil {
 					return
 				}
+
 				defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
 
 				for {

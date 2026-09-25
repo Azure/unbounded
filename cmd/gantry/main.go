@@ -1838,6 +1838,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			queuedAt := time.Now()
 
 			pullSem <- struct{}{}
+
 			defer func() { <-pullSem }()
 
 			if pumpHooks.OnQueueWait != nil {

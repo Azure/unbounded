@@ -12,20 +12,18 @@ import (
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	tokenrefreshermanifests "github.com/Azure/unbounded/deploy/token-refresher"
-	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // TestEmbeddedManifestsHaveNoLatestImageTags guards that the component manifests
 // the operator embeds and applies never pin an image to :latest. Operator-managed
 // components must be version-matched to the operator's release; a :latest tag
-// (as previously produced by the storage supervisor manifests) breaks that
+// in the manifests breaks that
 // invariant. This test relies on `make test` rendering the manifests first.
 func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 	sets := map[string]fs.FS{
 		"machina":         machinamanifests.Manifests,
 		"net":             netmanifests.Manifests,
-		"storage":         storagemanifests.Manifests,
 		"gantry":          gantrymanifests.Manifests,
 		"token-refresher": tokenrefreshermanifests.Manifests,
 	}

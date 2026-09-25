@@ -16,8 +16,8 @@ import (
 // knownComponents are the components that generate workloads an override can
 // target, and the kinds each one actually emits.
 //
-// Component and kind used to be validated against separate lists, so seven of
-// the ten pairs they accepted between them could not resolve to anything:
+// Component and kind used to be validated against separate lists, so accepted
+// pairs could not resolve to anything:
 // machina emits no DaemonSet, gantry no Deployment. Such an entry validated,
 // matched nothing, and was reported as a successfully applied document that
 // overrode zero workloads. Naming the mistake is the whole job of validation.
@@ -34,7 +34,6 @@ var knownComponents = map[string]struct {
 	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
 	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
-	"storage":         {perSite: true, kinds: []string{"DaemonSet"}},
 }
 
 // knownKinds are the workload kinds the operator emits at all.

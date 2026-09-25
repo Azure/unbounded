@@ -64,6 +64,7 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+
 	defer func() {
 		if err := lock.Release(); err != nil {
 			c.log.Error("release installation lock", "error", err)

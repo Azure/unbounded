@@ -316,6 +316,7 @@ func (r *ChairResolver) dispatchChairs(ctx context.Context, targets []chairs.Cha
 		chair := chair
 
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 

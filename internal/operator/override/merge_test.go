@@ -41,17 +41,17 @@ func siteAffinity(site string) map[string]any {
 	}
 }
 
-// testWorkload builds a DaemonSet shaped like the ones the operator generates:
+// testWorkload builds a Deployment shaped like the ones the operator generates:
 // a selector, matching template labels, a container, an operator volume mount,
 // and per-Site node affinity.
 func testWorkload(site string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
-		"kind":       "DaemonSet",
+		"kind":       "Deployment",
 		"metadata": map[string]any{
-			"name":      "unbounded-storage-supervisor-" + site,
+			"name":      "metalman-" + site,
 			"namespace": "unbounded-system",
-			"labels":    map[string]any{"app.kubernetes.io/name": "storage"},
+			"labels":    map[string]any{"app.kubernetes.io/name": "metalman"},
 			"ownerReferences": []any{
 				map[string]any{
 					"apiVersion": "unbounded-cloud.io/v1alpha3",
@@ -65,18 +65,18 @@ func testWorkload(site string) *unstructured.Unstructured {
 		"spec": map[string]any{
 			"selector": map[string]any{
 				"matchLabels": map[string]any{
-					"app.kubernetes.io/name":  "storage",
+					"app.kubernetes.io/name":  "metalman",
 					"unbounded-cloud.io/site": site,
 				},
 			},
 			"template": map[string]any{
 				"metadata": map[string]any{
 					"labels": map[string]any{
-						"app.kubernetes.io/name":  "storage",
+						"app.kubernetes.io/name":  "metalman",
 						"unbounded-cloud.io/site": site,
 					},
 					"annotations": map[string]any{
-						"unbounded-cloud.io/storage-config-hash": "abc123",
+						"unbounded-cloud.io/metalman-config-hash": "abc123",
 					},
 				},
 				"spec": map[string]any{
@@ -84,17 +84,17 @@ func testWorkload(site string) *unstructured.Unstructured {
 					"containers": []any{
 						map[string]any{
 							"name":  "run",
-							"image": "ghcr.io/azure/unbounded-storage-supervisor:v1",
-							"args":  []any{"--config=/etc/storage/config.yaml"},
+							"image": "ghcr.io/azure/metalman:v1",
+							"args":  []any{"--config=/etc/metalman/config.yaml"},
 							"volumeMounts": []any{
-								map[string]any{"name": "storage-config", "mountPath": "/etc/storage"},
+								map[string]any{"name": "metalman-config", "mountPath": "/etc/metalman"},
 							},
 						},
 					},
 					"volumes": []any{
 						map[string]any{
-							"name":      "storage-config",
-							"configMap": map[string]any{"name": "unbounded-storage-config-" + site},
+							"name":      "metalman-config",
+							"configMap": map[string]any{"name": "metalman-config-" + site},
 						},
 					},
 				},
@@ -163,10 +163,10 @@ func podSpec(t *testing.T, workload *unstructured.Unstructured) corev1.PodSpec {
 
 func TestApplyMergesResources(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -201,10 +201,10 @@ func TestApplyMergesResources(t *testing.T) {
 // two Sites' workloads schedule onto the same nodes.
 func TestApplyPreservesSiteAffinity(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -262,10 +262,10 @@ func TestApplyPreservesSiteAffinity(t *testing.T) {
 // operator terms combined with two user terms must produce four, not two.
 func TestApplyAffinityIsCartesian(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -321,10 +321,10 @@ func TestApplyAppendsTolerations(t *testing.T) {
 		map[string]any{"key": "operator-owned", "operator": "Exists"},
 	}, "spec", "template", "spec", "tolerations")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -353,10 +353,10 @@ func TestApplyRejectsOverwritingOperatorNodeSelector(t *testing.T) {
 	_ = unstructured.SetNestedMap(workload.Object, map[string]any{"kubernetes.io/os": "linux"},
 		"spec", "template", "spec", "nodeSelector")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -380,14 +380,14 @@ func TestApplyRejectsOverwritingOperatorNodeSelector(t *testing.T) {
 // must not depend on validation being exhaustive.
 func TestApplyRestampsIdentity(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
 	// Bypass Validate deliberately: this asserts the re-stamp, not the check.
 	entries := []SourcedEntry{{
 		Source: Source{Key: "evil.yaml", Index: 0},
 		Entry: Entry{
-			Component: "storage",
-			Kind:      "DaemonSet",
+			Component: "metalman",
+			Kind:      "Deployment",
 			Patch: map[string]any{
 				"apiVersion": "rbac.authorization.k8s.io/v1",
 				"kind":       "ClusterRoleBinding",
@@ -410,11 +410,11 @@ func TestApplyRestampsIdentity(t *testing.T) {
 
 	got := plan.Operations[0].Object
 
-	if got.GetAPIVersion() != "apps/v1" || got.GetKind() != "DaemonSet" {
-		t.Fatalf("GVK = %s %s, want apps/v1 DaemonSet", got.GetAPIVersion(), got.GetKind())
+	if got.GetAPIVersion() != "apps/v1" || got.GetKind() != "Deployment" {
+		t.Fatalf("GVK = %s %s, want apps/v1 Deployment", got.GetAPIVersion(), got.GetKind())
 	}
 
-	if got.GetName() != "unbounded-storage-supervisor-rack-a" || got.GetNamespace() != "unbounded-system" {
+	if got.GetName() != "metalman-rack-a" || got.GetNamespace() != "unbounded-system" {
 		t.Fatalf("identity = %s/%s, want the operator's", got.GetNamespace(), got.GetName())
 	}
 
@@ -432,10 +432,10 @@ func TestApplyRestampsIdentity(t *testing.T) {
 // workload the API server rejects outright.
 func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -453,7 +453,7 @@ func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 		"spec", "template", "metadata", "labels")
 
 	for key, want := range map[string]string{
-		"app.kubernetes.io/name":  "storage",
+		"app.kubernetes.io/name":  "metalman",
 		"unbounded-cloud.io/site": "rack-a",
 		"team":                    "platform",
 	} {
@@ -465,10 +465,10 @@ func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 
 func TestApplyExtraArgsAppends(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--verbose"]
 `))
@@ -480,7 +480,7 @@ func TestApplyExtraArgsAppends(t *testing.T) {
 
 	spec := podSpec(t, plan.Operations[0].Object)
 
-	want := []string{"--config=/etc/storage/config.yaml", "--verbose"}
+	want := []string{"--config=/etc/metalman/config.yaml", "--verbose"}
 	if len(spec.Containers[0].Args) != len(want) {
 		t.Fatalf("args = %v, want %v", spec.Containers[0].Args, want)
 	}
@@ -496,10 +496,10 @@ func TestApplyExtraArgsAppends(t *testing.T) {
 // that replaces args wins, and extraArgs appends to what it left.
 func TestApplyExtraArgsFollowReplacedArgs(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--appended"]
     patch:
@@ -540,10 +540,10 @@ func TestApplyRejectsMalformedScheduling(t *testing.T) {
 	for name, fragment := range cases {
 		t.Run(name, func(t *testing.T) {
 			workload := testWorkload("rack-a")
-			plan := planWith(workload, "storage", "rack-a")
+			plan := planWith(workload, "metalman", "rack-a")
 
-			entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: storage
-    kind: DaemonSet
+			entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -576,11 +576,11 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 		},
 	}, "spec", "template", "spec", "topologySpreadConstraints")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
 	constraint := func(key string) string {
-		return doc(`  - component: storage
-    kind: DaemonSet
+		return doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:

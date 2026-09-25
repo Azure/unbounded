@@ -374,7 +374,7 @@ before that.
 
 `release.yaml` needs no input. It validates the tag shape, then builds the
 binaries via GoReleaser, the frontend, every container image, the offline agent
-artifacts, the manifests tarball and the storage tarballs. Everything is signed
+artifacts and the manifests tarball. Everything is signed
 with keyless cosign, images carry SPDX SBOM attestations, and a digest-pinned
 release BOM records exactly what shipped.
 
@@ -403,10 +403,6 @@ per-Site component, so those targets are discovered from the cluster rather than
 assumed: on `unbounded-stable` the cluster's own Site is `stable` while metalman
 runs for a remote site. A cluster where **no** Site enables it fails the deploy,
 because this one is expected to run it.
-
-**`unbounded-storage-supervisor` is still not gated**, so a release can publish
-with it failing to start; tracked in
-[#625](https://github.com/Azure/unbounded/issues/625).
 
 A clean deploy, a clean Orca deploy and green smoke are the soak gate.
 **Publishing is not a manual step.** If you find yourself running
@@ -539,8 +535,8 @@ changes; the next `rc` is chosen for you. Promote when it is good.
 
 The operator resolves each component image as
 `<registry>/<repository>:<operator version>`, where the version is the one
-compiled into the operator binary. So `machina`, `gantry`, `metalman`,
-`unbounded-storage-supervisor` and the two `unbounded-net-*` images are all
+compiled into the operator binary. So `machina`, `gantry`, `metalman`
+and the two `unbounded-net-*` images are all
 deployed at the release tag. There is no per-component versioning, and a
 component's image must be built by the release pipeline or its workload will not
 start. `internal/operator/imagecoverage_test.go` enforces that.
@@ -795,8 +791,8 @@ same tree.
 
 Two limits on this:
 
-- **It has a seven-day shelf life.** `finalize` downloads the GoReleaser dist,
-  the manifests tarball and the storage tarballs by name, and those artifacts
+- **It has a seven-day shelf life.** `finalize` downloads the GoReleaser dist
+  and the manifests tarball by name, and those artifacts
   are kept for seven days. Past that, `--failed` will not help: the jobs that
   produced them are still green, so it will not rebuild them, and `finalize`
   fails on the missing artifact. Use a full `gh run rerun <run-id>` instead,

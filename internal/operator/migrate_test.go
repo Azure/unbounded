@@ -94,12 +94,6 @@ func machinaDeployment(namespace string) *appsv1.Deployment {
 	}
 }
 
-func storageDaemonSet(namespace string) *appsv1.DaemonSet {
-	return &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "unbounded-storage-supervisor", Labels: map[string]string{appNameLabel: "unbounded-storage-supervisor"}},
-	}
-}
-
 func metalmanDeploymentForSite(namespace, site string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -136,11 +130,10 @@ func TestDetectComponents(t *testing.T) {
 	r := newReaper(t,
 		ns(legacyKubeNamespace),
 		machinaDeployment(legacyKubeNamespace),
-		storageDaemonSet(legacyKubeNamespace),
 		metalmanDeploymentForSite(legacyKubeNamespace, "edge"),
 	)
 
-	// Cluster site: machina + storage; no metalman (its metalman is for "edge").
+	// Cluster site: machina; no metalman (its metalman is for "edge").
 	cluster, err := r.detectComponents(t.Context(), clusterSiteName)
 	if err != nil {
 		t.Fatalf("detectComponents(cluster): %v", err)
@@ -150,15 +143,11 @@ func TestDetectComponents(t *testing.T) {
 		t.Fatalf("expected machina enabled on cluster site: %#v", cluster)
 	}
 
-	if !componentEnabledInMap(cluster, "storage") {
-		t.Fatalf("expected storage enabled on cluster site: %#v", cluster)
-	}
-
 	if _, ok := cluster["metalman"]; ok {
 		t.Fatalf("did not expect metalman on cluster site: %#v", cluster)
 	}
 
-	// Edge site: storage (every site) + metalman; NOT machina (cluster only).
+	// Edge site: metalman; NOT machina (cluster only).
 	edge, err := r.detectComponents(t.Context(), "edge")
 	if err != nil {
 		t.Fatalf("detectComponents(edge): %v", err)
@@ -166,10 +155,6 @@ func TestDetectComponents(t *testing.T) {
 
 	if _, ok := edge["machina"]; ok {
 		t.Fatalf("did not expect machina on non-cluster site: %#v", edge)
-	}
-
-	if !componentEnabledInMap(edge, "storage") {
-		t.Fatalf("expected storage enabled on edge site: %#v", edge)
 	}
 
 	if !componentEnabledInMap(edge, "metalman") {
@@ -198,7 +183,6 @@ func TestTranslateSitesCreatesMachinaSite(t *testing.T) {
 		ns(legacyKubeNamespace),
 		legacySite(clusterSiteName, spec),
 		machinaDeployment(legacyKubeNamespace),
-		storageDaemonSet(legacyKubeNamespace),
 	)
 
 	if err := r.translateSites(t.Context(), logr.Discard()); err != nil {
@@ -226,10 +210,6 @@ func TestTranslateSitesCreatesMachinaSite(t *testing.T) {
 	// Components detected from running workloads.
 	if enabled, _, _ := unstructured.NestedBool(got.Object, "spec", "components", "machina", "enabled"); !enabled {
 		t.Fatalf("expected machina enabled on cluster site")
-	}
-
-	if enabled, _, _ := unstructured.NestedBool(got.Object, "spec", "components", "storage", "enabled"); !enabled {
-		t.Fatalf("expected storage enabled on cluster site")
 	}
 }
 
@@ -328,7 +308,7 @@ func TestTranslateSiteValidatesExistingNetworkingSpec(t *testing.T) {
 				"nodeCidrs":          []any{tc.targetCIDR},
 				"podCidrAssignments": []any{},
 				"components": map[string]any{
-					"storage": map[string]any{"enabled": true},
+					"metalman": map[string]any{"enabled": true},
 				},
 			})
 			target.SetGroupVersionKind(newSiteGVK())
@@ -834,17 +814,6 @@ func readyDaemonSet(namespace, name string) *appsv1.DaemonSet {
 	}
 }
 
-func storageConfigAndReadyDaemonSet(namespace, site, config string) (*corev1.ConfigMap, *appsv1.DaemonSet) {
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: storageConfigName(site)},
-		Data:       map[string]string{"config.yaml": config},
-	}
-	ds := readyDaemonSet(namespace, storageDaemonSetName(site))
-	ds.Spec.Template.Annotations = map[string]string{storageConfigHashAnnotation: configMapPayloadHash(cm)}
-
-	return cm, ds
-}
-
 func labeledDeployment(namespace, name, appName string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: map[string]string{appNameLabel: appName}},
@@ -1129,143 +1098,6 @@ func TestReapOnceReapsNetWhenNewNetNotReady(t *testing.T) {
 	}
 }
 
-func TestStorageTargetsReadyGatesOnPerSiteDaemonSets(t *testing.T) {
-	r := newReaper(t, ns("unbounded-system"))
-
-	config, readyTarget := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
-	if err := r.Create(t.Context(), config); err != nil {
-		t.Fatalf("create storage config: %v", err)
-	}
-
-	// No per-site storage DaemonSet yet: not ready.
-	ready, err := r.storageTargetsReady(t.Context(), "unbounded-system")
-	if err != nil {
-		t.Fatalf("storageTargetsReady: %v", err)
-	}
-
-	if ready {
-		t.Fatalf("expected not ready with no per-site storage DaemonSet")
-	}
-
-	// A per-site DaemonSet that is not yet Ready keeps the gate closed.
-	notReady := readyTarget.DeepCopy()
-	notReady.Status.NumberReady = 0
-
-	if err := r.Create(t.Context(), notReady); err != nil {
-		t.Fatalf("create not-ready ds: %v", err)
-	}
-
-	ready, err = r.storageTargetsReady(t.Context(), "unbounded-system")
-	if err != nil {
-		t.Fatalf("storageTargetsReady: %v", err)
-	}
-
-	if ready {
-		t.Fatalf("expected not ready while a per-site storage DaemonSet is not Ready")
-	}
-
-	// Once Ready, the gate opens.
-	if err := r.Delete(t.Context(), notReady); err != nil {
-		t.Fatalf("delete not-ready ds: %v", err)
-	}
-
-	if err := r.Create(t.Context(), readyTarget); err != nil {
-		t.Fatalf("create ready ds: %v", err)
-	}
-
-	ready, err = r.storageTargetsReady(t.Context(), "unbounded-system")
-	if err != nil {
-		t.Fatalf("storageTargetsReady: %v", err)
-	}
-
-	if !ready {
-		t.Fatalf("expected ready once the per-site storage DaemonSet is Ready")
-	}
-}
-
-func storageEnabledSite(name string) *unboundedv1alpha3.Site {
-	enabled := true
-
-	return &unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
-			Storage: &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled}},
-		}},
-	}
-}
-
-func TestStorageTargetsReadyRequiresEveryStorageEnabledSite(t *testing.T) {
-	// Two storage-enabled Sites, but only the cluster Site has a Ready
-	// DaemonSet. The gate must stay closed until edge has one too, so a
-	// multi-site cluster never loses the legacy supervisor early.
-	clusterConfig, clusterDS := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
-	edgeConfig, edgeDS := storageConfigAndReadyDaemonSet("unbounded-system", "edge", "version: 7")
-	r := newReaper(t,
-		ns("unbounded-system"),
-		storageEnabledSite("cluster"),
-		storageEnabledSite("edge"),
-		clusterConfig,
-		clusterDS,
-		edgeConfig,
-	)
-
-	ready, err := r.storageTargetsReady(t.Context(), "unbounded-system")
-	if err != nil {
-		t.Fatalf("storageTargetsReady: %v", err)
-	}
-
-	if ready {
-		t.Fatalf("expected not ready while the edge Site has no storage DaemonSet")
-	}
-
-	// Add edge's Ready DaemonSet: every storage-enabled Site now has one.
-	if err := r.Create(t.Context(), edgeDS); err != nil {
-		t.Fatalf("create edge ds: %v", err)
-	}
-
-	ready, err = r.storageTargetsReady(t.Context(), "unbounded-system")
-	if err != nil {
-		t.Fatalf("storageTargetsReady: %v", err)
-	}
-
-	if !ready {
-		t.Fatalf("expected ready once every storage-enabled Site has a Ready DaemonSet")
-	}
-}
-
-func TestMigrateStorageConfigMapsCreatesPerSiteConfigs(t *testing.T) {
-	r := newReaper(t,
-		ns(legacyKubeNamespace),
-		ns("unbounded-system"),
-		storageEnabledSite("cluster"),
-		storageEnabledSite("edge"),
-		storageDaemonSet(legacyKubeNamespace),
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config", Namespace: legacyKubeNamespace},
-			Data:       map[string]string{"config.yaml": "version: 7"},
-		},
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config-edge", Namespace: "unbounded-system"},
-			Data:       map[string]string{"config.yaml": "default: true"},
-		},
-	)
-
-	if err := r.migrateStorageConfigMaps(t.Context(), logr.Discard(), "unbounded-system"); err != nil {
-		t.Fatalf("migrateStorageConfigMaps: %v", err)
-	}
-
-	for _, name := range []string{"unbounded-storage-config-cluster", "unbounded-storage-config-edge"} {
-		var cm corev1.ConfigMap
-		if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: name}, &cm); err != nil {
-			t.Fatalf("expected migrated storage config %s: %v", name, err)
-		}
-
-		if cm.Data["config.yaml"] != "version: 7" {
-			t.Fatalf("%s config.yaml = %q, want version: 7", name, cm.Data["config.yaml"])
-		}
-	}
-}
-
 func TestMigrateConfigMapsUpsertsOverReconcilerDefault(t *testing.T) {
 	// The reconciler already created a default machina-config in the target;
 	// the reaper must overwrite it with the migrated (legacy) config.
@@ -1330,51 +1162,9 @@ func TestMigrateMachineCloudInitConfigMaps(t *testing.T) {
 		"spec", "pxe", "cloudInit", "userDataConfigMapRef", "namespace")
 }
 
-func TestReapOnceStorageGatedOnPerSiteDaemonSet(t *testing.T) {
-	r := newReaper(t,
-		ns(legacyKubeNamespace),
-		ns("unbounded-system"),
-		storageDaemonSet(legacyKubeNamespace),
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config", Namespace: legacyKubeNamespace},
-			Data:       map[string]string{"config.yaml": "version: 7"},
-		},
-	)
-
-	// No per-site storage DaemonSet in the target yet: storage must not reap.
-	done, err := r.reapOnce(t.Context(), logr.Discard())
-	if err != nil {
-		t.Fatalf("reapOnce: %v", err)
-	}
-
-	if done {
-		t.Fatalf("expected not done while the per-site storage DaemonSet is absent")
-	}
-
-	if err := r.Get(t.Context(), client.ObjectKey{Namespace: legacyKubeNamespace, Name: "unbounded-storage-supervisor"}, &appsv1.DaemonSet{}); err != nil {
-		t.Fatalf("legacy storage DaemonSet should remain until target ready: %v", err)
-	}
-
-	// Bring up the per-site storage config and DaemonSet (Ready): storage reaps.
-	config, ds := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
-	for _, obj := range []client.Object{config, ds} {
-		if err := r.Create(t.Context(), obj); err != nil {
-			t.Fatalf("create per-site storage target %T: %v", obj, err)
-		}
-	}
-
-	if _, err := r.reapOnce(t.Context(), logr.Discard()); err != nil {
-		t.Fatalf("reapOnce(2): %v", err)
-	}
-
-	if err := r.Get(t.Context(), client.ObjectKey{Namespace: legacyKubeNamespace, Name: "unbounded-storage-supervisor"}, &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected legacy storage DaemonSet reaped, err=%v", err)
-	}
-}
-
 func TestReapOnceSkipsComponentsWithoutLegacyFootprint(t *testing.T) {
-	// The legacy unbounded-kube namespace contains only machina (no storage).
-	// The reaper must NOT block waiting for a storage target that never exists.
+	// The legacy unbounded-kube namespace contains only machina.
+	// The reaper must NOT block waiting for a metalman target that never exists.
 	config, target := readyMachinaTarget("unbounded-system", "apiServerEndpoint: https://api.example:6443\n")
 	r := newReaper(t,
 		ns(legacyKubeNamespace),

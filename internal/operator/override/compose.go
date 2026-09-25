@@ -14,7 +14,7 @@ import (
 // overwrite, so two contributors touching them can never conflict.
 //
 // Scheduling is additive because the operator's own constraints must survive:
-// metalman and storage place their workloads with a mandatory per-Site node
+// metalman places its workloads with a mandatory per-Site node
 // affinity, and NodeSelectorTerms carries no patchMergeKey, so a raw merge
 // would replace it and let two Sites schedule onto the same nodes.
 var additivePaths = map[string]bool{
