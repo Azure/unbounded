@@ -226,31 +226,14 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 	var total int64
 
 	for {
-		if s.closed {
-			return total, net.ErrClosed, true
-		}
-
-		if s.err != nil {
-			return total, s.err, true
-		}
-
-		if err := s.ctx.Err(); err != nil {
-			return total, s.fail(err), true
-		}
-
-		if s.offset == s.end {
-			err := s.finish()
-			if err == io.EOF {
-				err = nil
-			}
-
-			reusable = err == nil
+		if done, err := s.readState(); done || err != nil {
+			reusable = done
 
 			return total, err, true
 		}
 
-		if err := s.nextPage(); err != nil {
-			return total, s.fail(err), true
+		if err := s.prepareRead(); err != nil {
+			return total, err, true
 		}
 
 		remaining := s.page.pageEnd - s.offset
@@ -265,16 +248,11 @@ func (s *Stream) spliceTo(dst io.Writer) (int64, error, bool) {
 				return total, err, true
 			}
 
-			s.page.operation = "downstream_write"
-			written, writeErr := conn.Write((*buf)[:n])
+			written, writeErr := s.writeBuffered(conn, (*buf)[:n])
 
 			total += int64(written)
-			if writeErr == nil && written != n {
-				writeErr = io.ErrShortWrite
-			}
-
 			if writeErr != nil {
-				return total, s.fail(writeErr), true
+				return total, writeErr, true
 			}
 
 			continue

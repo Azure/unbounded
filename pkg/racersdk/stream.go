@@ -195,31 +195,11 @@ func (s *Stream) Prepare() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
-		return net.ErrClosed
+	if done, err := s.readState(); done || err != nil {
+		return err
 	}
 
-	if s.err != nil {
-		return s.err
-	}
-
-	if err := s.ctx.Err(); err != nil {
-		return s.fail(err)
-	}
-
-	if s.offset == s.end {
-		if err := s.finish(); err != io.EOF {
-			return err
-		}
-
-		return nil
-	}
-
-	if err := s.nextPage(); err != nil {
-		return s.fail(err)
-	}
-
-	return nil
+	return s.prepareRead()
 }
 
 // Stream opens the entire snapshot without verifying a content digest.
@@ -307,29 +287,55 @@ func (s *Stream) fail(err error) error {
 	return err
 }
 
-func (s *Stream) read(p []byte) (int, error) {
+// readState checks terminal conditions before either preparing or consuming a
+// page. In particular, EOF and failures take precedence over a zero-length read.
+func (s *Stream) readState() (done bool, err error) {
 	if s.closed {
-		return 0, net.ErrClosed
+		return false, net.ErrClosed
 	}
 
 	if s.err != nil {
-		return 0, s.err
+		return false, s.err
 	}
 
 	if err := s.ctx.Err(); err != nil {
-		return 0, s.fail(err)
+		return false, s.fail(err)
 	}
 
 	if s.offset == s.end {
-		return 0, s.finish()
+		if err := s.finish(); err != io.EOF {
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// prepareRead advances only when needed and records failures at the page
+// operation and offset that produced them. Call after checking readState.
+func (s *Stream) prepareRead() error {
+	if err := s.nextPage(); err != nil {
+		return s.fail(err)
+	}
+
+	return nil
+}
+
+func (s *Stream) read(p []byte) (int, error) {
+	if done, err := s.readState(); err != nil {
+		return 0, err
+	} else if done {
+		return 0, io.EOF
 	}
 
 	if len(p) == 0 {
 		return 0, nil
 	}
 
-	if err := s.nextPage(); err != nil {
-		return 0, s.fail(err)
+	if err := s.prepareRead(); err != nil {
+		return 0, err
 	}
 
 	s.page.operation = "page_body"
@@ -353,6 +359,23 @@ func (s *Stream) read(p []byte) (int, error) {
 		}
 
 		return n, err
+	}
+
+	return n, nil
+}
+
+// writeBuffered counts downstream progress separately from the bytes already
+// consumed by read. A partial write without an error is still a stream failure.
+func (s *Stream) writeBuffered(dst io.Writer, p []byte) (int, error) {
+	s.page.operation = "downstream_write"
+
+	n, err := dst.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+
+	if err != nil {
+		return n, s.fail(err)
 	}
 
 	return n, nil
@@ -408,16 +431,11 @@ func (s *Stream) WriteTo(dst io.Writer) (int64, error) {
 		}
 
 		if n > 0 {
-			s.page.operation = "downstream_write"
-			written, writeErr := dst.Write((*buf)[:n])
+			written, writeErr := s.writeBuffered(dst, (*buf)[:n])
 
 			total += int64(written)
-			if writeErr == nil && written != n {
-				writeErr = io.ErrShortWrite
-			}
-
 			if writeErr != nil {
-				return total, s.fail(writeErr)
+				return total, writeErr
 			}
 		}
 
