@@ -9,11 +9,21 @@ Membership wire versions are snapshot counters, not algorithm versions.
 
 The controller publishes membership; readiness and local link health never
 change it. Validate a nonzero version, at most 100,000 members, positive u32
-shares, nonempty ASCII graphic node IDs/fabric names of at most 256 bytes,
-IP socket endpoints with nonzero port (neither unspecified nor multicast),
-unique node IDs, and unique u16 rail IDs within each member. Sort members by
+shares, nonempty ASCII graphic node IDs of at most 256 bytes, nonempty UTF-8
+fabric names without NUL/CR/LF, IP socket endpoints with nonzero port and no
+zone identifier, unique node IDs, and unique u16 rail IDs within each member.
+Optional NUMA IDs must fit unsigned u32. Sort members by
 node ID bytes and rails by unsigned rail ID. No normalization changes identity.
 Empty memberships are valid, with zero candidates and no routes.
+
+The control codec validates canonical UUID node identities and the aggregate
+64 MiB publication bound before topology admission. The internal topology API
+also supports short opaque node IDs for algorithm fixtures. Fabric names have
+no additional local length cap, ASCII restriction, trimming, or Unicode
+normalization. Unspecified/multicast endpoint addresses are wire-valid;
+connectivity failures belong to transport health rather than membership
+validation. These rules match `internal/racer/wire/validate.go` (`validRail`
+and `validatePublication`) and `CONTROL_API.md`'s codec contract.
 
 Members are immutable through their `Arc<Membership>` lease. Existing leases
 keep old snapshots usable; retention/admission of those leases is the control
