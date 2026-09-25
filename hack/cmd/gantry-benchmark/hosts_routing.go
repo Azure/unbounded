@@ -564,10 +564,14 @@ func nodeDaemonSet(
 }
 
 func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string) error {
+	return b.validateDaemonSet(ctx, b.config.Namespace, name)
+}
+
+func (b *benchmark) validateDaemonSet(ctx context.Context, namespace, name string) error {
 	output, err := b.commands.Run(
 		ctx,
 		nil,
-		"kubectl", "-n", b.config.Namespace,
+		"kubectl", "-n", namespace,
 		"get", "daemonset", name, "-o", "json",
 	)
 	if err != nil {

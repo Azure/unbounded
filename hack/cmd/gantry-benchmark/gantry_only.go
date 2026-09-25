@@ -270,6 +270,86 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 	return nil
 }
 
+func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, payloadSHA string) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare-gantry-standalone-adopt", state.Status)
+	}
+	if state.usesProxy() {
+		return fmt.Errorf("prepare-gantry-standalone-adopt requires direct dual-ACR mode")
+	}
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	repository, digestValue, err := splitImageReference(image, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("adopt standalone image: %w", err)
+	}
+	if repository != state.WorkloadRepository || !strings.HasPrefix(digestValue, "sha256:") {
+		return fmt.Errorf("adopted image must be a digest-pinned %s image", state.WorkloadRepository)
+	}
+	if parsed, err := digest.Parse(payloadSHA); err != nil || parsed.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("payload fingerprint %q must be a sha256 digest", payloadSHA)
+	}
+
+	if state.ArtifactStreaming {
+		if err := b.verifyArtifactStreamingImage(ctx, state, image); err != nil {
+			return err
+		}
+		state.ArtifactStreamingPrepared = true
+	}
+
+	state.StandaloneGantry = true
+	state.BaselineImage = ""
+	state.GantryColdImage = image
+	state.WorkloadPayloadSHA256 = payloadSHA
+	state.WorkloadComparisonMode = workloadComparisonRandomShape
+	state.Status = "images-prepared"
+
+	if _, _, err := state.preparedImages(); err != nil {
+		return err
+	}
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("adopted standalone Gantry image %s for %s\n", image, state.RunID))
+
+	return nil
+}
+
+func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benchmarkState, imageReference string) error {
+	repository, digestValue, err := splitImageReference(imageReference, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("verify Artifact Streaming image: %w", err)
+	}
+	image := repository + "@" + digestValue
+
+	output, err := b.runArtifactStreamingCommand(ctx,
+		"operation", "show",
+		"--name", b.config.GantryACRName,
+		"--image", image,
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
+	}
+	if err := requireArtifactStreamingSucceeded(output); err != nil {
+		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
+	}
+
+	return nil
+}
+
 func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmarkState, imageReference string) error {
 	if b.config.GantryACRName == "" {
 		return fmt.Errorf("BENCHMARK_ARTIFACT_STREAMING requires GANTRY_ACR_NAME")

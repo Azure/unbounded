@@ -36,6 +36,16 @@ func (r *artifactStreamingPollingRunner) Run(ctx context.Context, stdin []byte, 
 	return output, nil
 }
 
+type readyDaemonSetRunner struct {
+	recordingRunner
+}
+
+func (r *readyDaemonSetRunner) Run(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
+	_, _ = r.recordingRunner.Run(ctx, stdin, name, args...)
+
+	return []byte(`{"status":{"desiredNumberScheduled":1000,"numberReady":1000}}`), nil
+}
+
 func TestPrepareArtifactStreaming(t *testing.T) {
 	runner := &artifactStreamingRunner{}
 	benchmark := &benchmark{
@@ -219,5 +229,30 @@ upstream_registries:
 				t.Fatal("validation unexpectedly passed")
 			}
 		})
+	}
+}
+
+func TestValidateStreamingDaemonSetUsesGantryNamespace(t *testing.T) {
+	runner := &readyDaemonSetRunner{}
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			Namespace:       "gantry-benchmark",
+			GantryNamespace: "gantry-system",
+			NodeCount:       1000,
+		},
+		commands: runner,
+	}
+
+	if err := benchmark.validateDaemonSet(context.Background(), benchmark.config.GantryNamespace, "gantry-overlaybd-config"); err != nil {
+		t.Fatalf("validateDaemonSet: %v", err)
+	}
+
+	if len(runner.commands) != 1 {
+		t.Fatalf("commands = %d, want 1", len(runner.commands))
+	}
+	command := runner.commands[0]
+	want := []string{"-n", "gantry-system", "get", "daemonset", "gantry-overlaybd-config", "-o", "json"}
+	if command.name != "kubectl" || !reflect.DeepEqual(command.args, want) {
+		t.Fatalf("command = %s %v, want kubectl %v", command.name, command.args, want)
 	}
 }
