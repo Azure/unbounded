@@ -4,6 +4,9 @@ One Rust package containing the node dataplane. `app.rs` composes worker-local
 services; the binary enters through configuration and the application lifecycle.
 The Go control plane is outside this package.
 
+[Control API](CONTROL_API.md) defines the controller/dataplane contract, Kubernetes
+membership inputs, enrollment, and projected credential rotation.
+
 ```sh
 cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
 cargo check --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features

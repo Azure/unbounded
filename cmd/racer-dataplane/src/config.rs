@@ -1,19 +1,21 @@
 //! Environment and deployment configuration, validated before startup.
 //!
-//! Default to four positive placement shares, at most eight allowed CPU threads,
-//! and aligned rails. Do not advertise a local weight outside accepted membership.
+//! Default to at most eight allowed CPU threads. Shares and rail alignment come
+//! exclusively from accepted controller membership, derived from Node annotations.
 
 use crate::{
     error::{Result, pending},
-    model::{identity::NodeId, limits::Limits},
+    model::{
+        identity::{ClusterId, NodeId},
+        limits::Limits,
+    },
 };
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 pub struct Config {
+    pub cluster: ClusterId,
     pub node: NodeId,
-    pub shares: NonZeroU32,
     pub max_threads: usize,
-    pub aligned_rails: bool,
     pub enable_rdma: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
@@ -21,6 +23,8 @@ pub struct Config {
     pub trust_bundle: PathBuf,
     pub service_account_token: PathBuf,
     pub secret_directory: PathBuf,
+    /// Node-private persistent keys, separate from projected Secrets and slabs.
+    pub identity_directory: PathBuf,
     pub slab_directory: PathBuf,
     pub slab_bytes: u64,
     pub segment_bytes: u64,
@@ -45,5 +49,5 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    // Cover invalid budgets, positive shares, cpusets, and overflowing geometry.
+    // Cover invalid budgets, cluster/node identities, cpusets, and overflowing geometry.
 }

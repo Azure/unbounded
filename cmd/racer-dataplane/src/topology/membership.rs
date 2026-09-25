@@ -2,6 +2,8 @@
 //!
 //! Readiness never changes ownership. Exclusions, weights, additions, and deletions
 //! do. Retain bounded old snapshots until their in-flight leases are released.
+//! Endpoint/rail/alignment changes also advance membership version, but placement
+//! depends only on node IDs and shares. All inputs are controller-accepted values.
 use super::rails::RailMapping;
 use crate::{
     error::{Result, pending},

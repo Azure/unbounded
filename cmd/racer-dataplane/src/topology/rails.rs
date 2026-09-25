@@ -1,4 +1,6 @@
 //! Select RDMA only with compatible authenticated mappings over the entire path.
+//! Published Node-annotation mappings must match local hardware; discovery never
+//! reports or overrides membership. Missing/incompatible mappings fall back to HTTP.
 use super::paths::Route;
 use crate::{
     error::{Result, pending},

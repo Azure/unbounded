@@ -16,7 +16,7 @@ use crate::{
     config::Config,
     control::{
         caches::CacheRegistry,
-        client::ControlClient,
+        client::{ControlClient, ControlEndpoint},
         enrollment::Enrollment,
         secrets::SecretWatcher,
         snapshot::{PublishedState, SnapshotStore},
@@ -142,12 +142,17 @@ impl WorkerApplication {
         let admission = runtime.admission.clone();
         let reactor = runtime.reactor.clone();
         let snapshots = Rc::new(SnapshotStore::new(
+            config.cluster.clone(),
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         ));
         let caches = Rc::new(CacheRegistry);
-        let keys = Rc::new(Keyring::new(node.keys.clone()));
-        let certificates = Rc::new(Certificates::new(config.trust_bundle.clone()));
+        let keys = Rc::new(Keyring::new(
+            config.cluster.clone(),
+            config.node.clone(),
+            node.keys.clone(),
+        ));
+        let certificates = Rc::new(Certificates::new(config.cluster.clone(), keys.clone()));
         let replay = Rc::new(ReplayWindow::new(
             node.replay.clone(),
             config.limits.replay_entries.get(),
@@ -156,12 +161,24 @@ impl WorkerApplication {
         let credentials = Rc::new(CredentialCrypto::new(keys.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone()));
         let control = if worker == node.control_worker {
-            let enrollment =
-                Enrollment::new(config.node.clone(), config.service_account_token.clone());
-            let secrets = SecretWatcher::new(config.secret_directory.clone(), keys.clone());
+            let enrollment = Rc::new(Enrollment::new(
+                config.cluster.clone(),
+                config.node.clone(),
+                config.service_account_token.clone(),
+                config.identity_directory.clone(),
+            ));
+            let secrets = SecretWatcher::new(
+                config.secret_directory.clone(),
+                keys.clone(),
+                enrollment.clone(),
+            );
             Some(ControlClient::new(
-                config.control_endpoint.clone(),
+                ControlEndpoint {
+                    url: config.control_endpoint.clone(),
+                    trust_bundle: config.trust_bundle.clone(),
+                },
                 enrollment,
+                keys.clone(),
                 secrets,
                 snapshots.clone(),
                 caches,

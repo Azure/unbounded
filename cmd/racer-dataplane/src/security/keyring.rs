@@ -1,12 +1,22 @@
 //! Active/retiring key epochs and lifetime barriers across memory, disk, and I/O.
 use crate::{
-    error::{Result, pending},
-    model::{envelope::KeyId, identity::CacheId},
+    control::{
+        enrollment::LocalSigningIdentity,
+        wire::{BundleGeneration, CacheKeyRef, CredentialBundle},
+    },
+    error::{Operation, Result, deferred, pending},
+    model::{
+        envelope::KeyId,
+        identity::{CacheId, ClusterId, NodeId},
+    },
+    runtime::deadline::RequestScope,
 };
 /// Node-wide epoch state, published by the sole control owner. Secret material
 /// implementation must support immutable leased epochs and coordinated retirement.
 pub struct KeyEpochs;
 pub struct Keyring {
+    cluster: ClusterId,
+    node: NodeId,
     epochs: std::sync::Arc<KeyEpochs>,
 }
 /// Secret material is private, non-Debug, and only accessed through crypto adapters.
@@ -21,8 +31,22 @@ pub enum KeyPurpose {
     PeerVerification,
 }
 impl Keyring {
-    pub fn new(epochs: std::sync::Arc<KeyEpochs>) -> Self {
-        Self { epochs }
+    pub fn new(cluster: ClusterId, node: NodeId, epochs: std::sync::Arc<KeyEpochs>) -> Self {
+        Self {
+            cluster,
+            node,
+            epochs,
+        }
+    }
+    /// Validate bundle identity/generation and key pairing before atomic activation.
+    /// Missing prior keys request retirement, never immediate deletion. Prepared
+    /// keys may decrypt received ciphertext but must not encrypt new fills.
+    pub fn install(
+        &self,
+        _bundle: CredentialBundle,
+        _identities: Vec<LocalSigningIdentity>,
+    ) -> Result<BundleGeneration> {
+        pending("keyring.install")
     }
     pub fn lease(
         &self,
@@ -37,8 +61,14 @@ impl Keyring {
     }
     /// Coordinate eviction of every dependent record/buffer/checkpoint and fence
     /// late writes before removing an epoch. Request credential leases also drain.
-    pub fn retire(&self, _id: KeyId) -> Result<()> {
-        pending("keyring.retire")
+    /// Local completion only. Cancellation retains material until barriers finish;
+    /// no control-plane acknowledgment or cluster-wide barrier is involved.
+    pub fn retire<'a>(
+        &'a self,
+        _key: &'a CacheKeyRef,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        deferred("keyring.retire")
     }
 }
 #[cfg(test)]

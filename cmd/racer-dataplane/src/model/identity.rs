@@ -6,10 +6,14 @@
 use crate::error::{Result, pending};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClusterId(pub String);
+/// Kubernetes ClusterCache UID, not its reusable resource name.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheId(pub String);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CacheKey(pub [u8; 32]);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Kubernetes Node UID, not its reusable resource name.
 pub struct NodeId(pub String);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StrongEtag(String);

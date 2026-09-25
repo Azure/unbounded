@@ -2,12 +2,12 @@
 use crate::{
     config::Config,
     error::{Result, pending},
-    model::{identity::NodeId, limits::Limits},
+    model::{
+        identity::{ClusterId, NodeId},
+        limits::Limits,
+    },
 };
-use std::{
-    num::{NonZeroU32, NonZeroUsize},
-    time::Duration,
-};
+use std::{num::NonZeroUsize, time::Duration};
 pub struct Cluster;
 impl Cluster {
     pub fn partition(&self, _left: &NodeId, _right: &NodeId) -> Result<()> {
@@ -18,10 +18,9 @@ pub fn config(enable_rdma: bool) -> Config {
     let count = NonZeroUsize::new(16).unwrap();
     let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
     Config {
-        node: NodeId("test-node".into()),
-        shares: NonZeroU32::new(4).unwrap(),
+        cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
+        node: NodeId("00000000-0000-4000-8000-000000000002".into()),
         max_threads: 1,
-        aligned_rails: true,
         enable_rdma,
         control_endpoint: "https://control.invalid".into(),
         peer_listen: "127.0.0.1:0".parse().unwrap(),
@@ -29,6 +28,7 @@ pub fn config(enable_rdma: bool) -> Config {
         trust_bundle: "unused/ca".into(),
         service_account_token: "unused/token".into(),
         secret_directory: "unused/secrets".into(),
+        identity_directory: "unused/identity".into(),
         slab_directory: "unused/slabs".into(),
         slab_bytes: 1024 * 1024 * 1024,
         segment_bytes: 64 * 1024 * 1024,
