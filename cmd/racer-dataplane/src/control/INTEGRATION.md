@@ -124,10 +124,10 @@ against the real production library. That additional harness requires the siblin
 `racer-control-plane-implementation` worktree for the authoritative Go rejection
 vectors. It does not replace the module's full unit tests.
 
-All 20 control tests passed against the pinned production graph, including real
-kernel io_uring filesystem/TLS tests. The full Cargo filter passed all 16 tests
-before the additional persistence-boundary tests were added; its latest rerun was
-blocked by concurrent read/peer interface changes. Rerun Cargo after integration.
+All 20 control tests passed both in the full Cargo control filter and against the
+pinned production graph, including actual kernel io_uring filesystem/TLS tests.
+The three reactor filesystem ownership/partial-I/O tests also passed. Earlier
+concurrent interface compilation failures were resolved before the final run.
 
 Public Go fixtures are copied under `testdata/` with canonical content and membership
 SHA-256 assertions in `codec.rs`. Certificate private keys used by TLS/enrollment
