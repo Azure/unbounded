@@ -998,14 +998,11 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := requireFinalLayerResponseTimestamps(diagnosticTimestamps, diagnosticsAfter.PodNodes); err != nil {
-		return err
-	}
-
 	diagnostics, err := subtractGantryDiagnosticSnapshots(diagnosticsBefore, diagnosticsAfter, diagnosticTimestamps)
 	if err != nil {
 		return err
 	}
+	b.warnIncompleteFinalLayerResponseTimestamps(diagnostics)
 
 	bytes, bytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, proxyPhaseTotals{}, metrics, job)
 

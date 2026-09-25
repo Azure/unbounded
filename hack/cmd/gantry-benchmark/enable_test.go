@@ -141,6 +141,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	}
 
 	for _, metric := range []string{
+		"gantry_streaming_(requests|bytes|rejected)_total",
+		"gantry_streaming_(request_duration|time_to_first_byte)_seconds_(bucket|sum|count)",
+		"gantry_streaming_inflight",
 		"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",
 		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",
 		"gantry_peer_fetch_last_timestamp_seconds",
