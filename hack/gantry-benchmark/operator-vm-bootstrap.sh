@@ -163,6 +163,10 @@ if ! grep -Fq "UUID=$build_uuid " /etc/fstab; then
 fi
 mount "$build_mount" 2>/dev/null || mount -a
 findmnt --mountpoint "$build_mount" >/dev/null
+build_block_device=$(basename "$(readlink -f "$build_device")")
+if [[ -w "/sys/class/block/$build_block_device/device/rescan" ]]; then
+  echo 1 >"/sys/class/block/$build_block_device/device/rescan"
+fi
 resize2fs "$build_device"
 
 install -d -m 0711 "$build_mount/containers"
