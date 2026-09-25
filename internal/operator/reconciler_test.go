@@ -781,8 +781,8 @@ func TestReconcileReplansWhenAnObjectAppearsMidPass(t *testing.T) {
 // placed in the cluster, standing in for losing the create race.
 type creatingCluster struct{}
 
-func (creatingCluster) Name() string          { return "racer" }
-func (creatingCluster) ConditionType() string { return "RacerReady" }
+func (creatingCluster) Name() string          { return "creator" }
+func (creatingCluster) ConditionType() string { return "CreatorReady" }
 
 func (creatingCluster) Plan(
 	context.Context, *component.Env, []unboundedv1alpha3.Site,
@@ -793,7 +793,7 @@ func (creatingCluster) Plan(
 	obj.SetName("raced-config")
 
 	plan := component.NewPlan()
-	plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: obj, Component: "racer"})
+	plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: obj, Component: "creator"})
 
 	return plan, component.Reconciled(), nil
 }
