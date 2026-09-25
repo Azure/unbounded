@@ -4,6 +4,10 @@ This is the contract for the Go controller and Rust dataplane. Types and service
 interfaces are scaffolded; network, filesystem, and cryptographic operations still
 return `Unimplemented`.
 
+The [client and origin API](CLIENT_ORIGIN_API.md) defines the separate HTTP/1.1
+Unix-socket read contract. The [Go SDK design](../../designs/racer-sdk.md) specifies
+its streaming client, origin callback, resource defaults, and implementation plan.
+
 ## Authority and membership
 
 The controller watches Kubernetes and publishes identical topology inputs to every
