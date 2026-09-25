@@ -6,6 +6,11 @@
 //! requests do not release them: original and cancellation completion accounting
 //! must both finish. Shutdown must fence kernel access before dropping the table.
 //! The worker drives CQEs explicitly. Operation futures never run an executor.
+//!
+//! Degraded shutdown: a fatal driver error during Drop cannot establish a kernel
+//! fence. In that case the bounded ring and its resource owners are deliberately
+//! leaked for memory safety; shutdown is not successfully fenced. Explicit worker
+//! shutdown must keep driving its fence and report failures rather than rely on Drop.
 
 use super::{
     admission::{Admission, Reservation},
@@ -58,6 +63,92 @@ struct State {
     next: u64,
     scan_after: IoId,
     stopped: bool,
+    fence_waiters: BTreeMap<(Option<IoId>, u64), FenceWaiter>,
+    next_waiter: u64,
+}
+
+struct FenceWaiter {
+    waker: Waker,
+    _reservation: Reservation,
+}
+
+struct Fence<'a> {
+    reactor: &'a Reactor,
+    target: Option<IoId>,
+    registration: Option<u64>,
+}
+
+impl Future for Fence<'_> {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut state = this.reactor.state.borrow_mut();
+        let pending = match this.target {
+            Some(id) => match state.entries.get_mut(&id) {
+                Some(entry) => {
+                    entry.cancel_reason.get_or_insert(Error::Cancelled);
+                    true
+                }
+                None => false,
+            },
+            None => {
+                state.stopped = true;
+                !state.entries.is_empty()
+            }
+        };
+        if !pending {
+            if let Some(id) = this.registration.take() {
+                state.fence_waiters.remove(&(this.target, id));
+            }
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(id) = this.registration {
+            let waiter = state
+                .fence_waiters
+                .get_mut(&(this.target, id))
+                .expect("pending fence registration");
+            waiter.waker.clone_from(cx.waker());
+        } else {
+            // Separate bounded control registrations support independent callers,
+            // including callers using the same executor waker. Drop removes only
+            // its own registration. No quota is needed to submit cancellation.
+            if state.fence_waiters.len() >= this.reactor.admission.limits().queue_entries.get() {
+                return Poll::Ready(Err(Error::Overloaded));
+            }
+            let Some(next) = state.next_waiter.checked_add(1) else {
+                return Poll::Ready(Err(Error::Overloaded));
+            };
+            let reservation = this.reactor.admission.reserve_completion(
+                None,
+                ResourceClass::RequestContext,
+                std::mem::size_of::<FenceWaiter>(),
+            )?;
+            let id = state.next_waiter;
+            state.next_waiter = next;
+            state.fence_waiters.insert(
+                (this.target, id),
+                FenceWaiter {
+                    waker: cx.waker().clone(),
+                    _reservation: reservation,
+                },
+            );
+            this.registration = Some(id);
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for Fence<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration {
+            self.reactor
+                .state
+                .borrow_mut()
+                .fence_waiters
+                .remove(&(self.target, id));
+        }
+    }
 }
 
 /// Cloneable cross-thread wake endpoint for worker command/crypto producers.
@@ -237,6 +328,8 @@ impl Reactor {
                 next: 1,
                 scan_after: IoId(0),
                 stopped: false,
+                fence_waiters: BTreeMap::new(),
+                next_waiter: 0,
             }),
         }
     }
@@ -583,6 +676,7 @@ impl Reactor {
             return Ok(0);
         }
         let mut finished = Vec::new();
+        let mut fence_wakes = Vec::new();
         let mut completed = 0;
         while completed < budget {
             let cqe = state.ring.as_mut().unwrap().completion().next();
@@ -592,7 +686,12 @@ impl Reactor {
             completed += 1;
             if let Some(entry) = state.complete(cqe.user_data(), cqe.result())? {
                 finished.push(entry);
+                fence_wakes
+                    .extend(state.take_fence_wakers(Some(IoId(cqe.user_data() & !CANCEL_BIT))));
             }
+        }
+        if state.entries.is_empty() {
+            fence_wakes.extend(state.take_fence_wakers(None));
         }
         let count = budget.min(state.entries.len());
         for _ in 0..count {
@@ -635,6 +734,9 @@ impl Reactor {
             if let Some(waker) = entry.finish() {
                 waker.wake();
             }
+        }
+        for waker in fence_wakes {
+            waker.wake();
         }
         match submitted {
             Ok(_) => Ok(completed),
@@ -699,34 +801,28 @@ impl Reactor {
         Ok(())
     }
 
+    /// Request cancellation and sleep until the original and any cancel CQEs arrive.
+    /// The worker must drive poll_budgeted. Notification registrations share a
+    /// queue_entries bound with drain waiters and charge completion metadata;
+    /// admission failure still leaves cancellation requested, but is not a fence.
     pub fn cancel_and_fence(&self, id: IoId) -> Operation<'_, ()> {
-        Box::pin(std::future::poll_fn(move |cx| {
-            let mut state = self.state.borrow_mut();
-            match state.entries.get_mut(&id) {
-                None => Poll::Ready(Ok(())),
-                Some(entry) => {
-                    entry.cancel_reason.get_or_insert(Error::Cancelled);
-                    // Self-wake avoids storing unbounded additional fence waiters.
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-        }))
+        Box::pin(Fence {
+            reactor: self,
+            target: Some(id),
+            registration: None,
+        })
     }
 
     /// Close admission and cancel outstanding work. The worker must keep driving
     /// poll_budgeted while awaiting this fence, including after request deadlines.
+    /// Notification admission can fail as for cancel_and_fence; only Ok confirms
+    /// the fence. Failure leaves admission closed and cancellation requested.
     pub fn drain(&self) -> Operation<'_, ()> {
-        Box::pin(std::future::poll_fn(move |cx| {
-            let mut state = self.state.borrow_mut();
-            state.stopped = true;
-            if state.entries.is_empty() {
-                Poll::Ready(Ok(()))
-            } else {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }))
+        Box::pin(Fence {
+            reactor: self,
+            target: None,
+            registration: None,
+        })
     }
 }
 
@@ -746,6 +842,17 @@ fn offset_or_zero(operation: BufferOperation) -> u64 {
 }
 
 impl State {
+    fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<Waker> {
+        let keys: Vec<_> = self
+            .fence_waiters
+            .range((target, 0)..=(target, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .map(|key| self.fence_waiters.remove(&key).unwrap().waker)
+            .collect()
+    }
+
     fn complete(&mut self, tag: u64, result: i32) -> Result<Option<Entry>> {
         let id = IoId(tag & !CANCEL_BIT);
         let entry = self.entries.get_mut(&id).ok_or(Error::Io)?;
@@ -880,7 +987,16 @@ mod tests {
         model::{identity::RequestId, limits::Limits},
         runtime::deadline::{Cancellation, Deadline},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{num::NonZeroUsize, os::unix::net::UnixStream, time::Instant};
+
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     struct Buffer(Box<[u8]>, Rc<Cell<usize>>);
     impl sealed::Sealed for Buffer {}
@@ -982,6 +1098,169 @@ mod tests {
         assert!(reactor.state.borrow().wake.is_none());
         assert_eq!(reactor.in_flight(), 0);
         assert_eq!(reactor.poll_budgeted(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn fence_waiters_sleep_until_both_cqes_and_unregister_on_drop() {
+        for cancel_first in [false, true] {
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
+            reactor.state.borrow_mut().entries.insert(
+                IoId(1),
+                Entry {
+                    finish: Box::new(|_| None),
+                    signal: Rc::new(Signal {
+                        abandoned: Cell::new(false),
+                        waker: RefCell::new(None),
+                    }),
+                    scope: scope(),
+                    original: None,
+                    accept: false,
+                    cancel_reason: None,
+                    cancel_sent: true,
+                    cancel_done: false,
+                },
+            );
+            let counter = Arc::new(Count(AtomicUsize::new(0)));
+            let waker = Waker::from(counter.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut cancel = reactor.cancel_and_fence(IoId(1));
+            let mut drain = reactor.drain();
+            let mut abandoned = reactor.cancel_and_fence(IoId(1));
+            for future in [&mut cancel, &mut drain, &mut abandoned] {
+                for _ in 0..3 {
+                    assert!(future.as_mut().poll(&mut cx).is_pending());
+                }
+            }
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+            assert_eq!(reactor.state.borrow().fence_waiters.len(), 3);
+            drop(abandoned);
+            assert_eq!(reactor.state.borrow().fence_waiters.len(), 2);
+            let first = if cancel_first { 1 | CANCEL_BIT } else { 1 };
+            let second = if cancel_first { 1 } else { 1 | CANCEL_BIT };
+            assert!(
+                reactor
+                    .state
+                    .borrow_mut()
+                    .complete(first, -libc::ECANCELED)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(cancel.as_mut().poll(&mut cx).is_pending());
+            assert!(drain.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+            let (entry, wakes) = {
+                let mut state = reactor.state.borrow_mut();
+                let entry = state.complete(second, -libc::ENOENT).unwrap().unwrap();
+                let mut wakes = state.take_fence_wakers(Some(IoId(1)));
+                wakes.extend(state.take_fence_wakers(None));
+                (entry, wakes)
+            };
+            entry.finish();
+            for waker in wakes {
+                waker.wake();
+            }
+            assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+            assert!(matches!(cancel.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            assert!(reactor.state.borrow().fence_waiters.is_empty());
+            assert_eq!(reactor.admission.used(ResourceClass::RequestContext), 0);
+        }
+    }
+
+    #[test]
+    fn fence_waiters_are_bounded_and_refresh_executor_wakers() {
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+        reactor.state.borrow_mut().entries.insert(
+            IoId(1),
+            Entry {
+                finish: Box::new(|_| None),
+                signal: Rc::new(Signal {
+                    abandoned: Cell::new(false),
+                    waker: RefCell::new(None),
+                }),
+                scope: scope(),
+                original: None,
+                accept: false,
+                cancel_reason: None,
+                cancel_sent: false,
+                cancel_done: false,
+            },
+        );
+        let mut first = reactor.cancel_and_fence(IoId(1));
+        assert!(poll(&mut first).is_pending());
+        let refreshed = Waker::from(Arc::new(Count::default()));
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&refreshed))
+                .is_pending()
+        );
+        assert!(
+            reactor
+                .state
+                .borrow()
+                .fence_waiters
+                .first_key_value()
+                .unwrap()
+                .1
+                .waker
+                .will_wake(&refreshed)
+        );
+        let mut overflow = reactor.drain();
+        assert!(matches!(
+            poll(&mut overflow),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        drop(first);
+        let mut replacement = reactor.drain();
+        assert!(poll(&mut replacement).is_pending());
+        drop(replacement);
+        assert!(reactor.state.borrow().fence_waiters.is_empty());
+        reactor
+            .state
+            .borrow_mut()
+            .complete(1, -libc::ECANCELED)
+            .unwrap()
+            .unwrap()
+            .finish();
+    }
+
+    #[test]
+    fn kernel_cancellation_wakes_registered_fences_without_self_waking() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let request = scope();
+        let mut recv = reactor.recv(
+            Rc::new(OwnedFd::from(socket)),
+            buffer(&[0; 8]),
+            (),
+            &request,
+        );
+        assert!(poll(&mut recv).is_pending());
+        let id = *reactor.state.borrow().entries.first_key_value().unwrap().0;
+        let counter = Arc::new(Count::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut cancel = reactor.cancel_and_fence(id);
+        let mut drain = reactor.drain();
+        assert!(cancel.as_mut().poll(&mut cx).is_pending());
+        assert!(drain.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reactor.in_flight() != 0 {
+            assert!(Instant::now() < deadline);
+            reactor.poll_budgeted(1).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+        assert!(matches!(cancel.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            poll(&mut recv),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
     }
 
     #[test]
