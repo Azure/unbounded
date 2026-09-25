@@ -183,6 +183,7 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan error, 1)
+
 	go func() { done <- reader.Start(ctx) }()
 
 	t.Cleanup(func() {

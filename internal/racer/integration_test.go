@@ -142,6 +142,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 			return c.Update(ctx, obj, opts...)
 		}}, c).Topology
+
 		go func() { results <- r.InitializeVersion(ctx) }()
 	}
 
@@ -476,6 +477,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		ctx, cancels[i] = context.WithCancel(t.Context())
 
 		done[i] = make(chan error, 1)
+
 		go func() { done[i] <- mgr.Start(ctx) }()
 
 		t.Cleanup(func() {
@@ -715,6 +717,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	}
 
 	server := &http.Server{Handler: measured.Handler(), TLSConfig: config}
+
 	go func() { server.Serve(tls.NewListener(listener, config)) }()
 
 	t.Cleanup(func() { server.Close() })

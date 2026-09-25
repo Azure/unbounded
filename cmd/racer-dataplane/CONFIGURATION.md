@@ -204,6 +204,6 @@ recheck them after partitioning and reduce the pair count if needed):
    readiness. Apply per-cache UDS paths from accepted publications; there is no
    configurable client/origin socket override.
 
-The package README's scaffold status predates this focused implementation. This
+The server and client were implemented independently. This
 document describes configuration only; it does not claim the application lifecycle
 or every consumer is fully integrated.

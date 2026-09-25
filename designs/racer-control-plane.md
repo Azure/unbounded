@@ -14,9 +14,10 @@ and Phase 6 server-side managed workload reconciliation are implemented. Phase 7
 server integration and bounded publication/reconciliation measurements are complete.
 The initialize-only command and leader-scoped HTTPS service are operational;
 deployment must provide serving TLS files, bootstrap server trust, and a compatible
-dataplane image. The repository's Rust dataplane remains a runtime scaffold;
-only its committed wire codecs and contract vectors are implemented. Phase 6
-does not implement a Rust control client, local identity logic, or transport.
+dataplane image. The Rust control client, local identity logic, and transport
+were implemented independently and are outside the scope of this server work.
+Shared contract tests retain a test-only reference codec and also exercise the
+existing Rust runtime codec against the server fixtures.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -403,11 +404,14 @@ Projection requires a kubelet and remains deployment verification.
   `/var/lib/racer/slabs` (disposable slabs), and `/run/racer` (both socket endpoint
   trees). They use `DirectoryOrCreate`; the pod runs as root with all capabilities
   dropped, privilege escalation disabled, and a read-only root filesystem.
-  Private-key creation, file permissions, reload, and retirement remain client work.
+  Private-key creation, file permissions, reload, and retirement are client responsibilities.
   Linux affinity excludes every Node carrying the exclusion label, regardless of
   its value. The pod uses the supplied image's default entrypoint; no unsupported
-  `control` subcommand is injected. Environment paths are the deployment contract,
-  not evidence that the scaffold consumes them.
+  `control` subcommand is injected. The generated environment uses the existing
+  client's `RACER_CONTROL_ENDPOINT`, `RACER_PEER_LISTEN`, `RACER_TRUST_BUNDLE`,
+  `RACER_SERVICE_ACCOUNT_TOKEN`, and `RACER_SECRET_DIRECTORY` settings, with
+  explicit identity/slab directories. The server's own `RACER_CONTROL_URL` and
+  `RACER_PEER_PORT` settings are translated when building the DaemonSet.
 - Existing manifests provide three controller replicas, leader-readiness Service
   routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Templates
   accept `ServingTLSSecret`, `BootstrapTrustConfigMap`, and `ControlURL` overrides.
@@ -572,3 +576,37 @@ Secret projection/reload, host filesystem permissions, and end-to-end dataplane
 operation remain unverified. Rust control-client runtime, local identity management,
 and transport are explicitly out of scope. This server-only Phase 7 does not claim
 those components work or that one leader sustains 100,000 authenticated HTTPS polls.
+
+## Integration onto racer-v2
+
+The seven server phases were cherry-picked onto the independently completed client
+branch at `093c6f63`. The resulting commits are `7dab33a4`, `15328a54`, `91ca1f85`,
+`e4b5c0eb`, `c7f3c2c0`, `b6e5b84c`, and `12f6d76a`. Integration preserved the
+production Rust codec and exports, Cargo dependency versions (including
+`x509-parser` 0.16 with verification), and native/release/image Makefile targets.
+The server reference codec is namespaced under `cfg(test)`; its original tests
+remain present. An additional test checks the production codec against the shared
+server fixtures and canonical bytes. The DaemonSet now emits the existing client's
+accepted configuration names and matching projection/storage paths.
+
+Combined-branch verification on September 25, 2026:
+
+- `GOTOOLCHAIN=go1.26.6 make fmt`: passed, including repository-wide auto-fix lint.
+  The host default Go 1.27.1 caused the installed Go 1.26-built linter to panic;
+  selecting the repository's declared Go toolchain resolved this.
+- `make racer-test` with Go 1.26.6: server/deployment lint and race tests,
+  Rust formatting, and locked all-target/all-feature checks passed. Rust library,
+  executable, and enabled conformance tests passed. The shell timeout interrupted
+  the final production suite; rerunning that suite with a larger timeout passed
+  all six tests. All 31 doctests also passed. In total, 557 Rust tests passed and
+  seven existing opt-in tests were ignored (six native RDMA and one SDK bridge).
+- `make racer-envtest` with repository-local Kubernetes 1.37.0 assets: all three
+  subtests passed under the race detector, including real manager election,
+  authenticated HTTPS recovery, initialization/CAS, and rotation crash recovery.
+- `make racer-scale`: passed through 100,000 members and 100,000 waiters. This
+  remains a reconciliation/publication test, not an HTTPS capacity result.
+- `make racer-controller-build`: passed.
+
+This integration does not establish kubelet projection, scheduling, or a full
+deployed Go-controller/Rust-dataplane end-to-end result. Those deployment checks
+remain as described above.

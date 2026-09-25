@@ -2,11 +2,11 @@
 
 Run build commands from the repository root. This packages the Rust dataplane;
 the existing `racer-controller-build`, `racer-test`, `racer-generate`, and
-`racer-manifests` targets remain available. The Go controller in this tree is a
-scaffold: its bootstrap authentication/enrollment methods return `pending`
-(`internal/racer/bootstrap.go:25-33`). Rendering those manifests alone does not
-provide an operational enrollment/control service. Supply a compatible service
-implementing [CONTROL_API.md](CONTROL_API.md) before starting the dataplane.
+`racer-manifests` targets remain available. The Go controller implements bootstrap
+authentication, enrollment, and publication serving. Follow the
+[controller installation procedure](../racer-controller/README.md#first-installation)
+to initialize durable state and provision serving TLS and bootstrap trust before
+starting the dataplane. The shared protocol is [CONTROL_API.md](CONTROL_API.md).
 
 ## Release artifacts
 

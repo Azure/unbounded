@@ -18,8 +18,9 @@ spawning threads. Activation is explicit through the application lifecycle. See
 [configuration](CONFIGURATION.md) for environment variables, resource limits, and
 startup requirements. Linux io_uring and direct-I/O-capable storage are required.
 See [deployment](DEPLOYMENT.md) for release artifacts, mounts, permissions, and
-trusted local native-port configuration. The Go controller is still a scaffold;
-the dataplane requires a compatible enrollment/publication service.
+trusted local native-port configuration. The [Go controller](../racer-controller/README.md)
+implements enrollment and publication serving; follow its installation procedure
+to initialize durable state and provision serving TLS and bootstrap trust.
 
 The optional `rdma` feature loads the separately built native libibverbs adapter.
 See [native adapter](native/README.md) for installation and provider tests. Missing

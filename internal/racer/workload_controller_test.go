@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path"
+	"strconv"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -98,6 +100,72 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 
 	if len(pod.Containers[0].Args) != 0 || len(pod.Containers[0].Command) != 0 {
 		t.Fatal("workload must use the image entrypoint")
+	}
+}
+
+func TestWorkloadDataplaneEnvironment(t *testing.T) {
+	for _, port := range []uint16{8082, 7443, 65535} {
+		t.Run(strconv.Itoa(int(port)), func(t *testing.T) {
+			r := workloadFixture(t)
+			r.Config.PeerPort = port
+
+			ds, err := r.DesiredDaemonSet()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			container := ds.Spec.Template.Spec.Containers[0]
+
+			env := map[string]string{}
+			for _, value := range container.Env {
+				if _, exists := env[value.Name]; exists || value.ValueFrom != nil {
+					t.Fatalf("duplicate or indirect configuration: %s", value.Name)
+				}
+
+				env[value.Name] = value.Value
+			}
+			// These names are consumed by the existing Rust Config::from_lookup.
+			expected := map[string]string{
+				"RACER_CLUSTER_ID":            string(r.Config.Cluster),
+				"RACER_CONTROL_ENDPOINT":      r.Config.ControlURL,
+				"RACER_PEER_LISTEN":           "0.0.0.0:" + strconv.Itoa(int(port)),
+				"RACER_TRUST_BUNDLE":          "/etc/racer/bootstrap/ca.crt",
+				"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
+				"RACER_SECRET_DIRECTORY":      "/etc/racer/keyring",
+				"RACER_IDENTITY_DIRECTORY":    "/var/lib/racer/identity",
+				"RACER_SLAB_DIRECTORY":        "/var/lib/racer/slabs",
+			}
+			if len(env) != len(expected) {
+				t.Fatalf("unexpected configuration: %v", env)
+			}
+
+			for name, value := range expected {
+				if env[name] != value {
+					t.Errorf("%s = %q, want %q", name, env[name], value)
+				}
+			}
+
+			if container.Ports[0].ContainerPort != int32(port) {
+				t.Fatal("listener disagrees with advertised peer port")
+			}
+
+			mounts := map[string]string{}
+			for _, mount := range container.VolumeMounts {
+				mounts[mount.Name] = mount.MountPath
+			}
+
+			for name, location := range map[string]string{
+				"RACER_TRUST_BUNDLE":          path.Join(mounts["bootstrap"], "ca.crt"),
+				"RACER_SERVICE_ACCOUNT_TOKEN": path.Join(mounts["token"], "token"),
+				"RACER_SECRET_DIRECTORY":      mounts["keyring"],
+				"RACER_IDENTITY_DIRECTORY":    mounts["identity"],
+				"RACER_SLAB_DIRECTORY":        mounts["slabs"],
+			} {
+				if env[name] != location {
+					t.Errorf("%s does not match its mounted projection or storage", name)
+				}
+			}
+		})
 	}
 }
 

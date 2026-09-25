@@ -13,8 +13,9 @@ usable credentials, a committed publication, and an accepting TLS listener.
 The [control API](../racer-dataplane/CONTROL_API.md) is shared with the Rust
 dataplane. The [design](../../designs/racer-control-plane.md) describes intended
 behavior, recovery protocols, and measured constraints. Rust client runtime,
-identity-file handling, and dataplane transport are out of scope; only the
-previously committed Rust wire codecs/vectors are implemented.
+identity-file handling, and dataplane transport were implemented independently
+and are outside the scope of this server work. Shared contract tests exercise
+both the test-only reference codec and the existing Rust runtime codec.
 
 ## Structure
 

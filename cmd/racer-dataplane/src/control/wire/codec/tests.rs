@@ -48,6 +48,27 @@ fn shared_bootstrap_and_bundle_vectors() {
 }
 
 #[test]
+fn runtime_codec_accepts_server_vectors() {
+    use crate::control::wire as runtime;
+
+    let p = runtime::decode_publication(&fixture("publication.json")).unwrap();
+    let (content, membership) = runtime::canonical_content(&p).unwrap();
+    assert_eq!(content, fixture("content.json"));
+    assert_eq!(membership, fixture("membership.json"));
+    decode_publication(runtime::encode_publication(&p).unwrap().as_slice()).unwrap();
+
+    let request = runtime::decode_enrollment_request(&fixture("bootstrap-request.json")).unwrap();
+    let encoded = runtime::encode_enrollment_request(&request).unwrap();
+    decode_enrollment_request(encoded.as_slice()).unwrap();
+    let response =
+        runtime::decode_enrollment_response(&fixture("bootstrap-response.json")).unwrap();
+    let encoded = runtime::encode_enrollment_response(&response).unwrap();
+    decode_enrollment_response(encoded.as_slice()).unwrap();
+    let bundle = runtime::decode_bundle(&fixture("bundle.json")).unwrap();
+    decode_bundle(runtime::encode_bundle(&bundle).unwrap().as_slice()).unwrap();
+}
+
+#[test]
 fn shared_rejection_vectors() {
     let cases: Value = serde_json::from_slice(&fixture("rejections.json")).unwrap();
     for case in cases.as_array().unwrap() {
