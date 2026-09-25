@@ -44,8 +44,15 @@ func newConfiguratorFixture(t *testing.T) configuratorFixture {
 	}
 
 	nsenter := writeExecutable(t, binDir, "nsenter", `#!/bin/sh
-while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+wd=/
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  case "$1" in
+  --wd=*) wd="${1#--wd=}" ;;
+  esac
+  shift
+done
 shift
+cd "$wd" || exit 1
 exec "$@"
 `)
 	curl := writeExecutable(t, binDir, "curl", "#!/bin/sh\nexit 0\n")
@@ -53,20 +60,12 @@ exec "$@"
 printf '%s\n' "$*" >> "$TEST_SYSTEMCTL_LOG"
 exit 0
 `)
+	// Match the AKS tool's jq interpolation and relative temporary file.
 	configTool := writeExecutable(t, binDir, "config.sh", `#!/bin/sh
 key=$1
 value=$2
-tmp="$TEST_HOST_CONFIG.tmp"
-case "$key" in
-p2pConfig.enable)
-  jq --argjson value "$value" '.p2pConfig.enable=$value' "$TEST_HOST_CONFIG" > "$tmp"
-  ;;
-p2pConfig.address)
-  jq --arg value "$value" '.p2pConfig.address=$value' "$TEST_HOST_CONFIG" > "$tmp"
-  ;;
-*) exit 2 ;;
-esac
-mv "$tmp" "$TEST_HOST_CONFIG"
+jq ".$key = $value" "$TEST_HOST_CONFIG" > tmp.json
+mv tmp.json "$TEST_HOST_CONFIG"
 `)
 
 	return configuratorFixture{
@@ -79,6 +78,7 @@ mv "$tmp" "$TEST_HOST_CONFIG"
 			"OVERLAYBD_P2P_ADDRESS=http://localhost:5000/blobs",
 			"OVERLAYBD_CONFIG_TOOL="+configTool,
 			"GANTRY_OVERLAYBD_ONESHOT=true",
+			"HOST_STATE_DIR="+stateDir,
 			"NSENTER_BIN="+nsenter,
 			"CURL_BIN="+curl,
 			"TEST_HOST_CONFIG="+config,

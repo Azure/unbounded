@@ -13,6 +13,7 @@ set -eu
 : "${CURL_BIN:=curl}"
 : "${JQ_BIN:=jq}"
 : "${READY_MARKER:=/run/gantry-overlaybd/configured}"
+: "${HOST_STATE_DIR:=/var/lib/gantry/overlaybd-config}"
 
 HOST_CONFIG="$HOST_ROOT/etc/overlaybd/overlaybd.json"
 STATE_DIR="$HOST_ROOT/var/lib/gantry/overlaybd-config"
@@ -34,6 +35,11 @@ release_lock() {
 
 host_exec() {
 	"$NSENTER_BIN" -t 1 -m -u -i -n -p --root=/proc/1/root --wd=/ -- "$@"
+}
+
+# Change directory after nsenter because its --wd resolves inside this container.
+host_exec_writable() {
+	host_exec sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$HOST_STATE_DIR" "$@"
 }
 
 restart_services() {
@@ -81,8 +87,8 @@ apply_config() {
 	if verify_desired; then
 		cp "$HOST_CONFIG" "$MANAGED_CONFIG"
 	else
-		host_exec "$OVERLAYBD_CONFIG_TOOL" p2pConfig.enable true
-		host_exec "$OVERLAYBD_CONFIG_TOOL" p2pConfig.address "$OVERLAYBD_P2P_ADDRESS"
+		host_exec_writable "$OVERLAYBD_CONFIG_TOOL" p2pConfig.enable true
+		host_exec_writable "$OVERLAYBD_CONFIG_TOOL" p2pConfig.address "\"$OVERLAYBD_P2P_ADDRESS\""
 		verify_desired || { echo "OverlayBD config did not converge" >&2; return 1; }
 		cp "$HOST_CONFIG" "$MANAGED_CONFIG"
 		restart_services
