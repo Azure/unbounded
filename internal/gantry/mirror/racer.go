@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
@@ -242,52 +241,7 @@ func writeRacerError(w http.ResponseWriter, err error) {
 }
 
 func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64, partial, invalid bool) {
-	value := r.Header.Get("Range")
-	if r.Header.Get("If-Range") != "" && r.Header.Get("If-Range") != etag {
-		return 0, size, false, false
-	}
+	decision := sdk.DecideRange(r.Header, sdk.Metadata{Size: size, ETag: etag})
 
-	if !strings.HasPrefix(value, "bytes=") || strings.Contains(value, ",") {
-		return 0, size, false, false
-	}
-
-	left, right, ok := strings.Cut(strings.TrimPrefix(value, "bytes="), "-")
-	if !ok || size == 0 {
-		return 0, 0, false, true
-	}
-
-	decimal := func(value string) (int64, error) {
-		if value == "" || strings.IndexFunc(value, func(c rune) bool { return c < '0' || c > '9' }) >= 0 {
-			return 0, errors.New("invalid range")
-		}
-
-		return strconv.ParseInt(value, 10, 64)
-	}
-	if left == "" {
-		n, err := decimal(right)
-		if err != nil || n == 0 {
-			return 0, 0, false, true
-		}
-
-		n = min(n, size)
-
-		return size - n, n, true, false
-	}
-
-	start, err := decimal(left)
-	if err != nil || start >= size {
-		return 0, 0, false, true
-	}
-
-	end := size - 1
-	if right != "" {
-		end, err = decimal(right)
-		if err != nil || end < start {
-			return 0, 0, false, true
-		}
-
-		end = min(end, size-1)
-	}
-
-	return start, end - start + 1, true, false
+	return decision.Offset, decision.Length, decision.StatusCode == http.StatusPartialContent, decision.StatusCode == http.StatusRequestedRangeNotSatisfiable
 }

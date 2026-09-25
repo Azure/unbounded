@@ -358,9 +358,17 @@ Racer mode has no ordinary registry or direct local-content bypass. Unavailable
 sockets, timeouts, invalid metadata, unsupported origin ranges, and stream
 preparation failures return a retryable `503` before headers. Registry `401`/`403`
 responses preserve authentication challenges; `404` and `429` retain their status,
-and SDK-provided retry hints are preserved. Invalid client byte ranges return
-`416` with the object size. An interrupted or invalid stream after headers is
-aborted rather than spliced together with a second source. Racer's origin adapter
+and SDK-provided retry hints are preserved. Client ranges use the SDK/Racer
+single-range semantics: `bytes` is case-insensitive, unsigned 64-bit endpoints
+are clipped to the object size, and satisfiable ranges return `206`. Malformed
+or reversed ranges, values exceeding unsigned 64-bit limits, multipart ranges,
+and repeated `Range` fields are ignored, returning the full object with `200`.
+A present `If-Range` permits a range only when it is a single matching strong
+ETag; weak tags, dates, empty values, and repeated fields select the full object.
+Valid but unsatisfiable ranges, including zero-length suffixes and valid ranges
+on empty objects, return `416` with `Content-Range: bytes */<size>`. HEAD ignores
+Range and If-Range and remains metadata-only. An interrupted or invalid stream
+after headers is aborted rather than spliced together with a second source. Racer's origin adapter
 still reads registry/containerd content to fill Racer. There is no bypass flag.
 Tag resolution and containerd's own configured host retry chain are separate
 from Gantry's digest-serving path. Readiness requires working containerd, origin

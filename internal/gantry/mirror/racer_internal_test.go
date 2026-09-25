@@ -24,16 +24,27 @@ func TestRacerRangeSemantics(t *testing.T) {
 		{"bytes=10-", "", 10, 0, 0, false, true},
 		{"bytes=0-", "", 0, 0, 0, false, true},
 		{"bytes=-0", "", 10, 0, 0, false, true},
-		{"bytes=5-2", "", 10, 0, 0, false, true},
-		{"bytes=+2-5", "", 10, 0, 0, false, true},
+		{"bytes=5-2", "", 10, 0, 10, false, false},
+		{"bytes=+2-5", "", 10, 0, 10, false, false},
 		{"bytes=2-5", `"other"`, 10, 0, 10, false, false},
 		{"bytes=2-5", `"tag"`, 10, 2, 4, true, false},
 		{"bytes=0-1,4-5", "", 10, 0, 10, false, false},
+		{"ByTeS=2-5", "", 10, 2, 4, true, false},
+		{"bytes=2-18446744073709551615", "", 10, 2, 8, true, false},
+		{"bytes=-18446744073709551615", "", 10, 0, 10, true, false},
+		{"bytes=18446744073709551615-", "", 10, 0, 0, false, true},
+		{"bytes=18446744073709551616-", "", 10, 0, 10, false, false},
+		{"bytes=broken", "", 0, 0, 0, false, false},
+		{"bytes=2-5", ` W/"tag" `, 10, 0, 10, false, false},
+		{"bytes=2-5", ` "tag" `, 10, 2, 4, true, false},
 	} {
 		t.Run(tc.rangeValue+tc.ifRange, func(t *testing.T) {
 			r := httptest.NewRequest("GET", "/", nil)
 			r.Header.Set("Range", tc.rangeValue)
-			r.Header.Set("If-Range", tc.ifRange)
+
+			if tc.ifRange != "" {
+				r.Header.Set("If-Range", tc.ifRange)
+			}
 
 			offset, length, partial, invalid := mirrorRange(r, tc.size, `"tag"`)
 			if offset != tc.offset || length != tc.length || partial != tc.partial || invalid != tc.invalid {
