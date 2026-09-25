@@ -715,6 +715,7 @@ impl WorkerApplication {
                 dispatcher.clone(),
                 relay,
             )
+            .with_request_timeout(config.request_timeout)
             .with_network(network.clone())
             .with_wire(wire)
             .with_handshake(handshake)

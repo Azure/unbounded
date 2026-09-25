@@ -9,7 +9,10 @@ use crate::{
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
 };
-use std::rc::Rc;
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 /// Implemented by the existing read coordinator, never a second acquisition graph.
 /// Ingress must be verified; the local result is unsigned until the server signs
 /// it with a retained clone of the request binding.
@@ -39,6 +42,7 @@ pub struct PeerServer {
     handshake: Option<Rc<super::handshake::Handshake>>,
     reactor: Option<Rc<crate::runtime::reactor::Reactor>>,
     transfers: Option<Rc<super::transfer::Transfers>>,
+    request_timeout: Duration,
 }
 impl PeerServer {
     /// Accept bounded neighbor HTTP connections on the owning reactor. The shared
@@ -111,7 +115,13 @@ impl PeerServer {
             handshake: None,
             reactor: None,
             transfers: None,
+            request_timeout: Duration::from_secs(30),
         }
+    }
+    /// Bound the entire incoming head, including idle time between exchanges.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
     pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
         self.transfers = Some(transfers);
@@ -146,7 +156,11 @@ impl PeerServer {
             use crate::runtime::reactor::IoBuffer;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
-            let mut received = self.io.receive_head(connection, scope).await?;
+            // One fixed budget per exchange, never renewed by partial headers.
+            // Clone the listener cancellation, but keep this cap out of dispatch
+            // and response I/O, which use the signed request deadline below.
+            let header_scope = header_scope(scope, self.request_timeout, Instant::now())?;
+            let mut received = self.io.receive_head(connection, &header_scope).await?;
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())
                     .and_then(|n| n.checked_add(h.value.len()))
@@ -352,6 +366,61 @@ impl PeerServer {
         })
     }
 }
+fn header_scope(
+    scope: &RequestScope,
+    timeout: Duration,
+    now: Instant,
+) -> crate::error::Result<RequestScope> {
+    let mut header = scope.clone();
+    header.deadline.0 = scope.deadline.0.min(
+        now.checked_add(timeout)
+            .ok_or(Error::InvalidConfiguration)?,
+    );
+    Ok(header)
+}
 #[cfg(test)]
-mod tests { /* Authentication before work, copy-only isolation, signed error replies. */
+mod tests {
+    use super::*;
+    use crate::{model::identity::RequestId, test_support::clock::Clock};
+
+    #[test]
+    fn header_budget_is_fixed_per_exchange_and_preserves_listener_cancellation() {
+        let clock = Clock::default();
+        let timeout = Duration::from_secs(10);
+        let listener =
+            RequestScope::new(RequestId([9; 16]), clock.now() + Duration::from_secs(60)).unwrap();
+        let first = header_scope(&listener, timeout, clock.now()).unwrap();
+        assert_eq!(first.request, listener.request);
+        assert_eq!(first.deadline.0, clock.now() + timeout);
+        clock.advance(timeout).unwrap();
+        assert_eq!(
+            clock.check_deadline(first.deadline),
+            Err(Error::DeadlineExceeded)
+        );
+        let next = header_scope(&listener, timeout, clock.now()).unwrap();
+        assert_eq!(next.deadline.0, clock.now() + timeout);
+        assert_eq!(clock.check_deadline(next.deadline), Ok(()));
+        assert_eq!(clock.check_deadline(listener.deadline), Ok(()));
+        listener.cancel().unwrap();
+        assert_eq!(first.check(), Err(Error::Cancelled));
+        assert_eq!(next.check(), Err(Error::Cancelled));
+    }
+
+    #[test]
+    fn header_budget_never_extends_listener_deadline_and_rejects_overflow() {
+        let clock = Clock::default();
+        let listener =
+            RequestScope::new(RequestId([8; 16]), clock.now() + Duration::from_secs(1)).unwrap();
+        let header = header_scope(&listener, Duration::from_secs(30), clock.now()).unwrap();
+        assert_eq!(header.deadline.0, listener.deadline.0);
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            clock.check_deadline(header.deadline),
+            Err(Error::DeadlineExceeded)
+        );
+        assert!(matches!(
+            header_scope(&listener, Duration::MAX, clock.now()),
+            Err(Error::InvalidConfiguration)
+        ));
+    }
 }

@@ -26,15 +26,27 @@ let requester = Rc::new(Requester::new(paths.clone(), rails, forwarding.clone(),
 let relay = Rc::new(Relay::new(paths, forwarding.clone(), requester.clone(), admission.clone())
     .with_network(network.clone()).with_handshake(handshake.clone()));
 let server = PeerServer::new(peer_io, forwarding, admission, local_service, relay)
+    .with_request_timeout(config.request_timeout)
     .with_network(network).with_wire(codec).with_handshake(handshake).with_reactor(reactor)
     .with_transfers(transfers);
 ```
 
 The worker must poll `server.listen(address, scope)` and drive its reactor. HTTP
 connections and ciphertext retain quota through I/O completion. The listener scope
-bounds connection lifetime; decoded request deadlines can only shorten it. The
-listener uses bounded concurrent connection tasks. Each task serves sequential
-pooled exchanges. Errors close that connection and do not stop other connections.
+bounds connection lifetime. At the start of every exchange, including the first
+and each reused keepalive exchange, header reception gets a fixed deadline of
+`min(listener deadline, now + request_timeout)` with the listener's cancellation.
+This covers idle waiting and the entire head; partial/trickled bytes never renew
+the budget. Application assembly supplies `Config.request_timeout`; the constructor
+default is 30 seconds. Expiry closes the connection, retaining I/O resources and
+admission charges until completion is fenced.
+
+After the head, authenticated requests retain the existing signed request deadline
+policy, bounded by the listener deadline, for dispatch and response transfer. The
+header cap does not bound the whole response or reset the signed request budget.
+Challenge and handshake responses retain the listener scope. The listener uses
+bounded concurrent connection tasks. Each task serves sequential pooled exchanges.
+Errors close that connection and do not stop other connections.
 
 Install exact immutable membership snapshots on every worker and retire old entries
 only after acquisition policy stops issuing requests for those versions. Replacing
@@ -79,5 +91,8 @@ Peer tests cover bounded/versioned envelope framing, original signature and opaq
 credential preservation across a relay, replay and attempt substitution rejection,
 deadline/cancellation preservation, authenticated copy-only dispatch and signed
 failure replies, capability tampering, and real TCP partial ciphertext bodies with
-pool reuse and truncated-body rejection. They are under `peer::tests` and
+pool reuse and truncated-body rejection. Header timeout tests cover silent/partial
+peers, idle keepalive, healthy reuse, response deadline isolation, shorter listener
+deadlines, cancellation, and admission retention through completion fences.
+They are under `peer::tests`, `peer::server::tests`, and
 `peer::wire::tests`; run `cargo test --lib peer::` and the all-feature variant.

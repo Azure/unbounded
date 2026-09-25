@@ -124,6 +124,17 @@ embedders must explicitly supply them to the builder.
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | 1 through request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1 through 3600000 |
 
+`RACER_REQUEST_TIMEOUT_MS` also bounds incoming peer HTTP headers. Each exchange
+starts one fixed header budget, capped by the listener deadline and sharing its
+cancellation, including idle time on accepted and reused keepalive connections.
+Partial header bytes do not extend it. Expiry closes the connection; admission
+charges remain held until outstanding I/O is fenced. Once the head is received,
+authenticated peer dispatch and response transfer use the existing signed request
+deadline capped by the listener deadline, not the header cap. Challenge and
+handshake responses continue under the listener scope. This is a header-only
+ingress limit; it does not renew or otherwise change the fixed read/range request
+budget.
+
 A slab has at most 1048576 segments. Geometry arithmetic and conversions are
 checked before resource creation. The envelope bound is currently 16384 bytes,
 so the minimum unpadded segment size is 16793616 bytes. Filesystem-specific direct

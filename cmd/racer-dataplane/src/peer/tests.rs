@@ -639,6 +639,9 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
                 scope.check()?;
+                // The authenticated request has its own budget, independent of
+                // the server's five-second header cap.
+                assert_eq!(scope.deadline.0, request.request().route.deadline.0);
                 assert_eq!(
                     request
                         .request()
@@ -736,6 +739,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         Rc::new(Local),
         relay,
     )
+    .with_request_timeout(Duration::from_secs(5))
     .with_network(destination_network)
     .with_wire(codec)
     .with_handshake(destination_handshake);
@@ -749,14 +753,19 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     .with_network(source_network);
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
+    let listener_scope = RequestScope::new(
+        RequestId([0; 16]),
+        scope.deadline.0 + Duration::from_secs(60),
+    )
+    .unwrap();
     let server_work = async {
         let fd = reactor
             .accept(Rc::new(OwnedFd::from(listener)), &scope)
             .await?;
         let connection = ConnectionLease::from_accepted(fd, &admission)?;
-        let connection = server.serve_connection(connection, &scope).await?;
-        let connection = server.serve_connection(connection, &scope).await?;
-        server.serve_connection(connection, &scope).await?;
+        let connection = server.serve_connection(connection, &listener_scope).await?;
+        let connection = server.serve_connection(connection, &listener_scope).await?;
+        server.serve_connection(connection, &listener_scope).await?;
         Ok::<(), Error>(())
     };
     let exchange = async { futures::try_join!(requester.request(local, &scope), server_work) };
@@ -770,6 +779,224 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
     assert!(matches!(response.response(), PeerResponse::Miss));
+}
+
+#[test]
+fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
+    use crate::{
+        http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+        runtime::reactor::Reactor,
+        topology::{health::LinkHealth, paths::Paths},
+    };
+    use std::{
+        future::Future,
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        task::{Context, Poll},
+    };
+
+    struct Never;
+    impl requester::PeerTransport for Never {
+        fn exchange<'a>(
+            &'a self,
+            _: wire::SignedRequest,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+            Box::pin(async { panic!("incomplete headers must not relay") })
+        }
+    }
+    impl server::LocalPageService for Never {
+        fn serve_peer<'a>(
+            &'a self,
+            _: wire::VerifiedRequest,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, PeerResponse> {
+            Box::pin(async { panic!("incomplete headers must not dispatch") })
+        }
+    }
+    fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // Harness watchdog only, not an assertion about timeout latency.
+        let watchdog = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                return result;
+            }
+            assert!(Instant::now() < watchdog, "peer exchange did not finish");
+            reactor.poll_budgeted(128).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+
+    // The long listener would trip the watchdog if header timeout wiring were
+    // absent. The short listener case verifies the opposite deadline ordering.
+    for case in [
+        "silent", "partial", "trickle", "idle", "listener", "cancel", "drop",
+    ] {
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let io = Rc::new(HttpIo::with_admission(
+            reactor.clone(),
+            Codec::new(
+                wire::MAX_ENVELOPE_HEAD,
+                crate::model::range::PAGE_BYTES + 16,
+            ),
+            admission.clone(),
+        ));
+        let (signers, discovery) = identities();
+        let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
+        let relay = Rc::new(relay::Relay::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000)),
+            forwarding.clone(),
+            Rc::new(Never),
+            admission.clone(),
+        ));
+        let mut server =
+            server::PeerServer::new(io, forwarding, admission.clone(), Rc::new(Never), relay)
+                .with_wire(Rc::new(codec(&admission)))
+                .with_request_timeout(if matches!(case, "listener" | "cancel" | "drop") {
+                    Duration::from_secs(60)
+                } else if case == "idle" {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(30)
+                })
+                .with_handshake(Rc::new(
+                    handshake::Handshake::new(signers[2].clone(), None).with_discovery(
+                        discovery[2].0.clone(),
+                        discovery[2].1.clone(),
+                        discovery[2].2.clone(),
+                    ),
+                ));
+        let scope = RequestScope::new(
+            RequestId([7; 16]),
+            Instant::now()
+                + if case == "listener" {
+                    Duration::from_millis(30)
+                } else {
+                    Duration::from_secs(60)
+                },
+        )
+        .unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        if case == "idle" {
+            // Real successful challenge exchanges leave the same connection
+            // reusable, then an idle next exchange must time out too.
+            for _ in 0..2 {
+                use crate::{
+                    http::codec::{MessageHead, StartLine},
+                    security::protocol as p,
+                };
+                let probe = crate::security::session::ChallengeProbe::new(
+                    NodeId(A.into()),
+                    NodeId(C.into()),
+                )
+                .unwrap();
+                let mut head = MessageHead {
+                    start: StartLine::Request {
+                        method: "POST".into(),
+                        target: "/racer/peer/v1/challenge".into(),
+                    },
+                    headers: vec![],
+                };
+                p::push(&mut head, "content-length", 0);
+                p::push_binary(&mut head, "racer-probe", &probe.request_bytes());
+                let http = Codec::new(
+                    wire::MAX_ENVELOPE_HEAD,
+                    crate::model::range::PAGE_BYTES + 16,
+                );
+                peer.write_all(&http.encode_head(&head).unwrap()).unwrap();
+                connection = drive(&reactor, server.serve_connection(connection, &scope)).unwrap();
+                assert!(connection.is_reusable());
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    peer.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                }
+                let (head, _) = http.decode_head(&bytes).unwrap().unwrap();
+                assert!(matches!(head.start, StartLine::Response { status: 200 }));
+                let mut body = vec![0; head.content_length().unwrap().unwrap() as usize];
+                peer.read_exact(&mut body).unwrap();
+                probe
+                    .verify(
+                        &discovery[0].1,
+                        crate::security::session::ChallengeReply::decode(&body).unwrap(),
+                    )
+                    .unwrap();
+            }
+            server = server.with_request_timeout(Duration::from_millis(30));
+        }
+        if matches!(case, "partial" | "trickle") {
+            peer.write_all(b"POST /racer/peer/v1/request HTTP/1.1\r\nRacer-")
+                .unwrap();
+        }
+        let mut work = server.serve_connection(connection, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        assert!(admission.used(ResourceClass::RequestContext) > baseline);
+        assert_eq!(reactor.in_flight(), 1);
+        if case == "silent" {
+            reactor.poll_budgeted(128).unwrap();
+            // Let the header deadline pass without driving completion. Expiry
+            // alone must not release resources still owned by the reactor.
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert!(admission.used(ResourceClass::RequestContext) > baseline);
+            assert_eq!(reactor.in_flight(), 1);
+        }
+        if matches!(case, "cancel" | "drop") {
+            reactor.poll_budgeted(128).unwrap();
+            scope.cancel().unwrap();
+            // Cancellation cannot release the socket or staging before its CQE
+            // fence, even when the whole peer exchange future is abandoned.
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert!(admission.used(ResourceClass::RequestContext) > baseline);
+        }
+        if case == "drop" {
+            drop(work);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert!(admission.used(ResourceClass::RequestContext) > baseline);
+        } else {
+            let expected = if case == "cancel" {
+                Error::Cancelled
+            } else {
+                Error::DeadlineExceeded
+            };
+            let result = drive(
+                &reactor,
+                futures::future::poll_fn(|cx| {
+                    let result = work.as_mut().poll(cx);
+                    if result.is_pending() && case == "trickle" {
+                        // Continued progress must not renew receive_head's budget.
+                        peer.write_all(b"x").unwrap();
+                    }
+                    result
+                }),
+            );
+            assert!(matches!(result, Err(error) if error == expected), "{case}");
+            drop(work);
+        }
+        drive(&reactor, reactor.drain()).unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        let closed = peer.read(&mut [0; 1]);
+        assert!(
+            matches!(closed, Ok(0))
+                || closed.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+            "{case}"
+        );
+    }
 }
 
 #[test]
