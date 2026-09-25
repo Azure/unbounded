@@ -614,7 +614,14 @@ impl WorkerApplication {
         let placement = Rc::new(Placement::new(limits.cached_rankings.get()));
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
-            config.limits.retained_snapshots.get(),
+            // SnapshotStore bounds old generations separately from the current
+            // publication. Every accepted generation must fit the routing table.
+            config
+                .limits
+                .retained_snapshots
+                .get()
+                .checked_add(1)
+                .ok_or(Error::InvalidConfiguration)?,
         )?);
         let wire = Rc::new(crate::peer::wire::SecurityCodec::new(
             admission.clone(),
@@ -1410,6 +1417,31 @@ mod tests {
             );
             assert_eq!(worker.poll_budgeted(0), Err(Error::Unavailable));
             assert_eq!(worker.poll_budgeted(1), Err(Error::Unavailable));
+            // Hold every old generation at the configured limit while installing
+            // the current generation on both actual application networks.
+            for network in [&worker.network, &second.network] {
+                let mut requests = Vec::new();
+                for version in 0..=config.limits.retained_snapshots.get() {
+                    let membership = Arc::new(
+                        crate::topology::membership::Membership::validate(
+                            crate::model::identity::MembershipVersion(version as u64 + 1),
+                            vec![],
+                        )
+                        .unwrap(),
+                    );
+                    network.install(membership.clone()).unwrap();
+                    requests.push(membership);
+                }
+                assert_eq!(requests.len(), config.limits.retained_snapshots.get() + 1);
+                let extra = Arc::new(
+                    crate::topology::membership::Membership::validate(
+                        crate::model::identity::MembershipVersion(requests.len() as u64 + 1),
+                        vec![],
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(network.install(extra), Err(Error::Overloaded));
+            }
         }
     }
 
