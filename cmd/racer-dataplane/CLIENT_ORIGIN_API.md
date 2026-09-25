@@ -1,11 +1,15 @@
 # Racer client and origin API (v1)
 
 This is the approved implementation contract for the Go SDK and Rust dataplane.
-The [Go SDK](../../pkg/racersdk/doc.go) implements the client and origin boundaries;
-this does not establish live Rust interoperability. The Rust parser, origin calls,
-and stream coordinator still return `Unimplemented` (`src/client/request.rs:32-34`,
-`src/origin/client.rs:46-64`, `src/read/serve.rs:61-68`). Paths in source citations
-here are relative to this directory. See the [SDK design](../../designs/racer-sdk.md)
+The [Go SDK](../../pkg/racersdk/doc.go) implements the client and origin boundaries.
+The Rust request parser, origin client, and stream coordinator are implemented
+(`src/client/request.rs:73`, `src/origin/client.rs:245`, `src/read/serve.rs:145`).
+The explicit SDK conformance test exercises actual Go SDK calls against Rust HTTP
+handling with scripted responses; the production-component suite separately
+exercises real read, crypto, and storage paths. Deployed SDK-to-application reads
+remain an acceptance gate; see [production validation](../../designs/racer-production-validation.md).
+Paths in source citations here are relative to this directory.
+See the [SDK design](../../designs/racer-sdk.md)
 for public Go types, resource defaults, ownership, and implementation acceptance.
 The [control API](CONTROL_API.md) provisions caches and credentials separately.
 
@@ -14,8 +18,9 @@ The [control API](CONTROL_API.md) provisions caches and credentials separately.
 - HTTP/1.1 over Unix-domain stream sockets only. Racer owns
   `/run/racer/<cache name>/client/socket`; the adapter owns
   `/run/racer/<cache name>/origin/socket`. The directory selects the cache; no cache
-  header or URL parameter exists. These ownership boundaries follow
-  `src/control/caches.rs:3-7,14-23`; lifecycle validation is still a stub at 34-35.
+  header or URL parameter exists. Canonical socket paths and cache-definition
+  validation are implemented in `src/control/caches.rs:55-99`; application cache
+  transitions and retirement are wired in `src/app_caches.rs` and `src/app_retirement.rs`.
 - Exactly `HEAD` and `GET` on `/v1/objects/<key>`, where `<key>` is exactly 64
   lowercase hexadecimal characters encoding the 32-byte key. Require this exact
   origin-form request target: no query (even empty), fragment, percent encoding,
@@ -75,8 +80,9 @@ it is not required to be a content hash. Expiry may be refreshed without changin
 ETag, but size must not change. Fresh metadata admits new unpinned reads only while
 `now < ExpiresAt`. Revalidation may admit its current waiters once even with zero
 TTL; it must not authorize later unpinned cache hits. Explicit pins and admitted
-streams may continue after expiry. This preserves the zero-TTL intent in
-`src/read/metadata.rs:3-6`, whose resolver is unimplemented at 46-54.
+streams may continue after expiry. The metadata resolver implements this zero-TTL
+and retained-version behavior (`src/read/metadata.rs:321-360`), with production
+coverage in `tests/production_dataplane.rs`.
 
 ## Operations
 
