@@ -850,6 +850,7 @@ racer-ktls-test: ## Verify strict kTLS admission, HTTP/sendfile, and rekey/recon
 		tls::tests::tls13_key_update_preserves_application_and_file_transfers \
 		tls::tests::tls13_key_update_with_actual_ktls \
 		tls::tests::inbound_key_update_succeeds_or_closes_and_reconnects_on_older_kernels \
+		tls::channel::tests::fatal_record_error_rejects_cached_admission_and_pending_io \
 		http_server::tests::tls_transport::encrypted_http_kernel_integration; do \
 		RACER_REQUIRE_URING=1 $(RACER_TEST_HARNESS) selected dataplane "$$test" || failed=1; \
 		done; exit $$failed

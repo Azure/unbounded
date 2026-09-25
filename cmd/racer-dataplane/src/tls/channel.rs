@@ -136,6 +136,11 @@ impl TlsChannel {
         ring: &mut Ring,
         deadline: Instant,
     ) -> io::Result<Progress<()>> {
+        // A cached handshake or pending readiness must not mask a fatal record
+        // error, including failed key replacement on an admitted connection.
+        if self.session.failed {
+            return Err(super::invalid("TLS session has failed"));
+        }
         if !self.ready && self.expired() {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -253,7 +258,7 @@ impl TlsChannel {
             .expired(self.session.valid_until().unwrap_or(u64::MAX))
     }
     pub fn admits_new_request(&self) -> bool {
-        self.ready && !self.expired()
+        self.ready && self.session.valid_until().is_some() && !self.expired()
     }
 }
 impl Drop for TlsChannel {
