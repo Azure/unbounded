@@ -604,9 +604,23 @@ wait_for_node_pool_provisioning() {
 }
 
 recreate_aks_node_pool() {
-  log "submitting deletion of benchmark pool $AKS_NODE_POOL_NAME"
-  az aks nodepool delete -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
-    -n "$AKS_NODE_POOL_NAME" --no-wait --only-show-errors -o none
+  local provisioning_state
+  provisioning_state=$(timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+    --query provisioningState -o tsv 2>/dev/null || true)
+  case "$provisioning_state" in
+    "")
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME is already absent"
+      ;;
+    Deleting)
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME is already deleting"
+      ;;
+    *)
+      log "submitting deletion of benchmark pool $AKS_NODE_POOL_NAME"
+      az aks nodepool delete -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+        -n "$AKS_NODE_POOL_NAME" --no-wait --only-show-errors -o none
+      ;;
+  esac
 
   local attempt
   for attempt in $(seq 1 240); do
