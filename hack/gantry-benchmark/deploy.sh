@@ -1074,7 +1074,7 @@ migrate_legacy_gantry_install() {
     kubectl get priorityclass gantry-low >/dev/null 2>&1; then
     legacy=true
   fi
-  [[ "$legacy" == true ]] || return
+  [[ "$legacy" == true ]] || return 0
 
   local resource
   for resource in \

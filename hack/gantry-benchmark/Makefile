@@ -84,6 +84,7 @@ operator-vm-check:
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
 	grep -Fq 'local helm_args=(' deploy.sh
+	grep -Fq '[[ "$$legacy" == true ]] || return 0' deploy.sh
 	grep -Fq 'upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
 	grep -Fq '"$$repo_root/bin/helm" "$${helm_args[@]}"' deploy.sh
 	grep -Fq -- '--enable-artifact-streaming' deploy.sh
