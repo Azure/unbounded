@@ -9,13 +9,14 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh <plan|scale|deploy|status> [config-file]
+Usage: deploy.sh <plan|scale|recreate-pool|deploy|status> [config-file]
 
 One idempotent entrypoint for the complete Gantry benchmark stack. The config
 file is a shell environment file. No credentials are stored in it.
 
   plan    validate inputs and print the complete deployment contract
   scale   resize the existing AKS node pool and wait for Ready nodes
+  recreate-pool  delete and recreate the Artifact Streaming benchmark pool
   deploy  create or validate every resource and leave the benchmark ready
   status  report Azure and Kubernetes readiness without mutation
 USAGE
@@ -25,7 +26,7 @@ action=${1:-plan}
 config_file=${2:-${GANTRY_BENCHMARK_DEPLOY_CONFIG:-$script_dir/deploy.env}}
 
 case "$action" in
-plan | scale | deploy | status) ;;
+plan | scale | recreate-pool | deploy | status) ;;
 -h | --help | help)
   usage
   exit 0
@@ -71,11 +72,20 @@ POD_CIDR=${POD_CIDR:-10.64.0.0/12}
 SERVICE_CIDR=${SERVICE_CIDR:-10.0.0.0/16}
 DNS_SERVICE_IP=${DNS_SERVICE_IP:-10.0.0.10}
 AKS_KUBERNETES_VERSION=${AKS_KUBERNETES_VERSION:-1.35}
-AKS_NODE_POOL_NAME=${AKS_NODE_POOL_NAME:-system}
+BENCHMARK_ARTIFACT_STREAMING=${BENCHMARK_ARTIFACT_STREAMING:-false}
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+  default_node_pool_name=stream
+else
+  default_node_pool_name=system
+fi
+AKS_NODE_POOL_NAME=${AKS_NODE_POOL_NAME:-$default_node_pool_name}
 AKS_NODE_COUNT=${AKS_NODE_COUNT:-1000}
 AKS_NODE_VM_SIZE=${AKS_NODE_VM_SIZE:-Standard_D8s_v3}
 AKS_NODE_OS_DISK_GB=${AKS_NODE_OS_DISK_GB:-512}
 AKS_MAX_PODS=${AKS_MAX_PODS:-250}
+AKS_SYSTEM_NODE_POOL_NAME=${AKS_SYSTEM_NODE_POOL_NAME:-system}
+AKS_SYSTEM_NODE_COUNT=${AKS_SYSTEM_NODE_COUNT:-1}
+AKS_SYSTEM_NODE_VM_SIZE=${AKS_SYSTEM_NODE_VM_SIZE:-Standard_D4s_v5}
 
 BENCHMARK_NODE_COUNT=${BENCHMARK_NODE_COUNT:-$AKS_NODE_COUNT}
 BENCHMARK_IMAGE_SIZE_MIB=${BENCHMARK_IMAGE_SIZE_MIB:-40960}
@@ -120,6 +130,15 @@ BASELINE_ACR_DATA_HOST=${BASELINE_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
 GANTRY_ACR_DATA_HOST=${GANTRY_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
 
 [[ "$AKS_NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "AKS_NODE_COUNT must be positive" >&2; exit 2; }
+[[ "$BENCHMARK_ARTIFACT_STREAMING" == true || "$BENCHMARK_ARTIFACT_STREAMING" == false ]] || {
+  echo "BENCHMARK_ARTIFACT_STREAMING must be true or false" >&2
+  exit 2
+}
+[[ "$AKS_SYSTEM_NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "AKS_SYSTEM_NODE_COUNT must be positive" >&2; exit 2; }
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true && "$AKS_NODE_POOL_NAME" == "$AKS_SYSTEM_NODE_POOL_NAME" ]]; then
+  echo "AKS_NODE_POOL_NAME must differ from AKS_SYSTEM_NODE_POOL_NAME when Artifact Streaming is enabled" >&2
+  exit 2
+fi
 [[ "$BENCHMARK_NODE_COUNT" == "$AKS_NODE_COUNT" ]] || {
   echo "BENCHMARK_NODE_COUNT must equal AKS_NODE_COUNT for this topology" >&2
   exit 2
@@ -157,6 +176,10 @@ if ((adoption_values != 0 && adoption_values != 3)); then
   echo "ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 must be set together" >&2
   exit 2
 fi
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true && "$adoption_values" != 0 ]]; then
+  echo "Artifact Streaming standalone runs do not support ADOPT_BASELINE_IMAGE or ADOPT_GANTRY_IMAGE" >&2
+  exit 2
+fi
 if ((adoption_values == 3)); then
   valid_adopted_image "$ADOPT_BASELINE_IMAGE" "$BASELINE_ACR_LOGIN_SERVER" || {
     echo "ADOPT_BASELINE_IMAGE must be an immutable gantry-benchmark-pull image in $BASELINE_ACR_LOGIN_SERVER" >&2
@@ -168,6 +191,16 @@ if ((adoption_values == 3)); then
   }
   [[ "$ADOPT_PAYLOAD_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
     echo "ADOPT_PAYLOAD_SHA256 must be a sha256 digest" >&2
+    exit 2
+  }
+fi
+if [[ "$action" == recreate-pool ]]; then
+  [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]] || {
+    echo "recreate-pool requires BENCHMARK_ARTIFACT_STREAMING=true" >&2
+    exit 2
+  }
+  [[ "${RECREATE_BENCHMARK_POOL_CONFIRM:-}" == "$AKS_NODE_POOL_NAME" ]] || {
+    echo "set RECREATE_BENCHMARK_POOL_CONFIRM=$AKS_NODE_POOL_NAME to authorize replacement" >&2
     exit 2
   }
 fi
@@ -211,6 +244,9 @@ retry_command() {
 
 print_plan() {
   local image_preparation="build and push fresh workload images"
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    image_preparation="build, push, and convert one standalone workload image"
+  fi
   if ((adoption_values == 3)); then
     image_preparation="adopt existing immutable workload images"
   fi
@@ -229,7 +265,9 @@ Azure
   resource group:      $AZURE_RESOURCE_GROUP
   AKS:                 $AZURE_AKS_CLUSTER_NAME
   node resource group: $AZURE_NODE_RESOURCE_GROUP
-  node pool:           $AKS_NODE_POOL_NAME ($AKS_NODE_COUNT x $AKS_NODE_VM_SIZE)
+  benchmark pool:      $AKS_NODE_POOL_NAME ($AKS_NODE_COUNT x $AKS_NODE_VM_SIZE)
+  system pool:         $AKS_SYSTEM_NODE_POOL_NAME ($([[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]] && printf '%s x %s' "$AKS_SYSTEM_NODE_COUNT" "$AKS_SYSTEM_NODE_VM_SIZE" || printf 'same as benchmark pool'))
+  Artifact Streaming:  $BENCHMARK_ARTIFACT_STREAMING
   node OS disk:        ${AKS_NODE_OS_DISK_GB} GiB managed
   Kubernetes:          $AKS_KUBERNETES_VERSION
 
@@ -463,15 +501,23 @@ build_source_image() {
 }
 
 ensure_aks() {
-  local subnet_id
+  local subnet_id initial_pool_name initial_node_count initial_vm_size
   subnet_id=$(az network vnet subnet show -g "$AZURE_RESOURCE_GROUP" --vnet-name "$VNET_NAME" \
     -n "$AKS_SUBNET_NAME" --query id -o tsv)
+  initial_pool_name=$AKS_NODE_POOL_NAME
+  initial_node_count=$AKS_NODE_COUNT
+  initial_vm_size=$AKS_NODE_VM_SIZE
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    initial_pool_name=$AKS_SYSTEM_NODE_POOL_NAME
+    initial_node_count=$AKS_SYSTEM_NODE_COUNT
+    initial_vm_size=$AKS_SYSTEM_NODE_VM_SIZE
+  fi
   if ! az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null; then
     log "creating AKS cluster $AZURE_AKS_CLUSTER_NAME"
     az aks create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -l "$AZURE_LOCATION" \
       --tier standard --enable-managed-identity --node-resource-group "$AZURE_NODE_RESOURCE_GROUP" \
-      --nodepool-name "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" \
-      --node-vm-size "$AKS_NODE_VM_SIZE" --node-osdisk-type Managed \
+      --nodepool-name "$initial_pool_name" --node-count "$initial_node_count" \
+      --node-vm-size "$initial_vm_size" --node-osdisk-type Managed \
       --node-osdisk-size "$AKS_NODE_OS_DISK_GB" --max-pods "$AKS_MAX_PODS" \
       --os-sku Ubuntu --network-plugin azure --network-plugin-mode overlay \
       --network-dataplane azure --pod-cidr "$POD_CIDR" --service-cidr "$SERVICE_CIDR" \
@@ -482,6 +528,28 @@ ensure_aks() {
 
   az aks wait -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
     --created --interval 30 --timeout 7200
+
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    local system_pool_json
+    system_pool_json=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+      -n "$AKS_SYSTEM_NODE_POOL_NAME" -o json)
+    assert_equal "AKS system node count" "$(jq -r .count <<<"$system_pool_json")" "$AKS_SYSTEM_NODE_COUNT"
+    assert_equal "AKS system node-pool mode" "$(jq -r .mode <<<"$system_pool_json")" System
+
+    az extension add --name aks-preview --upgrade --only-show-errors >/dev/null
+    if ! az aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+      -n "$AKS_NODE_POOL_NAME" --output none 2>/dev/null; then
+      log "creating Artifact Streaming benchmark pool $AKS_NODE_POOL_NAME"
+      az aks nodepool add -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+        -n "$AKS_NODE_POOL_NAME" --mode User \
+        --node-count "$AKS_NODE_COUNT" --node-vm-size "$AKS_NODE_VM_SIZE" \
+        --node-osdisk-type Managed --node-osdisk-size "$AKS_NODE_OS_DISK_GB" \
+        --max-pods "$AKS_MAX_PODS" --os-sku Ubuntu --vnet-subnet-id "$subnet_id" \
+        --kubernetes-version "$AKS_KUBERNETES_VERSION" --enable-artifact-streaming \
+        --no-wait --only-show-errors -o none
+    fi
+      wait_for_node_pool_provisioning
+  fi
 
   local cluster_json pool_json
   cluster_json=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -o json)
@@ -498,8 +566,82 @@ ensure_aks() {
   assert_equal "AKS max pods" "$(jq -r .maxPods <<<"$pool_json")" "$AKS_MAX_PODS"
   assert_equal "AKS node OS disk" "$(jq -r .osDiskSizeGb <<<"$pool_json")" "$AKS_NODE_OS_DISK_GB"
   assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
-  assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
   assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    assert_equal "AKS benchmark node-pool mode" "$(jq -r .mode <<<"$pool_json")" User
+    assert_equal "AKS benchmark pool Artifact Streaming" \
+      "$(jq -r '.artifactStreamingProfile.enabled // false' <<<"$pool_json")" true
+
+  else
+    assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
+  fi
+}
+
+wait_for_node_pool_provisioning() {
+  local attempt state
+  for attempt in $(seq 1 240); do
+    state=$(timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --query provisioningState -o tsv 2>/dev/null || true)
+    case "$state" in
+      Succeeded)
+        log "AKS benchmark pool $AKS_NODE_POOL_NAME provisioning succeeded"
+        return
+        ;;
+      Failed | Canceled)
+        echo "AKS benchmark pool $AKS_NODE_POOL_NAME provisioning ended in $state" >&2
+        return 1
+        ;;
+      *)
+        log "waiting for benchmark pool provisioning: ${state:-not visible} ($attempt/240)"
+        sleep 30
+        ;;
+    esac
+  done
+
+  echo "AKS benchmark pool $AKS_NODE_POOL_NAME did not provision" >&2
+  return 1
+}
+
+recreate_aks_node_pool() {
+  local provisioning_state
+  provisioning_state=$(timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+    --query provisioningState -o tsv 2>/dev/null || true)
+  case "$provisioning_state" in
+    "")
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME is already absent"
+      ;;
+    Deleting)
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME is already deleting"
+      ;;
+    *)
+      log "submitting deletion of benchmark pool $AKS_NODE_POOL_NAME"
+      az aks nodepool delete -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+        -n "$AKS_NODE_POOL_NAME" --no-wait --only-show-errors -o none
+      ;;
+  esac
+
+  local attempt
+  for attempt in $(seq 1 240); do
+    if ! timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --output none 2>/dev/null; then
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME deleted"
+      break
+    fi
+    log "waiting for benchmark pool deletion ($attempt/240)"
+    sleep 30
+  done
+  if timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+    --output none 2>/dev/null; then
+    echo "AKS benchmark pool $AKS_NODE_POOL_NAME did not delete" >&2
+    return 1
+  fi
+
+  ensure_aks
+  wait_for_nodes
 }
 
 scale_aks_node_pool() {
@@ -522,7 +664,13 @@ scale_aks_node_pool() {
   assert_equal "AKS max pods" "$(jq -r .maxPods <<<"$pool_json")" "$AKS_MAX_PODS"
   assert_equal "AKS node OS disk" "$(jq -r .osDiskSizeGb <<<"$pool_json")" "$AKS_NODE_OS_DISK_GB"
   assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
-  assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" User
+    assert_equal "AKS node-pool Artifact Streaming" \
+      "$(jq -r '.artifactStreamingProfile.enabled // false' <<<"$pool_json")" true
+  else
+    assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
+  fi
   assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
 
   current_count=$(jq -r .count <<<"$pool_json")
@@ -651,7 +799,7 @@ wait_for_nodes() {
   local attempt total ready unschedulable
   for attempt in $(seq 1 120); do
     local nodes
-    nodes=$(kubectl get nodes -o json)
+    nodes=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json)
     total=$(jq '.items|length' <<<"$nodes")
     ready=$(jq '[.items[]|select(any(.status.conditions[];.type=="Ready" and .status=="True"))]|length' <<<"$nodes")
     unschedulable=$(jq '[.items[]|select(.spec.unschedulable==true)]|length' <<<"$nodes")
@@ -736,6 +884,9 @@ install_containerd_pull_tuning() {
   kubectl -n "$GANTRY_NAMESPACE" delete configmap gantry-benchmark-containerd-config \
     --ignore-not-found=true
   kubectl apply -f "$repo_root/hack/gantry-benchmark/manifests/containerd-pull-tuning.yaml"
+  kubectl -n "$GANTRY_NAMESPACE" patch daemonset gantry-benchmark-containerd-pull-tuning \
+    --type merge \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/os\":\"linux\",\"agentpool\":\"$AKS_NODE_POOL_NAME\"}}}}}"
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
     daemonset/gantry-benchmark-containerd-pull-tuning --timeout=45m
 }
@@ -777,6 +928,7 @@ spec:
       dnsPolicy: Default
       nodeSelector:
         kubernetes.io/os: linux
+        agentpool: $AKS_NODE_POOL_NAME
       tolerations:
         - operator: Exists
       containers:
@@ -935,6 +1087,7 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/os: linux
+        agentpool: $AKS_NODE_POOL_NAME
       tolerations:
         - operator: Exists
       containers:
@@ -1000,7 +1153,7 @@ migrate_legacy_gantry_install() {
     kubectl get priorityclass gantry-low >/dev/null 2>&1; then
     legacy=true
   fi
-  [[ "$legacy" == true ]] || return
+  [[ "$legacy" == true ]] || return 0
 
   local resource
   for resource in \
@@ -1025,6 +1178,7 @@ migrate_legacy_gantry_install() {
 
   log "removing legacy rendered Gantry resources before first Helm install"
   kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry gantry-containerd-config \
+    gantry-overlaybd-config \
     --ignore-not-found=true --wait=true
   kubectl -n "$GANTRY_NAMESPACE" delete \
     configmap/gantry-config \
@@ -1042,18 +1196,36 @@ deploy_gantry() {
   export KUBECONFIG
   GOTOOLCHAIN=auto make -C "$repo_root" install-helm
   migrate_legacy_gantry_install
-  "$repo_root/bin/helm" upgrade --install gantry "$repo_root/deploy/gantry/chart" \
-    --namespace "$GANTRY_NAMESPACE" \
-    --create-namespace \
-    --set-string "image.reference=$GANTRY_IMAGE" \
-    --set-string 'gantry.pprofListen=127.0.0.1:6060' \
-    --set-string "gantry.upstreamRegistries[0].name=$GANTRY_ACR_LOGIN_SERVER" \
-    --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER" \
-    --wait \
-    --timeout 45m
+  local helm_args=(
+    upgrade --install gantry "$repo_root/deploy/gantry/chart"
+    --namespace "$GANTRY_NAMESPACE"
+    --create-namespace
+    --set-string "image.reference=$GANTRY_IMAGE"
+    --set-string 'gantry.pprofListen=127.0.0.1:6060'
+    --set-string "nodeSelector.agentpool=$AKS_NODE_POOL_NAME"
+    --set-string "gantry.upstreamRegistries[0].name=$GANTRY_ACR_LOGIN_SERVER"
+  )
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    helm_args+=(
+      --set gantry.artifactStreaming.enabled=true
+      --set overlaybdConfig.enabled=true
+      --set-string "overlaybdConfig.image.reference=$GANTRY_NODE_CONFIG_IMAGE"
+      --set-string "overlaybdConfig.nodeSelector.agentpool=$AKS_NODE_POOL_NAME"
+      --set-string "gantry.upstreamRegistries[0].endpoint=http://127.0.0.1:8578?ns=$GANTRY_ACR_LOGIN_SERVER"
+    )
+  else
+    helm_args+=(
+      --set-string "gantry.upstreamRegistries[0].endpoint=https://$GANTRY_ACR_LOGIN_SERVER"
+    )
+  fi
+  helm_args+=(--wait --timeout 45m)
+  "$repo_root/bin/helm" "${helm_args[@]}"
 
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=45m
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+    kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-overlaybd-config --timeout=45m
+  fi
 }
 
 provision_operator() {
@@ -1065,6 +1237,7 @@ provision_operator() {
   export OPERATOR_BUILD_DISK_IOPS OPERATOR_BUILD_DISK_MBPS OPERATOR_SUBNET_NAME OPERATOR_SUBNET_CIDR
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
+  export BENCHMARK_ARTIFACT_STREAMING BENCHMARK_NODE_POOL=$AKS_NODE_POOL_NAME
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
   export ADOPT_BASELINE_IMAGE ADOPT_GANTRY_IMAGE ADOPT_PAYLOAD_SHA256
   AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \
@@ -1102,12 +1275,13 @@ build_operator_images() {
     --query 'value[0].message' -o tsv)
   local result_json
   result_json=$(tr -d '\r' <<<"$output" | sed -n 's/^DEPLOYMENT_IMAGES_JSON=//p' | tail -1)
-  jq -e 'type == "object" and (.gantry_image | type == "string") and (.baseline_probe_image | type == "string")' \
+  jq -e 'type == "object" and (.gantry_image | type == "string") and (.gantry_node_config_image | type == "string") and (.baseline_probe_image | type == "string")' \
     <<<"$result_json" >/dev/null || {
     echo "operator did not return valid deployment image JSON" >&2
     return 1
   }
   GANTRY_IMAGE=$(jq -r .gantry_image <<<"$result_json")
+  GANTRY_NODE_CONFIG_IMAGE=$(jq -r .gantry_node_config_image <<<"$result_json")
   BASELINE_PROBE_IMAGE=$(jq -r .baseline_probe_image <<<"$result_json")
   [[ "$GANTRY_IMAGE" == "$GANTRY_ACR_LOGIN_SERVER/gantry@sha256:"* ]] || {
     echo "operator did not return an immutable Gantry image" >&2
@@ -1117,6 +1291,11 @@ build_operator_images() {
     echo "operator did not return an immutable baseline probe image" >&2
     return 1
   }
+  if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true &&
+    "$GANTRY_NODE_CONFIG_IMAGE" != "$GANTRY_ACR_LOGIN_SERVER/gantry-node-config@sha256:"* ]]; then
+    echo "operator did not return an immutable Gantry node-config image" >&2
+    return 1
+  fi
 }
 
 acquire_operator_run_command_lock() {
@@ -1137,6 +1316,12 @@ if [[ "$action" == scale ]]; then
   wait_for_nodes
   release_operator_run_command_lock
   log "AKS node pool scale complete"
+  exit 0
+fi
+if [[ "$action" == recreate-pool ]]; then
+  recreate_aks_node_pool
+  release_operator_run_command_lock
+  log "AKS benchmark pool recreation complete"
   exit 0
 fi
 
@@ -1176,10 +1361,15 @@ assert_equal "Gantry ACR public access" \
 
 kubectl -n "$MONITORING_NAMESPACE" get endpoints "$PROMETHEUS_SERVICE" -o json | \
   jq -e '.subsets | any(.addresses | length > 0)' >/dev/null
-for daemonset in gantry-benchmark-containerd-pull-tuning gantry-acr-private-dns-guard gantry-containerd-config gantry; do
+daemonsets=(gantry-benchmark-containerd-pull-tuning gantry-acr-private-dns-guard gantry-containerd-config gantry)
+if [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]]; then
+  daemonsets+=(gantry-overlaybd-config)
+fi
+for daemonset in "${daemonsets[@]}"; do
   namespace=$GANTRY_NAMESPACE
   desired=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.desiredNumberScheduled}')
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')
+  assert_equal "$daemonset desired" "$desired" "$AKS_NODE_COUNT"
   assert_equal "$daemonset readiness" "$ready" "$desired"
 done
 

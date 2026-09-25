@@ -61,6 +61,19 @@ func TestBuildBOM(t *testing.T) {
 		t.Fatalf("first image reference = %q, want %q", got, want)
 	}
 
+	foundGantryNodeConfig := false
+
+	for _, image := range bom.Images {
+		if image.Name == "gantry-node-config" && image.Reference == "registry.example.com/project/gantry-node-config:v1.2.3" {
+			foundGantryNodeConfig = true
+			break
+		}
+	}
+
+	if !foundGantryNodeConfig {
+		t.Fatal("gantry-node-config image is missing from release BOM")
+	}
+
 	if bom.NodeBootstrap.ContainerdVersion != goalstates.ContainerdVersion ||
 		bom.NodeBootstrap.RuncVersion != goalstates.RunCVersion ||
 		bom.NodeBootstrap.CNIPluginVersion != goalstates.CNIPluginVersion ||

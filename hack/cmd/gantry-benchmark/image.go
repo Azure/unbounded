@@ -63,6 +63,10 @@ func (b *benchmark) loginRegistry(ctx context.Context, loginServer, username, pa
 }
 
 func (b *benchmark) prepareImages(ctx context.Context) error {
+	if b.config.ArtifactStreaming {
+		return fmt.Errorf("Artifact Streaming requires prepare-gantry-standalone")
+	}
+
 	state, err := b.loadState(ctx)
 	if err != nil {
 		return err

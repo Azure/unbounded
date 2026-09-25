@@ -51,6 +51,22 @@ func TestRenderHosts(t *testing.T) {
 	}
 }
 
+func TestArtifactStreamingDoesNotMutateHostsRouting(t *testing.T) {
+	runner := &recordingRunner{}
+	benchmark := &benchmark{commands: runner}
+	state := benchmarkState{ArtifactStreaming: true}
+
+	if err := benchmark.installHosts(context.Background(), state, hostsModeGantry); err != nil {
+		t.Fatalf("installHosts: %v", err)
+	}
+	if err := benchmark.restoreHosts(context.Background(), state); err != nil {
+		t.Fatalf("restoreHosts: %v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("streaming routing executed %d commands", len(runner.commands))
+	}
+}
+
 func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	const registry = "gantry.azurecr.io"
 
@@ -129,6 +145,45 @@ func TestRenderHostsDirectGantryFailOpenResolvesGantryThenACR(t *testing.T) {
 
 	if len(resolved) != 2 || resolved[0].Host != "127.0.0.1:5000" || resolved[1].Host != registry {
 		t.Fatalf("resolved hosts = %#v, want Gantry followed by ACR", resolved)
+	}
+}
+
+func TestRenderHostsArtifactStreamingFailOpenResolvesGantryThenAKS(t *testing.T) {
+	const registry = "gantry.azurecr.io"
+
+	state := benchmarkState{
+		RunID:                 "run-1",
+		Mode:                  benchmarkModeDirect,
+		GantryRoutingStrategy: gantryRoutingFailOpen,
+		GantryACRLoginServer:  registry,
+		ArtifactStreaming:     true,
+	}
+
+	hostsFile, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	hostDirectory := filepath.Join(t.TempDir(), registry)
+	if err := os.MkdirAll(hostDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(hostDirectory, "hosts.toml"), []byte(hostsFile), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := containerdconfig.ConfigureHosts(context.Background(), containerdconfig.HostOptions{
+		HostDir: containerdconfig.HostDirFromRoot(filepath.Dir(hostDirectory)),
+	})
+
+	resolved, err := resolver(registry)
+	if err != nil {
+		t.Fatalf("resolve containerd hosts: %v", err)
+	}
+
+	if len(resolved) != 2 || resolved[0].Host != "127.0.0.1:5000" || resolved[1].Host != "127.0.0.1:8578" {
+		t.Fatalf("resolved hosts = %#v, want Gantry followed by AKS Artifact Streaming", resolved)
 	}
 }
 

@@ -59,6 +59,31 @@ func TestRenderProxyManifest(t *testing.T) {
 	}
 }
 
+func TestRenderMonitoringManifestSelectsBenchmarkPool(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
+	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
+		Namespace:       "gantry-benchmark",
+		GantryNamespace: "gantry-system",
+		MonitoringLabel: "kps",
+		NodeOS:          "linux",
+		NodeArch:        "amd64",
+		NodePool:        "stream",
+		RunID:           "run-1",
+	})
+	if err != nil {
+		t.Fatalf("renderManifest: %v", err)
+	}
+
+	if !strings.Contains(string(rendered), "agentpool: stream") {
+		t.Fatalf("streaming monitoring manifest does not select the benchmark pool")
+	}
+}
+
 // The Gantry PodMonitor lives outside the proxy template because direct mode
 // installs no proxy but still needs gantry_benchmark-labeled agent samples.
 func TestRenderMonitoringManifest(t *testing.T) {
@@ -84,9 +109,13 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	if strings.Contains(string(rendered), "{{") {
 		t.Fatalf("rendered manifest contains an unresolved template expression")
 	}
+	if strings.Contains(string(rendered), "agentpool:") {
+		t.Fatalf("classic monitoring manifest unexpectedly selects a node pool")
+	}
 
 	if !strings.Contains(string(rendered), `targetLabel: gantry_benchmark`) ||
-		!strings.Contains(string(rendered), `- controller-revision-hash`) {
+		!strings.Contains(string(rendered), `- controller-revision-hash`) ||
+		!strings.Contains(string(rendered), `app.kubernetes.io/component: agent`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
 
@@ -112,6 +141,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	}
 
 	for _, metric := range []string{
+		"gantry_streaming_(requests|bytes|rejected)_total",
+		"gantry_streaming_(request_duration|time_to_first_byte)_seconds_(bucket|sum|count)",
+		"gantry_streaming_inflight",
 		"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",
 		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",
 		"gantry_peer_fetch_last_timestamp_seconds",
@@ -361,7 +393,10 @@ func TestContainerdPullTuningManifest(t *testing.T) {
 		}
 	}
 
-	if !bytes.Contains(deployScript, []byte("migrate_legacy_gantry_install\n  \"$repo_root/bin/helm\" upgrade --install gantry")) {
+	migrateIndex := bytes.Index(deployScript, []byte("migrate_legacy_gantry_install"))
+	helmArgsIndex := bytes.Index(deployScript, []byte("local helm_args=("))
+	helmRunIndex := bytes.Index(deployScript, []byte("\"$repo_root/bin/helm\" \"${helm_args[@]}\""))
+	if migrateIndex < 0 || helmArgsIndex <= migrateIndex || helmRunIndex <= helmArgsIndex {
 		t.Fatal("deploy script does not migrate legacy Gantry resources before Helm install")
 	}
 }

@@ -234,6 +234,63 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 	return p
 }
 
+type artifactStreamingMetrics struct {
+	requests  *prometheus.CounterVec
+	bytes     *prometheus.CounterVec
+	duration  *prometheus.HistogramVec
+	firstByte *prometheus.HistogramVec
+	rejected  *prometheus.CounterVec
+	inflight  *prometheus.GaugeVec
+}
+
+func newArtifactStreamingMetrics(reg *metrics.Registry) *artifactStreamingMetrics {
+	m := &artifactStreamingMetrics{
+		requests: reg.NewCounterVec("streaming", prometheus.CounterOpts{
+			Name: "gantry_streaming_requests_total",
+			Help: "OverlayBD range requests completed, labeled by bounded source and outcome.",
+		}, []string{"source", "outcome"}),
+		bytes: reg.NewCounterVec("streaming", prometheus.CounterOpts{
+			Name: "gantry_streaming_bytes_total",
+			Help: "OverlayBD range bytes served from complete local blobs, complete peers, or signed origin.",
+		}, []string{"source"}),
+		duration: reg.NewHistogramVec("streaming", prometheus.HistogramOpts{
+			Name:    "gantry_streaming_request_duration_seconds",
+			Help:    "End-to-end OverlayBD range request duration by source and outcome.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 16),
+		}, []string{"source", "outcome"}),
+		firstByte: reg.NewHistogramVec("streaming", prometheus.HistogramOpts{
+			Name:    "gantry_streaming_time_to_first_byte_seconds",
+			Help:    "Time until Gantry commits response headers for an OverlayBD range.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 16),
+		}, []string{"source"}),
+		rejected: reg.NewCounterVec("streaming", prometheus.CounterOpts{
+			Name: "gantry_streaming_rejected_total",
+			Help: "OverlayBD requests rejected before source selection, by bounded reason.",
+		}, []string{"reason"}),
+		inflight: reg.NewGaugeVec("streaming", prometheus.GaugeOpts{
+			Name: "gantry_streaming_inflight",
+			Help: "OverlayBD response bodies currently being served by source.",
+		}, []string{"source"}),
+	}
+
+	for _, source := range []string{"local", "peer", "origin"} {
+		m.bytes.WithLabelValues(source).Add(0)
+		m.firstByte.WithLabelValues(source)
+		m.inflight.WithLabelValues(source).Set(0)
+
+		for _, outcome := range []string{"success", "error"} {
+			m.requests.WithLabelValues(source, outcome).Add(0)
+			m.duration.WithLabelValues(source, outcome)
+		}
+	}
+
+	for _, reason := range []string{"range", "origin_url"} {
+		m.rejected.WithLabelValues(reason).Add(0)
+	}
+
+	return m
+}
+
 type layerProgressTracker struct {
 	mu              sync.Mutex
 	gauge           *prometheus.GaugeVec

@@ -1,10 +1,10 @@
 # gantry - end-to-end test suite
 
 This directory holds the kind-based integration suite. It boots a real
-Kubernetes cluster on Docker, builds the gantry container image, and
+Kubernetes cluster on Docker or rootless Podman, builds the gantry container image, and
 deploys the DaemonSet. The current smoke scenario asserts rollout
 readiness, installs containerd mirror config, pulls through Gantry on
-one worker, then verifies a second worker reuses warmed content through
+one node, then verifies a second node reuses warmed content through
 peer fetch.
 
 ## Status
@@ -36,6 +36,16 @@ peer fetch.
 - ✅ Containerd restart recovery - restarts containerd on a worker, verifies
    the socket inode changes, and confirms the same Gantry pod reconnects and
    serves a subsequent image pull without restarting.
+- ✅ ACR Artifact Streaming contract - serves the first exact range from a
+   cluster-local signed TLS origin, commits and advertises a complete blob on
+   another node, then serves the next range from that peer. The origin rejects
+   any request whose URI did not arrive byte-for-byte, so this also pins raw
+   signed-URL preservation through the real listener, and the test asserts the
+   SAS value never appears in any agent's logs or metrics.
+- ✅ Stale provider fallback - removes the blob from the provider's containerd
+   while its DHT record survives, then asserts the next range fails over to the
+   signed origin inside one request and the peer serves nothing further.
+   Busy peers (429 with `Retry-After`) remain covered by unit tests only.
 
 Additional scenarios listed below should each land as their own commit.
 
@@ -44,14 +54,20 @@ Additional scenarios listed below should each land as their own commit.
 The harness shells out to standard CLIs; no extra Go deps. Install:
 
 - [Docker](https://docs.docker.com/get-docker/) or [Podman](https://podman.io/) (engine running)
-- [kind](https://kind.sigs.k8s.io/) ≥ 0.20
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) ≥ 1.28
 - Go ≥ 1.26 (matching root `go.mod`)
+
+`make e2e-gantry` installs the CI-pinned Kind version into `bin/`. Rootless
+Podman additionally requires a running user systemd manager; the Make target
+automatically runs the suite in a transient `Delegate=yes` scope.
 
 ## Running
 
 ```sh
 make e2e-gantry       # boot kind, build+load image, deploy, run tests, tear down
+
+# Run only the Artifact Streaming live contract.
+make e2e-gantry GANTRY_E2E_RUN=TestE2E_ArtifactStreamingOriginThenPeer
 ```
 
 The root Makefile defaults `CONTAINER_ENGINE` to `podman`. Set
@@ -76,7 +92,7 @@ prereq CLIs:
 
 | Step | What it does |
 | --- | --- |
-| `bootCluster()` | `kind create cluster --config kind-config.yaml` |
+| `bootCluster()` | creates the Docker CI topology from `kind-config.yaml`, or the reduced rootless Podman topology from `kind-config-rootless.yaml` |
 | `buildAndLoadImage()` | builds `images/gantry/Containerfile` as `docker.io/library/gantry:e2e`, saves an image archive, then loads the archive into kind |
 | `applyManifests()` | renders `deploy/gantry/chart` with the pinned Helm binary, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
@@ -90,9 +106,11 @@ The smoke test also installs a `hosts.toml` mirror entry for
 for Gantry advertisement, then pulls the same image on a second worker
 and asserts peer-fetch metrics increase.
 
-The kind config (`kind-config.yaml`) declares one control-plane + two
-worker nodes - enough to exercise multi-peer coord paths in future
-scenarios.
+The Docker CI config (`kind-config.yaml`) declares one control-plane and seven
+workers to exercise eight-chair fanout. The rootless Podman config declares one
+control-plane and one worker. Both run Gantry and tolerate test workloads, so
+the local topology still proves cross-node peer service while staying below the
+host user's common 128 inotify-instance limit.
 
 ## Build tag
 
@@ -130,8 +148,9 @@ The scenarios below are still gaps. Each should land as a focused commit.
 
 ## Caveats
 
-- The kind cluster boot takes ~60–120 s. The Makefile target reserves
-  a 10-minute test timeout to absorb that.
+- Two clean local Artifact Streaming runs completed in 93 seconds and 137
+   seconds on rootless Podman in the measured development environment. The Make
+   target retains the suite's 120-minute hard timeout for the full scenario set.
 - The default kind containerd uses namespace `k8s.io`, matching the
   gantry `containerd_namespace` default - no extra config needed.
 - Containerd socket access is mandatory. The default DaemonSet runs with

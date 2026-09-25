@@ -35,6 +35,50 @@ passes.
 The deployment config contains names and topology only. Credentials remain in
 Azure managed identities and short-lived ACR tokens.
 
+### AKS Artifact Streaming
+
+Artifact Streaming is opt-in and preserves the classic deployment when unset:
+
+```bash
+BENCHMARK_ARTIFACT_STREAMING="true"
+```
+
+With that setting, deployment creates a one-node System pool and a separate
+`AKS_NODE_COUNT`-node User pool named `stream` by default. The benchmark,
+Gantry, containerd tuning, private DNS guard, and pull workload select only the
+User pool. The pool is created with AKS Artifact Streaming enabled; this cannot
+be added to an existing pool.
+
+The Helm release routes containerd through Gantry on port 5000 and chains
+Gantry's OCI upstream through the node-local AKS helper on port 8578. OverlayBD
+range requests use the same Gantry listener under `/blobs/`. Fail-open routing
+falls back to port 8578, preserving native Artifact Streaming if Gantry is
+unavailable.
+
+The operator lifecycle automatically uses the standalone path:
+
+```text
+enable -> prepare-gantry-standalone -> ACR conversion -> preflight -> run-gantry
+```
+
+Image preparation enables conversion on the workload repository and waits for
+the freshly pushed 40 GiB image conversion to succeed before state becomes
+preflight-ready. Preflight requires the containerd and OverlayBD configurator
+DaemonSets on every benchmark node and validates Gantry's `:8578?ns=` upstream.
+
+Use the same Make entrypoints as the classic deployment:
+
+```bash
+make -C hack/gantry-benchmark deploy-plan
+make -C hack/gantry-benchmark deploy
+make -C hack/gantry-benchmark operator-vm-run-standalone
+make -C hack/gantry-benchmark operator-vm-watch
+```
+
+Artifact Streaming currently supports the standalone lifecycle only. The
+classic two-phase `prepare`/`run` lifecycle remains unchanged and rejects the
+streaming flag rather than measuring an unconverted image.
+
 The workstation needs one valid Azure management-plane login before invoking
 `deploy.sh`; the script never invokes `az login`, `az acr login`, or workstation
 Podman. It publishes only the revision-labeled source carrier through an ACR

@@ -1,4 +1,135 @@
-# Gantry Benchmark
+# Gantry Benchmark Results
+
+## AKS ACR Artifact Streaming smoke test - 2026-09-25
+
+Run `run-20260925-160553-7f811295` exercised ACR Artifact Streaming on 100
+AKS worker nodes with a 1 GiB, four-layer image. All 100 workload pods
+succeeded. The Kubernetes Job ran from `16:09:01Z` to `16:09:34Z`, for a
+33-second wall-clock duration.
+
+The benchmark lifecycle subsequently reported failure because the original
+post-run validation required a final-layer response timestamp from every
+Gantry pod and received 98 of 100. This happened after the workload succeeded.
+The validation has since been changed to retain a successful result while
+recording incomplete diagnostic timestamp coverage.
+
+This was a Gantry-only smoke test. It did not run a direct-ACR baseline, so no
+baseline latency or traffic-reduction percentage is available.
+
+### Configuration
+
+| Item | Value |
+| --- | --- |
+| Azure region | Canada Central |
+| Worker pool | 100 `Standard_D8s_v3` nodes |
+| System pool | One `Standard_D4s_v5` node |
+| Gantry agents | 100 running, zero container restarts |
+| Image | 1,024 MiB, four layers |
+| Original image digest | `sha256:2d646d6c719c04214fb92a063c2fbe15f32b40a7b8f28fa716309c8969fc276e` |
+| Streaming manifest digest | `sha256:8d5d997858cea552b84120630cc7174c20f6686bd7bc7eb15edc460a9803c67f` |
+| ACR conversion | Submitted `16:06:28Z`; succeeded `16:07:01Z` |
+| Preflight | Passed `16:08:39Z` |
+| Workload | 100 succeeded, zero failed |
+
+### Pod startup latency
+
+AKS audit logs contained all required create, binding, and started-status
+events for 100 of 100 pods. Percentiles use the benchmark's nearest-rank
+method. Startup is measured from the API-server create request to the first
+status request that reports the workload container started.
+
+| Measurement | P50 | P95 | P100 |
+| --- | ---: | ---: | ---: |
+| Pod startup | 11.288s | 13.671s | 15.581s |
+| Scheduling | 0.076s | 0.178s | 0.191s |
+| Post-bind startup | 11.195s | 13.600s | 15.525s |
+
+The first pod create request was observed at `16:09:01.536040Z`; the last
+started-status request was observed at `16:09:17.543502Z`.
+
+### ACR traffic
+
+The Gantry ACR Private Endpoint is the authoritative registry-boundary byte
+measurement for the closed `16:09:00Z` to `16:13:00Z` window.
+
+| Measurement | Bytes | Binary units |
+| --- | ---: | ---: |
+| Gantry ACR Private Endpoint `PEBytesIn` | 9,926,015,448 | 9.244 GiB |
+| Gantry mirror origin response bodies | 8,781,334,224 | 8.178 GiB |
+| Artifact Streaming origin range bodies | 217,841,584 | 207.750 MiB |
+| Derived sum of measured origin response bodies | 8,999,175,808 | 8.381 GiB |
+| Private Endpoint bytes not represented by those body counters | 926,839,640 | 883.903 MiB |
+| Baseline ACR Private Endpoint `PEBytesIn` | 0 | 0 GiB |
+
+The derived response-body sum is:
+
+$$
+8{,}781{,}334{,}224 + 217{,}841{,}584 = 8{,}999{,}175{,}808\ \text{bytes}.
+$$
+
+The remaining 926,839,640 bytes are measured at the Private Endpoint, but the
+available counters do not establish their exact traffic class. Private
+Endpoint traffic was 9.244% of the workload's 100 GiB logical image volume.
+
+ACR logged 116 workload repository pull events in the same window. All 116
+returned HTTP 200 and referenced the streaming manifest digest; no non-200
+repository event was present.
+
+### Artifact Streaming ranges
+
+These values are cumulative `gantry_streaming_*` counters collected directly
+from all 100 unchanged Gantry agents after the run. All agents responded to the
+collection, and none had restarted.
+
+| Source | Bytes | Share of bytes | Successful requests | Share of requests | Average duration | Average time to first byte |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Origin | 217,841,584 (207.750 MiB) | 60.835% | 5,857 | 50.098% | 311.806ms | 311.111ms |
+| Peer | 128,409,118 (122.460 MiB) | 35.860% | 5,391 | 46.112% | 184.985ms | 184.605ms |
+| Local | 11,835,807 (11.288 MiB) | 3.305% | 443 | 3.789% | 1.990ms | 0.529ms |
+| **Total** | **358,086,509 (341.498 MiB)** | **100%** | **11,691** | **100%** | - | - |
+
+Peer plus local service accounted for a derived 140,244,925 bytes, or 39.165%
+of all range bytes. Total range bytes were 0.333% of the 100 GiB logical image
+volume:
+
+$$
+\frac{358{,}086{,}509}{100 \times 1{,}073{,}741{,}824} \times 100
+= 0.333\%.
+$$
+
+All 11,691 range requests succeeded. Range errors, origin-URL rejections,
+range rejections, and requests still in flight were all zero.
+
+### Gantry distribution counters
+
+| Measurement | Value |
+| --- | ---: |
+| Origin pulls started / succeeded | 56 / 56 |
+| Origin layer pulls started / succeeded | 40 / 40 |
+| Origin config pulls started / succeeded | 8 / 8 |
+| Origin manifest pulls started / succeeded | 8 / 8 |
+| Peer fetch hits | 190 |
+| Peer bytes served, all kinds | 128,963,098 (122.989 MiB) |
+| Direct-origin fallbacks | 0 |
+| In-flight pulls after the run | 0 |
+
+Every recorded non-hit peer outcome was zero: busy, stall, unavailable,
+not-found, authentication/configuration, local error, digest mismatch,
+protocol error, and server error.
+
+### Evidence and limitations
+
+- Pod latency comes from 700 retained `AKSAuditAdmin` events covering all 100
+   workload pods.
+- Private Endpoint bytes and ACR events use the benchmark's exact closed Azure
+   metric window.
+- Gantry counters were read after lifecycle cleanup because the strict
+   timestamp gate prevented `gantry-cold.json` from being written. They are
+   cumulative values from the unchanged deployment, not saved phase deltas.
+- The removed benchmark namespace means Kubernetes pod objects and the normal
+   per-pod performance artifact are unavailable.
+
+## Complete-image benchmark
 
 Gantry delivers a 99% reduction in ACR traffic and improves pod startup
 latency across a 2000-node AKS cluster delivering a 40 GiB image to

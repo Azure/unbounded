@@ -13,6 +13,7 @@ usage() {
 Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh full
   operator-vm-image-pool.sh standalone
+  operator-vm-image-pool.sh stop
   operator-vm-image-pool.sh fail-open
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
@@ -27,6 +28,10 @@ during a measured phase invalidate Azure telemetry.
 
 Set ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 together
 with "full" to reuse an existing digest-pinned image pair.
+
+Set GANTRY_ONLY_STANDALONE_IMAGE, GANTRY_ONLY_STANDALONE_STREAMING_IMAGE, and
+GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 together with "standalone" to reuse an
+existing converted image.
 USAGE
 }
 
@@ -269,11 +274,25 @@ SCRIPT
       standalone)
         (($# == 0)) || { usage >&2; exit 2; }
         mode_config='GANTRY_ONLY_STANDALONE="true"'
+        if [[ -n "${GANTRY_ONLY_STANDALONE_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:-}" || -n "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:-}" ]]; then
+          : "${GANTRY_ONLY_STANDALONE_IMAGE:?Set GANTRY_ONLY_STANDALONE_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_STREAMING_IMAGE:?Set GANTRY_ONLY_STANDALONE_STREAMING_IMAGE with the complete standalone adoption set}"
+          : "${GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 with the complete standalone adoption set}"
+          printf -v mode_config '%s\nGANTRY_ONLY_STANDALONE_IMAGE=%q\nGANTRY_ONLY_STANDALONE_STREAMING_IMAGE=%q\nGANTRY_ONLY_STANDALONE_PAYLOAD_SHA256=%q' \
+            "$mode_config" "$GANTRY_ONLY_STANDALONE_IMAGE" "$GANTRY_ONLY_STANDALONE_STREAMING_IMAGE" "$GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256"
+        fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
+          hack/cmd/gantry-benchmark/config.go
+          hack/cmd/gantry-benchmark/enable.go
           hack/cmd/gantry-benchmark/gantry_only.go
+          hack/cmd/gantry-benchmark/hosts_routing.go
           hack/cmd/gantry-benchmark/main.go
+          hack/cmd/gantry-benchmark/peer_telemetry.go
+          hack/cmd/gantry-benchmark/preflight.go
+          hack/cmd/gantry-benchmark/results.go
           hack/cmd/gantry-benchmark/state.go
+          hack/gantry-benchmark/manifests/monitoring.yaml.tmpl
           hack/gantry-benchmark/operator-vm-run.sh
         )
         standalone_base_hashes_base64=$(
@@ -498,6 +517,26 @@ systemctl show "$prune_service" --property=ActiveState --property=SubState --no-
 SCRIPT
 )
     script=${script/__PRUNE_WORKER_BASE64__/$prune_worker}
+    invoke_remote "$script"
+    ;;
+  stop)
+    (($# == 0)) || { usage >&2; exit 2; }
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+systemctl stop gantry-benchmark-operator.service || true
+source /etc/gantry-benchmark/env
+export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
+export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
+if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state >/dev/null 2>&1 ||
+  kubectl -n "${GANTRY_NAMESPACE:-gantry-system}" get configmap gantry-benchmark-lock >/dev/null 2>&1; then
+  cd "$BENCHMARK_REPO_ROOT"
+  make -C hack/gantry-benchmark disable
+fi
+systemctl show gantry-benchmark-operator.service \
+  --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus --no-pager
+SCRIPT
+)
     invoke_remote "$script"
     ;;
   prune-status)

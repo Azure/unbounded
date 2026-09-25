@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -28,6 +31,7 @@ type benchmarkState struct {
 	GantryConfigMap              string                 `json:"gantry_configmap"`
 	MonitoringNamespace          string                 `json:"monitoring_namespace"`
 	PrometheusService            string                 `json:"prometheus_service"`
+	NodePool                     string                 `json:"node_pool,omitempty"`
 	NodeCount                    int                    `json:"node_count"`
 	ImagePlatform                string                 `json:"image_platform"`
 	ImageSizeMiB                 int                    `json:"image_size_mib"`
@@ -41,6 +45,9 @@ type benchmarkState struct {
 	WorkloadPayloadSHA256        string                 `json:"workload_payload_sha256,omitempty"`
 	WorkloadComparisonMode       workloadComparisonMode `json:"workload_comparison_mode,omitempty"`
 	StandaloneGantry             bool                   `json:"standalone_gantry,omitempty"`
+	ArtifactStreaming            bool                   `json:"artifact_streaming,omitempty"`
+	ArtifactStreamingPrepared    bool                   `json:"artifact_streaming_prepared,omitempty"`
+	ArtifactStreamingImage       string                 `json:"artifact_streaming_image,omitempty"`
 	ProxyImage                   string                 `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string                 `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string                 `json:"original_gantry_config"`
@@ -79,6 +86,15 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 
 		if s.WorkloadPayloadSHA256 == "" {
 			return "", "", fmt.Errorf("prepared standalone Gantry image has no payload fingerprint")
+		}
+
+		if s.ArtifactStreaming && !s.ArtifactStreamingPrepared {
+			return "", "", fmt.Errorf("standalone Gantry image has not completed Artifact Streaming conversion")
+		}
+		if s.ArtifactStreaming {
+			if err := s.validateArtifactStreamingImage(); err != nil {
+				return "", "", err
+			}
 		}
 
 		gantryRepository, _, err := splitImageReference(s.GantryColdImage, s.GantryACRLoginServer)
@@ -137,6 +153,43 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 	}
 
 	return s.BaselineImage, s.GantryColdImage, nil
+}
+
+func (s benchmarkState) validateArtifactStreamingImage() error {
+	if s.ArtifactStreamingImage == "" {
+		return fmt.Errorf("standalone Gantry run has no Artifact Streaming digest reference")
+	}
+	if !strings.Contains(s.ArtifactStreamingImage, "@") {
+		return fmt.Errorf("Artifact Streaming runtime image must use a digest: %s", s.ArtifactStreamingImage)
+	}
+
+	repository, digestValue, err := splitImageReference(s.ArtifactStreamingImage, s.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("invalid Artifact Streaming runtime image: %w", err)
+	}
+	if repository != s.WorkloadRepository {
+		return fmt.Errorf("Artifact Streaming runtime repository %q, want %q", repository, s.WorkloadRepository)
+	}
+	parsedDigest, err := digest.Parse(digestValue)
+	if err != nil || parsedDigest.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("Artifact Streaming runtime image must use a sha256 digest: %s", s.ArtifactStreamingImage)
+	}
+	if s.ArtifactStreamingImage == s.GantryColdImage {
+		return fmt.Errorf("Artifact Streaming runtime digest must differ from the original image digest: %s", s.ArtifactStreamingImage)
+	}
+
+	return nil
+}
+
+func (s benchmarkState) gantryRuntimeImage() (string, error) {
+	if !s.ArtifactStreaming {
+		return s.GantryColdImage, nil
+	}
+	if err := s.validateArtifactStreamingImage(); err != nil {
+		return "", err
+	}
+
+	return s.ArtifactStreamingImage, nil
 }
 
 func (b *benchmark) saveState(ctx context.Context, state benchmarkState) error {

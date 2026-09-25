@@ -662,12 +662,17 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 
 // urlFor returns the full URL for an OriginRef.
 func (r *registry) urlFor(ref ifaces.OriginRef) string {
+	u := *r.base
+	basePath := strings.TrimRight(u.Path, "/")
+
 	switch ref.Kind {
 	case ifaces.KindManifest:
-		return r.base.String() + "/v2/" + ref.Repository + "/manifests/" + ref.Digest.String()
+		u.Path = basePath + "/v2/" + ref.Repository + "/manifests/" + ref.Digest.String()
 	default:
-		return r.base.String() + "/v2/" + ref.Repository + "/blobs/" + ref.Digest.String()
+		u.Path = basePath + "/v2/" + ref.Repository + "/blobs/" + ref.Digest.String()
 	}
+
+	return u.String()
 }
 
 // do issues a request, preferring request-scoped delegated Basic/Bearer auth. A

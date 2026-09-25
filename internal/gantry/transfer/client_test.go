@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c deliberate
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -245,6 +246,88 @@ func TestClientFetchRange(t *testing.T) {
 
 	if string(got) != string(body[5:]) {
 		t.Fatalf("body = %q, want %q", got, body[5:])
+	}
+}
+
+func TestClientFetchExactRange(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("peer-served bytes")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	addr := startTransferOnEphemeral(t, cache)
+
+	rc, size, contentType, err := NewClient().FetchRangeFromPeer(
+		registryauth.WithAuthorization(context.Background(), "Bearer must-not-be-forwarded"),
+		addr,
+		d,
+		httprange.Range{Start: 5, End: 10},
+	)
+	if err != nil {
+		t.Fatalf("FetchRangeFromPeer: %v", err)
+	}
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	if size != int64(len(body)) {
+		t.Fatalf("size = %d, want %d", size, len(body))
+	}
+
+	if contentType != "application/octet-stream" {
+		t.Fatalf("content type = %q, want application/octet-stream", contentType)
+	}
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != string(body[5:11]) {
+		t.Fatalf("body = %q, want %q", got, body[5:11])
+	}
+}
+
+func TestClientExactRangeDoesNotForwardAuthorization(t *testing.T) {
+	d := mustDigest([]byte("range"))
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+
+		w.Header().Set("Content-Range", "bytes 0-0/1")
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x")) //nolint:errcheck // best-effort write
+	}))
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	rc, _, _, err := NewClient().FetchRangeFromPeer(ctx, addr, d, httprange.Range{Start: 0, End: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = rc.Close() //nolint:errcheck // best-effort close
+}
+
+func TestClientRejectsInvalidExactRangeResponse(t *testing.T) {
+	d := mustDigest([]byte("range"))
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 1-2/10")
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("xx")) //nolint:errcheck // best-effort write
+	}))
+
+	rc, _, _, err := NewClient().FetchRangeFromPeer(
+		context.Background(), addr, d, httprange.Range{Start: 2, End: 3},
+	)
+	if rc != nil {
+		_ = rc.Close() //nolint:errcheck // best-effort close
+	}
+
+	var protocolErr *ifaces.ErrPeerProtocol
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("error = %T %v, want ErrPeerProtocol", err, err)
 	}
 }
 

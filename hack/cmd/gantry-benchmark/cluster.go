@@ -57,8 +57,8 @@ func (b *benchmark) validateContext(ctx context.Context) error {
 }
 
 func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
-	platformParts := strings.SplitN(b.config.ImagePlatform, "/", 2)
-	if len(platformParts) != 2 || platformParts[0] == "" || platformParts[1] == "" {
+	selector := b.config.nodeSelector()
+	if selector["kubernetes.io/os"] == "" || selector["kubernetes.io/arch"] == "" {
 		return nil, fmt.Errorf("image platform BENCHMARK_IMAGE_PLATFORM=%q must have os/architecture form", b.config.ImagePlatform)
 	}
 
@@ -74,9 +74,15 @@ func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
 
 	result := make([]string, 0, len(list.Items))
 	for _, node := range list.Items {
-		if node.Metadata.Labels["kubernetes.io/os"] != platformParts[0] ||
-			node.Metadata.Labels["kubernetes.io/arch"] != platformParts[1] ||
-			node.Spec.Unschedulable {
+		matches := true
+		for key, value := range selector {
+			if node.Metadata.Labels[key] != value {
+				matches = false
+
+				break
+			}
+		}
+		if !matches || node.Spec.Unschedulable {
 			continue
 		}
 

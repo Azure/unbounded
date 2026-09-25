@@ -101,7 +101,11 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	}
 
 	if !b.config.usesProxy() {
-		if err := validateDirectGantryRegistry([]byte(originalConfig), b.config.GantryACRLoginServer); err != nil {
+		if err := validateDirectGantryRegistry(
+			[]byte(originalConfig),
+			b.config.GantryACRLoginServer,
+			b.config.gantryUpstreamEndpoint(),
+		); err != nil {
 			return fmt.Errorf("validate dedicated Gantry ACR configuration: %w", err)
 		}
 	}
@@ -117,11 +121,13 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		GantryConfigMap:              b.config.GantryConfigMap,
 		MonitoringNamespace:          b.config.MonitoringNamespace,
 		PrometheusService:            b.config.PrometheusService,
+		NodePool:                     b.config.NodePool,
 		NodeCount:                    b.config.NodeCount,
 		ImagePlatform:                b.config.ImagePlatform,
 		ImageSizeMiB:                 b.config.ImageSizeMiB,
 		ImageLayers:                  b.config.ImageLayers,
 		WorkloadRepository:           b.config.WorkloadRepository,
+		ArtifactStreaming:            b.config.ArtifactStreaming,
 		BaselineACRLoginServer:       b.config.BaselineACRLoginServer,
 		GantryACRLoginServer:         b.config.GantryACRLoginServer,
 		ACRLoginServer:               b.config.ACRLoginServer,
@@ -149,6 +155,7 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		MonitoringLabel: b.config.KPSRelease,
 		NodeOS:          strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
 		NodeArch:        strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
+		NodePool:        b.config.NodePool,
 		ProxyImage:      b.config.ProxyImage,
 		ACRLoginServer:  b.config.ACRLoginServer,
 		RunID:           runID,
@@ -338,6 +345,7 @@ type proxyManifestData struct {
 	MonitoringLabel string
 	NodeOS          string
 	NodeArch        string
+	NodePool        string
 	ProxyImage      string
 	ACRLoginServer  string
 	RunID           string

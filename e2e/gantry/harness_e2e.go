@@ -51,6 +51,7 @@ type harness struct {
 	artifacts       string
 	manifests       string
 	containerEngine string
+	kindConfig      string
 	keepCluster     bool
 }
 
@@ -67,13 +68,15 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	manifests := renderGantryChart(t, root)
+	containerEngine := resolveContainerEngine(t)
 
 	return &harness{
 		t:               t,
 		repoRoot:        root,
 		artifacts:       artifacts,
 		manifests:       manifests,
-		containerEngine: resolveContainerEngine(t),
+		containerEngine: containerEngine,
+		kindConfig:      resolveKindConfig(root, containerEngine),
 		keepCluster:     os.Getenv("E2E_KEEP") == "1",
 	}
 }
@@ -125,6 +128,23 @@ func resolveContainerEngine(t *testing.T) string {
 	return engine
 }
 
+func resolveKindConfig(root, containerEngine string) string {
+	if configured := strings.TrimSpace(os.Getenv("GANTRY_E2E_KIND_CONFIG")); configured != "" {
+		if filepath.IsAbs(configured) {
+			return configured
+		}
+
+		return filepath.Join(root, configured)
+	}
+
+	name := "kind-config.yaml"
+	if containerEngine == "podman" {
+		name = "kind-config-rootless.yaml"
+	}
+
+	return filepath.Join(root, "e2e", "gantry", name)
+}
+
 // checkPrereqs fails the test fast if any required CLI is missing or
 // the configured container engine isn't running.
 func (h *harness) checkPrereqs() {
@@ -141,7 +161,7 @@ func (h *harness) checkPrereqs() {
 	}
 }
 
-// bootCluster creates the kind cluster declared by kind-config.yaml.
+// bootCluster creates the kind cluster declared by the selected config.
 // Idempotent: if a cluster with the same name already exists we use it.
 func (h *harness) bootCluster(ctx context.Context) {
 	h.t.Helper()
@@ -151,8 +171,9 @@ func (h *harness) bootCluster(ctx context.Context) {
 		return
 	}
 
-	cfg := filepath.Join(h.repoRoot, "e2e", "gantry", "kind-config.yaml")
-	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--wait", "120s"); err != nil {
+	h.t.Logf("creating kind cluster with %s", h.kindConfig)
+
+	if err := h.run(ctx, "kind", "create", "cluster", "--config", h.kindConfig, "--wait", "120s"); err != nil {
 		h.t.Fatalf("kind create cluster: %v", err)
 	}
 }
@@ -286,7 +307,14 @@ func (h *harness) kindNodes(ctx context.Context) []string {
 func (h *harness) workerNodes(ctx context.Context) []string {
 	h.t.Helper()
 
-	out, err := h.runOut(ctx, "kubectl", "get", "nodes", "-l", "!node-role.kubernetes.io/control-plane", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	args := []string{"get", "nodes"}
+	if h.containerEngine != "podman" {
+		args = append(args, "-l", "!node-role.kubernetes.io/control-plane")
+	}
+
+	args = append(args, "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+
+	out, err := h.runOut(ctx, "kubectl", args...)
 	if err != nil {
 		h.t.Fatalf("kubectl get nodes: %v", err)
 	}

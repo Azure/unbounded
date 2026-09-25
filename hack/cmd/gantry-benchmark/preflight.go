@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const registryManifestAccept = "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
@@ -42,6 +44,16 @@ func (b *benchmark) preflight(ctx context.Context) error {
 		return fmt.Errorf("benchmark state is %q, run prepare before preflight or disable the run", state.Status)
 	}
 
+	if state.ArtifactStreaming != b.config.ArtifactStreaming {
+		return fmt.Errorf("benchmark Artifact Streaming state=%t does not match BENCHMARK_ARTIFACT_STREAMING=%t", state.ArtifactStreaming, b.config.ArtifactStreaming)
+	}
+	if state.NodePool != b.config.NodePool {
+		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
+	}
+	if state.ArtifactStreaming && !state.StandaloneGantry {
+		return fmt.Errorf("Artifact Streaming requires prepare-gantry-standalone")
+	}
+
 	if _, _, err := state.preparedImages(); err != nil {
 		return err
 	}
@@ -56,6 +68,12 @@ func (b *benchmark) preflight(ctx context.Context) error {
 
 	if err := b.validateGantry(ctx); err != nil {
 		return err
+	}
+
+	if state.ArtifactStreaming {
+		if err := b.checkArtifactStreaming(ctx, state); err != nil {
+			return err
+		}
 	}
 
 	if state.AzureTelemetry {
@@ -89,6 +107,60 @@ func (b *benchmark) preflight(ctx context.Context) error {
 	writeAll(b.stdout, fmt.Sprintf("preflight passed for %s on %d nodes\n", state.RunID, b.config.NodeCount))
 
 	return nil
+}
+
+func (b *benchmark) checkArtifactStreaming(ctx context.Context, state benchmarkState) error {
+	for _, daemonSet := range []string{"gantry-containerd-config", "gantry-overlaybd-config"} {
+		if err := b.validateDaemonSet(ctx, b.config.GantryNamespace, daemonSet); err != nil {
+			return fmt.Errorf("validate Artifact Streaming %s: %w", daemonSet, err)
+		}
+	}
+
+	output, err := b.commands.Run(
+		ctx,
+		nil,
+		"kubectl", "-n", b.config.GantryNamespace,
+		"get", "configmap", b.config.GantryConfigMap,
+		"-o", "json",
+	)
+	if err != nil {
+		return err
+	}
+
+	var configMap struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(output, &configMap); err != nil {
+		return fmt.Errorf("decode Gantry ConfigMap: %w", err)
+	}
+
+	return validateArtifactStreamingGantryConfig(configMap.Data["config.yaml"], state.GantryACRLoginServer)
+}
+
+func validateArtifactStreamingGantryConfig(raw, registry string) error {
+	var config struct {
+		ArtifactStreamingEnabled bool `yaml:"artifact_streaming_enabled"`
+		UpstreamRegistries       []struct {
+			Name     string `yaml:"name"`
+			Endpoint string `yaml:"endpoint"`
+		} `yaml:"upstream_registries"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &config); err != nil {
+		return fmt.Errorf("decode Gantry configuration: %w", err)
+	}
+
+	if !config.ArtifactStreamingEnabled {
+		return fmt.Errorf("Gantry Artifact Streaming is disabled")
+	}
+
+	wantEndpoint := "http://127.0.0.1:8578?ns=" + registry
+	for _, upstream := range config.UpstreamRegistries {
+		if upstream.Name == registry && upstream.Endpoint == wantEndpoint {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("Gantry upstream %q is not chained through %q", registry, wantEndpoint)
 }
 
 func (b *benchmark) smokeProxy(ctx context.Context, state benchmarkState) error {

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -241,6 +242,19 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 		return err
 	}
 
+	if state.ArtifactStreaming {
+		if err := b.prepareArtifactStreaming(ctx, state, gantryImage); err != nil {
+			return err
+		}
+		streamingImage, err := b.resolveArtifactStreamingImage(ctx, state, gantryImage, standaloneGantryTaggedImage(state))
+		if err != nil {
+			return err
+		}
+
+		state.ArtifactStreamingPrepared = true
+		state.ArtifactStreamingImage = streamingImage
+	}
+
 	state.StandaloneGantry = true
 	state.BaselineImage = ""
 	state.GantryColdImage = gantryImage
@@ -257,6 +271,284 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("prepared standalone Gantry image for %s using random payload %s\n", state.RunID, payloadSHA))
+
+	return nil
+}
+
+func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, streamingImage, payloadSHA string) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare-gantry-standalone-adopt", state.Status)
+	}
+	if state.usesProxy() {
+		return fmt.Errorf("prepare-gantry-standalone-adopt requires direct dual-ACR mode")
+	}
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	repository, digestValue, err := splitImageReference(image, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("adopt standalone image: %w", err)
+	}
+	if repository != state.WorkloadRepository || !strings.HasPrefix(digestValue, "sha256:") {
+		return fmt.Errorf("adopted image must be a digest-pinned %s image", state.WorkloadRepository)
+	}
+	if parsed, err := digest.Parse(payloadSHA); err != nil || parsed.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("payload fingerprint %q must be a sha256 digest", payloadSHA)
+	}
+
+	if state.ArtifactStreaming {
+		state.ArtifactStreamingImage = streamingImage
+		if err := state.validateArtifactStreamingImage(); err != nil {
+			return err
+		}
+		if err := b.verifyArtifactStreamingImage(ctx, state, image); err != nil {
+			return err
+		}
+		state.ArtifactStreamingPrepared = true
+	}
+
+	state.StandaloneGantry = true
+	state.BaselineImage = ""
+	state.GantryColdImage = image
+	state.WorkloadPayloadSHA256 = payloadSHA
+	state.WorkloadComparisonMode = workloadComparisonRandomShape
+	state.Status = "images-prepared"
+
+	if _, _, err := state.preparedImages(); err != nil {
+		return err
+	}
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("adopted standalone Gantry image %s for %s\n", image, state.RunID))
+
+	return nil
+}
+
+func standaloneGantryTaggedImage(state benchmarkState) string {
+	tag := strings.ReplaceAll(state.RunID+"-gantry-fresh", "_", "-")
+
+	return fmt.Sprintf("%s/%s:%s", state.GantryACRLoginServer, state.WorkloadRepository, tag)
+}
+
+func (b *benchmark) resolveArtifactStreamingImage(
+	ctx context.Context,
+	state benchmarkState,
+	originalImage string,
+	taggedImage string,
+) (string, error) {
+	originalRepository, originalDigest, err := splitImageReference(originalImage, state.GantryACRLoginServer)
+	if err != nil {
+		return "", fmt.Errorf("resolve original image: %w", err)
+	}
+	taggedRepository, tag, err := splitImageReference(taggedImage, state.GantryACRLoginServer)
+	if err != nil {
+		return "", fmt.Errorf("resolve converted image tag: %w", err)
+	}
+	if originalRepository != state.WorkloadRepository || taggedRepository != state.WorkloadRepository {
+		return "", fmt.Errorf("Artifact Streaming image repositories must both be %q", state.WorkloadRepository)
+	}
+	if strings.HasPrefix(tag, "sha256:") {
+		return "", fmt.Errorf("converted image lookup must use a tag: %s", taggedImage)
+	}
+
+	commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	output, err := b.commands.Run(commandContext, nil,
+		"az", "acr", "manifest", "show-metadata",
+		"--registry", b.config.GantryACRName,
+		"--name", taggedRepository+":"+tag,
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s: %w", taggedImage, err)
+	}
+
+	var metadata struct {
+		Digest string `json:"digest"`
+	}
+	if err := json.Unmarshal(output, &metadata); err != nil {
+		return "", fmt.Errorf("decode converted Artifact Streaming manifest metadata: %w", err)
+	}
+	convertedDigest, err := digest.Parse(metadata.Digest)
+	if err != nil || convertedDigest.Algorithm() != digest.SHA256 {
+		return "", fmt.Errorf("converted Artifact Streaming manifest has invalid digest %q", metadata.Digest)
+	}
+	if metadata.Digest == originalDigest {
+		return "", fmt.Errorf("converted Artifact Streaming manifest digest still equals original image digest %s", originalDigest)
+	}
+
+	return fmt.Sprintf("%s/%s@%s", state.GantryACRLoginServer, taggedRepository, convertedDigest), nil
+}
+
+func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benchmarkState, imageReference string) error {
+	repository, digestValue, err := splitImageReference(imageReference, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("verify Artifact Streaming image: %w", err)
+	}
+	image := repository + "@" + digestValue
+
+	output, err := b.runArtifactStreamingCommand(ctx,
+		"operation", "show",
+		"--name", b.config.GantryACRName,
+		"--image", image,
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
+	}
+	if err := requireArtifactStreamingSucceeded(output); err != nil {
+		return fmt.Errorf("verify Artifact Streaming image %s: %w", image, err)
+	}
+
+	return nil
+}
+
+func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmarkState, imageReference string) error {
+	if b.config.GantryACRName == "" {
+		return fmt.Errorf("BENCHMARK_ARTIFACT_STREAMING requires GANTRY_ACR_NAME")
+	}
+
+	repository, digest, err := splitImageReference(imageReference, state.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("resolve Artifact Streaming image: %w", err)
+	}
+	if !strings.HasPrefix(digest, "sha256:") {
+		return fmt.Errorf("Artifact Streaming image must be digest-pinned: %s", imageReference)
+	}
+	image := repository + "@" + digest
+
+	updateOutput, err := b.runArtifactStreamingCommand(ctx,
+		"update",
+		"--name", b.config.GantryACRName,
+		"--repository", state.WorkloadRepository,
+		"--enable-streaming", "true",
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
+	}
+	if err := requireArtifactStreamingSucceeded(updateOutput); err != nil {
+		return fmt.Errorf("enable Artifact Streaming on repository %s: %w", state.WorkloadRepository, err)
+	}
+
+	createOutput, err := b.runArtifactStreamingCommand(ctx,
+		"create",
+		"--name", b.config.GantryACRName,
+		"--image", image,
+		"--no-wait",
+		"--only-show-errors",
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+	}
+	operation := artifactStreamingOperation{Status: "Submitted"}
+	lookupArgs := []string{"--image", image}
+	operationLabel := image
+	if len(bytes.TrimSpace(createOutput)) != 0 {
+		operation, err = parseArtifactStreamingOperation(createOutput)
+		if err != nil {
+			return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+		}
+		if operation.Status == "Succeeded" {
+			return nil
+		}
+		if operation.ID != "" {
+			lookupArgs = []string{"--repository", repository, "--id", operation.ID}
+			operationLabel = operation.ID
+		}
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationLabel, operation.Status))
+
+	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(b.config.ArtifactStreamingPoll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("Artifact Streaming conversion %s did not complete within %s", operationLabel, b.config.ArtifactStreamingTimeout)
+		case <-ticker.C:
+			statusArgs := []string{
+				"operation", "show",
+				"--name", b.config.GantryACRName,
+			}
+			statusArgs = append(statusArgs, lookupArgs...)
+			statusArgs = append(statusArgs,
+				"--only-show-errors",
+				"--output", "json",
+			)
+			statusOutput, err := b.runArtifactStreamingCommand(ctx, statusArgs...)
+			if err != nil {
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
+			}
+
+			operation, err = parseArtifactStreamingOperation(statusOutput)
+			if err != nil {
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
+			}
+			writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationLabel, operation.Status))
+
+			switch operation.Status {
+			case "Succeeded":
+				return nil
+			case "Failed", "Canceled", "Cancelled":
+				return fmt.Errorf("Artifact Streaming conversion %s ended with status %s", operationLabel, operation.Status)
+			}
+		}
+	}
+}
+
+func (b *benchmark) runArtifactStreamingCommand(ctx context.Context, args ...string) ([]byte, error) {
+	commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	commandArgs := append([]string{"acr", "artifact-streaming"}, args...)
+
+	return b.commands.Run(commandContext, nil, "az", commandArgs...)
+}
+
+type artifactStreamingOperation struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+func parseArtifactStreamingOperation(output []byte) (artifactStreamingOperation, error) {
+	var operation artifactStreamingOperation
+	if err := json.Unmarshal(output, &operation); err != nil {
+		return artifactStreamingOperation{}, fmt.Errorf("decode operation: %w", err)
+	}
+
+	return operation, nil
+}
+
+func requireArtifactStreamingSucceeded(output []byte) error {
+	operation, err := parseArtifactStreamingOperation(output)
+	if err != nil {
+		return err
+	}
+	if operation.Status != "Succeeded" {
+		return fmt.Errorf("operation status is %q, want Succeeded", operation.Status)
+	}
 
 	return nil
 }
@@ -605,6 +897,13 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return fmt.Errorf("benchmark state is %q, run preflight before run-gantry", state.Status)
 	}
 
+	if state.ArtifactStreaming != b.config.ArtifactStreaming {
+		return fmt.Errorf("benchmark Artifact Streaming state=%t does not match BENCHMARK_ARTIFACT_STREAMING=%t", state.ArtifactStreaming, b.config.ArtifactStreaming)
+	}
+	if state.NodePool != b.config.NodePool {
+		return fmt.Errorf("benchmark node pool state=%q does not match BENCHMARK_NODE_POOL=%q", state.NodePool, b.config.NodePool)
+	}
+
 	if err := b.requireLock(ctx, state.RunID); err != nil {
 		return err
 	}
@@ -622,6 +921,10 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	}
 
 	_, gantryImage, err := state.preparedImages()
+	if err != nil {
+		return err
+	}
+	runtimeImage, err := state.gantryRuntimeImage()
 	if err != nil {
 		return err
 	}
@@ -709,7 +1012,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 
 	writeAll(b.stdout, fmt.Sprintf("running Gantry-only cold pull on %d nodes\n", b.config.NodeCount))
 
-	job, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, gantryImage)
+	job, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, runtimeImage)
 	if err != nil {
 		return err
 	}
@@ -751,14 +1054,11 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := requireFinalLayerResponseTimestamps(diagnosticTimestamps, diagnosticsAfter.PodNodes); err != nil {
-		return err
-	}
-
 	diagnostics, err := subtractGantryDiagnosticSnapshots(diagnosticsBefore, diagnosticsAfter, diagnosticTimestamps)
 	if err != nil {
 		return err
 	}
+	b.warnIncompleteFinalLayerResponseTimestamps(diagnostics)
 
 	bytes, bytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, proxyPhaseTotals{}, metrics, job)
 

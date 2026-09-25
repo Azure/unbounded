@@ -4,7 +4,7 @@ Verify the agent rollout:
   kubectl -n {{ .Release.Namespace }} rollout status daemonset/gantry
 
 {{- if .Values.nodeConfig.enabled }}
-The chart continuously reconciles containerd's default Gantry mirror route:
+The chart continuously reconciles containerd's Gantry mirror route:
   kubectl -n {{ .Release.Namespace }} rollout status daemonset/gantry-containerd-config
 {{- else }}
 Containerd mirror routing is externally managed because nodeConfig.enabled=false.

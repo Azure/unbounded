@@ -54,6 +54,35 @@ type chairCoordStub struct {
 	onCall     func(ifaces.ChairAssignment)
 }
 
+type boundedChairCoordStub struct {
+	current atomic.Int32
+	maximum atomic.Int32
+	release chan struct{}
+	started chan struct{}
+}
+
+func (s *boundedChairCoordStub) PleasePullChair(_ context.Context, _ ifaces.PeerEndpoint, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest, _ ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	current := s.current.Add(1)
+	defer s.current.Add(-1)
+
+	for {
+		maximum := s.maximum.Load()
+		if current <= maximum || s.maximum.CompareAndSwap(maximum, current) {
+			break
+		}
+	}
+
+	s.started <- struct{}{}
+	<-s.release
+
+	outcomes := make([]ifaces.PleasePullOutcome, 0, len(digests))
+	for _, d := range digests {
+		outcomes = append(outcomes, ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted})
+	}
+
+	return outcomes, nil
+}
+
 func (s *chairCoordStub) PleasePullChair(_ context.Context, _ ifaces.PeerEndpoint, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -249,6 +278,106 @@ func TestChairPrefetchPreservesHolderToSeedRatio(t *testing.T) {
 
 	if calls != 4 {
 		t.Fatalf("chair calls = %d; want 4", calls)
+	}
+}
+
+func TestChairPrefetchUsesDeterministicCoordinators(t *testing.T) {
+	manifestDigest := digest.MustParse("sha256:edededededededededededededededededededededededededededededededed")
+	childDigest := digest.MustParse("sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+	snapshot := fullChairSnapshot(5)
+	coordinators := chairs.Rank(snapshot, manifestDigest)[:3]
+	coordinatorSet := make(map[ifaces.NodeID]struct{}, len(coordinators))
+	for _, chair := range coordinators {
+		coordinatorSet[chair.Holder.PeerID] = struct{}{}
+	}
+
+	callers := 0
+	for _, chair := range snapshot.Chairs {
+		coord := &chairCoordStub{}
+		resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+			Chairs:                      &chairSnapshotStub{snapshot: snapshot},
+			Discovery:                   &stubDisco{},
+			Coord:                       coord,
+			Inflight:                    inflight.New(inflight.DefaultStalls(), nil),
+			SelfPeerID:                  chair.Holder.PeerID,
+			CurrentEpoch:                func() int64 { return 5 },
+			HolderCount:                 chairs.Count,
+			SeedCount:                   chairs.SeedCount,
+			PrefetchCoordinatorReplicas: 3,
+		})
+
+		if err := resolver.PrefetchManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
+			Digest: childDigest,
+			Kind:   ifaces.KindBlob,
+		}}, "registry.example.com", "repo/image"); err != nil {
+			t.Fatalf("PrefetchManifestChildren for %s: %v", chair.Holder.PeerID, err)
+		}
+
+		coord.mu.Lock()
+		calls := len(coord.calls)
+		coord.mu.Unlock()
+
+		_, coordinator := coordinatorSet[chair.Holder.PeerID]
+		if coordinator {
+			callers++
+			if calls != chairs.SeedCount {
+				t.Fatalf("coordinator %s calls = %d, want %d", chair.Holder.PeerID, calls, chairs.SeedCount)
+			}
+		} else if calls != 0 {
+			t.Fatalf("non-coordinator %s made %d calls", chair.Holder.PeerID, calls)
+		}
+	}
+
+	if callers != 3 {
+		t.Fatalf("coordinator callers = %d, want 3", callers)
+	}
+}
+
+func TestChairPrefetchBoundsConcurrentGroups(t *testing.T) {
+	manifestDigest := digest.MustParse("sha256:edededededededededededededededededededededededededededededededed")
+	childDigest := digest.MustParse("sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+	snapshot := fullChairSnapshot(5)
+	coord := &boundedChairCoordStub{
+		release: make(chan struct{}),
+		started: make(chan struct{}, chairs.SeedCount),
+	}
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:                      &chairSnapshotStub{snapshot: snapshot},
+		Discovery:                   &stubDisco{},
+		Coord:                       coord,
+		Inflight:                    inflight.New(inflight.DefaultStalls(), nil),
+		SelfPeerID:                  "self",
+		CurrentEpoch:                func() int64 { return 5 },
+		HolderCount:                 chairs.Count,
+		SeedCount:                   chairs.SeedCount,
+		PrefetchMaxConcurrentGroups: 2,
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- resolver.PrefetchManifestChildren(context.Background(), manifestDigest, []coldstart.ChildDigest{{
+			Digest: childDigest,
+			Kind:   ifaces.KindBlob,
+		}}, "registry.example.com", "repo/image")
+	}()
+
+	for range 2 {
+		select {
+		case <-coord.started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for bounded prefetch groups")
+		}
+	}
+	if got := coord.maximum.Load(); got != 2 {
+		t.Fatalf("maximum concurrent groups = %d, want 2", got)
+	}
+
+	close(coord.release)
+	if err := <-done; err != nil {
+		t.Fatalf("PrefetchManifestChildren: %v", err)
+	}
+	if got := coord.maximum.Load(); got > 2 {
+		t.Fatalf("maximum concurrent groups = %d, want <= 2", got)
 	}
 }
 

@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/chairs"
@@ -35,23 +37,26 @@ type ChairClaimer interface {
 }
 
 type ChairOptions struct {
-	Chairs                ChairSnapshotCache
-	Discovery             Discovery
-	Coord                 ifaces.ChairCoordinator
-	LocalPull             ifaces.LocalChairPullStarter
-	Inflight              *inflight.Map
-	SelfPeerID            ifaces.NodeID
-	CurrentEpoch          func() int64
-	InstallHolder         func(chairs.Holder) error
-	Claimer               ChairClaimer
-	Logger                *slog.Logger
-	QueryTimeout          time.Duration
-	PollManifest          time.Duration
-	PollLayer             time.Duration
-	APITimeout            time.Duration
-	HolderCount           int
-	SeedCount             int
-	TrustedFailureClasses []ifaces.FailureClass
+	Chairs                      ChairSnapshotCache
+	Discovery                   Discovery
+	Coord                       ifaces.ChairCoordinator
+	LocalPull                   ifaces.LocalChairPullStarter
+	Inflight                    *inflight.Map
+	SelfPeerID                  ifaces.NodeID
+	CurrentEpoch                func() int64
+	InstallHolder               func(chairs.Holder) error
+	Claimer                     ChairClaimer
+	Logger                      *slog.Logger
+	QueryTimeout                time.Duration
+	PollManifest                time.Duration
+	PollLayer                   time.Duration
+	APITimeout                  time.Duration
+	HolderCount                 int
+	SeedCount                   int
+	PrefetchCoordinatorReplicas int
+	PrefetchMaxConcurrentGroups int
+	PrefetchDispatchJitter      time.Duration
+	TrustedFailureClasses       []ifaces.FailureClass
 	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
 	// were selectable, how many were contacted, and how many accepted. contacted
 	// above the effective scaled cohort means the resolver moved down the ranking,
@@ -66,7 +71,9 @@ type ChairOptions struct {
 	// outcome separates a clean reply from "deadline" (QueryTimeout expired),
 	// so a run can tell a binding deadline from slow transport: deadline
 	// outcomes pile up at QueryTimeout, transport shows a long ok tail.
-	OnChairCall func(kind, outcome string, seconds float64)
+	OnChairCall     func(kind, outcome string, seconds float64)
+	OnPrefetchBatch func(pullers, digests int)
+	OnPrefetchGroup func(target, outcome string)
 }
 
 type ChairResolver struct {
@@ -120,6 +127,10 @@ func NewChairResolver(opts ChairOptions) *ChairResolver {
 
 	if opts.APITimeout <= 0 {
 		opts.APITimeout = 5 * time.Second
+	}
+
+	if opts.PrefetchMaxConcurrentGroups <= 0 {
+		opts.PrefetchMaxConcurrentGroups = 64
 	}
 
 	if len(opts.TrustedFailureClasses) == 0 {
@@ -384,7 +395,7 @@ func (r *ChairResolver) reportDispatch(kind ifaces.OriginRefKind, reason string)
 	}
 }
 
-func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.Digest, children []ChildDigest, registry, repository string) error {
+func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
 	if registry == "" || repository == "" {
 		return fmt.Errorf("%w: registry=%q repository=%q", ErrPrefetchInvalid, registry, repository)
 	}
@@ -400,6 +411,11 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 
 	if err != nil {
 		return err
+	}
+
+	coordinators := chairs.Rank(snapshot, manifestDigest)
+	if !coordinatesChairPrefetch(r.opts.SelfPeerID, coordinators, r.opts.PrefetchCoordinatorReplicas) {
+		return nil
 	}
 
 	type groupKey struct {
@@ -454,13 +470,41 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 		return keys[i].kind < keys[j].kind
 	})
 
+	dispatchOffset, dispatchDelay := prefetchDispatchPlan(r.opts.SelfPeerID, manifestDigest, len(keys), r.opts.PrefetchDispatchJitter)
+	if len(keys) > 1 {
+		rotated := append([]groupKey(nil), keys[dispatchOffset:]...)
+		keys = append(rotated, keys[:dispatchOffset]...)
+	}
+
+	distinctPullers := make(map[ifaces.NodeID]struct{}, len(groups))
+	totalDigests := 0
+	for key, digests := range groups {
+		distinctPullers[key.peer] = struct{}{}
+		totalDigests += len(digests)
+	}
+	if r.opts.OnPrefetchBatch != nil {
+		r.opts.OnPrefetchBatch(len(distinctPullers), totalDigests)
+	}
+
+	if dispatchDelay > 0 {
+		timer := time.NewTimer(dispatchDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	var (
 		wg       sync.WaitGroup
-		failures int
-		mu       sync.Mutex
+		failures atomic.Int32
 	)
+	remoteSlots := make(chan struct{}, r.opts.PrefetchMaxConcurrentGroups)
 
-	for _, key := range keys {
+dispatchRemote:
+	for index, key := range keys {
 		key := key
 		chair := chairs.Chair{
 			ID:              key.chair,
@@ -470,27 +514,81 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 		}
 		digests := append([]digest.Digest(nil), groups[key]...)
 
+		select {
+		case remoteSlots <- struct{}{}:
+		case <-ctx.Done():
+			failures.Add(int32(len(keys) - index))
+
+			break dispatchRemote
+		}
+
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
+			defer func() { <-remoteSlots }()
 
 			outcomes, err := r.pullChair(ctx, chair, registry, repository, key.kind, digests)
 			if err != nil || !allChairOutcomesAccepted(outcomes) {
-				mu.Lock()
-				failures++
-				mu.Unlock()
+				failures.Add(1)
+				if r.opts.OnPrefetchGroup != nil {
+					r.opts.OnPrefetchGroup(prefetchTarget(r.opts.SelfPeerID, chair), "error")
+				}
+			} else if r.opts.OnPrefetchGroup != nil {
+				r.opts.OnPrefetchGroup(prefetchTarget(r.opts.SelfPeerID, chair), "success")
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	if failures > 0 {
-		return fmt.Errorf("%w: %d/%d groups errored", ErrPrefetchPartial, failures, len(keys))
+	if failures.Load() > 0 {
+		return fmt.Errorf("%w: %d/%d groups errored", ErrPrefetchPartial, failures.Load(), len(keys))
 	}
 
 	return nil
+}
+
+func coordinatesChairPrefetch(self ifaces.NodeID, ranked []chairs.Chair, replicas int) bool {
+	if replicas <= 0 || replicas >= len(ranked) {
+		return true
+	}
+
+	for _, chair := range ranked[:replicas] {
+		if chair.Holder.PeerID == self {
+			return true
+		}
+	}
+
+	return false
+}
+
+func prefetchDispatchPlan(self ifaces.NodeID, manifestDigest digest.Digest, groups int, maxJitter time.Duration) (int, time.Duration) {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(self))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(manifestDigest.String()))
+	dispatchHash := hasher.Sum64()
+
+	offset := 0
+	if groups > 1 {
+		offset = int(dispatchHash % uint64(groups))
+	}
+
+	delay := time.Duration(0)
+	if maxJitter > 0 {
+		delay = time.Duration(dispatchHash % uint64(maxJitter))
+	}
+
+	return offset, delay
+}
+
+func prefetchTarget(self ifaces.NodeID, chair chairs.Chair) string {
+	if chair.Holder.PeerID == self {
+		return "local"
+	}
+
+	return "remote"
 }
 
 func (r *ChairResolver) seedCount(selectable int) int {

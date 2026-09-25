@@ -3159,13 +3159,20 @@ func isDigestRef(ref string) bool { return strings.HasPrefix(ref, "sha256:") }
 // ListenAndServe runs the mirror on the configured loopback address. The
 // returned function stops the server gracefully.
 func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error) {
+	return s.ListenAndServeHandler(addr, s.Handler())
+}
+
+// ListenAndServeHandler runs a caller-composed handler on the mirror listener.
+// It allows other node-local protocols to share the loopback hostPort without
+// placing their request paths behind the OCI mirror's ServeMux.
+func (s *Server) ListenAndServeHandler(addr string, handler http.Handler) (func(context.Context) error, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: listen %s: %w", addr, err)
 	}
 
 	srv := &http.Server{
-		Handler:           s.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
