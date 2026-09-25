@@ -76,6 +76,7 @@ type Server struct {
 	auth    AuthenticationChallenger
 	logger  *slog.Logger
 	metrics metricsHooks
+	racer   RacerClient
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -817,6 +818,11 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+	}
+
+	if s.racer != nil || s.cfg.RacerEnabled {
+		s.serveRacer(w, r, upstream, repo, d, kind)
+		return
 	}
 
 	s.serveDigest(w, r, upstream, repo, d, kind)

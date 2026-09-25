@@ -98,7 +98,96 @@ derived from `hosts.toml.template` (substitute `${REGISTRY_SERVER}`
 with the registry's `https://...` URL). containerd reloads `certs.d`
 on its own; no restart needed.
 
-## What to verify after rollout
+## Opt-in Racer backend
+
+Set `GANTRY_RACER_ENABLED=true` in the Gantry process environment to use Racer.
+The default is `false`; an invalid boolean fails startup. This switch is
+environment-only: `racer_enabled` is not a YAML field and there is no CLI flag.
+The Racer cache name is fixed to `gantry`.
+
+Racer mode starts the SDK client, Gantry's registry origin callback, the OCI
+mirror, the operations endpoint, and optional existing loopback pprof endpoint.
+It does not start libp2p/DHT, Lease chairs, peer transfer, containerd storage or
+subscriptions, inventory advertisement, or legacy coordination and metrics.
+Mirror/operations listeners, upstream registries, logging, and pprof settings
+are still validated. Legacy-specific settings are not required in Racer mode;
+environment and YAML parsing still reject malformed values.
+
+### Provisioning
+
+Provision Racer separately with a cache named `gantry`, and expose these
+canonical paths to the Gantry process:
+
+| Path | Owner and purpose |
+| --- | --- |
+| `/run/racer/gantry/client/socket` | Racer serves this Unix socket; Gantry's SDK client connects to it. |
+| `/run/racer/gantry/origin/socket` | Gantry's SDK origin server creates this Unix socket; Racer connects to it for registry reads. |
+
+Create the parent directories before starting Gantry. The SDK neither creates
+nor changes them. Directories and their ancestors must not be symlinks or
+writable by untrusted peers. Gantry needs write access to the origin directory
+and permission to connect to the client socket. The origin socket uses SDK
+default mode `0600`, so arrange compatible process identities and mount
+visibility for Racer to connect. An existing origin path, including a stale
+socket, is refused; investigate and remove stale artifacts during provisioning
+before restarting. Shutdown removes only the socket created by that invocation.
+
+This is a process-level opt-in; the chart and Unbounded operator do not provision
+Racer, add its socket mounts, or enable the switch. Supply those deployment
+details in your own provisioning. Keep containerd's mirror route pointing to
+Gantry. Upstream configuration and registry credential negotiation remain with
+Gantry: the mirror uses its origin client for authentication probes, while
+content reads go through Racer and its Gantry origin callback. Racer errors
+never switch the Gantry agent back to its legacy backend or trigger direct
+content-origin fallback in the mirror.
+
+Digest-addressed GETs stream through Racer with bounded memory and SHA-256
+verification. The mirror withholds the final chunk until verification succeeds;
+stream failures abort the response. The SDK currently exposes full-object reads
+only: HEAD opens a stream, inspects up to 512 bytes for the OCI media type, then
+closes it; an open-ended blob resume reads and hashes the skipped prefix before
+returning the remainder. HEAD can therefore initiate a cache fill, and resumes
+can transfer extra bytes. Unsupported range forms are ignored as in the legacy
+mirror. Tags still return 503 for containerd to resolve through its existing
+registry host chain. Containerd's own origin fallback is unchanged.
+
+The origin callback identifies immutable versions by their quoted OCI digest
+and gives metadata a 24-hour admission TTL. It validates the configured registry,
+repository, pin, total size, and requested page. Registry HEAD must report a
+known size consistent with GET. Credentials travel separately from adapter
+metadata and cache keys. On a Racer 401, Gantry can repeat the bounded registry
+challenge probe; the SDK does not transport a remote origin's repository-specific
+`WWW-Authenticate` challenge, so only locally known or registry-level challenges
+can be recovered.
+
+Integration tests use `racersdk.NewFakeClient`, which exercises the real SDK
+client and origin protocol with a sequential fake page scheduler. The fake does
+not model distributed caching and does not establish interoperability with the
+unfinished Rust dataplane.
+
+### Readiness and shutdown
+
+`/livez` reports process liveness. `/readyz` and `/healthz` report whether both
+canonical Unix sockets recently accepted connections, polled every 250 ms with
+a shared 200 ms probe deadline. **Socket availability is not Racer readiness:**
+these probes do not verify cache provisioning, cluster health, origin
+registration, registry access, or a successful object fetch. The SDK has no
+origin-ready API. Validate an actual image pull as part of deployment checks.
+
+The mirror's startup gate returns 503 until the first successful socket check.
+Later socket failures make operations readiness fail; the mirror remains open
+and reports request failures through its normal Racer error handling. An origin
+startup or serve failure terminates the agent with an error. Essential mirror
+and operations HTTP failures also terminate it. SIGINT/SIGTERM clears readiness
+and drains HTTP requests, then cancels the origin server and closes the SDK
+client. Cleanup uses a 10-second HTTP/origin shutdown budget and force-closes
+HTTP connections when draining times out. Pprof remains diagnostic and optional.
+
+Racer mode exposes runtime/process metrics on `/metrics`, not legacy Gantry
+P2P or containerd metrics. Use Racer's own observability for its cache and
+cluster. The rollout checks below describe the default legacy backend.
+
+## What to verify after rollout (legacy backend)
 
 | Check | How |
 | --- | --- |

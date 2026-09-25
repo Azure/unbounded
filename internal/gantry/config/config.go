@@ -52,10 +52,14 @@ const (
 
 // Config is the typed configuration surface.
 //
-// Every field carries a yaml/json tag matching the file/env name and a comment
-// citing the design-doc section it derives from. Defaults are set by
+// Fields carry YAML tags matching the file names, except environment-only
+// switches such as RacerEnabled. Defaults are set by
 // NewDefault; see Validate for hard correctness constraints.
 type Config struct {
+	// RacerEnabled selects the Racer-backed agent. This opt-in is environment-only
+	// (GANTRY_RACER_ENABLED); the cache name is fixed to gantry.
+	RacerEnabled bool `yaml:"-"`
+
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -216,9 +220,8 @@ type Config struct {
 	// background origin pulls (storage_mode=containerd is the only
 	// supported mode; see).
 	//
-	// REQUIRED. Validate rejects an empty value when
-	// storage_mode=containerd (the only accepted storage_mode), which
-	// is enforced at startup. The default deploy manifests set it to
+	// REQUIRED in legacy mode, where Validate rejects an empty value.
+	// Racer mode does not use containerd. The default deploy manifests set it to
 	// "/run/containerd/containerd.sock"; operators on non-default
 	// socket paths override via `containerd_socket` in the ConfigMap
 	// or GANTRY_CONTAINERD_SOCKET in the environment. The agent will
@@ -471,6 +474,7 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
+		RacerEnabled:               false,
 		MirrorListen:               "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
@@ -618,6 +622,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 		}
 	}
 
+	setBool("RACER_ENABLED", &c.RacerEnabled)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
@@ -741,7 +746,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	// (Validate enforces it). YAML-only back-compat for these names
 	// lives in Config.StorageMode and Config.LegacyDeprecated.
 
-	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (REQUIRED; storage_mode=containerd is the only supported mode and Validate() rejects an empty value)")
+	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (required in legacy mode; unused with GANTRY_RACER_ENABLED=true)")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
 	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
@@ -834,7 +839,6 @@ func (c *Config) Validate() error {
 		}
 	}
 	mustAddr("mirror_listen", c.MirrorListen)
-	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
 	if c.PprofListen != "" {
@@ -875,44 +879,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Deprecated cache fields (CacheDir, CacheBudgetBytes,
-	// CacheForcedEvictionHeadroomPct, EvictionProviderCountThreshold)
-	// are no longer validated - they are silently ignored under
-	// storage_mode=containerd. Validation here would force operators
-	// to either keep sensible-looking values (defeating the
-	// "deprecated" signal) or remove them from their ConfigMap (a
-	// breaking change). We do neither; the fields exist as no-ops
-	// until a future major version removes them.
-
-	switch c.StorageMode {
-	case StorageModeContainerd:
-		// valid
-	case storageModeGantryCache:
-		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
-	case "":
-		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
-	default:
-		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
-	}
-
-	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
-		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
-	}
-
-	if c.StorageMode == StorageModeContainerd {
-		// mandates a 30m–120m TTL. We accept a wider
-		// range with warnings deferred to log; pure validation just
-		// requires positive values so the cleanup interval cannot
-		// degenerate into a tight loop.
-		if c.ContainerdLeaseTTL <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
-		}
-
-		if c.ContainerdLeaseCleanupInterval <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
-		}
-	}
-
 	if len(c.UpstreamRegistries) == 0 {
 		errs = append(errs, errors.New("upstream_registries: at least one entry required"))
 	}
@@ -940,6 +906,52 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
+		}
+	}
+
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
+	}
+
+	switch c.LogFormat {
+	case "json", "text":
+	default:
+		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
+	}
+
+	// Racer uses only the common listeners, registries, and logging settings.
+	if c.RacerEnabled {
+		return errors.Join(errs...)
+	}
+
+	mustAddr("transfer_listen", c.TransferListen)
+
+	// Deprecated cache fields remain accepted but unused.
+	switch c.StorageMode {
+	case StorageModeContainerd:
+		// valid
+	case storageModeGantryCache:
+		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
+	case "":
+		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
+	default:
+		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
+	}
+
+	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
+		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
+	}
+
+	if c.StorageMode == StorageModeContainerd {
+		// Positive values keep the cleanup loop from spinning.
+		if c.ContainerdLeaseTTL <= 0 {
+			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
+		}
+
+		if c.ContainerdLeaseCleanupInterval <= 0 {
+			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
 		}
 	}
 
@@ -1125,18 +1137,6 @@ func (c *Config) Validate() error {
 		if !validClasses[cls] {
 			errs = append(errs, fmt.Errorf("origin_failure_classes_trusted_cluster_wide: unknown class %q (valid: auth, not_found, rate_limited, transient)", cls))
 		}
-	}
-
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
-		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
-	}
-
-	switch c.LogFormat {
-	case "json", "text":
-	default:
-		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
 	// A chair publishes its dialable addresses on its Lease, and those are
