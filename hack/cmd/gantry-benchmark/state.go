@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -155,18 +157,25 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 
 func (s benchmarkState) validateArtifactStreamingImage() error {
 	if s.ArtifactStreamingImage == "" {
-		return fmt.Errorf("standalone Gantry run has no Artifact Streaming tag reference")
+		return fmt.Errorf("standalone Gantry run has no Artifact Streaming digest reference")
 	}
-	if strings.Contains(s.ArtifactStreamingImage, "@") {
-		return fmt.Errorf("Artifact Streaming runtime image must use a tag: %s", s.ArtifactStreamingImage)
+	if !strings.Contains(s.ArtifactStreamingImage, "@") {
+		return fmt.Errorf("Artifact Streaming runtime image must use a digest: %s", s.ArtifactStreamingImage)
 	}
 
-	repository, _, err := splitImageReference(s.ArtifactStreamingImage, s.GantryACRLoginServer)
+	repository, digestValue, err := splitImageReference(s.ArtifactStreamingImage, s.GantryACRLoginServer)
 	if err != nil {
 		return fmt.Errorf("invalid Artifact Streaming runtime image: %w", err)
 	}
 	if repository != s.WorkloadRepository {
 		return fmt.Errorf("Artifact Streaming runtime repository %q, want %q", repository, s.WorkloadRepository)
+	}
+	parsedDigest, err := digest.Parse(digestValue)
+	if err != nil || parsedDigest.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("Artifact Streaming runtime image must use a sha256 digest: %s", s.ArtifactStreamingImage)
+	}
+	if s.ArtifactStreamingImage == s.GantryColdImage {
+		return fmt.Errorf("Artifact Streaming runtime digest must differ from the original image digest: %s", s.ArtifactStreamingImage)
 	}
 
 	return nil
