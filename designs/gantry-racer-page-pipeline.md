@@ -147,6 +147,9 @@ or combined pipeline coverage.
 
 ## Phase 3 implementation handoff
 
+Historical pre-strict-kTLS results. The current merged transport contract and
+verification are recorded in the final appendix below.
+
 Implementation commit: `2b292fb4` (`perf(racer): serve admitted pages with
 pool-bounded early buffers`). This phase owns only `cmd/racer-dataplane` Rust
 files and this tracked design. The SDK/Gantry work was committed concurrently
@@ -291,6 +294,9 @@ verification. These tests establish ordering and ownership, not production
 throughput improvement.
 
 ## Phase 4: combined verification
+
+Historical verification before the strict-kTLS merge. In particular, optional
+offload flags and software-fallback descriptions below are not current behavior.
 
 Integration commit: `a66ee991`. Phase 4 did not delegate further. The parent owns
 the independent production review and parent-branch merge.
@@ -449,3 +455,116 @@ opt-in NUMA placement, scale campaigns, or the ignored production-duration
 timing lanes. No throughput improvement is claimed. Phase-4 core acceptance is
 implemented; parent merge readiness is conditional on the independent review
 and explicit acknowledgment of the two remaining baseline-suite failures.
+
+## Strict-kTLS merge verification (current)
+
+Verified merge `73b8dcb6d20d9a63ecb30f6e8dd78a112dcab330`, combining phase 4
+with strict-kTLS parent `70db0ded`. Current `src/tls_native.c:46-66` takes no
+offload flag and always requests kTLS; `src/tls.rs:831-846` rejects admission
+without both directions. Earlier TLS diagnoses above describe the pre-merge
+source/artifact mismatch only. Mandatory kTLS is now the intended native shim.
+
+### Artifact provenance
+
+Copied dependency artifacts into worktree-local `tmp/strict-target` using
+`cp -a --reflink=auto`, then ran `timeout -k 5s 60s cargo clean --manifest-path
+cmd/racer-dataplane/Cargo.toml --target-dir "$PWD/tmp/strict-target" -p racer-dataplane`.
+This removed the crate's Rust, build-script and native artifacts before rebuilding:
+
+```sh
+TMPDIR=/home/azureuser/code/unbounded/tmp GIT_COMMIT=73b8dcb6 \
+timeout -k 5s 180s cargo test --manifest-path cmd/racer-dataplane/Cargo.toml \
+  --target-dir "$PWD/tmp/strict-target" --locked --all-targets --no-run
+```
+
+Compilation passed, including both default benchmark targets. Disassembly of
+`racer_tls_configure` in the resulting library executable confirms the current
+OpenSSL >= 3.5 check and unconditional kTLS option. The main checkout's sources
+and native cache were not invalidated. The only compiler warnings were the two
+existing unused handshake `Progress` results in `tests/security/channel.rs:45-46`.
+
+### Bounded results
+
+Runtime commands used `TMPDIR=/home/azureuser/code/unbounded/tmp`,
+`RACER_REQUIRE_URING=1`, and `RUST_TEST_THREADS=2`. Let `T` be
+`tmp/strict-target/debug/deps/racer_dataplane-7c0a8706462bb89e`.
+
+| Command | Result |
+| --- | --- |
+| `timeout -k 5s 120s $T cache:: buffers:: metrics::` | Final: 68 passed, 3 ignored; applicable child helpers executed |
+| `timeout -k 5s 120s $T handlers:: http_server:: http_client::` | 68 passed, 16 ignored; includes early UDS handler, multi-page peers, strict encrypted HTTP and cancellation |
+| `timeout -k 5s 120s $T allocator::tests::` | 32 passed, 1 ignored throughput benchmark |
+| `timeout -k 5s 120s cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$PWD/tmp/strict-target" --locked --doc` | 73 passed |
+
+The first cache partition exposed an intermittent assertion in
+`tests/storage/cache_persistence.rs:688`: the waiter could finish its independent
+disk read before the first reader, but the test asserted it must still be
+pending. An isolated rerun and ten bounded repetitions passed before the fix;
+these did not erase the observed failure. The fixture now tracks both readers
+independently, retains both results, checks disk materialization and exact bytes,
+and bounds progress by the existing deadline. The final full cache/buffer/metrics
+partition above passed after rebuilding. No production-code change was needed.
+
+Prepared fresh harness receipts with `timeout -k 5s 180s python3
+hack/scripts/racer-test.py --artifacts tmp/strict-artifacts --build-timeout 150
+--test-timeout 60 compile controlplane dataplane`, using
+`RACER_CARGO_TARGET_DIR="$PWD/tmp/strict-target"` and
+`RACER_CONTROLPLANE_CARGO_TARGET_DIR=/home/azureuser/code/unbounded/cmd/racer-controlplane/target`.
+Then passed the complete current target:
+
+```sh
+RACER_TEST_ARTIFACT_DIR=tmp/strict-artifacts timeout -k 5s 120s \
+make racer-ktls-test RACER_CARGO_TARGET_DIR="$PWD/tmp/strict-target" \
+  RACER_CONTROLPLANE_CARGO_TARGET_DIR=/home/azureuser/code/unbounded/cmd/racer-controlplane/target \
+  RACER_TEST_TIMEOUT_SECONDS=60
+```
+
+All ten selections passed: mutual authentication, outbound/bootstrap and inbound
+missing-offload rejection, TLS 1.3 AES-GCM negotiation, sendfile, application/file
+KeyUpdate, actual offload rekey, failed inbound key replacement/reconnect, failed
+channel cached-admission rejection, and encrypted HTTP. Real io_uring, TX/RX kTLS,
+and socket-scoped seccomp fault injection executed on kernel `7.0.0-30-generic`.
+This does not establish execution on older kernels. The subsequent cache-test
+fix changes only its fixture; strict-TLS source and tests remained identical.
+
+### Fresh baseline investigation
+
+Created detached worktree `tmp/strict-baseline` at `70db0ded`, with its own
+`tmp/strict-baseline-target` dependency copy, then independently ran package clean
+and `timeout -k 5s 180s cargo test --manifest-path
+tmp/strict-baseline/cmd/racer-dataplane/Cargo.toml --target-dir
+"$PWD/tmp/strict-baseline-target" --locked --lib --no-run` with `GIT_COMMIT=70db0ded`.
+The two exact test filters were run on both fresh binaries under 60-second
+timeouts. Their source files are identical between baseline and merge.
+
+- Slab setup accounting fails identically at `tests/storage/slab_io_setup.rs:41`,
+  actual `(25, 90112)` versus expected `(13, 40960)`. The test assumes one new
+  shard, but `LayoutPlan::new(32 * WIDE, 1)` selects four
+  (`src/allocator/layout.rs:33-43`). Replacement writes and reads two roots per
+  shard (`src/allocator/slab.rs:24-31,46-54`): from `(8, 24576)`, seventeen more
+  operations and sixteen pages give exactly `(25, 90112)`. This is a preexisting
+  stale one-shard test expectation, left unchanged as requested.
+- Topology status fails identically at `tests/control/configuration.rs:68`,
+  actual `503` versus expected `502`, when the two binaries execute sequentially.
+  The fixture encodes hop rank eight (`:41-45`); the eight-slot runtime fixture
+  (`tests/runtime/scenarios.rs:87-91`) and frozen received-rank rejection
+  (`src/handlers.rs:640-654,1111-1113`) explain a capacity rejection. Busy maps to
+  503 (`src/http_auth.rs:105-114`). That causal explanation is an inference from
+  the path, not separately instrumented failure evidence. Initial parallel
+  baseline/merge runs collided on the fixture's fixed peer ports and produced
+  TLS/reset failures; those runs were discarded and replaced by sequential
+  runs. The verified unchanged 503/502 mismatch remains outside this scope.
+
+Both failures are now demonstrated against freshly built pre-pipeline strict-TLS
+sources, not merely the old saved binary. Neither expectation was weakened.
+Final library SHA-256: `792263eb93c422ba6d34d27b354a5fef6cf5310e43cab8f83c9561cc4a60ea88`;
+fresh `70db0ded` baseline: `03a56b061b19c737f501bc9ccaa3e6356e1aef7be5dda6ce24e83927325b1d8b`.
+
+Passed scoped `timeout -k 5s 120s make fmt
+GO_PACKAGE_PATTERNS=./internal/version/... GO_PACKAGE_DIRS=./internal/version`
+with Go 1.26.6 and project-local temporary directories (zero issues, no Go edits),
+`timeout -k 5s 60s make racer-dataplane-fmt-check`, and `git diff --check`.
+Go broad suites were not repeated because Go code is unchanged. Full deployed
+Gantry/SDK/Rust verification and throughput benchmarks remain absent. Affected
+merge checks pass after the fixture fix; parent review/merge must retain explicit
+awareness of the two verified preexisting failures.

@@ -689,42 +689,49 @@ mod persistence {
         let mut cache = cache(1);
         let meta = metadata(&cache, "/corrupt", 3, 0);
         drop(cache.page::<Fake>(&meta, 0, deadline()).unwrap());
-        let mut fault = cache.page(&meta, 0, deadline()).unwrap();
+        let fault = cache.page(&meta, 0, deadline()).unwrap();
         let key = fault.key;
         let bytes = buffer(ring.pool(), key, b"abc");
         cache.admit(&fault, &bytes, PageCrc::Supplied(0)).unwrap();
         drop(bytes);
         cache.shutdown(ring).unwrap();
         let mut upstream = Fake::default();
-        let mut waiter = cache.page(&meta, 0, deadline()).unwrap();
-        loop {
+        let waiter = cache.page(&meta, 0, deadline()).unwrap();
+        let mut readers = [Some(fault), Some(waiter)];
+        let mut completed = [None, None];
+        let mut disk = [false; 2];
+        let end = deadline();
+        while readers.iter().any(Option::is_some) {
+            assert!(Instant::now() < end, "disk readers stalled");
             ring.progress().unwrap();
             let mut work = cache.poll(ring, 1).unwrap();
-            match cache.poll_fault(fault, ring, &mut upstream).unwrap() {
-                Progress::Ready(bytes) => {
-                    assert_eq!(bytes.as_slice(), b"abc");
-                    // Independent materializations need not complete in the
-                    // same reactor turn. Keep driving the surviving reader.
-                    let (shared, disk) = resolve_checked(&mut cache, ring, &mut upstream, waiter);
-                    assert!(disk);
-                    assert_eq!(shared.as_slice(), bytes.as_slice());
-                    break;
-                }
-                Progress::Pending {
-                    fault: next,
-                    work: w,
-                } => {
-                    fault = next;
-                    work.merge(w);
+            // Independent materializations can complete in either order and
+            // on different reactor turns. Retain each result until both finish.
+            for (index, reader) in readers.iter_mut().enumerate() {
+                let Some(fault) = reader.take() else { continue };
+                disk[index] |= matches!(fault.state, Loading::Materializing(..));
+                match cache.poll_fault(fault, ring, &mut upstream).unwrap() {
+                    Progress::Ready(bytes) => {
+                        assert!(disk[index]);
+                        assert_eq!(bytes.as_slice(), b"abc");
+                        completed[index] = Some(bytes);
+                    }
+                    Progress::Pending { fault, work: next } => {
+                        *reader = Some(fault);
+                        work.merge(next);
+                    }
                 }
             }
-            let (next, w) = pending(cache.poll_fault(waiter, ring, &mut upstream).unwrap());
-            waiter = next;
-            work.merge(w);
-            if !work.runnable {
-                ring.wait(work.deadline).unwrap();
+            if readers.iter().any(Option::is_some) && !work.runnable {
+                ring.wait(Some(work.deadline.unwrap_or(end).min(end)))
+                    .unwrap();
             }
         }
+        assert_eq!(
+            completed[0].as_ref().unwrap().as_slice(),
+            completed[1].as_ref().unwrap().as_slice()
+        );
+        drop(completed);
         assert!(upstream.starts.is_empty());
         cache.scrub_at = Instant::now();
         let end = deadline();
