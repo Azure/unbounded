@@ -49,7 +49,7 @@ spec:
       volumes:
         - name: tls
           secret:
-            secretName: racer-controller-tls
+            secretName: {{ .ServingTLSSecret | default "racer-controller-tls" | quote }}
 ---
 apiVersion: v1
 kind: Service

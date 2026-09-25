@@ -9,10 +9,13 @@ compute placement/routes locally, and serve disposable encrypted cache pages.
 This document describes intended behavior. Phase 1 bounded codecs, canonical
 hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
 reconciliation, Phase 3 initialization/publication lifecycle, Phase 4 issuer
-and shared-key rotation, and Phase 5 token bootstrap/authenticated HTTPS serving
-are implemented. Workload construction remains a fail-closed Phase 6 stub.
+and shared-key rotation, Phase 5 token bootstrap/authenticated HTTPS serving,
+and Phase 6 server-side managed workload reconciliation are implemented.
 The initialize-only command and leader-scoped HTTPS service are operational;
-deployment must provide serving TLS files and the managed dataplane workload.
+deployment must provide serving TLS files, bootstrap server trust, and a compatible
+dataplane image. The repository's Rust dataplane remains a runtime scaffold;
+only its committed wire codecs and contract vectors are implemented. Phase 6
+does not implement a Rust control client, local identity logic, or transport.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -194,7 +197,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
    manager startup enqueue, and leadership cancellation (complete).
 4. Implement issuer/shared-key Secret rotation, including failure recovery (complete).
 5. Implement token bootstrap and mTLS serving with adversarial identity tests (complete).
-6. Implement the managed workload and Rust identity/TLS/projection boundaries.
+6. Implement server-side managed workload reconciliation and deployment wiring (complete).
 7. Exercise envtest integration, failover, rotation, and bounded fanout.
 
 Each step replaces stubs with meaningful success/failure/edge tests. Keep scaffold
@@ -243,7 +246,7 @@ composition tests; do not add tests that merely enumerate every placeholder.
   even for empty lists. Sources/workers are leader-scoped; cache synchronization
   precedes worker execution. Pod `spec.nodeName` is indexed; predicates ignore
   readiness/unrelated inputs and map relevant events to one singleton key.
-  Workload reconciliation remains Phase 6 work; keyring is implemented in Phase 4.
+  Workload reconciliation is implemented in server-only Phase 6; keyring in Phase 4.
 
 Targeted fake-client and race tests cover initialization crash ordering, ambiguous
 responses, CAS conflicts, cancellation before writes/install, counter transitions,
@@ -370,5 +373,52 @@ Phase 5 tests include real TLS enrollment/snapshots, strict errors/routes/bounds
 live UID/ownership/audience attacks, pooled trust retirement and expiry, disabled
 resumption, expired-identity recovery, poll expiration/cancellation, write-completion
 admission, API/body deadlines, listener startup/readiness and leadership shutdown.
-Scaffold composition tests remain; Phase 6 owns workload/Rust integration and
+Scaffold composition tests remain; Phase 6 owns server-side workload wiring and
 Phase 7 owns real API-server/election, projection, and capacity verification.
+
+## Phase 6 server-only workload and deployment handoff
+
+- `WorkloadReconciler` validates deployment configuration and creates the managed
+  DaemonSet from the startup singleton enqueue, including when no objects exist.
+  Normal `Run` validates workload configuration before constructing the manager;
+  initialize-only operation still does not require a dataplane image or endpoint.
+- Reconciliation uses authoritative reads and optimistic resource-version patches.
+  Conflicts and create races requeue for a fresh read; canceled leadership stops
+  writes. Foreign management labels or incompatible immutable selectors fail
+  closed. Terminating workloads are allowed to finish deletion before recreation.
+  The controller repairs the pod spec, including added privileges or volumes,
+  while preserving DaemonSet metadata and pod-template rollout annotations.
+- The managed service account has no API RBAC binding and automatic token mounting
+  is disabled. A dedicated projected token has audience `racer-control`, one-hour
+  requested lifetime, and mode 0400. The common Secret exposes only `bundle.json`
+  at `/etc/racer/keyring`; the issuer Secret is never mounted. Deployment server
+  trust is a distinct ConfigMap mounted at `/etc/racer/bootstrap/ca.crt`.
+  Projection mounts use directories without subPath so kubelet rotation is visible.
+- Node-local host directories are `/var/lib/racer/identity` (identity persistence),
+  `/var/lib/racer/slabs` (disposable slabs), and `/run/racer` (both socket endpoint
+  trees). They use `DirectoryOrCreate`; the pod runs as root with all capabilities
+  dropped, privilege escalation disabled, and a read-only root filesystem.
+  Private-key creation, file permissions, reload, and retirement remain client work.
+  Linux affinity excludes every Node carrying the exclusion label, regardless of
+  its value. The pod uses the supplied image's default entrypoint; no unsupported
+  `control` subcommand is injected. Environment paths are the deployment contract,
+  not evidence that the scaffold consumes them.
+- Existing manifests provide three controller replicas, leader-readiness Service
+  routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Templates
+  accept `ServingTLSSecret`, `BootstrapTrustConfigMap`, and `ControlURL` overrides.
+  Supply the serving TLS Secret externally. Supply the trust ConfigMap externally,
+  or render with `BootstrapCA` containing the public PEM CA bundle. An omitted
+  `BootstrapCA` emits no ConfigMap, preserving externally managed trust. It must
+  verify the controller Service hostname and must not be copied from rotating peer
+  roots. For example, the generic renderer accepts `--set BootstrapCA="$(cat ca.crt)"`
+  with `--templates-dir deploy/racer --output-dir deploy/racer/rendered` and the
+  same namespace, cluster UUID, and image settings used by `make racer-manifests`.
+  ConfigMap environment changes and serving certificate replacement require a
+  controller rollout; bootstrap trust remains a live projected directory.
+
+Phase 6 tests cover workload creation from startup enqueue, drift repair/no-op,
+ownership rejection, conflict/create-race recovery, cancellation after reads,
+credential/storage/affinity contracts, and rendered deployment/RBAC consistency.
+These are fake-client and render tests, not a claim of a working Rust client or
+end-to-end dataplane deployment. Real API-server defaulting/admission, election,
+projected-token rotation, and node filesystem integration remain Phase 7 checks.

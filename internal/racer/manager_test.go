@@ -52,12 +52,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	}
 	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
-			want := error(ErrUnimplemented)
-			if name == "topology" || name == "keyring" || name == "server" || name == "run" {
-				want = wire.InvalidRequest
-			}
-
-			if err := operation(); !errors.Is(err, want) {
+			if err := operation(); !errors.Is(err, wire.InvalidRequest) {
 				t.Fatalf("entry point did not fail closed: %v", err)
 			}
 		})

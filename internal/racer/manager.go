@@ -41,7 +41,7 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	return &Application{
 		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers)},
 		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle},
-		Workload:  &WorkloadReconciler{Client: c, Config: cfg},
+		Workload:  &WorkloadReconciler{Client: c, APIReader: reader, Config: cfg},
 		Server:    &Server{Config: cfg, APIReader: reader, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
 		Lifecycle: lifecycle,
 	}
@@ -81,6 +81,10 @@ func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
 func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+
+	if _, err := (&WorkloadReconciler{Config: cfg}).DesiredDaemonSet(); err != nil {
+		return fmt.Errorf("validate managed workload: %w", err)
 	}
 
 	scheme := runtime.NewScheme()
