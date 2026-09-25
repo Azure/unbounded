@@ -5,19 +5,164 @@
 //! only abandons its result; it cannot release submitted resources. Cancellation
 //! requests do not release them: original and cancellation completion accounting
 //! must both finish. Shutdown must fence kernel access before dropping the table.
-//! These are implementation requirements; this scaffold submits no I/O.
+//! The worker drives CQEs explicitly. Operation futures never run an executor.
 
-use super::{admission::Admission, deadline::RequestScope};
-use crate::error::{Operation, Result, deferred};
-use std::{any::Any, cell::RefCell, collections::HashMap, os::fd::OwnedFd, rc::Rc};
+use super::{
+    admission::{Admission, Reservation},
+    deadline::RequestScope,
+};
+use crate::{
+    error::{Error, Operation, Result},
+    model::limits::ResourceClass,
+};
+use io_uring::{IoUring, opcode, squeue, types};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    future::Future,
+    net::SocketAddr,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    path::PathBuf,
+    pin::Pin,
+    rc::Rc,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
 pub struct Reactor {
     admission: Rc<Admission>,
-    /// Type-erased `InFlight<B, L>` owners, never borrowed from a waiting future.
-    in_flight: RefCell<HashMap<IoId, Box<dyn Any>>>,
+    state: RefCell<State>,
 }
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IoId(pub u64);
+
+/// An owned address; the encoded sockaddr remains pinned in the in-flight owner.
+#[derive(Clone, Debug)]
+pub enum SocketAddress {
+    Inet(SocketAddr),
+    Unix(PathBuf),
+}
+
+const CANCEL_BIT: u64 = 1 << 63;
+const MAX_WAIT: Duration = Duration::from_millis(10);
+
+struct State {
+    ring: Option<IoUring>,
+    wake: Option<Arc<OwnedFd>>,
+    ring_reservation: Option<Reservation>,
+    entries: BTreeMap<IoId, Entry>,
+    next: u64,
+    scan_after: IoId,
+    stopped: bool,
+}
+
+/// Cloneable cross-thread wake endpoint for worker command/crypto producers.
+#[derive(Clone)]
+pub struct ReactorWake {
+    fd: Arc<OwnedFd>,
+}
+
+impl ReactorWake {
+    pub fn wake(&self) -> Result<()> {
+        let value = 1u64;
+        loop {
+            // SAFETY: eventfd consumes this initialized, stack-local u64 synchronously.
+            let result =
+                unsafe { libc::write(self.fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            if result == 8 {
+                return Ok(());
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return Ok(()), // Already readable.
+                _ => return Err(Error::Io),
+            }
+        }
+    }
+}
+
+struct Signal {
+    abandoned: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+struct Reply<T> {
+    result: Option<Result<T>>,
+    // Charge completed-but-unconsumed results as well as submitted work.
+    _reservation: Rc<Reservation>,
+}
+
+struct Waiting<T> {
+    reply: Rc<RefCell<Reply<T>>>,
+    signal: Rc<Signal>,
+}
+
+impl<T> Future for Waiting<T> {
+    type Output = Result<T>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(result) = self.reply.borrow_mut().result.take() {
+            Poll::Ready(result)
+        } else {
+            *self.signal.waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> Drop for Waiting<T> {
+    fn drop(&mut self) {
+        self.signal.abandoned.set(true);
+        self.signal.waker.borrow_mut().take();
+    }
+}
+
+enum KernelResult {
+    Value(i32),
+    Accepted(OwnedFd),
+}
+
+impl KernelResult {
+    fn value(self) -> Result<i32> {
+        match self {
+            Self::Value(value) if value >= 0 => Ok(value),
+            Self::Value(value) if value == -libc::ECANCELED => Err(Error::Cancelled),
+            _ => Err(Error::Io),
+        }
+    }
+}
+
+struct Entry {
+    // The finish closure owns every FD, buffer, lease and sockaddr backing.
+    finish: Box<dyn FnOnce(Result<KernelResult>) -> Option<Waker>>,
+    signal: Rc<Signal>,
+    scope: RequestScope,
+    original: Option<KernelResult>,
+    accept: bool,
+    cancel_reason: Option<Error>,
+    cancel_sent: bool,
+    cancel_done: bool,
+}
+
+impl Entry {
+    fn fenced(&self) -> bool {
+        self.original.is_some() && (!self.cancel_sent || self.cancel_done)
+    }
+    fn finish(mut self) -> Option<Waker> {
+        let original = self.original.take().expect("original CQE fenced");
+        let result = match self.cancel_reason {
+            Some(error) => {
+                drop(original);
+                Err(error)
+            }
+            None => Ok(original),
+        };
+        (self.finish)(result)
+    }
+}
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -84,8 +229,213 @@ impl Reactor {
     pub fn new(admission: Rc<Admission>) -> Self {
         Self {
             admission,
-            in_flight: RefCell::new(HashMap::new()),
+            state: RefCell::new(State {
+                ring: None,
+                wake: None,
+                ring_reservation: None,
+                entries: BTreeMap::new(),
+                next: 1,
+                scan_after: IoId(0),
+                stopped: false,
+            }),
         }
+    }
+
+    /// Explicit, idempotent kernel resource acquisition. Also called lazily on I/O.
+    pub fn init(&self) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.stopped {
+            return Err(Error::Unavailable);
+        }
+        if state.ring.is_some() {
+            return Ok(());
+        }
+        let capacity = self.admission.limits().queue_entries.get();
+        // One original and one cancel per admitted operation, with no multishot
+        // CQEs. Dedicated SQ/CQ headroom cannot be consumed by new data work.
+        let sq = u32::try_from(capacity.checked_mul(2).ok_or(Error::InvalidConfiguration)?)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        let cq = sq.checked_mul(2).ok_or(Error::InvalidConfiguration)?;
+        // Ring infrastructure is memory, not a permanently occupied control
+        // message. Cancellation headroom is structural and requires no new quota,
+        // even after ordinary admission stops or all request-context bytes fill.
+        let ring_bytes = (sq as usize)
+            .checked_next_power_of_two()
+            .and_then(|sq| sq.checked_mul(128))
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or(Error::InvalidConfiguration)?;
+        let ring_reservation =
+            self.admission
+                .reserve_completion(None, ResourceClass::RequestContext, ring_bytes)?;
+        let ring = IoUring::builder()
+            .setup_cqsize(cq)
+            .build(sq)
+            .map_err(|_| Error::Io)?;
+        // SAFETY: no borrowed pointers; ownership of the returned descriptor is unique.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(Error::Io);
+        }
+        state.wake = Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }));
+        state.ring_reservation = Some(ring_reservation);
+        state.ring = Some(ring);
+        Ok(())
+    }
+
+    /// Obtain after init, and attach to external worker queues before starting them.
+    pub fn waker(&self) -> Result<ReactorWake> {
+        self.init()?;
+        Ok(ReactorWake {
+            fd: self.state.borrow().wake.as_ref().unwrap().clone(),
+        })
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.state.borrow().entries.len()
+    }
+
+    fn submit<T: 'static>(
+        &self,
+        sqe: squeue::Entry,
+        scope: &RequestScope,
+        accept: bool,
+        finish: impl FnOnce(Result<KernelResult>) -> Result<T> + 'static,
+    ) -> Result<Waiting<T>> {
+        scope.check()?;
+        self.init()?;
+        let mut state = self.state.borrow_mut();
+        if state.stopped {
+            return Err(Error::Unavailable);
+        }
+        if state.entries.len() >= self.admission.limits().queue_entries.get() {
+            return Err(Error::Overloaded);
+        }
+        let reservation = Rc::new(self.admission.reserve_completion(
+            None,
+            ResourceClass::RequestContext,
+            std::mem::size_of::<Entry>()
+                + std::mem::size_of::<Reply<T>>()
+                + std::mem::size_of_val(&finish)
+                + std::mem::size_of::<Signal>()
+                + std::mem::size_of::<libc::sockaddr_storage>(),
+        )?);
+        let id = IoId(state.next);
+        if id.0 >= CANCEL_BIT {
+            return Err(Error::Overloaded);
+        }
+        state.next += 1;
+        let reply = Rc::new(RefCell::new(Reply {
+            result: None,
+            _reservation: reservation,
+        }));
+        let signal = Rc::new(Signal {
+            abandoned: Cell::new(false),
+            waker: RefCell::new(None),
+        });
+        let output = reply.clone();
+        let notify = signal.clone();
+        // Insert ownership BEFORE publishing the SQE. No fallible action may drop
+        // this entry after publication; even submission errors leave it retained.
+        state.entries.insert(
+            id,
+            Entry {
+                finish: Box::new(move |result| {
+                    let result = finish(result);
+                    if !notify.abandoned.get() {
+                        output.borrow_mut().result = Some(result);
+                    }
+                    let waker = notify.waker.borrow_mut().take();
+                    waker
+                }),
+                signal: signal.clone(),
+                scope: scope.clone(),
+                original: None,
+                accept,
+                cancel_reason: None,
+                cancel_sent: false,
+                cancel_done: false,
+            },
+        );
+        // SAFETY: the inserted entry owns all SQE backing until both CQEs arrive.
+        if unsafe {
+            state
+                .ring
+                .as_mut()
+                .unwrap()
+                .submission()
+                .push(&sqe.user_data(id.0))
+        }
+        .is_err()
+        {
+            state.entries.remove(&id);
+            return Err(Error::Overloaded);
+        }
+        // Submission itself is driven by poll_budgeted, so polling a future never
+        // executes potentially blocking file/socket operations on the worker.
+        Ok(Waiting { reply, signal })
+    }
+
+    fn buffer_io<'a, B: IoBuffer, L: 'static>(
+        &'a self,
+        file: Rc<OwnedFd>,
+        buffer: B,
+        lease: L,
+        scope: &'a RequestScope,
+        operation: BufferOperation,
+    ) -> Operation<'a, Completion<B, L>> {
+        Box::pin(async move {
+            scope.check()?;
+            let mut owned = InFlight {
+                file,
+                buffer,
+                lease,
+            };
+            let fd = types::Fd(owned.file.as_raw_fd());
+            // File issue may block on filesystem work; force it off the worker.
+            // Socket opcodes use io_uring's native nonblocking issue/poll path.
+            let sqe = match operation {
+                BufferOperation::Read(_) | BufferOperation::Recv => {
+                    let bytes = owned.buffer.bytes_mut()?;
+                    let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                    match operation {
+                        BufferOperation::Read(_) => opcode::Read::new(fd, bytes.as_mut_ptr(), len)
+                            .offset(offset_or_zero(operation))
+                            .build()
+                            .flags(squeue::Flags::ASYNC),
+                        _ => opcode::Recv::new(fd, bytes.as_mut_ptr(), len).build(),
+                    }
+                }
+                BufferOperation::Write(_) | BufferOperation::Send => {
+                    let bytes = owned.buffer.bytes()?;
+                    let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                    match operation {
+                        BufferOperation::Write(_) => opcode::Write::new(fd, bytes.as_ptr(), len)
+                            .offset(offset_or_zero(operation))
+                            .build()
+                            .flags(squeue::Flags::ASYNC),
+                        _ => opcode::Send::new(fd, bytes.as_ptr(), len)
+                            .flags(libc::MSG_NOSIGNAL)
+                            .build(),
+                    }
+                }
+            };
+            self.submit(sqe, scope, false, move |result| {
+                // Destructure inside the closure to retain the FD even when a
+                // caller drops its own last reference while this I/O is pending.
+                let InFlight {
+                    file,
+                    buffer,
+                    lease,
+                } = owned;
+                drop(file);
+                Ok(Completion {
+                    buffer,
+                    bytes: result?.value()? as usize,
+                    lease,
+                })
+            })?
+            .await
+        })
     }
     /// Transfer the FD, buffer, and any reuse-preventing lease (`()` if none).
     /// Owned resources can move from one completed operation to the next:
@@ -114,33 +464,1009 @@ impl Reactor {
     /// ```
     pub fn read_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        _file: Rc<OwnedFd>,
-        _offset: u64,
-        _buffer: B,
-        _lease: L,
-        _scope: &'a RequestScope,
+        file: Rc<OwnedFd>,
+        offset: u64,
+        buffer: B,
+        lease: L,
+        scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        deferred("reactor.read_at")
+        self.buffer_io(file, buffer, lease, scope, BufferOperation::Read(offset))
     }
     pub fn write_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        _file: Rc<OwnedFd>,
-        _offset: u64,
-        _buffer: B,
-        _lease: L,
-        _scope: &'a RequestScope,
+        file: Rc<OwnedFd>,
+        offset: u64,
+        buffer: B,
+        lease: L,
+        scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        deferred("reactor.write_at")
+        self.buffer_io(file, buffer, lease, scope, BufferOperation::Write(offset))
     }
-    pub fn cancel_and_fence(&self, _id: IoId) -> Operation<'_, ()> {
-        deferred("reactor.cancel_and_fence")
+
+    pub fn recv<'a, B: IoBuffer, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        buffer: B,
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, L>> {
+        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Recv)
     }
+
+    pub fn send<'a, B: IoBuffer, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        buffer: B,
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, L>> {
+        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Send)
+    }
+
+    pub fn readiness<'a>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        interest: u32,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, u32> {
+        Box::pin(async move {
+            if interest == 0 || interest & !((libc::POLLIN | libc::POLLOUT) as u32) != 0 {
+                return Err(Error::InvalidRequest);
+            }
+            let sqe = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build();
+            self.submit(sqe, scope, false, move |result| {
+                drop(fd);
+                Ok(result?.value()? as u32)
+            })?
+            .await
+        })
+    }
+
+    pub fn accept<'a>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, OwnedFd> {
+        Box::pin(async move {
+            let sqe = opcode::Accept::new(
+                types::Fd(fd.as_raw_fd()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+            .build();
+            self.submit(sqe, scope, true, move |result| {
+                drop(fd);
+                match result? {
+                    KernelResult::Accepted(fd) => Ok(fd),
+                    value => {
+                        value.value()?;
+                        Err(Error::Io)
+                    }
+                }
+            })?
+            .await
+        })
+    }
+
+    pub fn connect<'a>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        address: SocketAddress,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let (address, len) = encode_address(address)?;
+            let sqe = opcode::Connect::new(
+                types::Fd(fd.as_raw_fd()),
+                (&*address as *const libc::sockaddr_storage).cast(),
+                len,
+            )
+            .build();
+            self.submit(sqe, scope, false, move |result| {
+                drop((fd, address));
+                result?.value()?;
+                Ok(())
+            })?
+            .await
+        })
+    }
+
+    /// Process at most `budget` CQEs and inspect at most `budget` cancellation
+    /// candidates, round-robin. Returns CQEs consumed, including cancel CQEs.
+    pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
+        if budget == 0 {
+            return Ok(0);
+        }
+        let mut state = self.state.borrow_mut();
+        if state.ring.is_none() {
+            return Ok(0);
+        }
+        let mut finished = Vec::new();
+        let mut completed = 0;
+        while completed < budget {
+            let cqe = state.ring.as_mut().unwrap().completion().next();
+            let Some(cqe) = cqe else {
+                break;
+            };
+            completed += 1;
+            if let Some(entry) = state.complete(cqe.user_data(), cqe.result())? {
+                finished.push(entry);
+            }
+        }
+        let count = budget.min(state.entries.len());
+        for _ in 0..count {
+            let id = state
+                .entries
+                .range((
+                    std::ops::Bound::Excluded(state.scan_after),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .or_else(|| state.entries.first_key_value())
+                .map(|(id, _)| *id);
+            let Some(id) = id else {
+                break;
+            };
+            state.scan_after = id;
+            let stopped = state.stopped;
+            let entry = state.entries.get_mut(&id).unwrap();
+            if entry.cancel_reason.is_none() {
+                entry.cancel_reason = if stopped || entry.signal.abandoned.get() {
+                    Some(Error::Cancelled)
+                } else {
+                    entry.scope.check().err()
+                };
+            }
+            if entry.original.is_none() && entry.cancel_reason.is_some() && !entry.cancel_sent {
+                let sqe = opcode::AsyncCancel::new(id.0)
+                    .build()
+                    .user_data(id.0 | CANCEL_BIT);
+                // SAFETY: cancel uses only an ID, and its target entry is retained.
+                if unsafe { state.ring.as_mut().unwrap().submission().push(&sqe) }.is_ok() {
+                    state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                }
+            }
+        }
+        let submitted = state.ring.as_ref().unwrap().submit();
+        drop(state);
+        // Wakers may reenter the worker; never invoke under the reactor RefCell.
+        for entry in finished {
+            if let Some(waker) = entry.finish() {
+                waker.wake();
+            }
+        }
+        match submitted {
+            Ok(_) => Ok(completed),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
+                ) =>
+            {
+                Ok(completed)
+            }
+            Err(_) => Err(Error::Io),
+        }
+    }
+
+    /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
+    /// fallback for producers that cannot yet attach the eventfd wake endpoint.
+    pub fn wait(&self, duration: Duration) -> Result<()> {
+        let state = self.state.borrow();
+        let mut fds = [
+            libc::pollfd {
+                fd: state.ring.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: state.wake.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let duration = duration.min(MAX_WAIT);
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: duration.as_nanos() as libc::c_long,
+        };
+        // SAFETY: poll only borrows initialized descriptor/timeout arrays for this call.
+        let result = unsafe {
+            libc::ppoll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                &timeout,
+                std::ptr::null(),
+            )
+        };
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return Err(Error::Io);
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            let mut value = 0u64;
+            // SAFETY: nonblocking eventfd read into an initialized local u64.
+            unsafe {
+                libc::read(fds[1].fd, (&mut value as *mut u64).cast(), 8);
+            }
+        }
+        if fds
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    pub fn cancel_and_fence(&self, id: IoId) -> Operation<'_, ()> {
+        Box::pin(std::future::poll_fn(move |cx| {
+            let mut state = self.state.borrow_mut();
+            match state.entries.get_mut(&id) {
+                None => Poll::Ready(Ok(())),
+                Some(entry) => {
+                    entry.cancel_reason.get_or_insert(Error::Cancelled);
+                    // Self-wake avoids storing unbounded additional fence waiters.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }))
+    }
+
+    /// Close admission and cancel outstanding work. The worker must keep driving
+    /// poll_budgeted while awaiting this fence, including after request deadlines.
     pub fn drain(&self) -> Operation<'_, ()> {
-        deferred("reactor.drain")
+        Box::pin(std::future::poll_fn(move |cx| {
+            let mut state = self.state.borrow_mut();
+            state.stopped = true;
+            if state.entries.is_empty() {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }))
     }
+}
+
+#[derive(Clone, Copy)]
+enum BufferOperation {
+    Read(u64),
+    Write(u64),
+    Recv,
+    Send,
+}
+
+fn offset_or_zero(operation: BufferOperation) -> u64 {
+    match operation {
+        BufferOperation::Read(offset) | BufferOperation::Write(offset) => offset,
+        _ => 0,
+    }
+}
+
+impl State {
+    fn complete(&mut self, tag: u64, result: i32) -> Result<Option<Entry>> {
+        let id = IoId(tag & !CANCEL_BIT);
+        let entry = self.entries.get_mut(&id).ok_or(Error::Io)?;
+        if tag & CANCEL_BIT != 0 {
+            if !entry.cancel_sent || entry.cancel_done {
+                return Err(Error::Io);
+            }
+            entry.cancel_done = true; // ENOENT/EALREADY are also cancellation fences.
+        } else {
+            if entry.original.is_some() {
+                return Err(Error::Io);
+            }
+            entry.original = Some(if entry.accept && result >= 0 {
+                // SAFETY: successful single-shot accept CQE transfers a fresh FD.
+                KernelResult::Accepted(unsafe { OwnedFd::from_raw_fd(result) })
+            } else {
+                KernelResult::Value(result)
+            });
+            // Cancellation/deadline may precede this CQE without a cancel SQE.
+            if entry.cancel_reason.is_none() {
+                entry.cancel_reason = entry.scope.check().err();
+            }
+        }
+        if entry.fenced() {
+            Ok(self.entries.remove(&id))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        self.state.get_mut().stopped = true;
+        while self.in_flight() != 0 {
+            if self.poll_budgeted(256).is_err() || self.wait(MAX_WAIT).is_err() {
+                // Closing an io_uring FD alone is NOT a synchronous memory fence.
+                // On an unrecoverable driver failure retain the bounded owners and
+                // ring forever rather than free memory the kernel may still use.
+                let state = self.state.get_mut();
+                std::mem::forget(std::mem::take(&mut state.entries));
+                std::mem::forget(state.ring.take());
+                std::mem::forget(state.ring_reservation.take());
+                return;
+            }
+        }
+        // Every SQE (including cancellation SQEs) has now produced its CQE.
+        self.state.get_mut().ring.take();
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        // Also protect kernel ownership if an application lease destructor or a
+        // custom waker panics while Reactor::drop is driving its final fence.
+        if !self.entries.is_empty() {
+            std::mem::forget(std::mem::take(&mut self.entries));
+            std::mem::forget(self.ring.take());
+            std::mem::forget(self.ring_reservation.take());
+        }
+    }
+}
+
+fn encode_address(
+    address: SocketAddress,
+) -> Result<(Box<libc::sockaddr_storage>, libc::socklen_t)> {
+    // SAFETY: all-zero sockaddr storage is valid and sufficiently aligned for
+    // every supported sockaddr variant. Box keeps its address stable across moves.
+    let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
+    let len = match address {
+        SocketAddress::Inet(SocketAddr::V4(address)) => {
+            let value = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: address.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::write(
+                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
+                    value,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddress::Inet(SocketAddr::V6(address)) => {
+            let value = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as _,
+                sin6_port: address.port().to_be(),
+                sin6_flowinfo: address.flowinfo().to_be(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: address.ip().octets(),
+                },
+                sin6_scope_id: address.scope_id(),
+            };
+            unsafe {
+                std::ptr::write(
+                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
+                    value,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+        SocketAddress::Unix(path) => {
+            let bytes = path.as_os_str().as_bytes();
+            let mut value: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= value.sun_path.len() {
+                return Err(Error::InvalidRequest);
+            }
+            value.sun_family = libc::AF_UNIX as _;
+            for (dst, src) in value.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            unsafe {
+                std::ptr::write(
+                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_un>(),
+                    value,
+                );
+            }
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1
+        }
+    };
+    Ok((storage, len as libc::socklen_t))
 }
 
 #[cfg(test)]
 mod tests {
-    // Inject delayed and reordered CQEs, short I/O, cancellation, and shutdown.
+    use super::*;
+    use crate::{
+        model::{identity::RequestId, limits::Limits},
+        runtime::deadline::{Cancellation, Deadline},
+    };
+    use std::{num::NonZeroUsize, os::unix::net::UnixStream, time::Instant};
+
+    struct Buffer(Box<[u8]>, Rc<Cell<usize>>);
+    impl sealed::Sealed for Buffer {}
+    impl IoBuffer for Buffer {
+        fn bytes(&self) -> Result<&[u8]> {
+            Ok(&self.0)
+        }
+        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            Ok(&mut self.0)
+        }
+    }
+    impl Drop for Buffer {
+        fn drop(&mut self) {
+            self.1.set(self.1.get() + 1);
+        }
+    }
+    struct Lease(Rc<Cell<usize>>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    fn buffer(bytes: &[u8]) -> Buffer {
+        Buffer(bytes.into(), Rc::new(Cell::new(0)))
+    }
+    fn limits(capacity: usize) -> Limits {
+        let n = NonZeroUsize::new(1024 * 1024).unwrap();
+        Limits {
+            plaintext_bytes: n,
+            ciphertext_bytes: n,
+            dirty_bytes: n,
+            registered_bytes: n,
+            request_context_bytes: n,
+            flights: n,
+            waiters_per_flight: n,
+            queue_entries: NonZeroUsize::new(capacity).unwrap(),
+            connections_per_neighbor: n,
+            client_connections: n,
+            pipes: n,
+            range_window_pages: n,
+            replay_entries: n,
+            header_bytes: n,
+            route_search_work: n,
+            cached_rankings: n,
+            cached_paths: n,
+            retained_snapshots: n,
+            metadata_entries: n,
+            relay_transfers: n,
+        }
+    }
+    fn scope() -> RequestScope {
+        RequestScope {
+            request: RequestId([0; 16]),
+            deadline: Deadline(Instant::now() + Duration::from_secs(5)),
+            cancellation: Cancellation::new().unwrap(),
+        }
+    }
+    fn poll<T>(future: &mut Operation<'_, T>) -> Poll<Result<T>> {
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+    }
+    fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = poll(&mut future) {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "reactor failed to make progress");
+            reactor.poll_budgeted(8).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+    fn kernel_reactor(capacity: usize) -> Option<Reactor> {
+        // Skip only when the kernel lacks io_uring or policy denies ring creation.
+        // Configuration, quota, opcode, and ordinary I/O errors must fail tests.
+        match IoUring::new(2) {
+            Ok(ring) => drop(ring),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                eprintln!("io_uring kernel test unavailable: {error}");
+                return None;
+            }
+            Err(error) => panic!("unexpected io_uring setup failure: {error}"),
+        }
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(capacity))));
+        reactor.init().unwrap();
+        Some(reactor)
+    }
+
+    #[test]
+    fn constructor_does_not_open_kernel_resources() {
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+        assert!(reactor.state.borrow().ring.is_none());
+        assert!(reactor.state.borrow().wake.is_none());
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(reactor.poll_budgeted(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn delayed_and_reordered_cancel_cqes_retain_every_owner() {
+        for cancel_first in [false, true] {
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let fd = Rc::new(OwnedFd::from(socket));
+            let weak = Rc::downgrade(&fd);
+            let drops = Rc::new(Cell::new(0));
+            let owned = InFlight {
+                file: fd,
+                buffer: Buffer(vec![0; 32].into(), drops.clone()),
+                lease: Lease(drops.clone()),
+            };
+            let signal = Rc::new(Signal {
+                abandoned: Cell::new(false),
+                waker: RefCell::new(None),
+            });
+            let reservation = Rc::new(
+                reactor
+                    .admission
+                    .reserve(None, ResourceClass::RequestContext, 64)
+                    .unwrap(),
+            );
+            let reply = Rc::new(RefCell::new(Reply::<()> {
+                result: None,
+                _reservation: reservation.clone(),
+            }));
+            let waiting = Waiting {
+                reply: reply.clone(),
+                signal: signal.clone(),
+            };
+            reactor.state.borrow_mut().entries.insert(
+                IoId(1),
+                Entry {
+                    finish: Box::new(move |result| {
+                        drop((owned, reservation));
+                        assert!(matches!(result, Err(Error::Cancelled)));
+                        None
+                    }),
+                    scope: scope(),
+                    signal,
+                    original: None,
+                    accept: false,
+                    cancel_reason: Some(Error::Cancelled),
+                    cancel_sent: true,
+                    cancel_done: false,
+                },
+            );
+            drop(waiting);
+            drop(reply);
+            assert_eq!(drops.get(), 0);
+            let (first, second) = if cancel_first {
+                ((1 | CANCEL_BIT, 0), (1, -libc::ECANCELED))
+            } else {
+                ((1, 7), (1 | CANCEL_BIT, -libc::ENOENT))
+            };
+            assert!(
+                reactor
+                    .state
+                    .borrow_mut()
+                    .complete(first.0, first.1)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(drops.get(), 0);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(reactor.admission.used(ResourceClass::RequestContext), 64);
+            let done = reactor
+                .state
+                .borrow_mut()
+                .complete(second.0, second.1)
+                .unwrap()
+                .unwrap();
+            done.finish();
+            assert_eq!(drops.get(), 2);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(reactor.admission.used(ResourceClass::RequestContext), 0);
+        }
+    }
+
+    #[test]
+    fn sockaddr_encoding_is_owned_and_validated() {
+        let (address, len) =
+            encode_address(SocketAddress::Inet("127.0.0.1:1234".parse().unwrap())).unwrap();
+        assert_eq!(len as usize, std::mem::size_of::<libc::sockaddr_in>());
+        let value =
+            unsafe { &*(&*address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+        assert_eq!(value.sin_port, 1234u16.to_be());
+        assert_eq!(value.sin_addr.s_addr.to_ne_bytes(), [127, 0, 0, 1]);
+        let (address, _) =
+            encode_address(SocketAddress::Inet("[::1]:4321".parse().unwrap())).unwrap();
+        assert_eq!(address.ss_family, libc::AF_INET6 as libc::sa_family_t);
+        let (address, len) = encode_address(SocketAddress::Unix("/a/b".into())).unwrap();
+        assert_eq!(address.ss_family, libc::AF_UNIX as libc::sa_family_t);
+        assert_eq!(
+            len as usize,
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + 5
+        );
+        for path in [
+            PathBuf::new(),
+            PathBuf::from("a\0b"),
+            PathBuf::from("x".repeat(108)),
+        ] {
+            assert!(matches!(
+                encode_address(SocketAddress::Unix(path)),
+                Err(Error::InvalidRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn accepted_descriptor_is_retained_until_cancel_fence() {
+        use std::os::fd::IntoRawFd;
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = socket.into_raw_fd();
+        reactor.state.borrow_mut().entries.insert(
+            IoId(1),
+            Entry {
+                finish: Box::new(|result| {
+                    assert!(matches!(result, Err(Error::Cancelled)));
+                    None
+                }),
+                scope: scope(),
+                signal: Rc::new(Signal {
+                    abandoned: Cell::new(true),
+                    waker: RefCell::new(None),
+                }),
+                original: None,
+                accept: true,
+                cancel_reason: Some(Error::Cancelled),
+                cancel_sent: true,
+                cancel_done: false,
+            },
+        );
+        assert!(
+            reactor
+                .state
+                .borrow_mut()
+                .complete(1, fd)
+                .unwrap()
+                .is_none()
+        );
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        reactor
+            .state
+            .borrow_mut()
+            .complete(1 | CANCEL_BIT, -libc::ENOENT)
+            .unwrap()
+            .unwrap()
+            .finish();
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn delayed_short_success_and_error_return_only_on_original_cqe() {
+        for result in [3, -libc::EIO] {
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+            let delivered = Rc::new(Cell::new(None));
+            let output = delivered.clone();
+            let drops = Rc::new(Cell::new(0));
+            let lease = Lease(drops.clone());
+            reactor.state.borrow_mut().entries.insert(
+                IoId(1),
+                Entry {
+                    finish: Box::new(move |result| {
+                        output.set(Some(result.and_then(KernelResult::value)));
+                        drop(lease);
+                        None
+                    }),
+                    scope: scope(),
+                    signal: Rc::new(Signal {
+                        abandoned: Cell::new(false),
+                        waker: RefCell::new(None),
+                    }),
+                    original: None,
+                    accept: false,
+                    cancel_reason: None,
+                    cancel_sent: false,
+                    cancel_done: false,
+                },
+            );
+            assert_eq!(delivered.get(), None);
+            assert_eq!(drops.get(), 0);
+            reactor
+                .state
+                .borrow_mut()
+                .complete(1, result)
+                .unwrap()
+                .unwrap()
+                .finish();
+            assert_eq!(
+                delivered.get(),
+                Some(if result >= 0 { Ok(3) } else { Err(Error::Io) })
+            );
+            assert_eq!(drops.get(), 1);
+        }
+    }
+
+    #[test]
+    fn real_socket_short_io_readiness_eof_and_broken_pipe() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let scope = scope();
+        let (left, right) = UnixStream::pair().unwrap();
+        left.set_nonblocking(true).unwrap();
+        right.set_nonblocking(true).unwrap();
+        let left = Rc::new(OwnedFd::from(left));
+        let right = Rc::new(OwnedFd::from(right));
+        let sent = drive(
+            &reactor,
+            reactor.send(left.clone(), buffer(b"hello"), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(sent.bytes, 5);
+        let ready = drive(
+            &reactor,
+            reactor.readiness(right.clone(), libc::POLLIN as u32, &scope),
+        )
+        .unwrap();
+        assert_ne!(ready & libc::POLLIN as u32, 0);
+        let received = drive(
+            &reactor,
+            reactor.recv(right.clone(), buffer(&[0; 64]), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(received.bytes, 5);
+        assert_eq!(&received.buffer.bytes().unwrap()[..5], b"hello");
+        drop(left);
+        assert_eq!(
+            drive(
+                &reactor,
+                reactor.recv(right.clone(), buffer(&[0; 64]), (), &scope)
+            )
+            .unwrap()
+            .bytes,
+            0
+        );
+        assert!(matches!(
+            drive(&reactor, reactor.send(right, buffer(b"x"), (), &scope)),
+            Err(Error::Io)
+        ));
+    }
+
+    #[test]
+    fn real_tcp_accept_connect() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let scope = scope();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = Rc::new(OwnedFd::from(listener));
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        assert!(raw >= 0);
+        let client = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut accept = reactor.accept(listener, &scope);
+        assert!(poll(&mut accept).is_pending());
+        drive(
+            &reactor,
+            reactor.connect(client.clone(), SocketAddress::Inet(address), &scope),
+        )
+        .unwrap();
+        let server = Rc::new(drive(&reactor, accept).unwrap());
+        drive(
+            &reactor,
+            reactor.send(client, buffer(b"connected"), (), &scope),
+        )
+        .unwrap();
+        let received = drive(&reactor, reactor.recv(server, buffer(&[0; 32]), (), &scope)).unwrap();
+        assert_eq!(
+            &received.buffer.bytes().unwrap()[..received.bytes],
+            b"connected"
+        );
+    }
+
+    #[test]
+    fn real_unix_connect_keeps_sockaddr_alive() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let scope = scope();
+        // Linux exposes an unnamed Unix listener's autobound abstract name via
+        // getsockname, but SocketAddress::Unix intentionally means a filesystem
+        // path. Use a process-unique socket in the existing build directory.
+        let path =
+            PathBuf::from("target").join(format!("reactor-unix-{}.sock", std::process::id()));
+        struct RemoveSocket(PathBuf);
+        impl Drop for RemoveSocket {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _cleanup = RemoveSocket(path.clone());
+        listener.set_nonblocking(true).unwrap();
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        assert!(raw >= 0);
+        let client = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut accept = reactor.accept(Rc::new(listener.into()), &scope);
+        assert!(poll(&mut accept).is_pending());
+        drive(
+            &reactor,
+            reactor.connect(client.clone(), SocketAddress::Unix(path), &scope),
+        )
+        .unwrap();
+        let server = Rc::new(drive(&reactor, accept).unwrap());
+        drive(&reactor, reactor.send(client, buffer(b"unix"), (), &scope)).unwrap();
+        let received = drive(&reactor, reactor.recv(server, buffer(&[0; 32]), (), &scope)).unwrap();
+        assert_eq!(&received.buffer.bytes().unwrap()[..received.bytes], b"unix");
+    }
+
+    #[test]
+    fn real_cancellation_abandonment_limits_and_drop_fence() {
+        let Some(reactor) = kernel_reactor(1) else {
+            return;
+        };
+        let scope = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = Rc::new(OwnedFd::from(socket));
+        let weak = Rc::downgrade(&fd);
+        let drops = Rc::new(Cell::new(0));
+        let mut receive = reactor.recv(
+            fd.clone(),
+            Buffer(vec![0; 32].into(), drops.clone()),
+            Lease(drops.clone()),
+            &scope,
+        );
+        assert!(poll(&mut receive).is_pending());
+        reactor.poll_budgeted(1).unwrap();
+        assert_eq!(drops.get(), 0);
+        let mut overflow = reactor.recv(fd.clone(), buffer(&[0; 1]), (), &scope);
+        assert!(matches!(
+            poll(&mut overflow),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        drop(overflow);
+        assert_eq!(reactor.poll_budgeted(0).unwrap(), 0);
+        drop(receive);
+        drop(fd);
+        assert_eq!(drops.get(), 0);
+        assert!(weak.upgrade().is_some());
+        // Drop must submit cancellation and consume both CQEs before ownership ends.
+        drop(reactor);
+        assert_eq!(drops.get(), 2);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn real_deadline_and_explicit_cancel_fences() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let scope = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = Rc::new(OwnedFd::from(socket));
+        let mut ready = reactor.readiness(fd.clone(), libc::POLLIN as u32, &scope);
+        assert!(poll(&mut ready).is_pending());
+        let id = *reactor.state.borrow().entries.first_key_value().unwrap().0;
+        drive(&reactor, reactor.cancel_and_fence(id)).unwrap();
+        assert!(matches!(
+            poll(&mut ready),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        let short = RequestScope {
+            deadline: Deadline(Instant::now() + Duration::from_millis(20)),
+            ..scope.clone()
+        };
+        assert!(matches!(
+            drive(
+                &reactor,
+                reactor.readiness(fd.clone(), libc::POLLIN as u32, &short)
+            ),
+            Err(Error::DeadlineExceeded)
+        ));
+        scope.cancel().unwrap();
+        assert!(matches!(
+            drive(&reactor, reactor.recv(fd, buffer(&[0; 1]), (), &scope)),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    fn real_offset_file_io_and_quota_release() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let scope = scope();
+        let baseline = reactor.admission.used(ResourceClass::RequestContext);
+        // Anonymous memory-backed regular file avoids filesystem fixture side effects.
+        let raw = unsafe { libc::memfd_create(c"reactor-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let written = drive(
+            &reactor,
+            reactor.write_at(fd.clone(), 7, buffer(b"payload"), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 7);
+        let read = drive(
+            &reactor,
+            reactor.read_at(fd, 7, buffer(&[0; 32]), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read.bytes, 7);
+        assert_eq!(&read.buffer.bytes().unwrap()[..7], b"payload");
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            baseline
+        );
+    }
+
+    #[test]
+    fn real_external_wake_is_persistent_and_bounded() {
+        let Some(reactor) = kernel_reactor(1) else {
+            return;
+        };
+        let wake = reactor.waker().unwrap();
+        std::thread::spawn(move || wake.wake().unwrap())
+            .join()
+            .unwrap();
+        let fd = reactor.state.borrow().wake.as_ref().unwrap().as_raw_fd();
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        reactor.wait(Duration::from_secs(60)).unwrap();
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+    }
+
+    #[test]
+    fn real_drain_io_preserves_control_capacity_after_admission_stop() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 0);
+        let control = reactor
+            .admission
+            .reserve(None, ResourceClass::ControlProgress, 2)
+            .unwrap();
+        reactor.admission.stop();
+        let scope = scope();
+        let (left, right) = UnixStream::pair().unwrap();
+        let left = Rc::new(OwnedFd::from(left));
+        let right = Rc::new(OwnedFd::from(right));
+        drive(&reactor, reactor.send(left, buffer(b"drain"), (), &scope)).unwrap();
+        let read = drive(
+            &reactor,
+            reactor.recv(right.clone(), buffer(&[0; 8]), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(&read.buffer.bytes().unwrap()[..read.bytes], b"drain");
+        let mut pending = reactor.readiness(right, libc::POLLOUT as u32, &scope);
+        assert!(poll(&mut pending).is_pending());
+        drive(&reactor, reactor.drain()).unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        assert!(matches!(
+            poll(&mut pending),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        assert_eq!(reactor.init(), Err(Error::Unavailable));
+        assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 2);
+        drop(control);
+    }
 }
