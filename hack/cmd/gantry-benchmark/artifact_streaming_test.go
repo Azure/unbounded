@@ -116,6 +116,40 @@ func TestPrepareArtifactStreamingPollsOperation(t *testing.T) {
 	}
 }
 
+func TestPrepareArtifactStreamingPollsByImageWhenCreateOutputIsEmpty(t *testing.T) {
+	runner := &artifactStreamingPollingRunner{outputs: [][]byte{
+		[]byte(`{"status":"Succeeded"}`),
+		nil,
+		[]byte(`{"status":"Succeeded"}`),
+	}}
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			GantryACRName:            "benchstreamacr",
+			ArtifactStreamingTimeout: time.Second,
+			ArtifactStreamingPoll:    time.Millisecond,
+		},
+		commands: runner,
+		stdout:   io.Discard,
+	}
+	state := benchmarkState{
+		WorkloadRepository:   "gantry-benchmark-pull",
+		GantryACRLoginServer: "benchstreamacr.azurecr.io",
+	}
+	image := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	if err := benchmark.prepareArtifactStreaming(context.Background(), state, image); err != nil {
+		t.Fatalf("prepareArtifactStreaming: %v", err)
+	}
+
+	status := runner.commands[2]
+	if !slices.Contains(status.args, "--image") || !slices.Contains(status.args, "gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Fatalf("status command = %s %v", status.name, status.args)
+	}
+	if slices.Contains(status.args, "--repository") || slices.Contains(status.args, "--id") {
+		t.Fatalf("status command mixes image and operation ID lookup: %v", status.args)
+	}
+}
+
 func TestArtifactStreamingConfigIsOptIn(t *testing.T) {
 	classic, err := loadBenchmarkConfig(envFromMap(nil))
 	if err != nil {

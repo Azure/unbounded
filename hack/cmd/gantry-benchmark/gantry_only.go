@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -309,19 +310,24 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 	if err != nil {
 		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
 	}
-	operation, err := parseArtifactStreamingOperation(createOutput)
-	if err != nil {
-		return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+	operation := artifactStreamingOperation{Status: "Submitted"}
+	lookupArgs := []string{"--image", image}
+	operationLabel := image
+	if len(bytes.TrimSpace(createOutput)) != 0 {
+		operation, err = parseArtifactStreamingOperation(createOutput)
+		if err != nil {
+			return fmt.Errorf("convert image %s for Artifact Streaming: %w", image, err)
+		}
+		if operation.Status == "Succeeded" {
+			return nil
+		}
+		if operation.ID != "" {
+			lookupArgs = []string{"--repository", repository, "--id", operation.ID}
+			operationLabel = operation.ID
+		}
 	}
-	if operation.Status == "Succeeded" {
-		return nil
-	}
-	if operation.ID == "" {
-		return fmt.Errorf("convert image %s for Artifact Streaming: operation has no ID and status %q", image, operation.Status)
-	}
-	operationID := operation.ID
 
-	writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationID, operation.Status))
+	writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationLabel, operation.Status))
 
 	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
 	defer deadline.Stop()
@@ -333,31 +339,33 @@ func (b *benchmark) prepareArtifactStreaming(ctx context.Context, state benchmar
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("Artifact Streaming conversion %s did not complete within %s", operationID, b.config.ArtifactStreamingTimeout)
+			return fmt.Errorf("Artifact Streaming conversion %s did not complete within %s", operationLabel, b.config.ArtifactStreamingTimeout)
 		case <-ticker.C:
-			statusOutput, err := b.runArtifactStreamingCommand(ctx,
+			statusArgs := []string{
 				"operation", "show",
 				"--name", b.config.GantryACRName,
-				"--repository", repository,
-				"--id", operationID,
+			}
+			statusArgs = append(statusArgs, lookupArgs...)
+			statusArgs = append(statusArgs,
 				"--only-show-errors",
 				"--output", "json",
 			)
+			statusOutput, err := b.runArtifactStreamingCommand(ctx, statusArgs...)
 			if err != nil {
-				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationID, err)
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
 			}
 
 			operation, err = parseArtifactStreamingOperation(statusOutput)
 			if err != nil {
-				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationID, err)
+				return fmt.Errorf("read Artifact Streaming conversion %s: %w", operationLabel, err)
 			}
-			writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationID, operation.Status))
+			writeAll(b.stdout, fmt.Sprintf("Artifact Streaming conversion %s status=%s\n", operationLabel, operation.Status))
 
 			switch operation.Status {
 			case "Succeeded":
 				return nil
 			case "Failed", "Canceled", "Cancelled":
-				return fmt.Errorf("Artifact Streaming conversion %s ended with status %s", operationID, operation.Status)
+				return fmt.Errorf("Artifact Streaming conversion %s ended with status %s", operationLabel, operation.Status)
 			}
 		}
 	}
