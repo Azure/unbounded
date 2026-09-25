@@ -72,11 +72,11 @@ func validOriginData(data []byte) bool {
 var _ sdk.ResolvedRangeStore = (*Origin)(nil)
 
 type resolvedRange struct {
-	origin     *Origin
-	ref        ifaces.OriginRef
-	meta       sdk.Metadata
-	originData []byte
-	remote     bool
+	origin               *Origin
+	ref                  ifaces.OriginRef
+	meta                 sdk.Metadata
+	originData           []byte
+	metadataFromRegistry bool
 }
 
 func (r *resolvedRange) Metadata() sdk.Metadata { return r.meta }
@@ -114,8 +114,8 @@ func (o *Origin) ResolveRange(ctx context.Context, target string, originData []b
 		}
 	}
 
-	remote := size < 0
-	if remote {
+	metadataFromRegistry := size < 0
+	if metadataFromRegistry {
 		meta, headErr := o.Registry.HeadMetadata(originContext(ctx, originData), ref)
 		if headErr != nil {
 			return nil, originError(headErr)
@@ -132,7 +132,7 @@ func (o *Origin) ResolveRange(ctx context.Context, target string, originData []b
 	ttl := MetadataTTL
 
 	return &resolvedRange{
-		origin: o, ref: ref, originData: originData, remote: remote,
+		origin: o, ref: ref, originData: originData, metadataFromRegistry: metadataFromRegistry,
 		meta: sdk.Metadata{Size: size, ETag: `"` + ref.Digest.Hex() + `"`, ContentType: contentType, TTL: &ttl},
 	}, nil
 }
@@ -161,9 +161,9 @@ func (r *resolvedRange) OpenRange(ctx context.Context, offset, length int64) (io
 			}
 
 			seeker, ok := body.(io.Seeker)
-			// A local object may have appeared after remote resolution. Require
+			// A local object may have appeared after registry metadata resolution. Require
 			// known, matching representation metadata before using it.
-			if ok && r.remote {
+			if ok && r.metadataFromRegistry {
 				desc, err := o.Local.Descriptor(ctx, ref.Digest)
 
 				var missing *ifaces.ErrNotFound
@@ -202,7 +202,7 @@ func (r *resolvedRange) OpenRange(ctx context.Context, offset, length int64) (io
 
 	ctx = originContext(ctx, r.originData)
 
-	if !r.remote {
+	if !r.metadataFromRegistry {
 		meta, err := o.Registry.HeadMetadata(ctx, ref)
 		if err != nil {
 			return nil, originError(err)

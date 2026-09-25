@@ -36,9 +36,8 @@ func NewRacer(cfg *config.Config, auth AuthenticationChallenger, backend *gantry
 	return configureServer(&Server{auth: auth, racer: state}, cfg, opts...)
 }
 
-// WithRacerMetrics registers Racer forwarding metrics. The legacy fallback
-// callback is retained for compatibility but is never called.
-func WithRacerMetrics(stream func(sdk.TransferStats, bool, error), _ func()) Option {
+// WithRacerMetrics registers Racer forwarding metrics.
+func WithRacerMetrics(stream func(sdk.TransferStats, bool, error)) Option {
 	return func(s *Server) {
 		if s.racer != nil {
 			s.racer.onStream = stream

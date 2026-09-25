@@ -64,11 +64,9 @@ func TestRacerColdPagePreparationExceedsMetadataBudget(t *testing.T) {
 	cfg := reviewConfig()
 	cfg.RacerMetadataTimeout = 100 * time.Millisecond
 
-	var fallback atomic.Int64
-
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 1)}
 
-	m := httptest.NewServer(mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(nil, func() { fallback.Add(1) })).Handler())
+	m := httptest.NewServer(mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}).Handler())
 	defer m.Close()
 
 	resp, err := m.Client().Get(m.URL + "/v2/repo/blobs/" + d.String())
@@ -79,8 +77,8 @@ func TestRacerColdPagePreparationExceedsMetadataBudget(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	if err != nil || !bytes.Equal(body, data) || progress.Load() != 7 || fallback.Load() != 0 {
-		t.Fatal(err, progress.Load(), fallback.Load())
+	if err != nil || !bytes.Equal(body, data) || progress.Load() != 7 || len(up.seen) != 0 {
+		t.Fatal(err, progress.Load(), len(up.seen))
 	}
 }
 
@@ -279,7 +277,7 @@ func TestRacerDisconnectCancelsLaterPage(t *testing.T) {
 	cfg.RacerMaxConcurrentTransfers = 1
 	up := &authorizationCapturingOrigin{seen: make(chan string, 1)}
 	stats := make(chan sdk.TransferStats, 1)
-	server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, _ bool, _ error) { stats <- s }, nil))
+	server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, _ bool, _ error) { stats <- s }))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()

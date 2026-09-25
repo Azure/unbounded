@@ -77,7 +77,7 @@ func TestRacerPinnedRetryCompletesVerifiedObject(t *testing.T) {
 		}
 
 		finished <- stats
-	}, nil))
+	}))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()

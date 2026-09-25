@@ -171,7 +171,7 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func validMetadata(m Metadata) bool {
-	return m.Size >= 0 && checksumETag(m.ETag) && (m.TTL == nil || *m.TTL >= 0) && validField(m.ContentType, 256) && strings.Trim(m.ContentType, " \t") == m.ContentType
+	return m.Size >= 0 && validRepresentationETag(m.ETag) && (m.TTL == nil || *m.TTL >= 0) && validField(m.ContentType, 256) && strings.Trim(m.ContentType, " \t") == m.ContentType
 }
 
 func metadataHeaders(h http.Header, m Metadata) {

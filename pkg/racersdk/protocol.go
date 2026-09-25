@@ -20,7 +20,7 @@ const PageSize int64 = 64 << 20
 
 var (
 	ErrVersionChanged = errors.New("racer: object version changed")
-	ErrNoValidator    = errors.New("racer: a canonical checksum ETag is required")
+	ErrNoValidator    = errors.New("racer: a canonical representation ETag is required")
 	ErrProtocol       = errors.New("racer: invalid HTTP response")
 )
 
@@ -91,7 +91,7 @@ func validETag(s string) bool {
 func strongETag(s string) bool { return validETag(s) && !strings.HasPrefix(s, "W/") }
 
 // Representation validators are stricter than client conditional-header grammar.
-func checksumETag(s string) bool {
+func validRepresentationETag(s string) bool {
 	if len(s) != 66 || s[0] != '"' || s[65] != '"' {
 		return false
 	}

@@ -119,10 +119,9 @@ func TestRacerFailuresNeverBypass(t *testing.T) {
 								cfg.RacerMetadataTimeout = 100 * time.Millisecond
 								cfg.PeerFetchTimeout = 200 * time.Millisecond
 
-								var fallbacks, completed int
+								var completed int
 
 								server := mirror.NewRacer(cfg, up, &gantryracer.Backend{Client: client},
-									mirror.WithRacerMetrics(nil, func() { fallbacks++ }),
 									mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 
 								pathKind := "blobs"
@@ -143,8 +142,8 @@ func TestRacerFailuresNeverBypass(t *testing.T) {
 									_, _ = fmt.Sscan(mode, &want)
 								}
 
-								if w.Code != want || requests.Load() == 0 || len(up.seen) != 0 || fallbacks != 0 || completed != 0 {
-									t.Fatal("failure bypassed Racer or reported completion", w.Code, requests.Load(), len(up.seen), fallbacks, completed)
+								if w.Code != want || requests.Load() == 0 || len(up.seen) != 0 || completed != 0 {
+									t.Fatal("failure bypassed Racer or reported completion", w.Code, requests.Load(), len(up.seen), completed)
 								}
 
 								for _, h := range []string{"ETag", "Content-Range", "Docker-Content-Digest", "Accept-Ranges", "Racer-Origin-Data", "Authorization"} {
@@ -284,11 +283,11 @@ func TestRacerTruncatedBodyAbortsAfterHeaders(t *testing.T) {
 	}))
 	up := &authorizationCapturingOrigin{body: data, seen: make(chan string, 4)}
 
-	var completed, fallbacks int
+	var completed int
 
 	result := make(chan error, 1)
 	server := mirror.NewRacer(reviewConfig(), up, &gantryracer.Backend{Client: client},
-		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { result <- err }, func() { fallbacks++ }),
+		mirror.WithRacerMetrics(func(_ sdk.TransferStats, _ bool, err error) { result <- err }),
 		mirror.WithLiveStreamCompletedHook(func(digest.Digest) { completed++ }))
 	finished := make(chan struct{})
 
@@ -309,8 +308,8 @@ func TestRacerTruncatedBodyAbortsAfterHeaders(t *testing.T) {
 
 	<-finished
 
-	if resp.StatusCode != 200 || readErr == nil || !bytes.Equal(body, data[:len(data)/2]) || <-result == nil || completed != 0 || fallbacks != 0 || len(up.seen) != 0 {
-		t.Fatal("truncated Racer response was completed or substituted", resp.Status, readErr, len(body), completed, fallbacks)
+	if resp.StatusCode != 200 || readErr == nil || !bytes.Equal(body, data[:len(data)/2]) || <-result == nil || completed != 0 || len(up.seen) != 0 {
+		t.Fatal("truncated Racer response was completed or substituted", resp.Status, readErr, len(body), completed, len(up.seen))
 	}
 }
 

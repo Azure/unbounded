@@ -143,7 +143,7 @@ func TestRacerPipelineBoundaries(t *testing.T) {
 			cfg.RacerMaxConcurrentTransfers = 1
 			server := mirror.NewRacer(cfg, registry, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
 				results <- pipelineResult{s, p, err}
-			}, nil))
+			}))
 			finished := make(chan struct{}, 1)
 
 			m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +237,7 @@ func TestRacerPipelineFullDigestAndConcurrentRanges(t *testing.T) {
 	results := make(chan pipelineResult, 16)
 	server := mirror.NewRacer(reviewConfig(), &metadataOnlyRegistry{}, &gantryracer.Backend{Client: client}, mirror.WithRacerMetrics(func(s sdk.TransferStats, p bool, err error) {
 		results <- pipelineResult{s, p, err}
-	}, nil))
+	}))
 
 	m := httptest.NewServer(server.Handler())
 	defer m.Close()

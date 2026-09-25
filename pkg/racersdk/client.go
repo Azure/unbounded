@@ -134,7 +134,7 @@ func (c *Client) Stat(ctx context.Context, target string) (Metadata, error) {
 		return Metadata{}, fmt.Errorf("%w: invalid metadata", ErrProtocol)
 	}
 
-	if !checksumETag(tag) {
+	if !validRepresentationETag(tag) {
 		return Metadata{}, ErrNoValidator
 	}
 

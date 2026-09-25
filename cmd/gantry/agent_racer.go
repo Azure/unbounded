@@ -94,8 +94,8 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginRa
 	}()
 
 	server := mirror.NewRacer(c, auth, &gantryracer.Backend{Client: client},
-		mirror.WithLogger(logger), mirror.WithLiveStreamThrough(), mirror.WithStartupReadinessGate(),
-		mirror.WithRacerMetrics(onRacerStream, nil),
+		mirror.WithLogger(logger), mirror.WithStartupReadinessGate(),
+		mirror.WithRacerMetrics(onRacerStream),
 		mirror.WithMetrics(inst.cacheHit.Inc, inst.cacheMiss.Inc),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
@@ -105,7 +105,6 @@ func runRacerAgent(ctx context.Context, c *config.Config, origin ifaces.OriginRa
 			progress.completed(d)
 			p2.mirrorCompletedAt.WithLabelValues(kind, source).SetToCurrentTime()
 		}),
-		mirror.WithOriginStreamMetrics(func(k string) { p9.originStreamStarted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamCompleted.WithLabelValues(k).Inc() }, func(k string) { p9.originStreamFailed.WithLabelValues(k).Inc() }),
 		// Demand-only: observe committed manifests, without speculative registry
 		// downloads or chair work competing with Racer's page fetch ownership.
 		mirror.WithManifestObserver(newManifestObserver(local, logger, progress.observeManifest)),
