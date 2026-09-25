@@ -248,6 +248,7 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 		}
 
 		state.ArtifactStreamingPrepared = true
+		state.ArtifactStreamingImage = standaloneGantryTaggedImage(state)
 	}
 
 	state.StandaloneGantry = true
@@ -270,7 +271,7 @@ func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
 	return nil
 }
 
-func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, payloadSHA string) error {
+func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, streamingImage, payloadSHA string) error {
 	state, err := b.loadState(ctx)
 	if err != nil {
 		return err
@@ -301,6 +302,10 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, p
 	}
 
 	if state.ArtifactStreaming {
+		state.ArtifactStreamingImage = streamingImage
+		if err := state.validateArtifactStreamingImage(); err != nil {
+			return err
+		}
 		if err := b.verifyArtifactStreamingImage(ctx, state, image); err != nil {
 			return err
 		}
@@ -324,6 +329,12 @@ func (b *benchmark) prepareAdoptedStandaloneGantry(ctx context.Context, image, p
 	writeAll(b.stdout, fmt.Sprintf("adopted standalone Gantry image %s for %s\n", image, state.RunID))
 
 	return nil
+}
+
+func standaloneGantryTaggedImage(state benchmarkState) string {
+	tag := strings.ReplaceAll(state.RunID+"-gantry-fresh", "_", "-")
+
+	return fmt.Sprintf("%s/%s:%s", state.GantryACRLoginServer, state.WorkloadRepository, tag)
 }
 
 func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benchmarkState, imageReference string) error {
@@ -857,6 +868,10 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	runtimeImage, err := state.gantryRuntimeImage()
+	if err != nil {
+		return err
+	}
 
 	var baselineResult phaseResult
 	if !state.StandaloneGantry {
@@ -941,7 +956,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 
 	writeAll(b.stdout, fmt.Sprintf("running Gantry-only cold pull on %d nodes\n", b.config.NodeCount))
 
-	job, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, gantryImage)
+	job, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, runtimeImage)
 	if err != nil {
 		return err
 	}

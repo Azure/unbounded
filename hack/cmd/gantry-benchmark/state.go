@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -44,6 +45,7 @@ type benchmarkState struct {
 	StandaloneGantry             bool                   `json:"standalone_gantry,omitempty"`
 	ArtifactStreaming            bool                   `json:"artifact_streaming,omitempty"`
 	ArtifactStreamingPrepared    bool                   `json:"artifact_streaming_prepared,omitempty"`
+	ArtifactStreamingImage       string                 `json:"artifact_streaming_image,omitempty"`
 	ProxyImage                   string                 `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string                 `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string                 `json:"original_gantry_config"`
@@ -86,6 +88,11 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 
 		if s.ArtifactStreaming && !s.ArtifactStreamingPrepared {
 			return "", "", fmt.Errorf("standalone Gantry image has not completed Artifact Streaming conversion")
+		}
+		if s.ArtifactStreaming {
+			if err := s.validateArtifactStreamingImage(); err != nil {
+				return "", "", err
+			}
 		}
 
 		gantryRepository, _, err := splitImageReference(s.GantryColdImage, s.GantryACRLoginServer)
@@ -144,6 +151,36 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 	}
 
 	return s.BaselineImage, s.GantryColdImage, nil
+}
+
+func (s benchmarkState) validateArtifactStreamingImage() error {
+	if s.ArtifactStreamingImage == "" {
+		return fmt.Errorf("standalone Gantry run has no Artifact Streaming tag reference")
+	}
+	if strings.Contains(s.ArtifactStreamingImage, "@") {
+		return fmt.Errorf("Artifact Streaming runtime image must use a tag: %s", s.ArtifactStreamingImage)
+	}
+
+	repository, _, err := splitImageReference(s.ArtifactStreamingImage, s.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("invalid Artifact Streaming runtime image: %w", err)
+	}
+	if repository != s.WorkloadRepository {
+		return fmt.Errorf("Artifact Streaming runtime repository %q, want %q", repository, s.WorkloadRepository)
+	}
+
+	return nil
+}
+
+func (s benchmarkState) gantryRuntimeImage() (string, error) {
+	if !s.ArtifactStreaming {
+		return s.GantryColdImage, nil
+	}
+	if err := s.validateArtifactStreamingImage(); err != nil {
+		return "", err
+	}
+
+	return s.ArtifactStreamingImage, nil
 }
 
 func (b *benchmark) saveState(ctx context.Context, state benchmarkState) error {
