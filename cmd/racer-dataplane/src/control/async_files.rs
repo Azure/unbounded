@@ -239,6 +239,70 @@ mod tests {
     use super::*;
     use crate::control::{enrollment::Enrollment, testing};
     #[test]
+    fn enrollment_creates_private_child_beneath_kubelet_host_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(r) = testing::reactor() else {
+            return;
+        };
+        let d = testing::Directory::new();
+        let mount = d.0.join("identity");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scope = testing::scope();
+        let enrollment = |path| {
+            let e = Enrollment::new(
+                crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                d.0.join("token"),
+                path,
+            );
+            e.attach_reactor(r.clone());
+            e
+        };
+        // A DirectoryOrCreate mount itself cannot store private identity state.
+        let insecure = enrollment(mount.clone());
+        assert!(matches!(
+            testing::drive(&r, insecure.load_identity_async(&scope)),
+            Err(Error::Unauthorized)
+        ));
+        let private = mount.join("private");
+        let e = enrollment(private.clone());
+        assert!(
+            testing::drive(&r, e.load_identity_async(&scope))
+                .unwrap()
+                .is_none()
+        );
+        let request = testing::drive(&r, e.prepare(&scope)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&mount).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let (ca, key) = testing::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let response = testing::issue(&request, &ca, &key, "22222222-2222-4222-8222-222222222222");
+        let identity = testing::drive(&r, e.accept_response_async(response, &scope)).unwrap();
+        let restarted = enrollment(private.clone());
+        restarted
+            .set_peer_trust_roots(vec![ca.der().to_vec()])
+            .unwrap();
+        assert_eq!(
+            testing::drive(&r, restarted.load_identity_async(&scope))
+                .unwrap()
+                .unwrap()
+                .node(),
+            identity.node()
+        );
+        // Keep rejecting insecure existing private directories, even on restart.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            testing::drive(&r, restarted.load_identity_async(&scope)),
+            Err(Error::Unauthorized)
+        ));
+    }
+    #[test]
     fn canceled_transaction_never_exposes_partial_replacement() {
         let Some(r) = testing::reactor() else {
             return;

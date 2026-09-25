@@ -132,7 +132,7 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				"RACER_TRUST_BUNDLE":          "/etc/racer/bootstrap/ca.crt",
 				"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
 				"RACER_SECRET_DIRECTORY":      "/etc/racer/keyring",
-				"RACER_IDENTITY_DIRECTORY":    "/var/lib/racer/identity",
+				"RACER_IDENTITY_DIRECTORY":    "/var/lib/racer/identity/private",
 				"RACER_SLAB_DIRECTORY":        "/var/lib/racer/slabs",
 			}
 			if len(env) != len(expected) {
@@ -158,7 +158,7 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				"RACER_TRUST_BUNDLE":          path.Join(mounts["bootstrap"], "ca.crt"),
 				"RACER_SERVICE_ACCOUNT_TOKEN": path.Join(mounts["token"], "token"),
 				"RACER_SECRET_DIRECTORY":      mounts["keyring"],
-				"RACER_IDENTITY_DIRECTORY":    mounts["identity"],
+				"RACER_IDENTITY_DIRECTORY":    path.Join(mounts["identity"], "private"),
 				"RACER_SLAB_DIRECTORY":        mounts["slabs"],
 			} {
 				if env[name] != location {

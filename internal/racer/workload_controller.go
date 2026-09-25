@@ -138,7 +138,9 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 					{Name: "RACER_TRUST_BUNDLE", Value: "/etc/racer/bootstrap/ca.crt"},
 					{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
 					{Name: "RACER_SECRET_DIRECTORY", Value: "/etc/racer/keyring"},
-					{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity"},
+					// Kubelet creates the hostPath mount with mode 0755. Let the
+					// dataplane create its private 0700 directory beneath it.
+					{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},
 					{Name: "RACER_SLAB_DIRECTORY", Value: "/var/lib/racer/slabs"},
 				},
 				Ports:           []corev1.ContainerPort{{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP}},
