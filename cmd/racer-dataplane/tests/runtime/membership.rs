@@ -163,7 +163,7 @@ fn compiler_snapshots_http_and_rdma() {
         panic!("io_uring required for compiler membership integration")
     };
     let ca = tls::tests::Authority::new();
-    let server_tls = ca.context(&bid, false);
+    let server_tls = ca.context(&bid);
     let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     origin.set_nonblocking(true).unwrap();
     let backend = Backend::new(&origin.local_addr().unwrap().to_string(), volume).unwrap();
@@ -239,7 +239,7 @@ fn compiler_snapshots_http_and_rdma() {
             );
             bytes[4..36].copy_from_slice(foreign.digest());
         }
-        let context = ca.context(&identity, false);
+        let context = ca.context(&identity);
         let hex = peer_wire::hex(&bytes);
         let selected_volume = if which == 3 { "foreign-cache" } else { volume };
         let end = Instant::now() + Duration::from_secs(5);

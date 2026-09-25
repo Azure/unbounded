@@ -268,7 +268,7 @@ pub(crate) mod tests {
                 let cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::cache::adapter_fixture::cache(backend.namespace(), 3),
                 ));
-                let context = authority.context(&identity(node), false);
+                let context = authority.context(&identity(node));
                 let provider = crate::control::credentials::Provider::for_test(
                     identity(node),
                     context.clone(),

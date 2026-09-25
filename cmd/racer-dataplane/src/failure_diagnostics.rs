@@ -294,7 +294,7 @@ pub(crate) fn selected(key: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn body_record_retains_first_read_and_partial_progress_without_raw_error() {
+    fn body_record_retains_ktls_wait_and_partial_progress_without_raw_error() {
         let mut d = BodyTrace::new(
             serde_json::json!({"key":"a".repeat(64)}),
             Instant::now() + Duration::from_secs(10),
@@ -302,7 +302,7 @@ mod tests {
         );
         let io = IoState {
             ticket: 7,
-            opcode: 22,
+            opcode: 6,
             offset: 4096,
             len: 64,
             flags: 0,
@@ -314,19 +314,20 @@ mod tests {
             ring_used: 2,
             slab_queued: 0,
         };
-        d.read_completed(Some(io.clone()));
-        d.observe("file_read", 100, Some(io));
+        d.observe("ktls_slab_rate", 100, None);
         assert_eq!(d.sent, 0);
-        d.observe("tls_socket_readiness", 36, None);
+        d.sampled_at -= Duration::from_millis(75);
+        d.observe("tls_socket_readiness", 36, Some(io));
         let record = d.record(
             "body_poll_error",
             Some(&std::io::Error::other("secret-target?token=password")),
         );
         assert_eq!(record["sent"], 64);
         assert_eq!(record["remaining"], 36);
-        assert_eq!(record["read_wait_ms"], 75);
-        assert_eq!(record["max_read_wait_ms"], 75);
-        assert_eq!(record["last_read"]["offset"], 4096);
+        assert!(record["file_wait_ms"].as_u64().unwrap() >= 75);
+        assert_eq!(record["io"]["ticket"], 7);
+        assert_eq!(record["stage"], "tls_socket_readiness");
+        assert!(record.get("last_read").is_none());
         assert!(!record.to_string().contains("secret"));
     }
     #[test]

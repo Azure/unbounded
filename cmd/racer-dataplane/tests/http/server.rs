@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn body_diagnostic_distinguishes_uncollected_file_read_and_socket_send() {
+    fn body_diagnostic_distinguishes_body_admission_and_socket_send() {
         let Some(mut ring) = crate::conformance::kernel_ring(2, Default::default()) else {
             return;
         };
@@ -382,27 +382,10 @@ mod tests {
         let chunk = BodyChunk::new(buffer(&ring, 1, 3), 0..3).unwrap();
         let mut body = writer.send(chunk).unwrap();
         body.set_diagnostic(serde_json::json!({"key":"c".repeat(64)}));
-        let file = File::new(std::fs::File::open("/dev/zero").unwrap().into());
-        let read = ring
-            .read_bytes(file.into(), vec![0; 3].into_boxed_slice(), 0)
-            .unwrap();
-        body.tls_read = Some(read);
-        drive(&mut ring, |r| {
-            let complete =
-                r.diagnostic(body.tls_read.as_ref().unwrap()).unwrap().state == "complete";
-            Ok(if complete {
-                Progress::Ready(())
-            } else {
-                pending(true, None)
-            })
-        })
-        .unwrap();
         body.observe_diagnostic(&ring);
         let record = body.diagnostic.as_ref().unwrap().record("test", None);
-        assert_eq!(record["stage"], "file_read");
-        assert_eq!(record["io"]["state"], "complete");
-        let mut read = body.tls_read.take().unwrap();
-        ring.take_bytes(&mut read).unwrap().unwrap().result.unwrap();
+        assert_eq!(record["stage"], "body_admission");
+        assert!(record["io"].is_null());
         body.small = Some(
             ring.send_bytes(
                 body.response
@@ -417,8 +400,22 @@ mod tests {
             )
             .unwrap(),
         );
+        drive(&mut ring, |r| {
+            Ok(
+                if r.diagnostic(body.small.as_ref().unwrap()).unwrap().state == "complete" {
+                    Progress::Ready(())
+                } else {
+                    pending(true, None)
+                },
+            )
+        })
+        .unwrap();
         body.observe_diagnostic(&ring);
         assert_eq!(body.diagnostic.as_ref().unwrap().stage, "socket_send");
+        assert_eq!(
+            body.diagnostic.as_ref().unwrap().io.as_ref().unwrap().state,
+            "complete"
+        );
         body.response.as_ref().unwrap().deadline.cap(Instant::now());
         assert_eq!(
             body.poll(&mut ring, 1).err().unwrap().kind(),

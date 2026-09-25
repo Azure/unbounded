@@ -28,6 +28,7 @@ fn accept(listener: &TcpListener, context: &crate::tls::TlsContext) -> TlsSessio
     )
     .unwrap();
     complete(|| session.handshake());
+    crate::tls::tests::assert_offload(&session);
     session
 }
 fn request(session: &mut TlsSession) -> Vec<u8> {
@@ -85,7 +86,7 @@ fn cached_peer_tls_abrupt_close_child() {
     };
     // Each cut is tested on small metadata and writable payload responses. A
     // partial HTTP byte (including informational headers) forbids all replay.
-    for ktls in [false, true] {
+    {
         for payload in [false, true] {
             for cut in [
                 "idle-fin",
@@ -98,17 +99,11 @@ fn cached_peer_tls_abrupt_close_child() {
                 "bad-record",
                 "wrong-pod",
             ] {
-                // Raw send on TX kTLS encrypts application bytes, so corruption
-                // injection is meaningful only on the forced software record path.
-                if ktls && cut == "bad-record" {
-                    continue;
-                }
                 let ca = Authority::new();
-                let client_context = ca.context(&identity("02"), ktls);
-                let server_context = ca.context(&identity("03"), ktls);
+                let client_context = ca.context(&identity("02"));
+                let server_context = ca.context(&identity("03"));
                 let bad_context = ca.context(
                     &PeerIdentity::new(&"01".repeat(32), &"03".repeat(32), "wrong-pod").unwrap(),
-                    ktls,
                 );
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let address = listener.local_addr().unwrap();
@@ -124,20 +119,9 @@ fn cached_peer_tls_abrupt_close_child() {
                     if matches!(cut, "partial" | "informational" | "body" | "bad-record") {
                         assert!(request(&mut session).starts_with(b"GET /exact?x=%2f "));
                         if cut == "bad-record" {
-                            let invalid = b"not a TLS record";
-                            // SAFETY: live socket and readable bytes; deliberately
-                            // bypass TLS to prove protocol failures never replay.
-                            assert_eq!(
-                                unsafe {
-                                    libc::send(
-                                        session.as_raw_fd(),
-                                        invalid.as_ptr().cast(),
-                                        invalid.len(),
-                                        libc::MSG_NOSIGNAL,
-                                    )
-                                },
-                                invalid.len() as isize
-                            );
+                            // TX kTLS encrypts raw application writes. Inject a
+                            // fatal bad_record_mac alert as a TLS control record.
+                            crate::tls::tests::send_fatal_alert(&session);
                         } else {
                             send(
                                 &mut session,
@@ -273,10 +257,7 @@ fn cached_peer_tls_abrupt_close_child() {
                         assert!(failure.owner_evidence());
                     }
                     if matches!(cut, "wrong-pod" | "bad-record") {
-                        assert!(
-                            !failure.owner_evidence(),
-                            "cut={cut} ktls={ktls}: {failure:?}"
-                        );
+                        assert!(!failure.owner_evidence(), "cut={cut}: {failure:?}");
                     }
                     drop(permit);
                 }

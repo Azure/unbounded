@@ -215,7 +215,7 @@ fn production_peer_recovery_is_budgeted_and_never_replays_responses() {
     let Some(mut ring) = crate::conformance::kernel_ring(8, uring::Config::default()) else {
         return;
     };
-    for ktls in [false, true] {
+    {
         for cut in [
             "close",
             "twice",
@@ -229,8 +229,8 @@ fn production_peer_recovery_is_budgeted_and_never_replays_responses() {
             "deadline",
         ] {
             let ca = crate::tls::tests::Authority::new();
-            let client_context = ca.context(&peer_identity(2), ktls);
-            let server_context = ca.context(&peer_identity(3), ktls);
+            let client_context = ca.context(&peer_identity(2));
+            let server_context = ca.context(&peer_identity(3));
             let wrong = ca.context(
                 &PeerIdentity::new(
                     &peer_identity(3).universe,
@@ -238,7 +238,6 @@ fn production_peer_recovery_is_budgeted_and_never_replays_responses() {
                     "wrong-pod",
                 )
                 .unwrap(),
-                ktls,
             );
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();

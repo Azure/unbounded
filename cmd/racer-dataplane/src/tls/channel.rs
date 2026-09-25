@@ -272,3 +272,7 @@ impl Drop for TlsChannel {
     }
 }
 thread_local! { static TLS_CONNECTIONS: std::cell::RefCell<std::collections::BTreeMap<u64, usize>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) }; }
+
+#[cfg(test)]
+#[path = "../../tests/security/channel.rs"]
+mod tests;
