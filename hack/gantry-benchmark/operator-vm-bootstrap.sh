@@ -11,11 +11,12 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
   <build-disk-lun> <build-mount> <source-image> <source-revision> \
-  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256>
+  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256> \
+  <artifact-streaming> <benchmark-node-pool>
 USAGE
 }
 
-[[ $# -eq 23 ]] || { usage >&2; exit 2; }
+[[ $# -eq 25 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -40,9 +41,16 @@ source_revision=${20}
 adopt_baseline_image=${21}
 adopt_gantry_image=${22}
 adopt_payload_sha256=${23}
+artifact_streaming=${24}
+benchmark_node_pool=${25}
 [[ "$adopt_baseline_image" != - ]] || adopt_baseline_image=""
 [[ "$adopt_gantry_image" != - ]] || adopt_gantry_image=""
 [[ "$adopt_payload_sha256" != - ]] || adopt_payload_sha256=""
+[[ "$benchmark_node_pool" != - ]] || benchmark_node_pool=""
+[[ "$artifact_streaming" == true || "$artifact_streaming" == false ]] || {
+  echo "artifact-streaming must be true or false" >&2
+  exit 2
+}
 
 adoption_values=0
 for value in "$adopt_baseline_image" "$adopt_gantry_image" "$adopt_payload_sha256"; do
@@ -313,6 +321,9 @@ BENCHMARK_NAMESPACE="gantry-benchmark"
 BENCHMARK_NODE_COUNT="$node_count"
 BENCHMARK_IMAGE_SIZE_MIB="$image_size_mib"
 BENCHMARK_IMAGE_LAYERS="$image_layers"
+BENCHMARK_ARTIFACT_STREAMING="$artifact_streaming"
+BENCHMARK_NODE_POOL="$benchmark_node_pool"
+GANTRY_ONLY_STANDALONE="$artifact_streaming"
 BENCHMARK_IMAGE_PLATFORM="linux/amd64"
 BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
 BENCHMARK_ROLLOUT_TIMEOUT="15m"

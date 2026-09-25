@@ -361,7 +361,10 @@ func TestContainerdPullTuningManifest(t *testing.T) {
 		}
 	}
 
-	if !bytes.Contains(deployScript, []byte("migrate_legacy_gantry_install\n  \"$repo_root/bin/helm\" upgrade --install gantry")) {
+	migrateIndex := bytes.Index(deployScript, []byte("migrate_legacy_gantry_install"))
+	helmArgsIndex := bytes.Index(deployScript, []byte("local helm_args=("))
+	helmRunIndex := bytes.Index(deployScript, []byte("\"$repo_root/bin/helm\" \"${helm_args[@]}\""))
+	if migrateIndex < 0 || helmArgsIndex <= migrateIndex || helmRunIndex <= helmArgsIndex {
 		t.Fatal("deploy script does not migrate legacy Gantry resources before Helm install")
 	}
 }
