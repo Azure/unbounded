@@ -1,4 +1,4 @@
-//! HTTPS/JSON v1 and projected bundle DTOs. Encoding/decoding is not implemented.
+//! Bounded HTTPS/JSON v1 and projected bundle DTOs.
 //! See CONTROL_API.md for field encoding, bounds, authentication, and retry policy.
 use super::caches::CacheDefinition;
 use crate::{
@@ -9,6 +9,9 @@ use crate::{
     topology::membership::Member,
 };
 use std::time::Duration;
+#[path = "codec.rs"]
+mod codec;
+pub use codec::*;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
@@ -47,6 +50,7 @@ pub enum SnapshotResponse {
     Updated(Publication),
     Unchanged,
 }
+#[derive(Clone)]
 pub struct Publication {
     pub schema_version: u32,
     pub cluster: ClusterId,
@@ -58,6 +62,7 @@ pub struct Publication {
 
 /// Bearer token is supplied by the transport from the projected token path,
 /// never embedded in a DTO or retained in diagnostics.
+#[derive(Clone)]
 pub struct EnrollmentRequest {
     pub schema_version: u32,
     pub cluster: ClusterId,
@@ -66,6 +71,7 @@ pub struct EnrollmentRequest {
 }
 /// Public certificate response. Resolve Node UID from the live token-bound Pod.
 /// Retrying may issue an equivalent certificate; the controller stores no ledger.
+#[derive(Clone)]
 pub struct EnrollmentResponse {
     pub schema_version: u32,
     pub cluster: ClusterId,
@@ -92,13 +98,21 @@ pub struct CacheKeyRef {
     pub purpose: CacheKeyPurpose,
 }
 /// Deliberately non-Debug. Decode only into a bounded, staged credential bundle.
+#[derive(Clone)]
 pub struct CacheEncryptionKey {
     pub key: CacheKeyRef,
     pub state: CacheKeyState,
     pub(crate) material: [u8; 32],
 }
+impl Drop for CacheEncryptionKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.material.zeroize();
+    }
+}
 /// One common bundle.json from one coherent projected directory generation.
 /// No node certificates/private keys; missing keys request local retirement.
+#[derive(Clone)]
 pub struct KeyringBundle {
     pub schema_version: u32,
     pub cluster: ClusterId,
