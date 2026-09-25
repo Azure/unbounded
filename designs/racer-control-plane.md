@@ -7,10 +7,11 @@ Kubernetes is the authority for desired state. Rust nodes receive full publicati
 compute placement/routes locally, and serve disposable encrypted cache pages.
 
 This document describes intended behavior. Phase 1 bounded codecs, canonical
-hashing, and shared Go/Rust contract vectors and Phase 2 pure membership/catalog
-reconciliation are implemented. Other operational methods remain fail-closed stubs;
-composition, controller registration, API declarations, and reserved 503 routes are
-also implemented. The executable cannot start an operational service.
+hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
+reconciliation, and Phase 3 initialization/publication lifecycle are implemented.
+Issuer/rotation, bootstrap, TLS serving, and workload construction remain fail-closed
+stubs. The initialize-only command is operational; normal invocation validates
+recovery state but cannot yet start an operational HTTPS service.
 The normative wire contract is `cmd/racer-dataplane/CONTROL_API.md`.
 
 ## Controllers and lifecycle
@@ -52,11 +53,60 @@ content hashes. Hashes exclude counters. No member checkpoints, publication blob
 or history. Candidate bytes become visible only after a successful ConfigMap CAS.
 Unchanged content reuses counters; cache-only changes preserve membership version.
 
-Initial creation must be an explicit initialize-only operation. Recovery never
-recreates missing established counters. Before implementing startup, define the
-initialization marker/command and its crash ordering so a missing ConfigMap cannot
-silently reset an existing cluster. Loss/corruption requires explicit new-cluster
-rebootstrap. This scaffold does not pretend that initialization is implemented.
+### Initialization protocol (Phase 3)
+
+`racer-controller initialize` is an initialize-only command; it never starts the
+manager, issuer, workload, or listener. Normal invocation only recovers existing
+counters. Both commands read `RACER_INSTALLATION_CONFIGMAP_NAME` (default
+`racer-installation`) authoritatively, not from an informer or environment snapshot.
+This ConfigMap is permanent deployment configuration, separate from runtime
+`racer-config`. Its data contains `cluster`, `version_configmap`, and `state`.
+
+The one-way transition is `fresh` (mutable) -> `consumed` (immutable). Only an
+operator installing a genuinely new cluster may provision `fresh`. The deployment
+template defaults to `consumed` and immutable; rendering a first installation
+requires the explicit `InitializationState=fresh` setting and a new permanent UUID.
+With `make racer-manifests`, use `RACER_INITIALIZATION_STATE=fresh` only for that
+first render; the unset/default state is consumed. Apply the configuration/RBAC,
+run the controller image once with argument `initialize` and the same configuration
+environment/service account, then start the controller Deployment. Set the rendered
+permanent configuration back to consumed after the successful command.
+Never render/apply `fresh` for an existing UUID. After initialization, retain the
+consumed immutable object in deployment configuration/backups; normal GitOps must
+use `InitializationState=consumed`. Kubernetes immutability prevents an old fresh
+manifest from rolling its data back. Do not delete/recreate this permanent object.
+
+The command validates the UUID/name binding and absence of the version ConfigMap,
+then resource-version-CAS updates the installation record to `consumed` AND
+`immutable: true` in one request. Only the invocation that receives a successful
+CAS response may make ONE create attempt for the initial version ConfigMap. It
+contains counters 1/1 and the hashes of empty membership/catalog. The version
+ConfigMap annotation `racer.unbounded-cloud.io/installation-uid` binds it to the
+permanent installation object's UID. No serving or workload startup precedes this
+ordering. A repeated/concurrent initialize command always rejects consumed state.
+
+Crash/error recovery is deliberately conservative:
+
+| Durable state | Recovery |
+| --- | --- |
+| Fresh marker, no counters | Explicit initialize may run; normal startup rejects |
+| Consumed marker, missing counters | Fail closed; including a crash after marker CAS or an ambiguous create failure; never retry creation |
+| Consumed marker, valid bound counters | Normal startup reconstructs and commits current inputs; initialize rejects |
+| Missing/corrupt marker, wrong UID/cluster binding, or corrupt counters | Fail closed |
+
+A successful create followed by process death is recovered through normal startup,
+not another initialize. Cancellation is checked before each write; cancellation
+after marker consumption can leave the deliberately unrecoverable gap. The marker
+is never reset, even when it is known that no publication was served. Kubernetes
+object deletion or restoration of stale whole-cluster backups is outside the
+one-way guarantee; restoring either object independently is not counter recovery.
+
+Explicit rebootstrap means stop the old installation, provision a NEW cluster UUID
+and new permanent installation/version objects (preferably a new namespace), run
+initialize once, and rebootstrap dataplane identities and disposable cache state.
+Do not copy old issuer/keyring state into the new cluster or reuse the old UUID.
+There is intentionally no force/reset/repair command. Loss of counters cannot be
+distinguished from a previously published high watermark and never authorizes 1/1.
 
 The common keyring Secret retains keys, generation, and transition times. The
 controller-only issuer Secret retains signing material. Kubernetes stores the
@@ -140,7 +190,7 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 1. Implement bounded codecs/canonical hashing and cross-language contract vectors (complete).
 2. Implement pure membership/catalog reconciliation, including cold-start rules (complete).
 3. Implement explicit initialization, version CAS, immutable publication install,
-   manager startup enqueue, and leadership cancellation.
+   manager startup enqueue, and leadership cancellation (complete).
 4. Implement issuer/shared-key Secret rotation, including failure recovery.
 5. Implement token bootstrap and mTLS serving with adversarial identity tests.
 6. Implement the managed workload and Rust identity/TLS/projection boundaries.
@@ -148,3 +198,54 @@ capacity claim. Validate fanout and reconciliation cost during implementation.
 
 Each step replaces stubs with meaningful success/failure/edge tests. Keep scaffold
 composition tests; do not add tests that merely enumerate every placeholder.
+
+## Phase 3 handoff interfaces
+
+- `Initialize(ctx, Config)` / `TopologyReconciler.InitializeVersion(ctx)` implement
+  the one-shot command. `Config.InstallationConfigMapName` binds permanent
+  configuration; `Run` validates it and counters before starting manager runnables.
+  Defaults are loaded from `RACER_*` and `POD_NAMESPACE`. Later phases must add
+  TLS/workload-specific validation when implementing those entry points.
+- `Publications.Prepare(previous, resourceVersion, candidateHistory, catalog)`
+  validates, hashes, assigns counters, and owns a private encoding.
+  `TopologyReconciler.CommitVersion(ctx, prepared)` authoritatively rereads state
+  and CAS-updates the version ConfigMap, even for unchanged content. Conflicts
+  requeue the singleton with fresh inputs and unchanged accepted history.
+  `Publications.Install(committed)` rejects zero/foreign/rolled-back/conflicting
+  values and canceled contexts. Only then does topology replace accepted history.
+  Missing/invalid durable state suspends readiness and wakes waiting polls; input
+  validation failures retain the previous valid publication. No recovery Create.
+- `CommittedPublication.Version()` returns a value; `Encoding()` returns an
+  immutable shared string. `WriteTo(io.Writer)` checks leadership between bounded
+  32 KiB writes. Phase 5 must impose request cancellation, certificate deadlines,
+  concurrent write admission, and HTTP write deadlines around it and close active
+  connections on leadership loss. Never convert the entire encoding to `[]byte`
+  per response. Retained publication references are bounded by admitted handlers.
+- `Publications.Wait(ctx, NodeIdentity, *wire.Sequence)` owns bounded waiting
+  admission (global `Limits.MaxPolls`, one waiter per node). Nil cursor returns
+  current immediately, lower cursor returns latest, future/zero cursor conflicts,
+  equal waits at most 30 seconds. `(nil, nil)` is normal 204 timeout. Expiration,
+  request cancellation, and committed leadership cancellation terminate waits.
+  Phase 5 must keep HTTP admission through response completion so a node cannot
+  overlap a waiting/writing response; `Wait` releases its slot when it returns.
+- `Application.Lifecycle` is shared with Keyring and Server. It is a one-shot
+  leader runnable and waits for manager cache sync. Phase 4 calls
+  `SetIssuerReady(bool)` only for usable issuer/trust, resetting on failure.
+  Phase 5 calls `Lifecycle.Wait(ctx)` before listener startup, then
+  `SetServingReady(true)` when accepting authenticated connections, resetting on
+  shutdown. `Server.Ready` delegates to all lifecycle gates plus publications.
+  `Server.Start` remains fail-closed pending TLS implementation. Controller
+  reconciliation currently has no per-reconcile timeout; committed publications
+  retain that leader-derived context. Do not introduce a short-lived reconcile
+  timeout without separately supplying the full leadership context for serving.
+- All three controllers use `initialEnqueue()` as a raw source, so startup runs
+  even for empty lists. Sources/workers are leader-scoped; cache synchronization
+  precedes worker execution. Pod `spec.nodeName` is indexed; predicates ignore
+  readiness/unrelated inputs and map relevant events to one singleton key.
+  Workload and keyring reconciliation bodies remain Phase 6 and Phase 4 work.
+
+Targeted fake-client and race tests cover initialization crash ordering, ambiguous
+responses, CAS conflicts, cancellation before writes/install, counter transitions,
+immutable ownership, readiness, and 256 simultaneous poll wakeups. This is not an
+envtest election/real-apiserver immutability test or a 100,000-node capacity claim;
+those integration/load checks remain Phase 7.

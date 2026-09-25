@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer scaffolds the Racer control plane using controller-runtime
-// directly. Constructors compose only; operational methods fail closed until
-// their contracts are implemented and tested.
+// Package racer implements the Racer publication lifecycle using controller-runtime
+// directly. Constructors compose only; credential and serving operations remain
+// fail-closed until their contracts are implemented and tested.
 package racer
 
 import (
@@ -24,27 +24,35 @@ import (
 )
 
 type Application struct {
-	Topology *TopologyReconciler
-	Keyring  *KeyringReconciler
-	Workload *WorkloadReconciler
-	Server   *Server
+	Topology  *TopologyReconciler
+	Keyring   *KeyringReconciler
+	Workload  *WorkloadReconciler
+	Server    *Server
+	Lifecycle *Lifecycle
 }
 
 // Assemble performs no Kubernetes calls, I/O, cryptography, or goroutine startup.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	publications := NewPublications(cfg.Limits)
+	lifecycle := newLifecycle(publications)
 	issuer := &Issuer{APIReader: reader, Config: cfg}
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 
 	return &Application{
-		Topology: &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers)},
-		Keyring:  &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer},
-		Workload: &WorkloadReconciler{Client: c, Config: cfg},
-		Server:   &Server{Config: cfg, APIReader: reader, Bootstrap: bootstrap, Publications: publications},
+		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers)},
+		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle},
+		Workload:  &WorkloadReconciler{Client: c, Config: cfg},
+		Server:    &Server{Config: cfg, APIReader: reader, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Lifecycle: lifecycle,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
+	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
+	if err := mgr.Add(a.Lifecycle); err != nil {
+		return fmt.Errorf("register leader lifecycle: %w", err)
+	}
+
 	if err := a.Topology.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register topology: %w", err)
 	}
@@ -90,12 +98,13 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                  scheme,
-		LeaderElection:          true,
-		LeaderElectionID:        "racer-controller",
-		LeaderElectionNamespace: cfg.Namespace,
-		Metrics:                 metricsserver.Options{BindAddress: cfg.MetricsAddress},
-		HealthProbeBindAddress:  cfg.ProbeAddress,
+		Scheme:                        scheme,
+		LeaderElection:                true,
+		LeaderElectionID:              "racer-controller",
+		LeaderElectionNamespace:       cfg.Namespace,
+		LeaderElectionReleaseOnCancel: false,
+		Metrics:                       metricsserver.Options{BindAddress: cfg.MetricsAddress},
+		HealthProbeBindAddress:        cfg.ProbeAddress,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Pod{}:       {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
 			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
@@ -108,6 +117,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	app := Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
+	// Recovery validates permanent configuration and counters before starting any
+	// manager runnable. The leader revalidates authoritatively for every commit.
+	if _, _, err := app.Topology.readVersion(ctx); err != nil {
+		return fmt.Errorf("recover Racer installation: %w", err)
+	}
+
 	if err := app.SetupWithManager(mgr); err != nil {
 		return err
 	}

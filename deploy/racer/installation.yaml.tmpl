@@ -1,0 +1,14 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+# Permanent configuration: use fresh ONLY for a new cluster UUID. After initialize,
+# retain consumed in declarative configuration. Never delete/recreate this object.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .InstallationConfigMapName | default "racer-installation" }}
+  namespace: {{ .Namespace | default "unbounded-system" }}
+immutable: {{ ne (.InitializationState | default "consumed") "fresh" }}
+data:
+  cluster: {{ .ClusterID | default "" | quote }}
+  version_configmap: {{ .VersionConfigMapName | default "racer-version" | quote }}
+  state: {{ .InitializationState | default "consumed" | quote }}

@@ -611,6 +611,7 @@ racer-manifests: ## Render Racer controller scaffold manifests
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir deploy/racer --output-dir deploy/racer/rendered \
 		--set Namespace=$(RACER_NAMESPACE) --set ClusterID=$(RACER_CLUSTER_ID) \
+		--set InitializationState=$(RACER_INITIALIZATION_STATE) \
 		--set ControllerImage=$(RACER_CONTROLLER_IMAGE) --set DataplaneImage=$(RACER_DATAPLANE_IMAGE)
 	@cp deploy/racer/crd/*.yaml deploy/racer/rendered/crd/
 

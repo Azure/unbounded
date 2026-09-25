@@ -21,4 +21,5 @@ data:
   RACER_DAEMONSET_NAME: "racer-dataplane"
   RACER_ISSUER_SECRET_NAME: "racer-issuer"
   RACER_KEYRING_SECRET_NAME: "racer-keyring"
-  RACER_VERSION_CONFIGMAP_NAME: "racer-version"
+  RACER_VERSION_CONFIGMAP_NAME: {{ .VersionConfigMapName | default "racer-version" | quote }}
+  RACER_INSTALLATION_CONFIGMAP_NAME: {{ .InstallationConfigMapName | default "racer-installation" | quote }}

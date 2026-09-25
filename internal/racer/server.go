@@ -19,6 +19,7 @@ type Server struct {
 	APIReader    client.Reader
 	Bootstrap    *Bootstrap
 	Publications *Publications
+	Lifecycle    *Lifecycle
 }
 
 var (
@@ -39,7 +40,13 @@ func (*Server) TLSConfig(_ context.Context) (*tls.Config, error) {
 // Leadership cancellation closes listeners/connections and cancels every poll.
 func (*Server) Start(_ context.Context) error { return pending("server.start") }
 
-func (*Server) Ready(_ *http.Request) error { return pending("server.ready") }
+func (s *Server) Ready(r *http.Request) error {
+	if s.Lifecycle == nil {
+		return wire.Unavailable
+	}
+
+	return s.Lifecycle.Ready(r)
+}
 
 // Handler reserves routes, but deliberately cannot return successful operations.
 // This also prevents accidental plaintext httptest use from bypassing scaffold

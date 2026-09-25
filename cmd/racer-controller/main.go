@@ -23,10 +23,19 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 2 || len(os.Args) == 2 && os.Args[1] != "initialize" {
+		return fmt.Errorf("usage: racer-controller [initialize]")
+	}
+
 	cfg, err := racer.LoadConfig()
 	if err != nil {
 		return err
 	}
 
-	return racer.Run(ctrl.SetupSignalHandler(), cfg)
+	ctx := ctrl.SetupSignalHandler()
+	if len(os.Args) == 2 {
+		return racer.Initialize(ctx, cfg)
+	}
+
+	return racer.Run(ctx, cfg)
 }

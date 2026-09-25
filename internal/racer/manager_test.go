@@ -30,7 +30,7 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("missing local accepted state or leader-scoped server")
 	}
 
-	if err := a.Server.Ready(nil); !errors.Is(err, ErrUnimplemented) {
+	if err := a.Server.Ready(nil); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("uninitialized server became ready: %v", err)
 	}
 }
@@ -48,7 +48,12 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	}
 	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
-			if err := operation(); !errors.Is(err, ErrUnimplemented) {
+			want := error(ErrUnimplemented)
+			if name == "topology" || name == "run" {
+				want = wire.InvalidRequest
+			}
+
+			if err := operation(); !errors.Is(err, want) {
 				t.Fatalf("entry point did not fail closed: %v", err)
 			}
 		})

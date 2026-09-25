@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -34,6 +35,7 @@ type KeyringReconciler struct {
 	APIReader client.Reader
 	Config    Config
 	Issuer    *Issuer
+	Lifecycle *Lifecycle
 }
 
 // Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
@@ -50,8 +52,9 @@ func (*KeyringReconciler) PlanRotation(_ wire.KeyringBundle, _ RotationState, _ 
 func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("racer-keyring").
-		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton)).
+		WatchesRawSource(initialEnqueue()).
+		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.IssuerSecretName, r.Config.KeyringSecretName))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
