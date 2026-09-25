@@ -23,11 +23,18 @@ the reactor and crypto client, including while application futures are draining.
   `accept(Rc<OwnedFd>, &RequestScope) -> Operation<OwnedFd>` and
   `connect(Rc<OwnedFd>, SocketAddress, &RequestScope) -> Operation<()>` support
   owned `SocketAddress::Inet(SocketAddr)` / `Unix(PathBuf)` addresses.
+  `connect_with_lease(fd, address, lease: L, scope) -> Operation<L>` retains and
+  returns the entire connection/pool/admission owner across connect cancellation.
+  HTTP checkout should use it rather than rely on FD weak-reference quarantine.
 - `CryptoPort::poll_job` and `complete` retain existing owned-message signatures.
   The security engine destructures crate-visible `CryptoJob` and constructs
   `CryptoCompletion { permit, outcome, key, scope }` after all input access ends.
   Completion publication never needs additional admission. `CryptoClient` reaps
   abandoned completions; `outstanding() -> usize` includes accepted unreaped work.
+  Once a job is accepted, `execute` returns cancellation/deadline failure only
+  after its completion has been consumed. Read drivers may treat that return as
+  their operation fence. Dropping the future separately abandons delivery while
+  worker-owned state continues retaining and reaping the accepted job.
   Operational startup uses fallible `crypto::try_pair(worker, generation, capacity)`;
   legacy `pair` remains for validated composition. Both allocate fixed bounded queues.
 - Runtime does not encrypt pages. Security's paired `PageCryptoEngine` owns AEAD.

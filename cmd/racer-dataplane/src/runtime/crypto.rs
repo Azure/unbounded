@@ -459,26 +459,29 @@ impl CryptoClient {
                 return Err(failure.error);
             }
             let result = futures::future::poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                if let Err(error) = scope.check() {
-                    return Poll::Ready(Err(error));
-                }
+                // After acceptance, returning is itself a completion fence for
+                // the retained read driver. Cancellation changes delivery, not
+                // the point at which a replacement acquisition may be elected.
                 let mut waiters = self.waiters.borrow_mut();
                 let Some(waiter) = waiters.get_mut(&id) else {
                     return Poll::Ready(Err(Error::Cancelled));
                 };
-                if waiter.abandoned {
-                    return Poll::Ready(Err(Error::Cancelled));
-                }
                 waiter.waker = cx.waker().clone();
                 if let Some(completion) = waiter.result.take() {
+                    let cancelled = waiter.abandoned;
                     waiters.remove(&id);
+                    if cancelled {
+                        return Poll::Ready(Err(Error::Cancelled));
+                    }
+                    if let Err(error) = scope.check() {
+                        return Poll::Ready(Err(error));
+                    }
                     Poll::Ready(match completion.outcome {
                         CryptoOutcome::Completed(output) => Ok(output),
                         CryptoOutcome::Failed { error, .. } => Err(error),
                     })
                 } else {
-                    if self.port.completions.borrow().is_closed() {
+                    if self.port.completions.borrow().is_closed() && self.outstanding() == 0 {
                         Poll::Ready(Err(Error::Unavailable))
                     } else {
                         Poll::Pending
@@ -503,8 +506,7 @@ impl CryptoClient {
                 let mut waiters = self.waiters.borrow_mut();
                 if let Some(waiter) = waiters.get_mut(&id) {
                     if waiter.abandoned {
-                        waiters.remove(&id);
-                        None
+                        waiters.remove(&id).map(|waiter| waiter.waker)
                     } else {
                         let wake = waiter.waker.clone();
                         waiter.result = Some(completion);
@@ -520,26 +522,9 @@ impl CryptoClient {
         }
         if self.port.completions.borrow().is_closed() {
             self.port.jobs.discard_closed();
-            let wakes: Vec<_> = self
-                .waiters
-                .borrow()
-                .values()
-                .map(|waiter| waiter.waker.clone())
-                .collect();
-            for waker in wakes {
-                waker.wake();
-            }
             if self.outstanding() == 0 {
-                self.waiters.borrow_mut().clear();
-            }
-            let wakes: Vec<_> = self
-                .pending
-                .borrow()
-                .iter()
-                .map(|(_, waker, _)| waker.clone())
-                .collect();
-            for waker in wakes {
-                waker.wake();
+                let abandoned: Vec<_> = self.waiters.borrow().iter().filter(|(_, waiter)| waiter.abandoned).take(work_budget).map(|(id, _)| *id).collect();
+                for id in abandoned { self.waiters.borrow_mut().remove(&id); }
             }
         }
         // All waits have bounded original deadlines. The worker drives this even
@@ -555,9 +540,7 @@ impl CryptoClient {
                 .take(work_budget.min(waiters.len()))
             {
                 self.deadline_cursor.set(Some(*id));
-                if !waiter.abandoned
-                    && (waiter.scope.check().is_err() || self.port.completions.borrow().is_closed())
-                {
+                if !waiter.abandoned && self.port.completions.borrow().is_closed() {
                     wakes.push(waiter.waker.clone());
                 }
             }
@@ -618,18 +601,30 @@ impl CryptoClient {
             }
             let _guard = DrainGuard(self);
             futures::future::poll_fn(move |cx| {
-                cancellation.register(cx.waker());
+                if scope.check().is_ok() {
+                    cancellation.register(cx.waker());
+                }
                 *self.drain_waiter.borrow_mut() = Some((scope.clone(), cx.waker().clone()));
                 self.register_driver(cx.waker());
                 self.port.handoff.capacity_waker.register(cx.waker());
                 self.poll_budgeted(self.port.handoff.capacity.get())?;
                 if scope.check().is_err() {
+                    let wakes: Vec<_> = self
+                        .waiters
+                        .borrow()
+                        .values()
+                        .filter(|waiter| waiter.result.is_some())
+                        .map(|waiter| waiter.waker.clone())
+                        .collect();
                     for waiter in self.waiters.borrow_mut().values_mut() {
                         waiter.abandoned = true;
                     }
                     self.waiters
                         .borrow_mut()
                         .retain(|_, waiter| waiter.result.is_none());
+                    for waker in wakes {
+                        waker.wake();
+                    }
                 }
                 if self.outstanding() == 0 {
                     Poll::Ready(Ok(()))
@@ -702,6 +697,146 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
         assert!(client.drain(&scope).as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn accepted_cancellation_cannot_return_before_completion_consumption() {
+        use crate::{
+            model::{identity::RequestId, limits::ResourceClass},
+            runtime::admission::Admission,
+        };
+        let admission = std::rc::Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+        let client = CryptoClient::new(io);
+        let scope = RequestScope::new(
+            RequestId([0; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut future = client.execute(input(&admission), key(), &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        scope.cancel().unwrap();
+        for _ in 0..4 {
+            client.poll_budgeted(1).unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(client.outstanding(), 1);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 1);
+        let job = match engine.poll_job(&mut cx) {
+            Poll::Ready(Ok(Some(job))) => job,
+            _ => panic!("job"),
+        };
+        let completion = crate::security::aead::PageCryptoEngine::process(job);
+        assert!(engine.complete(completion).is_ok());
+        assert!(
+            future.as_mut().poll(&mut cx).is_pending(),
+            "queued completion is not consumed"
+        );
+        client.poll_budgeted(1).unwrap();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        assert_eq!(client.outstanding(), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
+
+    #[test]
+    fn accepted_cancellation_waits_for_consumed_completion_not_notification() {
+        use crate::{
+            model::{identity::RequestId, limits::ResourceClass},
+            runtime::admission::Admission,
+        };
+        let admission = std::rc::Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+        let client = CryptoClient::new(io);
+        let scope = RequestScope::new(
+            RequestId([0; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut future = client.execute(input(&admission), key(), &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        scope.cancel().unwrap();
+        for _ in 0..4 {
+            client.poll_budgeted(1).unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(client.outstanding(), 1);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 1);
+        let job = match engine.poll_job(&mut cx) {
+            Poll::Ready(Ok(Some(job))) => job,
+            _ => panic!("job"),
+        };
+        let CryptoJob {
+            permit,
+            input,
+            key,
+            scope: job_scope,
+        } = job;
+        assert!(
+            engine
+                .complete(CryptoCompletion {
+                    permit,
+                    outcome: CryptoOutcome::Failed {
+                        input,
+                        error: Error::Cancelled
+                    },
+                    key,
+                    scope: job_scope
+                })
+                .is_ok()
+        );
+        assert!(
+            future.as_mut().poll(&mut cx).is_pending(),
+            "publication alone is not consumption"
+        );
+        client.poll_budgeted(1).unwrap();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        assert_eq!(client.outstanding(), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
+
+    #[test]
+    fn accepted_deadline_expiry_waits_for_engine_completion() {
+        use crate::{model::identity::RequestId, runtime::admission::Admission};
+        let admission = std::rc::Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+        let client = CryptoClient::new(io);
+        let key = key();
+        let scope = RequestScope::new(
+            RequestId([0; 16]),
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        let mut future = client.execute(input(&admission), key, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        let job = match engine.poll_job(&mut cx) {
+            Poll::Ready(Ok(Some(job))) => job,
+            _ => panic!("job"),
+        };
+        let completion = crate::security::aead::PageCryptoEngine::process(job);
+        assert!(engine.complete(completion).is_ok());
+        client.poll_budgeted(1).unwrap();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::DeadlineExceeded))
+        ));
+        assert_eq!(client.outstanding(), 0);
     }
 
     #[test]
