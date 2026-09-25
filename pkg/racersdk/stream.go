@@ -156,8 +156,23 @@ type TransferStats struct {
 	SpliceBytes   int64
 	SpliceCalls   int64
 	BufferedBytes int64
+	// PageRequests counts GET write attempts, including retries and failed writes,
+	// but excludes HEAD and connection failures before a request can be written.
+	PageRequests int64
+	// PageRetries counts PageRequests that retry rejected pre-body responses.
+	PageRetries int64
+	// PageHeaderWait is time spent preparing page headers on the consumption
+	// path, including connection setup, validation, retry backoff, and failures.
+	// It includes Prepare, but excludes HEAD and caller idle time.
+	PageHeaderWait time.Duration
+	// ForwardDuration is active WriteTo time excluding PageHeaderWait. It includes
+	// upstream body waits, downstream backpressure, and forwarding/cleanup work;
+	// it is not a measure of downstream socket blocking alone.
+	ForwardDuration time.Duration
 }
 
+// Stats returns a cumulative snapshot. It waits for an active Prepare or WriteTo
+// to finish, and remains available after failure or Close.
 func (s *Stream) Stats() TransferStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -266,6 +281,10 @@ func (s *Stream) nextPage() error {
 		s.release(false)
 	}
 
+	started := time.Now()
+
+	defer func() { s.stats.PageHeaderWait += time.Since(started) }()
+
 	return s.preparePageWithRetry()
 }
 
@@ -311,6 +330,8 @@ func (s *Stream) preparePage() error {
 	r.Header.Set("If-Match", s.object.meta.ETag)
 
 	s.operation = "page_request"
+
+	s.stats.PageRequests++
 	if err := r.Write(s.conn); err != nil {
 		return err
 	}
@@ -437,6 +458,14 @@ func (s *Stream) WriteTo(dst io.Writer) (int64, error) {
 
 	if dst == nil {
 		return 0, fmt.Errorf("racer: nil stream destination")
+	}
+
+	if !s.closed && s.err == nil && s.offset < s.end {
+		started, headerWait := time.Now(), s.stats.PageHeaderWait
+
+		defer func() {
+			s.stats.ForwardDuration += time.Since(started) - (s.stats.PageHeaderWait - headerWait)
+		}()
 	}
 
 	if n, err, supported := s.spliceTo(dst); supported {

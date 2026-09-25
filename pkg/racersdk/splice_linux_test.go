@@ -177,6 +177,10 @@ func TestSpliceContentAndReuse(t *testing.T) {
 				stats := s.Stats()
 				_ = s.Close()
 
+				if stats.PageRequests != 1 || stats.PageRetries != 0 || stats.PageHeaderWait <= 0 || stats.ForwardDuration <= 0 {
+					t.Fatal("splice timing accounting", stats)
+				}
+
 				if err != nil || n != int64(len(data)) || !bytes.Equal(body, data) {
 					t.Fatal(n, err, len(body))
 				}

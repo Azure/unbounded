@@ -83,6 +83,18 @@ prefix is drained first. `Stats().SpliceCalls`/`SpliceBytes` measure actual
 syscalls/forwarded bytes. Read-ahead bytes and portable copies appear in
 `BufferedBytes`.
 
+`Stats().PageRequests` counts page GET write attempts (including failed writes),
+and `PageRetries` counts those that retry a rejected pre-body response. HEAD and
+connection failures before request writing are excluded. `PageHeaderWait` is
+consumption-path time preparing headers, including connection setup, validation,
+retry backoff, and failed attempts. `ForwardDuration` is active `WriteTo` time
+outside that preparation: it includes upstream body waits, downstream
+backpressure, and forwarding/cleanup work. It does not isolate downstream socket
+blocking. Both durations exclude HEAD and caller idle time; header wait includes
+`Prepare`. Stats are cumulative, wait for active `Prepare`/`WriteTo` calls, and
+remain readable after failure or Close. Empty streams retain zero stats. These
+per-stream fields create no metric labels or per-page history.
+
 For a Gantry HTTP/1 mirror, prepare the stream, hijack the response connection,
 write status and headers (including exact Content-Length and Content-Type),
 flush the hijacker's buffered writer, then call `stream.WriteTo(conn)`.

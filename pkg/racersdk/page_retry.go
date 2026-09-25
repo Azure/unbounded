@@ -23,7 +23,13 @@ func (s *Stream) preparePageWithRetry() error {
 	var waited time.Duration
 
 	for retry := 0; ; retry++ {
+		requests := s.stats.PageRequests
+
 		err := s.preparePage()
+		if retry > 0 {
+			s.stats.PageRetries += s.stats.PageRequests - requests
+		}
+
 		if err == nil {
 			return nil
 		}

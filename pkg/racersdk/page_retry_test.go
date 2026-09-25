@@ -87,6 +87,11 @@ func TestPageRetryPinnedFirstAndLaterPage(t *testing.T) {
 			if err != nil || n != 16 || body.String() != "12345678abcdefgh" || head.Load() != 1 || first.Load() != 2 || second.Load() != 2 || s.Failure() != nil {
 				t.Fatal(n, err, body.String(), head.Load(), first.Load(), second.Load(), s.Failure())
 			}
+
+			stats := s.Stats()
+			if stats.PageRequests != 4 || stats.PageRetries != 2 || stats.PageHeaderWait < 200*time.Millisecond || stats.ForwardDuration <= 0 {
+				t.Fatal("page retry accounting", stats)
+			}
 		})
 	}
 }
@@ -164,6 +169,10 @@ func TestPageRetryTerminalResponses(t *testing.T) {
 			_, err = s.WriteTo(io.Discard)
 			if err == nil || gets.Load() != 1 || s.conn != nil || len(c.streamPool.idle) != 0 {
 				t.Fatal("retried terminal failure or retained connection", err, gets.Load())
+			}
+
+			if stats := s.Stats(); stats.PageRequests != 1 || stats.PageRetries != 0 || stats.PageHeaderWait <= 0 {
+				t.Fatal("terminal page accounting", stats)
 			}
 		})
 	}
@@ -356,6 +365,7 @@ func TestPageRetryClientTimeoutAndContextCancel(t *testing.T) {
 			start := time.Now()
 
 			done := make(chan error, 1)
+
 			go func() { done <- s.Prepare() }()
 
 			select {
