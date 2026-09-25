@@ -1,5 +1,13 @@
 # Racer rollout and Gantry benchmark: September 24, 2026
 
+**Historical transport scope:** these measurements predate strict kTLS admission.
+The software-TLS paths and fallback metrics described below existed in the
+recorded revisions; they have since been removed. Current dataplane sessions
+require actual TX and RX kTLS before application admission, and file transfers
+use `SSL_sendfile` (`cmd/racer-dataplane/src/tls.rs:833-843,1011-1056`). These
+results do not establish throughput or kernel compatibility for the strict-kTLS
+implementation. See the [current transport requirements](../docs/content/concepts/racer.md#required-kernel-tls).
+
 ## Latest conclusion: September 25, working 80-GB workload and measured bottlenecks
 
 **The requested 80-GB image works on all 1,500 clients at 1/1.** The same-version

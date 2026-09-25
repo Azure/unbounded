@@ -233,7 +233,7 @@ fn saturated_three_hop_http_payloads_complete_with_four_buffers() {
     let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
     for (index, listener) in listeners.iter_mut().enumerate().skip(1) {
         listener.set_tls(
-            ca.context(&peer_identity(index as u8 + 2), false),
+            ca.context(&peer_identity(index as u8 + 2)),
             ExpectedPeer::Identity(peer_identity(index as u8 + 1)),
         );
     }
@@ -262,7 +262,7 @@ fn saturated_three_hop_http_payloads_complete_with_four_buffers() {
                 let id = peer_identity(index as u8 + 2);
                 let credentials = crate::control::credentials::Provider::for_test(
                     id.clone(),
-                    Arc::new(ca.context(&id, false)),
+                    Arc::new(ca.context(&id)),
                 );
                 handler.set_peer_tls(
                     "v1",

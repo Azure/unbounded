@@ -18,10 +18,10 @@ fn stalled_final_owner_headers_and_body_advance_within_original_caller_deadline(
             |m| PeerIdentity::new(&hex(&[1; 32]), &format!("{m:064x}"), "timeout-pod").unwrap();
         let local = id(0);
         let remote = id(1);
-        let tls = ca.context(&remote, false);
+        let tls = ca.context(&remote);
         let credentials = crate::control::credentials::Provider::for_test(
             local.clone(),
-            Arc::new(ca.context(&local, false)),
+            Arc::new(ca.context(&local)),
         );
         let (stop, stopped) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
@@ -170,10 +170,10 @@ fn intermediate_private_timeout_repairs_but_caller_expiry_never_does() {
         let ca = crate::tls::tests::Authority::new();
         let local = peer_identity(2);
         let remote = peer_identity(3);
-        let server_tls = ca.context(&remote, false);
+        let server_tls = ca.context(&remote);
         let credentials = crate::control::credentials::Provider::for_test(
             local.clone(),
-            Arc::new(ca.context(&local, false)),
+            Arc::new(ca.context(&local)),
         );
         let (stop, stopped) = std::sync::mpsc::channel();
         let (ready, started) = std::sync::mpsc::channel();
@@ -674,7 +674,7 @@ fn product_http_stream(candidate_width: u32, body_len: usize, repairs: &[bool]) 
             let mut listener = listeners.remove(&member).unwrap();
             if member != 0 {
                 listener.set_tls(
-                    ca.context(&id(member), false),
+                    ca.context(&id(member)),
                     ExpectedPeer::Universe(hex(&[1; 32])),
                 );
             }
@@ -724,7 +724,7 @@ fn product_http_stream(candidate_width: u32, body_len: usize, repairs: &[bool]) 
             });
             let credentials = crate::control::credentials::Provider::for_test(
                 id(member),
-                Arc::new(ca.context(&id(member), false)),
+                Arc::new(ca.context(&id(member))),
             );
             handler.set_peer_tls("product-test", credentials, &identities);
             servers.push(http::Server::new(

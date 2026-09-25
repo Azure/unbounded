@@ -127,7 +127,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         listener.set_tls(
-            ca.context(bid, false),
+            ca.context(bid),
             ExpectedPeer::Universe(bid.universe.clone()),
         );
         let address = listener.local_addr().unwrap();
@@ -159,7 +159,7 @@ pub(crate) mod tests {
             let mut request = client::Connection::new_tls(
                 address,
                 "localhost",
-                &ca.context(&identity, false),
+                &ca.context(&identity),
                 ExpectedPeer::Identity(bid.clone()),
             )
             .unwrap()
@@ -206,7 +206,6 @@ pub(crate) mod tests {
         ao: &Offer,
         bo: &Offer,
         ring: &mut Ring,
-        offload: bool,
     ) -> (
         (AuthenticatedOffer, ControlChannel),
         (AuthenticatedOffer, ControlChannel),
@@ -228,14 +227,14 @@ pub(crate) mod tests {
         let (remote, _) = listener.accept().unwrap();
         let mut at = client::TlsChannel::new(
             crate::uring::File::new(stream.into()),
-            &ca.context(&aid, offload),
+            &ca.context(&aid),
             ExpectedPeer::Identity(bid.clone()),
             false,
         )
         .unwrap();
         let mut bt = client::TlsChannel::new(
             crate::uring::File::new(remote.into()),
-            &ca.context(&bid, offload),
+            &ca.context(&bid),
             ExpectedPeer::Identity(aid.clone()),
             true,
         )
@@ -252,12 +251,8 @@ pub(crate) mod tests {
             }
             assert!(crate::environment::now() < deadline);
         }
-        if offload && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
-            assert!(
-                at.ktls_tx() && bt.ktls_tx(),
-                "required native kTLS TX unavailable"
-            );
-        }
+        crate::tls::tests::assert_channel_offload(&at);
+        crate::tls::tests::assert_channel_offload(&bt);
         let binding = binding(
             &a.frame(false, ao),
             &b.frame(true, bo),
@@ -438,7 +433,7 @@ pub(crate) mod tests {
         let Some(mut ring) = control::tests::ring() else {
             return;
         };
-        for offload in [false, true] {
+        {
             let a = context(2, 0, b"route");
             let b = context(3, 0, b"route");
             let ca = Authority::new();
@@ -455,14 +450,14 @@ pub(crate) mod tests {
             let (remote, _) = listener.accept().unwrap();
             let mut at = client::TlsChannel::new(
                 crate::uring::File::new(stream.into()),
-                &ca.context(&aid, offload),
+                &ca.context(&aid),
                 ExpectedPeer::Identity(bid.clone()),
                 false,
             )
             .unwrap();
             let mut bt = client::TlsChannel::new(
                 crate::uring::File::new(remote.into()),
-                &ca.context(&bid, offload),
+                &ca.context(&bid),
                 ExpectedPeer::Identity(aid.clone()),
                 true,
             )
@@ -486,12 +481,8 @@ pub(crate) mod tests {
                 assert!(crate::environment::now() < deadline);
             }
             let binding = [11; 32];
-            if offload && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
-                assert!(
-                    at.ktls_tx() && bt.ktls_tx(),
-                    "required native kTLS TX unavailable"
-                );
-            }
+            crate::tls::tests::assert_channel_offload(&at);
+            crate::tls::tests::assert_channel_offload(&bt);
             let mut ac = ControlChannel::new(at, binding, &a, b.prepared.local_node()).unwrap();
             let mut bc = ControlChannel::new(bt, binding, &b, a.prepared.local_node()).unwrap();
             for round in 0..3 {

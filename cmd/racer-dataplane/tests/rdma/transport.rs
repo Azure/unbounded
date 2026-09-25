@@ -620,7 +620,7 @@ mod loopback_tests {
         let aa = a.prepare([7; 16], 0, 1).unwrap();
         let bb = b.prepare([7; 16], 0, 1).unwrap();
         let ((oa, sa), (ob, sb)) =
-            crate::negotiation::tests::tls_channels(aa.offer(), bb.offer(), &mut a_ring, false);
+            crate::negotiation::tests::tls_channels(aa.offer(), bb.offer(), &mut a_ring);
         let ac = aa.connect_authenticated(oa, sa, 0).unwrap();
         let bc = bb.connect_authenticated(ob, sb, 0).unwrap();
         let p = Pair {

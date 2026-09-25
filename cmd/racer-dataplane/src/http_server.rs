@@ -1279,8 +1279,6 @@ impl BodyWriter {
         }
         Ok(SendingBody {
             diagnostic: None,
-            tls_read: None,
-            tls_bytes: None,
             tls_file: None,
             response: Some(self.0),
             chunk: Some(chunk),
@@ -1292,17 +1290,10 @@ impl BodyWriter {
     }
 }
 
-// Batch filesystem IO independently from the TLS write quantum. A 64 MiB page
-// otherwise requires 1024 serial file submissions even when resident. Keep one
-// bounded read allocation per body; never prefetch another while TLS owns bytes.
-const TLS_FILE_READ: usize = 1024 * 1024;
-
 /// Sends a chunk, handles short transfers, and drains notifications as needed.
 #[must_use]
 pub struct SendingBody {
     diagnostic: Option<crate::failure_diagnostics::BodyTrace>,
-    tls_read: Option<Ticket<Bytes>>,
-    tls_bytes: Option<(Box<[u8]>, std::ops::Range<usize>)>,
     // Retain the same descriptor across OpenSSL WANT retries.
     tls_file: Option<File>,
     small: Option<Ticket<Bytes>>,
@@ -1348,15 +1339,8 @@ impl SendingBody {
             context["file_len"] = serde_json::json!(file.info().len);
         }
         if let Some(response) = &self.response {
-            context["transport"] = serde_json::json!(if response
-                .connection
-                .tls
-                .as_ref()
-                .is_some_and(|t| t.ktls_tx())
-            {
+            context["transport"] = serde_json::json!(if response.connection.tls.is_some() {
                 "ktls"
-            } else if response.connection.tls.is_some() {
-                "tls"
             } else {
                 "plain"
             });
@@ -1372,9 +1356,7 @@ impl SendingBody {
             return;
         };
         let Some(r) = &self.response else { return };
-        let (stage, io) = if let Some(t) = &self.tls_read {
-            ("file_read", ring.diagnostic(t))
-        } else if let Some(t) = &self.small {
+        let (stage, io) = if let Some(t) = &self.small {
             ("socket_send", ring.diagnostic(t))
         } else if let Some(t) = &self.buffered {
             ("buffer_send", ring.diagnostic(t))
@@ -1429,8 +1411,6 @@ impl SendingBody {
             self.file_owner.take();
             self.small.take();
             self.buffered.take();
-            self.tls_read.take();
-            self.tls_bytes.take();
             self.tls_file.take();
         }
         result
@@ -1523,61 +1503,13 @@ impl SendingBody {
                             let mut source = crate::allocator::FileSource::new(value)?;
                             self.tls_file = Some(source.descriptor(value)?);
                         }
-                        if !tls.ktls_tx() {
-                            if let Some(ticket) = &mut self.tls_read {
-                                let diagnostic = self
-                                    .diagnostic
-                                    .as_ref()
-                                    .and_then(|_| ring.diagnostic(ticket));
-                                let Some(done) = ring.take_bytes(ticket)? else {
-                                    return Ok(pending(false, Some(r.deadline.get())));
-                                };
-                                if let Some(d) = &mut self.diagnostic {
-                                    d.read_completed(diagnostic);
-                                }
-                                let len =
-                                    transfer(done.result?, chunk.range.len().min(TLS_FILE_READ))?;
-                                self.tls_read = None;
-                                self.tls_bytes = Some((done.resource, 0..len));
-                            }
-                            if self.tls_bytes.is_none() {
-                                match ring.read_bytes(
-                                    self.tls_file.as_ref().unwrap().clone().into(),
-                                    vec![0; chunk.range.len().min(TLS_FILE_READ)]
-                                        .into_boxed_slice(),
-                                    value.offset() + chunk.range.start as u64,
-                                ) {
-                                    Ok(ticket) => {
-                                        ring.retain(&ticket, Rc::new(value.clone()));
-                                        self.tls_read = Some(ticket.cancel_on_drop());
-                                        return Ok(pending(false, Some(r.deadline.get())));
-                                    }
-                                    Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {
-                                        return Ok(pending(true, Some(r.deadline.get())));
-                                    }
-                                    Err(e) => return Err(e.error),
-                                }
-                            }
-                            let (bytes, range) = self.tls_bytes.as_mut().unwrap();
-                            let progress =
-                                tls.poll_write(ring, &bytes[range.clone()], r.deadline.get())?;
-                            if let Progress::Ready(n) = progress {
-                                tls.record_fallback_sendfile_bytes(n);
-                                range.start += n;
-                                if range.start == range.end {
-                                    self.tls_bytes = None;
-                                }
-                            }
-                            progress
-                        } else {
-                            tls.poll_sendfile(
-                                ring,
-                                self.tls_file.as_ref().unwrap(),
-                                value.offset() + chunk.range.start as u64,
-                                chunk.range.len(),
-                                r.deadline.get(),
-                            )?
-                        }
+                        tls.poll_sendfile(
+                            ring,
+                            self.tls_file.as_ref().unwrap(),
+                            value.offset() + chunk.range.start as u64,
+                            chunk.range.len(),
+                            r.deadline.get(),
+                        )?
                     }
                 };
                 match progress {

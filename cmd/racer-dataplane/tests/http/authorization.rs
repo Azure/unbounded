@@ -76,9 +76,7 @@ fn multihop(routed: bool) {
         }
     });
     let ca = crate::tls::tests::Authority::new();
-    let contexts: Vec<_> = (1..=3)
-        .map(|n| ca.context(&peer_identity(n), false))
-        .collect();
+    let contexts: Vec<_> = (1..=3).map(|n| ca.context(&peer_identity(n))).collect();
     let mut servers = Vec::new();
     let mut next = None;
     let mut client_routing = None;

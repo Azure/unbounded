@@ -9,18 +9,12 @@ mod tls_transport {
         PeerIdentity::new(&"a".repeat(64), &node.to_string().repeat(64), "pod-1").unwrap()
     }
 
-    fn assert_offload(ktls: bool, before: crate::tls::TlsCounters) {
+    fn assert_offload(before: crate::tls::TlsCounters) {
         let after = crate::tls::global_counters();
         assert_eq!(after.handshakes - before.handshakes, 2);
-        if ktls && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
-            // Exactly one production HTTP client and server handshook. Requiring
-            // both increments catches attaching the client's BIO before connect.
-            assert_eq!(after.ktls_tx_connections - before.ktls_tx_connections, 2);
-            assert_eq!(after.ktls_rx_connections - before.ktls_rx_connections, 2);
-        } else if !ktls {
-            assert_eq!(after.ktls_tx_connections, before.ktls_tx_connections);
-            assert_eq!(after.ktls_rx_connections, before.ktls_rx_connections);
-        }
+        // This isolated child handshook exactly one production HTTP pair.
+        assert_eq!(after.ktls_tx_connections - before.ktls_tx_connections, 2);
+        assert_eq!(after.ktls_rx_connections - before.ktls_rx_connections, 2);
     }
 
     struct HeldEcho {
@@ -73,23 +67,22 @@ mod tls_transport {
         ) else {
             return;
         };
-        for ktls in [false, true] {
-            duplex_channel(&mut ring, ktls);
-            roundtrip_rotation_and_rejection(&mut ring, ktls);
-            rotation_bounds_inbound_reuse(&mut ring, ktls);
-            file_roundtrip(&mut ring, ktls, false, 192 * 1024 + 7);
-            file_roundtrip(&mut ring, ktls, true, 192 * 1024 + 7);
+        duplex_channel(&mut ring);
+        roundtrip_rotation_and_rejection(&mut ring);
+        rotation_bounds_inbound_reuse(&mut ring);
+        for limited in [false, true] {
+            file_roundtrip(&mut ring, limited, 192 * 1024 + 7);
+            // Cross many bounded sendfile calls with an unaligned start/tail.
+            file_roundtrip(&mut ring, limited, 2 * 1024 * 1024 + 7);
         }
-        // Cross multiple filesystem batches with an unaligned start and tail.
-        file_roundtrip(&mut ring, false, true, 2 * 1024 * 1024 + 7);
         ring.shutdown().unwrap();
     }
 
-    fn rotation_bounds_inbound_reuse(ring: &mut Ring, ktls: bool) {
+    fn rotation_bounds_inbound_reuse(ring: &mut Ring) {
         let ca = Authority::new();
         let mut listener = listener();
         listener.set_tls(
-            ca.context(&identity('b'), ktls),
+            ca.context(&identity('b')),
             ExpectedPeer::Universe(identity('b').universe),
         );
         listener.set_tls_revision(10);
@@ -105,7 +98,7 @@ mod tls_transport {
         let client = http_client::Connection::new_tls(
             address,
             "peer",
-            &ca.context(&identity('c'), ktls),
+            &ca.context(&identity('c')),
             ExpectedPeer::Identity(identity('b')),
         )
         .unwrap();
@@ -138,7 +131,7 @@ mod tls_transport {
             .get();
         let before = crate::environment::now();
         server.install_tls(
-            ca.context(&identity('b'), ktls),
+            ca.context(&identity('b')),
             ExpectedPeer::Universe(identity('b').universe),
             11,
             u64::MAX,
@@ -150,7 +143,7 @@ mod tls_transport {
         // admitted request deadline valid. Repeated installation cannot renew it.
         server.slots.front_mut().unwrap().tls_retire = Some(before);
         server.install_tls(
-            ca.context(&identity('b'), ktls),
+            ca.context(&identity('b')),
             ExpectedPeer::Universe(identity('b').universe),
             12,
             u64::MAX,
@@ -191,21 +184,21 @@ mod tls_transport {
         server.shutdown(ring).unwrap();
     }
 
-    fn duplex_channel(ring: &mut Ring, ktls: bool) {
+    fn duplex_channel(ring: &mut Ring) {
         let ca = Authority::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (accepted, _) = listener.accept().unwrap();
         let mut client = http_client::TlsChannel::new(
             crate::uring::File::new(socket.into()),
-            &ca.context(&identity('c'), ktls),
+            &ca.context(&identity('c')),
             ExpectedPeer::Identity(identity('b')),
             false,
         )
         .unwrap();
         let mut server = http_client::TlsChannel::new(
             crate::uring::File::new(accepted.into()),
-            &ca.context(&identity('b'), ktls),
+            &ca.context(&identity('b')),
             ExpectedPeer::Identity(identity('c')),
             true,
         )
@@ -230,6 +223,8 @@ mod tls_transport {
             )
         })
         .unwrap();
+        crate::tls::tests::assert_channel_offload(&client);
+        crate::tls::tests::assert_channel_offload(&server);
         // An idle read must not prevent writes on the same persistent channel.
         let mut input = [0; 16];
         assert!(matches!(
@@ -265,14 +260,14 @@ mod tls_transport {
         assert_eq!(&input[..6], b"client");
     }
 
-    fn roundtrip_rotation_and_rejection(ring: &mut Ring, ktls: bool) {
+    fn roundtrip_rotation_and_rejection(ring: &mut Ring) {
         let ca = Authority::new();
         let server_identity = identity('b');
         let client_identity = identity('c');
-        let context = ca.context(&client_identity, ktls);
+        let context = ca.context(&client_identity);
         let mut listener = listener();
         listener.set_tls(
-            ca.context(&server_identity, ktls),
+            ca.context(&server_identity),
             ExpectedPeer::Universe(server_identity.universe.clone()),
         );
         let address = listener.local_addr().unwrap();
@@ -309,12 +304,12 @@ mod tls_transport {
             })
         })
         .unwrap();
-        assert_offload(ktls, before);
+        assert_offload(before);
         assert_eq!(response.content_length(), Some(9999999));
         let client = response.recycle().unwrap();
         // Existing sessions retain their context across a listener replacement.
         server.install_tls(
-            ca.context(&server_identity, ktls),
+            ca.context(&server_identity),
             ExpectedPeer::Universe(server_identity.universe.clone()),
             2,
             u64::MAX,
@@ -361,7 +356,7 @@ mod tls_transport {
         tls.set_expiry(0);
         assert!(!tls.admits_new_request());
         server.install_tls(
-            ca.context(&server_identity, ktls),
+            ca.context(&server_identity),
             ExpectedPeer::Universe(server_identity.universe.clone()),
             3,
             u64::MAX,
@@ -410,7 +405,7 @@ mod tls_transport {
         let mut client = http_client::Connection::new_tls(
             address,
             "peer",
-            &ca.context(&client_identity, ktls),
+            &ca.context(&client_identity),
             ExpectedPeer::Identity(server_identity.clone()),
         )
         .unwrap();
@@ -577,10 +572,9 @@ mod tls_transport {
         }
     }
 
-    fn file_roundtrip(ring: &mut Ring, ktls: bool, limited: bool, length: usize) {
+    fn file_roundtrip(ring: &mut Ring, limited: bool, length: usize) {
         use crate::allocator::{Allocator, Slab};
-        let path =
-            std::env::temp_dir().join(format!("racer-http-tls-{}-{ktls}.slab", std::process::id()));
+        let path = std::env::temp_dir().join(format!("racer-http-tls-{}.slab", std::process::id()));
         let io = if limited {
             crate::slab_io::Io::testing(50, 1, false)
         } else {
@@ -649,7 +643,7 @@ mod tls_transport {
         let ca = Authority::new();
         let mut listener = listener();
         listener.set_tls(
-            ca.context(&identity('b'), ktls),
+            ca.context(&identity('b')),
             ExpectedPeer::Universe(identity('b').universe),
         );
         let address = listener.local_addr().unwrap();
@@ -657,57 +651,34 @@ mod tls_transport {
         let client = http_client::Connection::new_tls(
             address,
             "peer",
-            &ca.context(&identity('c'), ktls),
+            &ca.context(&identity('c')),
             ExpectedPeer::Identity(identity('b')),
         )
         .unwrap();
-        // At 50 file operations/sec, the old 33 serialized 64 KiB reads
-        // cannot complete the multi-batch range in this existing caller budget.
-        // Three batched reads can, without changing TLS's bounded write quantum.
-        let request_deadline = if limited && !ktls && length > 1024 * 1024 {
-            Instant::now() + Duration::from_millis(500)
-        } else {
-            deadline()
-        };
         let mut get = client
             .get(
                 http_client::Request::new("/file", &[]).unwrap(),
                 ring.pool().stage(Key::new([93; 32])).unwrap(),
-                request_deadline,
+                deadline(),
             )
             .unwrap();
         let before = crate::tls::global_counters();
-        let mut saw_read = false;
-        let mut saw_completed_read = false;
         let mut saw_rate_queued = false;
-        let mut read_tickets = std::collections::BTreeSet::new();
-        let mut saw_buffered_remainder = false;
         let mut response = drive(ring, |ring| {
             let mut work = allocator.poll(ring, 4)?;
             work.merge(server.poll(ring, 4)?);
             for slot in &server.slots {
                 if let Some(Task::Body(body)) = &slot.task {
                     let d = body.diagnostic.as_ref().unwrap();
-                    if d.stage == "file_read" {
-                        saw_read = true;
-                        assert_eq!(d.io.as_ref().unwrap().opcode, 22);
-                        assert!(d.io.as_ref().unwrap().len <= TLS_FILE_READ as u64);
-                        read_tickets.insert(d.io.as_ref().unwrap().ticket);
-                        saw_rate_queued |= d.io.as_ref().unwrap().state == "rate_queued";
+                    assert_eq!(d.context["transport"], "ktls");
+                    if d.stage == "ktls_slab_rate" {
+                        saw_rate_queued = true;
+                        assert!(d.io.is_none());
                         let record =
                             d.record("test", Some(&io::Error::from(io::ErrorKind::TimedOut)));
-                        assert_eq!(record["stage"], "file_read");
+                        assert_eq!(record["stage"], "ktls_slab_rate");
                         assert_eq!(record["error_kind"], "TimedOut");
-                        assert!(record["io"]["offset"].as_u64().unwrap() >= 13);
-                    }
-                    saw_completed_read |= d.read_count > 0;
-                    if let Some((bytes, range)) = &body.tls_bytes {
-                        assert!(bytes.len() <= TLS_FILE_READ);
-                        assert!(
-                            body.tls_read.is_none(),
-                            "do not accumulate reads behind socket backpressure"
-                        );
-                        saw_buffered_remainder |= range.len() > 65536;
+                        assert!(body.tls_file.is_some());
                     }
                 }
             }
@@ -724,29 +695,20 @@ mod tls_transport {
             response.body(),
             (13..13 + length).map(pattern).collect::<Vec<_>>()
         );
-        if !ktls {
-            assert!(saw_read);
-            assert!(saw_completed_read);
-            assert_eq!(
-                read_tickets.len(),
-                length.div_ceil(1024 * 1024),
-                "one file read per bounded batch, not per TLS write"
-            );
-            assert!(saw_buffered_remainder);
-            if limited {
-                assert!(saw_rate_queued);
-            }
-        }
-        // Abandon a token-queued software-TLS file batch. The ring, not the
-        // response, retains the extent until cancellation reaches a terminal CQE.
-        if limited && !ktls && length > 1024 * 1024 {
+        assert_offload(before);
+        assert_eq!(
+            crate::tls::global_counters().sendfile_bytes - before.sendfile_bytes,
+            length as u64
+        );
+        if limited {
+            assert!(saw_rate_queued);
             assert_eq!(counter("bytes_total") - bytes_before, length as u64);
-            assert_eq!(counter("operations_total") - ops_before, 3);
-            assert_eq!(
-                crate::tls::global_counters().fallback_sendfile_bytes
-                    - before.fallback_sendfile_bytes,
-                length as u64
-            );
+            assert!(counter("operations_total") - ops_before >= length.div_ceil(64 * 1024) as u64);
+            assert!(counter("waits_total") > 0);
+        }
+        // Abandon a token-queued kTLS sendfile. The response retains its extent
+        // while waiting, and dropping it releases the pin without a file-read CQE.
+        if limited && length > 1024 * 1024 {
             drop(response);
             server.shutdown(ring).unwrap();
             let value = server.handler().0.clone();
@@ -754,7 +716,7 @@ mod tls_transport {
             let ca = Authority::new();
             let mut listen = super::listener();
             listen.set_tls(
-                ca.context(&identity('b'), false),
+                ca.context(&identity('b')),
                 ExpectedPeer::Universe(identity('b').universe),
             );
             let addr = listen.local_addr().unwrap();
@@ -762,7 +724,7 @@ mod tls_transport {
             let mut canceled = http_client::Connection::new_tls(
                 addr,
                 "peer",
-                &ca.context(&identity('c'), false),
+                &ca.context(&identity('c')),
                 ExpectedPeer::Identity(identity('b')),
             )
             .unwrap()
@@ -782,15 +744,14 @@ mod tls_transport {
                     canceled.poll(ring, 4).unwrap(),
                     Progress::Pending(_)
                 ));
-                if cancel_server.slots.iter().any(|s|matches!(&s.task,Some(Task::Body(b)) if b.tls_read.as_ref().is_some_and(|t|ring.diagnostic(t).is_some_and(|d|d.state=="rate_queued")))) {break;}
+                if cancel_server.slots.iter().any(|s| matches!(&s.task, Some(Task::Body(b)) if b.diagnostic.as_ref().is_some_and(|d| d.stage == "ktls_slab_rate"))) { break; }
             }
             drop(canceled);
             cancel_server.shutdown(ring).unwrap();
             drop(cancel_server);
             assert!(pin.upgrade().is_some());
             drop(paused);
-            // Original file/allocator still own the extent; existing ring cleanup
-            // tests assert its last release. Here assert canceled IO drains safely.
+            // Original file/allocator still own the extent until dropped below.
             drive(ring, |r| {
                 let work = allocator.poll(r, 16)?;
                 Ok(if r.slab_deadline().is_none() {
@@ -811,32 +772,6 @@ mod tls_transport {
             .unwrap();
             std::fs::remove_file(path).unwrap();
             return;
-        }
-        if limited {
-            assert_eq!(counter("bytes_total") - bytes_before, length as u64);
-            if !ktls {
-                assert_eq!(
-                    counter("operations_total") - ops_before,
-                    length.div_ceil(TLS_FILE_READ) as u64
-                );
-            } else {
-                assert!(counter("operations_total") - ops_before >= 1);
-            }
-            assert!(counter("waits_total") > 0);
-        }
-        assert_offload(ktls, before);
-        let after = crate::tls::global_counters();
-        if ktls && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
-            assert!(after.ktls_tx_connections > before.ktls_tx_connections);
-        }
-        if ktls && after.ktls_tx_connections > before.ktls_tx_connections {
-            assert_eq!(after.sendfile_bytes - before.sendfile_bytes, length as u64);
-        } else {
-            assert_eq!(after.sendfile_bytes, before.sendfile_bytes);
-            assert_eq!(
-                after.fallback_sendfile_bytes - before.fallback_sendfile_bytes,
-                length as u64
-            );
         }
         drop(response);
         server.shutdown(ring).unwrap();

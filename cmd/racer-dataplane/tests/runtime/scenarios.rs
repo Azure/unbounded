@@ -470,7 +470,7 @@ pub(super) fn tls_provider(
     )
     .unwrap();
     AUTHORITY.with(|authority| {
-        let context = authority.context(&identity, true);
+        let context = authority.context(&identity);
         crate::control::credentials::Provider::for_test(identity, Arc::new(context))
     })
 }

@@ -98,11 +98,9 @@ fn peer_rotation_child() {
     let ca = crate::tls::tests::Authority::new();
     let aid = peer_identity(2);
     let bid = peer_identity(3);
-    let provider = crate::control::credentials::Provider::for_test(
-        aid.clone(),
-        Arc::new(ca.context(&aid, false)),
-    );
-    listener.set_tls(ca.context(&bid, false), ExpectedPeer::Identity(aid.clone()));
+    let provider =
+        crate::control::credentials::Provider::for_test(aid.clone(), Arc::new(ca.context(&aid)));
+    listener.set_tls(ca.context(&bid), ExpectedPeer::Identity(aid.clone()));
     listener.set_tls_revision(1);
     let (_, mut config) = crate::control::tests::fixture();
     config.volumes[0].peers = vec![bid.node.clone()];
@@ -222,14 +220,14 @@ fn peer_rotation_child() {
         let handshakes = crate::tls::global_counters().handshakes;
         if full_duration {
             owner.install_tls(
-                ca.context(&bid, false),
+                ca.context(&bid),
                 ExpectedPeer::Identity(aid.clone()),
                 revision,
                 u64::MAX,
             );
         } else {
             owner.install_tls_with_grace(
-                ca.context(&bid, false),
+                ca.context(&bid),
                 ExpectedPeer::Identity(aid.clone()),
                 revision,
                 u64::MAX,

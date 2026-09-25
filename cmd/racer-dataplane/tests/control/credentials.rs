@@ -286,7 +286,10 @@ pub(crate) fn server(socket: TcpStream, context: &TlsContext) -> Stream {
     };
     loop {
         match stream.session.handshake().unwrap() {
-            TlsProgress::Complete(()) => return stream,
+            TlsProgress::Complete(()) => {
+                crate::tls::tests::assert_offload(&stream.session);
+                return stream;
+            }
             TlsProgress::WantRead => stream.wait(false, stream.end).unwrap(),
             TlsProgress::WantWrite => stream.wait(true, stream.end).unwrap(),
             TlsProgress::Eof => panic!("TLS handshake EOF"),

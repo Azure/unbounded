@@ -87,8 +87,8 @@ impl PeerTls {
     fn new() -> Self {
         let ca = crate::tls::tests::Authority::new();
         Self {
-            client: ca.context(&peer_identity(2), false),
-            server: ca.context(&peer_identity(3), false),
+            client: ca.context(&peer_identity(2)),
+            server: ca.context(&peer_identity(3)),
         }
     }
 
@@ -121,6 +121,7 @@ impl PeerStream {
             end: deadline(),
         };
         assert_eq!(stream.progress(TlsSession::handshake).unwrap(), Some(()));
+        crate::tls::tests::assert_offload(&stream.session);
         assert_eq!(stream.session.peer_identity(), Some(&expected));
         stream
     }

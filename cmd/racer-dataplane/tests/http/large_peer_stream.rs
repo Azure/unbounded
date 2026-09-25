@@ -73,11 +73,9 @@ fn cold_nonowner_streams_multiple_pages_with_independent_page_resolution_budgets
     let ca = crate::tls::tests::Authority::new();
     let aid = peer_identity(2);
     let bid = peer_identity(3);
-    let ap = crate::control::credentials::Provider::for_test(
-        aid.clone(),
-        Arc::new(ca.context(&aid, false)),
-    );
-    peer_listener.set_tls(ca.context(&bid, false), ExpectedPeer::Identity(aid));
+    let ap =
+        crate::control::credentials::Provider::for_test(aid.clone(), Arc::new(ca.context(&aid)));
+    peer_listener.set_tls(ca.context(&bid), ExpectedPeer::Identity(aid));
     let (_, mut config) = crate::control::tests::fixture();
     config.volumes[0].peers = vec![bid.node.clone()];
     config.volumes[0]

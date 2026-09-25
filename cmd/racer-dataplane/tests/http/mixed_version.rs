@@ -91,14 +91,10 @@ fn http_a_b_a_exhausts_without_origin_or_coalescing_deadlock() {
     let ca = crate::tls::tests::Authority::new();
     let aid = peer_identity(2);
     let bid = peer_identity(3);
-    let ap = crate::control::credentials::Provider::for_test(
-        aid.clone(),
-        Arc::new(ca.context(&aid, false)),
-    );
-    let bp = crate::control::credentials::Provider::for_test(
-        bid.clone(),
-        Arc::new(ca.context(&bid, false)),
-    );
+    let ap =
+        crate::control::credentials::Provider::for_test(aid.clone(), Arc::new(ca.context(&aid)));
+    let bp =
+        crate::control::credentials::Provider::for_test(bid.clone(), Arc::new(ca.context(&bid)));
     al.set_tls(
         (*ap.current().context).clone(),
         ExpectedPeer::Identity(bid.clone()),
@@ -192,8 +188,7 @@ fn rdma_wire_a_b_a_preserves_identity_and_affine_fallback_budget() {
         .routed(a.upstream.route_state(None, page.key(), false).unwrap());
     let ao = crate::negotiation::tests::offer(1, [3; 16], 0, 1, "fabric");
     let bo = crate::negotiation::tests::offer(2, [4; 16], 0, 1, "fabric");
-    let ((_, mut ac), (_, mut bc)) =
-        crate::negotiation::tests::tls_channels(&ao, &bo, &mut ring, false);
+    let ((_, mut ac), (_, mut bc)) = crate::negotiation::tests::tls_channels(&ao, &bo, &mut ring);
     let end = Instant::now() + Duration::from_secs(5);
     let mut last_deadline = end;
     let data = crate::origin_data::OriginData::new(b"Bearer cyclic-page").unwrap();
@@ -389,7 +384,7 @@ fn production_http_recovery_and_reroute_spend_existing_chain() {
     let identity = peer_identity(2);
     let credentials = crate::control::credentials::Provider::for_test(
         identity.clone(),
-        Arc::new(ca.context(&identity, false)),
+        Arc::new(ca.context(&identity)),
     );
     a.set_peer_tls(
         "v1",
@@ -461,7 +456,7 @@ fn http_admission_retries_do_not_spend_resolution_budget() {
     let identity = peer_identity(2);
     let credentials = crate::control::credentials::Provider::for_test(
         identity.clone(),
-        Arc::new(ca.context(&identity, false)),
+        Arc::new(ca.context(&identity)),
     );
     let mut a = a;
     a.set_peer_tls(

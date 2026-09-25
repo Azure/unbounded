@@ -836,10 +836,24 @@ racer-controlplane-test-run:
 racer-dataplane-test-run:
 	$(RACER_TEST_HARNESS) execute dataplane
 
-# Explicit capability lane: Linux >= 6.14, working io_uring, and kTLS-enabled
-# OpenSSL >= 3.5. Missing prerequisites are failures, never successful skips.
-racer-ktls-test: ## Require real TX/RX kTLS offload (precompiled dataplane tests)
-	RACER_REQUIRE_URING=1 RACER_REQUIRE_KTLS=1 $(RACER_TEST_HARNESS) selected dataplane http_server::tests::tls_transport::encrypted_http_kernel_integration
+# Strict TLS lane: Linux >= 5.15 is the baseline; actual TX/RX kTLS is mandatory.
+# Requires working io_uring, kTLS-enabled OpenSSL >= 3.5, and thread-local seccomp
+# for key-installation faults. Missing prerequisites fail, never skip. Compile
+# both crates first with racer-rust-test-compile. Each selection must run one test.
+racer-ktls-test: ## Verify strict kTLS admission, HTTP/sendfile, and rekey/reconnect
+	@failed=0; for test in \
+		tls::tests::real_socket_mutual_auth_strict_ktls_and_close_notify \
+		tls::tests::normal_and_bootstrap_require_both_offload_directions \
+		tls::tests::inbound_admission_rejects_missing_offload_and_latches_failure \
+		tls::tests::negotiation_requires_tls13_aes_gcm \
+		tls::tests::sendfile_uses_actual_bidirectional_offload \
+		tls::tests::tls13_key_update_preserves_application_and_file_transfers \
+		tls::tests::tls13_key_update_with_actual_ktls \
+		tls::tests::inbound_key_update_succeeds_or_closes_and_reconnects_on_older_kernels \
+		tls::channel::tests::fatal_record_error_rejects_cached_admission_and_pending_io \
+		http_server::tests::tls_transport::encrypted_http_kernel_integration; do \
+		RACER_REQUIRE_URING=1 $(RACER_TEST_HARNESS) selected dataplane "$$test" || failed=1; \
+		done; exit $$failed
 
 .PHONY: racer-timing-test racer-resource-test racer-rdma-test racer-soft-roce-test racer-harness-test
 racer-harness-test: ## Check failure aggregation, deadlines, compiler receipts, and source context without builds

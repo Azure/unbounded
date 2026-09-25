@@ -37,9 +37,6 @@ impl TlsChannel {
             ("tls_write_or_admission", None)
         }
     }
-    pub(crate) fn ktls_tx(&self) -> bool {
-        self.session.offload().tx
-    }
     pub(crate) fn new(
         file: File,
         context: &super::TlsContext,
@@ -139,6 +136,11 @@ impl TlsChannel {
         ring: &mut Ring,
         deadline: Instant,
     ) -> io::Result<Progress<()>> {
+        // A cached handshake or pending readiness must not mask a fatal record
+        // error, including failed key replacement on an admitted connection.
+        if self.session.failed {
+            return Err(super::invalid("TLS session has failed"));
+        }
         if !self.ready && self.expired() {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -256,10 +258,7 @@ impl TlsChannel {
             .expired(self.session.valid_until().unwrap_or(u64::MAX))
     }
     pub fn admits_new_request(&self) -> bool {
-        self.ready && !self.expired()
-    }
-    pub(crate) fn record_fallback_sendfile_bytes(&mut self, bytes: usize) {
-        self.session.record_fallback_sendfile_bytes(bytes);
+        self.ready && self.session.valid_until().is_some() && !self.expired()
     }
 }
 impl Drop for TlsChannel {
@@ -278,3 +277,7 @@ impl Drop for TlsChannel {
     }
 }
 thread_local! { static TLS_CONNECTIONS: std::cell::RefCell<std::collections::BTreeMap<u64, usize>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) }; }
+
+#[cfg(test)]
+#[path = "../../tests/security/channel.rs"]
+mod tests;

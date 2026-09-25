@@ -93,6 +93,7 @@ mod tcp {
                 .unwrap(),
             );
             stream.drive(|s| s.handshake()).unwrap();
+            crate::tls::tests::assert_offload(&stream.0);
             Box::new(stream)
         } else {
             let path = crate::control::tests::test_socket(a, "client");
@@ -253,10 +254,10 @@ mod tcp {
             assert!(headers(&mut socket).starts_with("HTTP/1.1 200"));
         };
         probe_management();
-        let peer_context = authority.context(&remote_identity(), true);
+        let peer_context = authority.context(&remote_identity());
         updates.set_credentials(crate::control::credentials::Provider::for_test(
             local_identity(),
-            Arc::new(authority.context(&local_identity(), true)),
+            Arc::new(authority.context(&local_identity())),
         ));
         let (ready_tx, ready_rx) = mpsc::channel();
         let mut workers = Vec::new();

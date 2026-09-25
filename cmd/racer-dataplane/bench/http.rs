@@ -50,7 +50,7 @@ impl Options {
         let mode = args.next().unwrap_or_default();
         if mode.is_empty() || mode == "--help" {
             println!(
-                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nTCP modes: --tls-trust-dir DIR --tls-cert PEM --tls-key PEM --tls-peer SPIFFE_URI enables mutual TLS and automatic kTLS. All four TLS options are required together.\nUse taskset to select workers (one per allowed physical core). Payload: 64 MiB; default body: file. Unix parent directories must exist."
+                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nTCP modes: --tls-trust-dir DIR --tls-cert PEM --tls-key PEM --tls-peer SPIFFE_URI enables mutual TLS 1.3 with mandatory TX/RX kTLS and AES-GCM. All four TLS options are required together. TLS requires Linux >= 5.15 and OpenSSL >= 3.5 built with enable-ktls; missing offload rejects the connection.\nUse taskset to select workers (one per allowed physical core). Payload: 64 MiB; default body: file. Unix parent directories must exist."
             );
             return Ok(None);
         }

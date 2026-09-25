@@ -397,13 +397,13 @@ mod tests {
         client_socket.set_nonblocking(true).unwrap();
         server_socket.set_nonblocking(true).unwrap();
         let mut client = TlsSession::client(
-            &ca.context(&remote, false),
+            &ca.context(&remote),
             client_socket.into(),
             ExpectedPeer::Identity(local.clone()),
         )
         .unwrap();
         let mut server = TlsSession::server(
-            &ca.context(&local, false),
+            &ca.context(&local),
             server_socket.into(),
             ExpectedPeer::Universe(local.universe.clone()),
         )
@@ -421,6 +421,8 @@ mod tests {
         }
         assert_eq!(client.peer_identity(), Some(&local));
         assert_eq!(server.peer_identity(), Some(&remote));
+        crate::tls::tests::assert_offload(&client);
+        crate::tls::tests::assert_offload(&server);
         let mut policy = policy();
         policy.authorize(server.peer_identity().unwrap()).unwrap();
         Arc::make_mut(&mut policy.members).remove(&[2; 32]);

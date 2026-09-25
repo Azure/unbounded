@@ -139,6 +139,8 @@ fn ephemeral_tls_and_production_trust_isolation() {
             let a = client.handshake()?;
             let b = server.handshake()?;
             if a == TlsProgress::Complete(()) && b == TlsProgress::Complete(()) {
+                crate::tls::tests::assert_offload(&client);
+                crate::tls::tests::assert_offload(&server);
                 return Ok(());
             }
             if Instant::now() >= deadline {

@@ -82,6 +82,37 @@ Racer is designed for high throughput, low latency, and efficient CPU use:
 
 Racer also supports standard TCP networking, so RDMA hardware is optional.
 
+### Required kernel TLS
+
+The dataplane requires **Linux 5.15 or newer** with working kernel TLS (kTLS)
+transmit and receive support. This version is the minimum baseline, not a
+capability guarantee: after each TLS handshake, the dataplane checks that both
+**TX and RX kTLS are active on that socket** before admitting application data.
+This applies to peer connections and dataplane connections to the control plane,
+including bootstrap enrollment. A missing direction rejects the session.
+
+Only TLS 1.3 with `TLS_AES_128_GCM_SHA256` or `TLS_AES_256_GCM_SHA384` is
+supported. There is no software TLS fallback or compatibility mode for hosts
+without bidirectional kTLS. The managed dataplane image includes kTLS-enabled
+OpenSSL, but the host kernel must still provide the required runtime support.
+
+TLS 1.3 KeyUpdate continues on the existing kTLS session when the kernel supports
+key replacement. If replacement is unsupported or fails, the session fails
+closed: subsequent application reads, writes, and file transfers are rejected.
+Recovery requires a fresh connection and handshake; the failed session cannot
+be reused or switched to software TLS. This allows initial connections on older
+supported kernels without assuming that those kernels can rekey an active
+session. Linux 6.14 and newer support the modern rekey path, which remains
+covered by successful repeated-update tests.
+
+The dataplane exports `racer_dataplane_tls_handshakes_total`,
+`racer_dataplane_tls_ktls_tx_connections_total`, and
+`racer_dataplane_tls_ktls_rx_connections_total` for admitted sessions, plus
+`racer_dataplane_tls_sendfile_bytes_total` for file bytes sent through kTLS.
+The former `racer_dataplane_tls_encrypted_fallback_connections_total` and
+`racer_dataplane_tls_fallback_sendfile_bytes_total` metrics have been removed;
+update dashboards that used them.
+
 ## When to Use Racer
 
 Use Racer when many workers read the same blobs, repeated downloads limit
@@ -225,12 +256,30 @@ make racer-build
 ```
 
 The binaries are written to `bin/`. The control plane uses system OpenSSL for
-certificate cryptography and rustls for TLS transport. The dataplane uses
-vendored OpenSSL for its kTLS-capable transport.
+certificate cryptography and rustls for TLS transport. The dataplane statically
+links vendored OpenSSL built with kTLS enabled.
+
+To use an external OpenSSL for the dataplane, set `OPENSSL_NO_VENDOR=1` and
+install its development headers and `pkg-config`; also set `OPENSSL_DIR` when
+selecting a custom installation. Both the Rust bindings and the native C shim
+use that installation. It must be **OpenSSL 3.5 or newer**, built with
+`enable-ktls`. Older or kTLS-disabled builds are rejected, and a dynamically
+loaded library must also satisfy the version requirement. Installing a default
+distribution `libssl-dev` package is sufficient for the control plane but does
+not necessarily satisfy these external-dataplane requirements.
 
 Run `make racer-fmt-check racer-test` to check formatting and run the Go and
 Rust suites, including Rust doctests. To check only the Rust control plane,
 use `make racer-controlplane-fmt-check racer-controlplane-test`.
+
+Dataplane TLS tests always assert actual TX and RX kTLS; offload assertions are
+not optional. For focused coverage, first run `make racer-rust-test-compile`,
+then `make racer-ktls-test`. The focused target verifies admission rejection,
+TLS/cipher restrictions, HTTP and file transfers, supported rekey, terminal
+rekey failure, and fresh-connection recovery. It requires usable io_uring and
+permission to install thread-local seccomp filters for socket-scoped
+key-installation faults. CI records the host kernel and runs these checks on
+that host; injected faults do not establish runtime coverage on older kernels.
 
 Build the managed images from the repository root:
 
