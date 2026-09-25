@@ -160,7 +160,9 @@ func TestStreamFailureRetainsErrorBeforeCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	s := &Stream{ctx: ctx, operation: "page_validate", pageOffset: PageSize, offset: PageSize, statusCode: 503}
+	p := newPreparedPage(ctx, nil, PageSize)
+	p.operation, p.statusCode = "page_validate", 503
+	s := &Stream{ctx: ctx, offset: PageSize, page: p}
 
 	err := &HTTPError{StatusCode: 503, Target: "/secret"}
 	if !errors.Is(s.fail(err), context.Canceled) {

@@ -98,7 +98,7 @@ func TestLookaheadCriticalPath(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Force sequential mode to acquire the second scripted socket.
-				s.responseClose = true
+				s.page.responseClose = true
 				dst := &delayedWriter{delay: 5 * time.Second}
 
 				n, err := s.WriteTo(dst)
@@ -246,7 +246,7 @@ func TestLookaheadCancellationAndAbandonment(t *testing.T) {
 					}
 
 					_ = s.Close()
-					if stats := s.Stats(); stats.PageRequests < 2 || stats.PageRetries != stats.PageRequests-2 || s.future != nil || s.conn != nil {
+					if stats := s.Stats(); stats.PageRequests < 2 || stats.PageRetries != stats.PageRequests-2 || s.future != nil || s.page.conn != nil {
 						t.Fatal("lost canceled speculative attempts", stats)
 					}
 				})
@@ -587,7 +587,7 @@ func TestLookaheadConcurrentCloseAndStats(t *testing.T) {
 		wg.Go(func() { _ = s.Close() })
 		wg.Wait()
 
-		if s.future != nil || s.conn != nil || len(c.streamPool.speculative) != 0 {
+		if s.future != nil || s.page.conn != nil || len(c.streamPool.speculative) != 0 {
 			t.Fatal("Close did not join")
 		}
 	}
@@ -676,8 +676,121 @@ func TestLookaheadAdoptedBodyKeepsFullDeadline(t *testing.T) {
 		n, err := s.WriteTo(dst)
 
 		var timeout net.Error
-		if (!errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &timeout) || !timeout.Timeout())) || n != 8 || time.Since(start) != 4*time.Second || s.future != nil || s.conn != nil || len(s.object.client.streamPool.speculative) != 0 {
+		if (!errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &timeout) || !timeout.Timeout())) || n != 8 || time.Since(start) != 4*time.Second || s.future != nil || s.page.conn != nil || len(s.object.client.streamPool.speculative) != 0 {
 			t.Fatal("adopted body outlived deadline", n, err, s.Failure())
 		}
 	})
+}
+
+func TestLookaheadAdoptedOwnerReturnsSocketSafely(t *testing.T) {
+	c := newTestClient(t, lookaheadOrigin(t, PageSize+8, nil), ClientOptions{PageLookahead: true})
+
+	s := lookaheadRange(t, c, "/object", PageSize-8, 16)
+	if err := s.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+
+	f := s.future
+	owner := f.page
+
+	var first [8]byte
+	if n, err := s.read(first[:]); err != nil || n != len(first) {
+		t.Fatal(n, err)
+	}
+
+	if err := s.nextPage(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.page != owner || f.page != nil || s.future != nil || owner.ctx.Err() != nil || len(c.streamPool.speculative) != 0 {
+		t.Fatal("adoption did not transfer a live owner")
+	}
+
+	conn := owner.conn
+
+	if n, err := s.WriteTo(&patternWriter{offset: PageSize}); err != nil || n != 8 {
+		t.Fatal(n, err)
+	}
+
+	if owner.conn != nil || owner.ctx.Err() != context.Canceled || s.Stats().PageRequests != 2 {
+		t.Fatal("completed owner retained resources or lost attempts", s.Stats())
+	}
+
+	// The adopted socket must remain reusable after its owner and original
+	// stream are canceled, even while a new stream is using that exact socket.
+	next := lookaheadRange(t, c, "/object", PageSize, 8)
+	if err := next.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+
+	if next.page.conn != conn {
+		t.Fatal("adopted socket was not returned to the pool")
+	}
+
+	_ = s.Close()
+
+	if n, err := next.WriteTo(&patternWriter{offset: PageSize}); err != nil || n != 8 {
+		t.Fatal("old owner canceled a reused socket", n, err)
+	}
+
+	if s.Stats().PageRequests != 2 || next.Stats().PageRequests != 1 {
+		t.Fatal("ownership retirement counted attempts twice", s.Stats(), next.Stats())
+	}
+}
+
+func TestLookaheadAdoptedOwnerCancellation(t *testing.T) {
+	for _, action := range []string{"close", "cancel"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				body := make(chan struct{})
+				defer close(body)
+
+				s := lookaheadScript(t, ctx, scriptedPage{body: "12345678"},
+					scriptedPage{body: "abcdefgh", beforeBody: func() { <-body }})
+				if err := s.Prepare(); err != nil {
+					t.Fatal(err)
+				}
+
+				f := s.future
+				owner := f.page
+
+				var first [8]byte
+				if n, err := s.read(first[:]); err != nil || n != len(first) {
+					t.Fatal(n, err)
+				}
+
+				if err := s.nextPage(); err != nil {
+					t.Fatal(err)
+				}
+
+				if s.page != owner || f.page != nil || owner.ctx.Err() != nil {
+					t.Fatal("adoption changed ownership or canceled the page")
+				}
+
+				done := make(chan error, 1)
+
+				go func() { _, err := s.WriteTo(io.Discard); done <- err }()
+
+				synctest.Wait()
+
+				if action == "close" {
+					_ = s.Close()
+				} else {
+					cancel()
+				}
+
+				if err := <-done; !errors.Is(err, context.Canceled) {
+					t.Fatal("adopted body did not stop", err)
+				}
+
+				failure := s.Failure()
+				if owner.conn != nil || owner.ctx.Err() != context.Canceled || failure.Operation != "page_body" || failure.PageOffset != PageSize || failure.Offset != PageSize || failure.StatusCode != 206 || s.Stats().PageRequests != 2 {
+					t.Fatal("lost adopted ownership or diagnostics", failure, s.Stats())
+				}
+			})
+		})
+	}
 }

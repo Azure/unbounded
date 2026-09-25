@@ -19,15 +19,15 @@ const (
 // Only rejected page headers are retryable. preparePage has not consumed or
 // forwarded any page body, and the immutable Object and offset remain pinned.
 // Body reads, splice failures, and stale sockets never enter this retry loop.
-func (s *Stream) preparePageWithRetry() error {
+func (p *preparedPage) preparePageWithRetry(offset, end int64) error {
 	var waited time.Duration
 
 	for retry := 0; ; retry++ {
-		requests := s.requests.Load()
+		requests := p.requests.Load()
 
-		err := s.preparePage()
+		err := p.preparePage(offset, end)
 		if retry > 0 {
-			s.retries.Add(s.requests.Load() - requests)
+			p.retries.Add(p.requests.Load() - requests)
 		}
 
 		if err == nil {
@@ -35,7 +35,7 @@ func (s *Stream) preparePageWithRetry() error {
 		}
 
 		var status *HTTPError
-		if s.ctx.Err() != nil || retry == pageRetries || !errors.As(err, &status) ||
+		if p.ctx.Err() != nil || retry == pageRetries || !errors.As(err, &status) ||
 			(status.StatusCode != 429 && status.StatusCode != 503 && status.StatusCode != 504) {
 			return err
 		}
@@ -45,18 +45,18 @@ func (s *Stream) preparePageWithRetry() error {
 			return err
 		}
 
-		if end, ok := s.ctx.Deadline(); ok && time.Until(end) <= delay {
+		if deadline, ok := p.ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			return err
 		}
 
 		// Never pool a rejected response or drain an untrusted error body. This
 		// also discards header read-ahead before another attempt is dispatched.
-		s.release(false)
-		s.operation = "page_retry_wait"
+		p.release(false)
+		p.operation = "page_retry_wait"
 
 		timer := time.NewTimer(delay)
 		select {
-		case <-s.ctx.Done():
+		case <-p.ctx.Done():
 			timer.Stop()
 			return err // fail preserves the HTTP evidence and returns ctx.Err().
 		case <-timer.C:

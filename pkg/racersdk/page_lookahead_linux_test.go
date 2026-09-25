@@ -93,7 +93,7 @@ func TestLookaheadSpliceInterrupted(t *testing.T) {
 				t.Fatal("splice or speculative worker leaked")
 			}
 
-			if s.future != nil || s.conn != nil || len(c.streamPool.speculative) != 0 || len(c.streamPool.pipes.idle) != 0 || len(c.streamPool.idle) != 0 {
+			if s.future != nil || s.page.conn != nil || len(c.streamPool.speculative) != 0 || len(c.streamPool.pipes.idle) != 0 || len(c.streamPool.idle) != 0 {
 				t.Fatal("interrupted resources pooled or retained")
 			}
 		})

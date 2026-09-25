@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -132,25 +131,17 @@ func (c *streamConn) response(r *http.Request) (*http.Response, error) {
 // 64 MiB page. It allocates no page-sized buffers. Close cancels blocked I/O.
 // WriteTo calls are serialized; Close may run concurrently with WriteTo.
 type Stream struct {
-	mu                   sync.Mutex
-	object               *Object
-	ctx                  context.Context
-	cancel               context.CancelFunc
-	conn                 *streamConn
-	stop                 func() bool
-	stopped              chan struct{}
-	offset, end, pageEnd int64
-	responseClose        bool
-	err                  error
-	closed               bool
-	stats                TransferStats
-	operation            string
-	pageOffset           int64
-	statusCode           int
-	failure              *StreamFailure
-	future               *pageFuture
-	requests             atomic.Int64
-	retries              atomic.Int64
+	mu          sync.Mutex
+	object      *Object
+	ctx         context.Context
+	cancel      context.CancelFunc
+	page        *preparedPage
+	offset, end int64
+	err         error
+	closed      bool
+	stats       TransferStats
+	failure     *StreamFailure
+	future      *pageFuture
 }
 
 // TransferStats distinguishes actual kernel splice traffic from buffered
@@ -183,9 +174,11 @@ func (s *Stream) Stats() TransferStats {
 	defer s.mu.Unlock()
 
 	stats := s.stats
-	stats.PageRequests = s.requests.Load()
+	if s.page != nil {
+		stats.PageRequests += s.page.requests.Load()
+		stats.PageRetries += s.page.retries.Load()
+	}
 
-	stats.PageRetries = s.retries.Load()
 	if s.future != nil {
 		stats.PageRequests += s.future.page.requests.Load()
 		stats.PageRetries += s.future.page.retries.Load()
@@ -255,27 +248,7 @@ func (o *Object) ReadRange(ctx context.Context, offset, length int64) (*Stream, 
 		ctx, cancel = context.WithCancel(ctx)
 	}
 
-	return &Stream{object: o, ctx: ctx, cancel: cancel, offset: offset, end: offset + length, pageOffset: offset}, nil
-}
-
-func (s *Stream) release(reuse bool) {
-	if s.conn == nil {
-		return
-	}
-
-	if !s.stop() {
-		<-s.stopped
-
-		reuse = false
-	}
-
-	if reuse && s.ctx.Err() == nil {
-		s.object.client.streamPool.put(s.conn)
-	} else {
-		_ = s.conn.Close() //nolint:errcheck // Preserve the transfer error.
-	}
-
-	s.conn = nil
+	return &Stream{object: o, ctx: ctx, cancel: cancel, offset: offset, end: offset + length, page: newPreparedPage(ctx, o, offset)}, nil
 }
 
 func (s *Stream) nextPage() error {
@@ -283,16 +256,16 @@ func (s *Stream) nextPage() error {
 		return err
 	}
 
-	if s.conn != nil && s.offset < s.pageEnd {
+	if s.page.conn != nil && s.offset < s.page.pageEnd {
 		return nil
 	}
 
-	if s.conn != nil && s.conn.reader.Buffered() != 0 {
+	if s.page.conn != nil && s.page.conn.reader.Buffered() != 0 {
 		return fmt.Errorf("%w: bytes beyond response length", ErrProtocol)
 	}
 
-	if s.conn != nil && s.responseClose {
-		s.release(false)
+	if s.page.conn != nil && s.page.responseClose {
+		s.page.release(false)
 	}
 
 	started := time.Now()
@@ -300,12 +273,10 @@ func (s *Stream) nextPage() error {
 	defer func() { s.stats.PageHeaderWait += time.Since(started) }()
 
 	if s.future != nil {
-		s.release(!s.responseClose)
-
 		if err := s.takeFuture(); err != nil {
 			return err
 		}
-	} else if err := s.preparePageWithRetry(); err != nil {
+	} else if err := s.page.preparePageWithRetry(s.offset, s.end); err != nil {
 		return err
 	}
 
@@ -314,95 +285,15 @@ func (s *Stream) nextPage() error {
 	return nil
 }
 
-func (s *Stream) preparePage() error {
-	s.operation = "page_connect"
-	s.pageOffset = s.offset
-	s.statusCode = 0
-
-	if err := s.ctx.Err(); err != nil {
-		return err
-	}
-
-	if s.conn == nil {
-		c, err := s.object.client.streamPool.get(s.ctx)
-		if err != nil {
-			return err
-		}
-
-		s.conn = c
-		s.stopped = make(chan struct{})
-		done := s.stopped
-
-		s.stop = context.AfterFunc(s.ctx, func() {
-			_ = c.Close() //nolint:errcheck // Cancellation interrupts socket I/O.
-
-			close(done)
-		})
-		if deadline, ok := s.ctx.Deadline(); ok {
-			if err := c.SetDeadline(deadline); err != nil {
-				return err
-			}
-		}
-	}
-
-	s.pageEnd = s.offset + min(PageSize-s.offset%PageSize, s.end-s.offset)
-
-	r, err := s.object.client.request(s.ctx, http.MethodGet, s.object.target)
-	if err != nil {
-		return err
-	}
-
-	r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", s.offset, s.pageEnd-1))
-	r.Header.Set("If-Match", s.object.meta.ETag)
-
-	s.operation = "page_request"
-
-	s.requests.Add(1)
-
-	if err := r.Write(s.conn); err != nil {
-		return err
-	}
-
-	s.operation = "page_headers"
-
-	resp, err := s.conn.response(r)
-	if err != nil {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		}
-
-		return err
-	}
-
-	s.statusCode = resp.StatusCode
-
-	s.operation = "page_validate"
-
-	if resp.StatusCode == 429 || resp.StatusCode == 503 || resp.StatusCode == 504 {
-		if err := identityResponse(resp); err != nil {
-			return err
-		}
-	}
-
-	if err := s.object.validatePage(resp, s.offset, s.pageEnd-1); err != nil {
-		return err
-	}
-
-	s.responseClose = resp.Close
-	s.operation = "page_body"
-
-	return nil
-}
-
 func (s *Stream) finish() error {
-	s.release(!s.responseClose)
+	s.page.close(!s.page.responseClose)
 
 	return io.EOF
 }
 
 func (s *Stream) fail(err error) error {
 	if s.failure == nil {
-		s.failure = &StreamFailure{Operation: s.operation, PageOffset: s.pageOffset, Offset: s.offset, StatusCode: s.statusCode, Err: err, ContextErr: s.ctx.Err()}
+		s.failure = &StreamFailure{Operation: s.page.operation, PageOffset: s.page.pageOffset, Offset: s.offset, StatusCode: s.page.statusCode, Err: err, ContextErr: s.ctx.Err()}
 	}
 
 	if cause := s.ctx.Err(); cause != nil {
@@ -410,7 +301,7 @@ func (s *Stream) fail(err error) error {
 	}
 
 	s.err = err
-	s.release(false)
+	s.page.close(false)
 	s.discardFuture()
 
 	return err
@@ -441,13 +332,13 @@ func (s *Stream) read(p []byte) (int, error) {
 		return 0, s.fail(err)
 	}
 
-	s.operation = "page_body"
-	n, err := s.conn.reader.Read(p[:min(int64(len(p)), s.pageEnd-s.offset)])
+	s.page.operation = "page_body"
+	n, err := s.page.conn.reader.Read(p[:min(int64(len(p)), s.page.pageEnd-s.offset)])
 	s.offset += int64(n)
 
 	s.stats.BufferedBytes += int64(n)
 
-	if err != nil && (err != io.EOF || s.offset != s.pageEnd) {
+	if err != nil && (err != io.EOF || s.offset != s.page.pageEnd) {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
@@ -475,7 +366,7 @@ func (s *Stream) Close() error {
 	defer s.mu.Unlock()
 
 	s.closed = true
-	s.release(false)
+	s.page.close(false)
 	s.discardFuture()
 
 	return nil
@@ -517,7 +408,7 @@ func (s *Stream) WriteTo(dst io.Writer) (int64, error) {
 		}
 
 		if n > 0 {
-			s.operation = "downstream_write"
+			s.page.operation = "downstream_write"
 			written, writeErr := dst.Write((*buf)[:n])
 
 			total += int64(written)
