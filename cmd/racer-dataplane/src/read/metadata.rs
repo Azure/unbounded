@@ -422,16 +422,22 @@ impl MetadataService {
                     let mut owned_budget = budget.transfer();
                     let (send, mut receive) = futures::channel::oneshot::channel();
                     driver_permit.submit(Box::pin(async move {
-                        let result = service
-                            .refresh(
-                                selector,
-                                membership,
-                                &owned_context,
-                                &owned_scope,
-                                &mut owned_budget,
-                                bootstrap,
-                            )
-                            .await;
+                        let mut work = Box::pin(service.refresh(
+                            selector,
+                            membership,
+                            &owned_context,
+                            &owned_scope,
+                            &mut owned_budget,
+                            bootstrap,
+                        ));
+                        let result = poll_fn(|cx| {
+                            if Rc::strong_count(&driver_registration.lifetime) == 1 {
+                                let _ = owned_scope.cancel();
+                            }
+                            work.as_mut().poll(cx)
+                        })
+                        .await;
+                        drop(work);
                         let result = match result {
                             Ok(output) => {
                                 driver_registration.finish(Ok(output.clone()));
@@ -490,9 +496,10 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().epoch;
-        let candidates =
-            self.candidates
-                .candidates(membership.clone(), &context.object, PageNumber(0))?;
+        let candidates = self
+            .candidates
+            .candidates_async(membership.clone(), &context.object, PageNumber(0))
+            .await?;
         let operation = PeerOperation::Metadata {
             object: context.object.clone(),
             selector: selector.clone(),
@@ -533,11 +540,10 @@ impl MetadataService {
                     {
                         // A conditional origin miss says nothing about immutable
                         // copies on later candidates. Probe those copy-only first.
-                        let candidates = self.candidates.candidates(
-                            membership.clone(),
-                            &context.object,
-                            PageNumber(0),
-                        )?;
+                        let candidates = self
+                            .candidates
+                            .candidates_async(membership.clone(), &context.object, PageNumber(0))
+                            .await?;
                         let operation = PeerOperation::Metadata {
                             object: context.object.clone(),
                             selector: selector.clone(),

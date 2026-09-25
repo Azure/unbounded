@@ -881,7 +881,7 @@ impl Flights {
             scope.cancellation.register(cx.waker())?;
             self.poll_with_context(cx, self.limits.entries)?;
             let mut table = self.table.borrow_mut();
-            if table.entries.is_empty() {
+            if table.entries.is_empty() && super::drivers::pending() == 0 {
                 return Poll::Ready(Ok(()));
             }
             scope.check()?;
