@@ -21,7 +21,7 @@ import (
 )
 
 // Keep socket and test scratch paths inside this worktree, including under race.
-func socketDir(t *testing.T) string {
+func socketDir(t testing.TB) string {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("../../tmp", "sdk-")

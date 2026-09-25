@@ -264,6 +264,37 @@ func requestHead(r OriginRequest) ([]byte, error) {
 	if r.operation < OperationHead || r.operation > OperationPinned {
 		return nil, failure(ErrorInvalidArgument, "request", nil)
 	}
+	// Validate private values directly instead of serializing and reparsing with
+	// net/http. The latter allocates another buffered reader and header map on
+	// every request, including already validated origin requests.
+	if _, err := NewFetchContext(r.context.metadata, r.context.authorization); err != nil {
+		return nil, err
+	}
+
+	if r.pin.value != "" {
+		if _, err := ParseETag(r.pin.value); err != nil {
+			return nil, err
+		}
+	}
+
+	switch r.operation {
+	case OperationHead:
+		if r.byteRange.kind != 0 {
+			return nil, failure(ErrorInvalidArgument, "request", nil)
+		}
+	case OperationBootstrap:
+		if r.pin.value != "" || r.byteRange != bootstrapRange() {
+			return nil, failure(ErrorInvalidArgument, "request", nil)
+		}
+	case OperationPinned:
+		if r.pin.value == "" {
+			return nil, failure(ErrorInvalidArgument, "request", nil)
+		}
+
+		if _, err := parseRange(rangeValue(r.byteRange)); err != nil {
+			return nil, err
+		}
+	}
 
 	var b strings.Builder
 	b.WriteString(method + " " + objectPrefix + r.key.String() + " HTTP/1.1\r\nHost: racer\r\n")
@@ -287,13 +318,8 @@ func requestHead(r OriginRequest) ([]byte, error) {
 	b.WriteString("\r\n")
 	head := []byte(b.String())
 
-	parsed, err := parseRequestHead(head, false)
-	if err != nil {
-		return nil, err
-	}
-
-	if parsed.operation != r.operation {
-		return nil, failure(ErrorInvalidArgument, "request", nil)
+	if len(head) > maxHeadBytes {
+		return nil, headFailure(false, true)
 	}
 
 	return head, nil

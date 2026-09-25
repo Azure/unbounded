@@ -436,3 +436,19 @@ func FuzzWireHead(f *testing.F) {
 		_, _ = parseResponseHead(head, OriginRequest{operation: OperationBootstrap, byteRange: bootstrapRange()}, nil)
 	})
 }
+
+func TestConstructedRequestValidation(t *testing.T) {
+	for _, request := range []OriginRequest{
+		{operation: OperationHead, byteRange: bootstrapRange()},
+		{operation: OperationBootstrap, byteRange: bootstrapRange(), pin: ETag{value: `"v"`}},
+		{operation: OperationBootstrap},
+		{operation: OperationPinned, byteRange: bootstrapRange()},
+		{operation: OperationPinned, pin: ETag{value: `"v"`}},
+		{operation: OperationHead, pin: ETag{value: "bad\r\nHeader: injected"}},
+		{operation: OperationHead, context: FetchContext{authorization: Authorization{value: "bad\r\nHeader: injected"}}},
+	} {
+		if _, err := requestHead(request); err == nil {
+			t.Fatal("serialized invalid private request")
+		}
+	}
+}

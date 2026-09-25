@@ -8,7 +8,8 @@ normative [client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.m
 define the contract. Validated types, protocol guards, and client/origin lifecycles are in
 `pkg/racersdk`; see its [package guide](../pkg/racersdk/doc.go) and
 [examples](../pkg/racersdk/example_test.go) for usage. Independent integration and
-performance verification remain step 5. SDK packages must not import `cmd/` packages.
+performance verification are recorded in [the step 5 report](racer-sdk-verification.md).
+SDK packages must not import `cmd/` packages.
 
 Evidence read in implementation, test, then prose order (Rust paths below are
 relative to `cmd/racer-dataplane/`):
