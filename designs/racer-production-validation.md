@@ -2,12 +2,13 @@
 
 Source audit: 2026-09-25, baseline `6938c593..e975e41b` plus pending integration
 changes. Paths below are relative to `cmd/racer-dataplane`. This document describes
-inspected implementation and test assertions, not an independent suite execution.
-The integration owner records final commands/results against the settled commits.
+inspected implementation and test assertions. The production-component suite was
+also executed as recorded below; broader lifecycle/native results remain the
+integration owner's responsibility.
 
 ## Production-component read fixtures
 
-`tests/production_dataplane.rs:369-629` manually assembles the real read graph:
+`tests/production_dataplane.rs:368-663` manually assembles the real read graph:
 coordinator, fill, origin HTTP over Unix sockets, page crypto, memory, direct-I/O
 storage, dispatcher, parser, and response writer. It polls the real reactor and
 crypto engine. The client side uses accepted socket pairs; the fixture does not
@@ -17,12 +18,59 @@ The six tests assert:
 
 | Scenario | Assertions | Source |
 | --- | --- | --- |
-| Multipage bootstrap and cache reuse | Initial unpinned fetch, pinned remainder, exact bytes from memory and forced disk with origin offline | `tests/production_dataplane.rs:707-762` |
-| Zero-TTL metadata | HEAD revalidation, new version, old pinned version still available offline | `tests/production_dataplane.rs:765-808` |
-| Expired metadata and old pins | New length/version, missing pin returns 412, old-version disk suffix remains exact | `tests/production_dataplane.rs:811-854` |
-| Bounded page memory | Stream larger than page budget, dirty flush, complete offline reread | `tests/production_dataplane.rs:857-886` |
-| Overlapping zero-TTL callers | Concurrent callers share one origin flight; later caller revalidates | `tests/production_dataplane.rs:889-949` |
-| Backpressured reader | Fast reader completes while slow reader holds delivery; cancellation releases reactor/pipe/flight resources and preserves cache bytes | `tests/production_dataplane.rs:952-1043` |
+| Multipage bootstrap and cache reuse | Initial unpinned fetch, five-page pinned remainder with two-page window, six persisted records, exact memory and disk bytes with origin offline | `tests/production_dataplane.rs:712` |
+| Zero-TTL metadata | HEAD revalidation, new version, old pinned version still available offline | `tests/production_dataplane.rs:771` |
+| Expired metadata and old pins | Nonzero expired observation, new length/version, missing pin returns 412, old-version disk suffix remains exact | `tests/production_dataplane.rs:817` |
+| Bounded page memory | Eight-page stream with four plaintext pages and two dirty pages, dirty flush, offline reread of every actually persisted page | `tests/production_dataplane.rs:863` |
+| Overlapping zero-TTL callers | Concurrent callers share one origin flight; later caller revalidates | `tests/production_dataplane.rs:908` |
+| Backpressured reader | Fast reader completes while slow reader holds delivery; cancellation releases reactor/pipe/flight resources and preserves cache bytes | `tests/production_dataplane.rs:971` |
+
+### Executed production-component verification
+
+From `cmd/racer-dataplane`, on 2026-09-25:
+
+```sh
+rustfmt --edition 2024 --check tests/production_dataplane.rs
+cargo test --test production_dataplane -- --nocapture
+```
+
+Formatting passed. All six tests passed, zero failed, zero ignored. These tests
+run real crypto and O_DIRECT storage without read/storage/crypto success doubles.
+The parent reports actual Go SDK conformance already passes; it was not rerun here.
+
+### Production failure reported and corrected by parent
+
+The initial application composition shared a `PAGE_BYTES + 16` HTTP body cap
+between page traffic and client responses. Long-range tests failed with
+`Err(InvalidRequest)` before a response head or pinned origin fetch. Exact original
+repro from `cmd/racer-dataplane`:
+
+```sh
+cargo test --test production_dataplane bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin -- --exact --nocapture
+```
+
+The parent correction adds `HttpIo::for_clients` (`src/http/io.rs:139`) and uses
+it in application composition (`src/app.rs:718`). Sending supports whole-object
+ranges while receiving retains the page cap. The final fixture uses that same
+production constructor (`tests/production_dataplane.rs:558`), not a test-only
+relaxed codec. The test commit depends on the parent-owned production correction.
+The original repro now exercises the fixed path.
+
+### Harness corrections
+
+- The real crypto engine is polled inline in the fixture, so debug-build page
+  crypto can exceed a two-second delivery stall deadline while occupying the
+  fixture executor. Delivery now uses the bounded 40-second request timeout
+  (`tests/production_dataplane.rs:536`). This is not evidence of a production
+  delivery failure; production has a paired crypto worker.
+- A drained writer does not imply every fetched page persisted. Fill explicitly
+  discards unsubmitted writes and may retry without dirty admission under pressure
+  (`src/read/fill.rs:69-78`). The initial complete offline replay assertion was
+  intermittently false for this reason, not established corruption. The full-cache
+  test now has sufficient dirty capacity and asserts six records; the pressure
+  test demands offline reads only for records actually published in the disk index.
+
+No additional unresolved production failure was established by these six tests.
 
 ## Application lifecycle fixtures
 
