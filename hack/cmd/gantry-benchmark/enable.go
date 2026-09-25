@@ -101,7 +101,11 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	}
 
 	if !b.config.usesProxy() {
-		if err := validateDirectGantryRegistry([]byte(originalConfig), b.config.GantryACRLoginServer); err != nil {
+		if err := validateDirectGantryRegistry(
+			[]byte(originalConfig),
+			b.config.GantryACRLoginServer,
+			b.config.gantryUpstreamEndpoint(),
+		); err != nil {
 			return fmt.Errorf("validate dedicated Gantry ACR configuration: %w", err)
 		}
 	}
@@ -117,11 +121,13 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		GantryConfigMap:              b.config.GantryConfigMap,
 		MonitoringNamespace:          b.config.MonitoringNamespace,
 		PrometheusService:            b.config.PrometheusService,
+		NodePool:                     b.config.NodePool,
 		NodeCount:                    b.config.NodeCount,
 		ImagePlatform:                b.config.ImagePlatform,
 		ImageSizeMiB:                 b.config.ImageSizeMiB,
 		ImageLayers:                  b.config.ImageLayers,
 		WorkloadRepository:           b.config.WorkloadRepository,
+		ArtifactStreaming:            b.config.ArtifactStreaming,
 		BaselineACRLoginServer:       b.config.BaselineACRLoginServer,
 		GantryACRLoginServer:         b.config.GantryACRLoginServer,
 		ACRLoginServer:               b.config.ACRLoginServer,

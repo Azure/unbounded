@@ -3,7 +3,37 @@
 
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestNodeSelector(t *testing.T) {
+	tests := []struct {
+		name string
+		pool string
+		want map[string]string
+	}{
+		{
+			name: "classic default",
+			want: map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"},
+		},
+		{
+			name: "dedicated pool",
+			pool: "stream",
+			want: map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64", "agentpool": "stream"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := benchmarkConfig{ImagePlatform: "linux/amd64", NodePool: test.pool}
+			if got := config.nodeSelector(); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("nodeSelector() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestValidateGantryStatus(t *testing.T) {
 	status := daemonSetStatus{}

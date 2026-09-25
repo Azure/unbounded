@@ -72,11 +72,24 @@ profile-gantry: operator-vm-check
 
 operator-vm-check:
 	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-watch.sh
-	./deploy.sh plan deploy.env.example >/dev/null
+	./deploy.sh plan deploy.env.example | grep -Fq 'Artifact Streaming:  false'
+	@stream_config=$$(mktemp); \
+	trap 'rm -f "$$stream_config"' EXIT; \
+	sed -e 's/BENCHMARK_ARTIFACT_STREAMING="false"/BENCHMARK_ARTIFACT_STREAMING="true"/' \
+		deploy.env.example >"$$stream_config"; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'Artifact Streaming:  true'; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'benchmark pool:      stream (1000 x Standard_D8s_v3)'; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'system pool:         system (1 x Standard_D4s_v5)'
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
-	grep -Fq '"$$repo_root/bin/helm" upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
+	grep -Fq 'local helm_args=(' deploy.sh
+	grep -Fq 'upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
+	grep -Fq '"$$repo_root/bin/helm" "$${helm_args[@]}"' deploy.sh
+	grep -Fq -- '--enable-artifact-streaming' deploy.sh
+	grep -Fq -- '--set gantry.artifactStreaming.enabled=true' deploy.sh
+	grep -Fq -- '--set overlaybdConfig.enabled=true' deploy.sh
+	grep -Fq 'endpoint=http://127.0.0.1:8578?ns=$$GANTRY_ACR_LOGIN_SERVER' deploy.sh
 	! grep -Fq '"$$repo_root/bin/helm" template gantry' deploy.sh
 	! grep -Fq 'ensure_chair_leases' deploy.sh
 	grep -Fq 'git archive "$$source_revision" | tar -x -C "$$source_context"' deploy.sh

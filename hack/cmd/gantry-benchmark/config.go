@@ -50,6 +50,7 @@ type benchmarkConfig struct {
 	BaselineACRUsername          string
 	BaselineACRPassword          string
 	GantryACRLoginServer         string
+	GantryACRName                string
 	GantryACRUsername            string
 	GantryACRPassword            string
 	ACRLoginServer               string
@@ -60,6 +61,10 @@ type benchmarkConfig struct {
 	ImagePlatform                string
 	ContainerEngine              string
 	ConfirmedContext             string
+	NodePool                     string
+	ArtifactStreaming            bool
+	ArtifactStreamingTimeout     time.Duration
+	ArtifactStreamingPoll        time.Duration
 	NodeCount                    int
 	ImageSizeMiB                 int
 	ImageLayers                  int
@@ -131,6 +136,21 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, err
 	}
 
+	artifactStreaming, err := envBool(getenv, "BENCHMARK_ARTIFACT_STREAMING", false)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
+	artifactStreamingTimeout, err := envDuration(getenv, "BENCHMARK_ARTIFACT_STREAMING_TIMEOUT", 2*time.Hour)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
+	artifactStreamingPoll, err := envDuration(getenv, "BENCHMARK_ARTIFACT_STREAMING_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
 	telemetryTimeout, err := envDuration(getenv, "BENCHMARK_TELEMETRY_TIMEOUT", 15*time.Minute)
 	if err != nil {
 		return benchmarkConfig{}, err
@@ -183,6 +203,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		BaselineACRUsername:          getenv("BASELINE_ACR_USERNAME"),
 		BaselineACRPassword:          getenv("BASELINE_ACR_PASSWORD"),
 		GantryACRLoginServer:         getenv("GANTRY_ACR_LOGIN_SERVER"),
+		GantryACRName:                getenv("GANTRY_ACR_NAME"),
 		GantryACRUsername:            getenv("GANTRY_ACR_USERNAME"),
 		GantryACRPassword:            getenv("GANTRY_ACR_PASSWORD"),
 		ACRLoginServer:               getenv("ACR_LOGIN_SERVER"),
@@ -193,6 +214,10 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ImagePlatform:                envDefault(getenv, "BENCHMARK_IMAGE_PLATFORM", "linux/amd64"),
 		ContainerEngine:              envDefault(getenv, "CONTAINER_ENGINE", "podman"),
 		ConfirmedContext:             getenv("BENCHMARK_CONFIRM_CONTEXT"),
+		NodePool:                     getenv("BENCHMARK_NODE_POOL"),
+		ArtifactStreaming:            artifactStreaming,
+		ArtifactStreamingTimeout:     artifactStreamingTimeout,
+		ArtifactStreamingPoll:        artifactStreamingPoll,
 		NodeCount:                    nodeCount,
 		ImageSizeMiB:                 imageSizeMiB,
 		ImageLayers:                  imageLayers,
@@ -241,6 +266,13 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, errors.New("benchmark maximum latency ratio must be greater than zero")
 	}
 
+	if config.ArtifactStreaming && config.Mode != benchmarkModeDirect {
+		return benchmarkConfig{}, errors.New("BENCHMARK_ARTIFACT_STREAMING requires BENCHMARK_MODE=direct")
+	}
+	if config.ArtifactStreamingTimeout <= 0 || config.ArtifactStreamingPoll <= 0 {
+		return benchmarkConfig{}, errors.New("Artifact Streaming timeout and poll interval must be greater than zero")
+	}
+
 	if config.TelemetryTimeout <= 0 {
 		return benchmarkConfig{}, errors.New("benchmark telemetry timeout must be greater than zero")
 	}
@@ -254,6 +286,14 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 
 func (c benchmarkConfig) usesProxy() bool {
 	return c.Mode != benchmarkModeDirect
+}
+
+func (c benchmarkConfig) gantryUpstreamEndpoint() string {
+	if c.ArtifactStreaming {
+		return "http://127.0.0.1:8578?ns=" + c.GantryACRLoginServer
+	}
+
+	return "https://" + c.GantryACRLoginServer
 }
 
 func (c benchmarkConfig) registryForPhase(phase proxyPhase) (phaseRegistry, error) {
@@ -303,6 +343,9 @@ func (c benchmarkConfig) validateEnable() error {
 	} else {
 		required["BASELINE_ACR_LOGIN_SERVER"] = c.BaselineACRLoginServer
 		required["GANTRY_ACR_LOGIN_SERVER"] = c.GantryACRLoginServer
+		if c.ArtifactStreaming {
+			required["GANTRY_ACR_NAME"] = c.GantryACRName
+		}
 
 		if c.BaselineACRLoginServer != "" && strings.EqualFold(c.BaselineACRLoginServer, c.GantryACRLoginServer) {
 			return errors.New("baseline and Gantry ACR login servers must be different")
@@ -348,6 +391,9 @@ func (c benchmarkConfig) nodeSelector() map[string]string {
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 		selector["kubernetes.io/os"] = parts[0]
 		selector["kubernetes.io/arch"] = parts[1]
+	}
+	if c.NodePool != "" {
+		selector["agentpool"] = c.NodePool
 	}
 
 	return selector

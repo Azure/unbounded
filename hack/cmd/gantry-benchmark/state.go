@@ -28,6 +28,7 @@ type benchmarkState struct {
 	GantryConfigMap              string                 `json:"gantry_configmap"`
 	MonitoringNamespace          string                 `json:"monitoring_namespace"`
 	PrometheusService            string                 `json:"prometheus_service"`
+	NodePool                     string                 `json:"node_pool,omitempty"`
 	NodeCount                    int                    `json:"node_count"`
 	ImagePlatform                string                 `json:"image_platform"`
 	ImageSizeMiB                 int                    `json:"image_size_mib"`
@@ -41,6 +42,8 @@ type benchmarkState struct {
 	WorkloadPayloadSHA256        string                 `json:"workload_payload_sha256,omitempty"`
 	WorkloadComparisonMode       workloadComparisonMode `json:"workload_comparison_mode,omitempty"`
 	StandaloneGantry             bool                   `json:"standalone_gantry,omitempty"`
+	ArtifactStreaming            bool                   `json:"artifact_streaming,omitempty"`
+	ArtifactStreamingPrepared    bool                   `json:"artifact_streaming_prepared,omitempty"`
 	ProxyImage                   string                 `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string                 `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string                 `json:"original_gantry_config"`
@@ -79,6 +82,10 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 
 		if s.WorkloadPayloadSHA256 == "" {
 			return "", "", fmt.Errorf("prepared standalone Gantry image has no payload fingerprint")
+		}
+
+		if s.ArtifactStreaming && !s.ArtifactStreamingPrepared {
+			return "", "", fmt.Errorf("standalone Gantry image has not completed Artifact Streaming conversion")
 		}
 
 		gantryRepository, _, err := splitImageReference(s.GantryColdImage, s.GantryACRLoginServer)
