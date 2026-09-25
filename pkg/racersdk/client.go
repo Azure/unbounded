@@ -35,6 +35,9 @@ type Client struct {
 	active    map[*Value]struct{}
 	slots     chan struct{}
 	transport *http.Transport
+	ctx       context.Context
+	cancel    context.CancelFunc
+	dial      func(context.Context, string, string) (net.Conn, error)
 }
 
 // NewClient validates config without dialing. Each client owns its transport and
@@ -69,6 +72,8 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	}
 
 	dialer := &net.Dialer{Timeout: config.DialTimeout}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), ctx: ctx, cancel: cancel, dial: dialer.DialContext}
 	t := &http.Transport{
 		Proxy: nil, DisableCompression: true,
 		MaxConnsPerHost: config.MaxConnections, MaxIdleConns: config.MaxConnections, MaxIdleConnsPerHost: config.MaxConnections,
@@ -78,15 +83,30 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	}
 	t.Protocols.SetHTTP1(true)
 	t.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, "unix", path)
+		// Transport detaches dials from request cancellation for pool reuse. Keep
+		// them attached to the client lifetime so Close also stops pending dials.
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		stop := context.AfterFunc(c.ctx, cancel)
+		defer stop()
+
+		conn, err := c.dial(ctx, "unix", path)
 		if err != nil {
+			return nil, err
+		}
+
+		if err := c.ctx.Err(); err != nil {
+			closeBody(conn)
 			return nil, err
 		}
 
 		return newResponseConn(conn), nil
 	}
 
-	return &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), transport: t}, nil
+	c.transport = t
+
+	return c, nil
 }
 
 // Get admits a fresh object using a bootstrap GET and returns as soon as validated
@@ -175,6 +195,10 @@ func (c *Client) Close() error {
 
 	for _, v := range values {
 		v.finish(failure(ErrorClosed, "client", nil))
+	}
+
+	if c.cancel != nil {
+		c.cancel()
 	}
 
 	if c.transport != nil {
