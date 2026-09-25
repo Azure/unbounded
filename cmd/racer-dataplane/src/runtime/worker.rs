@@ -14,7 +14,7 @@
 use super::{admission::Admission, affinity::AffinityPlan, reactor::Reactor};
 use crate::{
     error::{Result, pending},
-    model::identity::{PageId, WorkerId},
+    model::identity::{ObjectId, PageId, WorkerId},
 };
 use std::rc::Rc;
 
@@ -39,6 +39,10 @@ pub trait WorkerService {
 }
 
 impl WorkerMap {
+    /// Same owner as this object's page zero, without needing an ETag first.
+    pub fn metadata_owner(&self, _object: &ObjectId) -> Result<WorkerId> {
+        pending("worker.metadata_owner")
+    }
     pub fn owner(&self, _page: &PageId) -> Result<WorkerId> {
         pending("worker.owner")
     }

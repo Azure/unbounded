@@ -22,6 +22,35 @@ use std::{rc::Rc, sync::Arc};
 /// request/reply messages, generation tags, backpressure, and cancellation fencing.
 pub struct WorkerDirectory;
 impl WorkerDirectory {
+    /// Bounded handoff to the object's page-zero owner, independent of ETag.
+    pub fn resolve_metadata<'a>(
+        &'a self,
+        _selector: crate::model::metadata::MetadataSelector,
+        _membership: crate::topology::membership::MembershipLease,
+        _context: &'a crate::model::context::OriginContext,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, crate::model::metadata::ObjectMetadata> {
+        deferred("dispatch.resolve_metadata")
+    }
+    /// Fill completion publishes only immutable version facts, never a current
+    /// pointer. Catalog admission may evict descriptors under its own bounded quota.
+    pub fn publish_metadata<'a>(
+        &'a self,
+        _metadata: crate::model::metadata::VersionMetadata,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        deferred("dispatch.publish_metadata")
+    }
+    /// Bounded local-shard lookup of page-attached descriptors after page-zero
+    /// catalog eviction or restart. Includes memory, pending writes, and index.
+    /// No peer/origin I/O; reject conflicting lengths for the exact same version.
+    pub fn retained_metadata<'a>(
+        &'a self,
+        _version: &'a crate::model::identity::ObjectVersion,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, Option<crate::model::metadata::VersionMetadata>> {
+        deferred("dispatch.retained_metadata")
+    }
     /// Select the stable page owner and enqueue a bounded request. The transport
     /// implementation moves an owned command, never the borrowed worker future.
     pub fn acquire<'a>(

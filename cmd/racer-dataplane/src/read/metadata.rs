@@ -15,15 +15,27 @@ use crate::{
     peer::requester::PeerClient,
     runtime::deadline::RequestScope,
     security::credentials::CredentialCrypto,
+    store::index::Index,
     topology::membership::MembershipLease,
 };
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
+/// An empty bootstrap is metadata-only: it never constructs an encrypted page.
+pub enum BootstrapResult {
+    Empty(ObjectMetadata),
+    Page(super::fill::PageResult),
+}
+pub struct MetadataDependencies {
+    pub index: Rc<Index>,
+    pub fill: Rc<super::fill::Fill>,
+    pub owners: Arc<super::dispatch::WorkerDirectory>,
+}
 pub struct MetadataService {
     candidates: Rc<CandidatePolicy>,
     origin: Rc<dyn Origin>,
     peers: Rc<dyn PeerClient>,
     credentials: Rc<CredentialCrypto>,
     capacity: usize,
+    storage: MetadataDependencies,
 }
 impl MetadataService {
     pub fn new(
@@ -32,6 +44,7 @@ impl MetadataService {
         peers: Rc<dyn PeerClient>,
         credentials: Rc<CredentialCrypto>,
         capacity: usize,
+        storage: MetadataDependencies,
     ) -> Self {
         Self {
             candidates,
@@ -39,6 +52,7 @@ impl MetadataService {
             peers,
             credentials,
             capacity,
+            storage,
         }
     }
     /// Missing pinned metadata may require a conditional page-zero probe; never
@@ -59,6 +73,20 @@ impl MetadataService {
         _scope: &'a RequestScope,
     ) -> Operation<'a, Option<ObjectMetadata>> {
         deferred("metadata.copy_only")
+    }
+    /// Runs on the page-zero owner. Resolve metadata, then acquire page zero via
+    /// the same Fill as pinned reads. Require identical version AND total length;
+    /// bounded version-change retries happen before any response headers escape.
+    /// Missing pinned descriptors may use owners.retained_metadata before probing
+    /// peers/origin; fresh admission must still revalidate an absent/expired pointer.
+    pub fn bootstrap<'a>(
+        &'a self,
+        _selector: MetadataSelector,
+        _membership: MembershipLease,
+        _context: &'a OriginContext,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, BootstrapResult> {
+        deferred("metadata.bootstrap")
     }
 }
 #[cfg(test)]

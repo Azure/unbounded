@@ -19,6 +19,10 @@ pub struct NodeId(pub String);
 pub struct StrongEtag(String);
 
 impl StrongEtag {
+    #[cfg(test)]
+    pub(crate) fn test_value(value: &str) -> Self {
+        Self(value.to_owned())
+    }
     /// Reject weak, wildcard, malformed, and ambiguous HTTP entity tags.
     pub fn parse(_value: &[u8]) -> Result<Self> {
         pending("identity.strong_etag")

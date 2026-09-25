@@ -9,7 +9,7 @@ use crate::{
     error::{Operation, deferred},
     memory::{
         cache::MemoryCache,
-        pool::{BufferPool, CiphertextPage, VerifiedPage},
+        pool::{BufferPool, CiphertextPage},
     },
     model::{context::OriginContext, identity::PageId, metadata::ObjectMetadata},
     origin::client::Origin,
@@ -19,13 +19,9 @@ use crate::{
     store::{reader::StoreReader, writer::StoreWriter},
     topology::membership::MembershipLease,
 };
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
-pub struct PageResult {
-    pub metadata: ObjectMetadata,
-    pub plaintext: VerifiedPage,
-    pub ciphertext: CiphertextPage,
-}
+pub use crate::memory::page::PageResult;
 pub struct FillDependencies {
     pub memory: Rc<MemoryCache>,
     pub buffers: Rc<BufferPool>,
@@ -38,6 +34,9 @@ pub struct FillDependencies {
     pub crypto: Rc<PageCrypto>,
     pub credentials: Rc<CredentialCrypto>,
     pub admission: Rc<Admission>,
+    /// Publish immutable descriptors to the page-zero owner over bounded commands.
+    /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
+    pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
 pub struct Fill {
     dependencies: FillDependencies,
@@ -45,6 +44,15 @@ pub struct Fill {
 impl Fill {
     pub fn new(dependencies: FillDependencies) -> Self {
         Self { dependencies }
+    }
+    /// Local shard's memory/pending/disk descriptors, without starting acquisition.
+    /// Used by WorkerDirectory's bounded retained-metadata lookup on a pinned miss.
+    pub fn retained_metadata<'a>(
+        &'a self,
+        _version: &'a crate::model::identity::ObjectVersion,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, Option<crate::model::metadata::VersionMetadata>> {
+        deferred("fill.retained_metadata")
     }
     pub fn acquire<'a>(
         &'a self,

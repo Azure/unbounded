@@ -19,6 +19,8 @@ impl CheckpointCodec {
     pub fn encode(&self, _image: &CheckpointImage) -> Result<Vec<u8>> {
         pending("checkpoint.encode")
     }
+    /// Validate bounded images, each index's metadata, and agreement of immutable
+    /// version lengths across all shards before exposing any recovery image.
     pub fn decode(&self, _bytes: &[u8]) -> Result<CheckpointImage> {
         pending("checkpoint.decode")
     }

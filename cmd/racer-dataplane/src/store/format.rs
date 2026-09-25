@@ -5,13 +5,15 @@ use super::{
 };
 use crate::{
     error::{Result, pending},
-    memory::pool::CiphertextPage,
-    model::envelope::PageEnvelope,
+    memory::page::CiphertextCopy,
+    model::{envelope::PageEnvelope, metadata::VersionMetadata},
 };
 pub struct RecordHeader {
     pub format_version: u32,
     pub generation: Generation,
     pub envelope: PageEnvelope,
+    /// Must match the index's immutable descriptor and the envelope's full version.
+    pub metadata: VersionMetadata,
     /// Header plus ciphertext, excluding direct-I/O padding.
     pub logical_bytes: u64,
     pub extent: DirectExtent,
@@ -25,7 +27,7 @@ impl RecordCodec {
     /// Preserve ciphertext exactly; authenticate only the envelope's payload bytes.
     pub fn encode(
         &self,
-        _page: &CiphertextPage,
+        _page: &CiphertextCopy,
         _generation: Generation,
         _alignment: DirectAlignment,
         _buffer: AlignedBuffer,

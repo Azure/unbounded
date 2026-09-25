@@ -5,7 +5,7 @@
 use super::{index::Index, segment::Segments, slab::Slabs};
 use crate::{
     error::{Operation, deferred},
-    memory::pool::{BufferPool, CiphertextPage},
+    memory::{page::CiphertextCopy, pool::BufferPool},
     model::identity::PageId,
     runtime::deadline::RequestScope,
 };
@@ -18,6 +18,13 @@ pub struct StoreReader {
     buffers: Rc<BufferPool>,
 }
 impl StoreReader {
+    /// Descriptor lookup without slab I/O, including retained nonzero-page entries.
+    pub fn metadata(
+        &self,
+        version: &crate::model::identity::ObjectVersion,
+    ) -> crate::error::Result<Option<crate::model::metadata::VersionMetadata>> {
+        self.index.version(version)
+    }
     pub fn new(
         clock: Rc<super::eviction::SegmentClock>,
         index: Rc<Index>,
@@ -37,7 +44,7 @@ impl StoreReader {
         &'a self,
         _page: &'a PageId,
         _scope: &'a RequestScope,
-    ) -> Operation<'a, Option<CiphertextPage>> {
+    ) -> Operation<'a, Option<CiphertextCopy>> {
         deferred("store.read")
     }
 }

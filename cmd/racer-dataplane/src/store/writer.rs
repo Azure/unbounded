@@ -6,7 +6,7 @@
 use super::{index::Index, segment::Segments, slab::Slabs};
 use crate::{
     error::{Operation, Result, deferred, pending},
-    memory::pool::CiphertextPage,
+    memory::page::CiphertextCopy,
     runtime::{admission::Reservation, deadline::RequestScope},
 };
 use std::rc::Rc;
@@ -26,8 +26,22 @@ impl StoreWriter {
             slabs,
         }
     }
-    pub fn enqueue(&self, _page: CiphertextPage, _dirty: Reservation) -> Result<DirtyTicket> {
+    /// Retain the descriptor with pending ciphertext. Index publication commits
+    /// location and descriptor together only after the entire record completes.
+    pub fn enqueue(&self, _page: CiphertextCopy, _dirty: Reservation) -> Result<DirtyTicket> {
         pending("store.enqueue")
+    }
+    pub fn copy_only(
+        &self,
+        _page: &crate::model::identity::PageId,
+    ) -> Result<Option<CiphertextCopy>> {
+        pending("store.pending_copy")
+    }
+    pub fn metadata(
+        &self,
+        _version: &crate::model::identity::ObjectVersion,
+    ) -> Result<Option<crate::model::metadata::VersionMetadata>> {
+        pending("store.pending_metadata")
     }
     pub fn drain<'a>(&'a self, _scope: &'a RequestScope) -> Operation<'a, ()> {
         deferred("store.drain")

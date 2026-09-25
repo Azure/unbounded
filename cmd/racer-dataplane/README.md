@@ -35,6 +35,15 @@ library. There are no third-party dependencies yet.
   same coordinator; transport does not create another acquisition pipeline.
   Explicit version pins may use expired metadata; fresh/unpinned admission requires
   revalidation. Existing reads never switch ETags.
+  `VersionMetadata` retains immutable version/total-length facts separately from
+  the volatile `CurrentVersion` freshness pointer. Only page-zero revalidation
+  publishes that pointer; pins and page hits publish immutable facts only.
+  `MetadataService` shares the worker's live `Index`, `Fill`, and bounded worker
+  directory. Bootstrap returns either metadata-only (empty) or a full `PageResult`.
+  Missing pinned metadata can query retained descriptors across local page shards
+  before a conditional page-zero probe. Fresh reads still require revalidation.
+  `read::fill::PageResult` re-exports the cloneable memory-layer result containing
+  metadata, verified plaintext, and original ciphertext for future flight sharing.
 - Per-cache UDS paths are exactly `/run/racer/<cache name>/client/socket` and
   `/run/racer/<cache name>/origin/socket`. Racer owns the client listener; the
   application adapter owns the origin listener. Separate endpoint directories let
@@ -61,6 +70,17 @@ library. There are no third-party dependencies yet.
 - `store` accepts only encrypted pages. Slabs require `O_DIRECT` with discovered
   address/offset/length alignment. Aligned padded record lengths differ from
   authenticated ciphertext lengths. Padding is initialized and never delivered.
+  Memory entries and dirty `CiphertextCopy` bundles retain metadata with each page;
+  completed index entries and record headers retain `VersionMetadata`. Total object
+  length is never inferred from a page length. Per-page descriptors survive bounded
+  page-zero catalog eviction, so old cached pages remain usable by explicit pins.
+  HEAD-only and empty-object descriptors have a bounded standalone catalog and
+  checkpoint representation without allocating an encrypted page. Checkpoints
+  include descriptors atomically with completed page mappings, omit dirty pages and
+  current-version pointers, and reject conflicting lengths for one version.
+  Recovery is connected to the same live index/segments and restores one consistent
+  cut before admission; recovered descriptors carry no freshness claim. Request
+  context, Authorization, and opaque adapter metadata are absent from these types.
 - `memory`, `runtime`, and `rdma` retain leases until all applicable kernel/NIC
   fences finish, including cancellation. Disk persistence is bounded and async;
   failed dirty writes may be discarded.

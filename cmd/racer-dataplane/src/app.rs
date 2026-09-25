@@ -39,7 +39,7 @@ use crate::{
         dispatch::{Dispatcher, WorkerDirectory},
         fill::{Fill, FillDependencies},
         flight::Flights,
-        metadata::MetadataService,
+        metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
         serve::Coordinator,
     },
@@ -202,7 +202,7 @@ impl WorkerApplication {
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(Delivery::new(pipes, config.reader_stall_timeout));
 
-        let index = Rc::new(Index);
+        let index = Rc::new(Index::new(worker, config.limits.metadata_entries.get()));
         let segments = Rc::new(Segments::new(worker, config.segment_bytes));
         let eviction = Rc::new(SegmentClock::new(
             index.clone(),
@@ -227,8 +227,12 @@ impl WorkerApplication {
         let store = Store {
             reader: disk.clone(),
             writer: writer.clone(),
-            checkpoint: Checkpointer::new(config.slab_directory.clone(), index, segments),
-            recovery: Recovery::new(config.slab_directory.clone()),
+            checkpoint: Checkpointer::new(
+                config.slab_directory.clone(),
+                index.clone(),
+                segments.clone(),
+            ),
+            recovery: Recovery::new(config.slab_directory.clone(), index.clone(), segments),
             eviction,
         };
 
@@ -285,6 +289,7 @@ impl WorkerApplication {
             crypto,
             credentials: credentials.clone(),
             admission: admission.clone(),
+            metadata_owner: node.workers.clone(),
         }));
         let metadata = Rc::new(MetadataService::new(
             candidates,
@@ -292,6 +297,11 @@ impl WorkerApplication {
             requester.clone(),
             credentials.clone(),
             config.limits.metadata_entries.get(),
+            MetadataDependencies {
+                index,
+                fill: fill.clone(),
+                owners: node.workers.clone(),
+            },
         ));
         let streams = Rc::new(RangeStreams::new(
             fill.clone(),
