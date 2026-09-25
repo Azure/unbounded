@@ -31,6 +31,7 @@ impl PageResult {
 
     /// Structural agreement only. Authentication remains the fill/crypto boundary.
     pub fn validate_metadata(&self) -> crate::error::Result<()> {
+        validate_ciphertext(&self.metadata, &self.ciphertext)?;
         validate_association(
             &self.metadata,
             self.plaintext.page(),
@@ -44,6 +45,24 @@ impl PageResult {
             ciphertext: self.ciphertext.clone(),
         }
     }
+}
+
+impl CiphertextCopy {
+    pub fn validate_metadata(&self) -> crate::error::Result<()> {
+        validate_ciphertext(&self.metadata, &self.ciphertext)
+    }
+}
+
+fn validate_ciphertext(
+    metadata: &ObjectMetadata,
+    ciphertext: &CiphertextPage,
+) -> crate::error::Result<()> {
+    metadata.validate()?;
+    metadata.immutable().validate_page(ciphertext.envelope())?;
+    if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
+        return Err(crate::error::Error::CorruptRecord);
+    }
+    Ok(())
 }
 
 fn validate_association(
@@ -73,6 +92,25 @@ mod tests {
             metadata::ExpiresAt,
         },
     };
+
+    #[test]
+    fn shared_results_reject_truncated_or_padded_ciphertext() {
+        let admission = crate::memory::pool::tests::admission(8);
+        for length in [0, 18, 19, 20] {
+            let mut page = crate::memory::pool::tests::bundle(&admission, "v1");
+            std::sync::Arc::get_mut(&mut page.ciphertext.inner)
+                .unwrap()
+                .bytes
+                .resize(length, 0);
+            let expected = if length == 19 {
+                Ok(())
+            } else {
+                Err(Error::CorruptRecord)
+            };
+            assert_eq!(page.validate_metadata(), expected);
+            assert_eq!(page.copy().validate_metadata(), expected);
+        }
+    }
 
     #[test]
     fn shared_result_rejects_mixed_metadata_plaintext_and_ciphertext() {
