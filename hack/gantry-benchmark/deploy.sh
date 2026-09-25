@@ -9,13 +9,14 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh <plan|scale|deploy|status> [config-file]
+Usage: deploy.sh <plan|scale|recreate-pool|deploy|status> [config-file]
 
 One idempotent entrypoint for the complete Gantry benchmark stack. The config
 file is a shell environment file. No credentials are stored in it.
 
   plan    validate inputs and print the complete deployment contract
   scale   resize the existing AKS node pool and wait for Ready nodes
+  recreate-pool  delete and recreate the Artifact Streaming benchmark pool
   deploy  create or validate every resource and leave the benchmark ready
   status  report Azure and Kubernetes readiness without mutation
 USAGE
@@ -25,7 +26,7 @@ action=${1:-plan}
 config_file=${2:-${GANTRY_BENCHMARK_DEPLOY_CONFIG:-$script_dir/deploy.env}}
 
 case "$action" in
-plan | scale | deploy | status) ;;
+plan | scale | recreate-pool | deploy | status) ;;
 -h | --help | help)
   usage
   exit 0
@@ -190,6 +191,16 @@ if ((adoption_values == 3)); then
   }
   [[ "$ADOPT_PAYLOAD_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
     echo "ADOPT_PAYLOAD_SHA256 must be a sha256 digest" >&2
+    exit 2
+  }
+fi
+if [[ "$action" == recreate-pool ]]; then
+  [[ "$BENCHMARK_ARTIFACT_STREAMING" == true ]] || {
+    echo "recreate-pool requires BENCHMARK_ARTIFACT_STREAMING=true" >&2
+    exit 2
+  }
+  [[ "${RECREATE_BENCHMARK_POOL_CONFIRM:-}" == "$AKS_NODE_POOL_NAME" ]] || {
+    echo "set RECREATE_BENCHMARK_POOL_CONFIRM=$AKS_NODE_POOL_NAME to authorize replacement" >&2
     exit 2
   }
 fi
@@ -535,8 +546,9 @@ ensure_aks() {
         --node-osdisk-type Managed --node-osdisk-size "$AKS_NODE_OS_DISK_GB" \
         --max-pods "$AKS_MAX_PODS" --os-sku Ubuntu --vnet-subnet-id "$subnet_id" \
         --kubernetes-version "$AKS_KUBERNETES_VERSION" --enable-artifact-streaming \
-        --only-show-errors -o none
+        --no-wait --only-show-errors -o none
     fi
+      wait_for_node_pool_provisioning
   fi
 
   local cluster_json pool_json
@@ -563,6 +575,59 @@ ensure_aks() {
   else
     assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
   fi
+}
+
+wait_for_node_pool_provisioning() {
+  local attempt state
+  for attempt in $(seq 1 240); do
+    state=$(timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --query provisioningState -o tsv 2>/dev/null || true)
+    case "$state" in
+      Succeeded)
+        log "AKS benchmark pool $AKS_NODE_POOL_NAME provisioning succeeded"
+        return
+        ;;
+      Failed | Canceled)
+        echo "AKS benchmark pool $AKS_NODE_POOL_NAME provisioning ended in $state" >&2
+        return 1
+        ;;
+      *)
+        log "waiting for benchmark pool provisioning: ${state:-not visible} ($attempt/240)"
+        sleep 30
+        ;;
+    esac
+  done
+
+  echo "AKS benchmark pool $AKS_NODE_POOL_NAME did not provision" >&2
+  return 1
+}
+
+recreate_aks_node_pool() {
+  log "submitting deletion of benchmark pool $AKS_NODE_POOL_NAME"
+  az aks nodepool delete -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+    -n "$AKS_NODE_POOL_NAME" --no-wait --only-show-errors -o none
+
+  local attempt
+  for attempt in $(seq 1 240); do
+    if ! timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --output none 2>/dev/null; then
+      log "AKS benchmark pool $AKS_NODE_POOL_NAME deleted"
+      break
+    fi
+    log "waiting for benchmark pool deletion ($attempt/240)"
+    sleep 30
+  done
+  if timeout 30s az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+    --output none 2>/dev/null; then
+    echo "AKS benchmark pool $AKS_NODE_POOL_NAME did not delete" >&2
+    return 1
+  fi
+
+  ensure_aks
+  wait_for_nodes
 }
 
 scale_aks_node_pool() {
@@ -1237,6 +1302,12 @@ if [[ "$action" == scale ]]; then
   wait_for_nodes
   release_operator_run_command_lock
   log "AKS node pool scale complete"
+  exit 0
+fi
+if [[ "$action" == recreate-pool ]]; then
+  recreate_aks_node_pool
+  release_operator_run_command_lock
+  log "AKS benchmark pool recreation complete"
   exit 0
 fi
 
