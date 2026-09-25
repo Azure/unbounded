@@ -4,7 +4,10 @@
 //! encrypt origin data once. Publish only verified whole pages, with original
 //! ciphertext queued asynchronously on candidates. Disk failure may discard dirty
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
-use super::{candidates::CandidatePolicy, flight::Flights};
+use super::{
+    candidates::CandidatePolicy,
+    flight::{AcquisitionBudget, Flights},
+};
 use crate::{
     error::{Operation, deferred},
     memory::{
@@ -54,17 +57,24 @@ impl Fill {
     ) -> Operation<'a, Option<crate::model::metadata::VersionMetadata>> {
         deferred("fill.retained_metadata")
     }
+    /// Join the shared flight with this request's borrowed context and original
+    /// budget. Drive only an elected AcquisitionEvent::Lead; on retry re-resolve
+    /// candidates using that waiter's membership, never a previous leader's grant.
+    /// Publish the full PageResult after validation. Driver drop abandons leadership
+    /// but worker-owned operations remain retained until actual completion fences.
     pub fn acquire<'a>(
         &'a self,
         _page: PageId,
         _membership: MembershipLease,
         _context: &'a OriginContext,
         _scope: &'a RequestScope,
+        _budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, PageResult> {
         deferred("fill.acquire")
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
-    /// another acquisition or contacts origin. Ciphertext preserves its nonce/tag.
+    /// another acquisition or contacts origin. Use Flights::join_copy, whose waiter
+    /// has no election/context API. Ciphertext preserves its nonce/tag.
     pub fn copy_only<'a>(
         &'a self,
         _page: &'a PageId,

@@ -125,6 +125,8 @@ pub struct WorkerApplication {
     peers: PeerServer,
     coordinator: Rc<Coordinator>,
     dispatcher: Rc<Dispatcher>,
+    /// Same table as Fill; the worker drives abandoned work without user futures.
+    flights: Rc<Flights>,
     rdma: Option<Rc<RdmaTransfer>>,
     telemetry: Telemetry,
 }
@@ -282,7 +284,7 @@ impl WorkerApplication {
             peers: requester.clone(),
             origin: origin.clone(),
             candidates: candidates.clone(),
-            flights,
+            flights: flights.clone(),
             crypto,
             credentials: credentials.clone(),
             admission: admission.clone(),
@@ -351,6 +353,7 @@ impl WorkerApplication {
             peers,
             coordinator,
             dispatcher,
+            flights,
             rdma,
             telemetry: Telemetry::default(),
         }
@@ -386,12 +389,15 @@ impl WorkerService for WorkerApplication {
         WorkerApplication::start(self, scope)
     }
     fn poll_budgeted(&mut self, _work_budget: usize) -> Result<()> {
+        // Reap reactor/crypto completions, then flights.poll_budgeted, even after
+        // the last request drops. No caller future owns the completion fence.
         pending("app.poll_budgeted")
     }
     fn stop_admission(&mut self) -> Result<()> {
         pending("app.stop_admission")
     }
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
+        // Drive flights.drain alongside runtime drain; never drop one table early.
         deferred("app.drain")
     }
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -429,6 +435,11 @@ mod tests {
             let mut worker = WorkerApplication::assemble(&config, &node, WorkerId(0), runtime);
             assert!(worker.control.is_some());
             assert_eq!(worker.rdma.is_some(), enable_rdma);
+            assert_eq!(
+                Rc::strong_count(&worker.flights),
+                2,
+                "worker lifecycle and fill share one flight table"
+            );
             assert_eq!(
                 Rc::strong_count(&crypto),
                 3,

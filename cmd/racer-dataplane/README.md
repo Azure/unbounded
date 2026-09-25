@@ -60,7 +60,30 @@ library. There are no third-party dependencies yet.
   Missing pinned metadata can query retained descriptors across local page shards
   before a conditional page-zero probe. Fresh reads still require revalidation.
   `read::fill::PageResult` re-exports the cloneable memory-layer result containing
-  metadata, verified plaintext, and original ciphertext for future flight sharing.
+  metadata, verified plaintext, and original ciphertext for flight sharing.
+  `Flights::join`/`AcquisitionWaiter::wait` elect one leader or return the complete
+  result/failure. `join_copy` exposes only miss/wait/complete, with no ability to
+  start acquisition or fund a retry. Publication validates the exact page and the
+  bundle's metadata/plaintext/ciphertext association; page hits cannot refresh TTL.
+  Acquisition waiters borrow non-cloneable request context and an exclusive
+  remaining `AcquisitionBudget`. Neither headers nor credentials enter flight
+  identity or completed entries. Different contexts share the same page flight.
+  Membership and candidate authority belong to each elected acquisition; retry
+  must resolve authority again under the selected caller's accepted membership.
+  Credential-specific origin rejection fails only the supplying caller, then
+  elects a remaining live acquisition caller under its original deadline,
+  cancellation, attempt credits, and remaining link budget. It is never cached as
+  page/version absence. Other terminal failures wake the current cohort.
+  Cancellation/detach affects one waiter. Abandoned leadership enters `Draining`;
+  accepted operations retain their owned I/O/crypto resources independently of
+  futures. Only actual completions permit `RetryPending`, failure for copy-only
+  survivors, or removal after the last waiter. Table identity, entry incarnation,
+  and acquisition generation fence stale publication/failure/drain callbacks.
+  The worker lifecycle retains the same flight table as Fill and exposes bounded
+  polling/drain hooks for cleanup after request futures disappear.
+  Operational registration, election, wakeups, Drop cleanup, resource accounting,
+  and completion-driven drain remain fail-closed. Pure budget/identity validation
+  and compile contracts establish the scaffold, not an operational flight engine.
 - Per-cache UDS paths are exactly `/run/racer/<cache name>/client/socket` and
   `/run/racer/<cache name>/origin/socket`. Racer owns the client listener; the
   application adapter owns the origin listener. Separate endpoint directories let

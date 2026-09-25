@@ -19,6 +19,7 @@ pub enum Error {
     Overloaded,
     DeadlineExceeded,
     Cancelled,
+    StaleFlight,
     Unauthorized,
     Replay,
     IncompatibleMembership,

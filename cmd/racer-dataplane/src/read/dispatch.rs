@@ -53,12 +53,15 @@ impl WorkerDirectory {
     }
     /// Select the stable page owner and enqueue a bounded request. The transport
     /// implementation moves an owned command, never the borrowed worker future.
+    /// Transfer the remaining acquisition budget without resetting it; route/link
+    /// consumption must be reconciled before returning it to the caller.
     pub fn acquire<'a>(
         &'a self,
         _page: crate::model::identity::PageId,
         _membership: crate::topology::membership::MembershipLease,
         _context: &'a crate::model::context::OriginContext,
         _scope: &'a RequestScope,
+        _budget: &'a mut super::flight::AcquisitionBudget,
     ) -> Operation<'a, super::fill::PageResult> {
         deferred("dispatch.acquire_page")
     }
