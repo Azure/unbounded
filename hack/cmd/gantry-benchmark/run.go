@@ -320,10 +320,6 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := requireFinalLayerResponseTimestamps(gantryDiagnosticTimestamps, gantryDiagnosticsAfter.PodNodes); err != nil {
-		return err
-	}
-
 	gantryDiagnostics, err := subtractGantryDiagnosticSnapshots(
 		gantryDiagnosticsBefore,
 		gantryDiagnosticsAfter,
@@ -332,6 +328,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	b.warnIncompleteFinalLayerResponseTimestamps(gantryDiagnostics)
 
 	var gantryProxy proxyPhaseTotals
 

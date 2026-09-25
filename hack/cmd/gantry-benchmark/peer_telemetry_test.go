@@ -30,7 +30,7 @@ func (r *diagnosticTimestampRunner) Run(_ context.Context, _ []byte, _ string, a
 	)), nil
 }
 
-func TestFetchGantryDiagnosticTimestampsUsesExactJobWindow(t *testing.T) {
+func TestFetchGantryDiagnosticTimestampsFiltersValuesToExactJobWindow(t *testing.T) {
 	runner := &diagnosticTimestampRunner{}
 	benchmark := &benchmark{
 		config: benchmarkConfig{
@@ -65,24 +65,40 @@ func TestFetchGantryDiagnosticTimestampsUsesExactJobWindow(t *testing.T) {
 	}
 }
 
-func TestRequireFinalLayerResponseTimestamps(t *testing.T) {
+func TestDiagnosticTimestampQueryWindowIncludesPostJobScrapes(t *testing.T) {
+	eventWindow := telemetryWindow{
+		StartedAt:  time.Date(2026, time.August, 4, 1, 2, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, time.August, 4, 1, 5, 0, 0, time.UTC),
+	}
+	collectedAt := eventWindow.FinishedAt.Add(20 * time.Second)
+
+	queryWindow := diagnosticTimestampQueryWindow(eventWindow, collectedAt)
+	if !queryWindow.StartedAt.Equal(eventWindow.StartedAt) || !queryWindow.FinishedAt.Equal(collectedAt) {
+		t.Fatalf("query window = %+v, want event start and collection end", queryWindow)
+	}
+}
+
+func TestMissingFinalLayerResponseTimestampPods(t *testing.T) {
 	timestamps := map[string]map[string]float64{
 		"gantry-a": {
 			"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=peer}": 1234,
 		},
 	}
-	podNodes := map[string]string{"gantry-a": "node-a", "gantry-b": "node-b"}
+	podNodes := map[string]string{"gantry-a": "node-a", "gantry-b": "node-b", "gantry-c": "node-c"}
 
-	err := requireFinalLayerResponseTimestamps(timestamps, podNodes)
-	if err == nil || !strings.Contains(err.Error(), "gantry-b") {
-		t.Fatalf("error = %v, want missing gantry-b completion", err)
+	missing := missingFinalLayerResponseTimestampPods(timestamps, podNodes)
+	if strings.Join(missing, ",") != "gantry-b,gantry-c" {
+		t.Fatalf("missing = %v, want sorted gantry-b and gantry-c", missing)
 	}
 
 	timestamps["gantry-b"] = map[string]float64{
 		"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=origin}": 1235,
 	}
-	if err := requireFinalLayerResponseTimestamps(timestamps, podNodes); err != nil {
-		t.Fatalf("requireFinalLayerResponseTimestamps: %v", err)
+	timestamps["gantry-c"] = map[string]float64{
+		"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=local}": 1236,
+	}
+	if missing := missingFinalLayerResponseTimestampPods(timestamps, podNodes); len(missing) != 0 {
+		t.Fatalf("missing = %v, want complete timestamp coverage", missing)
 	}
 }
 
@@ -205,7 +221,7 @@ func TestSubtractGantryDiagnosticSnapshots(t *testing.T) {
 		t.Fatalf("subtractGantryDiagnosticSnapshots: %v", err)
 	}
 
-	if !measurement.Complete || len(measurement.Pods) != 1 {
+	if !measurement.Complete || !measurement.FinalLayerResponseTimestampsComplete || len(measurement.Pods) != 1 {
 		t.Fatalf("measurement = %+v, want one complete pod", measurement)
 	}
 
@@ -214,6 +230,30 @@ func TestSubtractGantryDiagnosticSnapshots(t *testing.T) {
 		pod.TimestampSeconds["gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=peer}"] != 1234 ||
 		pod.FinalLayerResponseCompletedTimestampSeconds != 1234 {
 		t.Fatalf("pod = %+v, want correlated deltas and timestamp", pod)
+	}
+}
+
+func TestSubtractGantryDiagnosticSnapshotsRecordsMissingFinalLayerTimestamp(t *testing.T) {
+	before := gantryDiagnosticSnapshot{
+		PodNodes: map[string]string{"gantry-a": "node-a", "gantry-b": "node-b"},
+		Counters: map[string]map[string]float64{"gantry-a": {}, "gantry-b": {}},
+	}
+	after := gantryDiagnosticSnapshot{
+		PodNodes: map[string]string{"gantry-a": "node-a", "gantry-b": "node-b"},
+		Counters: map[string]map[string]float64{"gantry-a": {}, "gantry-b": {}},
+	}
+	timestamps := map[string]map[string]float64{
+		"gantry-a": {"gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=peer}": 1234},
+	}
+
+	measurement, err := subtractGantryDiagnosticSnapshots(before, after, timestamps)
+	if err != nil {
+		t.Fatalf("subtractGantryDiagnosticSnapshots: %v", err)
+	}
+
+	if measurement.FinalLayerResponseTimestampsComplete ||
+		strings.Join(measurement.MissingFinalLayerResponseTimestampPodNames, ",") != "gantry-b" {
+		t.Fatalf("measurement = %+v, want gantry-b recorded as missing diagnostic telemetry", measurement)
 	}
 }
 
