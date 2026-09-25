@@ -50,7 +50,8 @@ leases on evicting segments, and waits for leases before recycling. No live byte
 are copied. Bounded state is independently limited by configured slab capacity,
 page entries, metadata entries, dirty bytes, ciphertext bytes, and queue entries.
 
-Enqueue retains a credential-free CiphertextCopy and dirty reservation. Original
+Enqueue retains a credential-free CiphertextCopy and dirty reservation and reserves
+the exact padded staging charge before accepting a queue entry. Original
 ciphertext and aligned staging are separately charged. Index publication follows
 full-record completion and rechecks retirement and segment state. A failed or
 abandoned write discards its dirty copy; reactor-owned staging and lease remain
@@ -99,6 +100,10 @@ Uncheckpointed slab contents are unreachable and are never scanned.
 - Drive writer.progress(budget, scope) with a worker maintenance scope, polling
   concurrently with reactor.poll_budgeted. Keep a pending future alive between
   polls. Do not borrow a request credential context or create an extra executor.
+  Progress counts attempted copies, including discarded copies. Overloaded,
+  ENOSPC/other cache I/O failure, missing keys, cancellation, and expired maintenance
+  deadlines discard disposable persistence without a fatal progress error. Structural
+  configuration/corruption errors remain errors. Exactly one progress driver is allowed.
 - Fill can call reader.read_with_token and reader.invalidate(token) after AEAD
   failure; conditional invalidation cannot remove a replacement mapping.
 - Retirement first serializes against checkpoint publication, calls
@@ -107,8 +112,32 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   generations before key release. This sacrifices unrelated cache recovery
   instead of requiring payload scans. The security owner
   additionally drains memory/crypto/peer leases. Tombstone bounds fail closed.
-- Stop new request admission before shutdown, but keep completion and dirty-write
-  staging capacity available until writer drain and reactor fence finish.
+- Stopping Admission does not prevent previously accepted fills from handing over
+  their dirty reservations. Enqueue uses Admission::reserve_completion for padded
+  staging, with the same hard ciphertext limit, and must follow Store::open.
+  Once accepted fills have finished handing off, call writer.stop_admission or drain.
+  On the shutdown deadline call writer.cancel_pending_writes: it closes enqueue,
+  discards unsubmitted copies, and cancels the active maintenance scope. Continue
+  polling the active progress future and reactor. Never refresh its deadline or
+  retry discarded entries. Dropping the progress future abandons publication but
+  the reactor keeps submitted buffers, dirty quota, and segment leases through CQEs.
+  writer.drain performs these deadline actions and waits for write fences; poll it
+  alongside any already active progress driver and reactor completions.
+  is_idle includes slab write fences even after the progress future is dropped.
+  pending_count includes active copies, queued_count only unsubmitted copies,
+  writes_in_flight counts submitted/unconsumed fenced write owners, and
+  discarded_count is a saturating persistence-loss counter. Key retirement may
+  empty the index/queue before writes_in_flight reaches zero; key release must wait
+  for that fence plus the independent memory/crypto/transport barriers.
+
+Staging headroom is reserved per accepted dirty copy rather than borrowed later
+from holders that may wait for that same dirty copy. If there is no padded staging
+quota, enqueue returns Overloaded before acceptance and releases the supplied dirty
+reservation; the already verified memory result remains usable. The fill owner
+must treat this as skipped persistence, not an acquisition/node failure. Provision
+ciphertext quota for original retained pages plus padded accepted writes, or reduce
+dirty queue admission. Completion admission bypasses the stopped flag, not the hard
+byte limit. No runtime/read edits or uncharged allocation are required by this policy.
 
 External contracts required: Reservation::amount/class, StrongEtag::as_bytes and
 parse, BufferPool::ciphertext, and real Reactor::read_at/write_at completion owners.

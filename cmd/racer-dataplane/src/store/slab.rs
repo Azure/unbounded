@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fs::{File, OpenOptions},
     os::{
         fd::{AsRawFd, OwnedFd},
@@ -45,6 +45,7 @@ pub struct Slabs {
     segment_bytes: u64,
     opened: RefCell<Option<OpenSlab>>,
     admission: RefCell<Option<Rc<Admission>>>,
+    writes: Rc<Cell<usize>>,
 }
 impl Slabs {
     pub fn new(
@@ -62,6 +63,7 @@ impl Slabs {
             segment_bytes,
             opened: RefCell::new(None),
             admission: RefCell::new(None),
+            writes: Rc::new(Cell::new(0)),
         }
     }
     pub fn set_admission(&self, admission: Rc<Admission>) {
@@ -84,6 +86,32 @@ impl Slabs {
             .as_ref()
             .ok_or(Error::Unavailable)?
             .reserve(cache, class, amount)
+    }
+    /// Existing accepted fills may complete after request admission closes.
+    /// Completion admission still enforces the configured byte quota.
+    pub(crate) fn reserve_staging(&self, length: usize, cache: &CacheId) -> Result<Reservation> {
+        self.admission
+            .borrow()
+            .as_ref()
+            .ok_or(Error::Unavailable)?
+            .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
+    }
+    pub fn writes_in_flight(&self) -> usize {
+        self.writes.get()
+    }
+    #[cfg(test)]
+    pub(super) fn replace_file_for_test(&self, file: File) {
+        self.opened.borrow_mut().as_mut().unwrap().file = Rc::new(file.into());
+    }
+    pub fn fence_writes(&self) -> Operation<'_, ()> {
+        Box::pin(std::future::poll_fn(|cx| {
+            if self.writes.get() == 0 {
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }))
     }
     pub fn slab_bytes(&self) -> u64 {
         self.slab_bytes
@@ -215,9 +243,12 @@ impl Slabs {
     ) -> Operation<'a, AlignedBuffer> {
         Box::pin(async move {
             let fd = self.submission(location, &buffer, &lease)?;
+            self.writes
+                .set(self.writes.get().checked_add(1).ok_or(Error::Overloaded)?);
+            let fence = WriteFence(self.writes.clone());
             let completion = self
                 .reactor
-                .write_at(fd, location.extent.offset(), buffer, lease, scope)
+                .write_at(fd, location.extent.offset(), buffer, (lease, fence), scope)
                 .await?;
             if completion.bytes != location.extent.length() {
                 return Err(Error::Io);
@@ -230,6 +261,12 @@ impl Slabs {
             length,
             self.reserve(cache, ResourceClass::Ciphertext, length)?,
         )
+    }
+}
+struct WriteFence(Rc<Cell<usize>>);
+impl Drop for WriteFence {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
     }
 }
 fn direct_error(error: std::io::Error) -> Error {

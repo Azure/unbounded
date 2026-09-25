@@ -29,6 +29,7 @@ struct Dirty {
     ticket: u64,
     page: CiphertextCopy,
     _reservation: Rc<Reservation>,
+    staging: Option<Reservation>,
 }
 pub struct StoreWriter {
     index: Rc<Index>,
@@ -40,8 +41,11 @@ pub struct StoreWriter {
     next: Cell<u64>,
     capacity: Cell<usize>,
     busy: Cell<bool>,
+    active_scope: RefCell<Option<RequestScope>>,
     retired: RefCell<HashSet<(CacheId, KeyId)>>,
     removed: RefCell<HashSet<CacheId>>,
+    discarded: Cell<u64>,
+    closed: Cell<bool>,
 }
 pub struct DirtyTicket {
     id: u64,
@@ -63,8 +67,11 @@ impl StoreWriter {
             next: Cell::new(1),
             capacity: Cell::new(64),
             busy: Cell::new(false),
+            active_scope: RefCell::new(None),
             retired: RefCell::new(HashSet::new()),
             removed: RefCell::new(HashSet::new()),
+            discarded: Cell::new(0),
+            closed: Cell::new(false),
         }
     }
     pub fn configure(
@@ -100,6 +107,10 @@ impl StoreWriter {
     pub fn slabs(&self) -> &Rc<Slabs> {
         &self.slabs
     }
+    #[cfg(test)]
+    pub(super) fn segments_for_test(&self) -> &Rc<Segments> {
+        &self.segments
+    }
     pub fn index(&self) -> &Rc<Index> {
         &self.index
     }
@@ -116,6 +127,9 @@ impl StoreWriter {
             && !self.removed.borrow().contains(&e.page.version.object.cache)
     }
     pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<DirtyTicket> {
+        if self.closed.get() {
+            return Err(Error::Unavailable);
+        }
         let logical = RecordCodec.logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.slabs.owns_reservation(&dirty)
@@ -149,6 +163,12 @@ impl StoreWriter {
         if pending.len() >= self.capacity.get() {
             return Err(Error::Overloaded);
         }
+        // Reserve the exact padded staging bytes before queue acceptance. Thus
+        // accepted dirty copies never wait for ciphertext holders to release memory.
+        let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
+        let staging = self
+            .slabs
+            .reserve_staging(disk_bytes, &id.version.object.cache)?;
         let ticket = self.next.get();
         self.next
             .set(ticket.checked_add(1).ok_or(Error::Unavailable)?);
@@ -158,6 +178,7 @@ impl StoreWriter {
                 ticket,
                 page,
                 _reservation: Rc::new(dirty),
+                staging: Some(staging),
             },
         );
         self.queue.borrow_mut().push_back(id);
@@ -182,72 +203,71 @@ impl StoreWriter {
     pub fn pending_count(&self) -> usize {
         self.pending.borrow().len()
     }
+    pub fn queued_count(&self) -> usize {
+        self.queue.borrow().len()
+    }
+    pub fn writes_in_flight(&self) -> usize {
+        self.slabs.writes_in_flight()
+    }
+    pub fn discarded_count(&self) -> u64 {
+        self.discarded.get()
+    }
+    fn note_discard(&self, count: usize) {
+        self.discarded
+            .set(self.discarded.get().saturating_add(count as u64));
+    }
+    /// Reject new enqueue calls while preserving previously accepted copies.
+    pub fn stop_admission(&self) {
+        self.closed.set(true);
+    }
+    /// Shutdown deadline: abandon queued persistence and request cancellation of
+    /// active I/O. Keep polling progress/reactor until is_idle; this is not a fence.
+    pub fn cancel_pending_writes(&self) -> Result<usize> {
+        self.stop_admission();
+        let discarded = self.discard_unsubmitted();
+        if let Some(scope) = self.active_scope.borrow().as_ref() {
+            scope.cancel()?;
+        }
+        Ok(discarded)
+    }
+    /// Discard only work not taken by progress. Submitted owners remain fenced.
+    pub fn discard_unsubmitted(&self) -> usize {
+        let queued: Vec<_> = self.queue.borrow_mut().drain(..).collect();
+        let mut pending = self.pending.borrow_mut();
+        let mut removed = 0;
+        for page in queued {
+            removed += usize::from(pending.remove(&page).is_some());
+        }
+        self.note_discard(removed);
+        removed
+    }
     /// Drive at most `budget` writes. Keep polling this future through reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
         Box::pin(async move {
             if self.busy.replace(true) {
                 return Err(Error::Overloaded);
             }
-            let _busy = Busy(&self.busy);
+            *self.active_scope.borrow_mut() = Some(scope.clone());
+            let _busy = Busy(self);
             let mut completed = 0;
             for _ in 0..budget {
-                scope.check()?;
-                let id = match self.queue.borrow().front().cloned() {
+                if scope.check().is_err() {
+                    self.discard_unsubmitted();
+                    break;
+                }
+                let id = match self.queue.borrow_mut().pop_front() {
                     Some(id) => id,
                     None => break,
                 };
                 let page = match self.copy_only(&id)? {
                     Some(p) => p,
                     None => {
-                        self.queue.borrow_mut().pop_front();
                         self.pending.borrow_mut().remove(&id);
                         continue;
                     }
                 };
-                let alignment = self.slabs.alignment()?;
-                let disk_bytes = alignment
-                    .extent(0, RecordCodec.logical_length(&page)?)?
-                    .length();
-                // Reserve staging before consuming append space. Original copy remains independently charged.
-                let mut buffer = self
-                    .slabs
-                    .allocate(disk_bytes, Some(&id.version.object.cache))?;
-                buffer.retain_charge(
-                    self.pending
-                        .borrow()
-                        .get(&id)
-                        .ok_or(Error::Unavailable)?
-                        ._reservation
-                        .clone(),
-                );
-                let append = match self.segments.append(disk_bytes) {
-                    Ok(a) => a,
-                    Err(Error::Overloaded) => {
-                        let clock = self.clock.borrow().clone();
-                        if let Some(clock) = clock {
-                            clock.reclaim_now()?;
-                        }
-                        self.segments.append(disk_bytes)?
-                    }
-                    Err(e) => return Err(e),
-                };
-                let location = RecordLocation {
-                    segment: append.segment.id(),
-                    generation: append.segment.generation(),
-                    location: append.location,
-                };
-                // Keep the publication window fenced even after Slabs returns its I/O lease.
-                let _publication_lease =
-                    self.segments.lease(location.segment, location.generation)?;
-                let encoded = RecordCodec.encode_at(
-                    &page,
-                    location.generation,
-                    alignment,
-                    location.location.extent.offset(),
-                    buffer,
-                )?;
-                self.queue.borrow_mut().pop_front();
-                // On abandoned/error futures remove this dirty entry. The reactor still owns submitted staging and lease.
+                // Install cleanup BEFORE allocation, reclamation or submission.
+                // Every attempted copy leaves the queue, including disposable failures.
                 let _cleanup = DirtyCleanup {
                     writer: self,
                     page: id.clone(),
@@ -258,41 +278,117 @@ impl StoreWriter {
                         .ok_or(Error::Unavailable)?
                         .ticket,
                 };
-                let result = self
-                    .slabs
-                    .write(append.location, encoded.buffer, append.segment, scope)
-                    .await;
-                if result.is_ok()
-                    && self.allowed(&page)
-                    && self.segments.validate_location(&location).is_ok()
-                {
-                    self.index.publish(
-                        id.clone(),
-                        IndexedPage {
-                            location,
-                            metadata: page.metadata.immutable(),
-                            key_id: page.ciphertext.envelope().key_id,
-                        },
-                    )?;
-                }
+                let result = self.persist(&id, &page, scope).await;
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
                 }
-                // Disk failures discard this copy; callers already have verified plaintext.
+                // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
-                    return Err(error);
+                    self.note_discard(1);
+                    if !matches!(
+                        error,
+                        Error::Overloaded
+                            | Error::Io
+                            | Error::Unavailable
+                            | Error::MissingKey
+                            | Error::Cancelled
+                            | Error::DeadlineExceeded
+                    ) {
+                        return Err(error);
+                    }
+                    if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
+                        self.discard_unsubmitted();
+                        break;
+                    }
                 }
             }
             Ok(completed)
         })
     }
+    async fn persist(
+        &self,
+        id: &PageId,
+        page: &CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let alignment = self.slabs.alignment()?;
+        let disk_bytes = alignment
+            .extent(0, RecordCodec.logical_length(page)?)?
+            .length();
+        let (staging, dirty) = {
+            let mut pending = self.pending.borrow_mut();
+            let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
+            (
+                entry.staging.take().ok_or(Error::InvalidConfiguration)?,
+                entry._reservation.clone(),
+            )
+        };
+        let mut buffer = alignment.allocate(disk_bytes, staging)?;
+        buffer.retain_charge(dirty);
+        let append = match self.segments.append(disk_bytes) {
+            Ok(append) => append,
+            Err(Error::Overloaded) => {
+                if let Some(clock) = self.clock.borrow().clone() {
+                    clock.reclaim_now()?;
+                }
+                self.segments.append(disk_bytes)?
+            }
+            Err(error) => return Err(error),
+        };
+        let location = RecordLocation {
+            segment: append.segment.id(),
+            generation: append.segment.generation(),
+            location: append.location,
+        };
+        let _publication_lease = self.segments.lease(location.segment, location.generation)?;
+        let encoded = RecordCodec.encode_at(
+            page,
+            location.generation,
+            alignment,
+            location.location.extent.offset(),
+            buffer,
+        )?;
+        self.slabs
+            .write(append.location, encoded.buffer, append.segment, scope)
+            .await?;
+        if self.allowed(page) && self.segments.validate_location(&location).is_ok() {
+            self.index.publish(
+                id.clone(),
+                IndexedPage {
+                    location,
+                    metadata: page.metadata.immutable(),
+                    key_id: page.ciphertext.envelope().key_id,
+                },
+            )?;
+        }
+        Ok(())
+    }
     pub fn drain<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
+            self.stop_admission();
+            if scope.check().is_err() {
+                self.cancel_pending_writes()?;
+            }
+            // An application-held progress future must be polled alongside drain.
+            std::future::poll_fn(|cx| {
+                if scope.check().is_err() {
+                    if let Err(error) = self.cancel_pending_writes() {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                }
+                if !self.busy.get() {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await?;
             while self.pending_count() != 0 {
                 self.progress(1, scope).await?;
             }
-            Ok(())
+            self.slabs.fence_writes().await
         })
     }
     /// Stops new/late publication immediately. Call drain/fence before releasing keys.
@@ -327,13 +423,14 @@ impl StoreWriter {
         Ok(())
     }
     pub fn is_idle(&self) -> bool {
-        !self.busy.get() && self.pending_count() == 0
+        !self.busy.get() && self.pending_count() == 0 && self.writes_in_flight() == 0
     }
 }
-struct Busy<'a>(&'a Cell<bool>);
+struct Busy<'a>(&'a StoreWriter);
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        self.0.set(false);
+        self.0.busy.set(false);
+        self.0.active_scope.borrow_mut().take();
     }
 }
 struct DirtyCleanup<'a> {

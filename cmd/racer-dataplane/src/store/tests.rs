@@ -217,6 +217,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
 #[test]
 fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
     let first = f.copy(1, 3);
     let id = first.ciphertext.envelope().page.clone();
     let ticket = f.enqueue(first.clone()).unwrap();
@@ -325,12 +326,15 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     assert_eq!(f.store.writer.pending_count(), 0);
     assert!(f.admission.used(ResourceClass::Ciphertext) > 0);
+    assert!(!f.store.writer.is_idle());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
     let deadline = Instant::now() + Duration::from_secs(10);
     while f.reactor.in_flight() != 0 {
         f.reactor.poll_budgeted(32).unwrap();
         assert!(Instant::now() < deadline);
     }
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    assert!(f.store.writer.is_idle());
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
 }
 
@@ -381,15 +385,202 @@ fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
     let page = f.copy(8, 64);
     f.enqueue(page).unwrap();
     request.cancel().unwrap();
-    assert!(matches!(
-        drive(&f.reactor, f.store.writer.progress(1, &request)),
-        Err(Error::Cancelled)
-    ));
-    // A pre-submission cancellation preserves the bounded queue for maintenance retry.
-    assert_eq!(f.store.writer.pending_count(), 1);
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        0
+    );
+    assert_eq!(f.store.writer.pending_count(), 0);
     f.store
         .writer
         .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
         .unwrap();
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
+
+#[test]
+fn stopped_admission_drains_two_accepted_copies_with_no_spare_ciphertext_quota() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let first = f.copy(1, 64);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy(2, 64);
+    let second_id = second.ciphertext.envelope().page.clone();
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    let used = f.admission.used(ResourceClass::Ciphertext);
+    assert!(
+        used > 160,
+        "both accepted writes must already own padded staging quota"
+    );
+    let pressure = f
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            f.admission.limit(ResourceClass::Ciphertext) - used,
+        )
+        .unwrap();
+    f.admission.stop();
+    assert!(f.store.writer.slabs().allocate(512, None).is_err());
+    let request = scope();
+    drive(&f.reactor, f.store.writer.drain(&request)).unwrap();
+    assert!(f.store.writer.index().lookup(&first_id).unwrap().is_some());
+    assert!(f.store.writer.index().lookup(&second_id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    drop(pressure);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
+#[test]
+fn staging_pressure_rejects_before_queue_acceptance_and_preserves_accepted_work() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let first = f.copy(1, 64);
+    let second = f.copy(2, 64);
+    f.enqueue(first).unwrap();
+    let pressure = f
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            f.admission.limit(ResourceClass::Ciphertext)
+                - f.admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    assert!(matches!(f.enqueue(second), Err(Error::Overloaded)));
+    assert_eq!(f.store.writer.pending_count(), 1);
+    f.admission.stop();
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    drop(pressure);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
+#[test]
+fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    f.enqueue(f.copy(1, 64)).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    f.admission.stop();
+    let request = scope();
+    let mut write = f.store.writer.progress(1, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.queued_count(), 1);
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    let expired =
+        RequestScope::new(RequestId([9; 16]), Instant::now() - Duration::from_secs(1)).unwrap();
+    let mut drain = f.store.writer.drain(&expired);
+    assert!(drain.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert_eq!(f.store.writer.pending_count(), 1);
+    assert!(!f.store.writer.is_idle());
+    assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
+    let submitted = f.store.writer.segments_for_test();
+    let mut snapshot = submitted.snapshot().unwrap();
+    snapshot[0].state = segment::SegmentState::Sealed;
+    // Active segment leases prohibit restore/reuse even though queued work is gone.
+    assert!(submitted.restore(snapshot).is_err());
+    drive(&f.reactor, write).unwrap();
+    drive(&f.reactor, drain).unwrap();
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    assert!(
+        f.store
+            .writer
+            .index()
+            .snapshot()
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[test]
+fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    f.enqueue(f.copy(1, 64)).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    let segments = f.store.writer.segments_for_test();
+    let first = segments.append(32 * 1024 * 1024).unwrap();
+    let second = segments.append(32 * 1024 * 1024).unwrap();
+    f.admission.stop();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(2, &scope())).unwrap(),
+        2
+    );
+    assert_eq!(f.store.writer.discarded_count(), 2);
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    assert!(segments.recycle(segment::SegmentId(0)).is_err());
+    drop((first, second));
+    segments.recycle(segment::SegmentId(0)).unwrap();
+}
+
+#[test]
+fn actual_enospc_completion_discards_both_writes_and_drains() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    f.enqueue(f.copy(1, 64)).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    // Real kernel ENOSPC from /dev/full, substituted only as the test fault target.
+    // Production slab open remains exclusively O_DIRECT with no fallback.
+    f.store.writer.slabs().replace_file_for_test(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap(),
+    );
+    f.admission.stop();
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert_eq!(f.store.writer.discarded_count(), 2);
+    assert!(f.store.writer.is_idle());
+    assert!(
+        f.store
+            .writer
+            .index()
+            .snapshot()
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
+}
+
+#[test]
+fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let dirty = f
+        .admission
+        .reserve(
+            Some(&page.metadata.version.object.cache),
+            ResourceClass::DirtyCiphertext,
+            page.ciphertext.bytes().len(),
+        )
+        .unwrap();
+    f.admission.stop();
+    f.store.writer.enqueue(page, dirty).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
 }
