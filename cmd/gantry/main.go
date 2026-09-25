@@ -459,12 +459,15 @@ func runAgent(args []string) error {
 			InstallHolder: func(holder chairs.Holder) error {
 				return installChairHolder(disco.LibP2P().Peerstore(), holder)
 			},
-			Claimer:               chairManager,
-			Logger:                logger,
-			APITimeout:            c.ChairAPITimeout,
-			HolderCount:           c.ChairHolderCount,
-			SeedCount:             c.ChairSeedCount,
-			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
+			Claimer:                     chairManager,
+			Logger:                      logger,
+			APITimeout:                  c.ChairAPITimeout,
+			HolderCount:                 c.ChairHolderCount,
+			SeedCount:                   c.ChairSeedCount,
+			PrefetchCoordinatorReplicas: c.PrefetchCoordinatorReplicas,
+			PrefetchMaxConcurrentGroups: c.PrefetchMaxConcurrentGroups,
+			PrefetchDispatchJitter:      c.PrefetchDispatchJitter,
+			TrustedFailureClasses:       configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
 				p3.coldStartSeedSelectable.WithLabelValues(kind).Observe(float64(selectable))
 				p3.coldStartSeedContacted.WithLabelValues(kind).Observe(float64(contacted))
@@ -475,6 +478,14 @@ func runAgent(args []string) error {
 			},
 			OnChairCall: func(kind, outcome string, seconds float64) {
 				p3.coldStartChairCallDur.WithLabelValues(kind, outcome).Observe(seconds)
+			},
+			OnPrefetchBatch: func(pullers, digests int) {
+				p3.prefetchBatchesTotal.Inc()
+				p3.prefetchDigestsTotal.Add(float64(digests))
+				p3.prefetchPullersPerBatch.Observe(float64(pullers))
+			},
+			OnPrefetchGroup: func(target, outcome string) {
+				p3.prefetchGroupsTotal.WithLabelValues(target, outcome).Inc()
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
