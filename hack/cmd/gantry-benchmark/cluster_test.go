@@ -35,6 +35,14 @@ func TestNodeSelector(t *testing.T) {
 	}
 }
 
+func TestGantryAgentSelector(t *testing.T) {
+	config := benchmarkConfig{GantryDaemonSet: "gantry"}
+	want := "app.kubernetes.io/name=gantry,app.kubernetes.io/component=agent"
+	if got := config.gantryAgentSelector(); got != want {
+		t.Fatalf("gantryAgentSelector() = %q, want %q", got, want)
+	}
+}
+
 func TestValidateGantryStatus(t *testing.T) {
 	status := daemonSetStatus{}
 	status.Status.DesiredNumberScheduled = 1000

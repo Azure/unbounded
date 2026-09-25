@@ -19,6 +19,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: gantry
+      app.kubernetes.io/component: agent
   podTargetLabels:
     - controller-revision-hash
   podMetricsEndpoints:
