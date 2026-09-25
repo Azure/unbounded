@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
@@ -90,7 +91,25 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 		return err
 	}
 
-	return durableReset(ctx, store, inner, []string{"/etc", "/var/lib/machines", "/usr/local", store.Root()}, unix.Syncfs)
+	return durableReset(ctx, store, inner, teardownSyncPaths(store.Root()), unix.Syncfs)
+}
+
+// teardownSyncPaths returns the directories whose filesystems have to be
+// persisted for a teardown to survive a crash part way through: those holding
+// the agent's files, including the directory the host root link is in on a
+// migrated host, and the legacy root, where the installer scripts are. They are
+// resolved now, while the host root still leads to the files. A path that does
+// not exist is not a problem, because durableReset walks up to the nearest
+// existing ancestor before opening anything.
+func teardownSyncPaths(storeRoot string) []string {
+	return []string{
+		"/etc",
+		"/var/lib/machines",
+		filepath.Dir(hostroot.Path),
+		hostroot.Resolve(),
+		hostroot.LegacyPath,
+		storeRoot,
+	}
 }
 
 func stopRecoveryUnit(ctx context.Context, log *slog.Logger) error {
@@ -168,6 +187,10 @@ func resetResources(log *slog.Logger) phases.Task {
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
 		reset.CleanupNetwork(log),
+		// Before the artifacts, so a failure here stops the reset while the
+		// host is still recognizably installed. A unit that survived a reset
+		// would bootstrap the host again on the next boot.
+		RemoveFirstBootBootstrapUnit(log),
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
 	)

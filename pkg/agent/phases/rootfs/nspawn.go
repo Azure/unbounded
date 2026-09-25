@@ -167,7 +167,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
+		AgentBinaryPath:              goalstates.ResolveHostPaths().NSpawnLifecycleBinary,
 	}
 
 	if len(hostDevicePaths) > 0 {

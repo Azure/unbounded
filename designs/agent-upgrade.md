@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/usr/local/bin/unbounded-agent`. |
+| `BinaryPath` | Compatibility path, normally `/opt/unbounded/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -32,10 +32,18 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 | `SignalPath` | Single JSON signal file for pending and failure state. |
 | `CurrentTargetPath` | Resolved current binary target for one operation. |
 
-`goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
-stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
-`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
-current target. `NextTargetPath()` then chooses the inactive slot:
+`goalstates.ResolvedAgentUpgradePaths()` resolves the slots under the host
+root, applies environment overrides, and stores the resolved `CurrentPath`
+target in `CurrentTargetPath`. If `CurrentPath` does not exist, the
+compatibility `BinaryPath` is used as the current target.
+
+The host root is `/opt/unbounded`, resolved through symlinks before any path is
+built from it. On a host installed by a release before the host root, the agent
+links `/opt/unbounded` to `/usr/local`, where that release put its files, before
+it resolves anything. The slots then resolve to the paths that release wrote,
+so the resolved current target still compares equal to one of them.
+
+`NextTargetPath()` chooses the inactive slot:
 
 ```text
 current target == BluePath  -> next target = GreenPath
@@ -112,7 +120,9 @@ Without `--preflight`, the command performs one transactional activation:
    activated.
 3. Inspect the current binary layout and validate path safety, destination
    entry types, collisions, and unsafe aliases.
-4. Verify the pinned candidate snapshot by running its `version` command.
+4. Verify the pinned candidate snapshot by running its `version` command,
+   and, unless the host root is linked to `/usr/local`, its `host-root`
+   command, which must print the same host root.
 5. If the managed layout is not initialized, preserve the existing
    single-path daemon binary in one slot and establish `CurrentPath` and
    `LastGoodPath`.
@@ -260,7 +270,7 @@ Logs and errors omit URL query and fragment data.
 2. Download the tarball within the configured size bound.
 3. Require the archive to contain only the exact `unbounded-agent` entry.
 4. Bound decompression and atomically install the inactive slot.
-5. Run `unbounded-agent version` against the staged binary without exposing output.
+5. Run `unbounded-agent version` against the staged binary without exposing output, and check its host root as above.
 6. If the inactive slot is last-good, protect the running binary through `LastGoodPath` before replacing it; otherwise defer the last-good update until candidate verification succeeds.
 7. Atomically update `CurrentPath` to the staged binary.
 

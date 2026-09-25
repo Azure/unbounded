@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // ---------------------------------------------------------------------------
@@ -1188,4 +1190,237 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
+}
+
+// ignitionTestConfig returns an agent config shaped like one the command would
+// build.
+func ignitionTestConfig() *provision.UnboundedAgentConfig {
+	return &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			MachineName: "test-node",
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth:      provision.KubeletAuthInfo{BootstrapToken: "abc123.0123456789abcdef"},
+			},
+		},
+	}
+}
+
+const ignitionTestDigest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+// ignitionTestHandler returns a handler as validate leaves it.
+func ignitionTestHandler() *manualBootstrapHandler {
+	return &manualBootstrapHandler{
+		logger:      discardLogger(),
+		agentURL:    "https://example.test/unbounded-agent-linux-amd64",
+		agentSHA256: ignitionTestDigest,
+		agentHash:   "sha256-" + ignitionTestDigest,
+	}
+}
+
+// TestRenderIgnitionPlacesEverythingBeforeFirstBoot covers the property the
+// whole variant exists for: on a host with no shell and no operator, every file
+// the agent needs is already present when the unit starts.
+func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
+	t.Parallel()
+
+	out, err := ignitionTestHandler().renderIgnition(ignitionTestConfig())
+	require.NoError(t, err)
+
+	var cfg ignitionConfig
+	require.NoError(t, json.Unmarshal([]byte(out), &cfg), "emitted document must be valid JSON")
+	require.Equal(t, ignitionSpecVersion, cfg.Ignition.Version)
+
+	require.NotNil(t, cfg.Storage)
+
+	paths := map[string]ignitionFile{}
+	for _, f := range cfg.Storage.Files {
+		paths[f.Path] = f
+	}
+
+	agentConfig, ok := paths[ignitionAgentConfigPath]
+	require.True(t, ok, "the agent config must be written, got %v", paths)
+	require.Equal(t, ignitionModeConfig, agentConfig.Mode, "the agent config carries a bootstrap token")
+
+	binary, ok := paths["/opt/unbounded/bin/unbounded-agent"]
+	require.True(t, ok, "the agent binary must land under the host root, got %v", paths)
+	require.Equal(t, ignitionModeScript, binary.Mode)
+	require.Equal(t, "https://example.test/unbounded-agent-linux-amd64", binary.Contents.Source)
+	require.NotNil(t, binary.Contents.Verification, "an unattended host must not accept whatever the URL returns")
+	require.Equal(t, "sha256-"+ignitionTestDigest, binary.Contents.Verification.Hash)
+
+	require.NotNil(t, cfg.Systemd)
+	require.Len(t, cfg.Systemd.Units, 1)
+	require.Equal(t, goalstates.FirstBootBootstrapUnit, cfg.Systemd.Units[0].Name)
+	require.NotNil(t, cfg.Systemd.Units[0].Enabled)
+	require.True(t, *cfg.Systemd.Units[0].Enabled, "an unenabled unit never runs and nothing reports it")
+}
+
+// TestRenderIgnitionUsesTheHostRoot pins that every host-side path is under the
+// host root. On a host that mounts /usr read-only, Ignition cannot write under
+// /usr/local, and a unit pointing there could not start.
+func TestRenderIgnitionUsesTheHostRoot(t *testing.T) {
+	t.Parallel()
+
+	out, err := ignitionTestHandler().renderIgnition(ignitionTestConfig())
+	require.NoError(t, err)
+
+	var cfg ignitionConfig
+	require.NoError(t, json.Unmarshal([]byte(out), &cfg))
+	require.NotNil(t, cfg.Storage)
+	require.Len(t, cfg.Storage.Directories, 1)
+	require.Equal(t, "/opt/unbounded/bin", cfg.Storage.Directories[0].Path)
+
+	require.NotContains(t, out, "/usr/local", "nothing may be written or run from the legacy root")
+}
+
+// TestIgnitionBootstrapUnitRunsOnEveryBoot pins the decision not to carry a
+// completion condition.
+//
+// A condition needs a marker file, which is a second record of completion that
+// can disagree with the ownership record the agent already keeps. Instead the
+// unit runs every boot and the agent's own admission answers the question,
+// returning immediately once the record says the installation is complete. The
+// benefit is that a node whose daemon was stopped comes back on reboot.
+func TestIgnitionBootstrapUnitRunsOnEveryBoot(t *testing.T) {
+	t.Parallel()
+
+	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig())
+
+	require.NotContains(t, unit, "ConditionPathExists=!",
+		"a completion marker would be a second source of truth beside the ownership record")
+
+	// The one check that stays guards against running a binary Ignition failed
+	// to place. It asserts rather than conditions: a failed condition leaves the
+	// unit inactive and unremarkable, so a host that never bootstrapped would
+	// look no different from one that had nothing to do.
+	require.Contains(t, unit, "AssertPathExists=/opt/unbounded/bin/unbounded-agent")
+	require.NotContains(t, unit, "ConditionPathExists=/opt/unbounded/bin/unbounded-agent",
+		"a missing agent binary must fail visibly rather than skip silently")
+
+	require.Contains(t, unit, "WantedBy=multi-user.target", "the unit has to be started on every boot for this to work")
+}
+
+// TestIgnitionBootstrapUnitSurvivesEarlyBootRaces covers two failures seen on
+// real hardware rather than reasoned about.
+//
+// network-online.target means a link is configured, not that DNS resolves: a
+// unit can start in the same second the target is reached while
+// systemd-resolved is still coming up, and fail on an unresolved host. And
+// bootstrap has no later opportunity to run, so systemd's default start limit
+// would turn a burst of early failures into a permanently disabled unit.
+func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
+	t.Parallel()
+
+	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig())
+
+	require.Contains(t, unit, "Restart=on-failure", "DNS may not answer yet on the first attempt")
+	require.Contains(t, unit, "StartLimitIntervalSec=0", "bootstrap gets no second chance if systemd gives up on it")
+
+	// Retrying forever is the point, but retrying every ten seconds forever is
+	// not: with no start limit to stop it, an unreachable network would spawn
+	// the agent thousands of times a day and bury the reason in the journal.
+	require.Contains(t, unit, "RestartSteps=10")
+	require.Contains(t, unit, "RestartMaxDelaySec=300")
+	require.Contains(t, unit, "RestartSec=10s", "the first retry stays prompt")
+	require.Contains(t, unit, "Type=oneshot")
+	require.Contains(t, unit, "After=network-online.target nss-lookup.target systemd-sysext.service "+goalstates.DaemonUnit+"\n",
+		"on a reboot, start must not find the daemon still starting and repair it")
+
+	// start reads the config path from the environment; it has no flag for it.
+	require.Contains(t, unit, "Environment=UNBOUNDED_AGENT_CONFIG_FILE="+ignitionAgentConfigPath)
+
+	// Preflight runs before any host mutation and reports against this unit.
+	require.Contains(t, unit, "ExecStartPre=/opt/unbounded/bin/unbounded-agent preflight")
+	require.Contains(t, unit, "ExecStart=/opt/unbounded/bin/unbounded-agent start")
+}
+
+// TestValidateRejectsIgnitionInputBeforeContactingTheCluster covers where the
+// Ignition flag rules are enforced, not just that they are.
+//
+// validate runs before any Kubernetes client is built. Leaving these checks to
+// the renderer meant an operator who forgot --agent-sha256 waited for a cluster
+// connection and a site lookup before being told about a flag, and got that
+// answer only if the connection succeeded at all.
+func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
+	t.Parallel()
+
+	base := func() *manualBootstrapHandler {
+		return &manualBootstrapHandler{
+			siteName:    "site-a",
+			variant:     string(variantIgnition),
+			agentURL:    "https://example.test/unbounded-agent",
+			agentSHA256: strings.Repeat("a", 64),
+		}
+	}
+
+	// validate ends by requiring a readable kubeconfig, so the happy path needs
+	// one to reach that far. The failure cases below deliberately do not supply
+	// one: reporting a missing flag without it is the behavior being tested.
+	withKubeconfig := func(h *manualBootstrapHandler) *manualBootstrapHandler {
+		path := filepath.Join(t.TempDir(), "kubeconfig")
+		require.NoError(t, os.WriteFile(path, []byte("apiVersion: v1\n"), 0o600))
+		h.kubeconfigPath = path
+
+		return h
+	}
+
+	valid := withKubeconfig(base())
+	require.NoError(t, valid.validate(), "a complete ignition invocation must pass")
+	require.Equal(t, "sha256-"+strings.Repeat("a", 64), valid.agentHash, "the renderer uses the digest validate parsed")
+
+	for name, tc := range map[string]struct {
+		mutate  func(*manualBootstrapHandler)
+		wantErr string
+	}{
+		"no agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "" },
+			wantErr: "--agent-url is required",
+		},
+		"unfetchable agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "oci://ghcr.io/azure/agent:v1" },
+			wantErr: "cannot be fetched by Ignition",
+		},
+		"no digest": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "" },
+			wantErr: "--agent-sha256 is required",
+		},
+		"malformed digest": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "not-a-digest" },
+			wantErr: "invalid --agent-sha256",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := base()
+			tc.mutate(h)
+
+			// No kubeconfig on purpose. The point of checking these here is
+			// that an operator hears about a missing flag immediately, rather
+			// than after the tool has resolved a kubeconfig and built a client,
+			// so the flag error has to come first.
+			err := h.validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+			require.NotContains(t, err.Error(), "kubeconfig",
+				"the flag error must be reported before the kubeconfig is resolved")
+		})
+	}
+
+	// The other variants have no such requirements, and must not inherit them:
+	// they resolve the agent at runtime.
+	for _, variant := range []bootstrapVariant{variantScript, variantCloudInit} {
+		t.Run("no ignition rules for "+string(variant), func(t *testing.T) {
+			t.Parallel()
+
+			h := withKubeconfig(&manualBootstrapHandler{siteName: "site-a", variant: string(variant)})
+			require.NoError(t, h.validate())
+		})
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 func TestResetResourcesIncludesBPFFSMountCleanup(t *testing.T) {
@@ -136,4 +137,42 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "machine-1", r.MachineName)
 	require.Equal(t, "fingerprint-1", r.ConfigFingerprint)
+}
+
+// TestResetRemovesTheFirstBootUnitBeforeArtifacts pins that reset actually runs
+// the removal, not merely that the removal works.
+//
+// The unit runs on every boot and decides there is nothing to do from the
+// ownership record that reset is about to delete. Left behind, it would find an
+// uninstalled host and bootstrap it again, undoing the reset with nothing
+// reporting why. Ordering it before the artifacts means a failure stops the
+// reset while the host is still recognizably installed.
+func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
+	t.Parallel()
+
+	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
+
+	assert.Contains(t, taskName, "remove-first-boot-unit",
+		"reset must remove the Ignition bootstrap unit or the host re-bootstraps on next boot")
+	assert.Less(t,
+		strings.Index(taskName, "remove-first-boot-unit"),
+		strings.Index(taskName, "remove-agent-artifacts"),
+		"a failure here must stop the reset while the host is still recognizably installed")
+}
+
+// TestTeardownSyncPathsCoverBothRoots pins what a teardown makes durable.
+//
+// A crash during reset could otherwise leave files the teardown had already
+// removed present on the next boot, and those are exactly the files whose
+// absence lets the host be provisioned again. On a migrated host they are under
+// the legacy root and the link to it is in /opt; on every host the installer
+// scripts are under the legacy root.
+func TestTeardownSyncPathsCoverBothRoots(t *testing.T) {
+	t.Parallel()
+
+	paths := teardownSyncPaths("/var/lib/unbounded")
+
+	for _, want := range []string{"/etc", "/var/lib/machines", "/opt", hostroot.Resolve(), "/usr/local", "/var/lib/unbounded"} {
+		assert.Contains(t, paths, want)
+	}
 }

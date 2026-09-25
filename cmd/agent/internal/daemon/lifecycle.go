@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -82,13 +83,15 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
+	recoveryScriptPath := goalstates.ResolveHostPaths().DaemonRecoveryScript
+
 	recoveryScript, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
 	if err != nil {
-		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+		return fmt.Errorf("rendering %s: %w", recoveryScriptPath, err)
 	}
 
-	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
-		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	if err := writeFile(recoveryScriptPath, recoveryScript, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", recoveryScriptPath, err)
 	}
 
 	return activateDaemonUnit(ctx, d.log, executil.Systemctl())
@@ -132,8 +135,16 @@ func activateDaemonUnit(ctx context.Context, log *slog.Logger, sc func(context.C
 // host already has a usable daemon binary. The caller holds installation
 // ownership; existing binary layouts are retained and upgrades use their normal
 // activation path.
+//
+// The binary path comes from the resolved upgrade paths, so an environment
+// override lands the binary where VerifyDaemonInstalled will look for it.
 func InstallBootstrapBinary() error {
-	if usableDaemonBinary(goalstates.DaemonBinaryPath) {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return err
+	}
+
+	if usableDaemonBinary(paths.BinaryPath) {
 		return nil
 	}
 
@@ -142,7 +153,7 @@ func InstallBootstrapBinary() error {
 		return err
 	}
 
-	return fsutil.InstallFile(source, goalstates.DaemonBinaryPath, 0o755)
+	return fsutil.InstallFile(source, paths.BinaryPath, 0o755)
 }
 
 // usableDaemonBinary resolves symlinks on purpose. The healthy layout reaches
@@ -180,7 +191,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
 		DaemonBinaryCurrentPath:      paths.CurrentPath,
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
-		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
+		DaemonRecoveryScriptPath:     goalstates.ResolveHostPaths().DaemonRecoveryScript,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
 		DaemonDeferredExitCode:       DeferredExitCode,
 	}
@@ -263,11 +274,71 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	if err := removeOwnedFile(goalstates.DaemonRecoveryScriptPath); err != nil {
+	if err := removeOwnedFile(goalstates.ResolveHostPaths().DaemonRecoveryScript); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+type removeFirstBootUnit struct {
+	log *slog.Logger
+}
+
+// RemoveFirstBootBootstrapUnit returns a task that disables and removes the
+// unit an Ignition config installs to bootstrap the agent.
+func RemoveFirstBootBootstrapUnit(log *slog.Logger) phases.Task {
+	return &removeFirstBootUnit{log: log}
+}
+
+func (t *removeFirstBootUnit) Name() string { return "remove-first-boot-unit" }
+
+func (t *removeFirstBootUnit) Do(ctx context.Context) error {
+	return removeFirstBootBootstrapUnit(ctx, t.log)
+}
+
+// removeFirstBootBootstrapUnit disables and removes the unit an Ignition config
+// installs to bootstrap the agent.
+//
+// Reset has to take this with it. The unit is installed into
+// multi-user.target and carries no completion condition, so it runs on every
+// boot and relies on the agent's ownership record to decide there is nothing to
+// do. Reset removes that record, so a unit left behind would find a host with
+// no installation and bootstrap it again, undoing the reset on the next boot.
+//
+// Absent on every host not provisioned through Ignition, which is the common
+// case, so a missing unit is success rather than something to report.
+func removeFirstBootBootstrapUnit(ctx context.Context, log *slog.Logger) error {
+	return removeFirstBootBootstrapUnitIn(ctx, log, goalstates.SystemdSystemDir)
+}
+
+// removeFirstBootBootstrapUnitIn takes the unit directory so the sequence can
+// be exercised without writing to /etc.
+func removeFirstBootBootstrapUnitIn(ctx context.Context, log *slog.Logger, unitDir string) error {
+	unitPath := filepath.Join(unitDir, goalstates.FirstBootBootstrapUnit)
+
+	if _, err := os.Lstat(unitPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	log.Info("removing first-boot bootstrap unit", "unit", goalstates.FirstBootBootstrapUnit)
+
+	// --now stops it as well as disabling it. The unit is a oneshot with
+	// RemainAfterExit=yes, so after it has run it stays active, and deleting
+	// the file does not change that: systemd keeps the loaded unit active until
+	// something stops it. A host provisioned again afterwards writes the unit
+	// back and starts it, systemd sees a unit that is already active and does
+	// nothing, and the agent never runs. Nothing reports an error, because
+	// nothing failed.
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", "--now", goalstates.FirstBootBootstrapUnit); err != nil {
+		// Disable removes the enablement symlink. If it failed but the unit
+		// file is already gone, there is nothing left to start.
+		if _, statErr := os.Lstat(unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("disable %s: %w", goalstates.FirstBootBootstrapUnit, err)
+		}
+	}
+
+	return removeOwnedFile(unitPath)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,12 +347,25 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 
 type removeAgentArtifacts struct {
 	log *slog.Logger
+	// files, dirs and removeRoot are resolved at construction so the task can
+	// be exercised against a temporary tree. Do removes real system paths, so a
+	// test that had to call the exported constructor could not run it at all.
+	files      []string
+	dirs       []string
+	removeRoot func() error
 }
 
 // RemoveAgentArtifacts returns a task that removes the agent binary, install
-// script, legacy uninstall script, config directory, and temp files.
+// script, legacy uninstall script, config directory, and temp files, and then
+// the host root itself once it is empty, or the link to the legacy root on a
+// migrated host.
 func RemoveAgentArtifacts(log *slog.Logger) phases.Task {
-	return &removeAgentArtifacts{log: log}
+	return &removeAgentArtifacts{
+		log:        log,
+		files:      goalstates.OwnedHostFiles(),
+		dirs:       []string{goalstates.AgentConfigDir, "/tmp/unbounded-agent"},
+		removeRoot: func() error { return hostroot.Remove(log) },
+	}
 }
 
 func (t *removeAgentArtifacts) Name() string { return "remove-agent-artifacts" }
@@ -290,27 +374,14 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	t.log.Info("removing agent binaries and configuration")
 
 	// Remove known file paths.
-	for _, path := range []string{
-		goalstates.DaemonBinaryPath,
-		goalstates.DaemonBinaryBluePath,
-		goalstates.DaemonBinaryGreenPath,
-		goalstates.DaemonBinaryCurrentPath,
-		goalstates.DaemonBinaryLastGoodPath,
-		goalstates.NSpawnLifecycleBinaryPath,
-		goalstates.DaemonRecoveryScriptPath,
-		"/usr/local/bin/unbounded-agent-install.sh",
-		"/usr/local/bin/unbounded-agent-uninstall.sh",
-	} {
+	for _, path := range t.files {
 		if err := removeOwnedFile(path); err != nil {
 			return err
 		}
 	}
 
 	// Remove directories.
-	for _, dir := range []string{
-		"/etc/unbounded/agent",
-		"/tmp/unbounded-agent",
-	} {
+	for _, dir := range t.dirs {
 		if err := os.RemoveAll(dir); err != nil {
 			return err
 		}
@@ -324,11 +395,40 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		}
 	}
 
-	return nil
+	// Last, so the files above are removed through a link to the legacy root
+	// before the link goes.
+	return t.removeRoot()
 }
 
+// removeOwnedFile removes one of the agent's own files, tolerating its absence.
+//
+// The existence check is not an optimization. The installer scripts are
+// removed from the legacy root on every host, and on an immutable host that is
+// a read-only filesystem. Unlinking a path that is not there returns EROFS
+// rather than ENOENT, because the kernel checks the parent directory for write
+// permission before it resolves the final component, so an absent file there
+// would fail a reset that had nothing to do.
+//
+// Lstat rather than Stat: a dangling symlink is still a file the agent left
+// behind, and it has to be removed rather than read as absent.
 func removeOwnedFile(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	return removeOwnedFileWith(path, os.Lstat, os.Remove)
+}
+
+// removeOwnedFileWith takes the two syscalls so the ordering between them can
+// be tested. That ordering is the whole behavior, and it cannot be observed
+// from the outside without a read-only mount, which a unit test has no way to
+// arrange.
+func removeOwnedFileWith(
+	path string,
+	lstat func(string) (os.FileInfo, error),
+	remove func(string) error,
+) error {
+	if _, err := lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err := remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove owned artifact %s: %w", path, err)
 	}
 
@@ -350,7 +450,7 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 
-	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, goalstates.DaemonRecoveryScriptPath} {
+	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, goalstates.ResolveHostPaths().DaemonRecoveryScript} {
 		info, err := os.Stat(path)
 		if err != nil {
 			return err
@@ -396,5 +496,5 @@ func RepairDaemon(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(hostroot.Resolve(), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }

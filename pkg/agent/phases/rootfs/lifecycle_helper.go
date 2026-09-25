@@ -32,7 +32,7 @@ func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
 		return fmt.Errorf("resolve running agent executable: %w", err)
 	}
 
-	return installNSpawnLifecycleHelper(sourcePath, goalstates.NSpawnLifecycleBinaryPath)
+	return installNSpawnLifecycleHelper(sourcePath, goalstates.ResolveHostPaths().NSpawnLifecycleBinary)
 }
 
 func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) {

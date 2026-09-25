@@ -1,6 +1,8 @@
 [Unit]
 Description=Flush nftables rules to a clean state
-Before=systemd-nspawn@.service
+# The machines order themselves after this unit in their service override. A
+# Before= on the template here would not reach them: systemd fills in the
+# missing instance with this unit's own name.
 # Some hosts load a default firewall at boot. Azure Container Linux enables
 # iptables.service, which installs an INPUT policy of drop; without ordering
 # the two start within milliseconds of each other and the firewall is applied

@@ -196,6 +196,52 @@ runcmd:
   - export AGENT_MACHINE_NAME=my-custom-node
 ```
 
+### Where the agent installs
+
+The agent keeps its own host-side files under `/opt/unbounded`: the daemon
+binaries and helper scripts in `/opt/unbounded/bin`, and the LocalDNS network
+helper in `/opt/unbounded/libexec`. Paths inside the nspawn machine are always
+relative to the machine directory, and `/etc/unbounded/agent` and
+`/var/lib/unbounded` are separate.
+
+Earlier releases installed these files under `/usr/local`. On a host installed
+by one of them, the first command of a newer agent that changes the host links
+`/opt/unbounded` to `/usr/local`. That happens when the daemon starts after an
+AgentUpgrade, or when `start` or `agent-upgrade` runs. The files stay where
+they are and the units that run them are unchanged, so the host can still be
+returned to the earlier release. `unbounded-agent reset` removes the agent's
+files from both locations, and the link.
+
+The agent refuses to run on a host that has an installation under both
+locations, or an installation under `/usr/local` beside an existing
+`/opt/unbounded` directory. Run `unbounded-agent reset` first. On a host
+installed under `/opt/unbounded`, an AgentUpgrade to an earlier release is
+refused, because that release would look for its files under `/usr/local`.
+
+### Immutable hosts (read-only /usr)
+
+Some images mount `/usr` read-only and provide no package manager, so there is
+no shell-based provisioning path at first boot. Azure Container Linux is one
+such image. `/opt`, and with it the agent's files, is on the writable root
+filesystem there.
+
+For these hosts, generate an Ignition config:
+
+```bash
+curl -fsSLO https://github.com/Azure/unbounded/releases/download/v0.8.1/checksums.txt
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --variant ignition \
+    --agent-url https://github.com/Azure/unbounded/releases/download/v0.8.1/unbounded-agent-linux-amd64 \
+    --agent-sha256 "$(grep ' unbounded-agent-linux-amd64$' checksums.txt)" \
+    > config.ign
+```
+
+Ignition declares state rather than running commands, so this variant cannot
+resolve a version, detect an architecture, or extract an archive at boot. It
+therefore requires `--agent-url` pointing at the *bare agent binary* rather
+than the release tarball, and `--agent-sha256` to verify it. The digest for
+each release binary is published in `checksums.txt`.
+
 ### Customizing the agent download
 
 By default the bootstrap script downloads the latest published

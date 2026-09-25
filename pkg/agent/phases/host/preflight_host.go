@@ -221,10 +221,11 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 }
 
 // agentInstallDirs returns the host directories the agent writes its own files
-// into. Derived from the binary path rather than restated, so the check cannot
-// drift from where the agent actually installs.
+// into. Derived from the host layout rather than restated, so the check cannot
+// drift from where the agent actually installs. Planned rather than resolved,
+// because preflight does not migrate the host root.
 func agentInstallDirs() []string {
-	return []string{filepath.Dir(goalstates.DaemonBinaryPath)}
+	return []string{goalstates.PlannedHostPaths().BinDir}
 }
 
 // installDirResults verifies the agent can write its own host-side files.

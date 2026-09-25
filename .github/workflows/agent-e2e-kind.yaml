@@ -57,31 +57,78 @@ permissions:
   packages: read
 
 jobs:
+  # The Azure Container Linux image is not on a public mirror. It lives in a
+  # storage account that disables anonymous access and shared keys alike, so it
+  # is reachable only with a federated Azure login, and GitHub withholds secrets
+  # from workflows triggered by a fork. Every other host downloads from a public
+  # mirror and is unaffected.
+  #
+  # A job-level `if` would skip the whole matrix, and a static matrix cannot
+  # drop one entry conditionally, so the list is built here instead. On a fork
+  # the ACL entry is absent rather than failing, which is the difference between
+  # a contributor seeing their PR pass and seeing a red check they cannot fix.
+  select-hosts:
+    name: select host matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select hosts
+        id: select
+        env:
+          # Absent for non-pull_request events, where secrets are available.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          # Presence only. The image needs a federated login, and the entry is
+          # left out entirely until one is configured, rather than added and
+          # failed. GitHub masks the value; nothing here reads it.
+          ACL_CREDENTIAL: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure
+          # Linux nspawn. Azure Linux 3 does not currently publish a QEMU-ready
+          # VHD that this e2e can boot directly as the host VM.
+          hosts='[
+            {"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404","timeout":60},
+            {"host-base-os":"fedora","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux9","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux10","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"centosstream9","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"centosstream10","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604","timeout":60}
+          ]'
+
+          # Azure Container Linux gets longer: it downloads a 630 MiB image and
+          # boots a 31 GiB sparse overlay through OVMF.
+          acl='{"host-base-os":"acl","nspawn-base-os":"azlinux3","timeout":75}'
+
+          if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
+            echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
+          elif [ -z "${ACL_CREDENTIAL}" ]; then
+            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID is not configured"
+          else
+            hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
+          fi
+
+          hosts="$(printf '%s' "${hosts}" | jq -c .)"
+
+          printf 'matrix=%s\n' "$(printf '%s' "${hosts}" | jq -c '{include: .}')" >> "${GITHUB_OUTPUT}"
+
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
+    needs: select-hosts
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      packages: read
+      # Federated login for the Azure Container Linux image. Requested on this
+      # job alone rather than for the workflow, because no other step needs it.
+      id-token: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - host-base-os: ubuntu2404
-            nspawn-base-os: ubuntu2404
-          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure Linux nspawn.
-          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
-          # e2e can boot directly as the host VM.
-          - host-base-os: fedora
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux9
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux10
-            nspawn-base-os: azlinux3
-          - host-base-os: centosstream9
-            nspawn-base-os: azlinux3
-          - host-base-os: centosstream10
-            nspawn-base-os: azlinux3
-          - host-base-os: ubuntu2604
-            nspawn-base-os: ubuntu2604
+      matrix: ${{ fromJSON(needs.select-hosts.outputs.matrix) }}
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
@@ -93,11 +140,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Azure login
+        if: matrix.host-base-os == 'acl'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
+          subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+
+      # Resolved once for the job. The image URL, digest and build are
+      # exported to the environment, so later e2e.py processes use this build
+      # rather than reading the manifest again, which may have moved on.
+      - name: Resolve the Azure Container Linux build
+        if: matrix.host-base-os == 'acl'
+        id: acl-image
+        run: python3 ./hack/agent/e2e-kind/e2e.py resolve-host-image
+
+      # Keyed on the build, so a refreshed image misses and is downloaded once
+      # rather than every run re-fetching 630 MiB from the storage account.
+      # Restore and save are separate steps because Cleanup deletes .vm-e2e
+      # before a combined action's post step would save it.
+      - name: Restore the host image
+        if: matrix.host-base-os == 'acl'
+        id: acl-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
+          key: acl-image-${{ steps.acl-image.outputs.build }}
+
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
           vm-subnet: ${{ env.VM_SUBNET }}
+
+      # create-vm, in the step above, has downloaded and verified the image.
+      # Saving here rather than at the end means a later test failure does not
+      # stop the next run reusing it.
+      - name: Save the host image
+        if: matrix.host-base-os == 'acl' && steps.acl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
+          key: acl-image-${{ steps.acl-image.outputs.build }}
 
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup
@@ -151,6 +236,42 @@ jobs:
         uses: ./.github/actions/agent-e2e-kind-logs
         with:
           artifact-name: agent-bootstrap-recovery-logs
+      - name: Cleanup
+        if: always()
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
+
+  # A host installed by a release before the host root, moved to this build and
+  # back. The older release cannot be installed on an immutable host at all,
+  # and on a migrated host the units still run the same legacy paths, so one
+  # conventional host covers it.
+  agent-host-root-migration:
+    name: agent host root migration (Ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KIND_CLUSTER_NAME: agent-host-root-migration
+      VM_NAME: agent-host-root-migration
+      VM_SUBNET: "192.168.100"
+      VM_IP: "192.168.100.10"
+      AGENT_MACHINE_NAME: agent-host-root-migration
+      HOST_BASE_OS: ubuntu2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up test control plane
+        uses: ./.github/actions/agent-e2e-kind-control-plane
+        with:
+          cluster-name: ${{ env.KIND_CLUSTER_NAME }}
+          vm-subnet: ${{ env.VM_SUBNET }}
+      - name: Set up machina resources
+        uses: ./.github/actions/agent-e2e-machina-setup
+      - name: Upgrade, reboot, downgrade and reset a migrated host
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite migration
+      - name: Collect logs
+        if: always()
+        uses: ./.github/actions/agent-e2e-kind-logs
+        with:
+          artifact-name: agent-host-root-migration-logs
       - name: Cleanup
         if: always()
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup

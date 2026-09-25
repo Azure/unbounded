@@ -127,8 +127,14 @@ func existingDeploymentMachineArtifacts(machineName string) []existingDeployment
 	}
 }
 
+// existingDeploymentHostArtifacts returns the host files whose presence means
+// this host already carries a deployment.
+//
+// The recovery script is looked for under the legacy root as well as the host
+// root. Preflight does not migrate, so on a host installed by an older agent
+// the host root does not yet lead to its files.
 func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
-	return []existingDeploymentArtifact{
+	artifacts := []existingDeploymentArtifact{
 		{
 			description: "agent daemon unit",
 			path:        filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit),
@@ -137,11 +143,21 @@ func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
 			description: "agent daemon recovery unit",
 			path:        filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit),
 		},
-		{
-			description: "agent daemon recovery script",
-			path:        goalstates.DaemonRecoveryScriptPath,
-		},
 	}
+
+	scripts := []string{goalstates.ResolveHostPaths().DaemonRecoveryScript}
+	if legacy := goalstates.LegacyHostPaths().DaemonRecoveryScript; legacy != scripts[0] {
+		scripts = append(scripts, legacy)
+	}
+
+	for _, script := range scripts {
+		artifacts = append(artifacts, existingDeploymentArtifact{
+			description: "agent daemon recovery script",
+			path:        script,
+		})
+	}
+
+	return artifacts
 }
 
 func appendExistingDeploymentArtifactResult(

@@ -112,10 +112,14 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		return nil
 	}
 
+	// The unit names the helper, so both are written from one resolution.
+	helper := goalstates.ResolveHostPaths().LocalDNSNetworkHelper
+
 	data := map[string]string{
 		"MachineName":       s.goalState.MachineName,
 		"NodeListenerIP":    s.goalState.LocalDNS.NodeListenerIP.String(),
 		"ClusterListenerIP": s.goalState.LocalDNS.ClusterListenerIP.String(),
+		"NetworkHelper":     helper,
 	}
 
 	var script bytes.Buffer
@@ -123,7 +127,7 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		return fmt.Errorf("render LocalDNS network script: %w", err)
 	}
 
-	if err := utilio.WriteFile("/usr/local/libexec/unbounded-localdns-network", script.Bytes(), 0o755); err != nil {
+	if err := utilio.WriteFile(helper, script.Bytes(), 0o755); err != nil {
 		return fmt.Errorf("write LocalDNS network script: %w", err)
 	}
 
