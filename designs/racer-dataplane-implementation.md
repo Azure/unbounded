@@ -47,6 +47,44 @@ copy is introduced here.
 
 ## Ownership and historical handoffs
 
+- Integration verifier final observations: `cargo test --locked --manifest-path
+  cmd/racer-dataplane/Cargo.toml --all-features --quiet` completed successfully:
+  492 library passed, 6 native gates ignored; 2 executable passed; 18 conformance
+  passed, SDK gate ignored; 6 production passed; 31 doctests passed. The three
+  `native_no_device` ignored tests passed explicitly with the built adapter in
+  `LD_LIBRARY_PATH`. Default/all-feature all-target checks and Rust formatting
+  passed. After routing-capacity commit `50161a41`, all three application
+  composition/churn tests passed again. `make fmt` was attempted with a narrow
+  Go package scope: installed golangci-lint panicked because its Go 1.26 build
+  cannot analyze a dependency requiring Go 1.27. No Go source changes resulted.
+
+- Final cherry-pick owner: original branch advanced cleanly to `329089f2` with
+  user commits `09e3ccda` (SDK fake), `e766c9d4` (Gantry origin), and `329089f2`
+  (exclusive Racer backend) after `66ac6b83`. Preserve all three and cherry-pick
+  onto the latest original HEAD, not the earlier last-seen revision.
+  Explicit SDK conformance rerun against that newer original repository PASSED:
+  `RACER_SDK_ROOT=/home/azureuser/code/unbounded cargo test --manifest-path
+  cmd/racer-dataplane/Cargo.toml --all-features --test client_origin_conformance
+  sdk_client -- --ignored --nocapture`: 1 Rust test and all 4 Go cases passed.
+
+- Final integrator accepted app handoff `84f122b2` and now owns all remaining edits.
+  I applied the outstanding current-plus-retained routing capacity fix directly
+  after that handoff and extended the actual two-worker composition test. All
+  other sessions should stop edits and checks now; final verification and ordered
+  cherry-pick are in progress in this session.
+
+- Checkpoint/takeover verifier no-default results: the full no-default command
+  passed 493 library tests, 2 executable tests, 18 conformance tests (SDK ignored),
+  and 5 production tests before the tool's aggregate 120-second timeout interrupted
+  the last pressure test. Ran that exact remaining production test explicitly with
+  a larger timeout: PASSED (58.88 seconds). The no-default doc command then passed
+  all 31 doctests. Initial missing PeerNetwork import was fixed by its owner before
+  the passing run. Checkpoint commit `d7574b98` is recorded. This verification
+  session has yielded source ownership and will perform no competing cherry-pick.
+  Settled source `50161a41`: cargo fmt check, locked no-default all-target check,
+  and git diff whitespace check all passed. The outgoing implementation range
+  contains no SDK/Gantry path changes, preserving the user's three latest commits.
+
 - Final integrator to active app editor: membership slot-capacity correction is
   still absent at app.rs:617 (`retained_snapshots.get()` without +1) despite prior
   passing component churn checks. Please include it before your app commit. Your

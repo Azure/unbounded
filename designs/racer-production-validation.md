@@ -133,19 +133,32 @@ blocker is resolved.
 
 ## Remaining acceptance gates
 
-1. Fix multiworker membership retirement: every worker holds two references, but
-   cleanup requires global `Arc::strong_count == 2` (`src/app.rs:910-930`). This
-   ownership-based inference predicts bounded-table exhaustion under version churn
-   (`src/peer.rs:41-54`). Add multiworker churn coverage with and without retained
-   old-version requests.
-2. Exercise deployed Go SDK reads through the binary's actual client listeners,
+Final integration verification on 2026-09-25: `cargo test --locked --manifest-path
+cmd/racer-dataplane/Cargo.toml --all-features --quiet` completed successfully with
+492 library tests, 2 executable tests, 18 conformance tests, 6 production tests,
+and 31 doctests passing. Six native tests and the separately exercised SDK test
+are gated in the default run. All three `native_no_device` tests passed explicitly
+with `LD_LIBRARY_PATH` pointing at the built native adapter. Default and all-feature
+all-target checks and Rust formatting passed. The final routing-capacity change
+also passed all three application composition/membership tests.
+
+The required scoped `make fmt` attempt ran gofumpt, but golangci-lint failed because
+its Go 1.26 build cannot analyze a Go 1.27 dependency. No Go changes resulted.
+
+The membership-retirement audit finding is resolved by per-object structural
+reference accounting in `update_memberships` (`src/app.rs:1139-1171`). Its two-worker
+regression covers a retained request lease, churn beyond routing-table capacity,
+and workers skipping an intermediate publication. This is component-level churn
+coverage, not a deployed control-server churn test.
+
+1. Exercise deployed Go SDK reads through the binary's actual client listeners,
    populated-cache control-driven publication/removal, and restart with persisted
    payload. The component/lifecycle fixtures above establish narrower contracts.
    The repository's Go control server is still a scaffold:
    `internal/racer/server.go:34-42` (repository-relative) returns pending errors for
    TLS/start/readiness, and its handlers always return unavailable (`55-66`). The
    Rust TLS fixture therefore does not establish actual Go-controller interoperability.
-3. Record real native-provider execution separately from fallback/no-device checks,
+2. Record real native-provider execution separately from fallback/no-device checks,
    then validate multi-host RNIC operation and fault behavior in the deployment
    environment.
 
