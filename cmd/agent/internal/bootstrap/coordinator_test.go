@@ -117,7 +117,7 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 	for _, repair := range []bool{false, true} {
 		dir := t.TempDir()
 		store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-		r, err := installstate.NewRecord("machine", "fingerprint", "")
+		r, err := installstate.NewRecord("machine", "fingerprint")
 		require.NoError(t, err)
 
 		r.Phase = installstate.Complete
@@ -153,7 +153,7 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-			r, err := installstate.NewRecord("machine", "fingerprint", "")
+			r, err := installstate.NewRecord("machine", "fingerprint")
 			require.NoError(t, err)
 
 			if mode == "resetting" {
@@ -186,7 +186,7 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 
 func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint", "")
+	r, err := installstate.NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 	require.NoError(t, store.MarkComplete(r))
 	stages := &fakeStages{store: store, fail: "repair", verifyErr: errInjected}
@@ -232,7 +232,7 @@ func recordInode(t *testing.T, store *installstate.Store) uint64 {
 // taking one for no reason.
 func TestHealthyCompletedInstallIsNotRewritten(t *testing.T) {
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint", "")
+	r, err := installstate.NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 	require.NoError(t, store.MarkComplete(r))
 
@@ -254,7 +254,7 @@ func TestHealthyCompletedInstallIsNotRewritten(t *testing.T) {
 // the result has to be durable before the process exits.
 func TestRepairedInstallIsCommitted(t *testing.T) {
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint", "")
+	r, err := installstate.NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 	require.NoError(t, store.MarkComplete(r))
 
@@ -281,7 +281,7 @@ func TestRepairedInstallIsCommitted(t *testing.T) {
 // the wrong thing.
 func TestFailedRepairReportsWhatWasWrong(t *testing.T) {
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint", "")
+	r, err := installstate.NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 	require.NoError(t, store.MarkComplete(r))
 
@@ -334,7 +334,7 @@ func TestRunWaitsForTheInstallationLock(t *testing.T) {
 			t.Parallel()
 
 			store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-			r, err := installstate.NewRecord("machine", "fingerprint", "")
+			r, err := installstate.NewRecord("machine", "fingerprint")
 			require.NoError(t, err)
 			require.NoError(t, store.MarkComplete(r))
 

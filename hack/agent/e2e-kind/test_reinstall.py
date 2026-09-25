@@ -44,10 +44,10 @@ class TestReinstallPayload(unittest.TestCase):
     """What a reinstall is allowed to touch."""
 
     @staticmethod
-    def _doc(prefix: str, agent_config: str) -> dict:
+    def _doc(agent_config: str) -> dict:
         return {
             "storage": {"files": [
-                {"path": prefix + "/bin/unbounded-agent", "mode": 0o755,
+                {"path": e2e.DAEMON_BINARY, "mode": 0o755,
                  "contents": {"source": "http://runner/unbounded-agent", "verification": {
                      "hash": "sha256-" + hashlib.sha256(b"test-binary").hexdigest()}}},
                 {"path": "/etc/unbounded/agent/config.json", "mode": 0o600,
@@ -67,8 +67,7 @@ class TestReinstallPayload(unittest.TestCase):
         that reset is supposed to have left alone, hiding exactly the cleanup
         defects this step exists to find.
         """
-        prefix = "/opt/unbounded"
-        agent_config = json.dumps({"HostPrefix": prefix})
+        agent_config = json.dumps({"MachineName": "agent-e2e"})
 
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(e2e, "VM_DIR", Path(tmp)), \
@@ -77,10 +76,9 @@ class TestReinstallPayload(unittest.TestCase):
                 patch.object(e2e, "ssh_cmd") as ssh, \
                 patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"test-binary")), \
                 patch.object(e2e, "ignition_bootstrap_invocation", return_value="inv-before"):
-            image.return_value.host_prefix = prefix
             (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
 
-            previous = e2e._reinstall_ignition_payload(self._doc(prefix, agent_config))
+            previous = e2e._reinstall_ignition_payload(self._doc(agent_config))
 
             self.assertEqual(previous, "inv-before", "the wait needs the run from before the reinstall")
             self.assertEqual(scp.call_count, 3, "binary, agent config, bootstrap unit")
@@ -92,7 +90,7 @@ class TestReinstallPayload(unittest.TestCase):
 
     @staticmethod
     def _installed_digest(content: bytes) -> str:
-        return hashlib.sha256(content).hexdigest() + "  /opt/unbounded/bin/unbounded-agent"
+        return hashlib.sha256(content).hexdigest() + "  " + e2e.DAEMON_BINARY
 
     def test_the_installed_binary_is_checked_against_the_rendered_digest(self):
         """The binary is fetched by URL in the Ignition path, so its digest is
@@ -100,8 +98,7 @@ class TestReinstallPayload(unittest.TestCase):
         reinstall that delivers a different binary would pass every later
         assertion while testing the wrong artifact, so the copy on the VM is
         what gets checked."""
-        prefix = "/opt/unbounded"
-        doc = self._doc(prefix, json.dumps({"HostPrefix": prefix}))
+        doc = self._doc(json.dumps({"MachineName": "agent-e2e"}))
 
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(e2e, "VM_DIR", Path(tmp)), \
@@ -109,7 +106,6 @@ class TestReinstallPayload(unittest.TestCase):
                 patch.object(e2e, "scp_cmd"), patch.object(e2e, "ssh_cmd"), \
                 patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"a different binary")), \
                 patch.object(e2e, "ignition_bootstrap_invocation", return_value=""):
-            image.return_value.host_prefix = prefix
             (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
 
             with self.assertRaises(SystemExit):
@@ -120,8 +116,6 @@ class TestReinstallPayload(unittest.TestCase):
         appearing here that the test does not know about is a change in what
         bootstrap installs, and it should stop the run rather than be skipped
         silently."""
-        prefix = "/opt/unbounded"
-
         def moved_binary(doc):
             doc["storage"]["files"][0]["path"] = "/somewhere/else/unbounded-agent"
 
@@ -138,9 +132,8 @@ class TestReinstallPayload(unittest.TestCase):
                     patch.object(e2e, "scp_cmd") as scp, patch.object(e2e, "ssh_cmd"), \
                     patch.object(e2e, "ssh_capture", return_value=self._installed_digest(b"test-binary")), \
                     patch.object(e2e, "ignition_bootstrap_invocation", return_value=""):
-                image.return_value.host_prefix = prefix
                 (Path(tmp) / "unbounded-agent").write_bytes(b"test-binary")
-                doc = self._doc(prefix, json.dumps({"HostPrefix": prefix}))
+                doc = self._doc(json.dumps({"MachineName": "agent-e2e"}))
                 change(doc)
 
                 with self.assertRaises(SystemExit):
@@ -167,7 +160,7 @@ class TestBootstrapChoosesThePath(unittest.TestCase):
         # fail on a machine that has nothing to do with this branch.
         image = e2e.HostImage(url="file:///x", file_name="x.qcow2", backing_format="qcow2",
                               sudo_group="sudo", packages=[], ssh_user="core",
-                              provisioning="ignition", host_prefix="/opt/unbounded")
+                              provisioning="ignition")
 
         with patch.object(e2e, "host_image", return_value=image), \
                 patch.object(e2e, "_ensure_vm_ssh_key", return_value="ssh-ed25519 AAAA"), \

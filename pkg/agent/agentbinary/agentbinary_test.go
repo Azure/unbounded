@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
@@ -195,7 +196,74 @@ func writeTestAgentArchive(w io.Writer, binary []byte) error {
 }
 
 func testAgentScript(version string, exitCode int) []byte {
-	return []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %s\nexit %d\n", posixShellQuote(version), exitCode))
+	return []byte(fmt.Sprintf("#!/bin/sh\n%sprintf '%%s\\n' %s\nexit %d\n", hostRootAnswer(hostroot.Resolve()), posixShellQuote(version), exitCode))
+}
+
+// hostRootAnswer is the start of a fake agent that answers host-root with
+// root. Verify asks every candidate, and a current agent answers with the root
+// this host resolves.
+func hostRootAnswer(root string) string {
+	return fmt.Sprintf("if [ \"$1\" = host-root ]; then printf '%%s\\n' %s; exit 0; fi\n", posixShellQuote(root))
+}
+
+// TestVerifyHostRoot covers the guard against activating an agent that looks
+// for its files somewhere other than where this host keeps them. An agent
+// released before the host root answers host-root with an error, because it
+// has no such command.
+func TestVerifyHostRoot(t *testing.T) {
+	t.Parallel()
+
+	const root = "/opt/unbounded"
+
+	tests := []struct {
+		name    string
+		script  string
+		root    string
+		wantErr string
+	}{
+		{name: "same root", script: hostRootAnswer(root) + "exit 1\n", root: root},
+		{name: "trailing whitespace is ignored", script: "printf '%s \\n\\n' " + root + "\n", root: root},
+		{name: "older agent", script: "echo unknown command >&2\nexit 1\n", root: root, wantErr: "predates the host root"},
+		{name: "different root", script: hostRootAnswer("/usr/local"), root: root, wantErr: "uses the host root /usr/local, but this host uses /opt/unbounded"},
+		{name: "empty answer", script: "exit 0\n", root: root, wantErr: "uses the host root , but"},
+		// Every agent finds the legacy root, so a migrated host accepts any
+		// candidate without asking it.
+		{name: "legacy root accepts an older agent", script: "exit 1\n", root: hostroot.LegacyPath},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "unbounded-agent")
+			require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+tt.script), 0o755))
+
+			err := verifyHostRoot(t.Context(), path, tt.root)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+// TestVerifyAsksTheCandidateForItsHostRoot pins that Verify runs the host-root
+// check, not only that the check works. An agent that passes version but has no
+// host-root is exactly an older release.
+func TestVerifyAsksTheCandidateForItsHostRoot(t *testing.T) {
+	t.Parallel()
+
+	if hostroot.Resolve() == hostroot.LegacyPath {
+		t.Skip("this host's root is linked to the legacy root, where every agent is accepted")
+	}
+
+	path := filepath.Join(t.TempDir(), "unbounded-agent")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n[ \"$1\" = version ]\n"), 0o755))
+
+	require.ErrorContains(t, Verify(t.Context(), path), "predates the host root")
 }
 
 func posixShellQuote(value string) string {

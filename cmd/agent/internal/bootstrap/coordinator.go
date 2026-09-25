@@ -26,17 +26,7 @@ const (
 	lockPollInterval = 250 * time.Millisecond
 )
 
-// Identity is what makes one installation distinguishable from another.
-//
-// HostPrefix is the resolved installation prefix. It is carried here so the
-// record written before the first host mutation knows where this installation
-// puts its files, which is the only thing teardown can consult after a
-// bootstrap that failed before the node started.
-type Identity struct {
-	MachineName       string
-	ConfigFingerprint string
-	HostPrefix        string
-}
+type Identity struct{ MachineName, ConfigFingerprint string }
 
 type Stages interface {
 	EnsureHostClean(context.Context) error
@@ -109,7 +99,7 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 			return Outcome{}, err
 		}
 
-		r, err = installstate.NewRecord(id.MachineName, id.ConfigFingerprint, id.HostPrefix)
+		r, err = installstate.NewRecord(id.MachineName, id.ConfigFingerprint)
 		if err != nil {
 			return Outcome{}, err
 		}

@@ -36,12 +36,12 @@ class TestHostImageSelection(unittest.TestCase):
         e2e.acl_image_from_manifest.cache_clear()
         clear_image_pin(self)
 
-    def test_conventional_hosts_use_cloud_init_and_the_default_prefix(self):
+    def test_conventional_hosts_use_cloud_init(self):
         """Every pre-existing host must keep the behavior it had.
 
-        The prefix and provisioning fields were added for one image. If they
-        changed the answer for any other, the change would show up as a
-        different install location on hosts that were working.
+        The provisioning field was added for one image. If it changed the
+        answer for any other, the change would show up as a different bootstrap
+        path on hosts that were working.
         """
         for base_os in ("ubuntu2404", "ubuntu2604", "fedora", "almalinux9",
                         "almalinux10", "centosstream9", "centosstream10"):
@@ -50,19 +50,17 @@ class TestHostImageSelection(unittest.TestCase):
                     image = e2e.host_image()
 
                 self.assertEqual(image.provisioning, "cloud-init")
-                self.assertEqual(image.host_prefix, "")
                 self.assertEqual(image.ssh_user, "ubuntu")
                 self.assertEqual(image.auth, "")
                 self.assertTrue(image.packages, "a host with a package manager installs prerequisites")
 
     def test_acl_declares_an_immutable_host(self):
-        """The four properties that make ACL different, asserted together.
+        """The properties that make ACL different, asserted together.
 
         They are not independent. Ignition provisioning is why there is no
-        package installation step, no package installation is why the image has
-        to carry the tools, and a read-only /usr is why the prefix moves. A
-        change to any one of them without the others describes a host that does
-        not exist.
+        package installation step, and no package installation is why the image
+        has to carry the tools. A change to one of them without the others
+        describes a host that does not exist.
         """
         with patch.dict(os.environ, {"HOST_IMAGE_PATH": __file__}):
             with patch.object(e2e, "HOST_BASE_OS", "acl"):
@@ -70,7 +68,6 @@ class TestHostImageSelection(unittest.TestCase):
 
         self.assertEqual(image.provisioning, "ignition")
         self.assertEqual(image.ssh_user, "core")
-        self.assertEqual(image.host_prefix, "/opt/unbounded")
         self.assertEqual(image.packages, [])
 
     def test_acl_from_the_manifest_carries_download_credentials(self):
@@ -94,11 +91,11 @@ class TestHostImageSelection(unittest.TestCase):
         self.assertEqual(image.url, TestACLImageResolution.MANIFEST["qcow2"]["url"])
 
         # The unresolved form names no blob. Resolving it reads the published
-        # manifest, and host_image is called for the ssh user and the prefix far
+        # manifest, and host_image is called for the ssh user and provisioning far
         # more often than for the image, including at import, so it must not
         # drag a network call along with it.
         self.assertEqual(unresolved.url, "")
-        self.assertEqual(unresolved.host_prefix, "/opt/unbounded")
+        self.assertEqual(unresolved.provisioning, "ignition")
 
     def test_a_local_image_needs_no_credentials(self):
         """HOST_IMAGE_PATH is the developer path and must not require an Azure
@@ -275,7 +272,7 @@ class TestAcquireHostImage(unittest.TestCase):
 
         return e2e.HostImage(url="https://example.test/acl.qcow2", file_name="acl-b.qcow2",
                              backing_format="qcow2", sudo_group="sudo", packages=[],
-                             ssh_user="core", provisioning="ignition", host_prefix="/opt/unbounded",
+                             ssh_user="core", provisioning="ignition",
                              sha256=hashlib.sha256(self.GOOD).hexdigest(), auth="")
 
     def _acquire(self, tmp, download_writes):

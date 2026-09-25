@@ -16,12 +16,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 func TestResetResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	t.Parallel()
 
-	taskName := resetResources(slog.New(slog.DiscardHandler), "").Name()
+	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
 
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))
@@ -35,7 +36,7 @@ func TestResetRetainsOwnershipUntilTeardownAndSyncSucceed(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-			r, err := installstate.NewRecord("machine", "f", "")
+			r, err := installstate.NewRecord("machine", "f")
 			require.NoError(t, err)
 
 			r.Phase = installstate.Resetting
@@ -128,7 +129,7 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	dir := t.TempDir()
 	store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
 
-	saved, err := installstate.NewRecord("machine-1", "fingerprint-1", "")
+	saved, err := installstate.NewRecord("machine-1", "fingerprint-1")
 	require.NoError(t, err)
 	require.NoError(t, store.Save(saved))
 
@@ -136,57 +137,6 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "machine-1", r.MachineName)
 	require.Equal(t, "fingerprint-1", r.ConfigFingerprint)
-}
-
-// TestBeginTeardownChoosesOnePrefix covers where reset gets its prefix. The
-// teardown and the sync of what it removed both use this value, so a record
-// that has no prefix must not leave one of them on the default.
-func TestBeginTeardownChoosesOnePrefix(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		record string // "" for none; otherwise a prefix, "legacy", or "unreadable"
-		want   string
-	}{
-		{name: "record prefix", record: "/opt/recorded", want: "/opt/recorded"},
-		{name: "record without a prefix", record: "legacy", want: "/opt/applied"},
-		{name: "no record", record: "", want: "/opt/applied"},
-		{name: "unreadable record", record: "unreadable", want: "/opt/applied"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			dir := t.TempDir()
-			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-
-			switch tt.record {
-			case "":
-			case "unreadable":
-				require.NoError(t, os.MkdirAll(store.Root(), 0o755))
-				require.NoError(t, os.WriteFile(filepath.Join(store.Root(), "install-state.json"), []byte("{"), 0o600))
-			case "legacy":
-				r, err := installstate.NewRecord("machine", "fingerprint", "")
-				require.NoError(t, err)
-				require.NoError(t, store.Save(r))
-			default:
-				r, err := installstate.NewRecord("machine", "fingerprint", tt.record)
-				require.NoError(t, err)
-				require.NoError(t, store.Save(r))
-			}
-
-			prefix, err := beginTeardown(discardLogger(), store, func() string { return "/opt/applied" })
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, prefix)
-
-			saved, err := store.Load()
-			require.NoError(t, err)
-			assert.Equal(t, installstate.Resetting, saved.Phase)
-			assert.Equal(t, tt.want, saved.HostPrefix, "a retried reset must find the same prefix")
-		})
-	}
 }
 
 // TestResetRemovesTheFirstBootUnitBeforeArtifacts pins that reset actually runs
@@ -200,7 +150,7 @@ func TestBeginTeardownChoosesOnePrefix(t *testing.T) {
 func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
 	t.Parallel()
 
-	taskName := resetResources(slog.New(slog.DiscardHandler), "").Name()
+	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
 
 	assert.Contains(t, taskName, "remove-first-boot-unit",
 		"reset must remove the Ignition bootstrap unit or the host re-bootstraps on next boot")
@@ -210,38 +160,19 @@ func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
 		"a failure here must stop the reset while the host is still recognizably installed")
 }
 
-// TestTeardownSyncPathsCoverEveryPrefix pins what a teardown makes durable.
+// TestTeardownSyncPathsCoverBothRoots pins what a teardown makes durable.
 //
-// Syncing a fixed /usr/local persisted the wrong filesystem on a host with a
-// configured prefix, so a crash during reset could leave files the teardown had
-// already removed still present on the next boot. Those are exactly the files
-// whose absence lets the host be provisioned again.
-//
-// The default is always included even when a prefix is set, because a host that
-// was reprovisioned under a different prefix still has the earlier layout.
-func TestTeardownSyncPathsCoverEveryPrefix(t *testing.T) {
+// A crash during reset could otherwise leave files the teardown had already
+// removed present on the next boot, and those are exactly the files whose
+// absence lets the host be provisioned again. On a migrated host they are under
+// the legacy root and the link to it is in /opt; on every host the installer
+// scripts are under the legacy root.
+func TestTeardownSyncPathsCoverBothRoots(t *testing.T) {
 	t.Parallel()
 
-	for name, tc := range map[string]struct {
-		prefix string
-		want   []string
-	}{
-		"no prefix recorded": {
-			prefix: "",
-			want:   []string{"/etc", "/var/lib/machines", "/usr/local", "/var/lib/unbounded"},
-		},
-		"configured prefix keeps the default too": {
-			prefix: "/opt/unbounded",
-			want:   []string{"/etc", "/var/lib/machines", "/opt/unbounded", "/usr/local", "/var/lib/unbounded"},
-		},
-		"explicit default is not duplicated": {
-			prefix: "/usr/local",
-			want:   []string{"/etc", "/var/lib/machines", "/usr/local", "/var/lib/unbounded"},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tc.want, teardownSyncPaths(tc.prefix, "/var/lib/unbounded"))
-		})
+	paths := teardownSyncPaths("/var/lib/unbounded")
+
+	for _, want := range []string{"/etc", "/var/lib/machines", "/opt", hostroot.Resolve(), "/usr/local", "/var/lib/unbounded"} {
+		assert.Contains(t, paths, want)
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 
@@ -65,11 +64,11 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
 
-	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
-	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
+	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
@@ -109,64 +108,21 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 	assert.Contains(t, results[0].Message, root)
 }
 
-// TestAgentInstallDirsFollowTheInstallationPrefix keeps the checked directory
-// tied to where the agent actually installs, so the two cannot drift apart.
-//
-// The prefix case is the one that matters. Preflight runs before anything is
-// written, and it refuses rather than warns, so checking a fixed /usr/local on
-// a host that configured a prefix reports a host that cannot be provisioned
-// when it can. On an immutable host that default is read-only, which means
-// bootstrap never starts at all and the reason given is a directory the agent
-// was never going to use.
-func TestAgentInstallDirsFollowTheInstallationPrefix(t *testing.T) {
+// TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
+// where the agent actually installs, so the two cannot drift apart.
+func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
 	t.Parallel()
 
-	for name, tc := range map[string]struct {
-		prefix string
-		want   string
-	}{
-		"unset prefix keeps the historical directory": {
-			prefix: "",
-			want:   filepath.Dir(goalstates.DaemonBinaryPath),
-		},
-		"configured prefix moves it": {
-			prefix: "/opt/unbounded",
-			want:   "/opt/unbounded/bin",
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			dirs := agentInstallDirs(tc.prefix)
-			assert.Len(t, dirs, 1)
-			assert.Equal(t, tc.want, dirs[0])
-		})
-	}
-}
-
-// TestCheckHostOSConfigurationProbesThePrefix is the end-to-end form: the check
-// must not fail a host whose prefix is writable merely because the default is
-// not. This is the failure that stopped an immutable host from bootstrapping.
-func TestCheckHostOSConfigurationProbesThePrefix(t *testing.T) {
-	t.Parallel()
-
-	deps := defaultHostCheckDeps()
-	deps.stat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-	deps.writeProbe = func(dir string) error {
-		if strings.HasPrefix(dir, "/usr") {
-			return errors.New("read-only file system")
-		}
-
-		return nil
+	if goalstates.PlannedHostPaths() != goalstates.ResolveHostPaths() {
+		t.Skip("this host has an agent installation that has not been migrated to the host root")
 	}
 
-	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
-		Check(context.Background())
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	require.NoError(t, err)
 
-	for _, result := range results {
-		assert.NotContains(t, result.Message, "/usr/local/bin",
-			"a prefixed host must not be probed at the default install directory")
-	}
+	dirs := agentInstallDirs()
+	assert.Len(t, dirs, 1)
+	assert.Equal(t, filepath.Dir(paths.BinaryPath), dirs[0])
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
@@ -174,9 +130,36 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps.stat = statNotExist()
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+// TestCheckExistingDeploymentFindsTheRecoveryScriptUnderEitherRoot covers a
+// host installed by an older release. Preflight does not migrate the host root,
+// so the recovery script is found under the legacy root, not through the new
+// one.
+func TestCheckExistingDeploymentFindsTheRecoveryScriptUnderEitherRoot(t *testing.T) {
+	t.Parallel()
+
+	for _, script := range []string{
+		goalstates.ResolveHostPaths().DaemonRecoveryScript,
+		"/usr/local/bin/unbounded-agent-daemon-recovery.sh",
+	} {
+		t.Run(script, func(t *testing.T) {
+			t.Parallel()
+
+			deps := defaultHostCheckDeps()
+			deps.stat = statOnlyExists(script)
+			deps.outputCmd = outputWith("", errors.New("not found"))
+
+			results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+			require.Len(t, results, 1)
+			assert.Equal(t, preflight.SeverityError, results[0].Severity)
+			assert.Contains(t, results[0].Message, script)
+		})
+	}
 }
 
 func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
@@ -190,7 +173,7 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 		return "", errors.New("not found")
 	}
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -205,7 +188,7 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	deps.stat = statOnlyExists("/var/lib/machines/kube1")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -220,7 +203,7 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps, "")
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "node reset is needed")
@@ -398,78 +381,4 @@ func outputWith(value string, err error) func(context.Context, *slog.Logger, str
 
 func readFileString(value string, err error) func(string) ([]byte, error) {
 	return func(string) ([]byte, error) { return []byte(value), err }
-}
-
-// TestCheckExistingDeploymentDetectsAPrefixedInstall is the safety property
-// this check exists for, on a host that configured a prefix.
-//
-// Bootstrap refuses to run on a host that already carries a deployment. While
-// the check looked only at the default prefix, a host installed under a
-// configured one looked clean, so bootstrap would provision straight over a
-// live install: two daemons, two sets of units, and an ownership record
-// describing only the second.
-func TestCheckExistingDeploymentDetectsAPrefixedInstall(t *testing.T) {
-	const installed = "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh"
-
-	deps := defaultHostCheckDeps()
-	deps.outputCmd = outputWith("", errors.New("not found"))
-	deps.stat = func(path string) (os.FileInfo, error) {
-		if path == installed {
-			return nil, nil //nolint:nilnil // Presence is all this check reads.
-		}
-
-		return nil, os.ErrNotExist
-	}
-
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
-		Check(context.Background())
-
-	require.Len(t, results, 1)
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Contains(t, results[0].Message, installed)
-}
-
-// TestCheckExistingDeploymentDetectsAnAbandonedPrefix covers the other
-// direction: the host is being bootstrapped with one prefix but still carries
-// files from an earlier install under the default. That is still a dirty host.
-func TestCheckExistingDeploymentDetectsAnAbandonedPrefix(t *testing.T) {
-	const leftover = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
-
-	deps := defaultHostCheckDeps()
-	deps.outputCmd = outputWith("", errors.New("not found"))
-	deps.stat = func(path string) (os.FileInfo, error) {
-		if path == leftover {
-			return nil, nil //nolint:nilnil // Presence is all this check reads.
-		}
-
-		return nil, os.ErrNotExist
-	}
-
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
-		Check(context.Background())
-
-	require.Len(t, results, 1)
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Contains(t, results[0].Message, leftover)
-}
-
-// TestDeprecatedPreflightEntryPointsKeepTheirSignatures pins the signatures
-// these had on main before the installation prefix existed, so callers outside
-// this repository keep compiling. The assignments fail to build if a signature
-// changes; the names show the wrappers still build the same checks.
-func TestDeprecatedPreflightEntryPointsKeepTheirSignatures(t *testing.T) {
-	t.Parallel()
-
-	//nolint:staticcheck // Exercising the deprecated entry points is the point.
-	var (
-		checkExisting func(*slog.Logger) preflight.Checker      = CheckExistingDeployment
-		ensureNoneYet func(context.Context, *slog.Logger) error = EnsureNoExistingDeployment
-		checkHostOS   func(*slog.Logger) preflight.Checker      = CheckHostOSConfiguration
-	)
-
-	log := slog.New(slog.DiscardHandler)
-
-	assert.Equal(t, CheckExistingDeploymentName, checkExisting(log).Name())
-	assert.Equal(t, checkHostOSConfigurationName, checkHostOS(log).Name())
-	assert.NotNil(t, ensureNoneYet)
 }

@@ -61,7 +61,7 @@ func TestStartupStandsDownWhileInstallationUnfinished(t *testing.T) {
 	t.Parallel()
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
 
-	record, err := installstate.NewRecord("machine-1", "fingerprint", "")
+	record, err := installstate.NewRecord("machine-1", "fingerprint")
 	require.NoError(t, err)
 	require.NoError(t, store.Save(record))
 

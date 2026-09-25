@@ -15,31 +15,13 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-type ensureNSpawnLifecycleHelper struct {
-	targetPath string
-}
+type ensureNSpawnLifecycleHelper struct{}
 
-// EnsureNSpawnLifecycleHelper installs the lifecycle helper at its path under
-// the default installation prefix.
-//
-// Deprecated: use EnsureNSpawnLifecycleHelperAt with the path from the nspawn
-// goal state. The generated hook units name that path, so installing the
-// helper anywhere else leaves hooks that fail at machine start.
+// EnsureNSpawnLifecycleHelper installs a rollback-stable lifecycle command helper.
+// Agent rollback changes the daemon's current symlink but leaves this helper in
+// place so already-generated nspawn hooks remain executable.
 func EnsureNSpawnLifecycleHelper() phases.Task {
-	return EnsureNSpawnLifecycleHelperAt(goalstates.NSpawnLifecycleBinaryPath)
-}
-
-// EnsureNSpawnLifecycleHelperAt installs a rollback-stable lifecycle command
-// helper at targetPath. Agent rollback changes the daemon's current symlink but
-// leaves this helper in place so already-generated nspawn hooks remain
-// executable.
-//
-// The path is a parameter rather than a constant because it lives under the
-// installation prefix, and the generated hook units name the same value. A
-// helper installed under one prefix and referenced under another leaves hooks
-// that fail at machine start, which is not observable until then.
-func EnsureNSpawnLifecycleHelperAt(targetPath string) phases.Task {
-	return &ensureNSpawnLifecycleHelper{targetPath: targetPath}
+	return &ensureNSpawnLifecycleHelper{}
 }
 
 func (e *ensureNSpawnLifecycleHelper) Name() string { return "ensure-nspawn-lifecycle-helper" }
@@ -50,7 +32,7 @@ func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
 		return fmt.Errorf("resolve running agent executable: %w", err)
 	}
 
-	return installNSpawnLifecycleHelper(sourcePath, e.targetPath)
+	return installNSpawnLifecycleHelper(sourcePath, goalstates.ResolveHostPaths().NSpawnLifecycleBinary)
 }
 
 func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) {

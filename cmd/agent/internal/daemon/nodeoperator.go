@@ -195,7 +195,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 
 	if err := phases.Serial(
 		log,
-		rootfs.EnsureNSpawnLifecycleHelperAt(rootFS.NSpawnLifecycleBinary),
+		rootfs.EnsureNSpawnLifecycleHelper(),
 		rootfs.EnsureNSpawnConfig(log, rootFS),
 	).Do(ctx); err != nil {
 		return fmt.Errorf("write existing machine lifecycle: %w", err)
@@ -235,9 +235,7 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 
 func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Logger) error {
 	// The MachineOperation holds installation ownership through daemon stop.
-	return resetUnderLock(ctx, log, installstate.DefaultStore(), func(prefix string) phases.Task {
-		return resetResources(log, prefix)
-	})
+	return resetUnderLock(ctx, log, installstate.DefaultStore(), resetResources(log))
 }
 
 func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
@@ -275,7 +273,7 @@ func (nspawnNodeOperator) RepaveNode(
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
-		reset.CleanupNetwork(log, newCfg.HostPrefix),
+		reset.CleanupNetwork(log),
 		nodestart.StartNode(log, gs.NodeStart),
 		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -32,6 +33,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -127,11 +129,6 @@ type manualBootstrapHandler struct {
 	// agentHash is agentSHA256 in Ignition's form, set by validate for the
 	// ignition variant.
 	agentHash string
-
-	// hostPrefix is the installation prefix for the agent's own host-side
-	// files. Required by the ignition variant, whose target hosts mount /usr
-	// read-only.
-	hostPrefix string
 
 	// agentBaseURL overrides the base URL used to construct the download URL
 	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
@@ -382,13 +379,6 @@ func parseAdditionalHostDevice(value string) (string, error) {
 // detect an architecture, or extract an archive at boot, so the artifact has to
 // be named exactly, and a host that finds out otherwise has no way to report it.
 func (h *manualBootstrapHandler) validateIgnitionInput() (string, error) {
-	// Ignition writes the binary itself, so an unset prefix would place it
-	// under the default /usr/local and fail at first boot on exactly the
-	// immutable hosts this variant exists to serve.
-	if isEmpty(h.hostPrefix) {
-		return "", fmt.Errorf("--host-prefix is required with --variant %s: Ignition places the agent binary itself, and the default prefix /usr/local is read-only on immutable hosts", variantIgnition)
-	}
-
 	source := strings.TrimSpace(h.agentURL)
 	if source == "" {
 		return "", fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
@@ -426,14 +416,6 @@ func (h *manualBootstrapHandler) validate() error {
 		}
 
 		h.agentHash = hash
-	}
-
-	// Rejected here rather than on the host. The prefix is interpolated into
-	// generated systemd units and into a shell script, neither of which quotes
-	// it, and a value that breaks those does so on a machine with no operator
-	// watching and no way to report it.
-	if err := config.ValidateHostPrefix(h.hostPrefix); err != nil {
-		return fmt.Errorf("invalid host prefix: %w", err)
 	}
 
 	// The machine name is optional. When omitted, the unbounded-agent resolves
@@ -570,11 +552,6 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
 
-	// Carried in the config rather than only in the generated output, because
-	// the agent re-reads it long after bootstrap: the daemon and the nspawn
-	// lifecycle hooks are started by systemd and cannot inherit it from the
-	// environment that provisioned the host.
-	cfg.HostPrefix = strings.TrimSpace(h.hostPrefix)
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
 	}
@@ -648,21 +625,11 @@ func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDo
 // installEnv returns the KEY=VALUE pairs that should be exported before the
 // embedded install script runs. Only non-empty overrides are included.
 func (h *manualBootstrapHandler) installEnv() []string {
-	env := provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
+	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
 		Version: h.agentVersion,
 		BaseURL: h.agentBaseURL,
 		URL:     h.agentURL,
 	})
-
-	// The prefix is added here rather than in AgentInstallEnv because it comes
-	// from the agent config, not the agent spec. The Machine CR has no prefix
-	// field, so the controller-driven paths that share AgentInstallEnv have
-	// none to pass and correctly keep the default.
-	if prefix := strings.TrimSpace(h.hostPrefix); prefix != "" {
-		env = append(env, "AGENT_PREFIX="+provision.ShellSingleQuote(prefix))
-	}
-
-	return env
 }
 
 // machineNameDisplay returns the value rendered into the comment header of the
@@ -818,7 +785,6 @@ Examples:
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
 	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url). With --variant ignition this must name the bare binary, not the tarball")
 	cmd.Flags().StringVar(&handler.agentSHA256, "agent-sha256", "", "SHA-256 digest of the agent binary, published in checksums.txt. Required with --variant ignition")
-	cmd.Flags().StringVar(&handler.hostPrefix, "host-prefix", "", "Installation prefix for the agent's own host-side files. Required with --variant ignition, whose target hosts mount /usr read-only")
 	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
 
 	// Rootfs binary download overrides. See `kubectl unbounded machine register --help`
@@ -934,7 +900,7 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 		Ignition: ignitionVersion{Version: ignitionSpecVersion},
 		Storage: &ignitionStorage{
 			Directories: []ignitionDirectory{{
-				Path: ignitionAgentBinDir(cfg),
+				Path: ignitionAgentBinDir(),
 				Mode: ignitionModeDir,
 			}},
 			Files: []ignitionFile{
@@ -963,17 +929,17 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 }
 
 // ignitionAgentBinDir returns the directory the agent binary is placed in,
-// derived from the configured host prefix so that a host with a read-only /usr
-// puts it somewhere writable.
-func ignitionAgentBinDir(cfg *provision.UnboundedAgentConfig) string {
-	return goalstates.ResolveHostPaths(cfg.HostPrefix).BinDir
+// under the host root. It is not resolved: this runs on the workstation, and
+// the host is a new installation whose host root is a real directory.
+func ignitionAgentBinDir() string {
+	return path.Join(hostroot.Path, "bin")
 }
 
 // ignitionAgentBinaryFile fetches the agent binary straight to its final
 // location, verified against the digest validate parsed.
 func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.UnboundedAgentConfig) ignitionFile {
 	return ignitionFile{
-		Path:      ignitionAgentBinDir(cfg) + "/" + ignitionAgentBinaryName,
+		Path:      ignitionAgentBinDir() + "/" + ignitionAgentBinaryName,
 		Mode:      ignitionModeScript,
 		Overwrite: ptr.To(true),
 		Contents: ignitionContents{
@@ -1002,7 +968,7 @@ func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.Unbounde
 // cost is two short-lived processes per boot, and the benefit is that a node
 // whose daemon was stopped or damaged comes back on reboot.
 func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.UnboundedAgentConfig) string {
-	binary := ignitionAgentBinDir(cfg) + "/" + ignitionAgentBinaryName
+	binary := ignitionAgentBinDir() + "/" + ignitionAgentBinaryName
 
 	var b strings.Builder
 

@@ -122,7 +122,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
-	signals, err := newAgentUpgradeSignalOperator(t.log)
+	signals, err := newAgentUpgradeSignalOperator()
 	if err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
@@ -191,7 +191,7 @@ func finishFailedMachineOperation(ctx context.Context, store daemon.MachineOpera
 }
 
 func publishAndClearAgentUpgradeSignals(ctx context.Context, log *slog.Logger, c client.Client) error {
-	signals, err := newAgentUpgradeSignalOperator(log)
+	signals, err := newAgentUpgradeSignalOperator()
 	if err != nil {
 		return err
 	}

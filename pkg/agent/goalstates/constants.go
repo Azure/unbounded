@@ -39,13 +39,25 @@ const (
 	// had been reset, which re-bootstraps it on the next boot.
 	FirstBootBootstrapUnit = "unbounded-agent-bootstrap.service"
 
-	DaemonBinaryPath             = "/usr/local/bin/unbounded-agent"
-	DaemonBinaryBluePath         = "/usr/local/bin/unbounded-agent-blue"
-	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
-	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
-	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
-	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
-	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+	// The agent's host-side files under hostroot.LegacyPath, where agents
+	// released before hostroot.Path installed them.
+	//
+	// Deprecated: on hosts installed since, these files are elsewhere. Use
+	// ResolvedAgentUpgradePaths and ResolveHostPaths, which follow the host root.
+	DaemonBinaryPath = "/usr/local/bin/unbounded-agent"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryBluePath = "/usr/local/bin/unbounded-agent-blue"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryGreenPath = "/usr/local/bin/unbounded-agent-green"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryCurrentPath = "/usr/local/bin/unbounded-agent-current"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
+	// Deprecated: use ResolveHostPaths.
+	NSpawnLifecycleBinaryPath = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
+	// Deprecated: use ResolveHostPaths.
+	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 
@@ -98,13 +110,7 @@ func ConfigRegenerationUnit(machineName string) string {
 // AppliedConfigPath returns the path to the applied config file for the
 // given nspawn machine name, e.g. /etc/unbounded/agent/kube1-applied-config.json.
 func AppliedConfigPath(machineName string) string {
-	return appliedConfigPathIn(AgentConfigDir, machineName)
-}
-
-// appliedConfigPathIn takes the config directory so readers can be pointed at a
-// temporary one in tests. The filename shape is defined here only.
-func appliedConfigPathIn(configDir, machineName string) string {
-	return fmt.Sprintf("%s/%s-applied-config.json", configDir, machineName)
+	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }
 
 // ContainerImageArchivePath returns the path inside the nspawn machine where a

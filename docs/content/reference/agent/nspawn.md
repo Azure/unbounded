@@ -191,7 +191,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
-| Rollback-stable lifecycle helper | `/usr/local/bin/unbounded-agent-nspawn-lifecycle` |
+| Rollback-stable lifecycle helper | `/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle` |
 
 ### Customization points
 
@@ -346,7 +346,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
-| `/usr/local/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. |
+| `/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. On a host installed by an earlier release, `/opt/unbounded` is a link to `/usr/local`. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

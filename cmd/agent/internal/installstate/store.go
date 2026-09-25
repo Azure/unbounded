@@ -52,21 +52,6 @@ type Record struct {
 	MachineName       string `json:"machineName"`
 	ConfigFingerprint string `json:"configFingerprint"`
 	Phase             Phase  `json:"phase"`
-
-	// HostPrefix is the resolved installation prefix, recorded so teardown can
-	// find the agent's own files without being told where they are.
-	//
-	// It is written before the first host mutation, which makes it the only
-	// source that survives a bootstrap that failed before the node started. The
-	// applied config carries the same prefix but does not exist until then, so
-	// reset on a half-built host has nothing else to go on.
-	//
-	// Optional, and absent means the default. The schema version does not move
-	// for it: a record written by an agent that knows about the prefix stays
-	// readable by one that does not, because unknown fields are ignored, and a
-	// record written before it existed is read here as the default, which is
-	// what such a host actually has on disk.
-	HostPrefix string `json:"hostPrefix,omitempty"`
 }
 
 func (r Record) Validate() error {
@@ -172,16 +157,7 @@ func (s *Store) Remove() error {
 	return err
 }
 
-// NewRecord returns a record for a fresh installation.
-//
-// hostPrefix is a parameter rather than a field callers set afterwards because
-// forgetting it is silent and only surfaces at teardown, on a host whose files
-// are somewhere reset would not look. An empty prefix means the default.
-//
-// The value is stored as given and not validated here. This package deals in
-// stdlib and durability only, and pulling in config validation to re-check a
-// string this agent wrote from an already validated config would buy little.
-func NewRecord(machine, fingerprint, hostPrefix string) (Record, error) {
+func NewRecord(machine, fingerprint string) (Record, error) {
 	id := make([]byte, 16)
 	if _, err := rand.Read(id); err != nil {
 		return Record{}, err
@@ -189,7 +165,7 @@ func NewRecord(machine, fingerprint, hostPrefix string) (Record, error) {
 
 	return Record{
 		SchemaVersion: schemaVersion, InstallID: hex.EncodeToString(id), MachineName: machine,
-		ConfigFingerprint: fingerprint, Phase: Installing, HostPrefix: hostPrefix,
+		ConfigFingerprint: fingerprint, Phase: Installing,
 	}, nil
 }
 

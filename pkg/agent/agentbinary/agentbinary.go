@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
@@ -116,7 +118,8 @@ func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, erro
 	return paths.BluePath, nil
 }
 
-// Verify runs the installed agent binary's version command.
+// Verify runs the installed agent binary's version command, and checks that it
+// uses the same host root as this agent.
 func Verify(ctx context.Context, path string) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
 	defer cancel()
@@ -124,7 +127,7 @@ func Verify(ctx context.Context, path string) error {
 	for {
 		err := exec.CommandContext(verifyCtx, path, "version").Run()
 		if err == nil {
-			return nil
+			return verifyHostRoot(verifyCtx, path, hostroot.Resolve())
 		}
 
 		if errors.Is(err, syscall.ETXTBSY) {
@@ -138,4 +141,26 @@ func Verify(ctx context.Context, path string) error {
 
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
+}
+
+// verifyHostRoot refuses an agent that would look for its files somewhere
+// other than root. An agent released before the host root looks under the
+// legacy root, so on a host installed under the new one it would find nothing,
+// and on a writable /usr it would start a second layout there. On a host that
+// still uses the legacy root there is nothing to check: every agent finds it.
+func verifyHostRoot(ctx context.Context, path, root string) error {
+	if root == hostroot.LegacyPath {
+		return nil
+	}
+
+	out, err := exec.CommandContext(ctx, path, "host-root").Output()
+	if err != nil {
+		return fmt.Errorf("verify agent binary %s: it predates the host root %s and cannot run on this host: %w", path, root, err)
+	}
+
+	if got := strings.TrimSpace(string(out)); got != root {
+		return fmt.Errorf("verify agent binary %s: it uses the host root %s, but this host uses %s", path, got, root)
+	}
+
+	return nil
 }

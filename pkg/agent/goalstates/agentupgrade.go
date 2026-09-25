@@ -22,32 +22,25 @@ type AgentUpgradePaths struct {
 	CurrentTargetPath string
 }
 
-// ResolvedAgentUpgradePaths returns the host-side agent binary paths after
-// applying environment overrides.
+// ResolvedAgentUpgradePaths returns the host-side agent binary paths under the
+// resolved host root, after applying environment overrides. Overrides name a
+// specific file and so take precedence over the root.
 //
-// Deprecated: use ResolvedAgentUpgradePathsFor, which resolves the binaries
-// under a configured installation prefix. This entry point is equivalent to
-// passing an empty prefix and is kept for callers outside this repository.
+// The AgentUpgrade signal path is not under the host root. It is state about
+// an upgrade rather than part of the installed layout, and lives in the agent
+// config directory.
 func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
-	return ResolvedAgentUpgradePathsFor("")
+	return agentUpgradePathsIn(ResolveHostPaths().BinDir)
 }
 
-// ResolvedAgentUpgradePathsFor returns the host-side agent binary paths under an
-// installation prefix, after applying environment overrides.
-//
-// An empty prefix selects DefaultHostPrefix, so a host that does not configure
-// one resolves exactly the paths this package has always used.
-//
-// Environment overrides are absolute and win over the prefix. They name a
-// specific file, which is more particular than a directory to look in, and the
-// nspawn lifecycle hooks rely on that to pin a binary across an upgrade.
-//
-// The AgentUpgrade signal path is deliberately not prefixed. It lives under the
-// agent config directory rather than the installation prefix, because it is
-// state about an upgrade rather than part of the installed layout.
-func ResolvedAgentUpgradePathsFor(prefix string) (AgentUpgradePaths, error) {
-	binDir := ResolveHostPaths(prefix).BinDir
+// PlannedAgentUpgradePaths returns the paths ResolvedAgentUpgradePaths will
+// return once the host root is migrated, without migrating it; see
+// PlannedHostPaths.
+func PlannedAgentUpgradePaths() (AgentUpgradePaths, error) {
+	return agentUpgradePathsIn(PlannedHostPaths().BinDir)
+}
 
+func agentUpgradePathsIn(binDir string) (AgentUpgradePaths, error) {
 	paths := AgentUpgradePaths{
 		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, daemonBinaryName)),
 		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, daemonBinaryBlueName)),

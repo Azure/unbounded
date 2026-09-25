@@ -45,24 +45,22 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.Contains(t, script, "preflight ${_START_ARGS}")
 	require.Contains(t, script, "0|false|no|FALSE|NO|False|No")
 
-	// The installer must place the agent binary itself. The agent version is
-	// selected independently of this script, including the default of tracking
-	// the latest published release, so an installer that relies on the agent to
-	// install its own binary breaks every agent released before that behavior
-	// existed. The uninstall script removes this same path.
-	//
-	// The target follows the agent's own installation prefix. Staging it under
-	// a fixed /usr/local put it where the agent does not look, and on a host
-	// that mounts /usr read-only the install failed before the agent ran at
-	// all. The default preserves the historical path for every host that sets
-	// no prefix.
-	require.Contains(t, script, `AGENT_PREFIX="${AGENT_PREFIX:-/usr/local}"`)
-	require.Contains(t, script, `AGENT_BIN_TARGET="${AGENT_PREFIX}/bin/unbounded-agent"`)
-	require.NotContains(t, script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	// The installer must place the agent binary itself for an agent released
+	// before the host root. The agent version is selected independently of this
+	// script, including the default of tracking the latest published release,
+	// and such an agent never installs its own binary and looks for it at
+	// /usr/local/bin.
+	require.Contains(t, script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	require.Contains(t, script, `install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"`)
 
-	// -D creates the prefix's bin directory, which a configured prefix will
-	// not already have.
-	require.Contains(t, script, `install -D -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"`)
+	// Only for such an agent. One that answers host-root installs itself under
+	// the host root, and a binary seeded at /usr/local/bin would make the fresh
+	// host look like one installed by an older agent, which it migrates as one.
+	require.Contains(t, script, `if ! "${AGENT_BIN}" host-root >/dev/null 2>&1; then`)
+	require.Less(t,
+		strings.Index(script, `if ! "${AGENT_BIN}" host-root`),
+		strings.Index(script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`),
+		"the seeding must be inside the host-root check")
 
 	// It must not clobber a live binary. The test follows symlinks so a host
 	// this installation already owns resolves through the compatibility symlink

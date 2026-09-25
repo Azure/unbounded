@@ -4,7 +4,6 @@
 package installstate
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -26,7 +25,7 @@ func TestStoreLifecycle(t *testing.T) {
 	require.NoError(t, s.Remove())
 	_, err := s.Load()
 	require.ErrorIs(t, err, ErrNotFound)
-	r, err := NewRecord("machine", Fingerprint([]byte(`{"machineName":"machine"}`)), "")
+	r, err := NewRecord("machine", Fingerprint([]byte(`{"machineName":"machine"}`)))
 	require.NoError(t, err)
 	require.NoError(t, s.Save(r))
 	loaded, err := s.Load()
@@ -48,7 +47,7 @@ func TestStoreLifecycle(t *testing.T) {
 func TestOwnershipAdmission(t *testing.T) {
 	t.Parallel()
 
-	r, err := NewRecord("machine", "fingerprint", "")
+	r, err := NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 
 	for _, phase := range []Phase{Installing, Complete, Resetting} {
@@ -105,7 +104,7 @@ func TestInstallationLockSurvivesStateRemoval(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, lock.Release()) })
 
-	r, err := NewRecord("machine", "f", "")
+	r, err := NewRecord("machine", "f")
 	require.NoError(t, err)
 	require.NoError(t, s.Save(r))
 	require.NoError(t, s.Remove())
@@ -126,7 +125,7 @@ func TestRemoveRestoresOwnershipWhenUndurable(t *testing.T) {
 	t.Parallel()
 
 	s := testStore(t)
-	r, err := NewRecord("machine", "f", "")
+	r, err := NewRecord("machine", "f")
 	require.NoError(t, err)
 
 	r.Phase = Resetting
@@ -177,7 +176,7 @@ func TestMutationAdmission(t *testing.T) {
 			s := testStore(t)
 
 			if phase != "" {
-				r, err := NewRecord("machine", "f", "")
+				r, err := NewRecord("machine", "f")
 				require.NoError(t, err)
 
 				r.Phase = phase
@@ -227,46 +226,4 @@ func TestStoreIgnoresUnknownFields(t *testing.T) {
 	disposition, err := decide(r, nil, "machine", "f")
 	require.NoError(t, err)
 	require.Equal(t, Resume, disposition, "the record must still be usable, not merely parseable")
-}
-
-// TestRecordCarriesTheInstallationPrefix covers what the prefix is recorded
-// for: teardown on a host where bootstrap failed before the node started.
-//
-// The applied config carries the same value but does not exist until the node
-// runs, so on a half-built host this record is the only thing that knows where
-// the agent put its files.
-//
-// Bootstrap records the resolved prefix, never the configured one, so a host
-// that sets nothing records /usr/local explicitly rather than an empty string
-// meaning "wherever the default was at the time". Teardown then has a real
-// directory instead of something to infer.
-func TestRecordCarriesTheInstallationPrefix(t *testing.T) {
-	t.Parallel()
-
-	s := testStore(t)
-
-	prefixed, err := NewRecord("machine", "f", "/opt/unbounded")
-	require.NoError(t, err)
-	require.NoError(t, s.Save(prefixed))
-
-	loaded, err := s.Load()
-	require.NoError(t, err)
-	require.Equal(t, "/opt/unbounded", loaded.HostPrefix)
-	require.NoError(t, loaded.Validate())
-
-	// An empty prefix is not a location, so it is omitted rather than written
-	// as "". Bootstrap never passes one, because it resolves first; this covers
-	// the direct callers of NewRecord, for whom a recorded empty string would
-	// read as a prefix that had been chosen.
-	//
-	// Readability across versions is not what this is protecting: records are
-	// decoded without DisallowUnknownFields, so an agent that predates the
-	// field ignores it either way. TestStoreIgnoresUnknownFields pins that.
-	def, err := NewRecord("machine", "f", "")
-	require.NoError(t, err)
-
-	encoded, err := json.Marshal(def)
-	require.NoError(t, err)
-	require.NotContains(t, string(encoded), "hostPrefix",
-		"an unset prefix is absent, not an empty string that reads as a choice")
 }

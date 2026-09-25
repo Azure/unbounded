@@ -102,6 +102,12 @@ func (o *runOptions) validate() error {
 // machine, builds a Kubernetes client, registers the Machine CR if needed,
 // and blocks until the context is canceled.
 func Run(ctx context.Context, log *slog.Logger) error {
+	// After an AgentUpgrade from a release that predates the host root, this is
+	// the first time the new agent runs on the host.
+	if err := MigrateHostRoot(log); err != nil {
+		return err
+	}
+
 	return run(ctx, log, runOptions{})
 }
 

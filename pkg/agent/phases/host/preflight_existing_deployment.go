@@ -20,26 +20,16 @@ import (
 // resumed installation intentionally skips.
 const CheckExistingDeploymentName = "existing-deployment"
 
-// CheckExistingDeployment verifies the host does not already contain node
-// deployment artifacts, assuming the default installation prefix.
-//
-// Deprecated: use CheckExistingDeploymentFor, which also checks the configured
-// installation prefix.
+// CheckExistingDeployment verifies the host does not already contain
+// node deployment artifacts. Bootstrap must start from a clean host;
+// otherwise partial state from a prior run can be reused accidentally.
 func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
-	return CheckExistingDeploymentFor(log, "")
+	return checkExistingDeployment(log, defaultHostCheckDeps())
 }
 
-// CheckExistingDeploymentFor verifies the host does not already contain node
-// deployment artifacts. Bootstrap must start from a clean host; otherwise
-// partial state from a prior run can be reused accidentally. Artifacts are
-// looked for under the given installation prefix and under the default.
-func CheckExistingDeploymentFor(log *slog.Logger, prefix string) preflight.Checker {
-	return checkExistingDeployment(log, defaultHostCheckDeps(), prefix)
-}
-
-func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps, prefix string) preflight.Checker {
+func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: CheckExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
-		results := existingDeploymentResults(ctx, log, deps, prefix)
+		results := existingDeploymentResults(ctx, log, deps)
 		if len(results) > 0 {
 			return results
 		}
@@ -53,23 +43,14 @@ func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps, prefix string
 }
 
 // EnsureNoExistingDeployment returns an error when the host already contains
-// node deployment artifacts, assuming the default installation prefix.
-//
-// Deprecated: use EnsureNoExistingDeploymentFor, which also checks the
-// configured installation prefix.
+// node deployment artifacts. It is used by start before any
+// bootstrap task mutates host state.
 func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger) error {
-	return EnsureNoExistingDeploymentFor(ctx, log, "")
+	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps())
 }
 
-// EnsureNoExistingDeploymentFor returns an error when the host already contains
-// node deployment artifacts under the given installation prefix or the default.
-// It is used by start before any bootstrap task mutates host state.
-func EnsureNoExistingDeploymentFor(ctx context.Context, log *slog.Logger, prefix string) error {
-	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps(), prefix)
-}
-
-func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps hostCheckDeps, prefix string) error {
-	results := existingDeploymentResults(ctx, log, deps, prefix)
+func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps hostCheckDeps) error {
+	results := existingDeploymentResults(ctx, log, deps)
 	if len(results) == 0 {
 		return nil
 	}
@@ -90,7 +71,7 @@ func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps host
 	)
 }
 
-func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostCheckDeps, prefix string) []preflight.Result {
+func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostCheckDeps) []preflight.Result {
 	var results []preflight.Result
 
 	for _, machineName := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
@@ -109,7 +90,7 @@ func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostC
 		}
 	}
 
-	for _, artifact := range existingDeploymentHostArtifacts(prefix) {
+	for _, artifact := range existingDeploymentHostArtifacts() {
 		results = appendExistingDeploymentArtifactResult(results, deps, artifact)
 	}
 
@@ -149,12 +130,10 @@ func existingDeploymentMachineArtifacts(machineName string) []existingDeployment
 // existingDeploymentHostArtifacts returns the host files whose presence means
 // this host already carries a deployment.
 //
-// The recovery script is looked for under every prefix the host might hold one
-// under, not just the configured one. A host provisioned under a different
-// prefix is still a dirty host, and checking only the configured prefix would
-// let bootstrap run on top of one, which is the state this check exists to
-// refuse.
-func existingDeploymentHostArtifacts(prefix string) []existingDeploymentArtifact {
+// The recovery script is looked for under the legacy root as well as the host
+// root. Preflight does not migrate, so on a host installed by an older agent
+// the host root does not yet lead to its files.
+func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
 	artifacts := []existingDeploymentArtifact{
 		{
 			description: "agent daemon unit",
@@ -166,10 +145,15 @@ func existingDeploymentHostArtifacts(prefix string) []existingDeploymentArtifact
 		},
 	}
 
-	for _, candidate := range goalstates.MergeHostPrefixes(prefix) {
+	scripts := []string{goalstates.ResolveHostPaths().DaemonRecoveryScript}
+	if legacy := goalstates.LegacyHostPaths().DaemonRecoveryScript; legacy != scripts[0] {
+		scripts = append(scripts, legacy)
+	}
+
+	for _, script := range scripts {
 		artifacts = append(artifacts, existingDeploymentArtifact{
 			description: "agent daemon recovery script",
-			path:        goalstates.ResolveHostPaths(candidate).DaemonRecoveryScript,
+			path:        script,
 		})
 	}
 

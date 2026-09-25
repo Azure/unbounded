@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -64,56 +65,20 @@ func canonicalImageIdentity(image string) string {
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
 	// Keep identity tied to the cluster and installed rootfs, while allowing
 	// credentials and artifact locations to be refreshed for a retry.
-	//
-	// HostPrefix enters the hash only when it resolves somewhere other than the
-	// default, and carries omitempty so that at the default it contributes
-	// nothing at all. Every host already in the field was fingerprinted without
-	// this input; if the default hashed as a value, each of them would read as a
-	// different installation and demand an explicit reset on upgrade, for a
-	// field they never set. TestBootstrapV1CompatibilityFixtures catches that.
-	//
-	// It is the resolved prefix that matters, not how it was written. Leaving it
-	// unset and naming /usr/local explicitly put the files in the same place, so
-	// they are the same installation and must hash alike.
-	//
-	// A prefix that resolves elsewhere does belong in the identity. The agent's
-	// own files live under it, so starting with a different one is not a retry:
-	// it would leave the first installation behind and build a second one
-	// beside it.
-	resolvedPrefix := goalstates.HostPrefixOrDefault(cfg.HostPrefix)
-
-	fingerprintedPrefix := resolvedPrefix
-	if fingerprintedPrefix == goalstates.DefaultHostPrefix {
-		fingerprintedPrefix = ""
-	}
-
 	data, err := json.Marshal(struct {
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-		HostPrefix        string `json:",omitempty"`
-	}{
-		strings.TrimPrefix(cfg.Cluster.Version, "v"),
-		canonicalImageIdentity(cfg.OCIImage),
-		cfg.Kubelet.ApiServer,
-		fingerprintedPrefix,
-	})
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
 
-	return bootstrap.Identity{
-		MachineName:       cfg.MachineName,
-		ConfigFingerprint: installstate.Fingerprint(data),
-		// Resolved rather than configured, so the record names a real directory
-		// instead of an empty string meaning "wherever the default was at the
-		// time", which is what teardown would have to guess from.
-		HostPrefix: resolvedPrefix,
-	}, nil
+	return bootstrap.Identity{MachineName: cfg.MachineName, ConfigFingerprint: installstate.Fingerprint(data)}, nil
 }
 
 func (s *agentStages) EnsureHostClean(ctx context.Context) error {
-	return host.EnsureNoExistingDeploymentFor(ctx, s.log, s.cfg.HostPrefix)
+	return host.EnsureNoExistingDeployment(ctx, s.log)
 }
 
 func (s *agentStages) ResolveInputs(ctx context.Context) error {
@@ -132,19 +97,12 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 	return nil
 }
 
-// hostPrefix returns the directory the agent's own host-side files are written
-// under, which is the filesystem each stage has to sync to make them durable.
-//
-// Syncing a fixed /usr/local persisted the wrong filesystem on a host with a
-// configured prefix: the files had just been written somewhere else, so a crash
-// before the kernel flushed could lose exactly the work the sync was meant to
-// protect. Where the agent writes and where it syncs have to be the same place.
-func (s *agentStages) hostPrefix() string {
-	return goalstates.HostPrefixOrDefault(s.cfg.HostPrefix)
-}
-
 func (s *agentStages) PrepareHost(ctx context.Context) error {
-	if err := daemon.InstallBootstrapBinary(s.cfg.HostPrefix); err != nil {
+	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
+		return err
+	}
+
+	if err := daemon.InstallBootstrapBinary(); err != nil {
 		return err
 	}
 
@@ -154,7 +112,7 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/etc", s.hostPrefix(), installstate.DefaultDirectory)
+	return fsutil.SyncFilesystems("/etc", hostroot.Resolve(), installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -219,7 +177,7 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, s.hostPrefix(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, hostroot.Resolve(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
 // nodeStartTask composes the work that brings the node up.
@@ -286,7 +244,7 @@ func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems(s.hostPrefix(), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(hostroot.Resolve(), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) VerifyInstalled(ctx context.Context) error {

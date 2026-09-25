@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"text/template"
@@ -35,35 +36,30 @@ type hostAgentUpgradeHandler struct {
 	writer       io.Writer
 	executable   func() (string, error)
 	resolvedPath func() (goalstates.AgentUpgradePaths, error)
+	// plannedPath resolves the paths for preflight, which does not migrate
+	// the host root. Unset, preflight uses resolvedPath.
+	plannedPath  func() (goalstates.AgentUpgradePaths, error)
 	newService   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService
 	geteuid      func() int
 	installation *installstate.Store
+	// migrate links the host root on a legacy host before paths are resolved.
+	// Preflight leaves the host alone and does not call it.
+	migrate func(*slog.Logger) error
 }
 
 func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx:     cmdCtx,
-		writer:     os.Stdout,
-		executable: os.Executable,
-		// Wrapped rather than referenced directly so the prefix is read when
-		// the command runs, not when it is constructed. This runs on the host
-		// rather than under systemd, but the applied config is still the
-		// authority: the prefix belongs to the installation, not to whatever
-		// environment happens to be invoking the upgrade.
-		resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
-			return goalstates.ResolvedAgentUpgradePathsFor(daemon.ResolveHostPrefix(cmdCtx.Logger))
-		},
+		cmdCtx:       cmdCtx,
+		writer:       os.Stdout,
+		executable:   os.Executable,
+		resolvedPath: goalstates.ResolvedAgentUpgradePaths,
+		plannedPath:  goalstates.PlannedAgentUpgradePaths,
 		geteuid:      os.Geteuid,
 		installation: installstate.DefaultStore(),
+		migrate:      daemon.MigrateHostRoot,
 	}
 	handler.newService = func(paths goalstates.AgentUpgradePaths) agentbinary.DaemonService {
-		prefix := daemon.ResolveHostPrefix(handler.cmdCtx.Logger)
-
-		return daemon.NewHostDaemonActivationService(
-			handler.cmdCtx.Logger,
-			paths,
-			goalstates.ResolveHostPaths(prefix),
-		)
+		return daemon.NewHostDaemonActivationService(handler.cmdCtx.Logger, paths)
 	}
 
 	cmd := &cobra.Command{
@@ -99,7 +95,27 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	paths, err := h.resolvedPath()
+	resolve := h.resolvedPath
+
+	if h.preflight {
+		if h.plannedPath != nil {
+			resolve = h.plannedPath
+		}
+	} else {
+		// Before the migration, which cannot succeed without root either and
+		// would report it less plainly.
+		if h.geteuid() != 0 {
+			return fmt.Errorf("host agent upgrade requires root privileges")
+		}
+
+		if h.migrate != nil {
+			if err := h.migrate(h.cmdCtx.Logger); err != nil {
+				return err
+			}
+		}
+	}
+
+	paths, err := resolve()
 	if err != nil {
 		return fmt.Errorf("resolve agent binary paths: %w", err)
 	}
@@ -125,10 +141,6 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 		}
 
 		return writeHostAgentUpgradePlan(h.writer, plan)
-	}
-
-	if h.geteuid() != 0 {
-		return fmt.Errorf("host agent upgrade requires root privileges")
 	}
 
 	lock, err := h.installation.AcquireMutationLock()
@@ -165,7 +177,7 @@ func writeHostAgentUpgradePlan(w io.Writer, plan agentbinary.ActivationPlan) err
 	return hostAgentUpgradePlanTemplate.Execute(w, plan)
 }
 
-func newCmdRecordAgentUpgradeFailureSignal(cmdCtx *CommandContext) *cobra.Command {
+func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {
 	var message string
 
 	cmd := &cobra.Command{
@@ -174,9 +186,7 @@ func newCmdRecordAgentUpgradeFailureSignal(cmdCtx *CommandContext) *cobra.Comman
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			cmdCtx.Setup()
-
-			return daemon.RecordAgentUpgradeFailureSignal(cmdCtx.Logger, message)
+			return daemon.RecordAgentUpgradeFailureSignal(message)
 		},
 	}
 

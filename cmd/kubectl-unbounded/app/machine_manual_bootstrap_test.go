@@ -891,32 +891,6 @@ func TestManualBootstrapHandler_InstallEnv(t *testing.T) {
 			handler: manualBootstrapHandler{agentVersion: "v'1"},
 			want:    []string{`AGENT_VERSION='v'\''1'`},
 		},
-		// The install script stages the agent binary before the agent runs, so
-		// it has to be told the prefix. Left to a fixed /usr/local it writes
-		// where the agent does not look, and on a host that mounts /usr
-		// read-only it fails before the agent gets a chance to run at all.
-		{
-			name:    "host prefix is exported",
-			handler: manualBootstrapHandler{hostPrefix: "/opt/unbounded"},
-			want:    []string{"AGENT_PREFIX='/opt/unbounded'"},
-		},
-		// Nothing is exported without a prefix, so the script's own default
-		// stays the single definition of the historical path.
-		{
-			name:    "unset prefix exports nothing",
-			handler: manualBootstrapHandler{},
-			want:    nil,
-		},
-		{
-			name:    "whitespace is not a prefix",
-			handler: manualBootstrapHandler{hostPrefix: "   "},
-			want:    nil,
-		},
-		{
-			name:    "prefix is quoted with the rest",
-			handler: manualBootstrapHandler{agentVersion: "v0.0.10", hostPrefix: "/opt/it's"},
-			want:    []string{"AGENT_VERSION='v0.0.10'", `AGENT_PREFIX='/opt/it'\''s'`},
-		},
 	}
 
 	for _, tt := range tests {
@@ -1219,12 +1193,11 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 }
 
 // ignitionTestConfig returns an agent config shaped like one the command would
-// build, with the prefix the ignition variant requires.
-func ignitionTestConfig(prefix string) *provision.UnboundedAgentConfig {
+// build.
+func ignitionTestConfig() *provision.UnboundedAgentConfig {
 	return &provision.UnboundedAgentConfig{
 		AgentConfig: provision.AgentConfig{
 			MachineName: "test-node",
-			HostPrefix:  prefix,
 			Cluster: provision.AgentClusterConfig{
 				CaCertBase64: "dGVzdA==",
 				ClusterDNS:   "10.0.0.10",
@@ -1247,7 +1220,6 @@ func ignitionTestHandler() *manualBootstrapHandler {
 		agentURL:    "https://example.test/unbounded-agent-linux-amd64",
 		agentSHA256: ignitionTestDigest,
 		agentHash:   "sha256-" + ignitionTestDigest,
-		hostPrefix:  "/opt/unbounded",
 	}
 }
 
@@ -1257,7 +1229,7 @@ func ignitionTestHandler() *manualBootstrapHandler {
 func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	t.Parallel()
 
-	out, err := ignitionTestHandler().renderIgnition(ignitionTestConfig("/opt/unbounded"))
+	out, err := ignitionTestHandler().renderIgnition(ignitionTestConfig())
 	require.NoError(t, err)
 
 	var cfg ignitionConfig
@@ -1276,7 +1248,7 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.Equal(t, ignitionModeConfig, agentConfig.Mode, "the agent config carries a bootstrap token")
 
 	binary, ok := paths["/opt/unbounded/bin/unbounded-agent"]
-	require.True(t, ok, "the agent binary must land under the configured prefix, got %v", paths)
+	require.True(t, ok, "the agent binary must land under the host root, got %v", paths)
 	require.Equal(t, ignitionModeScript, binary.Mode)
 	require.Equal(t, "https://example.test/unbounded-agent-linux-amd64", binary.Contents.Source)
 	require.NotNil(t, binary.Contents.Verification, "an unattended host must not accept whatever the URL returns")
@@ -1289,21 +1261,22 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.True(t, *cfg.Systemd.Units[0].Enabled, "an unenabled unit never runs and nothing reports it")
 }
 
-// TestRenderIgnitionHonorsTheHostPrefix pins that every host-side path moves
-// together. A binary under the prefix and a unit pointing at /usr/local would
-// produce a host that provisions into a unit which cannot start.
-func TestRenderIgnitionHonorsTheHostPrefix(t *testing.T) {
+// TestRenderIgnitionUsesTheHostRoot pins that every host-side path is under the
+// host root. On a host that mounts /usr read-only, Ignition cannot write under
+// /usr/local, and a unit pointing there could not start.
+func TestRenderIgnitionUsesTheHostRoot(t *testing.T) {
 	t.Parallel()
 
-	h := ignitionTestHandler()
-	h.hostPrefix = "/var/lib/unbounded-agent"
-
-	out, err := h.renderIgnition(ignitionTestConfig("/var/lib/unbounded-agent"))
+	out, err := ignitionTestHandler().renderIgnition(ignitionTestConfig())
 	require.NoError(t, err)
 
-	require.Contains(t, out, "/var/lib/unbounded-agent/bin/unbounded-agent")
-	require.NotContains(t, out, "/usr/local/bin/unbounded-agent",
-		"nothing may resolve to the default prefix once one is configured")
+	var cfg ignitionConfig
+	require.NoError(t, json.Unmarshal([]byte(out), &cfg))
+	require.NotNil(t, cfg.Storage)
+	require.Len(t, cfg.Storage.Directories, 1)
+	require.Equal(t, "/opt/unbounded/bin", cfg.Storage.Directories[0].Path)
+
+	require.NotContains(t, out, "/usr/local", "nothing may be written or run from the legacy root")
 }
 
 // TestIgnitionBootstrapUnitRunsOnEveryBoot pins the decision not to carry a
@@ -1317,7 +1290,7 @@ func TestRenderIgnitionHonorsTheHostPrefix(t *testing.T) {
 func TestIgnitionBootstrapUnitRunsOnEveryBoot(t *testing.T) {
 	t.Parallel()
 
-	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig("/opt/unbounded"))
+	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig())
 
 	require.NotContains(t, unit, "ConditionPathExists=!",
 		"a completion marker would be a second source of truth beside the ownership record")
@@ -1344,7 +1317,7 @@ func TestIgnitionBootstrapUnitRunsOnEveryBoot(t *testing.T) {
 func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
 	t.Parallel()
 
-	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig("/opt/unbounded"))
+	unit := ignitionTestHandler().ignitionBootstrapUnitContents(ignitionTestConfig())
 
 	require.Contains(t, unit, "Restart=on-failure", "DNS may not answer yet on the first attempt")
 	require.Contains(t, unit, "StartLimitIntervalSec=0", "bootstrap gets no second chance if systemd gives up on it")
@@ -1371,7 +1344,7 @@ func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
 // Ignition flag rules are enforced, not just that they are.
 //
 // validate runs before any Kubernetes client is built. Leaving these checks to
-// the renderer meant an operator who forgot --host-prefix waited for a cluster
+// the renderer meant an operator who forgot --agent-sha256 waited for a cluster
 // connection and a site lookup before being told about a flag, and got that
 // answer only if the connection succeeded at all.
 func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
@@ -1381,7 +1354,6 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 		return &manualBootstrapHandler{
 			siteName:    "site-a",
 			variant:     string(variantIgnition),
-			hostPrefix:  "/opt/unbounded",
 			agentURL:    "https://example.test/unbounded-agent",
 			agentSHA256: strings.Repeat("a", 64),
 		}
@@ -1406,10 +1378,6 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 		mutate  func(*manualBootstrapHandler)
 		wantErr string
 	}{
-		"no host prefix": {
-			mutate:  func(h *manualBootstrapHandler) { h.hostPrefix = "" },
-			wantErr: "--host-prefix is required",
-		},
 		"no agent url": {
 			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "" },
 			wantErr: "--agent-url is required",
@@ -1446,7 +1414,7 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 	}
 
 	// The other variants have no such requirements, and must not inherit them:
-	// they resolve the agent at runtime and default the prefix.
+	// they resolve the agent at runtime.
 	for _, variant := range []bootstrapVariant{variantScript, variantCloudInit} {
 		t.Run("no ignition rules for "+string(variant), func(t *testing.T) {
 			t.Parallel()

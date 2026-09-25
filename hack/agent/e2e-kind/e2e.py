@@ -72,6 +72,7 @@ import sys
 import textwrap
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -103,6 +104,13 @@ KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 OFFLINE_BOOTSTRAP = os.environ.get("OFFLINE_BOOTSTRAP", "").lower() in ("1", "true", "yes")
+OFFLINE_ARTIFACTS_DIR = "/var/lib/unbounded-e2e/artifacts"
+
+# The last release before the host root. The migration suite installs it, and
+# returns to it after moving to this build.
+LEGACY_AGENT_VERSION = os.environ.get("LEGACY_AGENT_VERSION", "v0.8.0")
+LEGACY_AGENT_RELEASE_URL = f"https://github.com/Azure/unbounded/releases/download/{LEGACY_AGENT_VERSION}"
+LEGACY_AGENT_TARBALL = "unbounded-agent-linux-amd64.tar.gz"
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -149,10 +157,12 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
-# Rebound below from the selected host image's installation prefix. A host that
-# mounts /usr read-only cannot use the agent's default prefix, so these are not
-# constants; they are defaults for every image that does not set one.
-DAEMON_BIN_DIR = "/usr/local/bin"
+# The agent's host root, and where agents released before it installed their
+# files. A host installed by an older agent keeps its files under the legacy
+# root, and the current agent links the host root to it.
+HOST_ROOT = "/opt/unbounded"
+LEGACY_HOST_ROOT = "/usr/local"
+DAEMON_BIN_DIR = f"{HOST_ROOT}/bin"
 DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
 DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
 DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
@@ -1323,16 +1333,47 @@ def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int =
     die(f"Timed out waiting for Node Rebooted event for '{node_name}' boot ID '{boot_id}'")
 
 
+def resolve_on_host(path: str) -> str:
+    """Return *path* on the VM with every symlink resolved, missing parts kept."""
+
+    return ssh_capture(f"readlink -m {shlex.quote(path)}").strip()
+
+
+def host_root_state() -> str:
+    """Return what the host root is on the VM: absent, dir, link:<target>, or other."""
+
+    return ssh_capture(
+        f"sudo sh -c 'r={HOST_ROOT}; "
+        'if [ -L "$r" ]; then echo "link:$(readlink "$r")"; '
+        'elif [ -d "$r" ]; then echo dir; '
+        'elif [ -e "$r" ]; then echo other; '
+        "else echo absent; fi'"
+    ).strip()
+
+
+def _resolve_daemon_link(path: str) -> str:
+    """Return a command that resolves *path*, one of the daemon links.
+
+    On a host installed by a release before the host root, the host root does
+    not exist until this build first runs there, and until then the link is
+    found under the legacy root.
+    """
+
+    legacy = LEGACY_HOST_ROOT + path.removeprefix(HOST_ROOT)
+    return "sudo sh -c " + shlex.quote(
+        f"if [ -e {HOST_ROOT} ]; then readlink -f {path}; else readlink -f {legacy}; fi")
+
+
 def read_daemon_current_target() -> str:
     """Return the target path of the host daemon current binary symlink."""
 
-    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_CURRENT}").strip()
+    return ssh_capture(_resolve_daemon_link(DAEMON_BINARY_CURRENT)).strip()
 
 
 def read_daemon_last_good_target() -> str:
     """Return the target path of the host daemon last-good binary symlink."""
 
-    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_LAST_GOOD}").strip()
+    return ssh_capture(_resolve_daemon_link(DAEMON_BINARY_LAST_GOOD)).strip()
 
 
 def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180) -> None:
@@ -1343,8 +1384,7 @@ def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180
     last_target = ""
     while elapsed < timeout_secs:
         result = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET,
-             f"sudo readlink -f {DAEMON_BINARY_CURRENT}"],
+            ["ssh", *SSH_OPTS, SSH_TARGET, _resolve_daemon_link(DAEMON_BINARY_CURRENT)],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -1461,7 +1501,12 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
 
 
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
-    """Package an executable that passes preflight but fails as the daemon."""
+    """Package an executable that passes preflight but fails as the daemon.
+
+    It answers host-root the way a current agent does, resolving the host root
+    through any symlink, so that verification accepts it and the failure comes
+    from the daemon.
+    """
 
     _build_script_agent_tarball(
         tarball,
@@ -1471,8 +1516,32 @@ def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
         "    echo unbounded-agent e2e-daemon-failing\n"
         "    exit 0\n"
         "fi\n"
+        "if [ \"${1:-}\" = \"host-root\" ]; then\n"
+        f"    readlink -m {HOST_ROOT}\n"
+        "    exit 0\n"
+        "fi\n"
         "echo failing upgraded agent daemon >&2\n"
         "exit 42\n",
+    )
+
+
+def _build_legacy_agent_tarball(tarball: Path) -> None:
+    """Package an executable that behaves like an agent released before the host root.
+
+    It answers version and has no host-root command, which is all verification
+    can see of the difference.
+    """
+
+    _build_script_agent_tarball(
+        tarball,
+        "agent-upgrade-legacy",
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"version\" ]; then\n"
+        "    echo unbounded-agent e2e-legacy\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo \"unknown command \\\"${1:-}\\\"\" >&2\n"
+        "exit 1\n",
     )
 
 
@@ -1538,10 +1607,6 @@ class HostImage:
     # seeds an Ignition config, which is the only first-boot mechanism the
     # immutable Flatcar-derived images implement.
     provisioning: str = "cloud-init"
-
-    # Installation prefix for the agent's host-side files. Empty means the
-    # agent's own default of /usr/local, which is read-only on immutable images.
-    host_prefix: str = ""
 
     # Published digest of the image, verified after download. Empty for the
     # public mirrors, which publish no digest alongside the image.
@@ -1651,8 +1716,9 @@ def acl_host_image() -> HostImage:
     machined can take its bus name before anything asks for it.
 
     /usr/local is a real directory inside that read-only /usr rather than a
-    symlink to somewhere writable, so the agent's default prefix cannot be used
-    at all. /opt is on the writable root filesystem.
+    symlink to somewhere writable, so an agent released before the host root
+    cannot be installed at all. /opt, where the host root is, is on the writable
+    root filesystem.
     """
     path = os.environ.get("HOST_IMAGE_PATH", "")
     if path:
@@ -1664,8 +1730,8 @@ def acl_host_image() -> HostImage:
     else:
         # Left empty and filled in by resolved_host_image. Naming the blob means
         # reading the published manifest, which is a network call and an Azure
-        # token, and host_image is called for the ssh user and the installation
-        # prefix far more often than for the image itself, including at import.
+        # token, and host_image is called for the ssh user far more often than
+        # for the image itself, including at import.
         url, file_name, digest = "", "", ""
 
     return HostImage(
@@ -1677,7 +1743,6 @@ def acl_host_image() -> HostImage:
         ssh_user="core",
         packages=[],
         provisioning="ignition",
-        host_prefix="/opt/unbounded",
         sha256=digest,
         auth="" if path else "azure-storage",
     )
@@ -1777,7 +1842,7 @@ def resolved_host_image() -> HostImage:
     """Return the host image with its download location filled in.
 
     Only the two places that actually fetch or open the image need this. Every
-    other caller wants the ssh user or the installation prefix, and making them
+    other caller wants the ssh user or the provisioning mechanism, and making them
     resolve a manifest to get those would put an Azure round trip behind
     importing this module.
     """
@@ -1790,21 +1855,13 @@ def resolved_host_image() -> HostImage:
     return replace(image, url=url, file_name=file_name, sha256=digest)
 
 
-# The SSH user and the agent's installation prefix are properties of the image,
-# but SSH_TARGET and the daemon paths are referenced as module constants
-# throughout. Rebind them once the image is known, rather than threading an
-# image argument through every call site that needs a path.
+# The SSH user is a property of the image, but SSH_TARGET is referenced as a
+# module constant throughout. Rebind it once the image is known, rather than
+# threading an image argument through every call site that needs it.
 #
 # This sits below host_image and everything it calls, because it runs at import.
 VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
 SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
-
-DAEMON_BIN_DIR = f"{host_image().host_prefix or '/usr/local'}/bin"
-DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
-DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
-DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
-DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
-DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 
 
 def yaml_list(items: list[str], indent: str) -> str:
@@ -2858,10 +2915,12 @@ def prepare_offline_bootstrap_artifacts(node_config: NodeConfig) -> str:
 
     log("Copying offline artifact bundle to VM...")
     scp_cmd(str(tarball), f"{SSH_TARGET}:/tmp/offline-bootstrap-artifacts.tar.gz")
-    ssh_cmd("sudo rm -rf /opt/unbounded/artifacts && sudo mkdir -p /opt/unbounded/artifacts")
-    ssh_cmd("sudo tar -xzf /tmp/offline-bootstrap-artifacts.tar.gz -C /opt/unbounded/artifacts")
+    # Not under the agent's host root: reset removes that once it is empty, and
+    # files the harness left there would keep it.
+    ssh_cmd(f"sudo rm -rf {OFFLINE_ARTIFACTS_DIR} && sudo mkdir -p {OFFLINE_ARTIFACTS_DIR}")
+    ssh_cmd(f"sudo tar -xzf /tmp/offline-bootstrap-artifacts.tar.gz -C {OFFLINE_ARTIFACTS_DIR}")
 
-    source = f"file:///opt/unbounded/artifacts/{kube_version}"
+    source = f"file://{OFFLINE_ARTIFACTS_DIR}/{kube_version}"
     log(f"Offline artifact source installed on VM: {source}")
     return source
 
@@ -3151,7 +3210,6 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
     is the path an Ignition-provisioned host uses in production. SSH is only
     used afterwards, to report what happened.
     """
-    image = host_image()
     ssh_pub_key = _ensure_vm_ssh_key()
     binary_url, binary_digest = agent_binary_url_and_digest()
 
@@ -3165,7 +3223,6 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
         "--variant", "ignition",
         "--agent-url", binary_url,
         "--agent-sha256", binary_digest,
-        "--host-prefix", image.host_prefix,
         *node_config_bootstrap_args(node_config),
     ]
     if node_config.offline_artifacts_oci_ref:
@@ -3235,7 +3292,7 @@ def _reinstall_ignition_payload(doc: dict[str, Any]) -> str:
     the run rather than being skipped.
     """
     agent_files = {
-        f"{host_image().host_prefix}/bin/unbounded-agent",
+        DAEMON_BINARY,
         "/etc/unbounded/agent/config.json",
     }
     harness_files = {"/etc/hostname", f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}"}
@@ -3478,7 +3535,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool
         inject = (
             "for i in $(seq 1 600); do "
             "if test -f /var/lib/unbounded/agent/install-state.json; then "
-            "mkdir -p /usr/local/bin/unbounded-agent-daemon-recovery.sh; exit 0; fi; "
+            f"mkdir -p {DAEMON_BIN_DIR}/unbounded-agent-daemon-recovery.sh; exit 0; fi; "
             "sleep 1; done; exit 1"
         )
         ssh_cmd("sudo systemd-run --unit=p6-bootstrap-injection --collect /bin/bash -c " + shlex.quote(inject))
@@ -3527,7 +3584,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool
         scp_cmd(str(retry_script_path), f"{SSH_TARGET}:/tmp/bootstrap-retry.sh")
         ssh_cmd("chmod +x /tmp/bootstrap-retry.sh")
 
-        ssh_cmd("sudo rmdir /usr/local/bin/unbounded-agent-daemon-recovery.sh")
+        ssh_cmd(f"sudo rmdir {DAEMON_BIN_DIR}/unbounded-agent-daemon-recovery.sh")
         run(["timeout", "1200", "ssh", *SSH_OPTS, SSH_TARGET,
              f"sudo {env_prefix} /tmp/bootstrap-retry.sh"])
         after_text = bounded_ssh(
@@ -4750,26 +4807,25 @@ def validate_reset_cleanup() -> None:
     just told is clean. Preflight checks only that subset, since Ignition places
     the agent binary before it runs; this checks everything reset should remove.
 
-    Both the configured prefix and the default are checked. A host is only ever
-    installed under one of them, so the other is trivially absent, but that is
-    the point: teardown sweeps both, because a host reprovisioned with a
-    different prefix still carries the earlier layout, and a check that only
-    looked where this run installed would not notice it being left behind.
+    Both the host root and the legacy root are checked, and the host root has to
+    be gone as well: removed once empty on a host installed under it, and the
+    link removed on a host migrated from the legacy root. Reset does not depend
+    on the migration having run, so a check that only looked where this run
+    installed would not notice the other being left behind.
     """
-    prefix = host_image().host_prefix or "/usr/local"
-    log(f"Verifying reset removed the agent's files (prefix {prefix})...")
+    log(f"Verifying reset removed the agent's files under {HOST_ROOT} and {LEGACY_HOST_ROOT}...")
 
-    must_be_absent = []
-    for candidate in {prefix, "/usr/local"}:
+    must_be_absent = [HOST_ROOT]
+    for root in (HOST_ROOT, LEGACY_HOST_ROOT):
         must_be_absent.extend([
-            f"{candidate}/bin/unbounded-agent",
-            f"{candidate}/bin/unbounded-agent-blue",
-            f"{candidate}/bin/unbounded-agent-green",
-            f"{candidate}/bin/unbounded-agent-current",
-            f"{candidate}/bin/unbounded-agent-last-good",
-            f"{candidate}/bin/unbounded-agent-nspawn-lifecycle",
-            f"{candidate}/bin/unbounded-agent-daemon-recovery.sh",
-            f"{candidate}/libexec/unbounded-localdns-network",
+            f"{root}/bin/unbounded-agent",
+            f"{root}/bin/unbounded-agent-blue",
+            f"{root}/bin/unbounded-agent-green",
+            f"{root}/bin/unbounded-agent-current",
+            f"{root}/bin/unbounded-agent-last-good",
+            f"{root}/bin/unbounded-agent-nspawn-lifecycle",
+            f"{root}/bin/unbounded-agent-daemon-recovery.sh",
+            f"{root}/libexec/unbounded-localdns-network",
         ])
 
     must_be_absent.extend([
@@ -5232,10 +5288,13 @@ def validate_host_agent_upgrade() -> None:
     wait_for_daemon_active()
     after_current = read_daemon_current_target()
     last_good = read_daemon_last_good_target()
-    if after_current != DAEMON_BINARY_GREEN:
-        die(f"host-driven current target mismatch: got {after_current!r}, expected {DAEMON_BINARY_GREEN!r}")
-    if last_good != DAEMON_BINARY_BLUE:
-        die(f"host-driven last-good target mismatch: got {last_good!r}, expected {DAEMON_BINARY_BLUE!r}")
+    # The targets are read resolved, so compare them with the slots resolved the
+    # same way.
+    green, blue = resolve_on_host(DAEMON_BINARY_GREEN), resolve_on_host(DAEMON_BINARY_BLUE)
+    if after_current != green:
+        die(f"host-driven current target mismatch: got {after_current!r}, expected {green!r}")
+    if last_good != blue:
+        die(f"host-driven last-good target mismatch: got {last_good!r}, expected {blue!r}")
 
     preserved_digest = ssh_capture(f"sudo sha256sum {DAEMON_BINARY_BLUE} | awk '{{print $1}}'").strip()
     if preserved_digest != legacy_digest:
@@ -5260,6 +5319,211 @@ def validate_host_agent_upgrade() -> None:
     wait_for_node_ready(AGENT_MACHINE_NAME)
     log("============================================")
     log("  Host-driven agent upgrade validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
+# validate-host-root / migration suite
+# ---------------------------------------------------------------------------
+LEGACY_LAYOUT = [
+    "unbounded-agent", "unbounded-agent-blue", "unbounded-agent-green",
+    "unbounded-agent-current", "unbounded-agent-last-good",
+]
+
+
+def _daemon_unit_runs(binary_dir: str) -> None:
+    """Assert the daemon unit starts the current link in *binary_dir*."""
+
+    want = f"{binary_dir}/unbounded-agent-current daemon"
+    unit = ssh_capture("sudo cat /etc/systemd/system/unbounded-agent-daemon.service")
+    if want not in unit:
+        die(f"daemon unit does not run {want!r}:\n{unit}")
+
+
+def _log_selinux_denials() -> None:
+    """Print SELinux denials that mention the agent, without failing on them."""
+
+    denials = ssh_capture_quiet(
+        "if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then "
+        "sudo journalctl -b -k --no-pager | grep 'avc:  denied' | grep -i unbounded; fi"
+    ).stdout.strip()
+    if denials:
+        log("SELinux denials mentioning the agent:")
+        for line in denials.splitlines():
+            log(f"  {line}")
+
+
+def validate_host_root() -> None:
+    """Assert a host installed by this build keeps the agent under the host root.
+
+    Nothing may be installed under the legacy root: the install script seeds it
+    only for an agent released before the host root, and a fresh host that
+    carried the legacy layout would be migrated to it by the next agent.
+
+    On an SELinux host the directories the agent creates start with the label of
+    /opt, which is not the one policy gives them, so they are checked against
+    policy.
+    """
+
+    state = host_root_state()
+    if state != "dir":
+        die(f"{HOST_ROOT} is {state!r}; a host installed by this build must have a real directory there")
+
+    bin_dir = resolve_on_host(DAEMON_BIN_DIR)
+    legacy = " ".join(f"{LEGACY_HOST_ROOT}/bin/{name}" for name in LEGACY_LAYOUT)
+    script = textwrap.dedent(f"""
+        set -eu
+        for d in {HOST_ROOT} {HOST_ROOT}/bin {HOST_ROOT}/libexec; do
+            got=$(stat -c '%a %U' "$d")
+            [ "$got" = "755 root" ] || {{ echo "$d is $got, expected 755 root"; exit 1; }}
+        done
+        current=$(readlink -f {DAEMON_BINARY_CURRENT})
+        case "$current" in
+            {bin_dir}/*) ;;
+            *) echo "current binary $current is not under {bin_dir}"; exit 1 ;;
+        esac
+        for f in {legacy}; do
+            if [ -e "$f" ] || [ -L "$f" ]; then echo "$f exists under the legacy root"; exit 1; fi
+        done
+        if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
+            relabel=$(restorecon -nvR {HOST_ROOT})
+            if [ -n "$relabel" ]; then echo "labels differ from policy:"; echo "$relabel"; exit 1; fi
+        fi
+    """)
+    result = ssh_capture_quiet("sudo bash -c " + shlex.quote(script))
+    if result.returncode != 0:
+        die(f"host root check failed: {(result.stdout + result.stderr).strip()}")
+
+    _daemon_unit_runs(bin_dir)
+    _log_selinux_denials()
+    log(f"Agent is installed under {HOST_ROOT}, and nothing under {LEGACY_HOST_ROOT}")
+
+
+def validate_host_root_legacy() -> None:
+    """Assert the host carries the layout of an agent released before the host root."""
+
+    state = host_root_state()
+    if state != "absent":
+        die(f"{HOST_ROOT} is {state!r}; an agent released before the host root must not create it")
+
+    current = resolve_on_host(f"{LEGACY_HOST_ROOT}/bin/unbounded-agent-current")
+    if not current.startswith(f"{LEGACY_HOST_ROOT}/bin/"):
+        die(f"legacy current binary resolves to {current!r}")
+
+    _daemon_unit_runs(f"{LEGACY_HOST_ROOT}/bin")
+    log(f"Legacy layout is installed under {LEGACY_HOST_ROOT}")
+
+
+def validate_host_root_migrated() -> None:
+    """Assert the host root is linked to the legacy root and the layout is unchanged.
+
+    The link is all the migration adds. The units and the recovery script keep
+    naming the legacy paths, so an older agent rolled back to still finds its
+    files, and the slots compare equal to the targets the older agent wrote.
+    """
+
+    state = host_root_state()
+    if state != f"link:{LEGACY_HOST_ROOT}":
+        die(f"{HOST_ROOT} is {state!r}; a migrated host must link it to {LEGACY_HOST_ROOT}")
+
+    current = read_daemon_current_target()
+    if not current.startswith(f"{LEGACY_HOST_ROOT}/bin/"):
+        die(f"current binary resolves to {current!r}, not under {LEGACY_HOST_ROOT}/bin")
+
+    _daemon_unit_runs(f"{LEGACY_HOST_ROOT}/bin")
+    _log_selinux_denials()
+    log(f"{HOST_ROOT} links to {LEGACY_HOST_ROOT}, and the legacy layout is unchanged")
+
+
+def run_legacy_agent(node_config: NodeConfig) -> None:
+    """Install the last release before the host root.
+
+    It is fetched by the install script from the published release, the same
+    way a host installed before the host root got it.
+    """
+
+    if host_image().provisioning == "ignition":
+        die("the migration suite needs an agent released before the host root, which cannot be "
+            "installed on an immutable host; run it on a cloud-init host")
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", LEGACY_AGENT_VERSION):
+        die(f"LEGACY_AGENT_VERSION must be a release tag such as v0.8.0, got {LEGACY_AGENT_VERSION!r}")
+
+    # The bootstrap payload is still rendered by this build's kubectl-unbounded,
+    # and the upgrades that follow serve this build's agent.
+    prepare_agent_artifacts()
+
+    previous = os.environ.get("AGENT_URL")
+    os.environ["AGENT_URL"] = f"{LEGACY_AGENT_RELEASE_URL}/{LEGACY_AGENT_TARBALL}"
+    try:
+        run_agent(node_config)
+    finally:
+        if previous is None:
+            os.environ.pop("AGENT_URL", None)
+        else:
+            os.environ["AGENT_URL"] = previous
+
+
+def _download_legacy_agent_tarball() -> Path:
+    """Return an AgentUpgrade archive holding the legacy release's agent binary.
+
+    The release tarball is checked against the release checksums, then its
+    binary is repackaged alone: AgentUpgrade accepts an archive holding only
+    the agent, and the release also ships its license files.
+    """
+
+    tarball = VM_DIR / f"unbounded-agent-{LEGACY_AGENT_VERSION}.tar.gz"
+    with urllib.request.urlopen(f"{LEGACY_AGENT_RELEASE_URL}/checksums.txt", timeout=60) as response:
+        checksums = response.read().decode()
+    want = next((line.split()[0] for line in checksums.splitlines()
+                 if line.split()[1:] == [LEGACY_AGENT_TARBALL]), "")
+    if not want:
+        die(f"{LEGACY_AGENT_VERSION} publishes no checksum for {LEGACY_AGENT_TARBALL}")
+
+    with urllib.request.urlopen(f"{LEGACY_AGENT_RELEASE_URL}/{LEGACY_AGENT_TARBALL}", timeout=300) as response:
+        tarball.write_bytes(response.read())
+    got = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    if got != want:
+        die(f"{LEGACY_AGENT_TARBALL} from {LEGACY_AGENT_VERSION} has digest {got}, expected {want}")
+
+    build_dir = VM_DIR / "agent-upgrade-legacy-release"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    run(["tar", "-xzf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
+    upgrade = VM_DIR / f"unbounded-agent-{LEGACY_AGENT_VERSION}-upgrade.tar.gz"
+    run(["tar", "-czf", str(upgrade), "-C", str(build_dir), "unbounded-agent"])
+
+    return upgrade
+
+
+def validate_agent_downgrade_to_legacy() -> None:
+    """Validate AgentUpgrade back to the last release before the host root.
+
+    On a migrated host the host root is the legacy root, which every agent finds,
+    so this is an ordinary upgrade. What it proves is that the migration left
+    nothing an older agent cannot run with.
+    """
+
+    before_current = read_daemon_current_target()
+    tarball = _download_legacy_agent_tarball()
+    operation_name = f"e2e-agent-downgrade-{int(time.time())}"
+    _serve_agent_upgrade_tarball(tarball, operation_name)
+
+    wait_for_daemon_active()
+    after_current = read_daemon_current_target()
+    last_good = read_daemon_last_good_target()
+    if after_current == before_current:
+        die(f"downgrade did not switch the daemon current symlink (still points to {after_current})")
+    if last_good != before_current:
+        die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
+
+    version_output = ssh_capture(f"sudo {DAEMON_BINARY_CURRENT} version")
+    if LEGACY_AGENT_VERSION.lstrip("v") not in version_output:
+        die(f"current daemon is not {LEGACY_AGENT_VERSION}: {version_output!r}")
+
+    validate_host_root_migrated()
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    log("============================================")
+    log(f"  Downgrade to {LEGACY_AGENT_VERSION} validation PASSED")
     log("============================================")
 
 
@@ -5322,6 +5586,22 @@ def validate_agent_upgrade_rollback() -> None:
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
         die("broken AgentUpgrade changed current daemon binary symlink")
+
+    # An agent released before the host root would look for its files under the
+    # legacy root, where a host installed under the host root has none. On a
+    # host linked to the legacy root every agent finds them, so the check only
+    # applies here.
+    if host_root_state() == "dir":
+        legacy_operation_name = f"e2e-agent-upgrade-legacy-{int(time.time())}"
+        legacy_tarball = VM_DIR / "unbounded-agent-upgrade-legacy.tar.gz"
+        _build_legacy_agent_tarball(legacy_tarball)
+        legacy_operation = _serve_agent_upgrade_tarball(
+            legacy_tarball, legacy_operation_name, expect_complete=False)
+        legacy_message = legacy_operation.get("status", {}).get("message", "")
+        if "predates the host root" not in legacy_message:
+            die(f"AgentUpgrade to an agent without host-root was not refused: {legacy_message!r}")
+        if read_daemon_current_target() != previous_good:
+            die("refused AgentUpgrade changed current daemon binary symlink")
 
     operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
     tarball = VM_DIR / "unbounded-agent-upgrade-daemon-bad.tar.gz"
@@ -5849,7 +6129,7 @@ def validate_bootstrap_repair() -> None:
         before=$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)
         node_pid=$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)
         test "$node_pid" -gt 0
-        cp /usr/local/bin/unbounded-agent-current /tmp/p6-repair-agent
+        cp @DAEMON_BINARY_CURRENT@ /tmp/p6-repair-agent
         chmod 0755 /tmp/p6-repair-agent
         python3 - <<'PY'
         from pathlib import Path
@@ -5872,7 +6152,7 @@ def validate_bootstrap_repair() -> None:
         test "$node_pid" = "$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)"
         grep -q '"phase": "complete"' /var/lib/unbounded/agent/install-state.json
         systemctl is-active unbounded-agent-daemon.service
-    """)
+    """).replace("@DAEMON_BINARY_CURRENT@", DAEMON_BINARY_CURRENT)
     bounded_ssh("sudo bash -c " + shlex.quote(script), time.monotonic() + 180, check=True)
     validate_workload()
     log("Completed-install repair preserved the repaved slot and workload")
@@ -5881,15 +6161,25 @@ def validate_bootstrap_repair() -> None:
 SUITES: dict[str, list[str]] = {
     "setup": ["configure-kind-kube-proxy", "install-machine-crd", "deploy-unbounded-net-controller",
               "start-machina-controller", "validate-machina-controller", "validate-controllers-healthy"],
-    "lifecycle": ["run-agent", "wait-for-node", "validate-host-nspawn-distro", "validate-controllers-healthy",
+    "lifecycle": ["run-agent", "wait-for-node", "validate-host-root", "validate-host-nspawn-distro", "validate-controllers-healthy",
                   "validate-node-config", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
                   "validate-node-reboot-operation", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
                   "validate-agent-upgrade-rollback", "validate-workload", "validate-host-reboot", "reset-agent",
-                  "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node", "validate-host-nspawn-distro",
+                  "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node", "validate-host-root",
+                  "validate-host-nspawn-distro",
                   "validate-controllers-healthy", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
                   "validate-node-reboot-operation", "validate-workload", "validate-node-repave-upgrade"],
     "configuration": ["validate-node-configs"],
     "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
+    # A host installed before the host root: the first upgrade links the host
+    # root to the legacy root, the host keeps working across a reboot, upgrades
+    # and a return to the older release, and reset removes the link with the
+    # files.
+    "migration": ["run-legacy-agent", "wait-for-node", "validate-host-root-legacy",
+                  "validate-agent-upgrade-operation", "validate-host-root-migrated", "validate-host-reboot",
+                  "validate-agent-upgrade-operation", "validate-host-root-migrated",
+                  "validate-agent-downgrade-to-legacy", "validate-agent-upgrade-operation",
+                  "validate-host-root-migrated", "reset-agent"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
@@ -5970,6 +6260,11 @@ COMMANDS: dict[str, Command] = {
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
+    "validate-host-root": _without_node_config(validate_host_root),
+    "validate-host-root-legacy": _without_node_config(validate_host_root_legacy),
+    "validate-host-root-migrated": _without_node_config(validate_host_root_migrated),
+    "run-legacy-agent": run_legacy_agent,
+    "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
     "cleanup": _without_node_config(cleanup),
 }
 

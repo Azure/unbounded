@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 func TestInstallAndSwitchFromTarGzWithOptions(t *testing.T) {
@@ -37,7 +39,7 @@ func TestInstallAndSwitchFromTarGzWithOptions(t *testing.T) {
 		t.Fatalf("symlink last-good: %v", err)
 	}
 
-	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 0\n"))
+	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\n"+hostRootAnswer(hostroot.Resolve())+"exit 0\n"))
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(payload)
 	}))
@@ -425,7 +427,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 	t.Parallel()
 
 	paths := secureUpgradeReadyPaths(t)
-	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 0\n"))
+	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\n"+hostRootAnswer(hostroot.Resolve())+"exit 0\n"))
 	insecure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(payload)
 	}))

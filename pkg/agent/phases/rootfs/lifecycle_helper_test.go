@@ -9,9 +9,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 func TestInstallNSpawnLifecycleHelperPreservesExistingTargetOnCopyFailure(t *testing.T) {
@@ -61,38 +58,4 @@ func TestInstallNSpawnLifecycleHelper(t *testing.T) {
 	data, err = os.ReadFile(target)
 	require.NoError(t, err)
 	require.Equal(t, []byte("new-agent"), data)
-}
-
-// TestEnsureNSpawnLifecycleHelperInstallsAtTheGivenTarget covers the task
-// wrapper rather than the copy beneath it.
-//
-// The copy already had tests, but they call installNSpawnLifecycleHelper
-// directly and so say nothing about where the task decides to put the file.
-// That decision is the whole of this task's behavior, and a regression to a
-// fixed path would install the helper somewhere the generated hook units do
-// not name.
-func TestEnsureNSpawnLifecycleHelperInstallsAtTheGivenTarget(t *testing.T) {
-	t.Parallel()
-
-	target := filepath.Join(t.TempDir(), "bin", "unbounded-agent-nspawn-lifecycle")
-	require.NoError(t, EnsureNSpawnLifecycleHelperAt(target).Do(t.Context()))
-
-	info, err := os.Stat(target)
-	require.NoError(t, err, "helper must be installed at the requested target")
-	require.True(t, info.Mode().IsRegular())
-	require.NotZero(t, info.Mode().Perm()&0o111, "helper must be executable")
-}
-
-// TestDeprecatedEnsureNSpawnLifecycleHelperUsesTheDefaultPath pins the
-// signature it had on main and that it still installs to the path under the
-// default prefix, which is where hosts without a prefix expect it.
-func TestDeprecatedEnsureNSpawnLifecycleHelperUsesTheDefaultPath(t *testing.T) {
-	t.Parallel()
-
-	//nolint:staticcheck // Exercising the deprecated entry point is the point.
-	var ensure func() phases.Task = EnsureNSpawnLifecycleHelper
-
-	task, ok := ensure().(*ensureNSpawnLifecycleHelper)
-	require.True(t, ok)
-	require.Equal(t, goalstates.NSpawnLifecycleBinaryPath, task.targetPath)
 }

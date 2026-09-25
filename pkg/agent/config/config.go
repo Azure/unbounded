@@ -77,18 +77,6 @@ type AgentConfig struct {
 	// Empty remains unobserved for legacy installations; it is not inferred from
 	// the host distribution. The daemon reports explicit values in Machine status.
 	ProvisioningFormat string `json:"ProvisioningFormat,omitempty"`
-
-	// HostPrefix is the installation prefix for the agent's own host-side
-	// files: the daemon binaries under <HostPrefix>/bin and helper scripts
-	// under <HostPrefix>/libexec. It does not affect paths inside the nspawn
-	// machine, which are always relative to the machine directory.
-	//
-	// Empty means /usr/local, so hosts that do not set it are unaffected. Hosts
-	// with a read-only /usr must set it to a writable prefix; the agent refuses
-	// to bootstrap rather than guessing one, because where the agent may write
-	// is a property of the filesystem and not something that can be safely
-	// inferred from the distribution.
-	HostPrefix string `json:"HostPrefix,omitempty"`
 }
 
 const (
@@ -104,65 +92,6 @@ func ValidateProvisioningFormat(format string) error {
 	default:
 		return fmt.Errorf("ProvisioningFormat must be %q or %q", ProvisioningFormatCloudInit, ProvisioningFormatIgnition)
 	}
-}
-
-// hostPrefixAllowedRune reports whether r may appear in a host installation
-// prefix.
-//
-// The prefix is interpolated into generated systemd units and into a shell
-// script, neither of which quotes it. Rather than adding two kinds of escaping
-// and having to keep them correct in every consumer, the accepted syntax is
-// narrow enough that the value is inert in both contexts: no whitespace, no
-// quoting or substitution characters, and no systemd "%" specifiers.
-func hostPrefixAllowedRune(r rune) bool {
-	switch {
-	case r >= 'a' && r <= 'z':
-		return true
-	case r >= 'A' && r <= 'Z':
-		return true
-	case r >= '0' && r <= '9':
-		return true
-	case r == '/' || r == '.' || r == '_' || r == '-':
-		return true
-	default:
-		return false
-	}
-}
-
-// ValidateHostPrefix checks that a configured host installation prefix is an
-// absolute, normalized path that can hold a bin and libexec directory, and that
-// it is safe to interpolate into the assets generated from it. An empty prefix
-// is valid and selects the default.
-func ValidateHostPrefix(prefix string) error {
-	trimmed := strings.TrimSpace(prefix)
-	if trimmed == "" {
-		return nil
-	}
-
-	if !filepath.IsAbs(trimmed) {
-		return fmt.Errorf("HostPrefix must be an absolute path")
-	}
-
-	if cleaned := filepath.Clean(trimmed); cleaned != trimmed {
-		return fmt.Errorf("HostPrefix must be a normalized path, for example %s", cleaned)
-	}
-
-	if trimmed == "/" {
-		return fmt.Errorf("HostPrefix must not be the filesystem root")
-	}
-
-	// Report the offending character rather than only the rule, because the
-	// caller cannot otherwise tell which byte of a long path was rejected.
-	for _, r := range trimmed {
-		if !hostPrefixAllowedRune(r) {
-			return fmt.Errorf(
-				"HostPrefix may only contain letters, digits, '/', '.', '_' and '-', but contains %q",
-				r,
-			)
-		}
-	}
-
-	return nil
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -318,10 +247,6 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
-		errs = append(errs, err)
-	}
-
-	if err := ValidateHostPrefix(a.HostPrefix); err != nil {
 		errs = append(errs, err)
 	}
 

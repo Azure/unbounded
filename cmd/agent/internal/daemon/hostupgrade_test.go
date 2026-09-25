@@ -22,7 +22,7 @@ func TestHostDaemonActivationServicePreflightRejectsMachineOperationSignal(t *te
 
 	service := NewHostDaemonActivationService(discardLogger(), goalstates.AgentUpgradePaths{
 		SignalPath: signalPath,
-	}, goalstates.ResolveHostPaths(""))
+	})
 	_, err := service.Preflight(context.Background(), filepath.Join(dir, "unbounded-agent-current"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "MachineOperation signal exists")

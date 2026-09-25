@@ -335,7 +335,7 @@ func TestConfigRegenerationUnit(t *testing.T) {
 	require.Contains(t, out, "Wants=systemd-udev-settle.service")
 	require.Contains(t, out, "After=systemd-udev-settle.service")
 	require.Contains(t, out, "Type=oneshot")
-	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start kube1")
+	require.Contains(t, out, "ExecStart=/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start kube1")
 	require.NotContains(t, out, "ExecStart=-")
 	require.NotContains(t, out, "if [ ! -x")
 	require.Contains(t, out, "Restart=on-failure")
@@ -349,7 +349,7 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
-	require.Contains(t, buf.String(), "ExecStartPost=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
+	require.Contains(t, buf.String(), "ExecStartPost=/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
 	require.NotContains(t, buf.String(), "ExecStartPost=-")
 	require.NotContains(t, buf.String(), "if [ ! -x")
 }
@@ -369,7 +369,7 @@ func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
+		AgentBinaryPath:              "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle",
 	}
 }
 
@@ -500,22 +500,24 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
 }
 
-// TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper writes the generated
-// units from a goal state and checks they invoke the helper it resolved.
+// TestWriteNSpawnConfigsInvokeTheHelperUnderTheHostRoot writes the generated
+// units and checks they invoke the helper where the host root puts it.
 //
-// These units are the only callers of the helper. If they name the default
-// while the helper is installed under a prefix, nothing fails until systemd
-// starts the machine and the hook cannot exec, which surfaces as a machine that
-// will not start rather than as an installation error.
+// These units are the only callers of the helper. If they name the legacy
+// location while the helper is installed under the host root, nothing fails
+// until systemd starts the machine and the hook cannot exec.
 //
 // This goes through writeNSpawnConfigs rather than rendering the templates from
 // hand-built data, because the defect being guarded against is the population
 // step reverting to the constant. A test that supplies its own template data
 // passes either way.
-func TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper(t *testing.T) {
+func TestWriteNSpawnConfigsInvokeTheHelperUnderTheHostRoot(t *testing.T) {
 	t.Parallel()
 
-	const helper = "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle"
+	helper := goalstates.ResolveHostPaths().NSpawnLifecycleBinary
+	if helper == goalstates.LegacyHostPaths().NSpawnLifecycleBinary {
+		t.Skip("this host's root is linked to the legacy root, so the two cannot be told apart")
+	}
 
 	dir := t.TempDir()
 	goalState := &goalstates.RootFS{
@@ -523,7 +525,6 @@ func TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper(t *testing.T) {
 		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
 		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
 		ConfigRegenerationFile: filepath.Join(dir, "config-regeneration.service"),
-		NSpawnLifecycleBinary:  helper,
 	}
 
 	require.NoError(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState))
@@ -533,9 +534,9 @@ func TestWriteNSpawnConfigsCarriesTheResolvedLifecycleHelper(t *testing.T) {
 		require.NoError(t, err)
 
 		rendered := string(content)
-		require.Contains(t, rendered, helper,
-			"%s must invoke the helper the goal state resolved", filepath.Base(path))
-		require.NotContains(t, rendered, goalstates.NSpawnLifecycleBinaryPath+" nspawn-lifecycle",
-			"%s must not fall back to the default prefix", filepath.Base(path))
+		require.Contains(t, rendered, helper+" nspawn-lifecycle",
+			"%s must invoke the helper under the host root", filepath.Base(path))
+		require.NotContains(t, rendered, goalstates.LegacyHostPaths().NSpawnLifecycleBinary,
+			"%s must not fall back to the legacy root", filepath.Base(path))
 	}
 }

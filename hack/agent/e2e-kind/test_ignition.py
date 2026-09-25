@@ -185,7 +185,7 @@ class TestIgnitionHostBoundaries(unittest.TestCase):
     def _ignition_image():
         return e2e.HostImage(url="file:///x", file_name="x.qcow2", backing_format="qcow2",
                              sudo_group="sudo", packages=[], ssh_user="core",
-                             provisioning="ignition", host_prefix="/opt/unbounded")
+                             provisioning="ignition")
 
     def test_blocked_network_preparation_installs_nothing(self):
         """There is no package manager and /usr is read-only, so the apt/dnf

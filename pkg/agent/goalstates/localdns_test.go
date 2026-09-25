@@ -10,10 +10,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/require"
-
-	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestParseLocalDNSUpstreams(t *testing.T) {
@@ -271,57 +267,5 @@ func TestRenderLocalDNSCorefile(t *testing.T) {
 
 	if count := strings.Count(string(got), "prometheus 10.0.0.7:9253"); count != 1 {
 		t.Fatalf("rendered Corefile Prometheus directive count = %d, want 1:\n%s", count, got)
-	}
-}
-
-// TestResolveLocalDNSResolvesTheNetworkHelperFromThePrefix covers the value the
-// generated unit's ExecStart is built from.
-//
-// The unit template reading this field is checked where the template lives, but
-// that test supplies the field itself and so proves nothing about where the
-// value comes from. This is the other half: that the resolution actually
-// consults the configured prefix rather than defaulting.
-func TestResolveLocalDNSResolvesTheNetworkHelperFromThePrefix(t *testing.T) {
-	t.Parallel()
-
-	files := map[string][]byte{
-		hostResolvConfPath:            []byte("search example.test\nnameserver 127.0.0.53\n"),
-		systemdResolvedResolvConfPath: []byte("nameserver 10.0.0.5\n"),
-	}
-	deps := localDNSResolverDeps{
-		readFile: func(path string) ([]byte, error) { return files[path], nil },
-		resolvedDomains: func() (string, error) {
-			return "Global:\nLink 2 (eth0): ~.\n", nil
-		},
-	}
-
-	for name, tc := range map[string]struct {
-		prefix string
-		want   string
-	}{
-		"unset prefix keeps the historical path": {
-			prefix: "",
-			want:   "/usr/local/libexec/unbounded-localdns-network",
-		},
-		"configured prefix moves the helper": {
-			prefix: "/opt/unbounded",
-			want:   "/opt/unbounded/libexec/unbounded-localdns-network",
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := resolveLocalDNSWith(deps, &config.AgentConfig{
-				MachineName: "agent-e2e",
-				NodeName:    "node-1",
-				HostPrefix:  tc.prefix,
-				Cluster:     config.AgentClusterConfig{ClusterDNS: "10.0.0.10"},
-				Kubelet:     config.AgentKubeletConfig{ApiServer: "https://10.0.0.1:6443"},
-				LocalDNS:    &config.AgentLocalDNSConfig{Enabled: true},
-			}, nil)
-			require.NoError(t, err)
-			require.True(t, got.Enabled)
-			require.Equal(t, tc.want, got.NetworkHelper)
-		})
 	}
 }

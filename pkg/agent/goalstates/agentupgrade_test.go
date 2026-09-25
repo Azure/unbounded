@@ -40,7 +40,7 @@ func TestResolvedAgentUpgradePaths(t *testing.T) {
 	t.Setenv(EnvDaemonBinaryLastGood, lastGoodPath)
 	t.Setenv(EnvDaemonAgentUpgradeSignalPath, signalPath)
 
-	paths, err := ResolvedAgentUpgradePathsFor("")
+	paths, err := ResolvedAgentUpgradePaths()
 	require.NoError(t, err)
 
 	assert.Equal(t, binaryPath, paths.BinaryPath)
@@ -56,12 +56,13 @@ func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
 	t.Setenv(EnvDaemonBinary, "")
 	t.Setenv(EnvDaemonBinaryBlue, " ")
 
-	paths, err := ResolvedAgentUpgradePathsFor("")
+	paths, err := ResolvedAgentUpgradePaths()
 	require.NoError(t, err)
 
-	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
-	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
-	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath)
+	binDir := ResolveHostPaths().BinDir
+	assert.Equal(t, filepath.Join(binDir, "unbounded-agent"), paths.BinaryPath)
+	assert.Equal(t, filepath.Join(binDir, "unbounded-agent-blue"), paths.BluePath)
+	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath, "the signal is state in the config directory, not part of the layout")
 }
 
 func TestAgentUpgradePathsNextTargetPathUsesGreenWhenCurrentIsBlue(t *testing.T) {
@@ -87,7 +88,7 @@ func TestResolvedAgentUpgradePaths_ResolvesCurrentTarget(t *testing.T) {
 	t.Setenv(EnvDaemonBinary, binaryPath)
 	t.Setenv(EnvDaemonBinaryCurrent, currentPath)
 
-	paths, err := ResolvedAgentUpgradePathsFor("")
+	paths, err := ResolvedAgentUpgradePaths()
 
 	require.NoError(t, err)
 	assert.Equal(t, currentTargetPath, paths.CurrentTargetPath)
@@ -97,99 +98,8 @@ func TestResolvedAgentUpgradePaths_CurrentTargetFallsBackToBinaryPath(t *testing
 	t.Setenv(EnvDaemonBinary, "/agent")
 	t.Setenv(EnvDaemonBinaryCurrent, filepath.Join(t.TempDir(), "missing-current"))
 
-	paths, err := ResolvedAgentUpgradePathsFor("")
+	paths, err := ResolvedAgentUpgradePaths()
 
 	require.NoError(t, err)
 	assert.Equal(t, "/agent", paths.CurrentTargetPath)
-}
-
-// TestResolvedAgentUpgradePathsForPrefix covers the reason the prefix-aware
-// entry point exists: a host whose /usr is read-only cannot hold the agent's
-// own binaries under /usr/local, so they move with the prefix.
-//
-// The signal path deliberately does not move. It is state about an upgrade
-// rather than part of the installed layout, and it lives under the agent config
-// directory, which is writable on such hosts.
-func TestResolvedAgentUpgradePathsForPrefix(t *testing.T) {
-	paths, err := ResolvedAgentUpgradePathsFor("/opt/unbounded")
-	require.NoError(t, err)
-
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent", paths.BinaryPath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-blue", paths.BluePath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-green", paths.GreenPath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-current", paths.CurrentPath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-last-good", paths.LastGoodPath)
-	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath)
-}
-
-// TestResolvedAgentUpgradePathsForDefaultMatchesLegacyConstants pins that a host
-// which configures no prefix resolves exactly what this package resolved before
-// the prefix existed.
-//
-// These paths are baked into generated systemd units and into the blue-green
-// symlinks on every host already in the field. If the default drifted, an
-// upgraded agent would look for its binaries somewhere the installed host does
-// not have them, and the daemon would fail to start with nothing having changed
-// on disk.
-func TestResolvedAgentUpgradePathsForDefaultMatchesLegacyConstants(t *testing.T) {
-	paths, err := ResolvedAgentUpgradePathsFor("")
-	require.NoError(t, err)
-
-	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
-	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
-	assert.Equal(t, DaemonBinaryGreenPath, paths.GreenPath)
-	assert.Equal(t, DaemonBinaryCurrentPath, paths.CurrentPath)
-	assert.Equal(t, DaemonBinaryLastGoodPath, paths.LastGoodPath)
-	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath)
-}
-
-// TestDeprecatedResolvedAgentUpgradePathsStillWorks keeps the compatibility
-// promise honest. The entry point is deprecated rather than removed because it
-// is published from pkg/, and callers outside this repository compose their own
-// phases from it.
-func TestDeprecatedResolvedAgentUpgradePathsStillWorks(t *testing.T) {
-	//nolint:staticcheck // Exercising the deprecated entry point is the point.
-	legacy, err := ResolvedAgentUpgradePaths()
-	require.NoError(t, err)
-
-	current, err := ResolvedAgentUpgradePathsFor("")
-	require.NoError(t, err)
-
-	assert.Equal(t, current, legacy, "the deprecated entry point must stay equivalent to an empty prefix")
-}
-
-// TestResolvedAgentUpgradePathsForEnvOverridesWinOverPrefix covers the
-// interaction the two inputs have with each other, which neither of the tests
-// above reaches: every one of those either sets overrides with no prefix, or a
-// prefix with no overrides.
-//
-// The doc on ResolvedAgentUpgradePathsFor promises overrides win. The nspawn
-// lifecycle hooks depend on that: they pin a specific binary through an upgrade
-// by naming it in the environment, and a prefix silently taking precedence
-// would repoint them at whichever slot happens to be active.
-func TestResolvedAgentUpgradePathsForEnvOverridesWinOverPrefix(t *testing.T) {
-	dir := t.TempDir()
-	pinned := filepath.Join(dir, "pinned-agent")
-	pinnedCurrent := filepath.Join(dir, "pinned-current")
-
-	t.Setenv(EnvDaemonBinary, pinned)
-	t.Setenv(EnvDaemonBinaryCurrent, pinnedCurrent)
-
-	paths, err := ResolvedAgentUpgradePathsFor("/opt/unbounded")
-	require.NoError(t, err)
-
-	// Overridden: the environment names an exact file, which is more particular
-	// than a directory to look in.
-	assert.Equal(t, pinned, paths.BinaryPath)
-	assert.Equal(t, pinnedCurrent, paths.CurrentPath)
-
-	// Not overridden: these still come from the prefix, so a partial override
-	// does not drag the rest back to the default.
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-blue", paths.BluePath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-green", paths.GreenPath)
-	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-last-good", paths.LastGoodPath)
-
-	// The current link does not resolve, so the target falls back to the
-	// overridden binary rather than to anything under the prefix.
-	assert.Equal(t, pinned, paths.CurrentTargetPath)
 }

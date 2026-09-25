@@ -4,14 +4,11 @@
 package nodestart
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -63,31 +60,4 @@ func TestLocalDNSReadyRejectsFailureStatus(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("localDNSReady() error = %v", err)
 	}
-}
-
-// TestLocalDNSNetworkUnitExecutesTheResolvedHelper pins the agreement between
-// the unit and the script it runs.
-//
-// The helper is written under the installation prefix and the unit is the only
-// thing that executes it. When the unit carried a fixed path, a host with a
-// prefix got a unit pointing into a directory the script was never written to,
-// and the failure only appears when systemd runs the unit during node start.
-func TestLocalDNSNetworkUnitExecutesTheResolvedHelper(t *testing.T) {
-	t.Parallel()
-
-	const helper = "/opt/unbounded/libexec/unbounded-localdns-network"
-
-	var unit bytes.Buffer
-	require.NoError(t, assetsTemplate.ExecuteTemplate(&unit, "unbounded-localdns-network.service", map[string]string{
-		"MachineName":       "kube1",
-		"NodeListenerIP":    "169.254.10.10",
-		"ClusterListenerIP": "169.254.10.11",
-		"NetworkHelper":     helper,
-	}))
-
-	rendered := unit.String()
-	require.Contains(t, rendered, "ExecStart="+helper)
-	require.NotContains(t, rendered, "/usr/local/libexec",
-		"the unit must not carry a path from the default prefix")
-	require.NotContains(t, rendered, "{{", "template must be fully resolved")
 }

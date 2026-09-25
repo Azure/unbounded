@@ -1,7 +1,8 @@
 # Agent e2e: local and CI
 
-`e2e.py` defines shared `setup`, `lifecycle`, `configuration`, and `fresh-bootstrap`
-suites. Run `e2e.py list-suite --suite lifecycle` to inspect the exact sequence.
+`e2e.py` defines shared `setup`, `lifecycle`, `configuration`, `fresh-bootstrap`,
+`bootstrap-recovery`, and `migration` suites. Run
+`e2e.py list-suite --suite lifecycle` to inspect the exact sequence.
 The host lifecycle includes existing upgrade/rollback, reset/reinstall, and repave
 operations plus an unassisted host reboot with fresh node identity and workload/DNS.
 Persistent DNS failure is fatal after bounded convergence retries.
@@ -24,11 +25,10 @@ preserved environment. Same-disk reinstall checks host boot identity.
 image with no package manager, so nothing is installed at boot and the image
 must already carry what the agent needs. It does.
 
-Because `/usr/local` is a real directory inside that read-only `/usr` rather
-than a symlink to somewhere writable, the agent is installed under
-`/opt/unbounded` instead. The harness passes that prefix to
-`manual-bootstrap --host-prefix` and asserts against it throughout, including
-the reset cleanup.
+`/usr/local` is a real directory inside that read-only `/usr` rather than a
+symlink to somewhere writable, so an agent released before the host root cannot
+be installed there. The current agent installs under `/opt/unbounded` on every
+host, which is on the writable root filesystem here.
 
 Provisioning is Ignition rather than cloud-init, which inverts the usual order.
 An Ignition config is applied before the host boots and has to carry the
@@ -89,3 +89,19 @@ additional batches from consuming memory. Commands have bounded execution and
 CI's monitor records host resources before the suite deadline, leaving time for
 diagnostic collection and upload. These tests exercise main's existing lifecycle;
 they do not assert resumable bootstrap or introduce new recovery operations.
+
+## Host root migration
+
+The `migration` suite starts from a host installed by the last release before
+the host root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its
+GitHub release by the install script. An AgentUpgrade to this build must link
+`/opt/unbounded` to `/usr/local` and leave that release's layout and units as
+they were. The host then reboots, upgrades again, returns to the older release,
+and upgrades once more before a reset, which must remove the link along with
+the files. The older release cannot be installed on an immutable host, so the
+suite needs a cloud-init host:
+
+```sh
+HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+```

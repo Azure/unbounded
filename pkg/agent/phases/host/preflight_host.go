@@ -75,9 +75,9 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckExistingDeploymentFor(log, cfg.HostPrefix),
+		CheckExistingDeployment(log),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
-		CheckHostOSConfigurationFor(log, cfg.HostPrefix),
+		CheckHostOSConfiguration(log),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
@@ -174,24 +174,12 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 	}}
 }
 
-// CheckHostOSConfiguration verifies host OS configuration paths are writable,
-// assuming the default installation prefix.
-//
-// Deprecated: use CheckHostOSConfigurationFor. On a host with a read-only /usr
-// the default prefix is not writable, so this reports such a host as unusable
-// even when its configured prefix is fine.
+// CheckHostOSConfiguration verifies host OS configuration paths are writable.
 func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
-	return CheckHostOSConfigurationFor(log, "")
+	return checkHostOSConfiguration(log, defaultHostCheckDeps())
 }
 
-// CheckHostOSConfigurationFor verifies host OS configuration paths, including
-// the agent install directory under the given installation prefix, are
-// writable.
-func CheckHostOSConfigurationFor(log *slog.Logger, prefix string) preflight.Checker {
-	return checkHostOSConfiguration(log, defaultHostCheckDeps(), prefix)
-}
-
-func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps, prefix string) preflight.Checker {
+func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
 
@@ -218,7 +206,7 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps, prefix strin
 			))
 		}
 
-		results = append(results, installDirResults(log, agentInstallDirs(prefix), deps)...)
+		results = append(results, installDirResults(log, agentInstallDirs(), deps)...)
 
 		if len(results) > 0 {
 			return results
@@ -233,14 +221,11 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps, prefix strin
 }
 
 // agentInstallDirs returns the host directories the agent writes its own files
-// into. Resolved from the installation prefix rather than restated, so the
-// check cannot drift from where the agent actually installs.
-//
-// The prefix matters here more than anywhere else this is asked. On a host that
-// configures one, the default is read-only, so checking it reports a host that
-// cannot be provisioned when it can, and bootstrap never starts.
-func agentInstallDirs(prefix string) []string {
-	return []string{goalstates.ResolveHostPaths(prefix).BinDir}
+// into. Derived from the host layout rather than restated, so the check cannot
+// drift from where the agent actually installs. Planned rather than resolved,
+// because preflight does not migrate the host root.
+func agentInstallDirs() []string {
+	return []string{goalstates.PlannedHostPaths().BinDir}
 }
 
 // installDirResults verifies the agent can write its own host-side files.

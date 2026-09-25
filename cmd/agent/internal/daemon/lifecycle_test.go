@@ -4,6 +4,8 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,60 +21,41 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-// TestRenderDaemonAssetFollowsThePrefix renders the three daemon assets under
-// both prefixes and asserts every path they carry sits under the one asked for.
+// TestRenderDaemonAsset renders the three daemon assets and checks every path
+// they carry comes from the same host root.
 //
-// The recovery unit is the case that motivated this. Its ExecStart is the only
-// reference to the recovery script, so a render that resolved the script from
-// the default while installing it under the prefix would produce a unit that
-// points at a file that is not there. Nothing else would notice until recovery
-// was needed, which is the worst time to find out.
-//
-// Resolving both layouts from the same prefix here is what the production
-// callers do, so the test fails if they are ever resolved independently.
-func TestRenderDaemonAssetFollowsThePrefix(t *testing.T) {
+// The recovery unit's ExecStart is the only reference to the recovery script, so
+// a render that took the script from one root while the binaries came from
+// another would produce a unit that points at a file that is not there. Nothing
+// else would notice until recovery was needed.
+func TestRenderDaemonAsset(t *testing.T) {
 	t.Parallel()
 
-	for _, prefix := range []string{"", "/opt/unbounded"} {
-		t.Run("prefix "+goalstates.HostPrefixOrDefault(prefix), func(t *testing.T) {
-			t.Parallel()
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	require.NoError(t, err)
 
-			paths, err := goalstates.ResolvedAgentUpgradePathsFor(prefix)
-			require.NoError(t, err)
+	hostPaths := goalstates.ResolveHostPaths()
+	require.Equal(t, hostPaths.BinDir, filepath.Dir(paths.CurrentPath), "the binaries must be under the host root")
+	require.Equal(t, hostPaths.BinDir, filepath.Dir(hostPaths.DaemonRecoveryScript), "the recovery script must be under the host root")
 
-			hostPaths := goalstates.ResolveHostPaths(prefix)
-			bin := filepath.Join(goalstates.HostPrefixOrDefault(prefix), "bin")
+	service := renderAsset(t, "daemon-service", daemonServiceContent)
+	assert.Contains(t, service, goalstates.DaemonRecoveryUnit)
+	assert.Contains(t, service, paths.CurrentPath+" daemon")
 
-			service := renderAsset(t, "daemon-service", daemonServiceContent, paths, hostPaths)
-			assert.Contains(t, service, goalstates.DaemonRecoveryUnit)
-			assert.Contains(t, service, filepath.Join(bin, "unbounded-agent-current")+" daemon")
+	recoveryUnit := renderAsset(t, "daemon-recovery-service", daemonRecoveryServiceContent)
+	assert.Contains(t, recoveryUnit, "ExecStart="+hostPaths.DaemonRecoveryScript)
 
-			recoveryUnit := renderAsset(t, "daemon-recovery-service", daemonRecoveryServiceContent, paths, hostPaths)
-			assert.Contains(t, recoveryUnit, "ExecStart="+hostPaths.DaemonRecoveryScript)
-			assert.Contains(t, hostPaths.DaemonRecoveryScript, bin)
-
-			script := renderAsset(t, "daemon-recovery-script", daemonRecoveryScriptContent, paths, hostPaths)
-			assert.Contains(t, script, filepath.Join(bin, "unbounded-agent-last-good"))
-			assert.Contains(t, script, goalstates.DaemonUnit)
-			assert.Contains(t, script, "record-agent-upgrade-failure-signal")
-
-			// The signal path is state about an upgrade rather than part of the
-			// installed layout, so it stays put no matter the prefix.
-			assert.Contains(t, script, goalstates.DaemonAgentUpgradeSignalPath)
-		})
-	}
+	script := renderAsset(t, "daemon-recovery-script", daemonRecoveryScriptContent)
+	assert.Contains(t, script, paths.LastGoodPath)
+	assert.Contains(t, script, goalstates.DaemonUnit)
+	assert.Contains(t, script, goalstates.DaemonAgentUpgradeSignalPath)
+	assert.Contains(t, script, "record-agent-upgrade-failure-signal")
 }
 
-func renderAsset(
-	t *testing.T,
-	name string,
-	content []byte,
-	paths goalstates.AgentUpgradePaths,
-	hostPaths goalstates.HostPaths,
-) string {
+func renderAsset(t *testing.T, name string, content []byte) string {
 	t.Helper()
 
-	rendered, err := renderDaemonAssetForPaths(name, content, paths, hostPaths)
+	rendered, err := renderDaemonAsset(name, content)
 	require.NoError(t, err)
 	require.NotContains(t, string(rendered), "{{")
 
@@ -160,7 +143,7 @@ func TestDaemonUnitDeclaresDeferredExitCode(t *testing.T) {
 		LastGoodPath: "/usr/local/bin/unbounded-agent-last-good",
 		BinaryPath:   "/usr/local/bin/unbounded-agent",
 		SignalPath:   "/var/lib/unbounded/agent/upgrade-signal",
-	}, goalstates.ResolveHostPaths(""))
+	})
 	require.NoError(t, err)
 
 	unit := string(rendered)
@@ -264,25 +247,20 @@ func TestFirstBootBootstrapUnitAbsentIsSuccess(t *testing.T) {
 	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), t.TempDir()))
 }
 
-// TestInstallBootstrapBinaryInstallsUnderThePrefix covers the first host
+// TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks covers the first host
 // mutation of a bootstrap.
 //
 // PrepareHost is the earliest stage that writes anything, and it writes the
-// daemon binary. Installing it under the default while every later stage
-// resolves the prefix would leave the binary somewhere nothing looks, on the
-// one kind of host where the default is not writable at all.
-//
-// The already-usable check has to follow the prefix for the same reason: asking
-// about the default would report a fresh host as already installed whenever the
-// default happens to hold an executable of that name.
-func TestInstallBootstrapBinaryInstallsUnderThePrefix(t *testing.T) {
-	prefix := t.TempDir()
+// daemon binary. It has to land at the path the rest of the install resolves,
+// including an environment override, or VerifyDaemonInstalled looks elsewhere.
+func TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks(t *testing.T) {
+	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
+	t.Setenv(goalstates.EnvDaemonBinary, installed)
 
-	require.NoError(t, InstallBootstrapBinary(prefix))
+	require.NoError(t, InstallBootstrapBinary())
 
-	installed := filepath.Join(prefix, "bin", "unbounded-agent")
 	info, err := os.Stat(installed)
-	require.NoError(t, err, "binary must land under the configured prefix")
+	require.NoError(t, err, "binary must land at the resolved path")
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 }
 
@@ -290,12 +268,12 @@ func TestInstallBootstrapBinaryInstallsUnderThePrefix(t *testing.T) {
 // host that already has a usable binary keeps it, so a repair does not replace
 // the slot an upgrade activated.
 func TestInstallBootstrapBinaryKeepsAnExistingBinary(t *testing.T) {
-	prefix := t.TempDir()
-	installed := filepath.Join(prefix, "bin", "unbounded-agent")
+	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
+	t.Setenv(goalstates.EnvDaemonBinary, installed)
 
 	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
 	require.NoError(t, os.WriteFile(installed, []byte("incumbent"), 0o755))
-	require.NoError(t, InstallBootstrapBinary(prefix))
+	require.NoError(t, InstallBootstrapBinary())
 
 	data, err := os.ReadFile(installed)
 	require.NoError(t, err)
@@ -306,36 +284,32 @@ func TestInstallBootstrapBinaryKeepsAnExistingBinary(t *testing.T) {
 // present but non-executable file is the state a half-finished install leaves
 // behind, and repair has to be able to get past it.
 func TestInstallBootstrapBinaryReplacesAnUnusableBinary(t *testing.T) {
-	prefix := t.TempDir()
-	installed := filepath.Join(prefix, "bin", "unbounded-agent")
+	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
+	t.Setenv(goalstates.EnvDaemonBinary, installed)
 
 	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
 	require.NoError(t, os.WriteFile(installed, []byte("not executable"), 0o644))
-	require.NoError(t, InstallBootstrapBinary(prefix))
+	require.NoError(t, InstallBootstrapBinary())
 
 	data, err := os.ReadFile(installed)
 	require.NoError(t, err)
 	assert.NotEqual(t, "not executable", string(data), "an unusable binary must be replaced")
 }
 
-// TestRemoveAgentArtifactsSweepsEveryPrefix runs the teardown against a
-// temporary tree and checks it removes the agent's files from both the
-// configured prefix and the default.
-//
-// Sweeping only one of them orphans the files under the other, and a recovery
-// script left behind there refuses the next bootstrap, on a host the operator
-// was just told is clean.
-func TestRemoveAgentArtifactsSweepsEveryPrefix(t *testing.T) {
+// TestRemoveAgentArtifactsRemovesTheRootLast runs the teardown against a
+// temporary tree. On a migrated host the files are reached through the link
+// the root is, so removing the root first would leave them all behind.
+func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	configured := filepath.Join(root, "opt", "unbounded")
-	fallback := filepath.Join(root, "usr", "local")
 
 	var files []string
-	for _, prefix := range []string{configured, fallback} {
-		files = append(files, goalstates.OwnedHostFiles(prefix)...)
+	for _, name := range []string{"bin/unbounded-agent", "bin/unbounded-agent-current", "libexec/unbounded-localdns-network"} {
+		files = append(files, filepath.Join(root, "opt", "unbounded", name))
 	}
+
+	files = append(files, filepath.Join(root, "usr", "local", "bin", "unbounded-agent-install.sh"))
 
 	for _, path := range files {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
@@ -345,13 +319,25 @@ func TestRemoveAgentArtifactsSweepsEveryPrefix(t *testing.T) {
 	configDir := filepath.Join(root, "etc", "unbounded", "agent")
 	require.NoError(t, os.MkdirAll(configDir, 0o755))
 
-	task := &removeAgentArtifacts{log: discardLogger(), files: files, dirs: []string{configDir}}
-	require.NoError(t, task.Do(t.Context()))
+	rootRemovals := 0
+	task := &removeAgentArtifacts{
+		log:   discardLogger(),
+		files: files,
+		dirs:  []string{configDir},
+		removeRoot: func() error {
+			rootRemovals++
 
-	for _, path := range files {
-		_, err := os.Stat(path)
-		assert.ErrorIs(t, err, os.ErrNotExist, "%s must be removed", path)
+			for _, path := range files {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("%s is still present when the root is removed", path)
+				}
+			}
+
+			return nil
+		},
 	}
+	require.NoError(t, task.Do(t.Context()))
+	assert.Equal(t, 1, rootRemovals, "the root must be removed")
 
 	_, err := os.Stat(configDir)
 	assert.ErrorIs(t, err, os.ErrNotExist, "config directory must be removed")
@@ -361,25 +347,27 @@ func TestRemoveAgentArtifactsSweepsEveryPrefix(t *testing.T) {
 	require.NoError(t, task.Do(t.Context()), "teardown must be repeatable")
 }
 
-// TestRemoveAgentArtifactsIsBuiltFromThePrefix pins the wiring between the
+// TestRemoveAgentArtifactsIsBuiltFromTheHostRoot pins the wiring between the
 // exported constructor and the swept layout, which the test above cannot see
 // because it supplies the list itself.
-func TestRemoveAgentArtifactsIsBuiltFromThePrefix(t *testing.T) {
+func TestRemoveAgentArtifactsIsBuiltFromTheHostRoot(t *testing.T) {
 	t.Parallel()
 
-	task, ok := RemoveAgentArtifacts(discardLogger(), "/opt/unbounded").(*removeAgentArtifacts)
+	task, ok := RemoveAgentArtifacts(discardLogger()).(*removeAgentArtifacts)
 	require.True(t, ok)
 
-	assert.Contains(t, task.files, "/opt/unbounded/bin/unbounded-agent")
-	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent")
+	assert.Contains(t, task.files, filepath.Join(goalstates.ResolveHostPaths().BinDir, "unbounded-agent"))
+	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent", "teardown must not depend on the migration having run")
+	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent-install.sh")
 	assert.Contains(t, task.dirs, goalstates.AgentConfigDir)
+	assert.NotNil(t, task.removeRoot)
 }
 
 // TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent covers the failure that
 // stopped a reset on an immutable host.
 //
-// Teardown sweeps every prefix the host might hold files under, and on such a
-// host one of them is read-only. Unlinking a path that is not there returns
+// Teardown removes the installer scripts from the legacy root on every host,
+// and on such a host that root is read-only. Unlinking a path that is not there returns
 // EROFS rather than ENOENT, because the kernel checks the parent directory for
 // write permission before it resolves the final component, so the ENOENT the
 // old code tolerated never arrived and a reset failed over a file that had

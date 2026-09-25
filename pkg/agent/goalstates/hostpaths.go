@@ -4,23 +4,13 @@
 package goalstates
 
 import (
-	"encoding/json"
-	"errors"
-	"log/slog"
-	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
-// DefaultHostPrefix is the installation prefix used when the agent config does
-// not set one.
-const DefaultHostPrefix = "/usr/local"
-
-// Base names of the agent's own host-side files. They are joined with the
-// resolved prefix rather than being absolute constants so that hosts with a
-// read-only /usr can place them somewhere writable.
+// Base names of the agent's own host-side files, joined with the resolved host
+// root.
 const (
 	daemonBinaryName          = "unbounded-agent"
 	daemonBinaryBlueName      = "unbounded-agent-blue"
@@ -32,17 +22,17 @@ const (
 	localDNSNetworkHelperName = "unbounded-localdns-network"
 )
 
-// HostPaths is the resolved host-side layout of the agent's own files under an
-// installation prefix.
+// HostPaths is the host-side layout of the agent's own files under the
+// resolved host root; see the hostroot package.
 //
 // These are paths on the host. Files inside the nspawn machine are always
-// resolved relative to the machine directory and are unaffected by the prefix.
+// resolved relative to the machine directory.
 type HostPaths struct {
-	// Prefix is the resolved installation prefix.
-	Prefix string
-	// BinDir is <Prefix>/bin.
+	// Root is the resolved host root.
+	Root string
+	// BinDir is <Root>/bin.
 	BinDir string
-	// LibexecDir is <Prefix>/libexec.
+	// LibexecDir is <Root>/libexec.
 	LibexecDir string
 
 	// NSpawnLifecycleBinary is the rollback-stable helper invoked by the
@@ -54,25 +44,30 @@ type HostPaths struct {
 	LocalDNSNetworkHelper string
 }
 
-// HostPrefixOrDefault returns the configured prefix, or DefaultHostPrefix when
-// it is empty.
-func HostPrefixOrDefault(prefix string) string {
-	if trimmed := strings.TrimSpace(prefix); trimmed != "" {
-		return trimmed
-	}
-
-	return DefaultHostPrefix
+// ResolveHostPaths returns the agent's host-side layout on this host.
+func ResolveHostPaths() HostPaths {
+	return hostPathsUnder(hostroot.Resolve())
 }
 
-// ResolveHostPaths returns the host-side agent layout for an installation
-// prefix. An empty prefix selects DefaultHostPrefix.
-func ResolveHostPaths(prefix string) HostPaths {
-	resolved := HostPrefixOrDefault(prefix)
-	binDir := filepath.Join(resolved, "bin")
-	libexecDir := filepath.Join(resolved, "libexec")
+// PlannedHostPaths returns the layout ResolveHostPaths will return once the
+// host root is migrated, without migrating it. It is for code that must not
+// change the host, such as preflight.
+func PlannedHostPaths() HostPaths {
+	return hostPathsUnder(hostroot.Planned(HostRootMarkers()...))
+}
+
+// LegacyHostPaths returns the layout under hostroot.LegacyPath, for the few
+// checks that have to find an installation that has not been migrated yet.
+func LegacyHostPaths() HostPaths {
+	return hostPathsUnder(hostroot.LegacyPath)
+}
+
+func hostPathsUnder(root string) HostPaths {
+	binDir := filepath.Join(root, "bin")
+	libexecDir := filepath.Join(root, "libexec")
 
 	return HostPaths{
-		Prefix:                resolved,
+		Root:                  root,
 		BinDir:                binDir,
 		LibexecDir:            libexecDir,
 		NSpawnLifecycleBinary: filepath.Join(binDir, nspawnLifecycleName),
@@ -81,152 +76,66 @@ func ResolveHostPaths(prefix string) HostPaths {
 	}
 }
 
-// KnownHostPrefixes returns the prefixes that teardown and existing-deployment
-// detection must consider.
+// HostRootMarkers returns the files, relative to the host root, whose presence
+// under hostroot.LegacyPath identifies an unbounded-agent installation from
+// before the host root; pass them to hostroot.Migrate.
 //
-// A host provisioned before the prefix was configurable, or by an agent using a
-// different prefix, still has files under the default. Cleanup and
-// already-provisioned checks therefore look at both, so that changing the
-// prefix cannot orphan files or let a dirty host be silently reprovisioned.
-func KnownHostPrefixes(prefix string) []string {
-	resolved := HostPrefixOrDefault(prefix)
-	if resolved == DefaultHostPrefix {
-		return []string{DefaultHostPrefix}
+// They are the daemon's binary layout only. The installer scripts are written
+// under the legacy root on fresh hosts too, and a helper left behind by an
+// older reset is not an installation.
+func HostRootMarkers() []string {
+	return []string{
+		filepath.Join("bin", daemonBinaryName),
+		filepath.Join("bin", daemonBinaryBlueName),
+		filepath.Join("bin", daemonBinaryGreenName),
+		filepath.Join("bin", daemonBinaryCurrentName),
+		filepath.Join("bin", daemonBinaryLastGoodName),
 	}
-
-	return []string{resolved, DefaultHostPrefix}
 }
 
-// MergeHostPrefixes returns every distinct prefix teardown must sweep, given
-// candidates gathered from different sources.
-//
-// Teardown cannot rely on any single source. The installation record has the
-// prefix from before the first mutation but may be absent on hosts provisioned
-// by an older agent; the applied config has it only once the node started. An
-// empty candidate contributes nothing but never suppresses the default.
-func MergeHostPrefixes(candidates ...string) []string {
-	var (
-		out  []string
-		seen = map[string]struct{}{}
-	)
-
-	add := func(prefix string) {
-		if _, ok := seen[prefix]; ok {
-			return
-		}
-
-		seen[prefix] = struct{}{}
-
-		out = append(out, prefix)
-	}
-
-	for _, candidate := range candidates {
-		if strings.TrimSpace(candidate) == "" {
-			continue
-		}
-
-		for _, prefix := range KnownHostPrefixes(candidate) {
-			add(prefix)
-		}
-	}
-
-	add(DefaultHostPrefix)
-
-	return out
-}
-
-// HostPrefixFromAppliedConfig returns the installation prefix recorded in the
-// applied config of whichever machine is provisioned on this host.
-//
-// Processes started by systemd, such as the agent daemon and the nspawn
-// lifecycle hooks, cannot inherit the prefix from the environment that
-// bootstrapped the host. The applied config is the authoritative record: it is
-// written once at bootstrap and re-read here so that later upgrades and
-// teardown resolve the same paths the bootstrap used.
-//
-// An absent or unreadable config yields the default prefix, which is what a
-// host provisioned before the prefix was configurable actually has on disk.
-//
-// The applied config only exists once the node has started, so this returns the
-// default on a host where bootstrap failed before then. Callers that must be
-// right in that case should ask the installation record first, which carries the
-// same prefix and is written before the first host mutation.
-func HostPrefixFromAppliedConfig(log *slog.Logger) string {
-	return hostPrefixFromAppliedConfigIn(log, AgentConfigDir)
-}
-
-// hostPrefixFromAppliedConfigIn takes the config directory so the lookup can be
-// exercised without reading the real /etc. Without this the only reachable
-// branch in a test is the fallback, and on a provisioned host even that answer
-// depends on what happens to be installed.
-func hostPrefixFromAppliedConfigIn(log *slog.Logger, configDir string) string {
-	for _, name := range []string{NSpawnMachineKube1, NSpawnMachineKube2} {
-		path := appliedConfigPathIn(configDir, name)
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			// A machine that was never provisioned has no applied config, which
-			// is ordinary. Anything else is worth saying out loud, because the
-			// fallback is the one prefix known to be unwritable on a host that
-			// configured one.
-			if log != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Warn("cannot read applied config while resolving the host prefix", "path", path, "error", err)
-			}
-
-			continue
-		}
-
-		// The same integrity check FindActiveMachine applies. The prefix decides
-		// which directories get written to and swept, so a corrupt copy must not
-		// supply it.
-		if err := VerifyChecksum(data, appliedConfigChecksumPathIn(configDir, name)); err != nil {
-			if log != nil {
-				log.Warn("applied config failed its checksum while resolving the host prefix", "path", path, "error", err)
-			}
-
-			continue
-		}
-
-		// Only the prefix is needed here, so decode into the shared config type
-		// rather than a consumer-specific wrapper. Unknown fields are ignored.
-		var cfg config.AgentConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			if log != nil {
-				log.Warn("applied config is unreadable while resolving the host prefix", "path", path, "error", err)
-			}
-
-			continue
-		}
-
-		if prefix := HostPrefixOrDefault(cfg.HostPrefix); prefix != DefaultHostPrefix {
-			return prefix
-		}
-	}
-
-	return DefaultHostPrefix
-}
-
-// Base names of the legacy installer scripts. They are not installed by the
-// agent any more, but hosts provisioned by older versions still carry them and
-// teardown has to remove them.
+// Base names of the installer scripts. The cloud-init variant and netboot write
+// the install script under the legacy root on every host, and older versions
+// left the uninstall script there, so teardown removes both from there.
 const (
 	agentInstallScriptName   = "unbounded-agent-install.sh"
 	agentUninstallScriptName = "unbounded-agent-uninstall.sh"
 )
 
-// OwnedHostFiles returns every file the agent installs under a single prefix,
-// which is what teardown removes.
+// OwnedHostFiles returns every host file outside the config directory that
+// teardown removes: the agent's files under the host root and, when that is not
+// the legacy root, under the legacy root as well, and the installer scripts
+// under the legacy root.
+//
+// The legacy layout is swept on every host so teardown does not depend on the
+// host root having been migrated. Reset is what an operator runs when the
+// migration refuses, and it has to leave the host clean then too.
 //
 // The existing-deployment preflight deliberately checks only a subset: the
 // daemon units and the recovery script. The install script and Ignition both
-// put <prefix>/bin/unbounded-agent in place before preflight runs, so a
-// preflight that checked this whole list would refuse every fresh host.
+// put the agent binary in place before preflight runs, so a preflight that
+// checked this whole list would refuse every fresh host.
 //
 // Environment overrides are deliberately not applied. These are the paths the
 // agent installs to as a matter of layout, and teardown needs to find them on a
 // host whose environment no longer resembles the one that provisioned it.
-func OwnedHostFiles(prefix string) []string {
-	paths := ResolveHostPaths(prefix)
+func OwnedHostFiles() []string {
+	return ownedHostFilesUnder(hostroot.Resolve(), hostroot.LegacyPath)
+}
+
+func ownedHostFilesUnder(root, legacy string) []string {
+	files := layoutFilesUnder(root)
+	if root != legacy {
+		files = append(files, layoutFilesUnder(legacy)...)
+	}
+
+	return append(files,
+		filepath.Join(legacy, "bin", agentInstallScriptName),
+		filepath.Join(legacy, "bin", agentUninstallScriptName),
+	)
+}
+
+func layoutFilesUnder(root string) []string {
+	paths := hostPathsUnder(root)
 
 	return []string{
 		filepath.Join(paths.BinDir, daemonBinaryName),
@@ -237,19 +146,5 @@ func OwnedHostFiles(prefix string) []string {
 		paths.NSpawnLifecycleBinary,
 		paths.DaemonRecoveryScript,
 		paths.LocalDNSNetworkHelper,
-		filepath.Join(paths.BinDir, agentInstallScriptName),
-		filepath.Join(paths.BinDir, agentUninstallScriptName),
 	}
-}
-
-// OwnedHostFilesAcross returns the agent's files under every prefix the host
-// might hold them under, for callers that must not miss a layout left behind by
-// an earlier prefix.
-func OwnedHostFilesAcross(candidates ...string) []string {
-	var out []string
-	for _, prefix := range MergeHostPrefixes(candidates...) {
-		out = append(out, OwnedHostFiles(prefix)...)
-	}
-
-	return out
 }
