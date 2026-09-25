@@ -203,3 +203,13 @@ one active key per represented cache/purpose is required, while a removed scope 
 be absent. A removed key must stop new leases immediately, then await registered
 retirement fences and existing leases. Reappearing retired IDs cannot resurrect old
 material. Retirement is retryable and must retain material if barriers are absent.
+
+## Component verification
+
+Run `cargo test --lib security::` from `cmd/racer-dataplane` for the normal suite.
+During shared application integration, `bash src/security/check-component.sh`
+compiles all actual production modules and their tests except `app`, and runs the
+security tests. It uses the built Cargo dependency artifacts, generates only an
+in-memory test crate, and replaces no cryptography, buffers, queues, or other
+production component with a fake. The component runner is not an end-to-end startup
+or deployment test.
