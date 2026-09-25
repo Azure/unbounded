@@ -97,6 +97,9 @@ library. There are no third-party dependencies yet.
   consume a segment lease alongside the aligned buffer. Submission, staging,
   cancellation accounting, and shutdown fencing remain fail-closed stubs.
 - `control` publishes immutable accepted snapshots and coherent key bundles.
+  Bootstrap returns the local node certificate directly; common Secret bundles
+  contain only peer trust and cache keys. Token-authenticated bootstrap also renews
+  certificates; subsequent snapshot polls use mTLS, not control HTTP signatures.
   One selected worker owns control enrollment; worker handles share node-wide
   snapshot, key-epoch, and replay roots. Bounded dispatch routes work to page owners.
 - `test_support` is test-only. Inline test sections identify the owning contracts;

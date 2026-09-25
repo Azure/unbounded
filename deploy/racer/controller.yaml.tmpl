@@ -1,0 +1,65 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: racer-controller
+  namespace: {{ .Namespace | default "unbounded-system" }}
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: racer-controller
+  template:
+    metadata:
+      labels:
+        app: racer-controller
+    spec:
+      serviceAccountName: racer-controller
+      containers:
+        - name: controller
+          image: {{ .ControllerImage | default "ghcr.io/azure/racer-controller:latest" }}
+          envFrom:
+            - configMapRef:
+                name: racer-config
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: probes
+              containerPort: 8081
+            - name: metrics
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/racer/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: racer-controller-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-controller
+  namespace: {{ .Namespace | default "unbounded-system" }}
+spec:
+  selector:
+    app: racer-controller
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https

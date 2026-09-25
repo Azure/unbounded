@@ -2,7 +2,7 @@
 use crate::{
     control::{
         enrollment::LocalSigningIdentity,
-        wire::{BundleGeneration, CacheKeyRef, CredentialBundle},
+        wire::{BundleGeneration, CacheKeyRef, KeyringBundle},
     },
     error::{Operation, Result, deferred, pending},
     model::{
@@ -38,15 +38,16 @@ impl Keyring {
             epochs,
         }
     }
-    /// Validate bundle identity/generation and key pairing before atomic activation.
+    /// Validate shared bundle cluster/generation before atomic activation.
     /// Missing prior keys request retirement, never immediate deletion. Prepared
     /// keys may decrypt received ciphertext but must not encrypt new fills.
-    pub fn install(
-        &self,
-        _bundle: CredentialBundle,
-        _identities: Vec<LocalSigningIdentity>,
-    ) -> Result<BundleGeneration> {
+    pub fn install(&self, _bundle: KeyringBundle) -> Result<BundleGeneration> {
         pending("keyring.install")
+    }
+    /// Activate locally issued signing identity independently of shared-key epochs.
+    /// Validate the resolved node and preserve leases on retiring local identities.
+    pub fn install_identity(&self, _identity: LocalSigningIdentity) -> Result<()> {
+        pending("keyring.install_identity")
     }
     pub fn lease(
         &self,

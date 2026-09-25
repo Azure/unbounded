@@ -1,0 +1,78 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-controller
+  namespace: {{ .Namespace | default "unbounded-system" }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-dataplane
+  namespace: {{ .Namespace | default "unbounded-system" }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: racer-controller
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["racer.unbounded-cloud.io"]
+    resources: ["clustercaches"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: racer-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: racer-controller
+subjects:
+  - kind: ServiceAccount
+    name: racer-controller
+    namespace: {{ .Namespace | default "unbounded-system" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-controller
+  namespace: {{ .Namespace | default "unbounded-system" }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-controller
+  namespace: {{ .Namespace | default "unbounded-system" }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-controller
+subjects:
+  - kind: ServiceAccount
+    name: racer-controller
+    namespace: {{ .Namespace | default "unbounded-system" }}

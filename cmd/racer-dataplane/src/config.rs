@@ -15,6 +15,9 @@ use std::{path::PathBuf, time::Duration};
 
 pub struct Config {
     pub cluster: ClusterId,
+    /// Resolved by verified bootstrap/local identity recovery before workers start,
+    /// not from a caller-provided UID or the Downward API's node name. Startup
+    /// identity resolution is still unimplemented, like environment loading.
     pub node: NodeId,
     /// Total thread cap, minimum two; odd caps round down to complete worker pairs.
     /// Control and diagnostics run on I/O threads within this budget.

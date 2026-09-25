@@ -161,15 +161,10 @@ impl WorkerApplication {
         let control = if worker == node.control_worker {
             let enrollment = Rc::new(Enrollment::new(
                 config.cluster.clone(),
-                config.node.clone(),
                 config.service_account_token.clone(),
                 config.identity_directory.clone(),
             ));
-            let secrets = SecretWatcher::new(
-                config.secret_directory.clone(),
-                keys.clone(),
-                enrollment.clone(),
-            );
+            let secrets = SecretWatcher::new(config.secret_directory.clone(), keys.clone());
             Some(ControlClient::new(
                 ControlEndpoint {
                     url: config.control_endpoint.clone(),

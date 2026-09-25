@@ -5,6 +5,10 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
+RACER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+RACER_CLUSTER_ID ?=
+RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
+RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
@@ -540,6 +544,31 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
+
+.PHONY: racer-controller racer-controller-build racer-test racer-generate racer-manifests
+racer-controller: racer-test racer-controller-build ## Test and build the Racer controller scaffold
+
+racer-controller-build: ## Build the Racer controller scaffold without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
+
+racer-test: ## Check Racer Go and Rust scaffolds
+	$(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+	cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
+	cargo check --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
+	cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
+
+racer-generate: ## Generate Racer deepcopy and CRD artifacts
+	$(GOCMD) generate ./api/racer/v1alpha1
+
+racer-manifests: ## Render Racer controller scaffold manifests
+	@mkdir -p deploy/racer/rendered/crd
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir deploy/racer --output-dir deploy/racer/rendered \
+		--set Namespace=$(RACER_NAMESPACE) --set ClusterID=$(RACER_CLUSTER_ID) \
+		--set ControllerImage=$(RACER_CONTROLLER_IMAGE) --set DataplaneImage=$(RACER_DATAPLANE_IMAGE)
+	@cp deploy/racer/crd/*.yaml deploy/racer/rendered/crd/
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...

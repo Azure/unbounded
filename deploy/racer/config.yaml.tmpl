@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-config
+  namespace: {{ .Namespace | default "unbounded-system" }}
+data:
+  # Supply one permanent UUID before deployment. Empty fails configuration validation.
+  RACER_CLUSTER_ID: {{ .ClusterID | default "" | quote }}
+  RACER_DATAPLANE_IMAGE: {{ .DataplaneImage | default "ghcr.io/azure/racer-dataplane:latest" | quote }}
+  RACER_CONTROL_URL: "https://racer-controller.{{ .Namespace | default "unbounded-system" }}.svc:8443"
+  RACER_CONTROL_ADDRESS: ":8443"
+  RACER_METRICS_ADDRESS: ":8080"
+  RACER_PROBE_ADDRESS: ":8081"
+  RACER_PEER_PORT: "8082"
+  RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
+  RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
+  RACER_BOOTSTRAP_TRUST_CONFIGMAP: "racer-bootstrap-trust"
+  RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
+  RACER_DAEMONSET_NAME: "racer-dataplane"
+  RACER_ISSUER_SECRET_NAME: "racer-issuer"
+  RACER_KEYRING_SECRET_NAME: "racer-keyring"
+  RACER_VERSION_CONFIGMAP_NAME: "racer-version"

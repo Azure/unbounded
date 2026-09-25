@@ -5,7 +5,8 @@ use super::{
     enrollment::Enrollment,
     secrets::SecretWatcher,
     snapshot::SnapshotStore,
-    wire::{EnrollmentReceipt, EnrollmentRequest, SnapshotRequest, SnapshotResponse},
+    transport::ControlTransport,
+    wire::{EnrollmentRequest, EnrollmentResponse, SnapshotRequest, SnapshotResponse},
 };
 use crate::{
     error::{Operation, deferred},
@@ -19,7 +20,7 @@ pub struct ControlEndpoint {
     pub trust_bundle: PathBuf,
 }
 pub struct ControlClient {
-    endpoint: ControlEndpoint,
+    transport: ControlTransport,
     enrollment: Rc<Enrollment>,
     keys: Rc<Keyring>,
     secrets: SecretWatcher,
@@ -36,7 +37,7 @@ impl ControlClient {
         caches: Rc<CacheRegistry>,
     ) -> Self {
         Self {
-            endpoint,
+            transport: ControlTransport::new(endpoint),
             enrollment,
             keys,
             secrets,
@@ -49,10 +50,11 @@ impl ControlClient {
         &'a self,
         _request: &'a EnrollmentRequest,
         _scope: &'a RequestScope,
-    ) -> Operation<'a, EnrollmentReceipt> {
+    ) -> Operation<'a, EnrollmentResponse> {
         deferred("control.enroll")
     }
-    /// Requires an active mounted certificate and the matching local signing key.
+    /// Requires the locally activated certificate and matching local signing key.
+    /// New/pooled TLS connections must not outlive client certificate validity.
     pub fn poll<'a>(
         &'a self,
         _request: SnapshotRequest,

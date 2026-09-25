@@ -11,7 +11,7 @@ use crate::{
 use std::time::Duration;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const ENROLL_PATH: &str = "/v1/enroll";
+pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 pub const SNAPSHOT_PATH: &str = "/v1/snapshot";
 pub const TOKEN_AUDIENCE: &str = "racer-control";
 pub const MAX_ENROLLMENT_BYTES: usize = 64 * 1024;
@@ -35,7 +35,7 @@ pub const DEFAULT_SHARES: u32 = 4;
 pub struct PublicationSequence(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BundleGeneration(pub u64);
-/// Canonical UUID text on the wire; opaque idempotency identity, not a key ID.
+/// Canonical UUID text on the wire; response correlation, not a durable receipt ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentId(pub String);
 
@@ -61,27 +61,17 @@ pub struct Publication {
 pub struct EnrollmentRequest {
     pub schema_version: u32,
     pub cluster: ClusterId,
-    pub node: NodeId,
     pub enrollment: EnrollmentId,
     pub csr_der: Vec<u8>,
 }
-pub struct EnrollmentReceipt {
+/// Public certificate response. Resolve Node UID from the live token-bound Pod.
+/// Retrying may issue an equivalent certificate; the controller stores no ledger.
+pub struct EnrollmentResponse {
     pub schema_version: u32,
     pub cluster: ClusterId,
     pub node: NodeId,
     pub enrollment: EnrollmentId,
-}
-
-/// Receipt does not deliver a certificate: only the mounted bundle activates it.
-pub struct NodeCertificate {
-    pub enrollment: EnrollmentId,
-    pub state: CertificateState,
     pub certificate_chain: Vec<Vec<u8>>,
-}
-pub enum CertificateState {
-    Pending,
-    Active,
-    Retiring,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKeyPurpose {
@@ -107,14 +97,12 @@ pub struct CacheEncryptionKey {
     pub state: CacheKeyState,
     pub(crate) material: [u8; 32],
 }
-/// One node-specific bundle.json from one coherent projected directory generation.
-/// No signing private keys; missing old encryption keys request local retirement.
-pub struct CredentialBundle {
+/// One common bundle.json from one coherent projected directory generation.
+/// No node certificates/private keys; missing keys request local retirement.
+pub struct KeyringBundle {
     pub schema_version: u32,
     pub cluster: ClusterId,
-    pub node: NodeId,
     pub generation: BundleGeneration,
-    pub certificates: Vec<NodeCertificate>,
     pub peer_trust_roots: Vec<Vec<u8>>,
     pub cache_keys: Vec<CacheEncryptionKey>,
 }

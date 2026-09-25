@@ -1,0 +1,64 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: clustercaches.racer.unbounded-cloud.io
+spec:
+  group: racer.unbounded-cloud.io
+  names:
+    kind: ClusterCache
+    listKind: ClusterCacheList
+    plural: clustercaches
+    shortNames:
+    - rcache
+    singular: clustercache
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterCache names a disposable cache. Its Kubernetes UID is its wire identity.
+          The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterCacheSpec configures a cache's client socket. Origin
+              sockets belong to adapters.
+            properties:
+              socketMode:
+                default: 432
+                description: |-
+                  SocketMode contains Unix permission bits, expressed as a decimal integer.
+                  Paths are derived from metadata.name, never supplied independently.
+                format: int32
+                maximum: 511
+                minimum: 0
+                type: integer
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: name must fit the canonical Unix socket path
+          rule: size(self.metadata.name) <= 82
+    served: true
+    storage: true

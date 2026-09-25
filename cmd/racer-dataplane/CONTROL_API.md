@@ -30,6 +30,11 @@ endpoint during Pod gaps; a new node waits for its first endpoint. Pod readiness
 and disconnection do not change ownership. Invalid annotations reject the proposed
 update with a controller diagnostic, preserving accepted state.
 
+Accepted member history is memory-only. After controller recovery, a node without
+an eligible endpoint or with invalid annotations and no accepted values is omitted
+until its inputs are usable. Missing annotations still use their defaults. Recovery
+can therefore change membership; no accepted-member checkpoints are persisted.
+
 This intentionally replaces `tmp/design.md`'s shares environment variable. There
 is no dataplane shares/alignment override, node-report API, or status-write API.
 
@@ -37,7 +42,7 @@ is no dataplane shares/alignment override, node-report API, or status-write API.
 
 | Operation | Authentication and result |
 | --- | --- |
-| `POST /v1/enroll` | Server-authenticated TLS plus bearer service-account token; returns 202 and an enrollment receipt |
+| `POST /v1/bootstrap` | Server-authenticated TLS plus bearer service-account token; returns 200 with the node certificate chain and resolved Node UID |
 | `GET /v1/snapshot?after=<sequence>` | mTLS; returns 200 and the newest full publication, or 204 after a 30-second wait |
 
 JSON uses snake_case fields, decimal strings for u64 counters, and padded standard
@@ -46,7 +51,7 @@ and certificates. Missing `after` requests the current snapshot immediately.
 Only one poll is outstanding per node. Enrollment bodies, publications, and bundles
 carry `schema_version: 1`. Reject unknown versions, duplicate JSON fields/identities,
 invalid values, and unknown enum variants; ignore unknown object fields.
-Limits: enrollment request/receipt 64 KiB, credential bundle 512 KiB, publication
+Limits: bootstrap request/response 64 KiB, shared keyring bundle 512 KiB, publication
 64 MiB and 100,000 members. Enforce byte limits before allocating decoded state.
 
 Failures have `{ "code": "..." }`: 400 `invalid_request`, 401 `unauthenticated`,
@@ -70,6 +75,15 @@ updates do not. Endpoint/rail updates cannot move ownership: placement uses only
 node IDs and shares. Controller instances serialize durable updates through the
 leader. Loss of counter state requires a new cluster identity and explicit rebootstrap.
 
+Persist only a small version ConfigMap: cluster ID, both counters, and canonical
+publication-content/membership-content hashes (excluding counters). Reconstruct
+goal state from synchronized Kubernetes inputs. Compare hashes, commit changed
+counters with resource-version preconditions, then expose the publication. Never
+serve uncommitted counters. Initial creation is explicit cluster initialization;
+missing established state must not silently recreate counters. No publication
+blobs, member history, or checkpoint chunks are persisted. Only the initialized
+leader serves; leadership loss closes connections and cancels long polls.
+
 Snapshots are complete replacements; reconnects may skip intermediate updates.
 Validate bounds, identities, versions, paths, and resource availability before
 atomically accepting. Equal sequence is an idempotent replay only of identical
@@ -80,29 +94,43 @@ Unknown/evicted memberships fail explicitly. Disconnection preserves accepted
 state; expired credentials prohibit new authenticated work. Cluster mismatch
 requires explicit rebootstrap. Acceptance/reload failures are local diagnostics.
 
-## Enrollment and projected credentials
+## Bootstrap and local signing identity
 
 Generate Ed25519 private keys locally. Persist them in a node-private directory
-outside projected Secrets. Submit cluster ID, Node UID, a UUID enrollment ID, and
-CSR with a projected token whose audience is `racer-control`. The controller checks
-the live bound Pod, its authorized service account, and its Node UID; it never
-trusts the requested node identity alone. Reusing an enrollment ID with identical
-input returns the same receipt; different input conflicts.
+outside projected Secrets. Submit cluster ID, a UUID enrollment ID, and DER CSR
+with a projected token whose audience is `racer-control`. The controller performs
+TokenReview and checks the live bound Pod UID, its authorized service account and
+managed workload, and its assigned Node. It resolves the Node UID authoritatively;
+CSR SANs and caller-supplied identities are never authority. The request contains
+no Node UID, allowing first startup with only a projected token and public trust.
 
-The receipt echoes identities and enrollment ID, not certificate bytes. The
-controller delivers the certificate in that node's Secret as `bundle.json`.
-Certificates bind identity using URI SAN
+The response contains schema_version, cluster, node, enrollment, and
+certificate_chain (a leaf-first array of base64 DER certificates). Enrollment IDs
+correlate replies with locally persisted private keys. Retries may issue equivalent
+certificates; there is no durable receipt ledger or global enrollment-ID conflict
+check. Certificates bind identity using URI SAN
 `spiffe://<cluster-uuid>/node/<node-uid>` and permit control client authentication
 and peer signatures. They last 24 hours; begin renewal with a fresh key at 16 hours.
-Validate chain, identity, validity, and local key pairing before activation. Initial
-bootstrap and expired-certificate recovery use enrollment; other operations require
-a valid certificate. Old verification material serves already-admitted traffic.
+Validate response correlation, chain, identity, validity, and local key pairing
+before persisting/activating. Initial bootstrap, renewal, and expired-certificate
+recovery all use the same token-authenticated endpoint with a fresh projected
+token. Old verification material serves already-admitted traffic.
 
-Each bundle carries schema/cluster/Node identity, increasing generation, enrollment-
-tagged certificates (`pending`, `active`, `retiring`), peer trust roots, and
+The HTTPS listener verifies client certificates when supplied; the snapshot route
+requires a verified node identity. Recheck validity/authorization on every request,
+including pooled connections, and bound long polls by certificate expiration.
+Bootstrap can connect without a client certificate, including recovery from an
+expired identity. There are no control HTTP signatures or challenge endpoint.
+TLS authenticates responses. Peer HTTP retains its signature/replay machinery.
+
+## Shared projected keyring
+
+One common Secret carries bundle.json for all dataplanes. It contains schema/cluster
+identity, increasing generation, peer trust roots, and
 cache-scoped keys (`prepared`, `active`, `retiring`). Keys carry IDs, purposes
 (`page`, `origin_credentials`), and 32-byte material. Exactly one active key per
-cache/purpose and one active node certificate are allowed. Prepared keys can
+cache/purpose is allowed. Node certificates and private keys are never in this
+bundle; local signing identity rotates independently. Prepared keys can
 decrypt received ciphertext but cannot encrypt new fills. Peer trust updates do
 not replace deployment bootstrap trust. Read one coherent projected generation;
 malformed updates retain the last valid bundle. Reject generation rollback or
