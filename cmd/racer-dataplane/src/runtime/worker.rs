@@ -12,7 +12,7 @@
 
 use super::{
     admission::Admission,
-    affinity::{current_cpus, pin_cpu, set_cpus, AffinityPlan, WorkerPair},
+    affinity::{AffinityPlan, WorkerPair, current_cpus, pin_cpu, set_cpus},
     crypto::{self, CryptoClient, CryptoPort, IoCryptoPort},
     deadline::{Cancellation, Deadline, RequestScope},
     reactor::{Reactor, ReactorWake},
@@ -1196,10 +1196,12 @@ mod tests {
         };
         let count = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
         engine.register_driver(&Waker::from(count.clone()));
-        assert!(engine
-            ._port
-            .poll_job(&mut Context::from_waker(futures::task::noop_waker_ref()))
-            .is_pending());
+        assert!(
+            engine
+                ._port
+                .poll_job(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                .is_pending()
+        );
         io.close_submissions().unwrap();
         assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

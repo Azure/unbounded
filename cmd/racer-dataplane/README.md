@@ -17,6 +17,9 @@ Constructors connect dependencies without opening files, accepting requests, or
 spawning threads. Activation is explicit through the application lifecycle. See
 [configuration](CONFIGURATION.md) for environment variables, resource limits, and
 startup requirements. Linux io_uring and direct-I/O-capable storage are required.
+See [deployment](DEPLOYMENT.md) for release artifacts, mounts, permissions, and
+trusted local native-port configuration. The Go controller is still a scaffold;
+the dataplane requires a compatible enrollment/publication service.
 
 The optional `rdma` feature loads the separately built native libibverbs adapter.
 See [native adapter](native/README.md) for installation and provider tests. Missing
@@ -154,6 +157,11 @@ in the implementation test environment.
   certificates; subsequent snapshot polls use mTLS, not control HTTP signatures.
   One selected worker owns control enrollment; worker handles share node-wide
   snapshot, key-epoch, and replay roots. Bounded dispatch routes work to page owners.
+- Live key retirement and cache removal use a node-wide quiescent cut. Admission
+  pauses while accepted read, write, crypto, kernel, and native operations finish;
+  recoverable checkpoints are invalidated before omitted keys are destroyed.
+  The control worker alone restores client, peer, and diagnostic listeners.
+  This conservative path temporarily interrupts unrelated caches and diagnostics.
 - `test_support` is test-only. Inline test sections identify the owning contracts;
   implement behavioral tests with each feature, rather than tests of placeholders.
 
@@ -169,3 +177,5 @@ The `designs/` paths above are relative to the repository root. Component
 `INTEGRATION.md` files describe ownership and lifecycle APIs. Passing component
 tests does not establish deployment interoperability or hardware DMA guarantees;
 run the combined suite and applicable native-provider tests for a release.
+`designs/racer-production-validation.md` records real multi-page streaming,
+zero-TTL, cancellation, disk-hit, and memory-pressure validation.

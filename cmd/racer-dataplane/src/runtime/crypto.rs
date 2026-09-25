@@ -523,8 +523,17 @@ impl CryptoClient {
         if self.port.completions.borrow().is_closed() {
             self.port.jobs.discard_closed();
             if self.outstanding() == 0 {
-                let abandoned: Vec<_> = self.waiters.borrow().iter().filter(|(_, waiter)| waiter.abandoned).take(work_budget).map(|(id, _)| *id).collect();
-                for id in abandoned { self.waiters.borrow_mut().remove(&id); }
+                let abandoned: Vec<_> = self
+                    .waiters
+                    .borrow()
+                    .iter()
+                    .filter(|(_, waiter)| waiter.abandoned)
+                    .take(work_budget)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in abandoned {
+                    self.waiters.borrow_mut().remove(&id);
+                }
             }
         }
         // All waits have bounded original deadlines. The worker drives this even

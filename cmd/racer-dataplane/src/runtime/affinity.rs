@@ -624,9 +624,11 @@ mod tests {
             device: "eth0".into(),
             numa_node: Some(1),
         });
-        assert!(AffinityPlan::place(4, mismatch, &[]).unwrap().pairs[0]
-            .nic
-            .is_none());
+        assert!(
+            AffinityPlan::place(4, mismatch, &[]).unwrap().pairs[0]
+                .nic
+                .is_none()
+        );
     }
 
     #[test]

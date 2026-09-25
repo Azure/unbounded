@@ -108,7 +108,7 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   failure; conditional invalidation cannot remove a replacement mapping.
 - Retirement first serializes against checkpoint publication, calls
   writer.retire_key(cache,key) or remove_cache(cache), drains/fences outstanding
-  I/O, and calls checkpoint.invalidate_persisted to remove both recoverable
+  I/O, and awaits checkpoint.invalidate_persisted_async to remove both recoverable
   generations before key release. This sacrifices unrelated cache recovery
   instead of requiring payload scans. The security owner
   additionally drains memory/crypto/peer leases. Tombstone bounds fail closed.
@@ -157,3 +157,7 @@ Checkpoint metadata file opening, bounded reads/writes, and rename currently run
 synchronously within the checkpoint/recovery futures. Payload slab reads/writes
 use the reactor. Application scheduling must treat checkpoint publication as a
 maintenance operation; it is not a nonblocking reactor metadata-I/O adapter.
+
+Serving-loop retirement uses `invalidate_persisted_async`: directory opening and
+both generation unlinks are completion-owned reactor filesystem operations.
+Missing files are already invalidated; other errors leave retirement fenced.
