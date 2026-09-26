@@ -53,7 +53,7 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+            use futures::{StreamExt, stream::FuturesUnordered};
             scope.check()?;
             let reactor = self.reactor.as_ref().ok_or(Error::InvalidConfiguration)?;
             let listener = std::net::TcpListener::bind(address).map_err(|_| Error::Io)?;
@@ -67,16 +67,8 @@ impl PeerServer {
                     let _ = active.next().await;
                     continue;
                 }
-                let accept = reactor.accept(fd.clone(), scope).fuse();
-                futures::pin_mut!(accept);
-                let accepted = if active.is_empty() {
-                    accept.await?
-                } else {
-                    futures::select_biased! {
-                        _ = active.next().fuse() => continue,
-                        accepted = accept => accepted?,
-                    }
-                };
+                let accepted =
+                    next_accepted(reactor.accept(fd.clone(), scope), &mut active, scope).await?;
                 let connection = match crate::http::pool::ConnectionLease::from_accepted(
                     accepted,
                     &self.admission,
@@ -366,6 +358,31 @@ impl PeerServer {
         })
     }
 }
+/// Drain completed connections without abandoning the outstanding accept, which
+/// may already own a successful result that has not been consumed yet.
+async fn next_accepted<A, C>(
+    accept: A,
+    active: &mut futures::stream::FuturesUnordered<C>,
+    scope: &RequestScope,
+) -> crate::error::Result<std::os::fd::OwnedFd>
+where
+    A: std::future::Future<Output = crate::error::Result<std::os::fd::OwnedFd>>,
+    C: std::future::Future,
+{
+    use futures::{FutureExt, StreamExt};
+    let accept = accept.fuse();
+    futures::pin_mut!(accept);
+    loop {
+        scope.check()?;
+        if active.is_empty() {
+            return accept.await;
+        }
+        futures::select_biased! {
+            _ = active.next().fuse() => continue,
+            accepted = accept => return accepted,
+        }
+    }
+}
 fn header_scope(
     scope: &RequestScope,
     timeout: Duration,
@@ -382,6 +399,288 @@ fn header_scope(
 mod tests {
     use super::*;
     use crate::{model::identity::RequestId, test_support::clock::Clock};
+    use futures::{channel::oneshot, stream::FuturesUnordered};
+    use std::{
+        cell::Cell,
+        future::Future,
+        io::{Read, Write},
+        os::fd::OwnedFd,
+        os::unix::net::UnixStream,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    #[derive(Default)]
+    struct AcceptCounts {
+        created: Cell<usize>,
+        dropped: Cell<usize>,
+        consumed: Cell<usize>,
+        polled: Cell<usize>,
+    }
+    struct CountedAccept<F> {
+        future: Pin<Box<F>>,
+        counts: Rc<AcceptCounts>,
+    }
+    impl<F> CountedAccept<F> {
+        fn new(future: F, counts: &Rc<AcceptCounts>) -> Self {
+            counts.created.set(counts.created.get() + 1);
+            Self {
+                future: Box::pin(future),
+                counts: counts.clone(),
+            }
+        }
+    }
+    impl<F: Future<Output = crate::error::Result<OwnedFd>>> Future for CountedAccept<F> {
+        type Output = F::Output;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.counts.polled.set(self.counts.polled.get() + 1);
+            let result = self.future.as_mut().poll(cx);
+            if matches!(result, Poll::Ready(Ok(_))) {
+                self.counts.consumed.set(self.counts.consumed.get() + 1);
+            }
+            result
+        }
+    }
+    impl<F> Drop for CountedAccept<F> {
+        fn drop(&mut self) {
+            self.counts.dropped.set(self.counts.dropped.get() + 1);
+        }
+    }
+    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+    }
+    fn listener_scope() -> RequestScope {
+        RequestScope::new(RequestId([6; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+    }
+    fn assert_counts(counts: &AcceptCounts, dropped: usize, consumed: usize) {
+        assert_eq!(counts.created.get(), 1);
+        assert_eq!(counts.dropped.get(), dropped);
+        assert_eq!(counts.consumed.get(), consumed);
+    }
+    fn drive<T>(reactor: &crate::runtime::reactor::Reactor, future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let watchdog = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Poll::Ready(result) = poll(future.as_mut()) {
+                return result;
+            }
+            assert!(Instant::now() < watchdog, "accept did not finish");
+            reactor.poll_budgeted(128).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn accept_survives_pending_and_ready_connection_completions() {
+        for ready in [false, true] {
+            for (completions, remaining) in [(0, 0), (1, 0), (4, 0), (4, 1)] {
+                let scope = listener_scope();
+                let counts = Rc::new(AcceptCounts::default());
+                let (send_accept, receive_accept) = oneshot::channel();
+                let accept = CountedAccept::new(async { receive_accept.await.unwrap() }, &counts);
+                let mut active = FuturesUnordered::new();
+                let finished = Rc::new(Cell::new(0));
+                let mut send_completions = Vec::new();
+                for _ in 0..completions + remaining {
+                    let (send, receive) = oneshot::channel::<()>();
+                    send_completions.push(send);
+                    let finished = finished.clone();
+                    active.push(async move {
+                        receive.await.unwrap();
+                        finished.set(finished.get() + 1);
+                        Err::<(), _>(Error::DeadlineExceeded)
+                    });
+                }
+                let _pending_completion = if remaining == 1 {
+                    send_completions.pop()
+                } else {
+                    None
+                };
+                let mut work = Box::pin(next_accepted(accept, &mut active, &scope));
+                assert!(poll(work.as_mut()).is_pending());
+                assert_counts(&counts, 0, 0);
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let mut send_accept = Some(send_accept);
+                let mut socket = Some(socket);
+                if ready {
+                    // A successful, unconsumed accept and every completion become
+                    // ready before the next poll of the production helper.
+                    send_accept
+                        .take()
+                        .unwrap()
+                        .send(Ok(socket.take().unwrap().into()))
+                        .unwrap();
+                    for send in send_completions.drain(..) {
+                        send.send(()).unwrap();
+                    }
+                } else {
+                    // Separate polls prove repeated completions keep the same
+                    // pending accept, including the transition to empty active.
+                    for (i, send) in send_completions.drain(..).enumerate() {
+                        send.send(()).unwrap();
+                        assert!(poll(work.as_mut()).is_pending());
+                        assert_eq!(finished.get(), i + 1);
+                        assert_counts(&counts, 0, 0);
+                    }
+                    send_accept
+                        .take()
+                        .unwrap()
+                        .send(Ok(socket.take().unwrap().into()))
+                        .unwrap();
+                }
+                let Poll::Ready(Ok(fd)) = poll(work.as_mut()) else {
+                    panic!("retained accept must return its socket");
+                };
+                assert_eq!(finished.get(), completions);
+                drop(work);
+                assert_eq!(active.len(), remaining);
+                assert_counts(&counts, 1, 1);
+                // The exact accepted endpoint remains usable until its one
+                // returned owner is dropped, then the peer observes EOF.
+                let mut accepted = UnixStream::from(fd);
+                peer.write_all(b"x").unwrap();
+                let mut byte = [0];
+                accepted.read_exact(&mut byte).unwrap();
+                assert_eq!(&byte, b"x");
+                drop(accepted);
+                assert_eq!(peer.read(&mut byte).unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn accept_scope_cancellation_and_drop_dispose_unconsumed_result_once() {
+        for ready in [false, true] {
+            for cancel in [false, true] {
+                let scope = listener_scope();
+                let counts = Rc::new(AcceptCounts::default());
+                let (send_accept, receive_accept) = oneshot::channel();
+                let accept = CountedAccept::new(async { receive_accept.await.unwrap() }, &counts);
+                let (send_completion, receive_completion) = oneshot::channel::<()>();
+                let mut active = FuturesUnordered::new();
+                active.push(receive_completion);
+                let mut work = Box::pin(next_accepted(accept, &mut active, &scope));
+                assert!(poll(work.as_mut()).is_pending());
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                if ready {
+                    send_accept.send(Ok(socket.into())).unwrap();
+                } else {
+                    drop(socket);
+                }
+                if cancel {
+                    scope.cancel().unwrap();
+                    send_completion.send(()).unwrap();
+                    assert!(matches!(
+                        poll(work.as_mut()),
+                        Poll::Ready(Err(Error::Cancelled))
+                    ));
+                }
+                drop(work);
+                assert_counts(&counts, 1, 0);
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn accept_error_propagates_after_draining_completions() {
+        let scope = listener_scope();
+        let counts = Rc::new(AcceptCounts::default());
+        let accept = CountedAccept::new(std::future::ready(Err(Error::Io)), &counts);
+        let mut active = FuturesUnordered::new();
+        active.push(std::future::ready(Err::<(), _>(Error::DeadlineExceeded)));
+        let result = futures::executor::block_on(next_accepted(accept, &mut active, &scope));
+        assert!(matches!(result, Err(Error::Io)));
+        assert!(active.is_empty());
+        assert_counts(&counts, 1, 0);
+        assert_eq!(counts.polled.get(), 1);
+    }
+
+    #[test]
+    fn real_accept_retains_socket_and_fences_cancellation_and_abandonment() {
+        use crate::runtime::reactor::Reactor;
+        use std::net::{TcpListener, TcpStream};
+
+        for ready in [false, true] {
+            for end in ["consume", "cancel", "drop"] {
+                let admission = Rc::new(Admission::new(
+                    crate::test_support::cluster::config(false).limits,
+                ));
+                let reactor = Reactor::new(admission.clone());
+                reactor.init().unwrap();
+                let baseline = admission.used(ResourceClass::RequestContext);
+                let scope = listener_scope();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let fd = Rc::new(OwnedFd::from(listener));
+                let weak = Rc::downgrade(&fd);
+                let counts = Rc::new(AcceptCounts::default());
+                let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
+                let (send, receive) = oneshot::channel::<()>();
+                let mut active = FuturesUnordered::new();
+                active.push(receive);
+                let mut work = Box::pin(next_accepted(accept, &mut active, &scope));
+                assert!(poll(work.as_mut()).is_pending());
+                reactor.poll_budgeted(128).unwrap();
+                let mut peer = None;
+                if ready {
+                    peer = Some(TcpStream::connect(address).unwrap());
+                    // Reap the real successful accept without polling its owner.
+                    drive(
+                        &reactor,
+                        futures::future::poll_fn(|_| {
+                            if reactor.in_flight() == 0 {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        }),
+                    );
+                }
+                if end == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                send.send(()).unwrap();
+                if end == "consume" {
+                    if !ready {
+                        assert!(poll(work.as_mut()).is_pending());
+                        assert_counts(&counts, 0, 0);
+                        assert_eq!(reactor.in_flight(), 1);
+                        peer = Some(TcpStream::connect(address).unwrap());
+                    }
+                    let accepted = drive(&reactor, work.as_mut()).unwrap();
+                    let mut accepted = TcpStream::from(accepted);
+                    accepted.write_all(b"x").unwrap();
+                    let mut byte = [0];
+                    peer.as_mut().unwrap().read_exact(&mut byte).unwrap();
+                    assert_eq!(&byte, b"x");
+                    drop(accepted);
+                } else if end == "cancel" {
+                    assert!(matches!(
+                        poll(work.as_mut()),
+                        Poll::Ready(Err(Error::Cancelled))
+                    ));
+                }
+                drop(work);
+                assert_counts(&counts, 1, usize::from(end == "consume"));
+                if !ready && end != "consume" {
+                    assert_eq!(reactor.in_flight(), 1);
+                    assert!(weak.upgrade().is_some());
+                    assert!(admission.used(ResourceClass::RequestContext) > baseline);
+                }
+                drive(&reactor, reactor.drain()).unwrap();
+                assert_eq!(reactor.in_flight(), 0);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+                if let Some(mut peer) = peer {
+                    peer.set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn header_budget_is_fixed_per_exchange_and_preserves_listener_cancellation() {

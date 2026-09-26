@@ -47,6 +47,8 @@ header cap does not bound the whole response or reset the signed request budget.
 Challenge and handshake responses retain the listener scope. The listener uses
 bounded concurrent connection tasks. Each task serves sequential pooled exchanges.
 Errors close that connection and do not stop other connections.
+The listener retains one outstanding accept across connection task completions,
+including when its accepted socket is ready but has not yet been consumed.
 
 Install exact immutable membership snapshots on every worker and retire old entries
 only after acquisition policy stops issuing requests for those versions. Replacing
@@ -92,7 +94,9 @@ credential preservation across a relay, replay and attempt substitution rejectio
 deadline/cancellation preservation, authenticated copy-only dispatch and signed
 failure replies, capability tampering, and real TCP partial ciphertext bodies with
 pool reuse and truncated-body rejection. Header timeout tests cover silent/partial
-peers, idle keepalive, healthy reuse, response deadline isolation, shorter listener
+peers, idle keepalive, healthy reuse, dispatch deadline preservation, shorter listener
 deadlines, cancellation, and admission retention through completion fences.
+Accept-loop tests exercise the production selection helper across pending and ready
+accepts, concurrent connection completions, cancellation, and abandonment.
 They are under `peer::tests`, `peer::server::tests`, and
 `peer::wire::tests`; run `cargo test --lib peer::` and the all-feature variant.
