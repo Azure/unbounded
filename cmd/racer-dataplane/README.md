@@ -69,25 +69,79 @@ The contention suite's contract is a primary 2,000-node workload plus generated
 scenario tests. It is an internal test module, not a production feature or a
 standalone simulator binary. The scale model uses real `Admission`/`Reservation`
 accounting with metadata-only page `Arc` ownership. Logical page sizes charge
-quota without allocating page payloads. Queues use bounded FIFO admission and a
-bounded discrete-event simulation. Quotas are **per worker**; increasing the
-worker count also increases aggregate modeled capacity unless the scenario
-explicitly adjusts those quotas.
+quota without allocating page payloads. Pipe waiting uses bounded FIFO admission,
+and the discrete-event loop has an event budget (`src/contention.rs:440-483,640-649`).
+Quotas are **per worker**; increasing the worker count also increases aggregate
+modeled capacity unless the scenario explicitly adjusts those quotas. The model
+constructs each worker's limits directly (`src/contention.rs:200-233`); it does not
+exercise production node-budget partitioning or worker sizing (`src/app.rs:219-272`).
+
+Pipe and connection charges use real global admission within each worker, with
+`cache=None`, matching production transport charges. Cache-scoped byte admission
+and fair-share diagnosis also use the real authority
+(`src/contention.rs:265-284,298-334`, `src/runtime/admission.rs:123-156,190-224`,
+`src/memory/pipe.rs:157`, `src/http/pool.rs:411-420`). Request context, however, is a
+synthetic **256-byte charge per request** (`src/contention.rs:15,355-385`), not the
+production parser, waiting, and reactor owners and their allocation lifetimes
+(`src/client/listener.rs:465-471`, `src/memory/pipe.rs:120-130`,
+`src/runtime/reactor.rs:450-470`).
+
+Persistence is deliberately incomplete. The model **omits the padded ciphertext
+staging allocation and the bounded pending write queue**. Every fill with a
+successful dirty reservation schedules a disk task; all such tasks are modeled
+as submitted, non-discardable I/O until their completion event
+(`src/contention.rs:308-310,533-536,607-617,676-679`). Production checks pending
+capacity and reserves exact padded staging before accepting a write
+(`src/store/writer.rs:176-195`), charging that staging to `Ciphertext` via completion
+admission (`src/store/slab.rs:88-95`). Production can also discard/reclaim
+unsubmitted copies and their staging while submitted owners remain fenced
+(`src/store/writer.rs:260-302`). The slow-disk experiment is useful for studying
+dirty pressure and optional persistence shedding (`src/contention/scenarios.rs:168-200`),
+but **accepted-write ciphertext pressure and persistence rates are not
+production-equivalent**.
 
 NIC and disk service use serial bandwidth clocks, readers have modeled drain
-rates, and origin traffic contends for a shared origin bandwidth budget. Placement
-is simplified and deterministic. HTTP is an abstraction here: the scale model
-does not transfer real payloads, run network I/O, or perform cryptography. Small
-production-fidelity tests complement the scale model and **do allocate actual
-pages**. Modeled ticks, logical bytes, and admission pressure do not establish
-hardware bandwidth, CPU throughput, or production latency.
+rates, and origin traffic contends for a shared origin bandwidth budget
+(`src/contention.rs:544-561,583-596,607-617`). Warm-source placement selects the
+first live worker in the directory's ordered owner set, and local requests use
+object-number modulo worker count (`src/contention.rs:356,537-543`). These simplify
+production hashing and weighted placement (`src/runtime/worker.rs:174-180`,
+`src/topology/placement.rs:63-69,91-114`). Network partitions affect **new
+acquisitions/source selection only**; they do not interrupt in-progress transfers
+or prevent local hits and joins (`src/contention.rs:489-543,576`). HTTP is an
+abstraction here: the scale model does not transfer real payloads, run network I/O,
+or perform cryptography. **RDMA is not modeled.** Modeled ticks, logical bytes,
+and admission pressure do not establish hardware bandwidth, CPU throughput, or
+production latency.
+
+Small production-fidelity tests complement the scale model and **do allocate
+actual pages**. Owner and reclamation comparisons exercise the simulator's actual
+`Bundle`/`Bundle::idle` and `Simulator::reserve_page`, including busy-owner rejection,
+cache-local eviction, and reservation retry, against production allocation-backed
+pages and `MemoryCache` (`src/contention/fidelity.rs:171-240,242-419`). The dirty
+`Fill` test independently verifies that dirty overload skips persistence while a
+bootstrap read succeeds; it never accepts a disk write
+(`src/contention/fidelity.rs:461-615`). The crypto cancellation test independently
+verifies retained ownership through completion reap against a manually retained
+bundle (`src/contention/fidelity.rs:618-694`). Those narrower contracts do not
+validate the simulator's disk admission, event scheduling, or completion timing.
 
 For a report, capture the command, source revision (`git rev-parse HEAD`), selected
 test names, wrapper limit diagnostics, and complete test output. Record scenario
-configuration and fixed seeds from that revision alongside the observed counters:
-completion/failure/cancellation and retry counts, hits/fills/joins, logical
-origin/peer/delivered/disk bytes, event and request peaks, per-worker quota peaks
-and rejections, final quota usage, latency ticks, and replay trace information.
+configuration and fixed seeds from that revision alongside the printed fields
+(`src/contention.rs:715-741`): `nodes`, `workers`, `submitted`, `completed`, `failed`,
+`canceled`, `ticks`, `events`, `peak_events`, `logical_peak_bytes`, `p50`, `p95`, `p99`,
+`fills`, `hits`, `joined`, `retries`, `skips`, `origin_bytes`, `peer_bytes`,
+`delivered_bytes`, `disk_bytes`, `peak_worker`, `rejections`, and `trace`.
+Latency percentiles cover completed requests in modeled ticks; `skips` counts
+failed dirty reservations, and `disk_bytes` counts scheduled logical ciphertext
+bytes, not padded physical writes (`src/contention.rs:533-536,607-617,666-667,707-714`).
+Request peaks and final quota usage are held in the internal report, not printed
+in this summary; final usage is asserted to be zero (`src/contention.rs:353,694-706`).
+`trace` fingerprints processed event timestamps and sequence numbers only
+(`src/contention.rs:640-651`). It is a **schedule trace fingerprint**, not a hash of
+event contents or simulator state, and not hardware evidence. Generated replay
+tests compare complete reports as well (`src/contention/scenarios.rs:555-575`).
 Label values as simulation results and retain failures as well as successes.
 The commands above are execution examples, not measured results. Require a
 nonzero matching test count: the runner alone does not prove the companion
