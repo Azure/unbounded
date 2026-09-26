@@ -1,5 +1,8 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
+#[path = "production/bootstrap_pressure.rs"]
+mod bootstrap_pressure;
+
 use base64::Engine;
 use racer_dataplane::{
     client::{request::RequestParser, response::Responses},
@@ -284,7 +287,8 @@ fn adapter_connection(
             assert_eq!(key.len(), 64);
             assert!(key.bytes().all(|c| c.is_ascii_hexdigit()));
         } else {
-            assert!(head.contains(&format!("/v1/objects/{} HTTP/1.1", "ab".repeat(32))));
+            let target = head.split_whitespace().nth(1).unwrap();
+            CacheKey::parse_hex(target.strip_prefix("/v1/objects/").unwrap().as_bytes()).unwrap();
         }
         assert_eq!(
             f.get("authorization").map(String::as_str),

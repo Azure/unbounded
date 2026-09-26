@@ -39,6 +39,17 @@ use std::{
     rc::Rc,
 };
 pub trait Origin {
+    /// Consume the read owner's reclaimed and admitted bootstrap plaintext budget.
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        authority: &'a OriginAuthority,
+        context: &'a OriginContext,
+        reservation: Reservation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        drop(reservation);
+        self.bootstrap(authority, context, scope)
+    }
     /// Consume the fill's atomically admitted plaintext budget.
     fn page_reserved<'a>(
         &'a self,
@@ -128,12 +139,29 @@ impl OriginClient {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         scope.check()?;
-        let (admission, buffers) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, _) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
         let reservation = admission.reserve(
             Some(&context.object.cache),
             ResourceClass::Plaintext,
             PAGE_BYTES as usize,
         )?;
+        self.bootstrap_reserved_at(endpoint, context, reservation, scope)
+            .await
+    }
+
+    async fn bootstrap_reserved_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        reservation: Reservation,
+        scope: &RequestScope,
+    ) -> Result<MetadataReply> {
+        scope.check()?;
+        let (admission, buffers) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
+        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        if !admission.owns(&reservation) || reservation.cache() != Some(&context.object.cache) {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut head = request(context, "GET")?;
         head.headers.push(header("Range", b"bytes=0-16777215"));
         let connection = self
@@ -364,6 +392,21 @@ fn resolve_socket(root: &Path, cache: &CacheDefinition) -> Result<PathBuf> {
     Ok(endpoint)
 }
 impl Origin for OriginClient {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        authority: &'a OriginAuthority,
+        context: &'a OriginContext,
+        reservation: Reservation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async move {
+            scope.check()?;
+            authority.validate(&context.object, PageNumber(0))?;
+            let endpoint = self.endpoint(context)?;
+            self.bootstrap_reserved_at(&endpoint, context, reservation, scope)
+                .await
+        })
+    }
     fn page_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

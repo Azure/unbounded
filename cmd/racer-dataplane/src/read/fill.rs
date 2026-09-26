@@ -66,20 +66,40 @@ impl Fill {
         cache: &crate::model::identity::CacheId,
         persist: bool,
     ) -> Result<crate::runtime::admission::FillReservation> {
-        match self.dependencies.admission.reserve_fill(cache, persist) {
-            Ok(reservation) => Ok(reservation),
+        match self
+            .reserve_with_reclamation(|| self.dependencies.admission.reserve_fill(cache, persist))
+        {
+            Err(Error::Overloaded) if persist => {
+                self.dependencies.admission.reserve_fill(cache, false)
+            }
+            result => result,
+        }
+    }
+
+    fn reserve_with_reclamation<T>(&self, reserve: impl Fn() -> Result<T>) -> Result<T> {
+        match reserve() {
             Err(Error::Overloaded) => {
                 self.dependencies.writer.discard_unsubmitted();
                 self.dependencies.memory.evict_idle(usize::MAX)?;
-                match self.dependencies.admission.reserve_fill(cache, persist) {
-                    Err(Error::Overloaded) if persist => {
-                        self.dependencies.admission.reserve_fill(cache, false)
-                    }
-                    result => result,
-                }
+                reserve()
             }
-            Err(error) => Err(error),
+            result => result,
         }
+    }
+
+    /// Fresh metadata has no page identity yet. Admit its page-zero plaintext
+    /// before origin I/O using the same bounded reclamation as ordinary fills.
+    pub(crate) fn reserve_bootstrap(
+        &self,
+        cache: &crate::model::identity::CacheId,
+    ) -> Result<Reservation> {
+        self.reserve_with_reclamation(|| {
+            self.dependencies.admission.reserve(
+                Some(cache),
+                crate::model::limits::ResourceClass::Plaintext,
+                crate::model::range::PAGE_BYTES as usize,
+            )
+        })
     }
     pub fn new(dependencies: FillDependencies) -> Self {
         dependencies

@@ -614,7 +614,10 @@ impl MetadataService {
                 authority.validate(&context.object, PageNumber(0))?;
                 budget.begin_attempt(Instant::now(), scope.deadline.0)?;
                 let acquisition = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
-                    self.origin.bootstrap(&authority, context, scope).await
+                    let reservation = self.storage.fill.reserve_bootstrap(&context.object.cache)?;
+                    self.origin
+                        .bootstrap_reserved(&authority, context, reservation, scope)
+                        .await
                 } else {
                     self.origin
                         .metadata(&authority, context, selector.clone(), scope)

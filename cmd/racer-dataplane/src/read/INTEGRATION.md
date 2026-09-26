@@ -83,6 +83,8 @@ only unsubmitted disposable writes, evict idle memory, retry admission. Busy
 reader/ciphertext leases and submitted writes remain pinned. Dirty-only saturation
 permits memory-only completion. Local disk staging gets one reclamation retry;
 writer enqueue staging overload is disposable and never fails plaintext delivery.
+Fresh origin bootstrap uses Fill::reserve_bootstrap for the same bounded
+reclamation before network work, even when no fresh metadata pointer exists.
 
 ## Composition interfaces
 
@@ -93,6 +95,8 @@ writer enqueue staging overload is disposable and never fails plaintext delivery
   the same policy and budget-aware resolve/bootstrap paths.
 - Origin::page_reserved consumes the fill's plaintext reservation, avoiding a
   second full-page reservation. OriginClient implements this production path.
+- Origin::bootstrap_reserved likewise consumes the read owner's page-zero
+  plaintext reservation. Empty replies and failed operations release that charge.
 - Fill::publish_bootstrap_with_context(origin_page, membership, context, scope,
   budget) joins the shared page-zero flight. Only an elected supplier encrypts the
   prefetch; an existing acquisition wins. Empty objects allocate no page.

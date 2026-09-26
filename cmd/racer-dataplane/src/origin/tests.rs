@@ -794,3 +794,48 @@ fn opaque_request_values_reject_present_empty_and_keep_obs_text() {
     let head = request(&context(), "HEAD").unwrap();
     check_request(&head, "HEAD", None, None, true);
 }
+
+#[test]
+fn reserved_bootstrap_rejects_invalid_charges_before_io_and_releases_them() {
+    let (client, admission, _) = client();
+    let (_, foreign, _) = self::client();
+    let context = context();
+    let wrong_cache = CacheId("other".into());
+    for (owner, cache, class, amount) in [
+        (
+            &foreign,
+            &context.object.cache,
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        ),
+        (
+            &admission,
+            &wrong_cache,
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        ),
+        (
+            &admission,
+            &context.object.cache,
+            ResourceClass::Plaintext,
+            1,
+        ),
+        (
+            &admission,
+            &context.object.cache,
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize,
+        ),
+    ] {
+        let supplied = owner.reserve(Some(cache), class, amount).unwrap();
+        let result = block_on(client.bootstrap_reserved_at(
+            &Endpoint::Unix("does-not-exist".into()),
+            &context,
+            supplied,
+            &scope(),
+        ));
+        assert!(matches!(result, Err(Error::InvalidConfiguration)));
+        assert_eq!(owner.used(class), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}

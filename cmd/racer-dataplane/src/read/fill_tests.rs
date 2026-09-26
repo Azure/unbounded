@@ -722,6 +722,46 @@ fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
 }
 
 #[test]
+fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes =
+        std::num::NonZeroUsize::new(crate::model::range::PAGE_BYTES as usize).unwrap();
+    let mut f = fixture_with(3, Some(limits));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    drop(result);
+    let dependencies = &f.fill.dependencies;
+    assert_eq!(dependencies.writer.queued_count(), 1);
+    assert_eq!(dependencies.memory.evict_idle(usize::MAX), Ok(0));
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    assert_eq!(dependencies.writer.discarded_count(), 1);
+    assert_eq!(dependencies.writer.pending_count(), 0);
+    assert!(dependencies.memory.get(&f.page).unwrap().is_none());
+    assert_eq!(dependencies.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(
+        dependencies.admission.used(ResourceClass::DirtyCiphertext),
+        0
+    );
+    assert_eq!(
+        dependencies.admission.used(ResourceClass::Plaintext),
+        reservation.amount()
+    );
+    drop(reservation);
+    assert_eq!(dependencies.admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
     let mut f = fixture();
     f.origin.reject_once.set(true);
