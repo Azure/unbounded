@@ -11,17 +11,22 @@ pub(super) struct NativePairs {
     ports: Mutex<HashMap<WorkerId, NativePair>>,
 }
 type NativePair = (Option<IoPort>, Option<NativePort>);
+
+pub(super) fn slot_count(limits: &Limits) -> Result<usize> {
+    let charge =
+        crate::rdma::registered::native_slot_charge(crate::rdma::registered::MAX_CIPHERTEXT)?;
+    Ok((limits.registered_bytes.get() / charge)
+        .min(limits.queue_entries.get())
+        .min(256))
+}
+
 impl NativePairs {
     pub(super) fn prepare(
         &self,
         workers: impl Iterator<Item = WorkerId>,
         limits: &Limits,
     ) -> Result<()> {
-        let bytes = crate::rdma::registered::MAX_CIPHERTEXT;
-        let charge = ((bytes + 4095) & !4095) * 2;
-        let slots = (limits.registered_bytes.get() / charge)
-            .min(limits.queue_entries.get())
-            .min(256);
+        let slots = slot_count(limits)?;
         // Insufficient optional native capacity uses HTTP without inventing quota.
         if slots == 0 {
             return Ok(());
@@ -115,6 +120,237 @@ mod tests {
         runtime::crypto::{self, CryptoClient},
         topology::{membership::Member, rails::RailId},
     };
+
+    fn default_config(rdma: bool) -> Config {
+        Config::from_lookup_with_fabric_ports(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                "RACER_ENABLE_RDMA" => Some(rdma.to_string()),
+                _ => None,
+            })
+        })
+        .unwrap()
+        .0
+    }
+
+    fn four_pair_plan(config: &Config) -> AffinityPlan {
+        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        let plan = AffinityPlan::from_topology(
+            config,
+            EffectiveTopology {
+                cpus: (0..8)
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.pairs.len(), 4);
+        plan
+    }
+
+    #[test]
+    fn default_worker_sizing_funds_native_slots_within_node_budgets() {
+        let config = default_config(true);
+        assert_eq!(config.limits.registered_bytes.get(), 128 * 1024 * 1024);
+        let mut plan = four_pair_plan(&config);
+        let limits = size_workers(&config.limits, &mut plan, true).unwrap();
+        assert_eq!(plan.pairs.len(), 3);
+        assert_eq!(plan.max_threads, 8);
+        for (worker, pair) in plan.pairs.iter().enumerate() {
+            assert_eq!(pair.worker, WorkerId(worker as u16));
+        }
+        for (partition, node) in [
+            (limits.plaintext_bytes, config.limits.plaintext_bytes),
+            (limits.ciphertext_bytes, config.limits.ciphertext_bytes),
+            (limits.dirty_bytes, config.limits.dirty_bytes),
+            (limits.registered_bytes, config.limits.registered_bytes),
+            (
+                limits.request_context_bytes,
+                config.limits.request_context_bytes,
+            ),
+            (limits.flights, config.limits.flights),
+            (limits.queue_entries, config.limits.queue_entries),
+            (limits.client_connections, config.limits.client_connections),
+            (limits.pipes, config.limits.pipes),
+            (limits.cached_rankings, config.limits.cached_rankings),
+            (limits.cached_paths, config.limits.cached_paths),
+            (limits.metadata_entries, config.limits.metadata_entries),
+            (limits.relay_transfers, config.limits.relay_transfers),
+        ] {
+            assert_eq!(partition.get(), node.get() / plan.pairs.len());
+            assert!(partition.get() * plan.pairs.len() <= node.get());
+        }
+        assert_eq!(limits.range_window_pages, config.limits.range_window_pages);
+        assert_eq!(limits.replay_entries, config.limits.replay_entries);
+        assert_eq!(
+            limits.connections_per_neighbor,
+            config.limits.connections_per_neighbor
+        );
+
+        let native = NativePairs::default();
+        native
+            .prepare(plan.pairs.iter().map(|p| p.worker), &limits)
+            .unwrap();
+        let mut total = 0;
+        for pair in &plan.pairs {
+            let port = native
+                .io(pair.worker)
+                .unwrap()
+                .expect("funded native worker");
+            assert_eq!(port.capacity(), 1);
+            let devices = Devices::new(Rc::new(Verbs));
+            devices.attach(port).unwrap();
+            let admission = Admission::new(limits.clone());
+            let startup = scope(Duration::from_secs(10)).unwrap();
+            let mut activation = devices.activate(
+                vec![],
+                vec![],
+                &admission,
+                crate::rdma::registered::MAX_CIPHERTEXT,
+                &startup,
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(activation.as_mut().poll(&mut cx).is_pending());
+            let used = admission.used(ResourceClass::Registered);
+            assert_eq!(used, 32 * 1024 * 1024 + 8192);
+            assert!(used <= limits.registered_bytes.get());
+            total += used;
+        }
+        assert!(total <= config.limits.registered_bytes.get());
+    }
+
+    #[test]
+    fn native_worker_sizing_observes_exact_slot_boundaries() {
+        let mut config = default_config(true);
+        let charge = 32 * 1024 * 1024 + 8192;
+        for (budget, expected) in [
+            (1, 0),
+            (16 * 1024 * 1024 + 16, 0),
+            (charge - 1, 0),
+            (charge, 1),
+            (charge + 1, 1),
+            (2 * charge - 1, 1),
+            (2 * charge, 2),
+            (3 * charge - 1, 2),
+            (3 * charge, 3),
+            (4 * charge - 1, 3),
+            (4 * charge, 4),
+            (4 * charge + 3, 4),
+        ] {
+            config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
+            let mut plan = four_pair_plan(&config);
+            let result = size_workers(&config.limits, &mut plan, true);
+            if expected == 0 {
+                assert!(
+                    matches!(result, Err(Error::InvalidConfiguration)),
+                    "budget={budget}"
+                );
+            } else {
+                let limits = result.unwrap();
+                assert_eq!(plan.pairs.len(), expected, "budget={budget}");
+                assert!(slot_count(&limits).unwrap() >= 1);
+                assert!(limits.registered_bytes.get() * expected <= budget);
+            }
+        }
+        let mut plan = four_pair_plan(&config);
+        plan.pairs.clear();
+        assert!(matches!(
+            size_workers(&config.limits, &mut plan, true),
+            Err(Error::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn http_worker_sizing_ignores_unused_native_capacity() {
+        let mut config = default_config(false);
+        for budget in [1, 128 * 1024 * 1024] {
+            config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
+            let mut plan = four_pair_plan(&config);
+            let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+            assert_eq!(plan.pairs.len(), 4);
+            assert_eq!(limits.registered_bytes, config.limits.registered_bytes);
+            assert_eq!(
+                limits.plaintext_bytes.get(),
+                config.limits.plaintext_bytes.get() / 4
+            );
+            // Native sizing must still honor all the existing non-native floors.
+            config.limits.pipes = NonZeroUsize::new(2).unwrap();
+            for rdma in [false, true] {
+                if rdma && budget == 1 {
+                    continue;
+                }
+                let mut plan = four_pair_plan(&config);
+                let limits = size_workers(&config.limits, &mut plan, rdma).unwrap();
+                assert_eq!(plan.pairs.len(), 2);
+                assert_eq!(limits.pipes.get(), 1);
+            }
+            config.limits.pipes = NonZeroUsize::new(16).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_preparation_preserves_slot_caps_and_unfunded_fallback() {
+        let mut limits = default_config(true).limits;
+        let charge = 32 * 1024 * 1024 + 8192;
+        for (budget, queue, expected) in [
+            (charge - 1, 256, 0),
+            (charge, 256, 1),
+            (2 * charge - 1, 256, 1),
+            (3 * charge, 2, 2),
+            (257 * charge, 512, 256),
+        ] {
+            limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
+            limits.queue_entries = NonZeroUsize::new(queue).unwrap();
+            let native = NativePairs::default();
+            native
+                .prepare(std::iter::once(WorkerId(0)), &limits)
+                .unwrap();
+            let port = native.io(WorkerId(0)).unwrap();
+            assert_eq!(port.as_ref().map_or(0, IoPort::capacity), expected);
+        }
+    }
+
+    #[test]
+    fn native_activation_exhaustion_fails_closed_and_rolls_back_partial_quota() {
+        let mut limits = default_config(true).limits;
+        limits.registered_bytes = NonZeroUsize::new(2 * (32 * 1024 * 1024 + 8192)).unwrap();
+        let native = NativePairs::default();
+        native
+            .prepare(std::iter::once(WorkerId(0)), &limits)
+            .unwrap();
+        let port = native.io(WorkerId(0)).unwrap().unwrap();
+        assert_eq!(port.capacity(), 2);
+        let devices = Devices::new(Rc::new(Verbs));
+        devices.attach(port).unwrap();
+        let admission = Admission::new(limits);
+        let held = admission
+            .reserve(None, ResourceClass::Registered, 1)
+            .unwrap();
+        let startup = scope(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(devices.activate(
+                vec![],
+                vec![],
+                &admission,
+                crate::rdma::registered::MAX_CIPHERTEXT,
+                &startup,
+            )),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(admission.used(ResourceClass::Registered), 1);
+        assert!(!devices.ready(RailId(0)));
+        drop(held);
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+    }
 
     fn configured() -> Application {
         let (mut config, ports) = Config::from_lookup_with_fabric_ports(|name| {

@@ -151,10 +151,7 @@ impl Devices {
                 return Err(Error::InvalidConfiguration);
             }
             let port = self.port.borrow().clone().ok_or(Error::Unavailable)?;
-            let charge = bytes_per_slot
-                .checked_add(4095)
-                .and_then(|n| (n & !4095).checked_mul(2))
-                .ok_or(Error::Overloaded)?;
+            let charge = super::registered::native_slot_charge(bytes_per_slot)?;
             // One native registered allocation plus one bounded handoff staging
             // allocation per slot. Both remain charged through native quarantine.
             let quotas = (0..port.capacity())

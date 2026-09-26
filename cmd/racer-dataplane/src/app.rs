@@ -177,24 +177,7 @@ impl Application {
     pub fn run(mut self) -> Result<()> {
         self.config.validate()?;
         let mut plan = AffinityPlan::discover(&self.config)?;
-        // A pair must retain complete page progress reserves. Use fewer pairs if
-        // the configured node budget cannot support every discovered CPU pair.
-        loop {
-            match partition_limits(
-                &self.config.limits,
-                plan.pairs.len(),
-                self.config.enable_rdma,
-            ) {
-                Ok(limits) => {
-                    self.limits = limits;
-                    break;
-                }
-                Err(_) if plan.pairs.len() > 1 => {
-                    plan.pairs.pop();
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
         self.node = Arc::new(NodeState::new(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
@@ -257,7 +240,7 @@ fn partition_limits(node: &Limits, workers: usize, rdma: bool) -> Result<Limits>
         || limits.ciphertext_bytes.get()
             < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES
         || limits.dirty_bytes.get() < page + 16
-        || rdma && limits.registered_bytes.get() < page + 16
+        || rdma && native::slot_count(&limits)? == 0
         || limits.request_context_bytes.get()
             < 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES)
         || limits.queue_entries.get() < 2
@@ -266,6 +249,20 @@ fn partition_limits(node: &Limits, workers: usize, rdma: bool) -> Result<Limits>
         return Err(Error::InvalidConfiguration);
     }
     Ok(limits)
+}
+
+fn size_workers(node: &Limits, plan: &mut AffinityPlan, rdma: bool) -> Result<Limits> {
+    // Every pair needs page progress reserves and, when enabled, a complete native
+    // slot including aligned registered and staging buffers. Reduce pairs to fit.
+    loop {
+        match partition_limits(node, plan.pairs.len(), rdma) {
+            Ok(limits) => return Ok(limits),
+            Err(_) if plan.pairs.len() > 1 => {
+                plan.pairs.pop();
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Enrollment is the only authority for the Node UID. No node-bound service graph

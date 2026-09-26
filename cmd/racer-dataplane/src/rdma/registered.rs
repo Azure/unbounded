@@ -60,6 +60,13 @@ fn registered_charge(length: usize) -> Result<usize> {
         .map(|n| n & !4095)
         .ok_or(Error::Overloaded)
 }
+
+/// A native slot owns both a registered buffer and bounded handoff staging.
+pub(crate) fn native_slot_charge(length: usize) -> Result<usize> {
+    registered_charge(length)?
+        .checked_mul(2)
+        .ok_or(Error::Overloaded)
+}
 impl RegisteredLease {
     pub fn len(&self) -> usize {
         self.region.length()
@@ -96,5 +103,20 @@ mod tests {
         );
         assert_eq!(registered_charge(0), Err(Error::InvalidRange));
         assert_eq!(registered_charge(usize::MAX), Err(Error::InvalidRange));
+    }
+
+    #[test]
+    fn native_slot_quota_includes_aligned_staging_and_registration() {
+        for (length, expected) in [
+            (1, 8192),
+            (4096, 8192),
+            (4097, 16384),
+            (MAX_CIPHERTEXT, 32 * 1024 * 1024 + 8192),
+        ] {
+            assert_eq!(native_slot_charge(length), Ok(expected));
+        }
+        for length in [0, MAX_CIPHERTEXT + 1, usize::MAX] {
+            assert_eq!(native_slot_charge(length), Err(Error::InvalidRange));
+        }
     }
 }

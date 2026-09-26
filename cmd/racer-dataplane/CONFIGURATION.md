@@ -219,8 +219,12 @@ recheck them after partitioning and reduce the pair count if needed):
 - Ciphertext fits `(range_window_pages + 1) * (PAGE_BYTES + 16)` plus the maximum
   record header. This reserves an acquisition/record margin beyond a full window;
   direct-I/O padding is additionally checked against actual alignment at startup.
-- Dirty bytes fit at least one full encrypted page. Registered bytes do likewise
-  when RDMA is enabled; otherwise the registered limit remains positive but unused.
+- Dirty bytes fit at least one full encrypted page. Config checks the same floor
+  for registered bytes when RDMA is enabled. Runtime requires a complete native
+  slot per worker: `2 * round_up_4KiB(PAGE_BYTES + 16)` (32 MiB + 8 KiB), covering
+  the registered and staging buffers. It reduces pairs to fit and rejects a node
+  budget that cannot fund one slot. With RDMA disabled the registered limit remains
+  positive but unused.
 - Headers are at least 1024 bytes. Request context bytes are at least 128 KiB for
   an admitted head, bounded opaque fields, and credential sealing output/scratch.
 - At least two queue entries and two retained snapshots allow data/control and
@@ -245,7 +249,8 @@ recheck them after partitioning and reduce the pair count if needed):
    before constructing Keyring, candidate policy, or other identity-bound workers.
    An empty sentinel must never be sent as identity or used for admission/readiness.
 4. Partition node-wide resource limits, recheck all progress floors per worker,
-   and reduce pair count if necessary. Defaults fund four pairs. Wire partitioned
+   and reduce pair count if necessary. Defaults fund up to four HTTP-only pairs or
+   three pairs with RDMA enabled. Wire partitioned
    `Limits` into `WorkerFactory::limits` and each worker admission/queue/table
    owner, rather than retaining factory fallback defaults. Apply configured
    request, reader-stall, and shutdown deadlines to the
