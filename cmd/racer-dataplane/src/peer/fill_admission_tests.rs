@@ -65,6 +65,7 @@ use std::{
 
 const P: usize = PAGE_BYTES as usize;
 struct Data {
+    metadata_enabled: bool,
     bytes: HashMap<CacheKey, Vec<u8>>,
     calls: RefCell<HashMap<PageId, usize>>,
 }
@@ -76,11 +77,31 @@ impl Origin for Adapter {
     fn metadata<'a>(
         &'a self,
         _: &'a OriginAuthority,
-        _: &'a OriginContext,
+        context: &'a OriginContext,
         _: MetadataSelector,
         _: &'a RequestScope,
     ) -> FutureResult<'a, MetadataReply> {
-        Box::pin(async { panic!("pinned fixture must not refresh") })
+        Box::pin(async move {
+            assert!(
+                self.data.metadata_enabled,
+                "pinned fixture must not refresh"
+            );
+            Ok(MetadataReply {
+                metadata: ObjectMetadata {
+                    version: page(context.object.key, 0).version,
+                    length: self.data.bytes[&context.object.key].len() as u64,
+                    expires_at: ExpiresAt::from_unix_millis(
+                        (SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis()
+                            + 60_000) as u64,
+                    )
+                    .unwrap(),
+                },
+                page_zero: None,
+            })
+        })
     }
     fn page<'a>(
         &'a self,
@@ -132,6 +153,10 @@ impl Origin for Adapter {
     }
 }
 struct Node {
+    coordinator: Rc<Coordinator>,
+    owners: Arc<WorkerDirectory>,
+    client_io: Rc<HttpIo>,
+    responses: Rc<crate::client::response::Responses>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
@@ -335,7 +360,12 @@ fn build_node(
         Rc::new(PipePool::new(admission.clone(), reactor.clone())),
         Duration::from_secs(10),
     ));
-    let streams = Rc::new(RangeStreams::new(fill.clone(), owners, delivery, 2));
+    let streams = Rc::new(RangeStreams::new(
+        fill.clone(),
+        owners.clone(),
+        delivery.clone(),
+        2,
+    ));
     let coordinator = Rc::new(Coordinator::new(
         snapshots,
         metadata,
@@ -348,11 +378,20 @@ fn build_node(
             .with_network(network.clone())
             .with_handshake(handshake.clone()),
     );
-    let server = server::PeerServer::new(io, auth, admission.clone(), coordinator, relay)
+    let server = server::PeerServer::new(io, auth, admission.clone(), coordinator.clone(), relay)
         .with_network(network)
         .with_wire(codec)
         .with_handshake(handshake);
+    let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
+    let responses = Rc::new(crate::client::response::Responses::new(
+        client_io.clone(),
+        delivery,
+    ));
     Node {
+        coordinator,
+        owners,
+        client_io,
+        responses,
         admission,
         reactor,
         crypto,
@@ -368,6 +407,9 @@ fn build_node(
         directory,
     }
 }
+
+#[path = "production_stream_tests.rs"]
+mod production_stream_tests;
 
 #[test]
 #[ignore = "full production Fill/election eight-layer TCP regression: run with --release"]
@@ -488,6 +530,7 @@ fn run(concurrency: usize) {
         bytes.insert(*key, vec![42; P]);
     }
     let data = Rc::new(Data {
+        metadata_enabled: false,
         bytes,
         calls: RefCell::new(HashMap::new()),
     });

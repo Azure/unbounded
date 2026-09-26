@@ -108,6 +108,20 @@ impl CandidatePolicy {
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, CandidateResolution> {
         Box::pin(async move {
+            self.resolve_reserved(candidates, context, operation, scope, budget, &mut None)
+                .await
+        })
+    }
+    pub(crate) fn resolve_reserved<'a>(
+        &'a self,
+        candidates: Candidates,
+        context: &'a OriginContext,
+        operation: PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> Operation<'a, CandidateResolution> {
+        Box::pin(async move {
             scope.check()?;
             let (object, page) = operation_identity(&operation);
             if object != &context.object {
@@ -147,6 +161,7 @@ impl CandidatePolicy {
                         scope,
                         budget,
                         (count - index) as u32,
+                        output,
                     )
                     .await
                 {
@@ -206,6 +221,20 @@ impl CandidatePolicy {
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, Option<VerifiedResponse>> {
         Box::pin(async move {
+            self.remaining_copy_reserved(candidates, context, operation, scope, budget, &mut None)
+                .await
+        })
+    }
+    pub(crate) fn remaining_copy_reserved<'a>(
+        &'a self,
+        candidates: &'a Candidates,
+        context: &'a OriginContext,
+        operation: &'a PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> Operation<'a, Option<VerifiedResponse>> {
+        Box::pin(async move {
             let rank = candidates
                 .ordered
                 .iter()
@@ -223,6 +252,7 @@ impl CandidatePolicy {
                         scope,
                         budget,
                         1,
+                        output,
                     )
                     .await
                 {
@@ -258,6 +288,7 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         remaining_candidates: u32,
+        output: &mut Option<crate::runtime::admission::Reservation>,
     ) -> Result<VerifiedResponse> {
         scope.check()?;
         // Reserve the complete permitted route before sending. Lost responses cannot
@@ -296,7 +327,7 @@ impl CandidatePolicy {
                 deadline: Deadline(deadline),
             },
         };
-        let response = self.peers.request(request, scope).await?;
+        let response = self.peers.request_reserved(request, scope, output).await?;
         scope.check()?;
         Ok(response)
     }

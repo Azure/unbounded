@@ -273,6 +273,115 @@ fn drive<T>(
     panic!("bounded test executor did not complete");
 }
 
+#[test]
+fn consumed_peer_output_reacquires_for_origin_and_honors_cancellation() {
+    struct FailedBody {
+        cancel: bool,
+        calls: Cell<usize>,
+    }
+    impl PeerClient for FailedBody {
+        fn request<'a>(
+            &'a self,
+            _: crate::peer::wire::PeerRequest,
+            _: &'a RequestScope,
+        ) -> Operation<'a, crate::peer::wire::VerifiedResponse> {
+            Box::pin(async { panic!("Fill must pass its output") })
+        }
+        fn request_reserved<'a>(
+            &'a self,
+            _: crate::peer::wire::PeerRequest,
+            scope: &'a RequestScope,
+            output: &'a mut Option<Reservation>,
+        ) -> Operation<'a, crate::peer::wire::VerifiedResponse> {
+            Box::pin(async move {
+                self.calls.set(self.calls.get() + 1);
+                drop(output.take().expect("admitted output"));
+                if self.cancel {
+                    scope.cancel()?;
+                }
+                Err(Error::Io)
+            })
+        }
+    }
+    for cancel in [false, true] {
+        let mut f = fixture();
+        let local = f.membership.members()[0].node.clone();
+        let mut members = f.membership.members().to_vec();
+        members.push(Member {
+            node: crate::model::identity::NodeId("44444444-4444-4444-8444-444444444444".into()),
+            shares: NonZeroU32::new(4).unwrap(),
+            peer_endpoint: "127.0.0.1:8001".into(),
+            rails: vec![],
+            alignment_enabled: false,
+        });
+        f.membership = Arc::new(Membership::validate(f.membership.version, members).unwrap());
+        let placement = Rc::new(Placement::new(256));
+        let key = (0..256u16)
+            .map(|n| CacheKey([n as u8; 32]))
+            .find(|key| {
+                let object = ObjectId {
+                    cache: f.context.object.cache.clone(),
+                    key: *key,
+                };
+                placement
+                    .rank(f.membership.clone(), &object, PageNumber(0))
+                    .unwrap()
+                    .ordered[1]
+                    == local
+            })
+            .unwrap();
+        f.context.object.key = key;
+        f.page.version.object.key = key;
+        // The origin descriptor must name the same immutable object.
+        let origin = Rc::new(TestOrigin {
+            buffers: f.origin.buffers.clone(),
+            calls: Cell::new(0),
+            metadata: ObjectMetadata {
+                version: f.page.version.clone(),
+                ..f.origin.metadata.clone()
+            },
+            reject_once: Cell::new(false),
+        });
+        f.fill.dependencies.origin = origin.clone();
+        let peers = Rc::new(FailedBody {
+            cancel,
+            calls: Cell::new(0),
+        });
+        let candidates = Rc::new(CandidatePolicy::new(local, placement, peers.clone()));
+        candidates.set_credentials(f.fill.dependencies.credentials.clone());
+        f.fill.dependencies.candidates = candidates;
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        );
+        assert_eq!(peers.calls.get(), 1);
+        if cancel {
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(origin.calls.get(), 0);
+        } else {
+            assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+            assert_eq!(origin.calls.get(), 1);
+        }
+        f.fill.dependencies.writer.discard_unsubmitted();
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        assert_eq!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext),
+            0
+        );
+    }
+}
+
 struct GatedMetadataOrigin {
     receive: RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>,
     calls: Cell<usize>,

@@ -1,0 +1,112 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package racersdk
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"testing"
+	"time"
+)
+
+type streamDescriptor struct {
+	RawKey []byte `json:"raw_key"`
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
+}
+
+func TestProductionStreamFixture(t *testing.T) {
+	var descriptor streamDescriptor
+	data, err := os.ReadFile(os.Getenv("RACER_STREAM_LAYERS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(data, &descriptor); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := ParseCacheName("fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := newClient(ClientConfig{Cache: cache, MaxConnections: 4}, os.Getenv("RACER_STREAM_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Second)
+	defer cancel()
+	get := func(d streamDescriptor) *Value {
+		var key Key
+		copy(key[:], d.RawKey)
+		value, err := client.Get(ctx, Request{Key: key})
+		if err != nil {
+			t.Error(err)
+			return nil
+		}
+		return value
+	}
+	small := func(d streamDescriptor) []byte {
+		value := get(d)
+		if value == nil {
+			return nil
+		}
+		defer value.Close()
+		body, err := io.ReadAll(value)
+		if err != nil || int64(len(body)) != d.Size || fmt.Sprintf("sha256:%x", sha256.Sum256(body)) != d.Digest {
+			t.Errorf("object bytes=%d want=%d err=%v", len(body), d.Size, err)
+		}
+		return body
+	}
+	var manifest struct {
+		SchemaVersion int                `json:"schemaVersion"`
+		Config        streamDescriptor   `json:"config"`
+		Layers        []streamDescriptor `json:"layers"`
+	}
+	if err = json.Unmarshal(small(descriptor), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SchemaVersion != 2 || len(manifest.Layers) != 8 {
+		t.Fatal("invalid manifest")
+	}
+	var config struct {
+		Architecture string `json:"architecture"`
+	}
+	if err = json.Unmarshal(small(manifest.Config), &config); err != nil || config.Architecture != "amd64" {
+		t.Fatal("invalid config", err)
+	}
+	for start := 0; start < len(manifest.Layers); start += 4 {
+		var ready, done sync.WaitGroup
+		ready.Add(4)
+		done.Add(4)
+		for _, layer := range manifest.Layers[start : start+4] {
+			go func() {
+				defer done.Done()
+				value := get(layer)
+				if value == nil {
+					ready.Done()
+					return
+				}
+				defer value.Close()
+				hash := sha256.New()
+				n, err := io.CopyN(hash, value, int64(PageSize))
+				ready.Done()
+				ready.Wait()
+				if err == nil {
+					var rest int64
+					rest, err = io.Copy(hash, value)
+					n += rest
+				}
+				if err != nil || n != layer.Size || fmt.Sprintf("sha256:%x", hash.Sum(nil)) != layer.Digest {
+					t.Errorf("layer bytes=%d want=%d err=%v", n, layer.Size, err)
+				}
+			}()
+		}
+		done.Wait()
+	}
+}

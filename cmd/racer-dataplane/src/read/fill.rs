@@ -502,7 +502,7 @@ impl Fill {
         let resolution = self
             .dependencies
             .candidates
-            .resolve_with_budget(
+            .resolve_reserved(
                 crate::topology::placement::Candidates {
                     membership: candidates.membership.clone(),
                     ordered: candidates.ordered.clone(),
@@ -511,6 +511,7 @@ impl Fill {
                 operation,
                 scope,
                 budget,
+                &mut ciphertext,
             )
             .await?;
         let result = match resolution {
@@ -521,6 +522,32 @@ impl Fill {
             }
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, page.number)?;
+                // A failed peer body may have consumed the output reservation.
+                // Reacquire only then, under the same admitted driver's deadline.
+                if ciphertext.is_none() {
+                    ciphertext = Some(
+                        std::future::poll_fn(|cx| {
+                            cancellation.register(cx.waker());
+                            scope.check()?;
+                            if std::time::Instant::now() >= budget.deadline() {
+                                return std::task::Poll::Ready(Err(Error::DeadlineExceeded));
+                            }
+                            match self.dependencies.admission.reserve(
+                                Some(&context.object.cache),
+                                crate::model::limits::ResourceClass::Ciphertext,
+                                crate::model::range::PAGE_BYTES as usize + 16,
+                            ) {
+                                Err(Error::Overloaded) => {
+                                    self.dependencies.writer.discard_unsubmitted();
+                                    self.dependencies.memory.evict_idle(usize::MAX)?;
+                                    std::task::Poll::Pending
+                                }
+                                result => std::task::Poll::Ready(result),
+                            }
+                        })
+                        .await?,
+                    );
+                }
                 budget.begin_attempt(std::time::Instant::now(), scope.deadline.0)?;
                 scope.check()?;
                 match self
@@ -562,7 +589,14 @@ impl Fill {
                         let response = self
                             .dependencies
                             .candidates
-                            .remaining_copy(&candidates, context, &operation, scope, budget)
+                            .remaining_copy_reserved(
+                                &candidates,
+                                context,
+                                &operation,
+                                scope,
+                                budget,
+                                &mut ciphertext,
+                            )
                             .await?
                             .ok_or_else(|| {
                                 self.dependencies.candidates.origin_miss_error(&authority)

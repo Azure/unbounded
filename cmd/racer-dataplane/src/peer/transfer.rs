@@ -54,6 +54,25 @@ impl WireBuffer {
     pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
         (self.bytes.into_vec(), self._reservation)
     }
+    fn reserved(
+        admission: &Admission,
+        cache: &crate::model::identity::CacheId,
+        length: usize,
+        output: &mut Option<Reservation>,
+    ) -> Result<Self> {
+        if length == 0 || length > crate::model::range::PAGE_BYTES as usize + 16 {
+            return Err(Error::InvalidRequest);
+        }
+        let reservation = output.as_ref().ok_or(Error::InvalidConfiguration)?;
+        if !admission.owns(reservation) || reservation.cache() != Some(cache) {
+            return Err(Error::InvalidConfiguration);
+        }
+        reservation.validate(ResourceClass::Ciphertext, length)?;
+        Ok(Self {
+            bytes: vec![0; length].into_boxed_slice(),
+            _reservation: output.take().ok_or(Error::Internal)?,
+        })
+    }
 }
 impl crate::runtime::reactor::sealed::Sealed for WireBuffer {}
 impl IoBuffer for WireBuffer {
@@ -317,6 +336,22 @@ impl Transfers {
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
+            self.exchange_reserved(endpoint, request, plan, scope, &mut None)
+                .await
+        })
+    }
+    /// HTTP receive consumes an admitted Fill output only for a nonempty body.
+    /// Misses and failures before body admission leave it available for another
+    /// candidate or origin. Once submitted, reactor completion owns its lifetime.
+    pub(crate) fn exchange_reserved<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        request: SignedRequest,
+        plan: TransportPlan,
+        scope: &'a RequestScope,
+        output: &'a mut Option<Reservation>,
+    ) -> Operation<'a, SignedResponse> {
+        Box::pin(async move {
             scope.check()?;
             let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
             let head_size = std::iter::once(request.authentication.original.as_ref())
@@ -366,8 +401,12 @@ impl Transfers {
             let (body, reservation) = if length == 0 {
                 (Vec::new(), None)
             } else {
-                let mut buffer =
-                    self.receive_buffer(admission, &request.request.origin.object.cache, length)?;
+                let cache = &request.request.origin.object.cache;
+                let mut buffer = if output.is_some() {
+                    WireBuffer::reserved(admission, cache, length, output)?
+                } else {
+                    self.receive_buffer(admission, cache, length)?
+                };
                 let mut offset = 0;
                 while offset < length {
                     let completion = self
@@ -431,6 +470,48 @@ impl Transfers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reserved_receive_validates_before_taking_the_output() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let other = Admission::new(crate::test_support::cluster::config(false).limits);
+        let cache = crate::model::identity::CacheId("cache".into());
+        let wrong = crate::model::identity::CacheId("wrong".into());
+        for case in ["valid", "owner", "cache", "class", "short", "zero", "long"] {
+            let owner = if case == "owner" { &other } else { &admission };
+            let class = if case == "class" {
+                ResourceClass::Plaintext
+            } else {
+                ResourceClass::Ciphertext
+            };
+            let mut output = Some(
+                owner
+                    .reserve(
+                        Some(if case == "cache" { &wrong } else { &cache }),
+                        class,
+                        32,
+                    )
+                    .unwrap(),
+            );
+            let length = match case {
+                "short" => 33,
+                "zero" => 0,
+                "long" => crate::model::range::PAGE_BYTES as usize + 17,
+                _ => 32,
+            };
+            let result = WireBuffer::reserved(&admission, &cache, length, &mut output);
+            if case == "valid" {
+                assert!(output.is_none());
+                assert_eq!(admission.used(class), 32);
+                drop(result.unwrap());
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert!(output.is_some(), "{case}");
+            }
+            drop(output);
+            assert_eq!(admission.used(class), 0, "{case}");
+            assert_eq!(other.used(class), 0, "{case}");
+        }
+    }
     use crate::{
         memory::pool::BufferPool,
         model::{

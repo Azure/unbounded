@@ -42,6 +42,9 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     identities_with_replay_capacity(100)
 }
 fn identities_with_replay_capacity(capacity: usize) -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
+    named_identities(&[A, B, C], capacity)
+}
+fn named_identities(names: &[&str], capacity: usize) -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -50,7 +53,7 @@ fn identities_with_replay_capacity(capacity: usize) -> (Vec<Rc<Signatures>>, Vec
     let roots = vec![ca.der().to_vec()];
     let mut signers = Vec::new();
     let mut discovery = Vec::new();
-    for name in [A, B, C] {
+    for &name in names {
         let pending = PendingIdentity::generate().unwrap();
         let bytes = pending.export_pkcs8_for_persistence().unwrap();
         let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
@@ -1222,17 +1225,33 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             }),
             hops: vec![],
         };
-        let result = drive(transfers.exchange(
+        let mut output = (attempt != 0).then(|| {
+            admission
+                .reserve(
+                    Some(&CacheId(CACHE.into())),
+                    ResourceClass::Ciphertext,
+                    expected.len(),
+                )
+                .unwrap()
+        });
+        let before = admission.used(ResourceClass::Ciphertext);
+        let result = drive(transfers.exchange_reserved(
             endpoint.clone(),
             wire::SignedRequest {
                 authentication,
                 request: local,
             },
+            crate::topology::rails::TransportPlan::Http,
             &scope,
+            &mut output,
         ));
+        assert!(output.is_none());
         if attempt == 2 {
             assert!(result.is_err());
         } else {
+            if attempt == 1 {
+                assert_eq!(admission.used(ResourceClass::Ciphertext), before);
+            }
             match result.unwrap().response {
                 PeerResponse::Page { ciphertext, .. } => assert_eq!(ciphertext.bytes(), expected),
                 _ => panic!("wrong response"),

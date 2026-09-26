@@ -12,6 +12,16 @@ use crate::{
 };
 use std::rc::Rc;
 pub trait PeerClient {
+    /// Optional pre-admitted output, consumed only when the transport takes it.
+    /// Implementations returning independently owned pages may leave it untouched.
+    fn request_reserved<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        _output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> Operation<'a, VerifiedResponse> {
+        self.request(request, scope)
+    }
     fn request<'a>(
         &'a self,
         request: PeerRequest,
@@ -89,6 +99,14 @@ impl PeerClient for Requester {
         request: PeerRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move { self.request_reserved(request, scope, &mut None).await })
+    }
+    fn request_reserved<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request, scope)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -107,7 +125,7 @@ impl PeerClient for Requester {
                 .negotiate_at(next, request.route.membership, &scope)
                 .await?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
-            let response = self.exchange(signed, &scope).await?;
+            let response = self.exchange_reserved(signed, &scope, output).await?;
             scope.check()?;
             self.forwarding.verify_response(response, &binding)
         })
@@ -118,6 +136,16 @@ impl PeerTransport for Requester {
         &'a self,
         request: SignedRequest,
         scope: &'a RequestScope,
+    ) -> Operation<'a, SignedResponse> {
+        Box::pin(async move { self.exchange_reserved(request, scope, &mut None).await })
+    }
+}
+impl Requester {
+    fn exchange_reserved<'a>(
+        &'a self,
+        request: SignedRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request.request, scope)?;
@@ -157,7 +185,7 @@ impl PeerTransport for Requester {
                 }
             }
             self.transfers
-                .exchange_planned(endpoint, request, plan, &scope)
+                .exchange_reserved(endpoint, request, plan, &scope, output)
                 .await
                 .inspect_err(|error| {
                     // A restarted peer has a new receiver challenge. Rediscover it
