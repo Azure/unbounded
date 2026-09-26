@@ -390,6 +390,77 @@ fn check_request(
 }
 
 #[test]
+fn admitted_origin_waits_for_pool_capacity_and_preserves_scope() {
+    for outcome in ["release", "cancel", "deadline", "closed"] {
+        let (_path, listener, endpoint) = listen();
+        let (client, admission, reactor) = client();
+        let scope = scope();
+        let first = drive(&reactor, client.pool.checkout(&endpoint, &scope)).unwrap();
+        let second = drive(&reactor, client.pool.checkout(&endpoint, &scope)).unwrap();
+        let _first_server = accept(&listener);
+        let _second_server = accept(&listener);
+        let mut waiting_scope = scope.clone();
+        let original_deadline = waiting_scope.deadline;
+        if outcome == "deadline" {
+            waiting_scope.deadline.0 = Instant::now() + Duration::from_millis(20);
+        }
+        let mut waiting = Box::pin(client.checkout(&endpoint, &waiting_scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending(), "{outcome}");
+        assert_eq!(admission.used(ResourceClass::Connection), 2);
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        match outcome {
+            "release" => {
+                drop(first);
+                let connection = drive(&reactor, waiting).unwrap();
+                let _server = accept(&listener);
+                assert_eq!(waiting_scope.deadline.0, original_deadline.0);
+                assert_eq!(admission.used(ResourceClass::Connection), 2);
+                drop(connection);
+            }
+            "cancel" => {
+                waiting_scope.cancel().unwrap();
+                assert!(matches!(drive(&reactor, waiting), Err(Error::Cancelled)));
+                drop(first);
+            }
+            "deadline" => {
+                assert!(matches!(drive(&reactor, waiting), Err(Error::DeadlineExceeded)));
+                drop(first);
+            }
+            "closed" => {
+                client.pool.close();
+                assert!(matches!(drive(&reactor, waiting), Err(Error::Unavailable)));
+                drop(first);
+            }
+            _ => unreachable!(),
+        }
+        drop(second);
+        client.pool.close();
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}
+
+#[test]
+fn bootstrap_under_plaintext_pressure_discovers_metadata_without_allocating_a_page() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+    });
+    let (client, admission, reactor) = client();
+    let held = admission.reserve(None, ResourceClass::Plaintext, admission.limit(ResourceClass::Plaintext)).unwrap();
+    let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context(), &scope())).unwrap();
+    assert_eq!(reply.metadata.length, 3);
+    assert_eq!(reply.metadata.version.etag.as_bytes(), b"\"v\"");
+    assert!(reply.page_zero.is_none());
+    assert_eq!(admission.used(ResourceClass::Plaintext), held.amount());
+    drop(held);
+    client.pool.close();
+    server.join().unwrap();
+}
+
+#[test]
 fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {

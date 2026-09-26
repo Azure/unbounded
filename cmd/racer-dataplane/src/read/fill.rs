@@ -317,14 +317,27 @@ impl Fill {
                 PAGE_BYTES as usize + 16,
             )
         };
-        let ciphertext = match reserve() {
-            Err(Error::Overloaded) => {
-                self.dependencies.writer.discard_unsubmitted();
-                self.dependencies.memory.evict_idle(usize::MAX)?;
-                reserve()?
+        // Bootstrap already owns plaintext. Keep that admitted page while other
+        // streams release ciphertext instead of failing every coalesced reader.
+        // The bounded driver tick retries without spinning or renewing the scope.
+        let cancellation = scope.cancellation.subscribe()?;
+        let ciphertext = std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            let result = match reserve() {
+                Err(Error::Overloaded) => {
+                    self.dependencies.writer.discard_unsubmitted();
+                    self.dependencies.memory.evict_idle(usize::MAX)?;
+                    reserve()
+                }
+                result => result,
+            };
+            match result {
+                Err(Error::Overloaded) => std::task::Poll::Pending,
+                result => std::task::Poll::Ready(result),
             }
-            result => result?,
-        };
+        })
+        .await?;
         let dirty = match self.dependencies.admission.reserve(
             Some(&page.version.object.cache),
             ResourceClass::DirtyCiphertext,

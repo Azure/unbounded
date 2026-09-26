@@ -99,6 +99,27 @@ impl OriginClient {
         self
     }
 
+    // The caller already owns a bounded read driver. Local pool pressure is not
+    // an origin failure: retry admission on the driver tick under the same scope.
+    // Retain a pending connect so its accepted I/O is never restarted by a poll.
+    async fn checkout(&self, endpoint: &Endpoint, scope: &RequestScope) -> Result<ConnectionLease> {
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut pending = None;
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            let future = pending.get_or_insert_with(|| self.pool.checkout(endpoint, scope));
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(Err(Error::Overloaded)) => {
+                    pending = None;
+                    std::task::Poll::Pending
+                }
+                result => result,
+            }
+        })
+        .await
+    }
+
     /// Remap canonical published endpoints to `<root>/<cache name>/origin/socket`.
     /// The deployment root must be an absolute, lexically canonical directory path
     /// without NUL, empty, `.` or `..` components. This performs no filesystem I/O;
@@ -129,15 +150,25 @@ impl OriginClient {
     ) -> Result<MetadataReply> {
         scope.check()?;
         let (admission, buffers) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let reservation = admission.reserve(
+        let reservation = match admission.reserve(
             Some(&context.object.cache),
             ResourceClass::Plaintext,
             PAGE_BYTES as usize,
-        )?;
+        ) {
+            Ok(reservation) => reservation,
+            Err(Error::Overloaded) => {
+                // Discover the version without holding more page bytes. The
+                // coordinator then uses Fill's atomic, reclaiming admission for
+                // page zero, just as it does for a retained metadata hit.
+                return self
+                    .metadata_at(endpoint, context, MetadataSelector::Fresh, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         let mut head = request(context, "GET")?;
         head.headers.push(header("Range", b"bytes=0-16777215"));
         let connection = self
-            .pool
             .checkout(endpoint, scope)
             .await
             .map_err(response_error)?;
@@ -206,7 +237,6 @@ impl OriginClient {
             head.headers.push(header("If-Match", etag.as_bytes()));
         }
         let connection = self
-            .pool
             .checkout(endpoint, scope)
             .await
             .map_err(response_error)?;
@@ -291,7 +321,6 @@ impl OriginClient {
             return Err(Error::InvalidConfiguration);
         }
         let connection = self
-            .pool
             .checkout(endpoint, scope)
             .await
             .map_err(response_error)?;

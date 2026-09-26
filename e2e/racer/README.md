@@ -67,3 +67,29 @@ then verifies full-body SHA-256 and lengths for concurrent readers (default four
 maximum 64). It preserves the cluster and records diagnostics under `tmp/`.
 Rebuild and load the dataplane image, then replace its local pod before testing a
 new candidate; the test itself does not replace the dataplane or controller.
+
+## Full eight-layer image regression
+
+From the repository root, select a retained local e2e kind cluster explicitly:
+
+```sh
+timeout 900s python3 e2e/racer/full-image-kind.py \
+  --kubeconfig /absolute/path/to/retained/kubeconfig --concurrency 64
+```
+
+The script builds a test-only probe image and runs one finite batch inside the
+cluster. The data path is pod -> Gantry Service -> Racer -> in-cluster origin;
+there is no port-forward. Each pull verifies the manifest, config, and all eight
+64 MiB-base layers with 20% deterministic size jitter using the real loadgen
+puller. The `benchmark-v1` image is 542,952,560 bytes including manifest and config.
+Success requires every image, every layer, exact body-byte totals, and zero errors,
+cancellations, or remaining in-flight pulls. Per-pull errors and final counts are
+retained under `tmp/racer-full-image-*`.
+
+Use a new `--seed` for an uncached image and `--direct-origin` for the control
+batch. Each pull has a 90-second deadline, the probe has a 115-second test timeout,
+and the pod has a 120-second active deadline. The script has a 900-second outer
+deadline; build commands are bounded at 600 seconds and all other subprocesses
+at 120 seconds or less. The Gantry ConfigMap is restored and temporary Kubernetes
+resources are deleted in cleanup. The installed dataplane is selected separately,
+so the same probe can compare the base and candidate images.

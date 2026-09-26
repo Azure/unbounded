@@ -802,6 +802,75 @@ fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
 }
 
 #[test]
+fn admitted_bootstrap_waits_for_ciphertext_and_preserves_scope() {
+    for outcome in ["release", "cancel", "deadline"] {
+        let mut f = fixture();
+        let admission = f.fill.dependencies.admission.clone();
+        let held = admission
+            .reserve(
+                None,
+                ResourceClass::Ciphertext,
+                admission.limit(ResourceClass::Ciphertext),
+            )
+            .unwrap();
+        let reservation = admission
+            .reserve(
+                Some(&f.context.object.cache),
+                ResourceClass::Plaintext,
+                crate::model::range::PAGE_BYTES as usize,
+            )
+            .unwrap();
+        let mut plaintext = f
+            .fill
+            .dependencies
+            .buffers
+            .plaintext(reservation, 3)
+            .unwrap();
+        plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
+        let origin = OriginPage {
+            metadata: f.origin.metadata.clone(),
+            plaintext,
+        };
+        let mut scope = f.scope.clone();
+        if outcome == "deadline" {
+            scope.deadline.0 = Instant::now() + Duration::from_millis(20);
+        }
+        let deadline = scope.deadline;
+        let mut future =
+            Box::pin(
+                f.fill
+                    .admit_bootstrap(origin, &f.page, f.membership.clone(), &scope),
+            );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending(), "{outcome}");
+        assert_eq!(f.crypto.outstanding(), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), held.amount());
+        if outcome == "release" {
+            drop(held);
+            let result = drive(future, &mut f.engine, &f.crypto).unwrap();
+            assert_eq!(result.plaintext.bytes(), b"abc");
+            assert_eq!(scope.deadline.0, deadline.0);
+            drop(result);
+        } else {
+            if outcome == "cancel" {
+                scope.cancel().unwrap();
+            } else {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let result = drive(future, &mut f.engine, &f.crypto);
+            assert!(
+                matches!(result, Err(error) if error == if outcome == "cancel" { Error::Cancelled } else { Error::DeadlineExceeded })
+            );
+            drop(held);
+        }
+        f.fill.dependencies.writer.discard_unsubmitted();
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+}
+
+#[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
     let mut f = fixture();
     f.origin.reject_once.set(true);
