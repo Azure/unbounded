@@ -128,49 +128,55 @@ impl IoPort {
     pub fn register_driver(&self, waker: &Waker) {
         self.shared.io.register(waker);
     }
-    pub(crate) fn configure(
+    pub(crate) async fn configure(
         &self,
         publication: Vec<RailMapping>,
         associations: Vec<FabricPort>,
         quotas: Vec<Reservation>,
         bytes: usize,
+        scope: &RequestScope,
     ) -> Result<()> {
-        if self.shared.closed.load(Ordering::Acquire) || quotas.len() != self.capacity() {
-            return Err(Error::Unavailable);
-        }
-        let mut config = self
-            .shared
-            .config
-            .try_lock()
-            .map_err(|_| Error::Overloaded)?;
-        if config.is_some()
-            || self
-                .shared
-                .slots
-                .iter()
-                .any(|s| s.state.load(Ordering::Acquire) != IDLE)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        *self
-            .shared
-            .activation
-            .try_lock()
-            .map_err(|_| Error::Overloaded)? = None;
-        if self.shared.configured.swap(true, Ordering::AcqRel) {
-            return Err(Error::InvalidConfiguration);
-        }
-        *config = Some(Configuration {
+        let mut configuration = Some(Configuration {
             publication,
             associations,
             quotas,
             bytes,
         });
-        self.shared.engine.wake();
-        Ok(())
+        super::verbs::wait(scope, |cx| {
+            self.register_driver(cx.waker());
+            if self.shared.closed.load(Ordering::Acquire)
+                || configuration.as_ref().unwrap().quotas.len() != self.capacity()
+            {
+                return std::task::Poll::Ready(Err(Error::Unavailable));
+            }
+            let mut config = std::task::ready!(super::verbs::try_mailbox(&self.shared.config))?;
+            if config.is_some()
+                || self
+                    .shared
+                    .slots
+                    .iter()
+                    .any(|s| s.state.load(Ordering::Acquire) != IDLE)
+            {
+                return std::task::Poll::Ready(Err(Error::InvalidConfiguration));
+            }
+            let mut activation =
+                std::task::ready!(super::verbs::try_mailbox(&self.shared.activation))?;
+            if self.shared.configured.swap(true, Ordering::AcqRel) {
+                return std::task::Poll::Ready(Err(Error::InvalidConfiguration));
+            }
+            *activation = None;
+            *config = configuration.take();
+            self.shared.engine.wake();
+            std::task::Poll::Ready(Ok(()))
+        })
+        .await
     }
     pub(crate) fn activation(&self) -> Option<Result<Vec<RailMapping>>> {
-        self.shared.activation.try_lock().ok()?.take()
+        match self.shared.activation.try_lock() {
+            Ok(mut activation) => activation.take(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(Error::Io)),
+        }
     }
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
@@ -522,6 +528,10 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
 #[cfg(test)]
 #[path = "receive_tests.rs"]
 mod receive_tests;
+
+#[cfg(test)]
+#[path = "mailbox_tests.rs"]
+mod mailbox_tests;
 
 #[cfg(test)]
 mod tests {

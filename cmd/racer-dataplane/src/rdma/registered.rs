@@ -1,5 +1,9 @@
 //! Registered allocations carry their physical quota through the terminal fence.
-use super::{device::Devices, session::SessionLease, verbs::Region};
+use super::{
+    device::Devices,
+    session::SessionLease,
+    verbs::{Region, wait},
+};
 use crate::{
     error::{Error, Operation, Result},
     runtime::{admission::Admission, deadline::RequestScope},
@@ -24,12 +28,23 @@ impl RegisteredPool {
         // Registered resources are preprovisioned and bound to a session slot.
         Err(Error::Unavailable)
     }
-    pub fn acquire_for(&self, session: &SessionLease, length: usize) -> Result<RegisteredLease> {
-        registered_charge(length)?;
-        let region = Region::acquire(&session.qp, length)?;
-        Ok(RegisteredLease {
-            region,
-            rail: session.rail(),
+    pub fn acquire_for<'a>(
+        &'a self,
+        session: &'a SessionLease,
+        length: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, RegisteredLease> {
+        Box::pin(async move {
+            registered_charge(length)?;
+            let region = wait(scope, |cx| {
+                session.qp.register_waiter(cx);
+                Region::poll_acquire(&session.qp, length)
+            })
+            .await?;
+            Ok(RegisteredLease {
+                region,
+                rail: session.rail(),
+            })
         })
     }
 }
@@ -52,22 +67,18 @@ impl RegisteredLease {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub fn copy_from(&mut self, ciphertext: &[u8]) -> Result<()> {
-        self.region.copy_from(ciphertext)
+    pub fn copy_from<'a>(
+        &'a mut self,
+        ciphertext: &'a [u8],
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(wait(scope, |cx| {
+            self.region.register_waiter(cx);
+            self.region.poll_copy_from(ciphertext)
+        }))
     }
-    pub fn to_vec(&self) -> Result<Vec<u8>> {
-        self.region.copy_to()
-    }
-    pub(crate) fn read<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Vec<u8>> {
-        Box::pin(async move {
-            let cancellation = scope.cancellation.subscribe()?;
-            std::future::poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                scope.check()?;
-                self.region.poll_copy_to(cx)
-            })
-            .await
-        })
+    pub fn to_vec<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Vec<u8>> {
+        Box::pin(wait(scope, |cx| self.region.poll_copy_to(cx)))
     }
 }
 

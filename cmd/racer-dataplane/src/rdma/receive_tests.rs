@@ -96,9 +96,9 @@ fn receive_contended(readback: bool, terminal: Option<Error>) {
         .region
         .copy_from(&[0xa5; 32])
         .unwrap();
-    let grant = transfer
-        .prepare_receive(&session, &envelope, id, &scope)
-        .unwrap();
+    let grant =
+        futures::executor::block_on(transfer.prepare_receive(&session, &envelope, id, &scope))
+            .unwrap();
     native.poll_budgeted(1).unwrap();
     backend::lifetime_tests::complete(1, 0, 5);
     native.poll_budgeted(1).unwrap();

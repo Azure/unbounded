@@ -5,9 +5,40 @@ use crate::error::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, TryLockError, atomic::Ordering},
-    task::{Context, Poll},
+    sync::{Arc, Mutex, MutexGuard, TryLockError, atomic::Ordering},
+    task::{Context, Poll, ready},
 };
+
+// Contention is not admission failure. Callers register wakes and retain owners
+// across Pending; bounded worker ticks cover unlocks without a completion wake.
+pub(crate) fn try_mailbox<T>(mailbox: &Mutex<T>) -> Poll<Result<MutexGuard<'_, T>>> {
+    match mailbox.try_lock() {
+        Ok(guard) => Poll::Ready(Ok(guard)),
+        Err(TryLockError::WouldBlock) => Poll::Pending,
+        Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(Error::Io)),
+    }
+}
+
+pub(crate) async fn wait<T>(
+    scope: &crate::runtime::deadline::RequestScope,
+    mut poll: impl FnMut(&mut Context<'_>) -> Poll<Result<T>>,
+) -> Result<T> {
+    let cancellation = scope.cancellation.subscribe()?;
+    std::future::poll_fn(|cx| {
+        cancellation.register(cx.waker());
+        scope.check()?;
+        poll(cx)
+    })
+    .await
+}
+
+#[cfg(test)]
+fn immediate<T>(poll: Poll<Result<T>>) -> Result<T> {
+    match poll {
+        Poll::Ready(result) => result,
+        Poll::Pending => Err(Error::Overloaded),
+    }
+}
 
 pub struct Verbs;
 impl Verbs {
@@ -37,68 +68,65 @@ pub(crate) struct Region {
     length: usize,
 }
 impl Region {
+    #[cfg(test)]
     pub(crate) fn acquire(qp: &QueuePairHandle, length: usize) -> Result<Rc<Self>> {
+        immediate(Self::poll_acquire(qp, length))
+    }
+    pub(crate) fn poll_acquire(qp: &QueuePairHandle, length: usize) -> Poll<Result<Rc<Self>>> {
         if length == 0 {
-            return Err(Error::InvalidRange);
+            return Poll::Ready(Err(Error::InvalidRange));
         }
-        let mut mailbox = qp
-            .lease
-            .slot
-            .mailbox
-            .try_lock()
-            .map_err(|_| Error::Overloaded)?;
+        if qp.lease.slot.cancel.load(Ordering::Acquire)
+            || qp.lease.shared.closed.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Err(Error::Unavailable));
+        }
+        let mut mailbox = ready!(try_mailbox(&qp.lease.slot.mailbox))?;
         if length > mailbox.bytes.len() || mailbox.length != 0 {
-            return Err(Error::Overloaded);
+            return Poll::Ready(Err(Error::Overloaded));
         }
         mailbox.length = length;
-        Ok(Rc::new(Self {
+        Poll::Ready(Ok(Rc::new(Self {
             lease: qp.lease.clone(),
             length,
-        }))
+        })))
     }
     pub(crate) fn length(&self) -> usize {
         self.length
     }
+    #[cfg(test)]
     pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
+        immediate(self.poll_copy_from(bytes))
+    }
+    pub(crate) fn poll_copy_from(&self, bytes: &[u8]) -> Poll<Result<()>> {
         if bytes.len() != self.length {
-            return Err(Error::InvalidRange);
+            return Poll::Ready(Err(Error::InvalidRange));
         }
-        let mut mailbox = self
-            .lease
-            .slot
-            .mailbox
-            .try_lock()
-            .map_err(|_| Error::Overloaded)?;
-        if mailbox.command.is_some() || self.lease.slot.cancel.load(Ordering::Acquire) {
-            return Err(Error::Unavailable);
+        if self.lease.slot.cancel.load(Ordering::Acquire)
+            || self.lease.shared.closed.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Err(Error::Unavailable));
+        }
+        let mut mailbox = ready!(try_mailbox(&self.lease.slot.mailbox))?;
+        if mailbox.command.is_some() {
+            return Poll::Ready(Err(Error::Unavailable));
         }
         mailbox.bytes[..self.length].copy_from_slice(bytes);
-        Ok(())
+        Poll::Ready(Ok(()))
     }
+    pub(crate) fn register_waiter(&self, cx: &Context<'_>) {
+        self.lease.slot.waiter.register(cx.waker());
+    }
+    #[cfg(test)]
     pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
-        if !self.lease.slot.fenced.load(Ordering::Acquire) {
-            return Err(Error::Unavailable);
-        }
-        let mailbox = self
-            .lease
-            .slot
-            .mailbox
-            .try_lock()
-            .map_err(|_| Error::Overloaded)?;
-        self.copy_bytes(&mailbox)
+        immediate(self.poll_copy_to(&mut Context::from_waker(futures::task::noop_waker_ref())))
     }
     pub(crate) fn poll_copy_to(&self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
         self.lease.slot.waiter.register(cx.waker());
         if !self.lease.slot.fenced.load(Ordering::Acquire) {
             return Poll::Ready(Err(Error::Unavailable));
         }
-        let mailbox = match self.lease.slot.mailbox.try_lock() {
-            Ok(mailbox) => mailbox,
-            // The native role can still hold the mailbox after publishing the
-            // fence. Retry on the bounded lifecycle tick, without blocking I/O.
-            Err(TryLockError::WouldBlock) => return Poll::Pending,
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(Error::Io)),
-        };
+        let mailbox = ready!(try_mailbox(&self.lease.slot.mailbox))?;
         Poll::Ready(self.copy_bytes(&mailbox))
     }
     fn copy_bytes(&self, mailbox: &super::lifecycle::Mailbox) -> Result<Vec<u8>> {
@@ -124,11 +152,22 @@ struct TicketState {
 pub(crate) struct Ticket(Rc<TicketState>);
 impl Ticket {
     pub(crate) fn result(&self) -> Option<Result<()>> {
-        if let Some(result) = self.0.result.get() {
-            return Some(result);
+        match self.poll_result() {
+            Poll::Ready(result) => result,
+            Poll::Pending => None,
         }
-        let mut mailbox = self.0.lease.slot.mailbox.try_lock().ok()?;
-        let result = mailbox.result.take()?;
+    }
+    fn poll_result(&self) -> Poll<Option<Result<()>>> {
+        if let Some(result) = self.0.result.get() {
+            return Poll::Ready(Some(result));
+        }
+        let mut mailbox = match ready!(try_mailbox(&self.0.lease.slot.mailbox)) {
+            Ok(mailbox) => mailbox,
+            Err(error) => return Poll::Ready(Some(Err(error))),
+        };
+        let Some(result) = mailbox.result.take() else {
+            return Poll::Ready(None);
+        };
         if result.is_ok() {
             if let Some(window) = &self.0.window {
                 if let Some((address, key)) = mailbox.descriptor {
@@ -138,7 +177,7 @@ impl Ticket {
             }
         }
         self.0.result.set(Some(result));
-        Some(result)
+        Poll::Ready(Some(result))
     }
     pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.0.lease.slot.waiter.register(cx.waker());
@@ -162,13 +201,25 @@ pub struct QueuePairHandle {
     expires: Cell<Option<std::time::Instant>>,
 }
 impl QueuePairHandle {
+    #[cfg(test)]
     pub(crate) fn new(device: Rc<DeviceHandle>) -> Result<Rc<Self>> {
+        immediate(Self::poll_new(device))
+    }
+    pub(crate) fn poll_new(device: Rc<DeviceHandle>) -> Poll<Result<Rc<Self>>> {
         if device.port.shared.closed.load(Ordering::Acquire) {
-            return Err(Error::Unavailable);
+            return Poll::Ready(Err(Error::Unavailable));
         }
+        let mut contended = false;
         for slot in &device.port.shared.slots {
-            let Ok(mailbox) = slot.mailbox.try_lock() else {
+            if slot.state.load(Ordering::Acquire) != READY {
                 continue;
+            }
+            let mailbox = match try_mailbox(&slot.mailbox) {
+                Poll::Pending => {
+                    contended = true;
+                    continue;
+                }
+                Poll::Ready(result) => result?,
             };
             if mailbox.rail != device.rail {
                 continue;
@@ -181,7 +232,7 @@ impl QueuePairHandle {
                 continue;
             }
             let endpoint = mailbox.endpoint.ok_or(Error::Unavailable)?;
-            return Ok(Rc::new(Self {
+            return Poll::Ready(Ok(Rc::new(Self {
                 device: device.clone(),
                 lease: Rc::new(Lease {
                     slot: slot.clone(),
@@ -193,34 +244,33 @@ impl QueuePairHandle {
                 pending: RefCell::new(None),
                 failure: Cell::new(None),
                 expires: Cell::new(None),
-            }));
+            })));
         }
-        Err(Error::Overloaded)
+        if contended {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(Error::Overloaded))
+        }
     }
+    #[cfg(test)]
     fn submit(&self, command: Command, window: Option<Rc<Window>>) -> Result<Ticket> {
-        self.try_submit(command, window)?.ok_or(Error::Overloaded)
+        immediate(self.poll_submit(command, window))
     }
-    fn try_submit(&self, command: Command, window: Option<Rc<Window>>) -> Result<Option<Ticket>> {
+    fn poll_submit(&self, command: Command, window: Option<Rc<Window>>) -> Poll<Result<Ticket>> {
         if self.lease.slot.cancel.load(Ordering::Acquire)
             || self.lease.shared.closed.load(Ordering::Acquire)
         {
-            return Err(Error::Unavailable);
+            return Poll::Ready(Err(Error::Unavailable));
         }
-        if self
-            .pending
-            .borrow()
-            .as_ref()
-            .is_some_and(|t| t.result().is_none())
-        {
-            return Err(Error::Overloaded);
+        if let Some(ticket) = self.pending.borrow().as_ref() {
+            match ready!(ticket.poll_result()) {
+                None => return Poll::Ready(Err(Error::Overloaded)),
+                Some(result) => result?,
+            }
         }
-        let mut mailbox = match self.lease.slot.mailbox.try_lock() {
-            Ok(mailbox) => mailbox,
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Poisoned(_)) => return Err(Error::Io),
-        };
+        let mut mailbox = ready!(try_mailbox(&self.lease.slot.mailbox))?;
         if mailbox.command.is_some() {
-            return Err(Error::Overloaded);
+            return Poll::Ready(Err(Error::Overloaded));
         }
         mailbox.result = None;
         mailbox.command = Some(command);
@@ -231,15 +281,20 @@ impl QueuePairHandle {
         }));
         *self.pending.borrow_mut() = Some(ticket.clone());
         self.lease.shared.engine.wake();
-        Ok(Some(ticket))
+        Poll::Ready(Ok(ticket))
     }
+    #[cfg(test)]
     pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
+        immediate(self.poll_connect(remote))
+    }
+    pub(crate) fn poll_connect(&self, remote: Endpoint) -> Poll<Result<()>> {
         remote.validate()?;
         if self.connecting.borrow().is_some() || remote.link_layer != self.endpoint.link_layer {
-            return Err(Error::InvalidRequest);
+            return Poll::Ready(Err(Error::InvalidRequest));
         }
-        *self.connecting.borrow_mut() = Some(self.submit(Command::Connect(remote), None)?);
-        Ok(())
+        *self.connecting.borrow_mut() =
+            Some(ready!(self.poll_submit(Command::Connect(remote), None))?);
+        Poll::Ready(Ok(()))
     }
     pub(crate) fn device(&self) -> &Rc<DeviceHandle> {
         &self.device
@@ -256,18 +311,23 @@ impl QueuePairHandle {
     pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
+    #[cfg(test)]
     pub(crate) fn bind(&self, region: Rc<Region>) -> Result<(Rc<Window>, Ticket)> {
+        immediate(self.poll_bind(region))
+    }
+    pub(crate) fn poll_bind(&self, region: Rc<Region>) -> Poll<Result<(Rc<Window>, Ticket)>> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {
-            return Err(Error::Unavailable);
+            return Poll::Ready(Err(Error::Unavailable));
         }
         let window = Rc::new(Window {
             key: Cell::new(0),
             address: Cell::new(0),
             _region: region,
         });
-        let ticket = self.submit(Command::Bind, Some(window.clone()))?;
-        Ok((window, ticket))
+        let ticket = ready!(self.poll_submit(Command::Bind, Some(window.clone())))?;
+        Poll::Ready(Ok((window, ticket)))
     }
+    #[cfg(test)]
     pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
         if !self.ready() || !Rc::ptr_eq(&window._region.lease, &self.lease) {
             return Err(Error::Unavailable);
@@ -283,18 +343,25 @@ impl QueuePairHandle {
         if !self.ready() || !Rc::ptr_eq(&window._region.lease, &self.lease) {
             return Poll::Ready(Err(Error::Unavailable));
         }
-        match self.try_submit(Command::Invalidate, None)? {
-            // No command was accepted on contention. Keep the grant and retry
-            // on a service wake or the runtime's bounded lifecycle tick.
-            None => Poll::Pending,
-            Some(ticket) => Poll::Ready(Ok(ticket)),
-        }
+        self.poll_submit(Command::Invalidate, None)
     }
+    #[cfg(test)]
     pub(crate) fn write(&self, region: Rc<Region>, address: u64, key: u32) -> Result<Ticket> {
+        immediate(self.poll_write(region, address, key))
+    }
+    pub(crate) fn poll_write(
+        &self,
+        region: Rc<Region>,
+        address: u64,
+        key: u32,
+    ) -> Poll<Result<Ticket>> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {
-            return Err(Error::Unavailable);
+            return Poll::Ready(Err(Error::Unavailable));
         }
-        self.submit(Command::Write { address, key }, None)
+        self.poll_submit(Command::Write { address, key }, None)
+    }
+    pub(crate) fn register_waiter(&self, cx: &Context<'_>) {
+        self.lease.slot.waiter.register(cx.waker());
     }
     pub fn progress(&self) -> Result<usize> {
         if self.lease.shared.closed.load(Ordering::Acquire) && !self.stopped() {

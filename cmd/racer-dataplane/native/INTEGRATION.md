@@ -31,8 +31,10 @@ Application factory wiring:
    worker partition; exhaustion returns Overloaded and permits HTTP fallback.
    No MR allocation/registration occurs in a transfer. The service replenishes
    single-use QPs after a terminal fence and final lease release.
-7. `PreparedSession::finish` now submits connection transitions to the service.
-   Await `session.wait_ready(scope)` before receiver `prepare_receive`.
+7. Await `sessions.prepare(peer, rail, scope)` and
+   `prepared.finish(verified_head, scope)` to admit a slot and submit connection
+   transitions. Await `session.wait_ready(scope)` before awaiting receiver
+   `prepare_receive(session, envelope, transfer, scope)`.
    `send_to` awaits it internally. Signed offer/descriptor/completion encoding
    is unchanged. All grant readback awaits the asynchronous terminal fence.
 8. Continue `Sessions::progress` on I/O turns for deadline handling. It deliberately
@@ -52,12 +54,28 @@ The crypto role can block inside provider resource syscalls, but the I/O role
 continues socket/reactor/HTTP work. This is genuine cross-thread completion,
 not an async fn executing a syscall on its caller's thread.
 
-An admitted receive completion waits on mailbox contention while submitting local
-invalidation or copying fenced ciphertext. These waits retain the grant/buffer and
-ciphertext reservation, honor cancellation and the original deadline, and retry on
-service wakes or the bounded lifecycle tick. They do not retry quota exhaustion or
-allocation failure. A published terminal fence can precede the native role's
-mailbox unlock, so it alone does not make synchronous readback contention-free.
+All serving handoffs distinguish mailbox contention (`Pending`) from resource
+exhaustion (`Overloaded`). This includes activation submission, ready-slot selection,
+connect, region acquisition, source copy, bind, write, invalidation, completion
+consumption, and fenced readback. Waits retain their owners and reservations, honor
+cancellation and the original deadline, and retry on service wakes or the bounded
+lifecycle tick. They do not retry exhausted session/slot/region/command capacity,
+quota exhaustion, or allocation failure. A poisoned mailbox is an I/O error.
+
+Rust API migration: `Sessions::prepare`, consuming `PreparedSession::finish`,
+`RdmaTransfer::prepare_receive`, `Permissions::grant`, `RegisteredPool::acquire_for`,
+and `RegisteredLease::{copy_from,to_vec}` return operations to await and take a
+`RequestScope` (`grant` previously took only a deadline). The peer handshake and
+receive-preparation wrappers follow the same contract. `finish` waits for connection
+submission, not native connection completion; `wait_ready` is still required.
+Likewise `prepare_receive`/`grant` wait for bind submission; await `wait_bound`
+before synchronous descriptor/header export. Export reads the cached successful
+bind result. The wire protocol and native ABI are unchanged.
+
+Dropping a pending consuming setup or claimed grant requests cancellation without
+submitting another command. A published terminal fence can precede the native
+role's mailbox unlock; readback must still await mailbox access. Terminal fencing
+itself remains mandatory even after the request is canceled or expired.
 
 The runtime's bounded crypto/lifecycle timer tick drives pending CQ work and
 retries failed fences. The service does not spin or spawn timer threads. Failed

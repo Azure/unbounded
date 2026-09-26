@@ -107,6 +107,19 @@ pub fn match_publication(
     Ok(result)
 }
 impl Devices {
+    #[cfg(test)]
+    pub(crate) fn test(port: std::rc::Rc<IoPort>) -> Self {
+        let devices = Self::new(std::rc::Rc::new(Verbs));
+        devices.selected.borrow_mut().push(Device {
+            handle: std::rc::Rc::new(DeviceHandle {
+                port: port.clone(),
+                rail: RailId(0),
+            }),
+            rail: RailId(0),
+        });
+        *devices.port.borrow_mut() = Some(port);
+        devices
+    }
     pub fn new(verbs: Rc<Verbs>) -> Self {
         Self {
             _verbs: verbs,
@@ -147,7 +160,8 @@ impl Devices {
             let quotas = (0..port.capacity())
                 .map(|_| admission.reserve(None, ResourceClass::Registered, charge))
                 .collect::<Result<Vec<_>>>()?;
-            port.configure(publication, associations, quotas, bytes_per_slot)?;
+            port.configure(publication, associations, quotas, bytes_per_slot, scope)
+                .await?;
             struct ActivationGuard<'a> {
                 port: &'a IoPort,
                 completed: bool,

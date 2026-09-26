@@ -94,13 +94,20 @@ impl RdmaTransfer {
             session.claim()?;
             session.qp.expire_at(scope.deadline.0);
             let _abort = AbortOnDrop(session.qp.clone());
-            let mut buffer = self.buffers.acquire_for(session, page.bytes().len())?;
-            buffer.copy_from(page.bytes())?;
-            let ticket = session.qp.write(
-                buffer.region.clone(),
-                descriptor.descriptor.address,
-                descriptor.descriptor.scoped_key,
-            )?;
+            let mut buffer = self
+                .buffers
+                .acquire_for(session, page.bytes().len(), scope)
+                .await?;
+            buffer.copy_from(page.bytes(), scope).await?;
+            let ticket = super::verbs::wait(scope, |cx| {
+                session.qp.register_waiter(cx);
+                session.qp.poll_write(
+                    buffer.region.clone(),
+                    descriptor.descriptor.address,
+                    descriptor.descriptor.scoped_key,
+                )
+            })
+            .await?;
             let cancellation = scope.cancellation.subscribe()?;
             poll_fn(|cx| {
                 cancellation.register(cx.waker());
@@ -122,20 +129,24 @@ impl RdmaTransfer {
             })
         })
     }
-    pub fn prepare_receive(
-        &self,
-        session: &SessionLease,
-        envelope: &PageEnvelope,
+    pub fn prepare_receive<'a>(
+        &'a self,
+        session: &'a SessionLease,
+        envelope: &'a PageEnvelope,
         transfer: TransferId,
-        scope: &RequestScope,
-    ) -> Result<Grant> {
-        scope.check()?;
-        validate_envelope(envelope)?;
-        let buffer = self
-            .buffers
-            .acquire_for(session, envelope.ciphertext_length as usize)?;
-        self.permissions
-            .grant(session, buffer, transfer, scope.deadline)
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Grant> {
+        Box::pin(async move {
+            scope.check()?;
+            validate_envelope(envelope)?;
+            let buffer = self
+                .buffers
+                .acquire_for(session, envelope.ciphertext_length as usize, scope)
+                .await?;
+            self.permissions
+                .grant(session, buffer, transfer, scope)
+                .await
+        })
     }
     /// This handoff requires a signed completion and returns ciphertext only.
     pub fn finish_receive<'a>(
@@ -158,7 +169,7 @@ impl RdmaTransfer {
             if buffer.len() != envelope.ciphertext_length as usize {
                 return Err(Error::InvalidRange);
             }
-            let bytes = buffer.read(scope).await?;
+            let bytes = buffer.to_vec(scope).await?;
             BufferPool::new(admission.clone()).ciphertext(reservation, envelope, bytes)
         })
     }

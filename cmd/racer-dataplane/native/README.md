@@ -40,11 +40,12 @@ includes the rounded-up pinned final page.
 - The topology owner must validate the entire authenticated route and arrange
   worker affinity/local memory policy before enabling aligned rails. This adapter
   does not implement NUMA placement or choose GID indexes.
-- Call `Sessions::prepare(&VerifiedPeer, rail)` on both peers. Put
+- Await `Sessions::prepare(&VerifiedPeer, rail, scope)` on both peers. Put
   `prepared.setup().header_value()` in `racer-rdma-setup`. Authenticate offers
   with the existing `Signatures`. A signed acknowledgment must include both the
   sender's setup and `racer-rdma-setup-binding` containing the remote offer's
-  `binding_header_value()`. `PreparedSession::finish(&VerifiedHead)` checks the
+  `binding_header_value()`. Await `PreparedSession::finish(&VerifiedHead, scope)`;
+  it checks the
   certified peer, exact offer acknowledgment, rail, endpoint bounds, and signed
   components before submitting RTR/RTS. Await `session.wait_ready(scope)` before
   receiver admission. Both sides must acknowledge; this is a two-sided
@@ -53,7 +54,7 @@ includes the rounded-up pinned final page.
   signs all headers. Keep `racer-rdma-setup`, `racer-rdma-setup-binding`,
   `racer-rdma-descriptor`, and `racer-rdma-completion` in the signed component
   list. Request/page/membership/deadline binding remains the peer protocol's job.
-- Receiver: `prepare_receive(session, envelope, transfer, scope)`, then
+- Receiver: await `prepare_receive(session, envelope, transfer, scope)`, then
   `grant.wait_bound(scope)`. Only after the successful bind CQE may
   `grant.header_value()` be sent as `racer-rdma-descriptor`.
 - Sender: after verifying the control message and its page/request binding, use

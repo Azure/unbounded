@@ -700,7 +700,7 @@ impl Transfers {
         {
             return Ok((connection, false));
         }
-        let prepared = match sessions.prepare(&accept.peer, binding.rail) {
+        let prepared = match sessions.prepare(&accept.peer, binding.rail, scope).await {
             Ok(p) => p,
             Err(e) if recoverable(e) => return Ok((connection, false)),
             Err(e) => return Err(e),
@@ -739,7 +739,7 @@ impl Transfers {
                 .await;
         }
         let remote = SetupParameters::from_verified(&setup, binding.rail)?;
-        let session = match prepared.finish(&setup) {
+        let session = match prepared.finish(&setup, scope).await {
             Ok(session) => session,
             Err(error) if recoverable(error) => {
                 return self
@@ -1047,7 +1047,7 @@ impl Transfers {
         let remote = SetupParameters::from_verified(&offer, binding.rail)?;
         let mut previous = signed_digest(&offer.signed)?;
         connection.finish_exchange()?;
-        let prepared = match sessions.prepare(&offer.peer, binding.rail) {
+        let prepared = match sessions.prepare(&offer.peer, binding.rail, scope).await {
             Ok(prepared) => prepared,
             Err(error) if recoverable(error) => {
                 return self
@@ -1092,7 +1092,7 @@ impl Transfers {
         if SetupParameters::from_verified(&ready, binding.rail)?.encoded != remote.encoded {
             return Err(Error::Unauthorized);
         }
-        let session = match prepared.finish(&ready) {
+        let session = match prepared.finish(&ready, scope).await {
             Ok(session) => session,
             Err(error) if recoverable(error) => {
                 return self
@@ -1111,7 +1111,10 @@ impl Transfers {
             }
             return Err(error);
         }
-        let grant = match rdma.prepare_receive(&session, &envelope, binding.transfer, scope) {
+        let grant = match rdma
+            .prepare_receive(&session, &envelope, binding.transfer, scope)
+            .await
+        {
             Ok(grant) => grant,
             Err(error) if recoverable(error) => {
                 fence(&session, scope).await?;

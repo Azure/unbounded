@@ -99,36 +99,46 @@ impl AuthenticatedDescriptor {
     }
 }
 impl Permissions {
-    pub fn grant(
-        &self,
-        session: &SessionLease,
+    pub fn grant<'a>(
+        &'a self,
+        session: &'a SessionLease,
         buffer: RegisteredLease,
         transfer: TransferId,
-        deadline: Deadline,
-    ) -> Result<Grant> {
-        if Instant::now() >= deadline.0 {
-            return Err(Error::DeadlineExceeded);
-        }
-        if buffer.rail != session.rail() {
-            return Err(Error::InvalidRequest);
-        }
-        session.claim()?;
-        session.qp.expire_at(deadline.0);
-        let (window, bound) = match session.qp.bind(buffer.region.clone()) {
-            Ok(value) => value,
-            Err(error) => {
-                session.abort()?;
-                return Err(error);
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Grant> {
+        Box::pin(async move {
+            scope.check()?;
+            let deadline = scope.deadline;
+            if buffer.rail != session.rail() {
+                return Err(Error::InvalidRequest);
             }
-        };
-        Ok(Grant {
-            transfer,
-            buffer: Some(buffer),
-            qp: session.qp.clone(),
-            window,
-            bound,
-            deadline,
-            binding: session.binding(),
+            session.claim()?;
+            session.qp.expire_at(deadline.0);
+            struct Abort<'a>(Option<&'a QueuePairHandle>);
+            impl Drop for Abort<'_> {
+                fn drop(&mut self) {
+                    if let Some(qp) = self.0 {
+                        let _ = qp.stop();
+                    }
+                }
+            }
+            let mut abort = Abort(Some(&session.qp));
+            let (window, bound) = super::verbs::wait(scope, |cx| {
+                session.qp.register_waiter(cx);
+                session.qp.poll_bind(buffer.region.clone())
+            })
+            .await?;
+            // The returned Grant takes over abort-on-drop ownership.
+            abort.0 = None;
+            Ok(Grant {
+                transfer,
+                buffer: Some(buffer),
+                qp: session.qp.clone(),
+                window,
+                bound,
+                deadline,
+                binding: session.binding(),
+            })
         })
     }
     pub fn revoke_and_fence(&self, mut grant: Grant) -> Operation<'_, RegisteredLease> {

@@ -171,21 +171,24 @@ impl Transfers {
         })
     }
 
-    pub fn prepare_receive(
-        &self,
-        source: &crate::model::identity::NodeId,
-        session: &crate::rdma::session::SessionLease,
-        envelope: &crate::model::envelope::PageEnvelope,
+    pub fn prepare_receive<'a>(
+        &'a self,
+        source: &'a crate::model::identity::NodeId,
+        session: &'a crate::rdma::session::SessionLease,
+        envelope: &'a crate::model::envelope::PageEnvelope,
         transfer: crate::model::identity::TransferId,
-        scope: &RequestScope,
-    ) -> Result<crate::rdma::permission::Grant> {
-        if session.peer() != source {
-            return Err(Error::Unauthorized);
-        }
-        self.rdma
-            .as_ref()
-            .ok_or(Error::Unavailable)?
-            .prepare_receive(session, envelope, transfer, scope)
+        scope: &'a RequestScope,
+    ) -> Operation<'a, crate::rdma::permission::Grant> {
+        Box::pin(async move {
+            if session.peer() != source {
+                return Err(Error::Unauthorized);
+            }
+            self.rdma
+                .as_ref()
+                .ok_or(Error::Unavailable)?
+                .prepare_receive(session, envelope, transfer, scope)
+                .await
+        })
     }
 
     pub fn finish_receive<'a>(

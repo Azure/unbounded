@@ -81,33 +81,41 @@ impl Handshake {
     /// Prepare a QP only for a certificate-authenticated neighbor and a rail chosen
     /// by the full-path rail planner. The returned setup must be included in a
     /// signed control request; finish_session validates the signed peer answer.
-    pub fn prepare_session(
-        &self,
-        peer: &crate::security::certificates::VerifiedPeer,
+    pub fn prepare_session<'a>(
+        &'a self,
+        peer: &'a crate::security::certificates::VerifiedPeer,
         rail: crate::topology::rails::RailId,
-    ) -> Result<crate::rdma::session::PreparedSession> {
-        self.rdma
-            .as_ref()
-            .ok_or(Error::Unavailable)?
-            .prepare(peer, rail)
+        scope: &'a RequestScope,
+    ) -> Operation<'a, crate::rdma::session::PreparedSession> {
+        Box::pin(async move {
+            self.rdma
+                .as_ref()
+                .ok_or(Error::Unavailable)?
+                .prepare(peer, rail, scope)
+                .await
+        })
     }
 
-    pub fn finish_session(
-        &self,
+    pub fn finish_session<'a>(
+        &'a self,
         prepared: crate::rdma::session::PreparedSession,
         signed: crate::security::signing::SignedHead,
-        expected_request: &crate::security::signing::SignedHead,
-    ) -> Result<crate::rdma::session::SessionLease> {
-        let verified = self.signatures.verify(signed)?;
-        let binding = crate::security::signing::signed_digest(expected_request)?;
-        let actual = crate::security::protocol::decode_binary(
-            crate::security::protocol::field(&verified.signed.head, "racer-request-binding")?
-                .as_bytes(),
-        )?;
-        if actual != binding {
-            return Err(Error::Unauthorized);
-        }
-        prepared.finish(&verified)
+        expected_request: &'a crate::security::signing::SignedHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, crate::rdma::session::SessionLease> {
+        Box::pin(async move {
+            scope.check()?;
+            let verified = self.signatures.verify(signed)?;
+            let binding = crate::security::signing::signed_digest(expected_request)?;
+            let actual = crate::security::protocol::decode_binary(
+                crate::security::protocol::field(&verified.signed.head, "racer-request-binding")?
+                    .as_bytes(),
+            )?;
+            if actual != binding {
+                return Err(Error::Unauthorized);
+            }
+            prepared.finish(&verified, scope).await
+        })
     }
 
     /// Discover the receiver challenge using the security-owned fresh-probe

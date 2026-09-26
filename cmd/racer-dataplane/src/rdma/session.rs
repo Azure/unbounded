@@ -147,29 +147,44 @@ impl Sessions {
     }
     /// Both sides prepare before exchanging signed setup headers. The routing
     /// owner must first validate the complete path's authenticated rail mapping.
-    pub fn prepare(&self, peer: &VerifiedPeer, rail: RailId) -> Result<PreparedSession> {
+    pub fn prepare<'a>(
+        &'a self,
+        peer: &'a VerifiedPeer,
+        rail: RailId,
+        scope: &'a crate::runtime::deadline::RequestScope,
+    ) -> Operation<'a, PreparedSession> {
+        Box::pin(super::verbs::wait(scope, move |cx| {
+            self.register_driver(cx.waker());
+            self.poll_prepare(peer, rail)
+        }))
+    }
+    fn poll_prepare(
+        &self,
+        peer: &VerifiedPeer,
+        rail: RailId,
+    ) -> std::task::Poll<Result<PreparedSession>> {
         if !self.ready(rail) {
-            return Err(Error::Unavailable);
+            return std::task::Poll::Ready(Err(Error::Unavailable));
         }
         let mut live = self.live.borrow_mut();
         live.retain(|(_, qp)| !qp.stopped());
         if live.len() >= self.per_neighbor.saturating_mul(36)
             || live.iter().filter(|(node, _)| node == peer.node()).count() >= self.per_neighbor
         {
-            return Err(Error::Overloaded);
+            return std::task::Poll::Ready(Err(Error::Overloaded));
         }
-        let qp = QueuePairHandle::new(self.devices.select(rail)?.handle)?;
+        let qp = std::task::ready!(QueuePairHandle::poll_new(self.devices.select(rail)?.handle))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
         qp.expire_at(std::time::Instant::now() + std::time::Duration::from_secs(30));
         let setup = SetupParameters::new(rail, qp.endpoint)?;
         live.push((peer.node().clone(), qp.clone()));
-        Ok(PreparedSession {
+        std::task::Poll::Ready(Ok(PreparedSession {
             qp,
             peer: peer.node().clone(),
             setup,
             finished: Cell::new(false),
-        })
+        }))
     }
     /// Legacy one-message setup cannot bind a locally created QP to the signed
     /// exchange. Use prepare/finish instead; never silently trust encoded bytes.
@@ -242,34 +257,48 @@ impl PreparedSession {
     pub fn setup(&self) -> &SetupParameters {
         &self.setup
     }
-    pub fn finish(self, head: &VerifiedHead) -> Result<SessionLease> {
-        if head.peer.node() != &self.peer {
-            return Err(Error::Unauthorized);
-        }
-        if signed_value(head, SETUP_BINDING_HEADER, 32)?
-            != Sha256::digest(&self.setup.encoded).as_slice()
-        {
-            return Err(Error::Unauthorized);
-        }
-        let remote = SetupParameters::from_verified(head, self.setup.rail)?;
-        if remote.encoded == self.setup.encoded {
-            return Err(Error::Replay);
-        }
-        self.qp.connect(remote.endpoint()?)?;
-        let mut pair = [&self.setup.encoded, &remote.encoded];
-        pair.sort();
-        let mut hash = Sha256::new();
-        hash.update(b"racer-rdma-session-v1\0");
-        for bytes in pair {
-            hash.update(bytes);
-        }
-        self.finished.set(true);
-        Ok(SessionLease {
-            qp: self.qp.clone(),
-            peer: self.peer.clone(),
-            rail: self.setup.rail,
-            binding: hash.finalize().into(),
-            claimed: Cell::new(false),
+    /// Await mailbox submission without consuming setup on transient contention.
+    /// The returned session still requires wait_ready for native completion.
+    pub fn finish<'a>(
+        self,
+        head: &'a VerifiedHead,
+        scope: &'a crate::runtime::deadline::RequestScope,
+    ) -> Operation<'a, SessionLease> {
+        Box::pin(async move {
+            scope.check()?;
+            if head.peer.node() != &self.peer {
+                return Err(Error::Unauthorized);
+            }
+            if signed_value(head, SETUP_BINDING_HEADER, 32)?
+                != Sha256::digest(&self.setup.encoded).as_slice()
+            {
+                return Err(Error::Unauthorized);
+            }
+            let remote = SetupParameters::from_verified(head, self.setup.rail)?;
+            if remote.encoded == self.setup.encoded {
+                return Err(Error::Replay);
+            }
+            let endpoint = remote.endpoint()?;
+            super::verbs::wait(scope, |cx| {
+                self.qp.register_waiter(cx);
+                self.qp.poll_connect(endpoint)
+            })
+            .await?;
+            let mut pair = [&self.setup.encoded, &remote.encoded];
+            pair.sort();
+            let mut hash = Sha256::new();
+            hash.update(b"racer-rdma-session-v1\0");
+            for bytes in pair {
+                hash.update(bytes);
+            }
+            self.finished.set(true);
+            Ok(SessionLease {
+                qp: self.qp.clone(),
+                peer: self.peer.clone(),
+                rail: self.setup.rail,
+                binding: hash.finalize().into(),
+                claimed: Cell::new(false),
+            })
         })
     }
 }
