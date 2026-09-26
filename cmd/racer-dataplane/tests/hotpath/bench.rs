@@ -109,6 +109,15 @@ impl Service {
                                             .or_default() += 1;
                                     }
                                     lease = sent?;
+                                    if !lease.is_reusable() {
+                                        // send can now return a fully written error
+                                        // head when first-slice admission fails.
+                                        *failures
+                                            .borrow_mut()
+                                            .entry("response:rejected-before-body".into())
+                                            .or_default() += 1;
+                                        return Ok(());
+                                    }
                                 }
                                 Err(error) => {
                                     *failures

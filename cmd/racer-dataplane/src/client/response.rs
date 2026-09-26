@@ -93,6 +93,9 @@ impl Responses {
         success_head(&response.metadata, response.range)?;
         Ok(())
     }
+    /// Prepare the first slice before success headers. Pre-body failures send an
+    /// error head and return a poisoned connection; callers must check reuse.
+    /// Errors after success headers are terminal and close the incomplete body.
     pub fn send<'a>(
         &'a self,
         mut connection: ConnectionLease,
@@ -106,10 +109,36 @@ impl Responses {
             if response.body.is_some() != response.range.is_some() {
                 return Err(Error::BadGateway);
             }
+            // Acquire and validate the first page and its delivery pipe before
+            // promising a body. Admission failures can still be a complete 503.
+            let mut first = if let Some(stream) = response.body.as_mut() {
+                match stream.next_slice().await {
+                    Ok(Some(reader))
+                        if reader.remaining() != 0 && reader.remaining() as u64 <= expected =>
+                    {
+                        Some(reader)
+                    }
+                    result => {
+                        let error = result.err().unwrap_or(Error::BadGateway);
+                        // Drop the stream only after the error head is sent: its
+                        // destructor cancels the shared request scope.
+                        return self.send_error(connection, error, scope).await;
+                    }
+                }
+            } else {
+                None
+            };
             connection = self.io.send_head(connection, head, scope).await?.connection;
             let mut sent = 0u64;
             if let Some(stream) = response.body.as_mut() {
-                while let Some(reader) = stream.next_slice().await? {
+                loop {
+                    let reader = match first.take() {
+                        Some(reader) => reader,
+                        None => match stream.next_slice().await? {
+                            Some(reader) => reader,
+                            None => break,
+                        },
+                    };
                     let length = reader.remaining() as u64;
                     if length == 0 || length > expected - sent {
                         return Err(Error::BadGateway);

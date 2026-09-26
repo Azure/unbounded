@@ -232,6 +232,21 @@ impl RangeStream {
                 self.ready.clear();
                 return Err(error);
             }
+            if self.ready.is_empty() && self.next_page.is_none() {
+                self.terminated = true;
+                return Ok(None);
+            }
+            // Schedule delivery before starting more page work. Waiting requests
+            // cannot pin newly acquired pages merely to discover pipe exhaustion.
+            let pipe = match self.delivery.admit(&self.scope).await {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    self.terminated = true;
+                    self.next_page = None;
+                    self.ready.clear();
+                    return Err(error);
+                }
+            };
             while self.ready.len() < self.window_pages {
                 let Some(number) = self.next_page else {
                     break;
@@ -284,7 +299,7 @@ impl RangeStream {
                     .range
                     .slice_at(result.plaintext.page().number)?
                     .ok_or(Error::CorruptRecord)?;
-                self.delivery.attach(result.plaintext, slice)
+                self.delivery.attach_reserved(result.plaintext, slice, pipe)
             });
             match lease {
                 Ok(lease) => Ok(Some(lease)),

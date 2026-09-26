@@ -4,17 +4,22 @@
 //! backing page is recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
 use crate::{
-    error::{Error, Result},
+    error::{Error, Operation, Result},
     model::limits::ResourceClass,
     runtime::{
         admission::{Admission, Reservation},
+        deadline::RequestScope,
         reactor::Reactor,
     },
 };
 use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    future::poll_fn,
     io,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     rc::Rc,
+    task::{Poll, Waker},
 };
 
 /// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
@@ -25,6 +30,44 @@ pub const MAX_PIPE_BYTES: usize = 64 * 1024;
 pub struct PipePool {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
+    waiting: Waiters,
+}
+
+type Waiters = Rc<RefCell<VecDeque<Rc<RefCell<Option<Waker>>>>>>;
+
+// Contains no reactor reference: a pending send can own this through its fence.
+struct Notify(Waiters);
+impl Drop for Notify {
+    fn drop(&mut self) {
+        wake_front(&self.0);
+    }
+}
+fn wake_front(waiters: &Waiters) {
+    let wake = waiters
+        .borrow()
+        .front()
+        .and_then(|entry| entry.borrow().clone());
+    if let Some(wake) = wake {
+        wake.wake();
+    }
+}
+struct Waiting {
+    queue: Waiters,
+    entry: Rc<RefCell<Option<Waker>>>,
+    _reservation: Reservation,
+}
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        {
+            let mut queue = self.queue.borrow_mut();
+            queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
+            if queue.is_empty() {
+                // Do not retain queue storage after its admission charges leave.
+                *queue = VecDeque::new();
+            }
+        }
+        wake_front(&self.queue);
+    }
 }
 
 pub struct PipeLease {
@@ -34,11 +77,17 @@ pub struct PipeLease {
     buffered: usize,
     // Declared after the descriptors so capacity is returned only after closing.
     _reservation: Reservation,
+    // Wake only after descriptors close and admission is returned.
+    _notify: Notify,
 }
 
 impl PipePool {
     pub fn new(admission: Rc<Admission>, reactor: Rc<Reactor>) -> Self {
-        Self { admission, reactor }
+        Self {
+            admission,
+            reactor,
+            waiting: Rc::default(),
+        }
     }
 
     pub(crate) fn admission(&self) -> &Admission {
@@ -47,6 +96,59 @@ impl PipePool {
 
     pub(crate) fn reactor(&self) -> &Reactor {
         &self.reactor
+    }
+
+    /// FIFO scheduling above immediate raw admission. At most queue_entries wait
+    /// without pipes or new page acquisitions; each entry charges context bytes
+    /// for its guard, queue slot, wake cell, and cancellation registration.
+    /// The owning worker's bounded tick checks deadlines and stopped admission.
+    pub(crate) fn acquire_wait<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, PipeLease> {
+        Box::pin(async move {
+            scope.check()?;
+            if self.waiting.borrow().is_empty() {
+                match self.acquire() {
+                    Err(Error::Overloaded) => {}
+                    result => return result,
+                }
+            }
+            if self.waiting.borrow().len() >= self.admission.limits().queue_entries.get() {
+                return Err(Error::Overloaded);
+            }
+            let reservation = self.admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                std::mem::size_of::<Waiting>() + 128,
+            )?;
+            let cancellation = scope.cancellation.subscribe()?;
+            let entry = Rc::new(RefCell::new(None));
+            self.waiting.borrow_mut().push_back(entry.clone());
+            let waiting = Waiting {
+                queue: self.waiting.clone(),
+                entry,
+                _reservation: reservation,
+            };
+            poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                if self.admission.is_stopped() {
+                    return Poll::Ready(Err(Error::Unavailable));
+                }
+                *waiting.entry.borrow_mut() = Some(cx.waker().clone());
+                if self
+                    .waiting
+                    .borrow()
+                    .front()
+                    .is_some_and(|entry| Rc::ptr_eq(entry, &waiting.entry))
+                {
+                    match self.acquire() {
+                        Err(Error::Overloaded) => {}
+                        result => return Poll::Ready(result),
+                    }
+                }
+                Poll::Pending
+            })
+            .await
+        })
     }
 
     /// Reserve before creating descriptors. Exhaustion never waits for a reader.
@@ -81,6 +183,7 @@ impl PipePool {
             capacity: capacity as usize,
             buffered: 0,
             _reservation: reservation,
+            _notify: Notify(self.waiting.clone()),
         })
     }
 }
@@ -301,6 +404,113 @@ pub(super) mod tests {
         assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
         drop(lease);
         assert!(pool.acquire().is_ok());
+    }
+
+    #[test]
+    fn scheduled_acquisition_is_bounded_fifo_and_wakes_only_for_progress() {
+        use crate::{model::identity::RequestId, test_support::WakeCounter};
+        use std::{
+            sync::Arc,
+            task::Context,
+            time::{Duration, Instant},
+        };
+        let admission = admission(2);
+        let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
+        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let scope =
+            RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting: Vec<_> = (0..8).map(|_| pool.acquire_wait(&scope)).collect();
+        for wait in &mut waiting {
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(count.count(), 0, "waiting does not spin/self-wake");
+        assert!(matches!(
+            pool.acquire_wait(&scope).as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        assert_eq!(pool.waiting.borrow().len(), 8);
+        assert_eq!(admission.used(ResourceClass::Pipe), 2);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        drop(held);
+        assert!(count.count() > 0);
+        // Reverse polling cannot let new arrivals jump the queue.
+        for wait in waiting.iter_mut().skip(1).rev() {
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        let mut leases = VecDeque::new();
+        for mut wait in waiting {
+            if leases.len() == 2 {
+                leases.pop_front();
+            }
+            let Poll::Ready(Ok(pipe)) = wait.as_mut().poll(&mut cx) else {
+                panic!("FIFO waiter did not progress")
+            };
+            leases.push_back(pipe);
+            assert!(admission.used(ResourceClass::Pipe) <= 2);
+        }
+        assert!(pool.waiting.borrow().is_empty());
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        drop(leases);
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+    }
+
+    #[test]
+    fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
+        use crate::{model::identity::RequestId, test_support::WakeCounter};
+        use std::{
+            sync::Arc,
+            task::Context,
+            time::{Duration, Instant},
+        };
+        for failure in [
+            Some(Error::Cancelled),
+            Some(Error::DeadlineExceeded),
+            Some(Error::Unavailable),
+            None,
+        ] {
+            let admission = admission(1);
+            let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
+            let held = pool.acquire().unwrap();
+            let scope = RequestScope::new(
+                RequestId([0; 16]),
+                Instant::now()
+                    + if failure == Some(Error::DeadlineExceeded) {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::from_secs(5)
+                    },
+            )
+            .unwrap();
+            let count = Arc::new(WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut wait = pool.acquire_wait(&scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert!(admission.used(ResourceClass::RequestContext) > 0);
+            match failure {
+                Some(Error::Cancelled) => {
+                    scope.cancel().unwrap();
+                    assert!(count.count() > 0);
+                }
+                Some(Error::DeadlineExceeded) => std::thread::sleep(Duration::from_millis(20)),
+                Some(Error::Unavailable) => admission.stop(),
+                _ => {}
+            }
+            if let Some(expected) = failure {
+                assert!(
+                    matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
+                );
+            }
+            drop(wait);
+            assert!(pool.waiting.borrow().is_empty());
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            drop(held);
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        }
     }
 
     #[test]

@@ -107,15 +107,24 @@ impl Delivery {
     }
 
     pub fn attach(&self, page: VerifiedPage, slice: PageSlice) -> Result<ReaderLease> {
-        let end = (slice.offset as usize)
-            .checked_add(slice.length as usize)
-            .ok_or(Error::InvalidRange)?;
-        if slice.page != page.page().number || end > page.bytes().len() {
-            return Err(Error::InvalidRange);
-        }
+        validate_slice(&page, slice)?;
+        self.attach_reserved(page, slice, self.pipes.acquire()?)
+    }
+
+    pub(crate) fn admit<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, PipeLease> {
+        self.pipes.acquire_wait(scope)
+    }
+
+    pub(crate) fn attach_reserved(
+        &self,
+        page: VerifiedPage,
+        slice: PageSlice,
+        pipe: PipeLease,
+    ) -> Result<ReaderLease> {
+        validate_slice(&page, slice)?;
         Ok(ReaderLease {
             page,
-            pipe: self.pipes.acquire()?,
+            pipe,
             slice,
             sent: 0,
             connection: None,
@@ -347,6 +356,16 @@ impl Delivery {
         }
         Ok(())
     }
+}
+
+fn validate_slice(page: &VerifiedPage, slice: PageSlice) -> Result<()> {
+    let end = (slice.offset as usize)
+        .checked_add(slice.length as usize)
+        .ok_or(Error::InvalidRange)?;
+    if slice.page != page.page().number || end > page.bytes().len() {
+        return Err(Error::InvalidRange);
+    }
+    Ok(())
 }
 
 fn splice_unsupported(error: &io::Error) -> bool {

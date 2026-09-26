@@ -72,6 +72,17 @@ Client delivery calls `RangeStream::next_slice()` and
 `Delivery::finish_to(ReaderLease, ConnectionLease, &RequestScope)`; it checks the
 total transmitted length and closes on any post-header error.
 
+`Responses::send` prepares the first slice before writing success headers. A
+first-slice acquisition/admission failure sends the mapped error head and returns
+a poisoned connection; callers must check `is_reusable()` before another request.
+Range streams schedule delivery pipes before starting new page work. Each pipe
+pool has a FIFO capped by `queue_entries`, with request-context charges for live
+waiters. Pipe release and cancellation notify waiters; the existing bounded worker
+tick checks original deadlines and stopped admission. Raw `PipePool::acquire`
+still refuses immediately. Seeded/bootstrap pages and already buffered window
+pages retain their existing bounded leases while waiting. Later-page acquisition
+or transport failures can still truncate an already-started response.
+
 Use `Error::UnsatisfiableRangeWithLength(selected_length)` for SDK-valid 416.
 Bare `UnsatisfiableRange` cannot produce the required Content-Range and maps to
 500. Existing variants cover other endpoint statuses: `MethodNotAllowed`,

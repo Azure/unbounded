@@ -671,8 +671,11 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_limits(limits())
+        }
+        fn with_limits(limits: Limits) -> Self {
             let root = Root::new();
-            let admission = Rc::new(Admission::new(limits()));
+            let admission = Rc::new(Admission::new(limits));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
@@ -847,6 +850,7 @@ mod tests {
         admission: Rc<Admission>,
         streams: crate::read::range_stream::RangeStreams,
         late_failure: bool,
+        unseeded: bool,
     }
     impl ReadService for Bodies {
         fn read<'a>(
@@ -936,7 +940,7 @@ mod tests {
                     Arc::new(Membership::validate(MembershipVersion(1), vec![])?),
                     scope.clone(),
                     crate::read::flight::AcquisitionBudget::new(scope.deadline.0, 4, 4),
-                    Some(seed),
+                    if self.unseeded { None } else { Some(seed) },
                 )?;
                 Ok(ReadResponse {
                     metadata,
@@ -1012,6 +1016,7 @@ mod tests {
                 admission,
                 streams: RangeStreams::from_directory(directory, delivery, 1),
                 late_failure,
+                unseeded: false,
             });
             fixture.reconcile(&[definition()]).unwrap();
             let mut socket = fixture.connect();
@@ -1032,6 +1037,130 @@ mod tests {
             assert!(head.contains(&format!("content-length: {expected_length}\r\n")));
             assert!(head.contains(&format!("content-range: {expected_range}\r\n")));
             assert_eq!(&output[end..], expected_body);
+        }
+    }
+
+    fn body_fixture(queue: usize, unseeded: bool) -> (Fixture, Rc<PipePool>) {
+        use crate::{
+            model::identity::WorkerId,
+            read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
+            runtime::worker::WorkerMap,
+        };
+        use std::sync::Arc;
+        let mut limits = limits();
+        limits.pipes = NonZeroUsize::new(1).unwrap();
+        limits.queue_entries = NonZeroUsize::new(queue).unwrap();
+        let mut fixture = Fixture::with_limits(limits);
+        let admission = fixture.listeners.admission.clone();
+        let pipes = Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone()));
+        let delivery = Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2)));
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                vec![WorkerId(0)],
+                4,
+            )
+            .unwrap(),
+        );
+        fixture.listeners.responses = Rc::new(Responses::new(
+            fixture.listeners.io.clone(),
+            delivery.clone(),
+        ));
+        fixture.listeners.reads = Rc::new(Bodies {
+            admission,
+            streams: RangeStreams::from_directory(directory, delivery, 1),
+            late_failure: false,
+            unseeded,
+        });
+        fixture.reconcile(&[definition()]).unwrap();
+        (fixture, pipes)
+    }
+
+    fn start_body(fixture: &Fixture) -> UnixStream {
+        let mut socket = fixture.connect();
+        socket
+            .write_all(&request(
+                "GET",
+                "If-Match: \"v1\"\r\nRange: bytes=0-4\r\nConnection: close\r\n",
+            ))
+            .unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        socket
+    }
+
+    fn assert_no_head(socket: &mut UnixStream) {
+        assert_eq!(
+            socket.read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn assert_no_body_leases(fixture: &Fixture) {
+        use crate::model::limits::ResourceClass;
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        for class in [
+            ResourceClass::Pipe,
+            ResourceClass::Plaintext,
+            ResourceClass::Ciphertext,
+            ResourceClass::Connection,
+        ] {
+            assert_eq!(fixture.listeners.admission.used(class), 0, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
+        let (fixture, pipes) = body_fixture(2, false);
+        let held = pipes.acquire().unwrap();
+        let mut first = start_body(&fixture);
+        let mut second = start_body(&fixture);
+        assert_no_head(&mut first);
+        assert_no_head(&mut second);
+        let mut overflow = start_body(&fixture);
+        let output = fixture.receive(&mut overflow, true);
+        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
+        assert!(output.ends_with(b"\r\n\r\n"));
+        drop(held);
+        for socket in [&mut first, &mut second] {
+            let output = fixture.receive(socket, true);
+            assert!(output.starts_with(b"HTTP/1.1 206 "));
+            assert!(output.ends_with(b"\r\n\r\nhello"));
+        }
+        assert_no_body_leases(&fixture);
+    }
+
+    #[test]
+    fn actual_uds_first_page_failure_is_complete_503() {
+        let (fixture, _pipes) = body_fixture(2, true);
+        // No owner is installed for the unseeded first page.
+        let mut socket = start_body(&fixture);
+        let output = fixture.receive(&mut socket, true);
+        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
+        assert!(output.ends_with(b"\r\n\r\n"));
+        assert_no_body_leases(&fixture);
+    }
+
+    #[test]
+    fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
+        for cancel in [false, true] {
+            let (mut fixture, pipes) = body_fixture(2, false);
+            fixture.listeners.request_timeout = Duration::from_millis(200);
+            let held = pipes.acquire().unwrap();
+            let mut socket = start_body(&fixture);
+            assert_no_head(&mut socket);
+            if cancel {
+                fixture.listeners.cancel_cache(&definition().id).unwrap();
+            } else {
+                std::thread::sleep(Duration::from_millis(220));
+            }
+            let output = fixture.receive(&mut socket, true);
+            assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
+            assert!(output.ends_with(b"\r\n\r\n"));
+            drop(held);
+            futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
+            assert_no_body_leases(&fixture);
         }
     }
 
