@@ -77,6 +77,13 @@ func (c Chair) Active(now time.Time) bool {
 	return c.Selectable() && !c.Expired(now)
 }
 
+// Abandoned reports whether the holder stopped renewing long enough ago to be
+// treated as gone. It uses the same threshold as reclamation so a chair leaves
+// the selection set exactly when a live node may take it over.
+func (c Chair) Abandoned(now time.Time) bool {
+	return c.Expired(now)
+}
+
 type Snapshot struct {
 	Epoch     int64
 	Chairs    []Chair
@@ -104,11 +111,26 @@ func (s Snapshot) OccupiedCountWithin(chairCount int) int {
 	return count
 }
 
+// usable reports whether a chair may be dialed for work. A stale snapshot is
+// replayed cache from an API outage, so its timestamps cannot condemn a holder
+// that may well still be renewing.
+func (s Snapshot) usable(chair Chair) bool {
+	if !chair.Selectable() {
+		return false
+	}
+
+	if s.Stale || s.FetchedAt.IsZero() {
+		return true
+	}
+
+	return !chair.Abandoned(s.FetchedAt)
+}
+
 func (s Snapshot) AvailableCount() int {
 	count := 0
 
 	for _, chair := range s.Chairs {
-		if chair.Selectable() && chair.AssignmentEpoch == s.Epoch {
+		if s.usable(chair) && chair.AssignmentEpoch == s.Epoch {
 			count++
 		}
 	}
@@ -133,7 +155,7 @@ func (s Snapshot) SelectableCountWithin(chairCount int) int {
 			continue
 		}
 
-		if chair.Selectable() && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
+		if s.usable(chair) && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
 			count++
 		}
 	}
@@ -189,7 +211,11 @@ func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
 	ranked := make([]Chair, 0, len(candidates))
 
 	for _, candidate := range scored {
-		chair := byName[string(candidate.Node.ID)]
+		chair, ok := byName[string(candidate.Node.ID)]
+		if !ok || !snapshot.usable(chair) {
+			continue
+		}
+
 		ranked = append(ranked, chair)
 	}
 

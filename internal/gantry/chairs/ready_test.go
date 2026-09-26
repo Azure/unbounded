@@ -23,7 +23,7 @@ func TestManagerReadyWithFewerHoldersThanTarget(t *testing.T) {
 
 	now := time.Unix(2_000_000, 0)
 	client := fake.NewClientset(emptyChairObjects(ns)...)
-	store := chairs.NewStore(client.CoordinationV1().Leases(ns))
+	store := chairs.NewStore(client.CoordinationV1().Leases(ns), chairs.WithStoreClock(func() time.Time { return now }))
 	manager := chairs.NewManager(chairs.ManagerOptions{
 		Store:               store,
 		Self:                chairs.Holder{PeerID: "upgraded-node", P2PAddrs: []string{"/ip4/10.0.0.3/tcp/4001"}, TransferAddr: "10.0.0.3:5001"},
@@ -78,7 +78,7 @@ func TestManagerReadyWithOneSelectableChairHeldByPeer(t *testing.T) {
 	const ns = "gantry-system"
 
 	client := fake.NewClientset()
-	store := chairs.NewStore(client.CoordinationV1().Leases(ns))
+	store := chairs.NewStore(client.CoordinationV1().Leases(ns), chairs.WithStoreClock(func() time.Time { return time.Unix(0, 0) }))
 
 	peer := chairs.Holder{PeerID: "seed", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}, TransferAddr: "10.0.0.2:5001"}
 	if _, err := store.Claim(context.Background(), 0, peer, 0, time.Minute, false, time.Unix(0, 0)); err != nil {
