@@ -330,17 +330,23 @@ fn warm_peer_fanout_is_limited_by_source_node_network() {
     let report = run(&config, &requests);
 
     assert_success(&config, &requests, &report);
-    assert!(report.peer_bytes > 0, "warm peers were unused: {report:?}");
-    assert!(
-        report.origin_bytes < requested_bytes(&requests),
-        "fanout fetched every copy from origin: {report:?}"
+    let destinations = (config.nodes - 1) as u64;
+    assert_eq!(report.origin_bytes, CIPHER as u64, "{report:?}");
+    assert_eq!(
+        report.peer_bytes,
+        destinations * CIPHER as u64,
+        "fanout must fetch every copy from the warm peer: {report:?}"
     );
-    // Use charged peer bytes rather than an exact fanout count: subsequent
-    // destinations may themselves become sources as their fills complete.
-    let one_page_ticks = PAGE_BYTES.div_ceil(config.network_bytes_per_tick);
+    // Node 0 is warm and idle before the simultaneous arrivals. Every destination
+    // schedules its single fill before any fill completes, so all copies use
+    // node 0 and must serialize on its NIC, despite having distinct destination NICs.
+    let source_ticks = destinations * (CIPHER as u64).div_ceil(config.network_bytes_per_tick);
+    // Eight ciphertext transfers require 520 ticks. Without source serialization,
+    // each peer read takes only 65 + 64 + 2 * 2 = 133 ticks (fill, send, completions),
+    // and even the initial origin-backed warmup takes only 134 ticks.
     assert!(
-        report.latency_ticks.iter().copied().max().unwrap() > one_page_ticks * 2,
-        "fanout never queued behind source traffic: {report:?}"
+        report.latency_ticks.iter().copied().max().unwrap() >= source_ticks,
+        "fanout bypassed the cumulative source NIC bound of {source_ticks} ticks: {report:?}"
     );
 }
 
