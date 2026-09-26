@@ -204,7 +204,10 @@ impl Application {
 }
 
 fn scope(timeout: Duration) -> Result<RequestScope> {
-    RequestScope::new(RequestId([0; 16]), Instant::now() + timeout)
+    RequestScope::new(
+        RequestId([0; 16]),
+        crate::runtime::environment::now() + timeout,
+    )
 }
 
 /// Divide aggregate resource dimensions, preserving per-operation protocol caps.
@@ -314,7 +317,9 @@ fn bootstrap(
                     let io = ReactorControlIo::new(reactor.clone());
                     crate::control::transport::ControlIo::sleep(
                         &io,
-                        control.next_attempt().unwrap_or_else(Instant::now),
+                        control
+                            .next_attempt()
+                            .unwrap_or_else(crate::runtime::environment::now),
                         startup,
                     )
                     .await?;
@@ -412,6 +417,8 @@ impl Drop for SignalGuard {
 /// Node-level control events enter through bounded worker commands. Mutable state
 /// is not implicitly made global by Arc/Mutex or by a background async runtime.
 pub struct WorkerApplication {
+    environment: crate::runtime::environment::Environment,
+    drivers: Rc<crate::read::drivers::DriverQueue>,
     http: Rc<HttpPool>,
     pub worker: WorkerId,
     runtime: WorkerRuntime,
@@ -475,6 +482,9 @@ impl WorkerApplication {
         worker: WorkerId,
         runtime: WorkerRuntime,
     ) -> Result<Self> {
+        let environment = crate::runtime::environment::Environment::current();
+        let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _queue = drivers.enter();
         let admission = runtime.admission.clone();
         let reactor = runtime.reactor.clone();
         let limits = admission.limits();
@@ -746,6 +756,8 @@ impl WorkerApplication {
         telemetry.health = node.observations.health.clone();
         Ok(Self {
             http,
+            environment,
+            drivers,
             worker,
             runtime,
             control,
@@ -800,7 +812,9 @@ impl WorkerApplication {
     }
 
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
+        let environment = self.environment.clone();
+        let drivers = self.drivers.clone();
+        Box::pin(environment.scope(drivers.scope(async move {
             startup.check()?;
             if self.started || self.stopping {
                 return Err(Error::InvalidConfiguration);
@@ -855,7 +869,7 @@ impl WorkerApplication {
                             let io = ReactorControlIo::new(self.runtime.reactor.clone());
                             crate::control::transport::ControlIo::sleep(
                                 &io,
-                                Instant::now() + Duration::from_millis(100),
+                                crate::runtime::environment::now() + Duration::from_millis(100),
                                 startup,
                             )
                             .await?;
@@ -905,7 +919,7 @@ impl WorkerApplication {
             self.started = true;
             self.observe_health()?;
             Ok(())
-        })
+        })))
     }
 
     async fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
@@ -1020,12 +1034,15 @@ impl WorkerApplication {
     }
 
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+        let _environment = self.environment.enter();
+        let _queue = self.drivers.enter();
         if work_budget == 0 {
             return Ok(());
         }
         let budget = work_budget.min(64);
         self.http.poll_waiters(budget);
-        self.metadata.poll_deadlines(Instant::now(), budget);
+        self.metadata
+            .poll_deadlines(crate::runtime::environment::now(), budget);
         if self.stopping {
             for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
                 if let Some(result) = poll_task(task, cx) {
@@ -1128,7 +1145,9 @@ impl WorkerApplication {
     }
 
     pub fn shutdown<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
+        let environment = self.environment.clone();
+        let drivers = self.drivers.clone();
+        Box::pin(environment.scope(drivers.scope(async move {
             if let Some(endpoint) = &mut self.endpoint {
                 endpoint.uninstall()?;
             }
@@ -1152,7 +1171,7 @@ impl WorkerApplication {
                 .health
                 .transition(crate::telemetry::health::State::Stopped)?;
             Ok(())
-        })
+        })))
     }
 }
 
@@ -1238,6 +1257,8 @@ impl WorkerService for WorkerApplication {
         self.poll_services(cx, work_budget)
     }
     fn stop_admission(&mut self) -> Result<()> {
+        let _environment = self.environment.enter();
+        let _queue = self.drivers.enter();
         self.stopping = true;
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
@@ -1261,7 +1282,9 @@ impl WorkerService for WorkerApplication {
         Ok(())
     }
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
+        let environment = self.environment.clone();
+        let drivers = self.drivers.clone();
+        Box::pin(environment.scope(drivers.scope(async move {
             self.stop_admission()?;
             let deadline = scope(self.shutdown_timeout)?;
             let clients = self.clients.clone();
@@ -1351,7 +1374,7 @@ impl WorkerService for WorkerApplication {
                 self.checkpoint(&deadline).await?;
             }
             Ok(())
-        })
+        })))
     }
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::shutdown(self, scope)

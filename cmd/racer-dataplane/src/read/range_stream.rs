@@ -37,7 +37,7 @@ impl RangeBudget {
     fn next_page(&mut self, pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {
             Self::ClientPages { deadline } => {
-                if Instant::now() >= *deadline {
+                if crate::runtime::environment::now() >= *deadline {
                     return Err(Error::DeadlineExceeded);
                 }
                 Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))

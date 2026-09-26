@@ -5,10 +5,7 @@ use crate::{
     model::identity::{ClusterId, NodeId},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, UnixTime},
-};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use std::{rc::Rc, sync::Arc};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
@@ -34,7 +31,11 @@ pub(crate) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
             return Err(Error::Unauthorized);
         }
         let (rest, cert) = parse_x509_certificate(root).map_err(|_| Error::Unauthorized)?;
-        if !rest.is_empty() || !cert.is_ca() || !cert.validity().is_valid() {
+        let now = crate::runtime::environment::unix_time().as_secs();
+        let now = i64::try_from(now).map_err(|_| Error::Unauthorized)?;
+        let now =
+            x509_parser::time::ASN1Time::from_timestamp(now).map_err(|_| Error::Unauthorized)?;
+        if !rest.is_empty() || !cert.is_ca() || !cert.validity().is_valid_at(now) {
             return Err(Error::Unauthorized);
         }
         store
@@ -162,7 +163,11 @@ pub(crate) fn verify_chain(
         .map(|c| CertificateDer::from(c.as_slice()))
         .collect();
     verifier
-        .verify_client_cert(&leaf, &intermediates, UnixTime::now())
+        .verify_client_cert(
+            &leaf,
+            &intermediates,
+            crate::runtime::environment::unix_time(),
+        )
         .map_err(|_| Error::Unauthorized)?;
     let (rest, cert) = parse_x509_certificate(&chain[0]).map_err(|_| Error::Unauthorized)?;
     if !rest.is_empty()

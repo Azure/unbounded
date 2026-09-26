@@ -50,7 +50,7 @@ impl Resources {
 }
 impl Health {
     pub fn state(&self) -> Result<State> {
-        self.state_at(Instant::now())
+        self.state_at(crate::runtime::environment::now())
     }
     pub fn state_at(&self, now: Instant) -> Result<State> {
         let status = self.0.lock().map_err(|_| Error::Unavailable)?;
@@ -76,7 +76,10 @@ impl Health {
         if status.lifecycle == State::Stopped && state != State::Stopped
             || status.lifecycle == State::Draining
                 && !matches!(state, State::Draining | State::Stopped)
-            || state == State::Ready && !status.resources.usable_at(Instant::now())
+            || state == State::Ready
+                && !status
+                    .resources
+                    .usable_at(crate::runtime::environment::now())
         {
             return Err(Error::Unavailable);
         }
@@ -101,7 +104,7 @@ mod tests {
     }
     #[test]
     fn readiness_is_fail_closed_and_expires_without_updates() {
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let health = Health::default();
         assert!(health.live());
         assert!(!health.ready());

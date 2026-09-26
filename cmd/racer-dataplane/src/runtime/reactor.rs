@@ -73,6 +73,7 @@ use std::{
 };
 
 pub struct Reactor {
+    environment: super::environment::Environment,
     admission: Rc<Admission>,
     state: RefCell<State>,
 }
@@ -357,6 +358,7 @@ pub struct Completion<B: IoBuffer, L: 'static = ()> {
 impl Reactor {
     pub fn new(admission: Rc<Admission>) -> Self {
         Self {
+            environment: super::environment::Environment::current(),
             admission,
             state: RefCell::new(State {
                 ring: None,
@@ -780,6 +782,7 @@ impl Reactor {
     /// Process at most `budget` CQEs and inspect at most `budget` cancellation
     /// candidates, round-robin. Returns CQEs consumed, including cancel CQEs.
     pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
+        let _environment = self.environment.enter();
         if budget == 0 {
             return Ok(0);
         }

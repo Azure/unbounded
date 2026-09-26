@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 
 pub(crate) fn fresh_nonce() -> Result<Nonce> {
     let mut nonce = [0u8; 24];
-    getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+    crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
 pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -152,6 +152,7 @@ impl PageCrypto {
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
 pub struct PageCryptoEngine {
+    environment: crate::runtime::environment::Environment,
     runtime: CryptoRuntime,
     pending: Option<CryptoCompletion>,
     closed: bool,
@@ -159,6 +160,7 @@ pub struct PageCryptoEngine {
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
         Self {
+            environment: crate::runtime::environment::Environment::current(),
             runtime,
             pending: None,
             closed: false,
@@ -302,6 +304,7 @@ impl PageCryptoEngine {
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+        let _environment = self.environment.enter();
         let mut exhausted = budget != 0;
         for _ in 0..budget {
             if let Some(completion) = self.pending.take() {
@@ -342,7 +345,7 @@ impl CryptoService for PageCryptoEngine {
         self.runtime.port.register_driver(waker);
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move { scope.check() })
+        Box::pin(self.environment.scope(async move { scope.check() }))
     }
     fn poll_budgeted(&mut self, work_budget: usize) -> Result<()> {
         self.drive(

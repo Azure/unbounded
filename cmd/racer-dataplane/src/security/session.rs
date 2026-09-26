@@ -137,12 +137,12 @@ impl ChallengeProbe {
             return Err(Error::InvalidRequest);
         }
         let mut nonce = [0; 32];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+        crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             local,
             remote,
             nonce,
-            expires: Instant::now() + PROBE_LIFETIME,
+            expires: crate::runtime::environment::now() + PROBE_LIFETIME,
         })
     }
 
@@ -162,7 +162,7 @@ impl ChallengeProbe {
         certificates: &Certificates,
         reply: ChallengeReply,
     ) -> Result<AuthenticatedChallenge> {
-        if Instant::now() >= self.expires {
+        if crate::runtime::environment::now() >= self.expires {
             return Err(Error::DeadlineExceeded);
         }
         let bytes = response_bytes(&self.request_bytes(), &reply.challenge);
@@ -172,7 +172,7 @@ impl ChallengeProbe {
             &bytes,
             &reply.signature,
         )?;
-        if Instant::now() >= self.expires {
+        if crate::runtime::environment::now() >= self.expires {
             return Err(Error::DeadlineExceeded);
         }
         Ok(AuthenticatedChallenge {

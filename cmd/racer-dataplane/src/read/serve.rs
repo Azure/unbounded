@@ -449,7 +449,7 @@ mod tests {
     use super::*;
     #[test]
     fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
-        let now = std::time::Instant::now();
+        let now = crate::runtime::environment::now();
         let scope = RequestScope::new(
             crate::model::identity::RequestId([1; 16]),
             now + std::time::Duration::from_secs(60),

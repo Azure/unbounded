@@ -139,7 +139,7 @@ impl RequestScope {
     pub fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if Instant::now() >= self.deadline.0 {
+        } else if crate::runtime::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
             Ok(())

@@ -74,7 +74,7 @@ impl Binding {
         rail: RailId,
     ) -> Result<Self> {
         let mut transfer = [0; 16];
-        getrandom::getrandom(&mut transfer).map_err(|_| Error::Unavailable)?;
+        crate::runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             request: envelope_digest(auth)?,
             response: [0; 32],
@@ -163,7 +163,7 @@ impl Binding {
         scope: &RequestScope,
     ) -> Result<(VerifiedHead, Phase)> {
         scope.check()?;
-        if p::decode_deadline(self.deadline)?.0 <= std::time::Instant::now() {
+        if p::decode_deadline(self.deadline)?.0 <= crate::runtime::environment::now() {
             return Err(Error::DeadlineExceeded);
         }
         let kind = p::field(&signed.head, "racer-kind")?;

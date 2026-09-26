@@ -480,7 +480,7 @@ impl QueuePairHandle {
         let simulated = false;
         if simulated {
             psn = qpn.to_be_bytes();
-        } else if getrandom::getrandom(&mut psn).is_err() {
+        } else if crate::runtime::environment::fill_random(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
                 std::mem::forget(device);
             }
@@ -660,7 +660,7 @@ impl QueuePairHandle {
         if self
             .expires
             .get()
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            .is_some_and(|deadline| crate::runtime::environment::now() >= deadline)
         {
             self.stop()?;
             return Err(Error::DeadlineExceeded);

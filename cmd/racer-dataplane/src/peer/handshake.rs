@@ -198,7 +198,7 @@ impl Handshake {
             scope.check()?;
             self.cache
                 .borrow_mut()
-                .retain(|_, (_, expiry)| *expiry > Instant::now());
+                .retain(|_, (_, expiry)| *expiry > crate::runtime::environment::now());
             if self.cache.borrow().len() >= self.capacity && !self.cache.borrow().contains_key(peer)
             {
                 return Err(Error::Overloaded);
@@ -291,7 +291,7 @@ impl Handshake {
             self.cache
                 .borrow()
                 .get(peer)
-                .filter(|(_, expiry)| *expiry > Instant::now())
+                .filter(|(_, expiry)| *expiry > crate::runtime::environment::now())
                 .map(|(capabilities, _)| *capabilities)
                 .ok_or(Error::Unavailable)
         })
@@ -307,13 +307,13 @@ impl Handshake {
                 .cache
                 .borrow()
                 .get(peer)
-                .filter(|(_, expiry)| *expiry > Instant::now())
+                .filter(|(_, expiry)| *expiry > crate::runtime::environment::now())
             {
                 return Ok(*capabilities);
             }
             self.cache
                 .borrow_mut()
-                .retain(|_, (_, expiry)| *expiry > Instant::now());
+                .retain(|_, (_, expiry)| *expiry > crate::runtime::environment::now());
             if self.cache.borrow().len() >= self.capacity {
                 return Err(Error::Overloaded);
             }
@@ -324,7 +324,7 @@ impl Handshake {
                 .negotiate(peer, scope)
                 .await?;
             scope.check()?;
-            if result.peer.node() != peer || result.expires <= Instant::now() {
+            if result.peer.node() != peer || result.expires <= crate::runtime::environment::now() {
                 return Err(Error::Unauthorized);
             }
             let capabilities = result.capabilities;

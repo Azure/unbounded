@@ -107,7 +107,7 @@ impl Signatures {
             return Err(Error::Unauthorized);
         }
         let mut nonce = [0; 24];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+        crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
         push(&mut head, "racer-profile", protocol::PROFILE);
         protocol::uuid(&self.keys.cluster().0)?;
         protocol::uuid(&self.node().0)?;
@@ -123,7 +123,7 @@ impl Signatures {
         push(
             &mut head,
             "racer-timestamp",
-            protocol::millis(SystemTime::now())?,
+            protocol::millis(crate::runtime::environment::wall_now())?,
         );
         let input = signature_input(&head)?;
         push(&mut head, "signature-input", format!("racer={input}"));
@@ -169,7 +169,7 @@ impl Signatures {
         // Historical originals expire too, but only the intended final receiver
         // checks its local challenge and records the verified nonce.
         let freshness = freshness(head)?;
-        let now = SystemTime::now();
+        let now = crate::runtime::environment::wall_now();
         if freshness.timestamp
             > now
                 .checked_add(super::replay::MAX_FUTURE_SKEW)

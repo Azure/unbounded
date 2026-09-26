@@ -149,7 +149,11 @@ impl PeerServer {
             // One fixed budget per exchange, never renewed by partial headers.
             // Clone the listener cancellation, but keep this cap out of dispatch
             // and response I/O, which use the signed request deadline below.
-            let header_scope = header_scope(scope, self.request_timeout, Instant::now())?;
+            let header_scope = header_scope(
+                scope,
+                self.request_timeout,
+                crate::runtime::environment::now(),
+            )?;
             let mut received = self.io.receive_head(connection, &header_scope).await?;
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())

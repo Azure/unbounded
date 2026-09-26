@@ -43,7 +43,7 @@ pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
     /// `visited` contains prior senders, excluding the current recipient.
     pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        self.validate_at(from, Instant::now())?;
+        self.validate_at(from, crate::runtime::environment::now())?;
         if self.remaining_links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
@@ -70,7 +70,7 @@ impl RouteBudget {
         {
             return Err(Error::InvalidRequest);
         }
-        forwarded.validate_at(next, Instant::now())
+        forwarded.validate_at(next, crate::runtime::environment::now())
     }
 
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
@@ -204,7 +204,7 @@ impl Paths {
         from: &NodeId,
         budget: &RouteBudget,
     ) -> Result<PathKey> {
-        budget.validate_at(from, Instant::now())?;
+        budget.validate_at(from, crate::runtime::environment::now())?;
         if membership.version != budget.membership {
             return Err(Error::IncompatibleMembership);
         }
@@ -328,7 +328,7 @@ impl Search {
     }
 
     fn step(&mut self, quantum: usize, deadline: Deadline) -> Result<bool> {
-        if Instant::now() >= deadline.0 {
+        if crate::runtime::environment::now() >= deadline.0 {
             return Err(Error::DeadlineExceeded);
         }
         if self.key.from == self.key.to {

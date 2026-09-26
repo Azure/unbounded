@@ -450,7 +450,9 @@ impl AcquisitionWaiter<'_> {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
                 if entry.state == FlightState::RetryPending && !waiter.issued {
-                    if Instant::now() >= self.budget.deadline || self.budget.attempts == 0 {
+                    if crate::runtime::environment::now() >= self.budget.deadline
+                        || self.budget.attempts == 0
+                    {
                         let error = if self.budget.attempts == 0 {
                             Error::Unavailable
                         } else {
@@ -617,7 +619,7 @@ impl Flights {
                     return Err(Error::Overloaded);
                 }
             }
-            if Instant::now() >= budget.deadline {
+            if crate::runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.attempts == 0 {
@@ -1071,7 +1073,8 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
     for waiter in entry.waiters.values_mut() {
         if waiter.error.is_none() {
             waiter.error = waiter.scope.check().err().or_else(|| {
-                (Instant::now() >= waiter.budget_deadline).then_some(Error::DeadlineExceeded)
+                (crate::runtime::environment::now() >= waiter.budget_deadline)
+                    .then_some(Error::DeadlineExceeded)
             });
             if waiter.error.is_some() {
                 if let Some(waker) = waiter.waker.take() {

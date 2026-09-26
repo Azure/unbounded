@@ -182,7 +182,7 @@ impl ControlClient {
                 if self.stopped.get() {
                     return Ok(());
                 }
-                let now = Instant::now();
+                let now = crate::runtime::environment::now();
                 if let Some(next) = self.next.get().filter(|next| *next > now) {
                     self.transport.io()?.sleep(next, scope).await?;
                 }
@@ -229,11 +229,11 @@ impl ControlClient {
         let failures = self.failures.get().saturating_add(1);
         self.failures.set(failures);
         let mut random = [0; 8];
-        getrandom::getrandom(&mut random).map_err(|_| Error::Io)?;
+        crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
         let ceiling = (1u64 << failures.saturating_sub(1).min(5)).min(30) * 1000;
         let delay = Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 1000 + 1));
         let delay = delay.max(self.retry_after.take().unwrap_or_default());
-        Instant::now()
+        crate::runtime::environment::now()
             .checked_add(delay)
             .ok_or(Error::InvalidRequest)
     }
@@ -268,14 +268,18 @@ impl ControlClient {
             if self.started.get() {
                 return self.identity.borrow().clone().ok_or(Error::Unauthorized);
             }
-            if self.next.get().is_some_and(|n| n > Instant::now()) {
+            if self
+                .next
+                .get()
+                .is_some_and(|n| n > crate::runtime::environment::now())
+            {
                 return Err(Error::Unavailable);
             }
             let mut turn = scope.clone();
             turn.deadline.0 = turn
                 .deadline
                 .0
-                .min(Instant::now() + Duration::from_secs(40));
+                .min(crate::runtime::environment::now() + Duration::from_secs(40));
             *self.active_scope.borrow_mut() = Some(turn.clone());
             let _turn = ActiveTurn(&self.active_scope);
             let result = self.start_inner(&turn).await;
@@ -305,7 +309,7 @@ impl ControlClient {
         *self.identity.borrow_mut() = Some(identity.clone());
         *self.startup_bundle.borrow_mut() = Some(bundle);
         self.started.set(true);
-        self.next.set(Some(Instant::now()));
+        self.next.set(Some(crate::runtime::environment::now()));
         Ok(identity)
     }
     pub fn activate_identity(&self) -> Result<()> {
@@ -335,14 +339,17 @@ impl ControlClient {
             if !self.started.get() {
                 return Err(Error::InvalidConfiguration);
             }
-            if self.next.get().is_some_and(|n| n > Instant::now()) {
+            if self
+                .next
+                .get()
+                .is_some_and(|n| n > crate::runtime::environment::now())
+            {
                 return self.state();
             }
             let mut turn = scope.clone();
-            turn.deadline.0 = turn
-                .deadline
-                .0
-                .min(Instant::now() + wire::POLL_WAIT + Duration::from_secs(10));
+            turn.deadline.0 = turn.deadline.0.min(
+                crate::runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10),
+            );
             *self.active_scope.borrow_mut() = Some(turn.clone());
             let _turn = ActiveTurn(&self.active_scope);
             let result = self.advance(&turn).await;
@@ -351,7 +358,7 @@ impl ControlClient {
                     if self.renewal_error.get().is_none() {
                         self.failures.set(0);
                     }
-                    self.next.set(Some(Instant::now()));
+                    self.next.set(Some(crate::runtime::environment::now()));
                     self.state()
                 }
                 Err(e) => {
@@ -383,7 +390,10 @@ impl ControlClient {
                 .borrow()
                 .as_ref()
                 .is_none_or(|i| !i.valid_now())
-                || self.renew_next.get().is_none_or(|n| n <= Instant::now()))
+                || self
+                    .renew_next
+                    .get()
+                    .is_none_or(|n| n <= crate::runtime::environment::now()))
         {
             match self.renew(scope).await {
                 Ok(()) => {
@@ -460,7 +470,10 @@ impl ControlClient {
             identity: self.identity.borrow().as_ref().map(|i| i.node().clone()),
             snapshot: self.snapshots.current().ok(),
             cache_events: self.events.borrow_mut().drain(..).collect(),
-            next_attempt: self.next.get().unwrap_or_else(Instant::now),
+            next_attempt: self
+                .next
+                .get()
+                .unwrap_or_else(crate::runtime::environment::now),
         })
     }
     fn response(&self, response: HttpResponse, unchanged: bool) -> Result<Vec<u8>> {

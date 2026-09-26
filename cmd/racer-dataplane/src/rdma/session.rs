@@ -46,7 +46,7 @@ pub struct SetupParameters {
 impl SetupParameters {
     fn new(rail: RailId, endpoint: Endpoint) -> Result<Self> {
         let mut nonce = [0; 16];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Io)?;
+        crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
         let mut encoded = b"racer-rdma-setup-v1\0".to_vec();
         encoded.extend_from_slice(&rail.0.to_be_bytes());
         encoded.extend_from_slice(&nonce);
@@ -176,7 +176,7 @@ impl Sessions {
         let qp = std::task::ready!(QueuePairHandle::poll_new(self.devices.select(rail)?.handle))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
-        qp.expire_at(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        qp.expire_at(crate::runtime::environment::now() + std::time::Duration::from_secs(30));
         let setup = SetupParameters::new(rail, qp.endpoint)?;
         live.push((peer.node().clone(), qp.clone()));
         std::task::Poll::Ready(Ok(PreparedSession {

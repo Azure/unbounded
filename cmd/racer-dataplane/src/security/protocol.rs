@@ -14,10 +14,7 @@ use crate::{
     topology::paths::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{
-    sync::OnceLock,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const PROFILE: &str = "racer-peer-v1";
 pub const MAX_HOPS: usize = 8;
@@ -84,16 +81,12 @@ pub fn millis(time: SystemTime) -> Result<u64> {
     )
     .map_err(|_| Error::InvalidRequest)
 }
-fn clock() -> &'static (Instant, SystemTime) {
-    static CLOCK: OnceLock<(Instant, SystemTime)> = OnceLock::new();
-    CLOCK.get_or_init(|| (Instant::now(), SystemTime::now()))
-}
-/// Stable process clock mapping. Decode wire deadlines with `decode_deadline`,
+/// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    let (mono, wall) = clock();
-    let time = if deadline.0 >= *mono {
-        wall.checked_add(deadline.0.duration_since(*mono))
+    let (mono, wall) = crate::runtime::environment::clock_anchor();
+    let time = if deadline.0 >= mono {
+        wall.checked_add(deadline.0.duration_since(mono))
     } else {
         wall.checked_sub(mono.duration_since(deadline.0))
     }
@@ -101,8 +94,8 @@ pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
     millis(time)
 }
 pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    let (mono, wall) = clock();
-    let base = millis(*wall)?;
+    let (mono, wall) = crate::runtime::environment::clock_anchor();
+    let base = millis(wall)?;
     // Account for submillisecond wall-clock origin, making encode/decode exact.
     let fraction = wall
         .duration_since(UNIX_EPOCH)

@@ -64,8 +64,8 @@ impl Freshness {
     /// Nonces are generated independently of page/credential nonces and attempt IDs.
     pub fn generate(session_challenge: [u8; 32]) -> Result<Self> {
         let mut nonce = [0; 24];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
-        let elapsed = SystemTime::now()
+        crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
+        let elapsed = crate::runtime::environment::wall_now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::Unavailable)?;
         let millis = u64::try_from(elapsed.as_millis()).map_err(|_| Error::Unavailable)?;
@@ -93,7 +93,8 @@ impl ReplayWindow {
         let mut guard = self.state.inner.lock().map_err(|_| Error::Unavailable)?;
         if guard.is_none() {
             let mut challenge = [0; 32];
-            getrandom::getrandom(&mut challenge).map_err(|_| Error::Unavailable)?;
+            crate::runtime::environment::fill_random(&mut challenge)
+                .map_err(|_| Error::Unavailable)?;
             *guard = Some(Table {
                 challenge,
                 capacity: self.capacity,
@@ -112,7 +113,9 @@ impl ReplayWindow {
     /// Publish this challenge only in a certificate-authenticated handshake. A
     /// challenge is public randomness, not a replacement for peer authentication.
     pub fn challenge(&self) -> Result<[u8; 32]> {
-        self.with_table(SystemTime::now(), |table| Ok(table.challenge))
+        self.with_table(crate::runtime::environment::wall_now(), |table| {
+            Ok(table.challenge)
+        })
     }
 
     /// Compatibility admission using a stable node epoch. Signature verification
@@ -130,7 +133,12 @@ impl ReplayWindow {
         epoch: &[u8],
         freshness: &Freshness,
     ) -> Result<()> {
-        self.admit_at(signer, epoch, freshness, SystemTime::now())
+        self.admit_at(
+            signer,
+            epoch,
+            freshness,
+            crate::runtime::environment::wall_now(),
+        )
     }
 
     /// Explicit time input supports deterministic protocol verification/tests.

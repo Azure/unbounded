@@ -369,6 +369,7 @@ fn adapter_connection(
 }
 
 struct Rig {
+    drivers: Rc<racer_dataplane::read::drivers::DriverQueue>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
@@ -627,6 +628,7 @@ impl Rig {
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
             admission,
+            drivers: Rc::new(racer_dataplane::read::drivers::DriverQueue::default()),
             reactor,
             crypto,
             engine,
@@ -643,6 +645,7 @@ impl Rig {
         }
     }
     fn tick(&self) {
+        let _queue = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
         if let Some(engine) = &self.engine {
@@ -667,6 +670,7 @@ impl Rig {
         }
     }
     fn drive<T>(&self, future: impl Future<Output = T>) -> T {
+        let _queue = self.drivers.enter();
         let mut future = std::pin::pin!(future);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let deadline = Instant::now() + TIMEOUT;

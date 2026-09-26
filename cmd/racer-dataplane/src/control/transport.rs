@@ -87,7 +87,7 @@ impl ControlIo for ReactorControlIo {
     fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let duration = until.saturating_duration_since(Instant::now());
+            let duration = until.saturating_duration_since(crate::runtime::environment::now());
             if duration.is_zero() {
                 return Ok(());
             }
@@ -95,7 +95,7 @@ impl ControlIo for ReactorControlIo {
             if crate::runtime::reactor::simulation::Simulation::current().is_some() {
                 return std::future::poll_fn(|cx| {
                     scope.check()?;
-                    if Instant::now() >= until {
+                    if crate::runtime::environment::now() >= until {
                         std::task::Poll::Ready(Ok(()))
                     } else {
                         cx.waker().wake_by_ref();
@@ -415,7 +415,10 @@ fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
 impl ControlConnection {
     fn check(&self, scope: &RequestScope) -> Result<()> {
         scope.check()?;
-        if self.expires.is_some_and(|e| SystemTime::now() >= e) {
+        if self
+            .expires
+            .is_some_and(|e| crate::runtime::environment::wall_now() >= e)
+        {
             return Err(Error::Unauthorized);
         }
         Ok(())
@@ -460,9 +463,12 @@ impl ControlConnection {
             let mut bounded = scope.clone();
             if let Some(expiry) = self.expires {
                 let remaining = expiry
-                    .duration_since(SystemTime::now())
+                    .duration_since(crate::runtime::environment::wall_now())
                     .map_err(|_| Error::Unauthorized)?;
-                bounded.deadline.0 = bounded.deadline.0.min(Instant::now() + remaining);
+                bounded.deadline.0 = bounded
+                    .deadline
+                    .0
+                    .min(crate::runtime::environment::now() + remaining);
             }
             self.io
                 .ready(
@@ -794,7 +800,9 @@ fn retry_delay(bytes: &[u8]) -> Result<Duration> {
     let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
     let target = std::time::UNIX_EPOCH
         + Duration::from_secs(seconds.try_into().map_err(|_| Error::InvalidRequest)?);
-    Ok(target.duration_since(SystemTime::now()).unwrap_or_default())
+    Ok(target
+        .duration_since(crate::runtime::environment::wall_now())
+        .unwrap_or_default())
 }
 
 #[cfg(test)]

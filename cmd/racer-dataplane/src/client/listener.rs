@@ -526,10 +526,10 @@ async fn serve_connection(
 
 fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
     let mut id = [0; 16];
-    getrandom::getrandom(&mut id).map_err(|_| Error::Unavailable)?;
+    crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
     Ok(RequestScope {
         request: RequestId(id),
-        deadline: crate::runtime::deadline::Deadline(Instant::now() + timeout),
+        deadline: crate::runtime::deadline::Deadline(crate::runtime::environment::now() + timeout),
         cancellation,
     })
 }

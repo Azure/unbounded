@@ -435,8 +435,12 @@ impl MetadataService {
     }
 
     fn observe_clock(&self) -> Result<SystemTime> {
-        let now = SystemTime::now();
-        if self.clock.borrow_mut().observe(now, Instant::now()) {
+        let now = crate::runtime::environment::wall_now();
+        if self
+            .clock
+            .borrow_mut()
+            .observe(now, crate::runtime::environment::now())
+        {
             self.storage.index.invalidate_freshness()?;
         }
         Ok(now)
@@ -492,7 +496,8 @@ impl MetadataService {
                     }
                     let driver_permit = super::drivers::reserve()?;
                     let mut nonce = [0; 16];
-                    getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+                    crate::runtime::environment::fill_random(&mut nonce)
+                        .map_err(|_| Error::Unavailable)?;
                     let attempt = crate::model::identity::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
                     let owned_context =
@@ -613,7 +618,7 @@ impl MetadataService {
             },
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, PageNumber(0))?;
-                budget.begin_attempt(Instant::now(), scope.deadline.0)?;
+                budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
                 let acquisition = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
                     let reservation = self.storage.fill.reserve_bootstrap(&context.object.cache)?;
                     self.origin

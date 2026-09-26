@@ -156,6 +156,7 @@ struct Service {
 }
 impl Service {
     fn poll(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        let _queue = self.rig.drivers.enter();
         // WorkerGroup polls the reactor and crypto completions with its real waker.
         self.rig.endpoint.borrow_mut().poll(cx, 64)?;
         self.rig.flights.poll_with_context(cx, 64)?;

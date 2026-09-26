@@ -208,6 +208,7 @@ struct Resource {
 /// Construct only inside build_crypto, after its NativePort crossed threads.
 /// Rc native owners never cross threads, even during cancellation or shutdown.
 pub struct NativeService {
+    environment: crate::runtime::environment::Environment,
     port: NativePort,
     resources: Vec<Option<Resource>>,
     cursor: usize,
@@ -218,6 +219,7 @@ impl NativeService {
     pub fn new(port: NativePort) -> Self {
         let resources = (0..port.shared.slots.len()).map(|_| None).collect();
         Self {
+            environment: crate::runtime::environment::Environment::current(),
             port,
             resources,
             cursor: 0,
@@ -299,6 +301,7 @@ impl NativeService {
     /// Run at most budget slots. Each slot may execute one native syscall/job.
     /// Calls may block this crypto role, but cannot block the paired I/O reactor.
     pub fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        let _environment = self.environment.enter();
         if budget == 0 {
             return Ok(());
         }
@@ -337,14 +340,15 @@ impl NativeService {
         if resource.stopping {
             if resource
                 .next_retry
-                .is_some_and(|at| std::time::Instant::now() < at)
+                .is_some_and(|at| crate::runtime::environment::now() < at)
             {
                 return;
             }
             if let Some(qp) = &resource.qp {
                 if qp.stop().is_err() {
-                    resource.next_retry =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(10));
+                    resource.next_retry = Some(
+                        crate::runtime::environment::now() + std::time::Duration::from_millis(10),
+                    );
                     return;
                 } // quarantine, retry on next service turn
             }

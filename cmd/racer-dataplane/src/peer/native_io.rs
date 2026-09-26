@@ -19,7 +19,7 @@ use crate::{
     },
     topology::rails::TransportPlan,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn recoverable(error: Error) -> bool {
     matches!(error, Error::Unavailable | Error::Io | Error::Overloaded)
@@ -29,7 +29,7 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
     bounded.deadline.0 = bounded
         .deadline
         .0
-        .min(Instant::now() + Duration::from_secs(5));
+        .min(crate::runtime::environment::now() + Duration::from_secs(5));
     bounded
 }
 fn native_failure(error: Error, scope: &RequestScope) -> bool {

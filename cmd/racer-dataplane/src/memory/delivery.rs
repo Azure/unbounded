@@ -166,7 +166,7 @@ impl Delivery {
             let socket = connection.socket();
             validate_socket(&socket)?;
             drop(socket);
-            let mut stalled_at = Instant::now();
+            let mut stalled_at = crate::runtime::environment::now();
             let mut copying = false;
             let mut budget = 0;
             let mut calls = 0;
@@ -238,7 +238,7 @@ impl Delivery {
                     return Err(Error::Io);
                 }
                 reader.sent += sent;
-                stalled_at = Instant::now();
+                stalled_at = crate::runtime::environment::now();
                 budget += sent;
                 calls += 1;
                 if (budget >= SEND_BUDGET_BYTES || calls >= SEND_BUDGET_CALLS)
@@ -288,7 +288,7 @@ impl Delivery {
         scope: &RequestScope,
     ) -> Result<()> {
         scope.check()?;
-        let mut stalled_at = Instant::now();
+        let mut stalled_at = crate::runtime::environment::now();
         let mut budget = 0;
         let mut calls = 0;
         let mut copying = false;
@@ -297,7 +297,7 @@ impl Delivery {
             let stall_deadline = stalled_at
                 .checked_add(self.stall_timeout)
                 .ok_or(Error::InvalidConfiguration)?;
-            if Instant::now() >= stall_deadline {
+            if crate::runtime::environment::now() >= stall_deadline {
                 return Err(Error::DeadlineExceeded);
             }
             let result = reader.try_send(&connection, copying);
@@ -308,7 +308,7 @@ impl Delivery {
                 reader.sent += sent;
                 budget += sent;
                 calls += 1;
-                stalled_at = Instant::now();
+                stalled_at = crate::runtime::environment::now();
                 if (budget >= SEND_BUDGET_BYTES || calls >= SEND_BUDGET_CALLS)
                     && reader.remaining() != 0
                 {

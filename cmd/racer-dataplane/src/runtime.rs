@@ -5,5 +5,6 @@ pub mod affinity;
 pub mod channel;
 pub mod crypto;
 pub mod deadline;
+pub mod environment;
 pub mod reactor;
 pub mod worker;

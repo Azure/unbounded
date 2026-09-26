@@ -159,7 +159,8 @@ pub(super) fn prepare<'a>(
                 continue;
             }
             let mut random = [0; 16];
-            getrandom::getrandom(&mut random).map_err(|_| Error::Unavailable)?;
+            crate::runtime::environment::fill_random(&mut random)
+                .map_err(|_| Error::Unavailable)?;
             let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
             let next = Rc::new(bind(&owner.root, definition.clone(), &temporary)?);
             let previous = old

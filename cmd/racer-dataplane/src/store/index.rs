@@ -169,7 +169,7 @@ impl Index {
             .borrow()
             .current
             .get(object)
-            .filter(|v| std::time::SystemTime::now() < v.expires_at.0)
+            .filter(|v| crate::runtime::environment::wall_now() < v.expires_at.0)
             .cloned())
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
@@ -179,7 +179,7 @@ impl Index {
         self.publish_version(metadata.immutable())?;
         let mut s = self.state.borrow_mut();
         s.current.remove(&metadata.version.object);
-        if std::time::SystemTime::now() < metadata.expires_at.0 {
+        if crate::runtime::environment::wall_now() < metadata.expires_at.0 {
             s.current.insert(
                 metadata.version.object.clone(),
                 CurrentVersion {

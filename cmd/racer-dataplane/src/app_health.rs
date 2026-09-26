@@ -1,10 +1,7 @@
 //! Readiness observations expire unless every required worker keeps progressing.
 use super::*;
 use crate::telemetry::health::{Health, Resources, State};
-use std::{
-    collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, time::UNIX_EPOCH};
 
 #[derive(Default)]
 pub(super) struct Observations {
@@ -15,7 +12,7 @@ impl Observations {
     fn record(&self, worker: WorkerId, resources: Resources, count: usize) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, resources);
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
@@ -75,7 +72,7 @@ impl WorkerApplication {
         let Some(node) = &self.node else {
             return Ok(());
         };
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let credentials = self.keys.signing_identity().ok().and_then(|identity| {
             let expiry = identity
                 .certificate_chain()
@@ -86,7 +83,7 @@ impl WorkerApplication {
                 })
                 .min()?;
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
-                .duration_since(SystemTime::now())
+                .duration_since(crate::runtime::environment::wall_now())
                 .ok()?;
             now.checked_add(remaining)
         });
@@ -117,7 +114,7 @@ mod tests {
     #[test]
     fn readiness_requires_every_worker_and_expires_without_progress() {
         let observations = Observations::default();
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,

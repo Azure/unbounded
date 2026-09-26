@@ -8,7 +8,7 @@ use crate::{
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 enum Datagram {
@@ -142,7 +142,7 @@ pub(super) async fn resolve(
                 attempt.deadline.0 = attempt
                     .deadline
                     .0
-                    .min(Instant::now() + Duration::from_secs(2));
+                    .min(crate::runtime::environment::now() + Duration::from_secs(2));
                 match query(io, *server, &name, kind, &attempt).await {
                     Ok(ips) => {
                         addresses.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port)))
@@ -169,7 +169,7 @@ async fn query(
     scope: &RequestScope,
 ) -> Result<Vec<IpAddr>> {
     let mut id = [0; 2];
-    getrandom::getrandom(&mut id).map_err(|_| Error::Io)?;
+    crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
     let mut request = vec![id[0], id[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     if name.len() > 253 {
         return Err(Error::InvalidConfiguration);

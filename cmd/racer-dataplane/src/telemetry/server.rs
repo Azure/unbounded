@@ -185,7 +185,12 @@ fn exchange<'a>(
     Box::pin(async move {
         let scope = RequestScope {
             request: parent.request,
-            deadline: Deadline(parent.deadline.0.min(Instant::now() + CONNECTION_TIMEOUT)),
+            deadline: Deadline(
+                parent
+                    .deadline
+                    .0
+                    .min(crate::runtime::environment::now() + CONNECTION_TIMEOUT),
+            ),
             cancellation: parent.cancellation.clone(),
         };
         let mut used = 0;

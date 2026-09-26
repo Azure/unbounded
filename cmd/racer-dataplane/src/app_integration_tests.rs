@@ -176,11 +176,13 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
     let (release, receive) = futures::channel::oneshot::channel::<()>();
     let memory = second.memory.clone();
     let late = late1.clone();
+    let owner = second.drivers.enter();
     crate::read::drivers::spawn(Box::pin(async move {
         receive.await.map_err(|_| Error::Cancelled)?;
         memory.publish(late)
     }))
     .unwrap();
+    drop(owner);
     for _ in 0..4 {
         first.poll_retirement(&mut cx).unwrap();
         second.poll_retirement(&mut cx).unwrap();

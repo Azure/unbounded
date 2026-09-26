@@ -255,7 +255,8 @@ impl Fill {
                         // Seal/open creates an independently admitted operation owner;
                         // no raw secret clone or request borrow escapes into a worker job.
                         let mut nonce = [0; 16];
-                        getrandom::getrandom(&mut nonce).map_err(|_| Error::Unavailable)?;
+                        crate::runtime::environment::fill_random(&mut nonce)
+                            .map_err(|_| Error::Unavailable)?;
                         let attempt = crate::model::identity::AttemptId(nonce);
                         let sealed = self.dependencies.credentials.seal(
                             acquisition.origin,
@@ -532,7 +533,7 @@ impl Fill {
             CandidateResolution::Copy(result) => result,
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, page.number)?;
-                budget.begin_attempt(std::time::Instant::now(), scope.deadline.0)?;
+                budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
                 scope.check()?;
                 let plaintext = match plaintext.take() {
                     Some(reserved) => reserved,

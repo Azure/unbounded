@@ -370,7 +370,7 @@ impl QueuePairHandle {
         if self
             .expires
             .get()
-            .is_some_and(|d| std::time::Instant::now() >= d)
+            .is_some_and(|d| crate::runtime::environment::now() >= d)
             && !self.stopped()
         {
             self.failure.set(Some(Error::DeadlineExceeded));

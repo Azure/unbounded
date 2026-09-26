@@ -14,7 +14,7 @@ use crate::{
 };
 use std::{
     rc::Rc,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 pub struct Responses {
@@ -45,8 +45,10 @@ impl Responses {
             // only a short, independently bounded final head, then close.
             let final_scope;
             let scope = if scope.check().is_err() {
-                final_scope =
-                    RequestScope::new(scope.request, Instant::now() + Duration::from_secs(1))?;
+                final_scope = RequestScope::new(
+                    scope.request,
+                    crate::runtime::environment::now() + Duration::from_secs(1),
+                )?;
                 &final_scope
             } else {
                 scope

@@ -175,7 +175,7 @@ impl Drop for ConnectionLease {
                     entry.idle.push(Idle {
                         fd: self.fd.clone(),
                         reservation,
-                        since: Instant::now(),
+                        since: crate::runtime::environment::now(),
                     });
                 }
             }
@@ -226,7 +226,7 @@ impl HttpPool {
                 closed: false,
                 waiting: VecDeque::new(),
                 poll_cursor: 0,
-                next_waiter_poll: Instant::now(),
+                next_waiter_poll: crate::runtime::environment::now(),
             })),
         }
     }
@@ -328,7 +328,7 @@ impl HttpPool {
     /// does not repoll them merely because the outer worker received a timer tick.
     pub fn poll_waiters(&self, budget: usize) {
         let mut state = self.state.borrow_mut();
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         if budget == 0 || state.waiting.is_empty() || now < state.next_waiter_poll {
             return;
         }
@@ -438,7 +438,7 @@ impl HttpPool {
             .await
     }
     pub fn expire_idle(&self) {
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let mut state = self.state.borrow_mut();
         state.entries.retain(|_, entry| {
             entry

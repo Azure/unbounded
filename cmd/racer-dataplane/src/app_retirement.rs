@@ -102,6 +102,8 @@ impl RetirementBarriers for Retirement {
 }
 impl WorkerApplication {
     pub(super) fn poll_retirement(&mut self, cx: &mut Context<'_>) -> Result<bool> {
+        let _environment = self.environment.enter();
+        let _queue = self.drivers.enter();
         let Some(node) = self.node.clone() else {
             return Ok(false);
         };
@@ -271,7 +273,7 @@ impl WorkerApplication {
                 .endpoint
                 .as_ref()
                 .is_none_or(WorkerEndpoint::is_drained)
-            && crate::read::drivers::pending() == 0
+            && self.drivers.pending() == 0
             && self.peer_task.is_none()
             && self.diagnostic_task.is_none()
             && self.writer_task.is_none()

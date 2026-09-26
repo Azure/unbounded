@@ -114,7 +114,7 @@ pub(crate) fn read_file(file: File, limit: usize, private: bool) -> Result<Vec<u
 }
 pub(crate) fn atomic_write(dir: &File, target: &str, bytes: &[u8]) -> Result<()> {
     let mut random = [0; 16];
-    getrandom::getrandom(&mut random).map_err(|_| Error::Io)?;
+    crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
     let temporary = format!(".stage-{:032x}", u128::from_be_bytes(random));
     let mut file = open_at(
         dir,

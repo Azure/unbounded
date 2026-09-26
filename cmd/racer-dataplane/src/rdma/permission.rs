@@ -12,7 +12,7 @@ use crate::{
     security::signing::VerifiedHead,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{future::poll_fn, rc::Rc, task::Poll, time::Instant};
+use std::{future::poll_fn, rc::Rc, task::Poll};
 
 pub const DESCRIPTOR_HEADER: &str = "racer-rdma-descriptor";
 pub const COMPLETION_HEADER: &str = "racer-rdma-completion";
@@ -156,7 +156,7 @@ impl Grant {
         self.transfer
     }
     pub fn descriptor(&self) -> Result<RemoteDescriptor> {
-        if Instant::now() >= self.deadline.0 {
+        if crate::runtime::environment::now() >= self.deadline.0 {
             return Err(Error::DeadlineExceeded);
         }
         if !self.qp.ready() {
@@ -185,7 +185,7 @@ impl Grant {
                     let _ = self.qp.stop();
                     return Poll::Ready(Err(error));
                 }
-                if Instant::now() >= self.deadline.0 {
+                if crate::runtime::environment::now() >= self.deadline.0 {
                     let _ = self.qp.stop();
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
@@ -223,7 +223,7 @@ impl Grant {
                 if let Err(error) = scope.check() {
                     return Poll::Ready(Err(error));
                 }
-                if Instant::now() >= self.deadline.0 {
+                if crate::runtime::environment::now() >= self.deadline.0 {
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
                 if let Err(error) = self.qp.progress() {

@@ -184,7 +184,7 @@ impl Forwarding {
         next: &NodeId,
     ) -> Result<(SignedRequest, RequestBinding)> {
         let route = RouteState::from_budget(&request.route)?;
-        if route.deadline <= protocol::millis(std::time::SystemTime::now())? {
+        if route.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if route.visited != [self.signatures.node().clone()]
@@ -251,7 +251,7 @@ impl Forwarding {
         {
             return Err(Error::Unauthorized);
         }
-        if route.deadline <= protocol::millis(std::time::SystemTime::now())? {
+        if route.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         let last_peer = forwarders.last().unwrap_or(&origin);
@@ -398,7 +398,7 @@ impl Forwarding {
         }
         let old = RouteState::from_budget(&request.signed.request.route)?;
         let next = RouteState::from_budget(&budget)?;
-        if next.deadline <= protocol::millis(std::time::SystemTime::now())? {
+        if next.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         old.transition(&next, self.signatures.node())?;
@@ -615,7 +615,7 @@ fn response_authority(
     Ok(())
 }
 fn check_request_deadline(request: &RequestBinding) -> Result<()> {
-    if request.deadline <= protocol::millis(std::time::SystemTime::now())? {
+    if request.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
         return Err(Error::DeadlineExceeded);
     }
     Ok(())

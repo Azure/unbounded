@@ -23,7 +23,7 @@ pub struct SigningIdentity {
 impl PendingIdentity {
     pub fn generate() -> Result<Self> {
         let mut seed = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(&mut *seed).map_err(|_| Error::Unavailable)?;
+        crate::runtime::environment::fill_random(&mut *seed).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             key: SigningKey::from_bytes(&seed),
         })

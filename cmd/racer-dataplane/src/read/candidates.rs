@@ -313,7 +313,7 @@ impl CandidatePolicy {
         if links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
-        let now = Instant::now();
+        let now = crate::runtime::environment::now();
         let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
         // Share the remaining time among later candidates and, for predecessor
         // probes, local origin. Fast failures leave their unused time available.
@@ -331,7 +331,7 @@ impl CandidatePolicy {
             0
         };
         let mut bytes = [0; 16];
-        getrandom::getrandom(&mut bytes).map_err(|_| Error::Unavailable)?;
+        crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
         let credentials = self.credentials.borrow().clone().ok_or(Error::MissingKey)?;
         // Sealing is synchronous, but can still use up a very short time share.
@@ -400,7 +400,7 @@ impl CandidatePolicy {
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
     scope.check()?;
-    if Instant::now() >= budget.deadline() {
+    if crate::runtime::environment::now() >= budget.deadline() {
         Err(Error::DeadlineExceeded)
     } else {
         Ok(())

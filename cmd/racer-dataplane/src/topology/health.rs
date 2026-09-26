@@ -43,7 +43,7 @@ impl LinkHealth {
     }
 
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
-        self.observe_at(neighbor, outcome, Instant::now())
+        self.observe_at(neighbor, outcome, crate::runtime::environment::now())
     }
 
     pub fn observe_at(&self, neighbor: &NodeId, outcome: LinkOutcome, now: Instant) -> Result<()> {
@@ -69,7 +69,7 @@ impl LinkHealth {
     /// Read-only routing hint. Actual sends must call `try_acquire` to serialize
     /// half-open probes; successful closed circuits permit pooled concurrent I/O.
     pub fn available(&self, neighbor: &NodeId) -> Result<bool> {
-        self.available_at(neighbor, Instant::now())
+        self.available_at(neighbor, crate::runtime::environment::now())
     }
 
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
@@ -79,7 +79,7 @@ impl LinkHealth {
     }
 
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
-        self.try_acquire_at(neighbor, Instant::now())
+        self.try_acquire_at(neighbor, crate::runtime::environment::now())
     }
 
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
