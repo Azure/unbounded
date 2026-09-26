@@ -200,26 +200,47 @@ zero-TTL, cancellation, disk-hit, and memory-pressure validation.
 
 ## Hotpath bottleneck benchmark
 
-This ignored, release-only test reuses the production-component fixture with one
-real pinned I/O/crypto worker pair, io_uring, HTTP over Unix socket pairs, and
-encrypted O_DIRECT slabs. It runs 1, 32, and 128 concurrent readers sequentially:
+This ignored, release-only test reuses the production-component fixture with the
+host's production-default number and placement of pinned I/O/crypto worker pairs,
+io_uring, HTTP over Unix socket pairs, and encrypted O_DIRECT slabs. It parses
+`Config` defaults without ambient overrides and calls `AffinityPlan::from_topology`
+on discovered CPU affinity/cpuset, physical cores, quota, and NIC locality.
+`DEFAULT_MAX_THREADS=8` caps this at four pairs, not half the host logical CPUs
+(`src/config.rs:26`, `src/runtime/affinity.rs:91-112,125-191`). The default non-RDMA
+node budgets satisfy the builder's per-worker progress floors at four pairs
+(`src/app.rs:179-197,229-268`). The owned test driver needs one additional thread
+slot (`src/runtime/worker.rs:194-197`); it preserves the selected pairs and CPUs.
+Client and fixture-origin threads are additional benchmark machinery.
 
-- `memory`: repeated reads of one warmed 16 MiB page.
+It runs 1, 32, and 128 concurrent readers sequentially:
+
+- `memory`: repeated reads of one warmed, distinct 16 MiB page per owner.
 - `disk`: 128 distinct persisted pages per sweep, evicting plaintext between
   sweeps. Origin is offline, so a memory/origin fallback cannot mask disk work.
 - `fill`: 128 distinct cold pages from the streaming fixture origin, including
   encryption and asynchronous persistence.
 
-Memory and disk each run four sweeps; fill runs one. Each client issues one request
-at a time. This is a bounded, closed-loop saturation probe of one worker pair,
-not a full-node capacity estimate. Socket creation replaces listener acceptance;
-cross-worker routing and peer transports are outside this fixture. The disk case
-measures software overhead on RAM-backed ext4, not physical-storage performance.
+Memory and disk each run four sweeps of 128 total requests; fill runs one. Keys
+are selected with the production `WorkerMap` hash to balance page-zero/metadata
+owners. Every service installs its own worker ID in one shared, bounded
+`WorkerDirectory`, used by real dispatch, metadata, fill, and range streams.
+Client sockets enter round-robin workers; requests rotate to the next owner to
+exercise cross-worker coordination (with four pairs, all c32/c128 requests enter
+a different worker than their owner). c1 remains one sequential client and visits
+all owners. Warmup asserts the per-owner persisted record counts. Each client
+issues one request at a time. Memory now spans multiple keys, and aggregate
+admission grows with the selected pair count: results are not an apples-to-apples
+speedup comparison with the old single-key, single-pair benchmark.
+
+This is a bounded closed-loop component probe, not a full-node capacity estimate.
+Socket creation replaces listener acceptance; peer transports are outside this
+fixture. The disk case measures software overhead on RAM-backed ext4, not
+physical-storage performance.
 Fill timings also include the fixture origin's byte generation and streaming.
 
 ```sh
 sudo -v
-cargo test --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+CARGO_BUILD_JOBS=2 cargo test --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
   --test production_dataplane hotpath::hotpath -- \
   --ignored --exact --nocapture --test-threads=1
 ```
@@ -229,10 +250,33 @@ The test owns a 4 GiB RAM block device, formats/mounts it under the crate's
 `target/`, and unmounts/unloads it on success or panic. It refuses an already
 loaded `brd` module. Abrupt process termination cannot run Rust teardown.
 `RACER_BENCH_FAIL_SETUP=1` deliberately panics after mounting to check cleanup.
-It requires at least 16 GiB available host memory and checks visible cgroup-v2
-limits. Per-worker budgets are fixed: 256 MiB plaintext, 512 MiB ciphertext,
-128 MiB dirty data, and 16 delivery pipes. Clients stream into 64 KiB buffers;
-neither device size nor page budgets grow with CPU count or concurrency.
+Before allocating the device and before every case, it requires available host
+and visible ancestor cgroup-v2 memory of at least the larger of 16 GiB and twice
+the conservative memory envelope. Unsupported/unresolvable cgroup layouts fail
+closed. Per-worker **fixture limits**, not partitioned production defaults, remain
+256 MiB plaintext, 512 MiB ciphertext, 128 MiB dirty, 16 MiB request context,
+16 delivery pipes, and 256 queue entries/client connections. Production defaults
+instead divide node-wide 256/256/128/16 MiB and 16 pipes among workers
+(`src/config.rs:173-185`, `src/app.rs:234-249`). No limits are raised on overload.
+
+At four pairs the envelope is 12,416 MiB (plus 64 bytes): the full 4,096 MiB device,
+3,712 MiB admitted dimensions (including a conservative unused registered-memory
+allowance), 2,048 MiB aggregate worker auxiliary allowance (512 MiB each),
+2,048 MiB allocator allowance, and 512 MiB clients/kernel buffers.
+Thus preflight requires just over 24,832 MiB
+available, leaving an equal amount of headroom. Auxiliary allowances cover origin
+streaming, crypto scratch, stacks, indexes, queues, rings, sockets, and pipes;
+these are conservative planning allowances, not an OS-enforced RSS cap. Clients
+use two 64 KiB buffers each and origin streams 64 KiB chunks rather than retaining
+payloads. Plaintext/resident cache and ciphertext/slab staging are admission-bound.
+
+Disk preload is always 128 pages total (2 GiB payload), not per worker. Fill adds
+128 pages beyond one warm page per owner. Slab capacity is sized for three encrypted
+records per 64 MiB segment plus a free segment, bounded to 3 GiB aggregate
+(768 MiB per worker at four pairs), even if sparse files become fully allocated.
+All workers share one 4 GiB brd/ext4 filesystem with unique scratch/slab/UDS paths.
+Cases run sequentially and delete their slabs after joined shutdown. Standard
+output includes worker count, CPU layout, memory totals, and per-worker counters.
 
 Read the failure counts alongside throughput and latency. Only complete 206
 bodies count as successful requests/bytes; HTTP errors and truncated bodies are

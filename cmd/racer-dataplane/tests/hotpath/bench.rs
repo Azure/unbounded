@@ -1,8 +1,11 @@
 //! Opt-in bottleneck probe, reusing the production graph fixture above.
 use super::*;
-use racer_dataplane::runtime::{
-    affinity::{AffinityPlan, EffectiveTopology, WorkerPair},
-    worker::{WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService},
+use racer_dataplane::{
+    config::{Config, DEFAULT_MAX_THREADS},
+    runtime::{
+        affinity::{AffinityPlan, EffectiveTopology},
+        worker::{WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService},
+    },
 };
 use std::{
     collections::VecDeque,
@@ -14,6 +17,70 @@ mod brd;
 
 const REQUESTS: usize = 128;
 const SWEEPS: usize = 4;
+const MIB: u64 = 1 << 20;
+
+fn default_plan() -> AffinityPlan {
+    // Parse real defaults without inheriting ambient RACER_* overrides or loading files.
+    let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    assert_eq!(config.max_threads, DEFAULT_MAX_THREADS);
+    let topology = EffectiveTopology::discover().unwrap();
+    println!(
+        "allowed_cpus={:?} cpu_quota={:?} default_max_threads={DEFAULT_MAX_THREADS}",
+        topology.cpus, topology.quota
+    );
+    let plan = AffinityPlan::from_topology(&config, topology, &[]).unwrap();
+    // app::partition_limits' default, non-RDMA progress floors admit all <=4 pairs.
+    let n = plan.pairs.len();
+    assert!(n <= 4);
+    assert!(config.limits.plaintext_bytes.get() / n >= 3 * P as usize);
+    assert!(
+        config.limits.ciphertext_bytes.get() / n
+            >= 3 * (P as usize + 16) + racer_dataplane::store::format::MAX_HEADER_BYTES
+    );
+    assert!(config.limits.dirty_bytes.get() / n >= P as usize + 16);
+    println!("host_default_pairs={n} layout={:?}", plan.pairs);
+    plan
+}
+
+// A full encrypted page plus its header allows three records per 64 MiB segment.
+// Include one warm page per owner and one free segment; aggregate sparse lengths
+// stay <=3 GiB, so even complete allocation leaves space on the 4 GiB filesystem.
+fn slab_bytes(workers: usize) -> u64 {
+    ((REQUESTS.div_ceil(workers) + 1).div_ceil(3) + 1) as u64 * 64 * MIB
+}
+
+fn object(key: usize) -> ObjectId {
+    ObjectId {
+        cache: CacheId(CACHE.into()),
+        key: CacheKey::parse_hex(format!("{key:064x}").as_bytes()).unwrap(),
+    }
+}
+
+// Pick distinct keys with round-robin page-zero/metadata owners using the actual
+// production hash. Selection is bounded and takes place outside timed work.
+fn balanced_keys(map: &WorkerMap, workers: usize, count: usize) -> Vec<usize> {
+    let mut buckets = vec![VecDeque::new(); workers];
+    let per_worker = count.div_ceil(workers);
+    for key in 0..1_000_000 {
+        let owner = map.metadata_owner(&object(key)).unwrap().0 as usize;
+        if buckets[owner].len() < per_worker {
+            buckets[owner].push_back(key);
+        }
+        if buckets.iter().all(|keys| keys.len() == per_worker) {
+            return (0..count)
+                .map(|index| buckets[index % workers].pop_front().unwrap())
+                .collect();
+        }
+    }
+    panic!("could not find balanced fixture keys");
+}
 
 #[derive(Debug)]
 struct Stats {
@@ -21,6 +88,7 @@ struct Stats {
     discarded: u64,
     origin_calls: usize,
     failures: BTreeMap<String, usize>,
+    requests: usize,
 }
 
 enum Command {
@@ -33,7 +101,9 @@ enum Command {
 }
 struct Factory {
     root: PathBuf,
-    commands: Mutex<Option<mpsc::Receiver<Command>>>,
+    commands: Mutex<BTreeMap<u16, mpsc::Receiver<Command>>>,
+    directory: Arc<WorkerDirectory>,
+    slab_bytes: u64,
 }
 fn budgets() -> Limits {
     let mut limits = limits(16);
@@ -49,20 +119,27 @@ impl WorkerFactory for Factory {
     fn limits(&self) -> Limits {
         budgets()
     }
-    fn build(&self, _: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+    fn build(&self, worker: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
         let rig = Rc::new(Rig::assemble(
             P,
             false,
             16,
             8,
-            Some((Scratch::under(&self.root), runtime)),
+            Some(RigWorker {
+                scratch: Scratch::under(&self.root),
+                runtime,
+                worker,
+                directory: self.directory.clone(),
+                slab_bytes: self.slab_bytes,
+            }),
         ));
         Ok(Box::new(Service {
             rig,
-            commands: self.commands.lock().unwrap().take().unwrap(),
+            commands: self.commands.lock().unwrap().remove(&worker.0).unwrap(),
             clients: VecDeque::new(),
             inspection: None,
             failures: Rc::new(RefCell::new(BTreeMap::new())),
+            requests: Rc::new(std::cell::Cell::new(0)),
         }))
     }
     fn build_crypto(&self, _: WorkerId, runtime: CryptoRuntime) -> Result<Box<dyn CryptoService>> {
@@ -75,6 +152,7 @@ struct Service {
     clients: VecDeque<Operation<'static, ()>>,
     inspection: Option<(bool, mpsc::Sender<Stats>)>,
     failures: Rc<RefCell<BTreeMap<String, usize>>>,
+    requests: Rc<std::cell::Cell<usize>>,
 }
 impl Service {
     fn poll(&mut self, cx: &mut Context<'_>) -> Result<()> {
@@ -86,6 +164,7 @@ impl Service {
                 Command::Connect(socket) => {
                     let rig = self.rig.clone();
                     let failures = self.failures.clone();
+                    let requests = self.requests.clone();
                     self.clients.push_back(Box::pin(async move {
                         let mut lease =
                             ConnectionLease::from_accepted(socket.into(), &rig.admission)?;
@@ -95,6 +174,7 @@ impl Service {
                             let request = RequestParser::new(32768)
                                 .parse(&CacheId(CACHE.into()), received.value)?;
                             let kind = request.kind.clone();
+                            requests.set(requests.get() + 1);
                             match rig.dispatcher.read(request, &scope).await {
                                 Ok(response) => {
                                     rig.responses.validate(&kind, &response)?;
@@ -172,6 +252,7 @@ impl Service {
                     discarded: self.rig.writer.discarded_count(),
                     origin_calls: self.rig.adapter.calls().len(),
                     failures: self.failures.borrow().clone(),
+                    requests: self.requests.get(),
                 });
             }
         }
@@ -207,12 +288,19 @@ impl WorkerService for Service {
     }
 }
 
-fn inspect(commands: &mpsc::Sender<Command>, evict: bool) -> Stats {
+fn inspect(commands: &mpsc::SyncSender<Command>, evict: bool) -> Stats {
     let (reply, result) = mpsc::channel();
     commands.send(Command::Inspect { evict, reply }).unwrap();
     result.recv_timeout(TIMEOUT).unwrap()
 }
-fn connect(commands: &mpsc::Sender<Command>) -> BufReader<UnixStream> {
+fn inspect_all(commands: &[mpsc::SyncSender<Command>], evict: bool) -> Vec<Stats> {
+    commands
+        .iter()
+        .map(|commands| inspect(commands, evict))
+        .collect()
+}
+
+fn connect(commands: &mpsc::SyncSender<Command>) -> BufReader<UnixStream> {
     let (server, client) = UnixStream::pair().unwrap();
     client.set_read_timeout(Some(TIMEOUT)).unwrap();
     client.set_write_timeout(Some(TIMEOUT)).unwrap();
@@ -270,63 +358,157 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
 }
 
 #[test]
-#[ignore = "owns brd/ext4 via sudo; release-only, needs 16 GiB available memory"]
+fn balanced_workload_covers_owners_without_multiplying_pages() {
+    for workers in 1..=4 {
+        let map = WorkerMap::new((0..workers as u16).map(WorkerId).collect()).unwrap();
+        let keys = balanced_keys(&map, workers, REQUESTS + workers);
+        assert_eq!(
+            keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            keys.len()
+        );
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                map.metadata_owner(&object(*key)).unwrap(),
+                WorkerId((index % workers) as u16)
+            );
+        }
+        assert!(slab_bytes(workers) * workers as u64 <= 3 << 30);
+    }
+}
+
+#[test]
+fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
+    let mut plan = default_plan();
+    // Even a one-CPU host can execute two fixture pairs sharing allowed CPUs.
+    // This is a routing test, not a benchmark sizing override.
+    let mut second = plan.pairs[0].clone();
+    second.worker = WorkerId(1);
+    plan.pairs.truncate(1);
+    plan.pairs.push(second);
+    plan.max_threads = 5;
+    let ids = vec![WorkerId(0), WorkerId(1)];
+    let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
+    let keys = balanced_keys(&map, 2, 2);
+    let scratch = Scratch::new();
+    let mut receivers = BTreeMap::new();
+    let commands: Vec<_> = ids
+        .iter()
+        .map(|worker| {
+            let (send, receive) = mpsc::sync_channel(256);
+            receivers.insert(worker.0, receive);
+            send
+        })
+        .collect();
+    let factory = Arc::new(Factory {
+        root: scratch.path.clone(),
+        commands: Mutex::new(receivers),
+        directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
+        slab_bytes: 256 * MIB,
+    });
+    let mut group = WorkerGroup::new(plan);
+    group.start(factory, &scope()).unwrap();
+    for (owner, key) in keys.iter().enumerate() {
+        let mut client = connect(&commands[1 - owner]);
+        assert_eq!(get(&mut client, *key, true).unwrap(), 206);
+    }
+    let initial = inspect_all(&commands, true);
+    for stats in &initial {
+        assert_eq!(stats.records, 1);
+        assert!(stats.origin_calls > 0);
+        assert_eq!(stats.requests, 1);
+        assert!(stats.failures.is_empty());
+    }
+    for sender in &commands {
+        sender.send(Command::Offline).unwrap();
+    }
+    // Inspect is an ordering fence for the preceding Offline command.
+    inspect_all(&commands, false);
+    for (owner, key) in keys.iter().enumerate() {
+        let mut client = connect(&commands[1 - owner]);
+        assert_eq!(get(&mut client, *key, true).unwrap(), 206);
+    }
+    for (owner, stats) in inspect_all(&commands, false).iter().enumerate() {
+        assert_eq!(
+            stats.origin_calls, initial[owner].origin_calls,
+            "disk hit must stay on the original owner"
+        );
+        assert_eq!(stats.requests, 2);
+        assert!(stats.failures.is_empty());
+    }
+    group.drain(&scope()).unwrap();
+    group.shutdown(&scope()).unwrap();
+    group.join().unwrap();
+}
+
+#[test]
+#[ignore = "owns brd/ext4 via sudo; release-only, worker-sized RAM preflight"]
 fn hotpath() {
     assert!(!cfg!(debug_assertions), "run with --release");
-    let mut disk = brd::Brd::new();
+    let plan = default_plan();
+    let mut disk = brd::Brd::new(plan.pairs.len(), &budgets(), slab_bytes(plan.pairs.len()));
     if std::env::var_os("RACER_BENCH_FAIL_SETUP").is_some() {
         panic!("requested cleanup probe");
     }
     for mode in ["memory", "disk", "fill"] {
         for concurrency in [1, 32, 128] {
-            run_case(&disk.mount(), mode, concurrency);
+            run_case(&disk.mount(), &plan, mode, concurrency);
         }
     }
     assert!(disk.close(), "brd teardown failed");
 }
 
-fn run_case(root: &std::path::Path, mode: &str, concurrency: usize) {
-    let topology = EffectiveTopology::discover().unwrap();
-    let io = topology.cpus[0].clone();
-    let crypto = topology
-        .cpus
+fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurrency: usize) {
+    let workers = default.pairs.len();
+    brd::preflight(workers, &budgets(), slab_bytes(workers));
+    let ids: Vec<_> = default.pairs.iter().map(|pair| pair.worker).collect();
+    let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
+    let keys = balanced_keys(&map, workers, REQUESTS + workers);
+    let directory = Arc::new(WorkerDirectory::new(map, ids.clone(), 256).unwrap());
+    let mut receivers = BTreeMap::new();
+    let commands: Vec<_> = ids
         .iter()
-        .find(|cpu| (cpu.package, cpu.core) != (io.package, io.core))
-        .unwrap_or(&io)
-        .clone();
+        .map(|worker| {
+            let (send, receive) = mpsc::sync_channel(256);
+            receivers.insert(worker.0, receive);
+            send
+        })
+        .collect();
+    // Owned startup needs a slot for the benchmark driver (worker.rs::start).
+    // Preserve the production-selected pairs/CPUs; this does not add a worker.
     let plan = AffinityPlan {
-        pairs: vec![WorkerPair {
-            worker: WorkerId(0),
-            io: io.clone(),
-            crypto: crypto.clone(),
-            nic: None,
-        }],
-        max_threads: 3,
+        pairs: default.pairs.clone(),
+        max_threads: default.max_threads + 1,
     };
-    let (commands, receive) = mpsc::channel();
     let factory = Arc::new(Factory {
         root: root.into(),
-        commands: Mutex::new(Some(receive)),
+        commands: Mutex::new(receivers),
+        directory,
+        slab_bytes: slab_bytes(workers),
     });
     let mut group = WorkerGroup::new(plan);
     group.start(factory, &scope()).unwrap();
-    eprintln!(
-        "case={mode} concurrency={concurrency} pairs=1 io_cpu={} crypto_cpu={} plaintext_MiB=256 ciphertext_MiB=512 dirty_MiB=128 page_MiB=16",
-        io.cpu, crypto.cpu
+    println!(
+        "case={mode} concurrency={concurrency} pairs={workers} worker_threads={} driver_threads=1 plaintext_MiB_per_worker=256 ciphertext_MiB_per_worker=512 dirty_MiB_per_worker=128 page_MiB=16",
+        workers * 2
     );
     // Warm connections/crypto and fully validate fixture bytes outside timing.
-    let mut warm = connect(&commands);
-    for key in 0..if mode == "disk" { REQUESTS } else { 1 } {
-        assert_eq!(get(&mut warm, key, true).unwrap(), 206);
-        inspect(&commands, false);
+    let warm_count = if mode == "disk" { REQUESTS } else { workers };
+    for (index, key) in keys.iter().take(warm_count).enumerate() {
+        let mut warm = connect(&commands[(index + 1) % workers]);
+        assert_eq!(get(&mut warm, *key, true).unwrap(), 206);
+        inspect_all(&commands, false);
     }
-    drop(warm);
-    let initial = inspect(&commands, mode == "disk");
-    if mode == "disk" {
-        assert_eq!(initial.records, REQUESTS);
+    let initial = inspect_all(&commands, mode == "disk");
+    assert_eq!(initial.iter().map(|s| s.records).sum::<usize>(), warm_count);
+    for (owner, stats) in initial.iter().enumerate() {
+        let expected = (owner..warm_count).step_by(workers).count();
+        assert_eq!(stats.records, expected, "preload must reach its real owner");
+        assert!(stats.origin_calls > 0);
     }
     if mode != "fill" {
-        commands.send(Command::Offline).unwrap();
+        for commands in &commands {
+            commands.send(Command::Offline).unwrap();
+        }
     }
     let mut samples = Vec::new();
     let mut failures = BTreeMap::<String, usize>::new();
@@ -334,24 +516,25 @@ fn run_case(root: &std::path::Path, mode: &str, concurrency: usize) {
     let mut persisted_time = Duration::ZERO;
     for sweep in 0..if mode == "fill" { 1 } else { SWEEPS } {
         if mode == "disk" {
-            inspect(&commands, true);
+            inspect_all(&commands, true);
         }
         let barrier = Barrier::new(concurrency + 1);
         let start = thread::scope(|threads| {
             let mut handles = Vec::new();
-            for worker in 0..concurrency {
-                let commands = &commands;
+            for client_index in 0..concurrency {
+                let commands = &commands[client_index % workers];
+                let keys = &keys;
                 let barrier = &barrier;
                 handles.push(threads.spawn(move || {
                     let mut client = connect(commands);
                     let mut samples = Vec::new();
                     barrier.wait();
                     barrier.wait();
-                    for index in (worker..REQUESTS).step_by(concurrency) {
+                    for index in (client_index..REQUESTS).step_by(concurrency) {
                         let key = match mode {
-                            "memory" => 0,
-                            "disk" => index,
-                            _ => 1 + sweep * REQUESTS + index,
+                            "memory" => keys[(index + 1) % workers],
+                            "disk" => keys[(index + 1) % REQUESTS],
+                            _ => keys[workers + (index + 1) % REQUESTS],
                         };
                         let start = Instant::now();
                         let status = get(&mut client, key, false);
@@ -381,22 +564,24 @@ fn run_case(root: &std::path::Path, mode: &str, concurrency: usize) {
             start
         });
         elapsed += start.elapsed();
-        let stats = inspect(&commands, false);
+        let stats = inspect_all(&commands, false);
         persisted_time += start.elapsed();
-        eprintln!(
-            "  sweep={sweep} resident_records={} dirty_discards={} origin_calls={} server_failures={:?}",
-            stats.records, stats.discarded, stats.origin_calls, stats.failures
-        );
-        if mode != "fill" {
-            assert_eq!(
-                stats.origin_calls, initial.origin_calls,
-                "cache workload contacted origin"
+        for (worker, stats) in stats.iter().enumerate() {
+            println!(
+                "  sweep={sweep} worker={worker} resident_records={} dirty_discards={} origin_calls={} ingress_requests={} server_failures={:?}",
+                stats.records, stats.discarded, stats.origin_calls, stats.requests, stats.failures
             );
+            if mode != "fill" {
+                assert_eq!(
+                    stats.origin_calls, initial[worker].origin_calls,
+                    "cache workload contacted origin"
+                );
+            }
         }
         if mode == "fill" {
-            eprintln!(
+            println!(
                 "  fresh_pages_persisted={}/{} (drained does not mean all responses persisted)",
-                stats.records - initial.records,
+                stats.iter().map(|s| s.records).sum::<usize>() - warm_count,
                 REQUESTS
             );
         }
@@ -406,7 +591,7 @@ fn run_case(root: &std::path::Path, mode: &str, concurrency: usize) {
     let percentile = |p: usize| {
         samples[((samples.len() * p).div_ceil(100)).saturating_sub(1)].as_secs_f64() * 1000.
     };
-    eprintln!(
+    println!(
         "{mode} c={concurrency} ok={} failures={failures:?} req/s={:.1} MiB/s={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} read_s={:.3} drained_s={:.3}",
         samples.len(),
         samples.len() as f64 / elapsed.as_secs_f64(),

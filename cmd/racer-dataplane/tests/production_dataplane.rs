@@ -384,6 +384,13 @@ struct Rig {
     adapter: Adapter,
     _scratch: Scratch,
 }
+struct RigWorker {
+    scratch: Scratch,
+    runtime: racer_dataplane::runtime::worker::WorkerRuntime,
+    worker: WorkerId,
+    directory: Arc<WorkerDirectory>,
+    slab_bytes: u64,
+}
 impl Rig {
     fn new(length: u64, zero_ttl: bool, pages: usize) -> Self {
         Self::with_dirty_pages(length, zero_ttl, pages, pages)
@@ -396,12 +403,31 @@ impl Rig {
         zero_ttl: bool,
         pages: usize,
         dirty_pages: usize,
-        benchmark: Option<(Scratch, racer_dataplane::runtime::worker::WorkerRuntime)>,
+        benchmark: Option<RigWorker>,
     ) -> Self {
         let benchmarking = benchmark.is_some();
-        let (scratch, runtime) = match benchmark {
-            Some((scratch, runtime)) => (scratch, Some(runtime)),
-            None => (Scratch::new(), None),
+        let (scratch, runtime, worker, directory, slab_bytes) = match benchmark {
+            Some(worker) => (
+                worker.scratch,
+                Some(worker.runtime),
+                worker.worker,
+                worker.directory,
+                worker.slab_bytes,
+            ),
+            None => (
+                Scratch::new(),
+                None,
+                WorkerId(0),
+                Arc::new(
+                    WorkerDirectory::new(
+                        Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                        vec![WorkerId(0)],
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                512 * 1024 * 1024,
+            ),
         };
         fs::create_dir_all(scratch.path.join("production-fixture/origin")).unwrap();
         let origin_path = scratch.socket("production-fixture/origin/socket");
@@ -427,17 +453,13 @@ impl Rig {
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
-        let index = Rc::new(Index::new(WorkerId(0), entries));
-        let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
+        let index = Rc::new(Index::new(worker, entries));
+        let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
         let slabs = Rc::new(Slabs::new(
-            WorkerId(0),
+            worker,
             scratch.path.join("slabs"),
             reactor.clone(),
-            if benchmarking {
-                3 * 1024 * 1024 * 1024
-            } else {
-                512 * 1024 * 1024
-            },
+            slab_bytes,
             64 * 1024 * 1024,
         ));
         let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
@@ -552,14 +574,6 @@ impl Rig {
             }
         };
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                64,
-            )
-            .unwrap(),
-        );
         let flights = Rc::new(Flights::new(admission.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
@@ -607,8 +621,8 @@ impl Rig {
             streams,
             credentials,
         ));
-        let endpoint = RefCell::new(directory.install(WorkerId(0), coordinator.clone()).unwrap());
-        let dispatcher = Rc::new(Dispatcher::new(WorkerId(0), directory, coordinator));
+        let endpoint = RefCell::new(directory.install(worker, coordinator.clone()).unwrap());
+        let dispatcher = Rc::new(Dispatcher::new(worker, directory, coordinator));
         let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {

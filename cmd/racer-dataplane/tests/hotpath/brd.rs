@@ -1,5 +1,119 @@
 //! An exclusively owned RAM disk. All mountpoints and device nodes are in target/.
+use racer_dataplane::model::limits::Limits;
 use std::{fs, os::fd::AsRawFd, path::PathBuf, process::Command};
+
+const MIB: u64 = 1 << 20;
+const DEVICE: u64 = 4096 * MIB;
+
+fn memory_budget(workers: usize, limits: &Limits) -> (u64, u64) {
+    // Resident plaintext/cache, ciphertext including slab/crypto staging, dirty
+    // retention, registered allowance (unused here), and request contexts. Some
+    // dimensions overlap; adding them is deliberately conservative.
+    let admitted = [
+        limits.plaintext_bytes,
+        limits.ciphertext_bytes,
+        limits.dirty_bytes,
+        limits.registered_bytes,
+        limits.request_context_bytes,
+    ]
+    .iter()
+    .map(|n| n.get() as u64)
+    .sum::<u64>()
+        * workers as u64;
+    // Per worker: streaming origin (8 connections, 64 KiB chunks), stacks,
+    // crypto scratch, queues/indexes, rings, sockets and pipes. Origin never
+    // materializes all payloads. Global: allocator retention plus 128 clients'
+    // stacks, two 64 KiB buffers apiece and kernel socket buffers.
+    let auxiliary = workers as u64 * 512 * MIB + 2048 * MIB + 512 * MIB;
+    let envelope = DEVICE + admitted + auxiliary;
+    (envelope, (16 << 30).max(envelope * 2))
+}
+
+pub fn preflight(workers: usize, limits: &Limits, slab_bytes: u64) {
+    assert!((1..=4).contains(&workers));
+    assert!(
+        slab_bytes * workers as u64 <= 3 << 30,
+        "aggregate slab capacity must leave 1 GiB for ext4/headroom"
+    );
+    let (envelope, required) = memory_budget(workers, limits);
+    let info = fs::read_to_string("/proc/meminfo").unwrap();
+    let available = info
+        .lines()
+        .find(|s| s.starts_with("MemAvailable:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        * 1024;
+    println!(
+        "memory_preflight workers={workers} device_MiB=4096 slab_capacity_MiB={} plaintext_total_MiB={} ciphertext_total_MiB={} dirty_total_MiB={} context_total_MiB={} auxiliary_MiB={} envelope_MiB={} required_available_MiB={} host_available_MiB={}",
+        slab_bytes * workers as u64 / MIB,
+        limits.plaintext_bytes.get() as u64 * workers as u64 / MIB,
+        limits.ciphertext_bytes.get() as u64 * workers as u64 / MIB,
+        limits.dirty_bytes.get() as u64 * workers as u64 / MIB,
+        limits.request_context_bytes.get() as u64 * workers as u64 / MIB,
+        workers as u64 * 512 + 2560,
+        envelope / MIB,
+        required.div_ceil(MIB),
+        available / MIB
+    );
+    assert!(
+        available >= required,
+        "insufficient host RAM; refusing benchmark"
+    );
+    // Fail closed on layouts we cannot resolve, rather than treating a missing
+    // memory.max as unlimited. This fixture supports unified cgroup v2 mounted
+    // at its namespace root; it does not silently skip v1 or relocated mounts.
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    assert!(
+        mounts.lines().any(|line| {
+            let Some((before, after)) = line.split_once(" - ") else {
+                return false;
+            };
+            let fields: Vec<_> = before.split_whitespace().collect();
+            after.starts_with("cgroup2 ")
+                && fields.get(3) == Some(&"/")
+                && fields.get(4) == Some(&"/sys/fs/cgroup")
+        }),
+        "benchmark requires a resolvable unified cgroup-v2 mount"
+    );
+    let groups = fs::read_to_string("/proc/self/cgroup").unwrap();
+    let group = groups
+        .lines()
+        .find_map(|s| s.strip_prefix("0::"))
+        .expect("benchmark requires cgroup v2");
+    assert!(!group.split('/').any(|part| part == ".."));
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let leaf = root.join(group.trim_start_matches('/'));
+    assert!(leaf.is_dir(), "unresolved cgroup membership");
+    for path in leaf.ancestors().take_while(|path| path.starts_with(root)) {
+        if path == root {
+            break;
+        } // The root cgroup has no memory controller files.
+        let max =
+            fs::read_to_string(path.join("memory.max")).expect("cannot check cgroup memory limit");
+        let used = fs::read_to_string(path.join("memory.current"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        println!(
+            "cgroup_memory path={} max={} current_MiB={}",
+            path.display(),
+            max.trim(),
+            used / MIB
+        );
+        if max.trim() != "max" {
+            let max = max.trim().parse::<u64>().unwrap();
+            assert!(
+                max.saturating_sub(used) >= required,
+                "insufficient cgroup RAM; refusing benchmark"
+            );
+        }
+    }
+}
 
 pub struct Brd {
     pub root: PathBuf,
@@ -14,47 +128,8 @@ fn privileged(args: &[&str]) {
 }
 
 impl Brd {
-    pub fn new() -> Self {
-        // 4 GiB device + <= 2 GiB service/client/allocator allowance, with ample
-        // headroom. Never size buffers or the RAM disk from host CPU count.
-        let info = fs::read_to_string("/proc/meminfo").unwrap();
-        let available: u64 = info
-            .lines()
-            .find(|s| s.starts_with("MemAvailable:"))
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            available >= 16 * 1024 * 1024,
-            "benchmark needs 16 GiB MemAvailable; found {available} KiB"
-        );
-        // A container's host MemAvailable can be misleading. Check all visible
-        // cgroup-v2 ancestors as well; refuse constrained environments.
-        let groups = fs::read_to_string("/proc/self/cgroup").unwrap();
-        if let Some(group) = groups.lines().find_map(|s| s.strip_prefix("0::")) {
-            let mut path = PathBuf::from("/sys/fs/cgroup").join(group.trim_start_matches('/'));
-            loop {
-                if let Ok(max) = fs::read_to_string(path.join("memory.max")) {
-                    if let Ok(max) = max.trim().parse::<u64>() {
-                        let used: u64 = fs::read_to_string(path.join("memory.current"))
-                            .unwrap()
-                            .trim()
-                            .parse()
-                            .unwrap();
-                        assert!(
-                            max.saturating_sub(used) >= 16 << 30,
-                            "cgroup needs 16 GiB free memory"
-                        );
-                    }
-                }
-                if path == std::path::Path::new("/sys/fs/cgroup") || !path.pop() {
-                    break;
-                }
-            }
-        }
+    pub fn new(workers: usize, limits: &Limits, slab_bytes: u64) -> Self {
+        preflight(workers, limits, slab_bytes);
         let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
         fs::create_dir_all(&target).unwrap();
         let lock = fs::OpenOptions::new()
@@ -143,6 +218,17 @@ impl Brd {
         }
         fs::remove_dir_all(&self.root).is_ok()
     }
+}
+
+#[test]
+fn memory_envelope_scales_with_workers_and_retains_headroom() {
+    let limits = super::budgets();
+    let (one, one_required) = memory_budget(1, &limits);
+    let (four, four_required) = memory_budget(4, &limits);
+    assert!(four > one);
+    assert!(one_required >= 16 << 30);
+    assert_eq!(four_required, four * 2);
+    assert_eq!(four, 12416 * MIB + 4 * 16);
 }
 impl Drop for Brd {
     fn drop(&mut self) {
