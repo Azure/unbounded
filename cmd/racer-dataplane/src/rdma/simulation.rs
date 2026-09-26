@@ -896,6 +896,155 @@ mod tests {
     }
 
     #[test]
+    fn fallback_cannot_reuse_quarantined_region_in_either_completion_order() {
+        struct Probe(Rc<Cell<usize>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        for remote_first in [false, true] {
+            let sim = Simulation::new();
+            let drops = Rc::new(Cell::new(0));
+            {
+                let (sender, receiver, source, _) = connected(&sim);
+                let target =
+                    Region::new(sender.device().clone(), 32, Box::new(Probe(drops.clone())))
+                        .unwrap();
+                target.resize(17).unwrap();
+                let (window, bind) = receiver.bind(target.clone()).unwrap();
+                assert_eq!(receiver.progress(), Ok(1));
+                assert_eq!(bind.result(), Some(Ok(())));
+                let fallback_sender = QueuePairHandle::new(sender.device().clone()).unwrap();
+                let fallback_receiver = QueuePairHandle::new(sender.device().clone()).unwrap();
+                fallback_sender.connect(fallback_receiver.endpoint).unwrap();
+                fallback_receiver.connect(fallback_sender.endpoint).unwrap();
+                sim.fault(Operation::Write, Fault::Delay(1));
+                let write = sender
+                    .write(source.clone(), target.address(), window.key)
+                    .unwrap();
+                assert_eq!(sender.progress(), Ok(0));
+                // Revocation requested, but no remote fence has completed yet.
+                sim.fault(Operation::Invalidate, Fault::Delay(1));
+                let invalidation = receiver.invalidate(window.clone()).unwrap();
+                assert_eq!(receiver.progress(), Ok(0));
+                assert!(matches!(
+                    fallback_receiver.bind(target.clone()),
+                    Err(Error::InvalidRequest)
+                ));
+                assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                if remote_first {
+                    assert_eq!(receiver.progress(), Ok(1));
+                    assert_eq!(invalidation.result(), Some(Ok(())));
+                    assert_eq!(write.result(), None);
+                    assert_eq!(source.copy_to(), Err(Error::Unavailable));
+                } else {
+                    // A queued DMA can arrive after the invalidate request.
+                    assert_eq!(sender.progress(), Ok(1));
+                    assert_eq!(write.result(), Some(Ok(())));
+                    assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
+                    assert_eq!(invalidation.result(), None);
+                }
+                assert_eq!(drops.get(), 0);
+                assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                assert!(matches!(
+                    fallback_receiver.bind(target.clone()),
+                    Err(Error::InvalidRequest)
+                ));
+                if remote_first {
+                    assert_eq!(sender.progress(), Err(Error::Io));
+                    assert_eq!(write.result(), Some(Err(Error::Cancelled)));
+                } else {
+                    assert_eq!(receiver.progress(), Ok(1));
+                    assert_eq!(invalidation.result(), Some(Ok(())));
+                }
+                // Production requires the terminal QP fence even after invalidation.
+                assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                receiver.stop().unwrap();
+                let expected = if remote_first { [0; 17] } else { [0xa5; 17] };
+                assert_eq!(target.copy_to().unwrap(), expected);
+                let (fresh_window, fresh_bind) = fallback_receiver.bind(target.clone()).unwrap();
+                assert_ne!(fresh_window.key, window.key);
+                fallback_receiver.progress().unwrap();
+                assert_eq!(fresh_bind.result(), Some(Ok(())));
+                let stale = fallback_sender
+                    .write(source, target.address(), window.key)
+                    .unwrap();
+                assert_eq!(fallback_sender.progress(), Err(Error::Io));
+                assert_eq!(stale.result(), Some(Err(Error::Cancelled)));
+                fallback_receiver.stop().unwrap();
+                assert_eq!(
+                    target.copy_to().unwrap(),
+                    expected,
+                    "old key cannot modify the reused destination"
+                );
+                assert_eq!(drops.get(), 0);
+            }
+            assert_eq!(drops.get(), 1);
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+
+    #[test]
+    fn expiry_is_inclusive_but_not_a_remote_fence_and_faults_are_ordered() {
+        use crate::runtime::environment::{SimulationClock, now};
+        use std::time::Duration;
+        for failed_stop in [false, true] {
+            let clock = SimulationClock::new(7);
+            let environment = clock.environment(0);
+            let _clock = environment.enter();
+            let sim = Simulation::new();
+            {
+                let (sender, receiver, source, target) = connected(&sim);
+                let (window, bind) = receiver.bind(target.clone()).unwrap();
+                receiver.progress().unwrap();
+                assert_eq!(bind.result(), Some(Ok(())));
+                receiver.expire_at(now() + Duration::from_secs(2));
+                clock.advance(Duration::from_secs(2) - Duration::from_nanos(1));
+                assert_eq!(receiver.progress(), Ok(0));
+                assert!(receiver.ready());
+                sim.fault(Operation::Invalidate, Fault::Delay(2));
+                let invalidation = receiver.invalidate(window.clone()).unwrap();
+                assert_eq!(receiver.progress(), Ok(0));
+                clock.advance(Duration::from_nanos(1));
+                if failed_stop {
+                    sim.fault_on(Operation::Stop, Some(receiver.endpoint.qpn), Fault::Reject);
+                    assert_eq!(receiver.progress(), Err(Error::Io));
+                    assert!(!receiver.ready());
+                    assert!(!receiver.stopped());
+                    assert_eq!(invalidation.result(), None);
+                    assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                    assert!(matches!(
+                        receiver.invalidate(window.clone()),
+                        Err(Error::Unavailable)
+                    ));
+                    // Expiry blocks local admission, but a failed stop cannot revoke DMA.
+                    let late = sender
+                        .write(source.clone(), target.address(), window.key)
+                        .unwrap();
+                    assert_eq!(sender.progress(), Ok(1));
+                    assert_eq!(late.result(), Some(Ok(())));
+                    assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                    assert_eq!(receiver.progress(), Err(Error::Cancelled));
+                } else {
+                    assert_eq!(receiver.progress(), Err(Error::DeadlineExceeded));
+                }
+                assert!(receiver.stopped());
+                assert_eq!(invalidation.result(), Some(Err(Error::Cancelled)));
+                assert_eq!(receiver.progress(), Ok(0));
+                let expected = if failed_stop { [0xa5; 17] } else { [0; 17] };
+                assert_eq!(target.copy_to().unwrap(), expected);
+                let stale = sender.write(source, target.address(), window.key).unwrap();
+                assert_eq!(sender.progress(), Err(Error::Io));
+                assert_eq!(stale.result(), Some(Err(Error::Cancelled)));
+                assert_eq!(target.copy_to().unwrap(), expected);
+            }
+            assert_eq!(sim.pending_faults(), 0);
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+
+    #[test]
     fn wrong_key_address_length_and_peer_cannot_write() {
         for case in 0..4 {
             let sim = Simulation::new();

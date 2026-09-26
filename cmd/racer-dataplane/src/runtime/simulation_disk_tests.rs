@@ -375,3 +375,234 @@ fn renamed_directory_fsync_uses_inode_and_durable_corruption_targets_exact_gener
         b"before"
     );
 }
+
+// Migrated from test_support::disk. Persistence faults mutate the integrated disk;
+// submissions, readback, and crash-invalidated handles use the production reactor.
+#[test]
+fn crashprefix_covers_missing_torn_and_reordered_overwrites() {
+    let offset = (1 << 40) - 4;
+    for (prefix, expected) in [b"base", b"bBBe", b"AABe"].into_iter().enumerate() {
+        let (sim, _environment, r, scope) = setup();
+        let path = Path::new("/sparse");
+        sim.write_file(path, b"").unwrap();
+        let fd = open(&sim, "/sparse");
+        drive(
+            &r,
+            r.write_at(
+                fd.clone(),
+                offset,
+                r.file_bytes(b"base").unwrap(),
+                (),
+                &scope,
+            ),
+        )
+        .unwrap();
+        sim.disk().sync_all().unwrap();
+        for (at, bytes) in [(offset, b"AAAA".as_slice()), (offset + 1, b"BB".as_slice())] {
+            drive(
+                &r,
+                r.write_at(fd.clone(), at, r.file_bytes(bytes).unwrap(), (), &scope),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            sim.disk()
+                .read(path, offset, 4, DiskState::Volatile)
+                .unwrap(),
+            b"ABBA"
+        );
+        // Explicit durable-only fault prefixes preserve the independent volatile image.
+        if prefix >= 1 {
+            sim.disk()
+                .corrupt(path, offset + 1, b"BB", DiskState::Durable)
+                .unwrap();
+        }
+        if prefix >= 2 {
+            sim.disk()
+                .corrupt(path, offset, b"AA", DiskState::Durable)
+                .unwrap();
+        }
+        assert_eq!(
+            sim.disk()
+                .read(path, offset, 4, DiskState::Volatile)
+                .unwrap(),
+            b"ABBA"
+        );
+        sim.disk().crash().unwrap();
+        assert!(matches!(
+            drive(
+                &r,
+                r.write_at(fd, offset, r.file_bytes(b"late").unwrap(), (), &scope)
+            ),
+            Err(Error::Io)
+        ));
+        let result = drive(
+            &r,
+            r.read_at(
+                open(&sim, "/sparse"),
+                offset,
+                r.file_buffer(4).unwrap(),
+                (),
+                &scope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(result.bytes, 4);
+        assert_eq!(result.buffer.prefix(4).unwrap(), expected);
+        drop(result);
+        assert_eq!(r.in_flight(), 0);
+        assert_eq!(sim.live_handles(), 0);
+    }
+}
+
+#[test]
+fn invalid_fault_plans_and_extents_are_atomic_and_holes_are_zero() {
+    let (sim, _environment, r, scope) = setup();
+    let path = Path::new("/file");
+    sim.write_file(path, b"\0\0\0\0data").unwrap();
+    sim.disk().sync_all().unwrap();
+    for (offset, bytes) in [(4, b"large".as_slice()), (u64::MAX, b"x".as_slice())] {
+        assert!(
+            sim.disk()
+                .corrupt(path, offset, bytes, DiskState::Both)
+                .is_err()
+        );
+        for state in [DiskState::Volatile, DiskState::Durable] {
+            assert_eq!(sim.disk().read(path, 0, 8, state).unwrap(), b"\0\0\0\0data");
+        }
+    }
+    let old = open(&sim, "/file");
+    assert!(matches!(
+        drive(
+            &r,
+            r.write_at(
+                old.clone(),
+                u64::MAX,
+                r.file_bytes(b"x").unwrap(),
+                (),
+                &scope
+            )
+        ),
+        Err(Error::Io)
+    ));
+    assert_eq!(read(&sim, "/file"), b"\0\0\0\0data");
+    let holes = drive(
+        &r,
+        r.read_at(old.clone(), 0, r.file_buffer(4).unwrap(), (), &scope),
+    )
+    .unwrap();
+    assert_eq!(holes.buffer.prefix(4).unwrap(), &[0; 4]);
+    drop(holes);
+    // Files have EOF rather than the removed fixture's arbitrary capacity bound.
+    assert_eq!(
+        drive(
+            &r,
+            r.read_at(old.clone(), 15, r.file_buffer(2).unwrap(), (), &scope)
+        )
+        .unwrap()
+        .bytes,
+        0
+    );
+    sim.disk().crash().unwrap();
+    let fresh = open(&sim, "/file");
+    let (Descriptor::Sim(a), Descriptor::Sim(b)) = (&*old, &*fresh) else {
+        unreachable!()
+    };
+    assert_ne!(a.id(), b.id());
+    assert!(matches!(
+        drive(&r, r.file_stat(old, &scope)),
+        Err(Error::Io)
+    ));
+    drive(
+        &r,
+        r.write_at(fresh, 0, r.file_bytes(b"new").unwrap(), (), &scope),
+    )
+    .unwrap();
+    assert_eq!(read(&sim, "/file"), b"new\0data");
+    assert_eq!(r.in_flight(), 0);
+}
+
+#[test]
+fn direct_io_faults_check_address_offset_and_length_independently() {
+    use crate::{
+        model::limits::ResourceClass,
+        runtime::reactor::{IoBuffer, sealed},
+        store::direct::{AlignedBuffer, DirectAlignment},
+    };
+    // Only a borrowed-range view of real aligned storage; no I/O behavior here.
+    struct View {
+        buffer: AlignedBuffer,
+        start: usize,
+        length: usize,
+    }
+    impl sealed::Sealed for View {}
+    impl IoBuffer for View {
+        fn bytes(&self) -> Result<&[u8]> {
+            Ok(&self.buffer.bytes()?[self.start..self.start + self.length])
+        }
+        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            Ok(&mut self.buffer.bytes_mut()?[self.start..self.start + self.length])
+        }
+    }
+    let (sim, _environment, r, scope) = setup();
+    assert_eq!(
+        DirectAlignment::validate(0, 4096, 4096),
+        Err(Error::DirectIoUnsupported)
+    );
+    let alignment = DirectAlignment::validate(4096, 4096, 4096).unwrap();
+    let path = Path::new("/direct");
+    let fd = Rc::new(
+        sim.open(None, path, libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT)
+            .unwrap(),
+    );
+    for (offset, start, length) in [(1, 0, 4096), (0, 1, 4096), (0, 0, 4095), (4096, 0, 4096)] {
+        let quota = r
+            .admission
+            .reserve(None, ResourceClass::Ciphertext, 8192)
+            .unwrap();
+        let mut buffer = alignment.allocate(8192, quota).unwrap();
+        buffer.bytes_mut().unwrap().fill(7);
+        let result = drive(
+            &r,
+            r.write_at(
+                fd.clone(),
+                offset,
+                View {
+                    buffer,
+                    start,
+                    length,
+                },
+                (),
+                &scope,
+            ),
+        );
+        if offset == 4096 {
+            assert_eq!(result.unwrap().bytes, 4096);
+        } else {
+            assert!(matches!(result, Err(Error::Io)));
+            assert_eq!(
+                drive(&r, r.file_stat(fd.clone(), &scope)).unwrap().stx_size,
+                0
+            );
+        }
+        assert_eq!(r.admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(r.in_flight(), 0);
+    }
+    drive(&r, r.file_sync(fd.clone(), &scope)).unwrap();
+    sim.disk().sync(Path::new("/")).unwrap();
+    drop(fd);
+    sim.disk().crash().unwrap();
+    let result = drive(
+        &r,
+        r.read_at(
+            open(&sim, "/direct"),
+            4096,
+            r.file_buffer(4096).unwrap(),
+            (),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(result.bytes, 4096);
+    assert_eq!(result.buffer.prefix(4096).unwrap(), &[7; 4096]);
+}

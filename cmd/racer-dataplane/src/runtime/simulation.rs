@@ -19,6 +19,9 @@ pub use disk::{CrashDisk, DiskState};
 #[cfg(test)]
 #[path = "simulation_disk_tests.rs"]
 mod disk_tests;
+#[cfg(test)]
+#[path = "simulation_io_tests.rs"]
+mod io_tests;
 
 /// Labels new outbound streams with their owning node's listening endpoint.
 /// Enter this scope when polling that node; established sockets retain the label.
@@ -1661,19 +1664,19 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    fn reactor() -> Reactor {
+    pub(super) fn reactor() -> Reactor {
         Reactor::new(Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         )))
     }
-    fn scope() -> RequestScope {
+    pub(super) fn scope() -> RequestScope {
         RequestScope::new(RequestId([4; 16]), Instant::now() + Duration::from_secs(30)).unwrap()
     }
-    fn poll<T>(op: &mut Operation<'_, T>) -> Poll<Result<T>> {
+    pub(super) fn poll<T>(op: &mut Operation<'_, T>) -> Poll<Result<T>> {
         op.as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
-    fn drive<T>(r: &Reactor, mut op: Operation<'_, T>) -> Result<T> {
+    pub(super) fn drive<T>(r: &Reactor, mut op: Operation<'_, T>) -> Result<T> {
         for _ in 0..1000 {
             if let Poll::Ready(result) = poll(&mut op) {
                 return result;
