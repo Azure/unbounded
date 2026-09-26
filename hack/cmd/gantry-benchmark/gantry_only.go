@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -361,36 +362,82 @@ func (b *benchmark) resolveArtifactStreamingImage(
 	if strings.HasPrefix(tag, "sha256:") {
 		return "", fmt.Errorf("converted image lookup must use a tag: %s", taggedImage)
 	}
-
-	commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	output, err := b.commands.Run(commandContext, nil,
-		"az", "acr", "manifest", "show-metadata",
-		"--registry", b.config.GantryACRName,
-		"--name", taggedRepository+":"+tag,
-		"--only-show-errors",
-		"--output", "json",
+	podContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	podOutput, err := b.commands.Run(podContext, nil,
+		"kubectl", "-n", state.GantryNamespace,
+		"get", "pod",
+		"-l", "app.kubernetes.io/name=gantry,app.kubernetes.io/component=overlaybd-config",
+		"--field-selector=status.phase=Running",
+		"-o", "jsonpath={.items[0].metadata.name}",
 	)
+	cancel()
 	if err != nil {
-		return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s: %w", taggedImage, err)
+		return "", fmt.Errorf("select OverlayBD configurator for Artifact Streaming resolution: %w", err)
+	}
+	pod := strings.TrimSpace(string(podOutput))
+	if pod == "" {
+		return "", fmt.Errorf("no running OverlayBD configurator pod is available for Artifact Streaming resolution")
 	}
 
-	var metadata struct {
-		Digest string `json:"digest"`
+	helperURL := fmt.Sprintf(
+		"http://127.0.0.1:8578/v2/%s/manifests/%s?ns=%s",
+		taggedRepository,
+		tag,
+		url.QueryEscape(state.GantryACRLoginServer),
+	)
+
+	deadline := time.NewTimer(b.config.ArtifactStreamingTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(b.config.ArtifactStreamingPoll)
+	defer ticker.Stop()
+
+	for {
+		commandContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+		output, err := b.commands.Run(commandContext, nil,
+			"kubectl", "-n", state.GantryNamespace,
+			"exec", pod, "-c", "configure", "--",
+			"curl", "-fsS", "-D", "-", "-o", "/dev/null", "--max-time", "20",
+			"-H", "Accept: "+registryManifestAccept,
+			helperURL,
+		)
+		cancel()
+		if err != nil {
+			return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s through AKS helper: %w", taggedImage, err)
+		}
+
+		convertedDigest, err := artifactStreamingDigestFromHeaders(output)
+		if err != nil {
+			return "", fmt.Errorf("resolve converted Artifact Streaming manifest %s through AKS helper: %w", taggedImage, err)
+		}
+		if convertedDigest.String() != originalDigest {
+			return fmt.Sprintf("%s/%s@%s", state.GantryACRLoginServer, taggedRepository, convertedDigest), nil
+		}
+
+		writeAll(b.stdout, fmt.Sprintf("Artifact Streaming manifest %s still resolves to source digest %s; waiting for converted digest\n", taggedImage, originalDigest))
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-deadline.C:
+			return "", fmt.Errorf("converted Artifact Streaming manifest %s still equals original image digest %s after %s", taggedImage, originalDigest, b.config.ArtifactStreamingTimeout)
+		case <-ticker.C:
+		}
 	}
-	if err := json.Unmarshal(output, &metadata); err != nil {
-		return "", fmt.Errorf("decode converted Artifact Streaming manifest metadata: %w", err)
+}
+
+func artifactStreamingDigestFromHeaders(headers []byte) (digest.Digest, error) {
+	var value string
+	for _, line := range strings.Split(string(headers), "\n") {
+		name, candidate, found := strings.Cut(line, ":")
+		if found && strings.EqualFold(strings.TrimSpace(name), "Docker-Content-Digest") {
+			value = strings.TrimSpace(candidate)
+		}
 	}
-	convertedDigest, err := digest.Parse(metadata.Digest)
-	if err != nil || convertedDigest.Algorithm() != digest.SHA256 {
-		return "", fmt.Errorf("converted Artifact Streaming manifest has invalid digest %q", metadata.Digest)
-	}
-	if metadata.Digest == originalDigest {
-		return "", fmt.Errorf("converted Artifact Streaming manifest digest still equals original image digest %s", originalDigest)
+	parsed, err := digest.Parse(value)
+	if err != nil || parsed.Algorithm() != digest.SHA256 {
+		return "", fmt.Errorf("AKS helper returned invalid Docker-Content-Digest %q", value)
 	}
 
-	return fmt.Sprintf("%s/%s@%s", state.GantryACRLoginServer, taggedRepository, convertedDigest), nil
+	return parsed, nil
 }
 
 func (b *benchmark) verifyArtifactStreamingImage(ctx context.Context, state benchmarkState, imageReference string) error {
