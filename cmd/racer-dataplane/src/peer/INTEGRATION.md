@@ -82,6 +82,18 @@ Page, metadata, and copy-only requests use actual pooled HTTP. Page bodies prese
 ciphertext; AEAD verification belongs to the receiving read coordinator. Relay
 verification preserves the original and every hop signature in both directions.
 
+Authenticated relay requests wait in FIFO order when all relay-transfer permits
+are busy. Waiting retains the original signed deadline and request, without
+starting another attempt or consuming another link. The queue is capped by the
+worker's queue-entry limit and charges waiter/context admission; queue or context
+exhaustion still returns overload. Active transfer limits are unchanged. Permit
+release and cancellation wake queued tasks. The worker must call
+`server.poll_admission_deadlines()` on its timer tick, including when no socket
+completion occurs, to expire waits and observe admission shutdown. Application
+already drives this hook. A queued request retains its incoming connection and
+authenticated header; it acquires no outgoing socket or page buffer before a
+permit. Persistent saturation can still exhaust the queue or original deadline.
+
 `Requester::exchange` selects the route rail and automatically attempts native
 transfer when the local session provider is ready. The server validates the entire
 signed response path's rail mapping, then exchanges setup, grant, and completion

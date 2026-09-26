@@ -19,39 +19,90 @@ impl Drop for Process {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_uses_fill_receive_capacity() {
-    sdk_fixture(false, false, false, false);
+    sdk_fixture(false, false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_waits_for_busy_peer_slots() {
-    sdk_fixture(true, false, false, false);
+    sdk_fixture(true, false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_accepts_clients_with_idle_peer_capacity() {
-    sdk_fixture(true, true, false, false);
+    sdk_fixture(true, true, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_with_uniform_peer_memory_pressure() {
-    sdk_fixture(true, false, true, false);
+    sdk_fixture(true, false, true, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_reclaims_accepted_peer_keepalives() {
-    sdk_fixture(true, false, true, true);
+    sdk_fixture(true, false, true, true, false);
+}
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_full_image_waits_for_transient_relay_admission() {
+    sdk_fixture(true, false, true, false, true);
+}
+
+/// Select an explicit first hop so this small graph exercises a relay, as the
+/// fleet does. Everything after signing uses production transport and Fill.
+pub(super) struct ViaRelay {
+    pub(super) membership: Arc<Membership>,
+    pub(super) auth: Rc<Forwarding>,
+    pub(super) transfers: Rc<transfer::Transfers>,
+}
+impl requester::PeerClient for ViaRelay {
+    fn request<'a>(
+        &'a self,
+        request: wire::PeerRequest,
+        scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, wire::VerifiedResponse> {
+        Box::pin(async move { self.request_reserved(request, scope, &mut None).await })
+    }
+    fn request_reserved<'a>(
+        &'a self,
+        request: wire::PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> crate::error::Operation<'a, wire::VerifiedResponse> {
+        Box::pin(async move {
+            let next = self
+                .membership
+                .members()
+                .iter()
+                .skip(1)
+                .find(|m| m.node != request.route.destination)
+                .unwrap();
+            let (signed, binding) = self.auth.sign_request_to(request, &next.node)?;
+            let response = self
+                .transfers
+                .exchange_reserved(
+                    Endpoint::Peer(next.peer_endpoint.clone()),
+                    signed,
+                    crate::topology::rails::TransportPlan::Http,
+                    scope,
+                    output,
+                )
+                .await?;
+            self.auth.verify_response(response, &binding)
+        })
+    }
 }
 fn sdk_fixture(
     busy_peers: bool,
     idle_pressure: bool,
     uniform_memory: bool,
     incoming_pressure: bool,
+    relay_pressure: bool,
 ) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!(
-            "stream-sdk-{}-{busy_peers}-{idle_pressure}-{uniform_memory}-{incoming_pressure}",
+            "stream-sdk-{}-{busy_peers}-{idle_pressure}-{uniform_memory}-{incoming_pressure}-{relay_pressure}",
             std::process::id()
         ));
     fs::create_dir_all(&output).unwrap();
@@ -80,6 +131,7 @@ fn sdk_fixture(
             idle_pressure,
             uniform_memory,
             incoming_pressure,
+            relay_pressure,
         );
     }
     fs::remove_dir_all(output).unwrap();
@@ -91,6 +143,7 @@ fn run(
     idle_pressure: bool,
     uniform_memory: bool,
     incoming_pressure: bool,
+    relay_pressure: bool,
 ) {
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
@@ -212,7 +265,7 @@ fn run(
     // Four two-page windows must make progress without an eighth full-page charge.
     let nodes: Vec<_> = (0..4)
         .map(|i| {
-            build_node_with_queue_limit(
+            build_node_with_relay_pressure(
                 i,
                 membership.clone(),
                 signers[i].clone(),
@@ -228,7 +281,12 @@ fn run(
                 },
                 // Match the live two-worker partition: 256 node entries / 2.
                 // Other variants retain their original sixteen-entry fixture.
-                if incoming_pressure { 128 } else { 16 },
+                if incoming_pressure || relay_pressure {
+                    128
+                } else {
+                    16
+                },
+                relay_pressure,
             )
         })
         .collect();
@@ -254,7 +312,7 @@ fn run(
             }
             scope.check().unwrap();
             for (node, endpoint) in nodes.iter().zip(&mut endpoints) {
-                node.pool.poll_peer_waiters();
+                node.server.poll_admission_deadlines();
                 node.reactor.poll_budgeted(256).unwrap();
                 node.engine.borrow_mut().poll_budgeted(64).unwrap();
                 node.crypto.poll_budgeted(64).unwrap();
@@ -319,6 +377,8 @@ fn run(
     let ready_path = output.join("sdk-ready");
     let release_path = output.join("sdk-release");
     let mut pressure_seeded = false;
+    let mut relay_charges = Vec::new();
+    let mut relay_release = None;
     let mut seed_incoming = async || {
         let seed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // Called only after four SDK streams consumed their bootstrap pages.
@@ -437,7 +497,7 @@ fn run(
             .env("RACER_STREAM_LAYERS", fixture)
             .env(
                 "RACER_STREAM_BARRIER",
-                if incoming_pressure {
+                if incoming_pressure || relay_pressure {
                     output.as_os_str()
                 } else {
                     std::ffi::OsStr::new("")
@@ -476,6 +536,26 @@ fn run(
         let node = &nodes[0];
         let mut active = FuturesUnordered::new();
         loop {
+            if relay_pressure && !pressure_seeded && ready_path.exists() {
+                // Match the observed 8/8 live boundary with finite competing
+                // owners. The SDK continues on already established connections.
+                for node in nodes.iter().skip(1) {
+                    for _ in 0..8 {
+                        relay_charges.push(
+                            node.admission
+                                .reserve(None, ResourceClass::Relay, 1)
+                                .unwrap(),
+                        );
+                    }
+                }
+                pressure_seeded = true;
+                relay_release = Some(Instant::now() + Duration::from_millis(150));
+                fs::write(&release_path, b"release").unwrap();
+            }
+            if relay_release.is_some_and(|at| Instant::now() >= at) {
+                relay_charges.clear();
+                relay_release = None;
+            }
             if incoming_pressure && !pressure_seeded && ready_path.exists() {
                 seed_incoming().await;
                 pressure_seeded = true;
@@ -574,6 +654,16 @@ fn run(
         assert!(
             nodes[0].pool.incoming_reclaims.get() > 0,
             "SDK must exercise accepted-peer reclamation"
+        );
+    }
+    if relay_pressure {
+        assert!(
+            nodes
+                .iter()
+                .map(|node| node.server.relay_admission_waits())
+                .sum::<usize>()
+                > 0,
+            "SDK continuations must exercise relay admission"
         );
     }
     for node in &nodes {

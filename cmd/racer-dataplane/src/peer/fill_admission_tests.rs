@@ -247,6 +247,30 @@ fn build_node_with_queue_limit(
     peer_limit: usize,
     queue_limit: usize,
 ) -> Node {
+    build_node_with_relay_pressure(
+        i,
+        membership,
+        signer,
+        discovery,
+        data,
+        concurrency,
+        peer_limit,
+        queue_limit,
+        false,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn build_node_with_relay_pressure(
+    i: usize,
+    membership: Arc<Membership>,
+    signer: Rc<Signatures>,
+    discovery: &Discovery,
+    data: Rc<Data>,
+    concurrency: usize,
+    peer_limit: usize,
+    queue_limit: usize,
+    relay_pressure: bool,
+) -> Node {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = NonZeroUsize::new(queue_limit).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
@@ -254,6 +278,9 @@ fn build_node_with_queue_limit(
     limits.dirty_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
     limits.client_connections = NonZeroUsize::new(64).unwrap();
     limits.request_context_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap();
+    if relay_pressure {
+        limits.relay_transfers = NonZeroUsize::new(8).unwrap();
+    }
     let admission = Rc::new(Admission::new(limits));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let buffers = Rc::new(BufferPool::new(admission.clone()));
@@ -327,10 +354,19 @@ fn build_node_with_queue_limit(
         )
         .with_network(network.clone()),
     );
+    let fill_peers: Rc<dyn requester::PeerClient> = if relay_pressure && i == 0 {
+        Rc::new(production_stream_tests::ViaRelay {
+            membership: membership.clone(),
+            auth: auth.clone(),
+            transfers: transfers.clone(),
+        })
+    } else {
+        peers.clone()
+    };
     let candidates = Rc::new(CandidatePolicy::new(
         signer.node().clone(),
         Rc::new(Placement::new(128)),
-        peers.clone(),
+        fill_peers.clone(),
     ));
     let credentials = Rc::new(CredentialCrypto::new(
         discovery.0.clone(),
@@ -356,7 +392,7 @@ fn build_node_with_queue_limit(
         buffers,
         disk,
         writer: writer.clone(),
-        peers: peers.clone(),
+        peers: fill_peers.clone(),
         origin: origin.clone(),
         candidates: candidates.clone(),
         flights: flights.clone(),
@@ -368,7 +404,7 @@ fn build_node_with_queue_limit(
     let metadata = Rc::new(MetadataService::new(
         candidates,
         origin,
-        peers.clone(),
+        fill_peers,
         credentials.clone(),
         128,
         MetadataDependencies {

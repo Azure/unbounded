@@ -46,9 +46,14 @@ pub struct PeerServer {
 }
 impl PeerServer {
     pub fn poll_admission_deadlines(&self) {
+        self.relay.poll_admission_deadlines();
         if let Some(transfers) = &self.transfers {
             transfers.http.poll_peer_waiters();
         }
+    }
+    #[cfg(test)]
+    pub(super) fn relay_admission_waits(&self) -> usize {
+        self.relay.admission_waits()
     }
     /// Accept bounded neighbor HTTP connections on the owning reactor. The shared
     /// codec frames input before signatures are verified and operations decoded.

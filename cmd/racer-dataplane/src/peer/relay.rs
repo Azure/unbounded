@@ -8,17 +8,18 @@ use super::{
 };
 use crate::{
     error::{Error, Operation},
-    model::limits::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
     topology::paths::Paths,
 };
 use std::rc::Rc;
+#[path = "relay_admission.rs"]
+mod admission;
 pub struct Relay {
     paths: Rc<Paths>,
     forwarding: Rc<Forwarding>,
     transport: Rc<dyn PeerTransport>,
-    admission: Rc<Admission>,
+    admission: admission::RelayAdmission,
     network: Option<Rc<super::PeerNetwork>>,
     handshake: Option<Rc<super::handshake::Handshake>>,
 }
@@ -33,7 +34,7 @@ impl Relay {
             paths,
             forwarding,
             transport,
-            admission,
+            admission: admission::RelayAdmission::new(admission),
             network: None,
             handshake: None,
         }
@@ -41,6 +42,13 @@ impl Relay {
     pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
         self.network = Some(network);
         self
+    }
+    pub(super) fn poll_admission_deadlines(&self) {
+        self.admission.poll_deadlines();
+    }
+    #[cfg(test)]
+    pub(super) fn admission_waits(&self) -> usize {
+        self.admission.waits.get()
     }
     pub fn with_handshake(mut self, handshake: Rc<super::handshake::Handshake>) -> Self {
         self.handshake = Some(handshake);
@@ -69,7 +77,7 @@ impl Relay {
             if budget.destination == network.local || budget.visited.contains(&network.local) {
                 return Err(Error::InvalidRequest);
             }
-            let _reservation = self.admission.reserve(None, ResourceClass::Relay, 1)?;
+            let _reservation = self.admission.acquire(&scope).await?;
             let membership = network.membership(budget.membership)?;
             let search_budget = super::search_budget(budget, &network.local)?;
             let route = self
