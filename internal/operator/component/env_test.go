@@ -5,7 +5,6 @@ package component
 
 import (
 	"context"
-	"regexp"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -271,8 +271,8 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
 
-	if len(hash) > 63 || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(hash) {
-		t.Fatalf("applied payload hash %q is not a valid label value", hash)
+	if errs := validation.IsValidLabelValue(hash); len(errs) != 0 {
+		t.Fatalf("applied payload hash %q is not a valid label value: %v", hash, errs)
 	}
 
 	current := desired.DeepCopy()
@@ -302,6 +302,96 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 
 	if _, ok := desired.Labels[AppliedHashLabel]; ok {
 		t.Fatalf("ApplyObject mutated desired labels: %v", desired.Labels)
+	}
+}
+
+func TestApplyObjectHashLabelValid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		// These payloads produced the indicated leading character with raw URL-base64.
+		{name: "leading hyphen", data: "3"},
+		{name: "leading underscore", data: "56"},
+		{name: "leading alphanumeric", data: "46"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "racer-bootstrap-trust", "namespace": "unbounded-system",
+				},
+				"data": map[string]any{"ca.crt": tc.data},
+			}}
+			applies := 0
+
+			cl := fake.NewClientBuilder().WithScheme(testScheme(t)).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Apply: func(_ context.Context, _ client.WithWatch, cfg runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+						applies++
+
+						hash := cfg.(interface{ GetLabels() map[string]string }).GetLabels()[AppliedHashLabel]
+						if hash == "" {
+							t.Fatal("apply payload has no applied hash")
+						}
+
+						if errs := validation.IsValidLabelValue(hash); len(errs) != 0 {
+							t.Fatalf("applied payload hash %q is invalid: %v", hash, errs)
+						}
+
+						return nil
+					},
+				}).Build()
+			if err := (&Env{Client: cl}).ApplyObject(t.Context(), desired); err != nil {
+				t.Fatalf("ApplyObject: %v", err)
+			}
+
+			if applies != 1 {
+				t.Fatalf("applies = %d, want 1", applies)
+			}
+		})
+	}
+}
+
+func TestAppliedPayloadHashIgnoresOwnLabel(t *testing.T) {
+	desired := ToUnstructured(&corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Labels: map[string]string{"app": "test"}},
+		Data:       map[string]string{"payload": "original"},
+	})
+
+	hash, err := AppliedPayloadHash(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, previous := range []string{hash, "old-base64-hash"} {
+		desired.SetLabels(map[string]string{"app": "test", AppliedHashLabel: previous})
+
+		got, err := AppliedPayloadHash(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got != hash {
+			t.Fatalf("own label changed payload hash: %q != %q", got, hash)
+		}
+
+		if desired.GetLabels()[AppliedHashLabel] != previous {
+			t.Fatal("hashing mutated desired labels")
+		}
+	}
+
+	desired.Object["data"] = map[string]any{"payload": "changed"}
+
+	changed, err := AppliedPayloadHash(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if changed == hash {
+		t.Fatal("changed payload did not change hash")
 	}
 }
 

@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -416,7 +416,9 @@ func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 
 	sum := sha256.Sum256(data)
 
-	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
+	// Unpadded base32 keeps all 256 bits in 52 alphanumeric characters. Unlike
+	// URL-base64, it cannot begin or end with punctuation forbidden in labels.
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]), nil
 }
 
 // ListSites returns every Site in the cluster.
