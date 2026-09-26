@@ -415,6 +415,7 @@ impl Drop for SignalGuard {
 /// Node-level control events enter through bounded worker commands. Mutable state
 /// is not implicitly made global by Arc/Mutex or by a background async runtime.
 pub struct WorkerApplication {
+    http: Rc<HttpPool>,
     pub worker: WorkerId,
     runtime: WorkerRuntime,
     control: Option<Rc<ControlClient>>,
@@ -528,11 +529,19 @@ impl WorkerApplication {
             None
         };
 
-        let http = Rc::new(HttpPool::new(
-            reactor.clone(),
-            admission.clone(),
-            limits.connections_per_neighbor.get(),
-        ));
+        let http = Rc::new(
+            HttpPool::new(
+                reactor.clone(),
+                admission.clone(),
+                limits.connections_per_neighbor.get(),
+            )
+            .with_origin_limit(
+                config
+                    .origin_connections_per_cache
+                    .get()
+                    .min(limits.client_connections.get()),
+            ),
+        );
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             crate::http::codec::Codec::new(
@@ -655,7 +664,7 @@ impl WorkerApplication {
             requester.clone(),
         ));
         let origin: Rc<dyn Origin> = Rc::new(
-            OriginClient::new(snapshots.clone(), http, io.clone())
+            OriginClient::new(snapshots.clone(), http.clone(), io.clone())
                 .with_buffers(admission.clone(), buffers.clone()),
         );
         let flights = Rc::new(Flights::new(admission.clone()));
@@ -736,6 +745,7 @@ impl WorkerApplication {
         let mut telemetry = Telemetry::default();
         telemetry.health = node.observations.health.clone();
         Ok(Self {
+            http,
             worker,
             runtime,
             control,
@@ -1014,6 +1024,7 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        self.http.poll_waiters(budget);
         self.metadata.poll_deadlines(Instant::now(), budget);
         if self.stopping {
             for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {

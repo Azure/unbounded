@@ -159,7 +159,7 @@ I/O address/offset/length alignment and padded-record fit must additionally pass
 All limits are strictly positive. Aggregate limits are node-wide ceilings, not
 promised concurrency or allocations made by configuration. Runtime partitions
 aggregate dimensions after affinity discovery; per-operation caps such as window,
-headers, waiters per flight, connections per neighbor, and retained snapshots stay
+headers, waiters per flight, connections per neighbor/cache, and retained snapshots stay
 unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 
 | Environment variable | Default | Maximum |
@@ -173,6 +173,7 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_WAITERS_PER_FLIGHT` | `64` | 4096 |
 | `RACER_QUEUE_ENTRIES` | `256` | 65536 |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | 1024 |
+| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `8` | 1024 |
 | `RACER_CLIENT_CONNECTIONS` | `128` | 65536 |
 | `RACER_PIPES` | `16` | 65536 |
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
@@ -184,6 +185,32 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
+
+`RACER_CONNECTIONS_PER_NEIGHBOR` caps TCP peer connections (and RDMA sessions),
+not local origin adapters. `RACER_ORIGIN_CONNECTIONS_PER_CACHE` caps concurrent
+HTTP exchanges to each origin UDS per worker. It cannot exceed the node connection
+ceiling; each worker clamps it to its partitioned connection ceiling. It is not a
+reservation or a guarantee of that concurrency. Client sockets, peer sockets,
+and origin sockets still share `RACER_CLIENT_CONNECTIONS` admission.
+
+Origin bootstrap, HEAD, and pinned-page requests wait for endpoint or shared pool
+capacity under their original cancellation and deadline. Each worker's HTTP pool
+has at most its partitioned `RACER_QUEUE_ENTRIES` waiting requests, charged to
+request-context bytes. Waiters consume no new connection or reactor operation;
+already admitted page/flight/context leases remain bounded by their existing
+budgets. The queue is FIFO within each endpoint, so a saturated cache does not
+block ready endpoints. A full queue or exhausted context budget still returns
+`Overloaded`. TCP peer checkout remains immediate for routing fallback. Idle
+connections are reclaimed under pool pressure. No extra control-progress charges
+or threads are consumed by waiting. The worker wakes a bounded round-robin batch
+at most once per millisecond to check deadlines and shared quota; release and cancellation
+also notify waiters. Embedders using `HttpPool::checkout_wait` must drive
+`HttpPool::poll_waiters` along with the reactor, including during drain.
+
+Delivery pipe admission and first-page preparation happen before success headers.
+Brief pipe or origin connection saturation can therefore wait without promising
+an unavailable first body slice. Later acquisition/transport failure, cancellation,
+or deadline expiry can still truncate a response whose headers were already sent.
 
 Additional progress requirements (checked here for one worker; integration must
 recheck them after partitioning and reduce the pair count if needed):
@@ -198,7 +225,7 @@ recheck them after partitioning and reduce the pair count if needed):
   an admitted head, bounded opaque fields, and credential sealing output/scratch.
 - At least two queue entries and two retained snapshots allow data/control and
   current/replacement progress. Runtime must actually preserve progress reserves.
-- Connections per neighbor cannot exceed client connections (the admission
+- Connections per neighbor/cache cannot exceed client connections (the admission
   connection ceiling). Flights times waiters per flight cannot exceed 1048576.
 - Each byte dimension fits `isize::MAX`; their sum fits `isize::MAX` and is at
   most 256 GiB, including optional RDMA bytes.

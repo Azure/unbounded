@@ -166,7 +166,7 @@ impl OriginClient {
         head.headers.push(header("Range", b"bytes=0-16777215"));
         let connection = self
             .pool
-            .checkout(endpoint, scope)
+            .checkout_wait(endpoint, scope)
             .await
             .map_err(response_error)?;
         let sent = self
@@ -235,7 +235,7 @@ impl OriginClient {
         }
         let connection = self
             .pool
-            .checkout(endpoint, scope)
+            .checkout_wait(endpoint, scope)
             .await
             .map_err(response_error)?;
         let sent = self
@@ -320,7 +320,7 @@ impl OriginClient {
         }
         let connection = self
             .pool
-            .checkout(endpoint, scope)
+            .checkout_wait(endpoint, scope)
             .await
             .map_err(response_error)?;
         let sent = self

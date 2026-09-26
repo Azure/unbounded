@@ -390,6 +390,78 @@ fn check_request(
 }
 
 #[test]
+fn distinct_cold_requests_wait_for_origin_slots_and_finish_complete_bodies() {
+    let (_path, listener, endpoint) = listen();
+    let (client, admission, reactor) = client();
+    let contexts: Vec<_> = (0..3)
+        .map(|index| {
+            let mut context = context();
+            context.object.key = CacheKey([index; 32]);
+            context
+        })
+        .collect();
+    let scope = scope();
+    let mut requests: Vec<_> = contexts
+        .iter()
+        .map(|context| Box::pin(client.bootstrap_at(&endpoint, context, &scope)))
+        .collect();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    // Admit two connects. The third must wait without starting I/O or failing.
+    for request in &mut requests {
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 2);
+    assert_eq!(reactor.in_flight(), 2);
+    let server = thread::spawn(move || {
+        let mut sockets = [accept(&listener), accept(&listener)];
+        let mut targets = std::collections::HashSet::new();
+        for socket in &mut sockets {
+            let head = receive(socket);
+            let StartLine::Request { method, target } = head.start else {
+                panic!("request required")
+            };
+            assert_eq!(method, "GET");
+            assert!(targets.insert(target));
+        }
+        // Release only the first slot; the queued request must reuse it while
+        // the other distinct cold request is still waiting for its response.
+        let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nabc";
+        sockets[0].write_all(response).unwrap();
+        let head = receive(&mut sockets[0]);
+        let StartLine::Request { target, .. } = head.start else {
+            panic!("request required")
+        };
+        assert!(targets.insert(target));
+        assert_eq!(targets.len(), 3);
+        sockets[0].write_all(response).unwrap();
+        sockets[1].write_all(response).unwrap();
+    });
+    let mut pending: Vec<_> = requests.into_iter().map(Some).collect();
+    let mut completed = 0;
+    while completed < 3 {
+        scope.check().unwrap();
+        client.pool.poll_waiters(2);
+        for (index, request) in pending.iter_mut().enumerate() {
+            if let Some(future) = request {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                    let result = result.unwrap();
+                    assert_eq!(result.metadata.version.object, contexts[index].object);
+                    assert_eq!(result.page_zero.unwrap().plaintext.bytes().unwrap(), b"abc");
+                    *request = None;
+                    completed += 1;
+                }
+            }
+        }
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    server.join().unwrap();
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
 fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {

@@ -54,6 +54,8 @@ pub struct Config {
     pub segment_bytes: u64,
     pub free_segment_reserve: usize,
     pub limits: Limits,
+    /// Per-cache, per-worker origin HTTP cap, separate from peer connections.
+    pub origin_connections_per_cache: NonZeroUsize,
     pub request_timeout: Duration,
     pub reader_stall_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -191,6 +193,7 @@ impl Config {
             metadata_entries: limit("RACER_METADATA_ENTRIES", 4096)?,
             relay_transfers: limit("RACER_RELAY_TRANSFERS", 16)?,
         };
+        let origin_connections_per_cache = limit("RACER_ORIGIN_CONNECTIONS_PER_CACHE", 8)?;
         let config = Self {
             cluster,
             node: NodeId(UNRESOLVED_NODE_ID.into()),
@@ -208,6 +211,7 @@ impl Config {
             segment_bytes,
             free_segment_reserve,
             limits,
+            origin_connections_per_cache,
             request_timeout,
             reader_stall_timeout,
             shutdown_timeout,
@@ -273,6 +277,11 @@ impl Config {
             return Err(Error::InvalidConfiguration);
         }
         let limits = &self.limits;
+        if self.origin_connections_per_cache.get() > 1024
+            || self.origin_connections_per_cache > limits.client_connections
+        {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut bytes = 0u64;
         for limit in [
             limits.plaintext_bytes,
@@ -1068,8 +1077,34 @@ mod tests {
         assert_eq!(config.free_segment_reserve, 2);
         assert!(config.diagnostics_listen.ip().is_loopback());
         assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.origin_connections_per_cache.get(), 8);
+        assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
+    }
+
+    #[test]
+    fn origin_connection_cap_is_independent_and_validated() {
+        let config = parse(&[
+            ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "16"),
+            ("RACER_CONNECTIONS_PER_NEIGHBOR", "1"),
+        ])
+        .unwrap();
+        assert_eq!(config.origin_connections_per_cache.get(), 16);
+        assert_eq!(config.limits.connections_per_neighbor.get(), 1);
+        for value in ["", "0", "1025", "129", "-1", "1 ", "many"] {
+            assert!(
+                parse(&[("RACER_ORIGIN_CONNECTIONS_PER_CACHE", value)]).is_err(),
+                "{value}"
+            );
+        }
+        assert!(
+            parse(&[
+                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "1024"),
+                ("RACER_CLIENT_CONNECTIONS", "1024")
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

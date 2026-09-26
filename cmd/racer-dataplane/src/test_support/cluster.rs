@@ -150,6 +150,7 @@ pub fn config(enable_rdma: bool) -> Config {
         slab_bytes: 1024 * 1024 * 1024,
         segment_bytes: 64 * 1024 * 1024,
         free_segment_reserve: 2,
+        origin_connections_per_cache: NonZeroUsize::new(8).unwrap(),
         request_timeout: Duration::from_secs(30),
         reader_stall_timeout: Duration::from_secs(10),
         shutdown_timeout: Duration::from_secs(30),
