@@ -126,7 +126,7 @@ impl CandidatePolicy {
         mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
-            scope.check()?;
+            check_budget(scope, budget)?;
             let (object, page) = operation_identity(&operation);
             if object != &context.object {
                 return Err(Error::InvalidRequest);
@@ -164,7 +164,7 @@ impl CandidatePolicy {
                         mode,
                         scope,
                         budget,
-                        (count - index) as u32,
+                        (count - index + usize::from(rank.is_some())) as u32,
                     )
                     .await
                 {
@@ -204,8 +204,8 @@ impl CandidatePolicy {
                     Err(error) => return Err(error),
                 }
             }
+            check_budget(scope, budget)?;
             if rank.is_some() {
-                scope.check()?;
                 Ok(CandidateResolution::Origin(OriginAuthority {
                     membership: candidates.membership,
                     node: self.node.clone(),
@@ -247,13 +247,14 @@ impl CandidatePolicy {
         mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, Option<T>> {
         Box::pin(async move {
+            check_budget(scope, budget)?;
             let rank = candidates
                 .ordered
                 .iter()
                 .position(|node| node == &self.node)
                 .ok_or(Error::Unauthorized)?;
             let mut transient = false;
-            for destination in candidates.ordered.iter().skip(rank + 1) {
+            for (index, destination) in candidates.ordered.iter().enumerate().skip(rank + 1) {
                 match self
                     .request(
                         &candidates.membership,
@@ -263,7 +264,7 @@ impl CandidatePolicy {
                         FetchMode::CopyOnly,
                         scope,
                         budget,
-                        1,
+                        (candidates.ordered.len() - index) as u32,
                     )
                     .await
                 {
@@ -285,6 +286,7 @@ impl CandidatePolicy {
                     Err(error) => return Err(error),
                 }
             }
+            check_budget(scope, budget)?;
             if transient {
                 Err(Error::Unavailable)
             } else {
@@ -302,22 +304,28 @@ impl CandidatePolicy {
         mode: FetchMode,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-        remaining_candidates: u32,
+        remaining_opportunities: u32,
     ) -> Result<VerifiedResponse> {
-        scope.check()?;
+        check_budget(scope, budget)?;
         // Reserve the complete permitted route before sending. Lost responses cannot
         // refund an unknown number of forwarded links. No retry gets fresh credits.
         let links = budget.route_links();
         if links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
-        let deadline = budget.begin_peer_attempt(Instant::now(), scope.deadline.0, links)?;
+        let now = Instant::now();
+        let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
+        // Share the remaining time among later candidates and, for predecessor
+        // probes, local origin. Fast failures leave their unused time available.
+        let deadline = now + (overall - now) / remaining_opportunities.max(1);
+        // A clone shares cancellation: timing it out would cancel the caller too.
+        let attempt_scope = RequestScope::new(scope.request, deadline)?;
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
             // Without a signed response receipt unused remote credits stay spent.
             let credits = budget
                 .remaining_attempts()
-                .div_ceil(remaining_candidates.max(1));
+                .div_ceil(remaining_opportunities.max(1));
             budget.partition(credits, 0)?.remaining_attempts()
         } else {
             0
@@ -326,7 +334,13 @@ impl CandidatePolicy {
         getrandom::getrandom(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
         let credentials = self.credentials.borrow().clone().ok_or(Error::MissingKey)?;
-        let origin = credentials.seal(context, attempt, scope)?;
+        // Sealing is synchronous, but can still use up a very short time share.
+        let origin = credentials.seal(context, attempt, &attempt_scope);
+        check_budget(scope, budget)?;
+        let origin = origin.map_err(|error| match error {
+            Error::DeadlineExceeded => Error::Unavailable,
+            error => error,
+        })?;
         let request = PeerRequest {
             operation: copy_operation(operation, mode),
             origin,
@@ -341,9 +355,33 @@ impl CandidatePolicy {
                 deadline: Deadline(deadline),
             },
         };
-        let response = self.peers.request(request, scope).await?;
-        scope.check()?;
-        Ok(response)
+        let registration = scope.cancellation.subscribe()?;
+        let mut exchange = self.peers.request(request, &attempt_scope);
+        let mut stopped = None;
+        let response = std::future::poll_fn(|cx| {
+            registration.register(cx.waker());
+            if stopped.is_none() {
+                stopped = check_budget(scope, budget)
+                    .and_then(|()| attempt_scope.check())
+                    .err();
+                if stopped.is_some() {
+                    let _ = attempt_scope.cancel();
+                }
+            }
+            // Keep polling after cancellation: a timeout is not a completion
+            // fence and must not release accepted I/O before the peer returns.
+            exchange.as_mut().poll(cx)
+        })
+        .await;
+        check_budget(scope, budget)?;
+        match stopped.or_else(|| attempt_scope.check().err()) {
+            Some(Error::DeadlineExceeded) => Err(Error::Unavailable),
+            Some(error) => Err(error),
+            None => match response {
+                Err(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                result => result,
+            },
+        }
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
@@ -357,6 +395,15 @@ impl CandidatePolicy {
         } else {
             Error::VersionUnavailable
         }
+    }
+}
+
+fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
+    scope.check()?;
+    if Instant::now() >= budget.deadline() {
+        Err(Error::DeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 
@@ -476,6 +523,10 @@ fn classify(
 }
 
 #[cfg(test)]
+#[path = "candidate_timeout_tests.rs"]
+mod timeout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -564,7 +615,7 @@ mod tests {
             Box::pin(async move { Err(self.error) })
         }
     }
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         MembershipLease,
         Rc<Placement>,
         OriginContext,

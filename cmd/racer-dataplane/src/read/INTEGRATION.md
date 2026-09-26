@@ -69,6 +69,12 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
   Disk CopyOnly remains ciphertext-only: the requester decrypts each attempted
   copy once rather than adding a redundant decrypt on the serving peer. Local
   disk acquisition still conditionally invalidates its own bad read token.
+- Sequential peer attempts divide remaining time among the remaining candidates,
+  including one local-origin share after predecessor probes. Each attempt uses a
+  fresh cancellation scope and a deadline capped by the original scope and budget.
+  Expiring that share cancels and drains the peer operation before fallback; it
+  never cancels the caller or refunds uncertain attempt/link credits. Expired
+  original deadlines and caller cancellation remain terminal.
 
 ## Completion and memory ownership
 
