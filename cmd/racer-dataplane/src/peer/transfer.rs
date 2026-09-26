@@ -66,6 +66,8 @@ impl IoBuffer for WireBuffer {
 }
 
 pub struct Transfers {
+    receive_cache: Option<Rc<crate::memory::cache::MemoryCache>>,
+    receive_writer: Option<Rc<crate::store::writer::StoreWriter>>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -84,6 +86,8 @@ pub struct Transfers {
 impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
+            receive_cache: None,
+            receive_writer: None,
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -108,6 +112,48 @@ impl Transfers {
     pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
         self.wire = Some((admission, codec));
         self
+    }
+    /// Peer traffic shares the worker's byte quota with retained local fills.
+    /// Reclaim disposable copies before rejecting an already arriving response.
+    pub fn with_receive_reclamation(
+        mut self,
+        memory: Rc<crate::memory::cache::MemoryCache>,
+        writer: Rc<crate::store::writer::StoreWriter>,
+    ) -> Self {
+        self.receive_cache = Some(memory);
+        self.receive_writer = Some(writer);
+        self
+    }
+    pub(super) fn receive_buffer(
+        &self,
+        admission: &Admission,
+        cache: &crate::model::identity::CacheId,
+        length: usize,
+    ) -> Result<WireBuffer> {
+        match WireBuffer::for_cache(admission, Some(cache), length) {
+            Err(Error::Overloaded) => {
+                if let Some(writer) = &self.receive_writer {
+                    writer.discard_unsubmitted();
+                }
+                // Each pass removes an idle entry, so this is bounded by the
+                // existing cache size. Retry the actual ciphertext dimension:
+                // evict_idle reports plaintext plus ciphertext, including slack.
+                loop {
+                    match WireBuffer::for_cache(admission, Some(cache), length) {
+                        Err(Error::Overloaded) => {
+                            let Some(memory) = &self.receive_cache else {
+                                return Err(Error::Overloaded);
+                            };
+                            if memory.evict_idle(1)? == 0 {
+                                return Err(Error::Overloaded);
+                            }
+                        }
+                        result => return result,
+                    }
+                }
+            }
+            result => result,
+        }
     }
     pub fn exchange_probe<'a>(
         &'a self,
@@ -320,11 +366,8 @@ impl Transfers {
             let (body, reservation) = if length == 0 {
                 (Vec::new(), None)
             } else {
-                let mut buffer = WireBuffer::for_cache(
-                    admission,
-                    Some(&request.request.origin.object.cache),
-                    length,
-                )?;
+                let mut buffer =
+                    self.receive_buffer(admission, &request.request.origin.object.cache, length)?;
                 let mut offset = 0;
                 while offset < length {
                     let completion = self

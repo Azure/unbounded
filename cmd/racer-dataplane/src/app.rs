@@ -629,7 +629,8 @@ impl WorkerApplication {
             buffers.clone(),
         ));
         let transfers = Transfers::new(http.clone(), io.clone(), rdma.clone())
-            .with_wire(admission.clone(), wire.clone());
+            .with_wire(admission.clone(), wire.clone())
+            .with_receive_reclamation(memory.clone(), writer.clone());
         let transfers = Rc::new(match &sessions {
             Some(sessions) => transfers.with_native(signatures.clone(), sessions.clone()),
             None => transfers,
