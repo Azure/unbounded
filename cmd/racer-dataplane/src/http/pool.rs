@@ -193,6 +193,25 @@ pub struct HttpPool {
     state: Rc<RefCell<PoolState>>,
 }
 impl HttpPool {
+    /// Accept into the same worker quota as outbound traffic. A completed idle
+    /// exchange may yield its slot before a new client or neighbor is rejected.
+    /// The accepted FD is retained across the admission retry.
+    pub fn accept(&self, fd: OwnedFd) -> Result<ConnectionLease> {
+        if self.state.borrow().closed {
+            return Err(Error::Unavailable);
+        }
+        set_nonblocking(&fd)?;
+        let reservation = self.reserve_connection()?;
+        Ok(ConnectionLease::new(Rc::new(fd), reservation, None))
+    }
+    fn reserve_connection(&self) -> Result<Reservation> {
+        match self.admission.reserve(None, ResourceClass::Connection, 1) {
+            Err(Error::Overloaded) if self.reclaim_idle_connection() => {
+                self.admission.reserve(None, ResourceClass::Connection, 1)
+            }
+            result => result,
+        }
+    }
     pub fn new(reactor: Rc<Reactor>, admission: Rc<Admission>, per_endpoint: usize) -> Self {
         Self::with_limits(
             reactor,
@@ -370,12 +389,7 @@ impl HttpPool {
                     ));
                 }
             }
-            let reservation = match self.admission.reserve(None, ResourceClass::Connection, 1) {
-                Err(Error::Overloaded) if self.reclaim_idle_connection() => {
-                    self.admission.reserve(None, ResourceClass::Connection, 1)?
-                }
-                result => result?,
-            };
+            let reservation = self.reserve_connection()?;
             let (fd, address) = create_socket(endpoint)?;
             let connection = ConnectionLease::new(Rc::new(fd), reservation, slot.0.take());
             // Retain socket, admission and pool slot in the reactor through the
@@ -548,6 +562,61 @@ mod peer_tests;
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn accepted_connection_reclaims_only_idle_capacity_and_retains_its_fd() {
+        use std::io::{Read, Write};
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.client_connections = std::num::NonZeroUsize::new(2).unwrap();
+        let admission = Rc::new(Admission::new(limits));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let pool = HttpPool::new(reactor, admission.clone(), 1);
+        let (idle, mut idle_peer) = UnixStream::pair().unwrap();
+        idle_peer.set_nonblocking(true).unwrap();
+        pool.state.borrow_mut().entries.insert(
+            Endpoint::Peer("127.0.0.1:1".into()),
+            Entry {
+                idle: vec![Idle {
+                    fd: Rc::new(idle.into()),
+                    reservation: admission
+                        .reserve(None, ResourceClass::Connection, 1)
+                        .unwrap(),
+                    since: Instant::now(),
+                }],
+                ..Entry::default()
+            },
+        );
+        let (active, _active_peer) = UnixStream::pair().unwrap();
+        let active = pool.accept(active.into()).unwrap();
+        let (incoming, mut incoming_peer) = UnixStream::pair().unwrap();
+        let incoming = pool.accept(incoming.into()).unwrap();
+        assert_eq!(admission.used(ResourceClass::Connection), 2);
+        assert_eq!(idle_peer.read(&mut [0; 1]).unwrap(), 0);
+        assert!(pool.state.borrow().entries.is_empty());
+        incoming_peer.write_all(b"x").unwrap();
+        let mut byte = [0];
+        // The original accepted socket, rather than a replacement or closed FD,
+        // remains owned after reclaiming the completed outbound lease.
+        assert_eq!(
+            unsafe { libc::recv(incoming.fd.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            1
+        );
+        assert_eq!(byte, *b"x");
+        let (rejected, mut rejected_peer) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            pool.accept(rejected.into()),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(rejected_peer.read(&mut [0; 1]).unwrap(), 0);
+        drop((incoming, active));
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        pool.close();
+        let (rejected, _peer) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            pool.accept(rejected.into()),
+            Err(Error::Unavailable)
+        ));
+    }
 
     #[test]
     fn checkout_reclaims_idle_connections_before_rejecting_a_new_neighbor() {

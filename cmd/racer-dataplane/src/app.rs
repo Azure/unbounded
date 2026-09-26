@@ -656,7 +656,7 @@ impl WorkerApplication {
             requester.clone(),
         ));
         let origin: Rc<dyn Origin> = Rc::new(
-            OriginClient::new(snapshots.clone(), http, io.clone())
+            OriginClient::new(snapshots.clone(), http.clone(), io.clone())
                 .with_buffers(admission.clone(), buffers.clone()),
         );
         let flights = Rc::new(Flights::new(admission.clone()));
@@ -726,13 +726,16 @@ impl WorkerApplication {
         );
         let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
         let responses = Rc::new(Responses::new(io.clone(), delivery));
-        let clients = Rc::new(ClientListeners::new(
-            dispatcher.clone(),
-            RequestParser::new(config.limits.header_bytes.get()),
-            responses,
-            io,
-            admission,
-        ));
+        let clients = Rc::new(
+            ClientListeners::new(
+                dispatcher.clone(),
+                RequestParser::new(config.limits.header_bytes.get()),
+                responses,
+                io,
+                admission,
+            )
+            .with_pool(http),
+        );
 
         let mut telemetry = Telemetry::default();
         telemetry.health = node.observations.health.clone();

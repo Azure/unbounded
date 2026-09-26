@@ -74,6 +74,7 @@ pub struct ClientListeners {
     responses: Rc<Responses>,
     io: Rc<HttpIo>,
     admission: Rc<Admission>,
+    pool: Option<Rc<crate::http::pool::HttpPool>>,
     listeners: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
     preparing: Rc<Cell<bool>>,
     cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
@@ -98,6 +99,7 @@ impl ClientListeners {
             responses,
             io,
             admission,
+            pool: None,
             listeners: Rc::new(RefCell::new(BTreeMap::new())),
             preparing: Rc::new(Cell::new(false)),
             cleanup: Rc::new(RefCell::new(VecDeque::new())),
@@ -108,6 +110,15 @@ impl ClientListeners {
             root: PathBuf::from("/run/racer"),
             request_timeout: Duration::from_secs(30),
         }
+    }
+    pub fn with_pool(mut self, pool: Rc<crate::http::pool::HttpPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = root;
+        self
     }
     pub fn reconcile<'a>(
         &'a self,
@@ -190,12 +201,15 @@ impl ClientListeners {
             let (_, listener) = listeners.iter().nth(index).ok_or(Error::Internal)?;
             match listener.listener.accept() {
                 Ok((socket, _)) => {
-                    let connection =
-                        match ConnectionLease::from_accepted(socket.into(), &self.admission) {
-                            Ok(connection) => connection,
-                            Err(Error::Overloaded) => break,
-                            Err(error) => return Err(error),
-                        };
+                    let accepted = match &self.pool {
+                        Some(pool) => pool.accept(socket.into()),
+                        None => ConnectionLease::from_accepted(socket.into(), &self.admission),
+                    };
+                    let connection = match accepted {
+                        Ok(connection) => connection,
+                        Err(Error::Overloaded) => break,
+                        Err(error) => return Err(error),
+                    };
                     let cache = listener.definition.id.clone();
                     let cancellation = Cancellation::new()?;
                     let task_cancellation = cancellation.clone();

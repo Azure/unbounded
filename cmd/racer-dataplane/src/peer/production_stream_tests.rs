@@ -19,18 +19,26 @@ impl Drop for Process {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_uses_fill_receive_capacity() {
-    sdk_fixture(false);
+    sdk_fixture(false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_waits_for_busy_peer_slots() {
-    sdk_fixture(true);
+    sdk_fixture(true, false);
 }
-fn sdk_fixture(busy_peers: bool) {
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_full_image_accepts_clients_with_idle_peer_capacity() {
+    sdk_fixture(true, true);
+}
+fn sdk_fixture(busy_peers: bool, idle_pressure: bool) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(format!("stream-sdk-{}-{busy_peers}", std::process::id()));
+        .join(format!(
+            "stream-sdk-{}-{busy_peers}-{idle_pressure}",
+            std::process::id()
+        ));
     fs::create_dir_all(&output).unwrap();
     let overlay = output.join("overlay.json");
     fs::write(&overlay,serde_json::to_vec(&serde_json::json!({"Replace":{root.join("pkg/racersdk/production_stream_fixture_test.go").to_str().unwrap():root.join("cmd/racer-dataplane/tests/conformance/production_stream_fixture_test.go.txt")}})).unwrap()).unwrap();
@@ -50,11 +58,11 @@ fn sdk_fixture(busy_peers: bool) {
         .unwrap();
     assert!(status.success(), "SDK fixture build: {status}");
     for warm in [true, false] {
-        run(warm, &binary, busy_peers);
+        run(warm, &binary, busy_peers, idle_pressure);
     }
     fs::remove_dir_all(output).unwrap();
 }
-fn run(warm: bool, binary: &std::path::Path, busy_peers: bool) {
+fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bool) {
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
     for signer in &signers {
@@ -263,6 +271,76 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool) {
     );
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
+    let client_listeners = crate::client::listener::ClientListeners::new(
+        nodes[0].coordinator.clone(),
+        RequestParser::new(32768),
+        nodes[0].responses.clone(),
+        nodes[0].client_io.clone(),
+        nodes[0].admission.clone(),
+    )
+    .with_pool(nodes[0].pool.clone())
+    .with_root(output.clone());
+    let mut idle_servers = Vec::new();
+    if idle_pressure {
+        let (client_socket, origin_socket) = canonical_socket_paths("fixture").unwrap();
+        drive(Box::pin(async {
+            client_listeners
+                .reconcile(
+                    &[CacheDefinition {
+                        id: CacheId(CACHE.into()),
+                        name: "fixture".into(),
+                        client_socket,
+                        origin_socket,
+                        socket_mode: 0o600,
+                    }],
+                    &scope,
+                )
+                .await
+                .unwrap();
+            // Complete actual HTTP exchanges on distinct neighbors. All 64
+            // connection charges are idle before the first real SDK request.
+            for _ in 0..64 {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
+                let connection = nodes[0].pool.checkout(&endpoint, &scope).await.unwrap();
+                let (server, _) = listener.accept().unwrap();
+                use std::io::Write;
+                (&server)
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .unwrap();
+                let head = crate::http::codec::MessageHead {
+                    start: crate::http::codec::StartLine::Request {
+                        method: "GET".into(),
+                        target: "/".into(),
+                    },
+                    headers: vec![crate::http::codec::Header {
+                        name: "content-length".into(),
+                        value: b"0".to_vec(),
+                    }],
+                };
+                let response = nodes[0]
+                    .client_io
+                    .exchange_head(connection, head, &scope)
+                    .await
+                    .unwrap();
+                let mut connection = response.connection;
+                connection.finish_exchange().unwrap();
+                drop(connection);
+                idle_servers.push(server);
+            }
+        }));
+        assert_eq!(nodes[0].admission.used(ResourceClass::Connection), 64);
+    }
+    let socket = if idle_pressure {
+        format!(
+            "/proc/{}/fd/{}/fixture/client/socket",
+            std::process::id(),
+            directory.as_raw_fd()
+        )
+    } else {
+        socket
+    };
     let fixture = output.join("manifest.json");
     fs::write(&fixture, serde_json::to_vec(&manifest_descriptor).unwrap()).unwrap();
     let mut child = Process(
@@ -303,7 +381,18 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool) {
         let node = &nodes[0];
         let mut active = FuturesUnordered::new();
         loop {
-            while let Ok((stream, _)) = listener.accept() {
+            if idle_pressure {
+                std::future::poll_fn(|cx| Poll::Ready(client_listeners.poll_budgeted(cx, 64)))
+                    .await
+                    .unwrap();
+            }
+            loop {
+                if idle_pressure {
+                    break;
+                }
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
                 let scope = &scope;
                 active.push(async move {
                     let mut connection =
@@ -367,6 +456,19 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool) {
             futures::future::Either::Right((result, _)) => panic!("peer server: {result:?}"),
         }
     }));
+    if idle_pressure {
+        client_listeners
+            .cancel_cache(&CacheId(CACHE.into()))
+            .unwrap();
+        drive(Box::pin(std::future::poll_fn(|cx| {
+            client_listeners.poll_budgeted(cx, 64).unwrap();
+            if client_listeners.active_connections() == 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })));
+    }
     for node in &nodes {
         node.pool.close();
         node.writer.discard_unsubmitted();

@@ -240,8 +240,9 @@ fn build_node_with_peer_limit(
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!(
-            "fill-fleet-{}-{concurrency}-{peer_limit}-{i}",
-            std::process::id()
+            "fill-fleet-{}-{:?}-{concurrency}-{peer_limit}-{i}",
+            std::process::id(),
+            std::thread::current().id()
         ));
     let slabs = Rc::new(Slabs::new(
         WorkerId(0),

@@ -74,10 +74,13 @@ impl PeerServer {
                 }
                 let accepted =
                     next_accepted(reactor.accept(fd.clone(), scope), &mut active, scope).await?;
-                let connection = match crate::http::pool::ConnectionLease::from_accepted(
-                    accepted,
-                    &self.admission,
-                ) {
+                let accepted = match &self.transfers {
+                    Some(transfers) => transfers.http.accept(accepted),
+                    None => {
+                        crate::http::pool::ConnectionLease::from_accepted(accepted, &self.admission)
+                    }
+                };
+                let connection = match accepted {
                     Ok(connection) => connection,
                     Err(Error::Overloaded) => continue,
                     Err(error) => return Err(error),
