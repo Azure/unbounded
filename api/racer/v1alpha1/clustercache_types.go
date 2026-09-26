@@ -18,9 +18,12 @@ type ClusterCacheSpec struct {
 
 // ClusterCache names a disposable cache. Its Kubernetes UID is its wire identity.
 // The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
+// Each DNS label is limited to 63 characters to match the wire contract;
+// Kubernetes metadata validation enforces DNS subdomain spelling.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=rcache
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 82",message="name must fit the canonical Unix socket path"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.split('.').all(label, size(label) <= 63)",message="each name label must be at most 63 characters"
 type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

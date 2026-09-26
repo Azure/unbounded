@@ -151,6 +151,19 @@ until absent from the input lists (or explicitly excluded for Nodes); only Pod
 endpoint selection filters deletion timestamps. Complete publication byte bounds
 and canonical hashes are checked by `wire.ContentHashes` before version assignment.
 
+ClusterCache admission requires a lowercase ASCII DNS subdomain name, at most 82
+characters total and 63 characters per dot-separated label. Kubernetes validates
+the spelling; CRD CEL rules enforce the socket-path and per-label length bounds.
+Multi-label names longer than 63 characters are valid within the total limit.
+
+When upgrading from a CRD that checked only total length, audit existing
+ClusterCaches for labels longer than 63 characters. Updating the CRD does not
+remove or repair stored objects. Such objects still reject the whole catalog and
+make keyring reconciliation unready. Names are immutable: delete the invalid
+ClusterCache and create a validly named replacement, updating adapters to its new
+socket paths. The replacement has a new UID/cache identity and cold cache state.
+Complete this cleanup before expecting the controller to become ready.
+
 ## Authentication
 
 Two HTTPS endpoints only:
