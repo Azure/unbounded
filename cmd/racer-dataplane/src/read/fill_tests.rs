@@ -1,4 +1,6 @@
 use super::*;
+#[path = "fill_peer_tests.rs"]
+mod peer_copies;
 use crate::{
     model::{
         identity::{
@@ -45,6 +47,7 @@ struct TestOrigin {
     calls: Cell<usize>,
     metadata: ObjectMetadata,
     reject_once: Cell<bool>,
+    version_unavailable: Cell<bool>,
 }
 impl Origin for TestOrigin {
     fn metadata<'a>(
@@ -90,6 +93,9 @@ impl Origin for TestOrigin {
             .await;
             if self.reject_once.replace(false) {
                 return Err(Error::OriginForbidden);
+            }
+            if self.version_unavailable.get() {
+                return Err(Error::VersionUnavailable);
             }
             let length = self.metadata.immutable().page_length(page)? as usize;
             let mut plaintext = self.buffers.plaintext(reservation, length)?;
@@ -205,6 +211,7 @@ fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fi
         calls: Cell::new(0),
         metadata,
         reject_once: Cell::new(false),
+        version_unavailable: Cell::new(false),
     });
     let (port, engine) = crypto::pair(worker, 0, config.limits.queue_entries);
     let crypto = Rc::new(CryptoClient::new(port));

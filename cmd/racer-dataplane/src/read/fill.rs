@@ -1,6 +1,6 @@
 //! Local disk -> ranked peer -> authorized origin acquisition and publication.
 //!
-//! Reserve progress memory/dirty capacity before download. Decrypt once per fill;
+//! Reserve progress memory/dirty capacity before download. Decrypt each copy once;
 //! encrypt origin data once. Publish only verified whole pages, with original
 //! ciphertext queued asynchronously on candidates. Disk failure may discard dirty
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
@@ -470,10 +470,11 @@ impl Fill {
             mode: FetchMode::Acquire,
         };
         // Keep the accepted ranking to probe later cached copies on an origin 412.
+        let mut plaintext = Some(reservation.plaintext);
         let resolution = self
             .dependencies
             .candidates
-            .resolve_with_budget(
+            .resolve_validated(
                 crate::topology::placement::Candidates {
                     membership: candidates.membership.clone(),
                     ordered: candidates.ordered.clone(),
@@ -482,22 +483,28 @@ impl Fill {
                 operation,
                 scope,
                 budget,
+                |response| {
+                    let reserved = plaintext.take();
+                    Box::pin(
+                        async move { self.decrypt_response(page, response, reserved, scope).await },
+                    )
+                },
             )
             .await?;
         let result = match resolution {
-            CandidateResolution::Copy(response) => {
-                let copy = response_copy(response.response(), page)?;
-                self.decrypt(page, copy, reservation.plaintext, scope)
-                    .await?
-            }
+            CandidateResolution::Copy(result) => result,
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, page.number)?;
                 budget.begin_attempt(std::time::Instant::now(), scope.deadline.0)?;
                 scope.check()?;
+                let plaintext = match plaintext.take() {
+                    Some(reserved) => reserved,
+                    None => self.reserve_bootstrap(&context.object.cache)?,
+                };
                 match self
                     .dependencies
                     .origin
-                    .page_reserved(&authority, context, page, reservation.plaintext, scope)
+                    .page_reserved(&authority, context, page, plaintext, scope)
                     .await
                 {
                     Ok(origin) => {
@@ -530,25 +537,22 @@ impl Fill {
                             page: page.clone(),
                             mode: FetchMode::CopyOnly,
                         };
-                        let response = self
-                            .dependencies
+                        self.dependencies
                             .candidates
-                            .remaining_copy(&candidates, context, &operation, scope, budget)
+                            .remaining_validated_copy(
+                                &candidates,
+                                context,
+                                &operation,
+                                scope,
+                                budget,
+                                |response| {
+                                    Box::pin(self.decrypt_response(page, response, None, scope))
+                                },
+                            )
                             .await?
                             .ok_or_else(|| {
                                 self.dependencies.candidates.origin_miss_error(&authority)
-                            })?;
-                        self.decrypt(
-                            page,
-                            response_copy(response.response(), page)?,
-                            self.dependencies.admission.reserve(
-                                Some(&context.object.cache),
-                                crate::model::limits::ResourceClass::Plaintext,
-                                crate::model::range::PAGE_BYTES as usize,
-                            )?,
-                            scope,
-                        )
-                        .await?
+                            })?
                     }
                     Err(error) => return Err(error),
                 }
@@ -559,6 +563,22 @@ impl Fill {
         self.publish(result.clone(), reservation.dirty, scope)
             .await?;
         Ok(result)
+    }
+
+    async fn decrypt_response(
+        &self,
+        page: &PageId,
+        response: crate::peer::wire::VerifiedResponse,
+        reservation: Option<Reservation>,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        scope.check()?;
+        let copy = response_copy(response.response(), page)?;
+        let reservation = match reservation {
+            Some(reserved) => reserved,
+            None => self.reserve_bootstrap(&page.version.object.cache)?,
+        };
+        self.decrypt(page, copy, reservation, scope).await
     }
 
     async fn decrypt(

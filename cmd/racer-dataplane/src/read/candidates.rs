@@ -38,6 +38,8 @@ pub enum ProbeOutcome {
     Unreachable,
     Overloaded,
     VersionUnavailable,
+    /// An authenticated response carried a copy that could not be used locally.
+    UnusableCopy,
 }
 pub struct CandidatePolicy {
     node: NodeId,
@@ -107,6 +109,22 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, CandidateResolution> {
+        self.resolve_validated(candidates, context, operation, scope, budget, |response| {
+            Box::pin(async move { Ok(response) })
+        })
+    }
+
+    /// Validate a copy before accepting its source. The same ranked loop retains
+    /// predecessor evidence and spent credits across failed content validation.
+    pub(crate) fn resolve_validated<'a, T: 'a>(
+        &'a self,
+        candidates: Candidates,
+        context: &'a OriginContext,
+        operation: PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+    ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
             scope.check()?;
             let (object, page) = operation_identity(&operation);
@@ -151,16 +169,23 @@ impl CandidatePolicy {
                     .await
                 {
                     Ok(response) => {
-                        match classify(response.response(), &operation, rank.is_none())? {
-                            None => return Ok(CandidateResolution::Copy(response)),
-                            Some(outcome) => {
+                        match validated_copy(response, &operation, rank.is_none(), &mut validate)
+                            .await?
+                        {
+                            Ok(copy) => return Ok(CandidateResolution::Copy(copy)),
+                            Err(outcome) => {
                                 saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                                 saw_transient |= matches!(
                                     outcome,
-                                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                                    ProbeOutcome::Unreachable
+                                        | ProbeOutcome::Overloaded
+                                        | ProbeOutcome::UnusableCopy
                                 );
                                 evidence.push(outcome);
-                                if saw_transient {
+                                if matches!(
+                                    outcome,
+                                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                                ) {
                                     budget.note_route_failure();
                                 }
                             }
@@ -207,6 +232,20 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, Option<VerifiedResponse>> {
+        self.remaining_validated_copy(candidates, context, operation, scope, budget, |response| {
+            Box::pin(async move { Ok(response) })
+        })
+    }
+
+    pub(crate) fn remaining_validated_copy<'a, T: 'a>(
+        &'a self,
+        candidates: &'a Candidates,
+        context: &'a OriginContext,
+        operation: &'a PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+    ) -> Operation<'a, Option<T>> {
         Box::pin(async move {
             let rank = candidates
                 .ordered
@@ -228,13 +267,17 @@ impl CandidatePolicy {
                     )
                     .await
                 {
-                    Ok(response) => match classify(response.response(), operation, false)? {
-                        None => return Ok(Some(response)),
-                        Some(ProbeOutcome::Unreachable | ProbeOutcome::Overloaded) => {
-                            transient = true
+                    Ok(response) => {
+                        match validated_copy(response, operation, false, &mut validate).await? {
+                            Ok(copy) => return Ok(Some(copy)),
+                            Err(
+                                ProbeOutcome::Unreachable
+                                | ProbeOutcome::Overloaded
+                                | ProbeOutcome::UnusableCopy,
+                            ) => transient = true,
+                            Err(_) => {}
                         }
-                        Some(_) => {}
-                    },
+                    }
                     Err(Error::Unavailable | Error::Overloaded | Error::Io) => {
                         transient = true;
                         budget.note_route_failure();
@@ -307,7 +350,7 @@ impl CandidatePolicy {
         if authority.predecessor_evidence.iter().any(|outcome| {
             matches!(
                 outcome,
-                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded | ProbeOutcome::UnusableCopy
             )
         }) {
             Error::Unavailable
@@ -317,9 +360,33 @@ impl CandidatePolicy {
     }
 }
 
-pub enum CandidateResolution {
-    Copy(VerifiedResponse),
+pub enum CandidateResolution<T = VerifiedResponse> {
+    Copy(T),
     Origin(OriginAuthority),
+}
+
+async fn validated_copy<'a, T>(
+    response: VerifiedResponse,
+    operation: &PeerOperation,
+    acquire: bool,
+    validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+) -> Result<std::result::Result<T, ProbeOutcome>> {
+    let result = match classify(response.response(), operation, acquire) {
+        Ok(Some(outcome)) => return Ok(Err(outcome)),
+        Ok(None) => validate(response).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(copy) => Ok(Ok(copy)),
+        // Only page content validation is recoverable here. Transport/security
+        // errors never enter this helper, and Unauthorized remains terminal.
+        Err(Error::CorruptRecord | Error::MissingKey)
+            if matches!(operation, PeerOperation::Page { .. }) =>
+        {
+            Ok(Err(ProbeOutcome::UnusableCopy))
+        }
+        Err(error) => Err(error),
+    }
 }
 impl OriginAuthority {
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {

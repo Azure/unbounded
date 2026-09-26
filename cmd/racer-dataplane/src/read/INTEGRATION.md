@@ -59,6 +59,16 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
   ranked candidates can mint origin authority. Predecessor probes are CopyOnly;
   noncandidates request Acquire through peers. Origin 412 plus an unreachable
   permitted copy remains transient Unavailable, not proof of version absence.
+- Page candidate selection accepts a peer copy only after requester-side structural
+  and AEAD validation. CorruptRecord or MissingKey from copy validation advances
+  the existing ranked loop once per source, retaining predecessor evidence and
+  the original attempt/link/deadline allowance. Unauthorized remains terminal.
+  After origin 412, every later CopyOnly source is likewise validated before
+  acceptance. Unusable copies count as transient evidence, never proof that a
+  pinned version is absent. Only validated whole pages are published.
+  Disk CopyOnly remains ciphertext-only: the requester decrypts each attempted
+  copy once rather than adding a redundant decrypt on the serving peer. Local
+  disk acquisition still conditionally invalidates its own bad read token.
 
 ## Completion and memory ownership
 
