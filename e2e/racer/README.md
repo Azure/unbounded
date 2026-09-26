@@ -1,14 +1,21 @@
 # Racer full-stack e2e test
 
 Run from the repository root on a Linux Docker host with Go, Docker, kind,
-kubectl, and make installed:
+kubectl, and make installed. Build the images first, outside the test timeout:
 
 ```sh
-go test -tags=e2e ./e2e/racer -run TestOperatorImagePull -count=1 -v -timeout=45m
+for component in unbounded-operator racer-controller racer-dataplane gantry; do
+  docker build -f "images/$component/Containerfile" --build-arg VERSION=e2e \
+    -t "docker.io/library/$component:e2e" . || break
+done
+
+go test -tags=e2e ./e2e/racer -run TestOperatorImagePull -count=1 -v -timeout=10m
 ```
 
-The test builds the shipped operator, Racer controller, Racer dataplane, and
-Gantry images, then creates an isolated kind cluster with one worker. The host
+The test uses these local images and creates an isolated kind cluster with one
+worker. Setup and pull share a seven-minute deadline, leaving time for diagnostics
+and cleanup within the ten-minute test timeout. Commands have a two-minute
+deadline; workload waits are capped at 90 seconds. The host
 must support Racer's io_uring and direct-I/O requirements. The kind nodes must
 be able to reach HTTP fixtures on the Docker network's IPv4 host gateway.
 
@@ -33,8 +40,8 @@ deployed Rust dataplane, and Gantry's origin adapter.
 
 ## Iteration and diagnostics
 
-- `RACER_E2E_SKIP_BUILD=1` reuses locally built `docker.io/library/*:e2e` images.
-  Rebuild changed components before using it.
+- Rebuild changed components before rerunning the test; it always uses locally
+  built `docker.io/library/*:e2e` images.
 - `RACER_E2E_KEEP_CLUSTER=1` retains the cluster for debugging. Delete it with
   `kind delete cluster --name <name>` before another run on resource-limited hosts.
 - Generated fixtures, kubeconfig, pod/event diagnostics, and port-forward logs

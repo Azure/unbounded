@@ -50,15 +50,15 @@ func TestOperatorImagePull(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "tmp"), 0o755))
 	artifacts, err := os.MkdirTemp(filepath.Join(root, "tmp"), "racer-e2e-")
 	require.NoError(t, err)
-	h := &harness{t: t, root: root, artifacts: artifacts, cluster: fmt.Sprintf("racer-e2e-%d", time.Now().UnixNano())}
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Minute)
+	t.Cleanup(cancel)
+	h := &harness{t: t, ctx: ctx, root: root, artifacts: artifacts, cluster: fmt.Sprintf("racer-e2e-%d", time.Now().UnixNano())}
 	h.kubeconfig = filepath.Join(artifacts, "kubeconfig")
 	t.Logf("artifacts: %s", artifacts)
 
 	images := []string{"unbounded-operator", "racer-controller", "racer-dataplane", "gantry"}
 	for _, component := range images {
-		if os.Getenv("RACER_E2E_SKIP_BUILD") != "1" {
-			h.run("docker", "build", "-f", "images/"+component+"/Containerfile", "--build-arg", "VERSION=e2e", "-t", "docker.io/library/"+component+":e2e", ".")
-		}
+		h.run("docker", "image", "inspect", "docker.io/library/"+component+":e2e")
 	}
 
 	h.write("kind.yaml", "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n")
@@ -66,7 +66,7 @@ func TestOperatorImagePull(t *testing.T) {
 		h.diagnostics()
 
 		if os.Getenv("RACER_E2E_KEEP_CLUSTER") != "1" {
-			h.run("kind", "delete", "cluster", "--name", h.cluster)
+			h.command(context.Background(), "kind", "delete", "cluster", "--name", h.cluster)
 		}
 	})
 	h.run("kind", "create", "cluster", "--name", h.cluster, "--image", "kindest/node:v1.33.1", "--config", filepath.Join(artifacts, "kind.yaml"), "--kubeconfig", h.kubeconfig, "--wait", "120s")
@@ -89,15 +89,15 @@ func TestOperatorImagePull(t *testing.T) {
 		h.apply(string(data))
 	}
 
-	h.kubectl("rollout", "status", "deployment/unbounded-operator", "-n", namespace, "--timeout=180s")
+	h.kubectl("rollout", "status", "deployment/unbounded-operator", "-n", namespace, "--timeout=90s")
 	h.kubectl("wait", "--for=condition=Established", "crd/clustercaches.racer.unbounded-cloud.io", "--timeout=60s")
 	require.Empty(t, strings.TrimSpace(h.kubectl("get", "deployment/racer-controller", "-n", namespace, "--ignore-not-found", "-o", "name")))
 	h.apply("apiVersion: racer.unbounded-cloud.io/v1alpha1\nkind: ClusterCache\nmetadata:\n  name: gantry\n")
 	h.waitResource("deployment/racer-controller")
 	// Only the elected controller leader reports ready.
-	h.kubectl("wait", "deployment/racer-controller", "-n", namespace, "--for=jsonpath={.status.readyReplicas}=1", "--timeout=180s")
+	h.kubectl("wait", "deployment/racer-controller", "-n", namespace, "--for=jsonpath={.status.readyReplicas}=1", "--timeout=90s")
 	h.waitResource("daemonset/racer-dataplane")
-	h.kubectl("rollout", "status", "daemonset/racer-dataplane", "-n", namespace, "--timeout=180s")
+	h.kubectl("rollout", "status", "daemonset/racer-dataplane", "-n", namespace, "--timeout=90s")
 
 	fixture := newImage(t)
 
@@ -120,7 +120,7 @@ func TestOperatorImagePull(t *testing.T) {
 	origin := h.serve(fixture.handler())
 	originURL := "http://" + net.JoinHostPort(gateway, origin)
 	h.apply(fmt.Sprintf(gantryManifest, originURL))
-	h.kubectl("rollout", "status", "daemonset/gantry-racer-e2e", "-n", namespace, "--timeout=180s")
+	h.kubectl("rollout", "status", "daemonset/gantry-racer-e2e", "-n", namespace, "--timeout=90s")
 
 	racerPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "-o", "jsonpath={.items[0].metadata.name}"))
 	racerURL := h.forward(racerPod, "9090", "/readyz")
@@ -174,14 +174,20 @@ func TestOperatorImagePull(t *testing.T) {
 
 type harness struct {
 	t                                    *testing.T
+	ctx                                  context.Context
 	root, artifacts, cluster, kubeconfig string
 	sequence                             int
 }
 
 func (h *harness) run(name string, args ...string) string {
 	h.t.Helper()
+	return h.command(h.ctx, name, args...)
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+func (h *harness) command(parent context.Context, name string, args ...string) string {
+	h.t.Helper()
+
+	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -201,7 +207,7 @@ func (h *harness) run(name string, args ...string) string {
 
 func (h *harness) kubectl(args ...string) string {
 	h.t.Helper()
-	return h.run("kubectl", append([]string{"--kubeconfig", h.kubeconfig}, args...)...)
+	return h.run("kubectl", append([]string{"--kubeconfig", h.kubeconfig, "--request-timeout=10s"}, args...)...)
 }
 
 func (h *harness) write(name, content string) {
@@ -221,7 +227,7 @@ func (h *harness) waitResource(resource string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
 		return strings.TrimSpace(h.kubectl("get", resource, "-n", namespace, "--ignore-not-found", "-o", "name")) != ""
-	}, 3*time.Minute, time.Second, "operator did not create %s", resource)
+	}, time.Minute, time.Second, "operator did not create %s", resource)
 }
 
 func (h *harness) serve(handler http.Handler) string {
@@ -244,7 +250,7 @@ func (h *harness) serve(handler http.Handler) string {
 func (h *harness) forward(pod, port, readyPath string) string {
 	h.t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(h.ctx, time.Minute)
 	defer cancel()
 
 	address, stop, err := forwardHTTP(ctx, func() *exec.Cmd {
@@ -283,7 +289,7 @@ func (h *harness) diagnostics() {
 
 	commands = append(commands, []string{"logs", "-n", namespace, "-l", "app=gantry-racer-e2e", "--all-containers", "--prefix", "--tail=300"})
 	for i, args := range commands {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		data, _ := exec.CommandContext(ctx, "kubectl", append([]string{"--kubeconfig", h.kubeconfig}, args...)...).CombinedOutput()
 
 		cancel()
