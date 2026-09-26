@@ -15,6 +15,7 @@ RACER_DATAPLANE_BIN ?= bin/racer-dataplane
 RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
 RACER_TEST_ARGS ?=
 RACER_DST_FILTER ?= dst
+RACER_CONTENTION_BUILD_JOBS ?= 2
 RACER_NATIVE_RDMA ?= false
 RACER_NATIVE_LIB ?= bin/libracer_rdma.so.1
 RACER_PREFIX ?= /usr/local
@@ -379,6 +380,7 @@ help: ## Show this help
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
 	@echo "  racer-dataplane-test              Run Rust library and binary unit tests (RACER_TEST_ARGS)"
 	@echo "  racer-dataplane-dst               Run DST-filtered Rust tests under 16 GiB/no-swap cgroup limits"
+	@echo "  racer-dataplane-contention        Run metadata contention tests under 16 GiB/no-swap cgroup limits"
 	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
 	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
 	@echo "  image-racer-dataplane-local       Build local image (RACER_NATIVE_RDMA=false|true)"
@@ -580,7 +582,7 @@ racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
-.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
 racer-dataplane-test: ## Run Rust unit tests with all features; pass filters/options via RACER_TEST_ARGS
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features --lib --bins -- $(RACER_TEST_ARGS)
@@ -591,6 +593,13 @@ racer-dataplane-dst: ## Run DST tests with cgroup v2 memory <= 16 GiB and swap d
 	bash hack/scripts/memory-safe-run.sh -- $(RACER_CARGO) test --locked \
 		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
 		--all-features "$(RACER_DST_FILTER)" -- --test-threads=1 $(RACER_TEST_ARGS)
+
+# Keep compilation inside the same fail-closed cgroup gate as the DST runner.
+racer-dataplane-contention: ## Run metadata contention tests with bounded memory and compilation jobs
+	bash hack/scripts/memory-safe-run.sh -- $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--jobs "$(RACER_CONTENTION_BUILD_JOBS)" --all-features --lib contention:: -- \
+		--test-threads=1 --nocapture $(RACER_TEST_ARGS)
 
 racer-dataplane-build: ## Build the locked Rust release binary; optionally enable the RDMA loader
 	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac

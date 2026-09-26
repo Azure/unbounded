@@ -31,6 +31,68 @@ bash hack/scripts/memory-safe-run.sh -- cargo test --locked --manifest-path cmd/
 `bash hack/scripts/memory-safe-run.sh -- make racer-test` also runs the Go server
 checks before the complete Rust suite.
 
+## Metadata contention simulation
+
+Run the internal `cfg(test)` contention module from the repository root:
+
+```sh
+make racer-dataplane-contention
+# List matching tests without executing them (Cargo may still compile):
+make racer-dataplane-contention RACER_TEST_ARGS=--list
+# Select one fully qualified test name from that list:
+make racer-dataplane-contention \
+  RACER_TEST_ARGS='--exact contention::REPLACE_WITH_LISTED_TEST_NAME'
+# Reduce compilation concurrency:
+make racer-dataplane-contention RACER_CONTENTION_BUILD_JOBS=1
+```
+
+This target invokes the same fail-closed cgroup-v2 wrapper as
+`racer-dataplane-dst`, covering both Cargo compilation and all test descendants.
+The wrapper currently has a fixed cap of **16 GiB with zero swap**, not a
+configurable 4 GiB cap. It accepts an already bounded cgroup or creates a systemd
+scope, then reads back the executing process's limits before starting Cargo.
+Linux cgroup v2 and a working user systemd manager (system manager for root), or
+an already bounded delegated cgroup, are required. Missing enforcement stops the
+command; there is no unbounded fallback.
+
+Compilation defaults to two jobs via `RACER_CONTENTION_BUILD_JOBS`. Tests run with
+`--all-features --lib contention:: -- --test-threads=1 --nocapture`, using locked
+dependencies and the existing `RACER_CARGO` and `RACER_CARGO_TARGET_DIR` overrides.
+`RACER_TEST_ARGS` appends normal Rust test-harness arguments. Use `--exact` with a
+fully qualified name to select a single test: extra substring filters are ORed
+with `contention::`, so they do not narrow the module filter. Deterministic seeds
+are fixed in the tests; replay the same test at the same revision. There are no
+contention seed/workload environment controls, and the `RACER_DST_*` controls
+below apply to the separate datapath DST suite.
+
+The contention suite's contract is a primary 2,000-node workload plus generated
+scenario tests. It is an internal test module, not a production feature or a
+standalone simulator binary. The scale model uses real `Admission`/`Reservation`
+accounting with metadata-only page `Arc` ownership. Logical page sizes charge
+quota without allocating page payloads. Queues use bounded FIFO admission and a
+bounded discrete-event simulation. Quotas are **per worker**; increasing the
+worker count also increases aggregate modeled capacity unless the scenario
+explicitly adjusts those quotas.
+
+NIC and disk service use serial bandwidth clocks, readers have modeled drain
+rates, and origin traffic contends for a shared origin bandwidth budget. Placement
+is simplified and deterministic. HTTP is an abstraction here: the scale model
+does not transfer real payloads, run network I/O, or perform cryptography. Small
+production-fidelity tests complement the scale model and **do allocate actual
+pages**. Modeled ticks, logical bytes, and admission pressure do not establish
+hardware bandwidth, CPU throughput, or production latency.
+
+For a report, capture the command, source revision (`git rev-parse HEAD`), selected
+test names, wrapper limit diagnostics, and complete test output. Record scenario
+configuration and fixed seeds from that revision alongside the observed counters:
+completion/failure/cancellation and retry counts, hits/fills/joins, logical
+origin/peer/delivered/disk bytes, event and request peaks, per-worker quota peaks
+and rejections, final quota usage, latency ticks, and replay trace information.
+Label values as simulation results and retain failures as well as successes.
+The commands above are execution examples, not measured results. Require a
+nonzero matching test count: the runner alone does not prove the companion
+scenario and fidelity tests have been integrated.
+
 ## Generated datapath DST
 
 Run both HTTP and connected-native generated-traffic oracles with the normal `dst`
