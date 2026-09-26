@@ -13,6 +13,10 @@ use std::{
 
 pub struct Verbs;
 
+#[cfg(test)]
+#[path = "simulation.rs"]
+pub mod simulation;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Port {
@@ -218,6 +222,10 @@ pub struct DeviceHandle {
 }
 impl DeviceHandle {
     pub(crate) fn numa_node(&self) -> Option<usize> {
+        #[cfg(test)]
+        if simulation::is_api(&self.api) {
+            return simulation::numa_node(self.raw);
+        }
         if self.name.contains('/') || self.name.contains("..") {
             return None;
         }
@@ -241,6 +249,12 @@ impl Drop for DeviceHandle {
 
 impl Verbs {
     pub fn discover(&self) -> Result<Vec<DeviceHandle>> {
+        #[cfg(test)]
+        let api = match simulation::current() {
+            Some(_) => simulation::api(),
+            None => Api::load()?,
+        };
+        #[cfg(not(test))]
         let api = Api::load()?;
         let mut ports = [Port {
             name: [0; 64],
@@ -317,6 +331,10 @@ impl Region {
         }))
     }
     pub(crate) fn address(&self) -> u64 {
+        #[cfg(test)]
+        if simulation::is_api(&self.device.api) {
+            return simulation::address(self.raw);
+        }
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
     }
     pub(crate) fn length(&self) -> usize {
@@ -456,7 +474,13 @@ impl QueuePairHandle {
             return Err(Error::Unavailable);
         };
         let mut psn = [0; 4];
-        if getrandom::getrandom(&mut psn).is_err() {
+        #[cfg(test)]
+        let simulated = simulation::is_api(&device.api);
+        #[cfg(not(test))]
+        let simulated = false;
+        if simulated {
+            psn = qpn.to_be_bytes();
+        } else if getrandom::getrandom(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
                 std::mem::forget(device);
             }

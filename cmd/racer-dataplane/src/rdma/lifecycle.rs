@@ -20,6 +20,10 @@ use std::{
     task::Waker,
 };
 
+/// Test-only native fabric; enter its scope before constructing the crypto service.
+#[cfg(test)]
+pub use super::backend::simulation;
+
 pub(crate) const IDLE: u8 = 0;
 pub(crate) const READY: u8 = 1;
 pub(crate) const OWNED: u8 = 2;
@@ -207,6 +211,8 @@ pub struct NativeService {
     port: NativePort,
     resources: Vec<Option<Resource>>,
     cursor: usize,
+    #[cfg(test)]
+    simulation: Option<simulation::Simulation>,
 }
 impl NativeService {
     pub fn new(port: NativePort) -> Self {
@@ -215,12 +221,16 @@ impl NativeService {
             port,
             resources,
             cursor: 0,
+            #[cfg(test)]
+            simulation: simulation::current(),
         }
     }
     pub fn register_driver(&self, waker: &Waker) {
         self.port.shared.engine.register(waker);
     }
     fn activate(&mut self, config: Configuration) -> Result<Vec<RailMapping>> {
+        #[cfg(test)]
+        let _environment = self.simulation.as_ref().map(simulation::Simulation::enter);
         if self.port.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
         }
