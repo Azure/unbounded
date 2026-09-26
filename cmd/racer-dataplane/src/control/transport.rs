@@ -392,9 +392,7 @@ impl ControlConnection {
             match self.tls.read_tls(&mut self.stream) {
                 Ok(0) => return Err(Error::Io),
                 Ok(_) => {
-                    self.tls
-                        .process_new_packets()
-                        .map_err(|_| Error::Unauthorized)?;
+                    self.tls.process_new_packets().map_err(tls_error)?;
                     progress = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
@@ -575,6 +573,17 @@ impl ControlConnection {
                 Err(_) => return Err(Error::Io),
             }
         }
+    }
+}
+fn tls_error(error: rustls::Error) -> Error {
+    match error {
+        // Go's GetConfigForClient sends internal_error when admission is full or
+        // the issuer lookup is unavailable, before HTTP can return 429/503.
+        // Retry through the existing bounded control backoff, with fresh TLS
+        // authentication on every attempt. Certificate and other TLS failures
+        // remain fatal; an alert never authorizes a connection.
+        rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => Error::Unavailable,
+        _ => Error::Unauthorized,
     }
 }
 enum Framing {
@@ -931,6 +940,33 @@ mod tests {
         assert_eq!(second.status, 200);
         assert_eq!(second.body, b"{}");
         server.join().unwrap();
+    }
+    #[test]
+    fn only_internal_error_alert_is_transient() {
+        assert_eq!(
+            tls_error(rustls::Error::AlertReceived(
+                rustls::AlertDescription::InternalError
+            )),
+            Error::Unavailable
+        );
+        for alert in [
+            rustls::AlertDescription::AccessDenied,
+            rustls::AlertDescription::BadCertificate,
+            rustls::AlertDescription::CertificateExpired,
+            rustls::AlertDescription::UnknownCA,
+            rustls::AlertDescription::HandshakeFailure,
+        ] {
+            assert_eq!(
+                tls_error(rustls::Error::AlertReceived(alert)),
+                Error::Unauthorized
+            );
+        }
+        assert_eq!(
+            tls_error(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            )),
+            Error::Unauthorized
+        );
     }
     #[test]
     fn rejects_ambiguous_framing_and_insecure_urls() {

@@ -85,6 +85,12 @@ transport errors/429/503 with jitter, exponentially from 1 to 30 seconds; honor
 `Retry-After`. Other errors require corrected input/credentials. Normal 204 polls
 may immediately repeat. Keep tokens and key material out of diagnostics.
 
+The controller can reject TLS admission before HTTP with an `internal_error`
+alert when its bootstrap slots or issuer lookup are unavailable. Treat that alert
+as a transient transport failure using the same bounded attempts and backoff.
+Every retry performs normal TLS verification; certificate validation failures,
+authentication alerts, and HTTP 401/403 remain fatal credential failures.
+
 ## Publication lifecycle
 
 A publication contains cluster ID, schema version, sequence, membership version,

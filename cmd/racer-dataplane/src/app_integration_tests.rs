@@ -426,6 +426,9 @@ fn two_worker_real_control_retirement_and_checkpoint_cut() {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_bootstrap_failures(Vec::new())
+    }
+    fn with_bootstrap_failures(failures: Vec<BootstrapFailure>) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -520,8 +523,9 @@ impl Fixture {
         let polls = Arc::new(AtomicUsize::new(0));
         let polled = polls.clone();
         let server = thread::spawn(move || {
+            let mut failures = failures.into_iter();
             while !stopping.load(Ordering::Acquire) {
-                let (socket, _) = match listener.accept() {
+                let (mut socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -535,6 +539,21 @@ impl Fixture {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                let failure = failures.next();
+                if let Some(BootstrapFailure::Alert(alert)) = failure {
+                    // Consume the ClientHello before sending the same fatal TLS
+                    // alert record Go emits on GetConfigForClient failure.
+                    let mut header = [0; 5];
+                    socket.read_exact(&mut header).unwrap();
+                    assert_eq!(header[0], 22);
+                    let mut hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+                    socket.read_exact(&mut hello).unwrap();
+                    socket.write_all(&[21, 3, 3, 0, 2, 2, alert]).unwrap();
+                    continue;
+                }
+                if matches!(failure, Some(BootstrapFailure::Disconnect)) {
+                    continue;
+                }
                 let mut stream = rustls::StreamOwned::new(
                     rustls::ServerConnection::new(tls.clone()).unwrap(),
                     socket,
@@ -565,6 +584,13 @@ impl Fixture {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
+                if let Some(BootstrapFailure::Http(status, code)) = failure {
+                    assert!(head.starts_with("POST "));
+                    let body = format!(r#"{{"code":"{code}"}}"#);
+                    write!(stream, "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                    continue;
+                }
                 let (status, body) = if head.starts_with("POST ") {
                     assert!(head.contains("Authorization: Bearer fixture.token"));
                     assert!(stream.conn.peer_certificates().is_none());
@@ -626,6 +652,106 @@ impl Fixture {
             polls,
         }
     }
+}
+enum BootstrapFailure {
+    Alert(u8),
+    Disconnect,
+    Http(u16, &'static str),
+}
+
+#[test]
+fn bootstrap_recovers_from_tls_overload_disconnect_and_http_overload_with_backoff() {
+    let mut fixture = Fixture::with_bootstrap_failures(vec![
+        BootstrapFailure::Alert(80), // internal_error, as sent by Go on admission overload
+        BootstrapFailure::Disconnect,
+        BootstrapFailure::Http(429, "overloaded"),
+    ]);
+    let config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let before = Instant::now();
+    let identity = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(identity, config.node);
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
+    assert!(
+        before.elapsed() >= Duration::from_secs(3),
+        "retries must back off"
+    );
+    assert!(config.identity_directory.join("identity.json").is_file());
+}
+
+#[test]
+fn bootstrap_tls_overload_retry_respects_startup_deadline() {
+    let mut fixture = Fixture::with_bootstrap_failures(vec![BootstrapFailure::Alert(80)]);
+    let config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    assert_eq!(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_millis(500)).unwrap(),
+        ),
+        Err(Error::DeadlineExceeded)
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 0);
+    assert!(!config.identity_directory.join("identity.json").exists());
+}
+
+#[test]
+fn bootstrap_rejects_tls_and_http_authentication_failures_without_retry() {
+    for failure in [
+        BootstrapFailure::Alert(49), // access_denied
+        BootstrapFailure::Http(401, "unauthenticated"),
+        BootstrapFailure::Http(403, "forbidden"),
+    ] {
+        // A retry would reach the healthy server and incorrectly succeed.
+        let mut fixture = Fixture::with_bootstrap_failures(vec![failure]);
+        let config = fixture.config.take().unwrap();
+        let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+        assert_eq!(
+            bootstrap(
+                &config,
+                &node,
+                &config.limits,
+                &scope(Duration::from_secs(10)).unwrap(),
+            ),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(fixture.enrollments.load(Ordering::Acquire), 0);
+        assert!(!config.identity_directory.join("identity.json").exists());
+    }
+}
+
+#[test]
+fn bootstrap_rejects_untrusted_server_certificate() {
+    let mut fixture = Fixture::new();
+    let config = fixture.config.take().unwrap();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    std::fs::write(
+        &config.trust_bundle,
+        params.self_signed(&key).unwrap().pem(),
+    )
+    .unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    assert_eq!(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(5)).unwrap(),
+        ),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 0);
+    assert!(!config.identity_directory.join("identity.json").exists());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
