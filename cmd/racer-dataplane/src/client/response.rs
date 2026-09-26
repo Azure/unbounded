@@ -184,6 +184,9 @@ fn error_head(error: Error) -> Result<MessageHead> {
         | Error::IncompatibleMembership
         | Error::HopBudgetExhausted
         | Error::MissingKey
+        // Clock rollback or peer restart can reject an otherwise valid attempt's
+        // freshness. It is unavailable to this client, not an internal failure.
+        | Error::Replay
         | Error::Io => 503,
         // A bare unsatisfiable error has lost required version metadata. Never
         // invent a total length to make a syntactically valid but false 416.
@@ -314,6 +317,7 @@ mod tests {
             (Error::BadGateway, 502),
             (Error::Unavailable, 503),
             (Error::DeadlineExceeded, 503),
+            (Error::Replay, 503),
         ] {
             let head = error_head(error).unwrap();
             assert!(
