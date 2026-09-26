@@ -834,9 +834,42 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
 
 #[test]
 fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
+    let raw = raw_uds_acquisition_failure(true);
+    let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
+    let head = std::str::from_utf8(&raw[..end])
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 206 "));
+    assert!(head.contains("content-length: 50331661\r\n"));
+    assert!(head.contains("content-range: bytes 0-50331660/50331661\r\n"));
+    // The first authenticated page escaped, then page one's real acquisition
+    // failed. The exact partial body also rules out an appended error response.
+    assert_eq!(raw.len() - end, P as usize);
+    assert!(raw[end..].iter().all(|byte| *byte == b'x'));
+    assert_eq!(
+        raw.windows(8).filter(|part| *part == b"HTTP/1.1").count(),
+        1
+    );
+}
+
+#[test]
+fn raw_uds_first_rust_acquisition_failure_returns_complete_503() {
+    let raw = raw_uds_acquisition_failure(false);
+    let text = String::from_utf8(raw).unwrap().to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 503 "));
+    assert!(text.contains("content-length: 0\r\n"));
+    assert!(!text.contains("content-range:"));
+    assert_eq!(text.matches("http/1.1").count(), 1);
+    assert_eq!(text.find("\r\n\r\n").unwrap() + 4, text.len());
+}
+
+fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
     use racer_dataplane::{
-        model::identity::{MembershipVersion, WorkerId},
-        read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
+        model::{
+            identity::{MembershipVersion, WorkerId},
+            limits::ResourceClass,
+        },
+        read::{dispatch::WorkerDirectory, flight::AcquisitionBudget, range_stream::RangeStreams},
         runtime::worker::WorkerMap,
         topology::membership::Membership,
     };
@@ -851,20 +884,23 @@ fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
     rig.drive(async {
         let scope = scope();
         let received = rig.io.receive_head(rig.lease(local), &scope).await.unwrap();
+        // Page AEAD uses a canonical cache UUID. Keep the same object key and pin
+        // as the raw request, with the cache supplied by its accepted endpoint.
+        let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
         let parsed = RequestParser::new(LIMIT)
-            .parse(&object().cache, received.value)
+            .parse(&cache, received.value)
             .unwrap();
         let metadata = ObjectMetadata {
             version: ObjectVersion {
-                object: object(),
+                object: parsed.origin.object.clone(),
                 etag: StrongEtag::parse(b"\"v\"").unwrap(),
             },
             length: 3 * P + 13,
             expires_at: ExpiresAt(UNIX_EPOCH),
         };
         let range = ByteRange::From(0).resolve(metadata.length).unwrap();
-        // Deliberately absent owner produces a real acquisition error after the
-        // success head. No mock response writer or manufactured second status.
+        // An absent owner fails the first unseeded acquisition. With a seed this
+        // happens after page zero is delivered, otherwise before success headers.
         let directory = Arc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
@@ -878,16 +914,19 @@ fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
             Duration::from_secs(5),
         ));
         let streams = RangeStreams::from_directory(directory, delivery, 1);
+        let seed = seed_first.then(|| authenticated_first_page(&rig, metadata.clone(), &scope));
         let stream = streams
-            .open(
+            .open_with_budget(
                 metadata.clone(),
                 range,
                 parsed.origin,
                 Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
                 scope.clone(),
+                AcquisitionBudget::new(scope.deadline.0, 8, 16),
+                seed,
             )
             .unwrap();
-        assert_eq!(stream.buffered_pages(), 0);
+        assert_eq!(stream.buffered_pages(), usize::from(seed_first));
         let response = ReadResponse {
             metadata,
             range: Some(range),
@@ -895,19 +934,109 @@ fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
         };
         let responses = rig.responses();
         responses.validate(&parsed.kind, &response).unwrap();
-        assert!(
-            responses
-                .send(received.connection, response, &scope)
-                .await
-                .is_err()
-        );
+        let sent = responses.send(received.connection, response, &scope).await;
+        if seed_first {
+            assert!(matches!(sent, Err(Error::Unavailable)));
+        } else {
+            let connection = sent.unwrap();
+            assert!(!connection.is_reusable());
+            drop(connection);
+        }
     });
     let raw = reader.join().unwrap();
-    let text = String::from_utf8(raw).unwrap().to_ascii_lowercase();
-    assert!(text.starts_with("http/1.1 206 "));
-    assert!(text.contains("content-length: 50331661\r\n"));
-    assert_eq!(text.matches("http/1.1").count(), 1);
-    assert_eq!(text.find("\r\n\r\n").unwrap() + 4, text.len());
+    assert_eq!(rig.reactor.in_flight(), 0);
+    for class in [
+        ResourceClass::Plaintext,
+        ResourceClass::Ciphertext,
+        ResourceClass::Pipe,
+        ResourceClass::Connection,
+    ] {
+        assert_eq!(rig.admission.used(class), 0, "{class:?}");
+    }
+    raw
+}
+
+fn authenticated_first_page(
+    rig: &Rig,
+    metadata: ObjectMetadata,
+    scope: &RequestScope,
+) -> racer_dataplane::memory::page::PageResult {
+    use base64::Engine;
+    use racer_dataplane::{
+        control::wire,
+        memory::{page::PageResult, pool::BufferPool},
+        model::{
+            identity::{NodeId, WorkerId},
+            limits::ResourceClass,
+        },
+        runtime::{
+            crypto::{CryptoClient, pair},
+            worker::{CryptoRuntime, CryptoService},
+        },
+        security::{
+            aead::{PageCrypto, PageCryptoEngine},
+            keyring::{KeyEpochs, Keyring},
+        },
+    };
+    use std::sync::Arc;
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../src/control/testdata/bundle.json")).unwrap();
+    // The wire fixture reuses key material across purposes; the real keyring
+    // requires distinct material. These deterministic keys are only test data.
+    for (index, key) in bundle["cache_keys"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        key["material"] = base64::engine::general_purpose::STANDARD
+            .encode([index as u8 + 7; 32])
+            .into();
+    }
+    let bundle = wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap();
+    let keys = Rc::new(Keyring::new(
+        bundle.cluster.clone(),
+        NodeId("22222222-2222-4222-8222-222222222222".into()),
+        Arc::new(KeyEpochs::default()),
+    ));
+    keys.install(bundle).unwrap();
+    let (io, port) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+    let client = Rc::new(CryptoClient::new(io));
+    let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+    let crypto = PageCrypto::new(keys, client.clone());
+    let cache = &metadata.version.object.cache;
+    let mut staging = BufferPool::new(rig.admission.clone())
+        .plaintext(
+            rig.admission
+                .reserve(Some(cache), ResourceClass::Plaintext, P as usize)
+                .unwrap(),
+            P as usize,
+        )
+        .unwrap();
+    staging.bytes_mut().unwrap().fill(b'x');
+    let mut encrypt = crypto.encrypt(
+        PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        },
+        staging,
+        rig.admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, P as usize + 16)
+            .unwrap(),
+        scope,
+    );
+    let (plaintext, ciphertext) = rig
+        .drive(std::future::poll_fn(|cx| {
+            engine.poll_budgeted(1).unwrap();
+            client.poll_budgeted(1).unwrap();
+            encrypt.as_mut().poll(cx)
+        }))
+        .unwrap();
+    PageResult {
+        metadata,
+        plaintext,
+        ciphertext,
+    }
 }
 
 #[test]
