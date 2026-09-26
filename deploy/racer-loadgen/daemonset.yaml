@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-loadgen
+  labels:
+    app.kubernetes.io/name: racer-loadgen
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: racer-loadgen
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: racer-loadgen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: racer-loadgen
+          image: racer-loadgen:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=:8080
+            - --metrics-listen=:9090
+            - --target=http://racer-loadgen-gantry:5000
+            - --namespace=loadgen.invalid
+            - --repository=benchmark/image
+            - --layers=8
+            - --layer-bytes=67108864
+            - --jitter=0.2
+            - --seed=benchmark-v1
+            - --concurrency=64
+            - --layer-concurrency=4
+            - --pull-timeout=2m
+            - --retry-delay=1s
+            - --interval=0s
+            - --verify=true
+            - --start-delay=10s
+          ports:
+            - name: origin
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
