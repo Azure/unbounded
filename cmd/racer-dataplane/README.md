@@ -47,15 +47,19 @@ RACER_DST_SEEDS=1,7,42 \
   RACER_DST_FILTER=dst_generated_native RACER_TEST_ARGS=--nocapture
 ```
 
-`src/app_dst_tests.rs` defaults to seeds `1,7,42` and 41 generated actions per
-seed. `RACER_DST_STEPS` accepts 1 through 512; the seed list accepts at most 1024
-unsigned decimal 64-bit values. Failures print seed, action index, cluster size,
-and observed coverage. Replaying requires the same source revision: the seeded
-scheduler consumes random choices as the production graph progresses.
+`src/app_dst_tests.rs` defaults to seeds `1,7,42` and one full weighted action cycle
+per seed (currently 41 actions). `RACER_DST_STEPS` accepts 1 through 512; the seed
+list accepts at most 1024 unsigned decimal 64-bit values. Failures print seed,
+action index, action name, cluster size, and observed coverage. Replaying requires
+the same source revision: the seeded scheduler consumes random choices as the
+production graph progresses.
 Unknown `RACER_DST_*` parameters fail immediately. The supported parameters are
 `RACER_DST_SEEDS`, `RACER_DST_STEPS`, and the Makefile's `RACER_DST_FILTER`.
-The generator samples without replacement from a weighted bag of legal actions,
-refilling after each 41-action cycle. Order, node/worker counts, victims, ranges,
+The generator samples without replacement from `WEIGHTED_ACTIONS`, a list of named
+enum actions whose repeated entries supply their weights. Its length determines
+the refill cycle, default step count, and full-cycle coverage threshold. Four slots
+select ordinary traffic; actions gated by node count or native mode also fall back
+to ordinary traffic without resampling. Order, node/worker counts, victims, ranges,
 fault subtypes, and polling quanta are seeded; there are no scenario scripts.
 Runs shorter than a full cycle are useful for failure minimization but omit the
 full-cycle coverage assertions. A custom corpus can fail its coverage obligations

@@ -19,6 +19,83 @@ use std::{cell::RefCell, collections::BTreeMap};
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
+
+#[derive(Clone, Copy, Debug)]
+enum Action {
+    AddNode,
+    RemoveNode,
+    Update,
+    Evict,
+    Restart,
+    ShortIo,
+    ConnectFailure,
+    DelayedWrite,
+    ClientCancel,
+    PeerOutage,
+    InflightCrash,
+    OldPin,
+    FailedDirtyWrite,
+    InflightMembership,
+    Traffic,
+    Partition,
+    WallJump,
+    OriginFault,
+    MalformedClient,
+    KeyRetirement,
+    CacheRecreate,
+    NativeFault,
+    PeerSecurity,
+    DiskCorruption,
+    PendingWriteCrash,
+}
+
+// Repeated entries are weights. Keep the original bag order so swap_remove and
+// seeded selection preserve the action schedule and random draws.
+const WEIGHTED_ACTIONS: &[Action] = &[
+    Action::AddNode,
+    Action::RemoveNode,
+    Action::Update,
+    Action::Evict,
+    Action::Restart,
+    Action::ShortIo,
+    Action::ConnectFailure,
+    Action::DelayedWrite,
+    Action::ClientCancel,
+    Action::PeerOutage,
+    Action::InflightCrash,
+    Action::OldPin,
+    Action::FailedDirtyWrite,
+    Action::InflightMembership,
+    // Former IDs 14-17 all selected ordinary traffic.
+    Action::Traffic,
+    Action::Traffic,
+    Action::Traffic,
+    Action::Traffic,
+    Action::Partition,
+    Action::WallJump,
+    Action::OriginFault,
+    Action::MalformedClient,
+    Action::KeyRetirement,
+    Action::CacheRecreate,
+    Action::NativeFault,
+    Action::PeerSecurity,
+    Action::DiskCorruption,
+    Action::PendingWriteCrash,
+    Action::OriginFault,
+    Action::OriginFault,
+    Action::OriginFault,
+    Action::OriginFault,
+    Action::PeerSecurity,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+    Action::NativeFault,
+];
+
 const CLASSES: [ResourceClass; 11] = [
     ResourceClass::Plaintext,
     ResourceClass::Ciphertext,
@@ -1771,34 +1848,31 @@ impl Harness {
         let mut actions = Vec::new();
         for step in 0..steps {
             if actions.is_empty() {
-                actions.extend(0..28);
-                actions.extend([20; 4]);
-                actions.push(25);
-                actions.extend([24; 8]);
+                actions.extend_from_slice(WEIGHTED_ACTIONS);
             }
             let selected = self.rng.pick(actions.len());
             let action = actions.swap_remove(selected);
             self.coverage.trace.record(format!(
-                "step:{step}:{action}:{}:{}",
+                "step:{step}:{action:?}:{}:{}",
                 self.nodes.len(),
                 self.rng.0
             ));
             eprintln!(
-                "dst seed={} step={step} action={action} nodes={}",
+                "dst seed={} step={step} action={action:?} nodes={}",
                 self.seed,
                 self.nodes.len()
             );
             match action {
-                0 if self.nodes.len() < MAX_NODES => self.add(None),
-                1 if self.nodes.len() > 1 => {
+                Action::AddNode if self.nodes.len() < MAX_NODES => self.add(None),
+                Action::RemoveNode if self.nodes.len() > 1 => {
                     let index = self.rng.pick(self.nodes.len());
                     self.remove(index);
                 }
-                2 => {
+                Action::Update => {
                     let object = self.rng.pick(8);
                     self.update(object);
                 }
-                3 => {
+                Action::Evict => {
                     self.settle();
                     for worker in self.nodes.iter().flat_map(|n| &n.workers) {
                         worker.app.memory.evict_idle(usize::MAX).unwrap();
@@ -1806,12 +1880,12 @@ impl Harness {
                     self.coverage.action("evict");
                     self.traffic(1, false);
                 }
-                4 => {
+                Action::Restart => {
                     let index = self.rng.pick(self.nodes.len());
                     let id = self.remove(index);
                     self.add(Some(id));
                 }
-                5 => {
+                Action::ShortIo => {
                     let operation = if self.rng.pick(2) == 0 {
                         "send"
                     } else {
@@ -1823,7 +1897,7 @@ impl Harness {
                     self.coverage.action("short-io");
                     self.traffic(1, false);
                 }
-                6 => {
+                Action::ConnectFailure => {
                     self.sim.inject("connect", Fault::Errno(libc::ECONNREFUSED));
                     *self.coverage.injected.entry("connect".into()).or_default() += 1;
                     // A fresh unpinned object requires an origin connection even
@@ -1833,7 +1907,7 @@ impl Harness {
                     self.exchange(client, true);
                     self.coverage.action("connect-failure");
                 }
-                7 => {
+                Action::DelayedWrite => {
                     self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
                     *self.coverage.injected.entry("write".into()).or_default() += 1;
                     self.update(3);
@@ -1841,7 +1915,7 @@ impl Harness {
                     self.exchange(client, false);
                     self.coverage.action("delayed-write");
                 }
-                8 => {
+                Action::ClientCancel => {
                     let mut client = self.request(1, false, false);
                     for _ in 0..1 + self.rng.pick(32) {
                         self.tick();
@@ -1854,11 +1928,11 @@ impl Harness {
                     self.settle();
                     self.coverage.action("client-cancel");
                 }
-                9 => self.peer_outage(),
-                10 => {
+                Action::PeerOutage => self.peer_outage(),
+                Action::InflightCrash => {
                     self.crash_inflight();
                 }
-                11 => {
+                Action::OldPin => {
                     // Warm the ingress before mutation. This old pin is provably
                     // retained, so unavailability cannot excuse a failed read.
                     let object = 2 + self.rng.pick(6);
@@ -1870,7 +1944,7 @@ impl Harness {
                     self.exchange(client, false);
                     self.coverage.action("old-pin");
                 }
-                12 => {
+                Action::FailedDirtyWrite => {
                     self.sim.inject("write", Fault::Errno(libc::EIO));
                     *self.coverage.injected.entry("write".into()).or_default() += 1;
                     self.update(4);
@@ -1878,7 +1952,7 @@ impl Harness {
                     self.exchange(client, false);
                     self.coverage.action("failed-dirty-write");
                 }
-                13 if self.nodes.len() < MAX_NODES => {
+                Action::InflightMembership if self.nodes.len() < MAX_NODES => {
                     let mut client = self.request(1, false, false);
                     self.tick();
                     let complete = client.poll();
@@ -1892,8 +1966,8 @@ impl Harness {
                     }
                     self.coverage.action("inflight-membership");
                 }
-                18 if self.nodes.len() > 1 => self.partition_traffic(),
-                19 => {
+                Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
+                Action::WallJump => {
                     let wall = crate::runtime::environment::wall_now();
                     let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
                     self.clock.set_wall_time(if self.rng.pick(2) == 0 {
@@ -1911,15 +1985,23 @@ impl Harness {
                     );
                     self.coverage.action("wall-jump");
                 }
-                20 => self.origin_fault(),
-                21 => self.malformed_client(),
-                22 => self.key_retirement(),
-                23 => self.cache_recreate(),
-                24 if self.native => self.native_fault(),
-                25 if self.nodes.len() > 1 => self.peer_security(),
-                26 => self.disk_corruption(),
-                27 => self.crash_pending_write(),
-                _ => {
+                Action::OriginFault => self.origin_fault(),
+                Action::MalformedClient => self.malformed_client(),
+                Action::KeyRetirement => self.key_retirement(),
+                Action::CacheRecreate => self.cache_recreate(),
+                Action::NativeFault if self.native => self.native_fault(),
+                Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(),
+                Action::DiskCorruption => self.disk_corruption(),
+                Action::PendingWriteCrash => self.crash_pending_write(),
+                // Gated actions keep their slot and use ordinary traffic instead
+                // of resampling, preserving both weights and random draws.
+                Action::Traffic
+                | Action::AddNode
+                | Action::RemoveNode
+                | Action::InflightMembership
+                | Action::Partition
+                | Action::NativeFault
+                | Action::PeerSecurity => {
                     let count = 1 + self.rng.pick(4);
                     self.coverage.action("traffic");
                     self.traffic(count, false);
@@ -1960,7 +2042,7 @@ impl Harness {
             "no actual peer exchange"
         );
         self.cache_obligations();
-        if steps >= 41 {
+        if steps >= WEIGHTED_ACTIONS.len() {
             for action in [
                 "multi-worker",
                 "key-retirement",
@@ -2140,7 +2222,7 @@ fn run_corpus(native: bool) {
         .map(|s| s.trim().parse().expect("comma-separated u64 DST seeds"))
         .collect();
     assert!(!seeds.is_empty() && seeds.len() <= 1024);
-    let steps = setting("RACER_DST_STEPS", 41, 512);
+    let steps = setting("RACER_DST_STEPS", WEIGHTED_ACTIONS.len(), 512);
     let mut relay_turns = 0;
     let mut partition_sends = 0;
     let mut corrupted_reads = 0;
@@ -2166,7 +2248,7 @@ fn run_corpus(native: bool) {
         partition_sends += first.operations.get("blocked:send").copied().unwrap_or(0);
         corrupted_reads += first.actions.get("disk-corruption").copied().unwrap_or(0);
     }
-    if steps >= 41 {
+    if steps >= WEIGHTED_ACTIONS.len() {
         assert!(relay_turns > 0, "corpus never exercised an actual relay");
         assert!(
             partition_sends > 0,
