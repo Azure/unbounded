@@ -206,6 +206,25 @@ fn build_node(
     data: Rc<Data>,
     concurrency: usize,
 ) -> Node {
+    build_node_with_peer_limit(
+        i,
+        membership,
+        signer,
+        discovery,
+        data,
+        concurrency,
+        concurrency + 1,
+    )
+}
+fn build_node_with_peer_limit(
+    i: usize,
+    membership: Arc<Membership>,
+    signer: Rc<Signatures>,
+    discovery: &Discovery,
+    data: Rc<Data>,
+    concurrency: usize,
+    peer_limit: usize,
+) -> Node {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.ciphertext_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
     limits.plaintext_bytes = NonZeroUsize::new((concurrency + 3) * P).unwrap();
@@ -221,7 +240,7 @@ fn build_node(
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!(
-            "fill-fleet-{}-{concurrency}-{i}",
+            "fill-fleet-{}-{concurrency}-{peer_limit}-{i}",
             std::process::id()
         ));
     let slabs = Rc::new(Slabs::new(
@@ -253,7 +272,7 @@ fn build_node(
     let pool = Rc::new(HttpPool::new(
         reactor.clone(),
         admission.clone(),
-        concurrency + 1,
+        peer_limit,
     ));
     let codec = Rc::new(codec(&admission));
     let transfers = Rc::new(

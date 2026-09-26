@@ -165,6 +165,21 @@ fn full_image_through_relay_sends_admitted_ciphertext() {
 }
 
 fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurrency: usize) {
+    full_image_with_peer_limit(receive_pressure, send_pressure, concurrency, concurrency);
+}
+
+#[test]
+#[ignore = "full eight-layer TCP integrity regression: run with --release"]
+fn full_image_through_relay_waits_for_busy_neighbor() {
+    full_image_with_peer_limit(false, false, 4, 2);
+}
+
+fn full_image_with_peer_limit(
+    receive_pressure: bool,
+    send_pressure: bool,
+    concurrency: usize,
+    relay_limit: usize,
+) {
     const LAYERS: usize = 8;
     let (signers, discovery) = identities_with_replay_capacity(4096);
     for signer in &signers {
@@ -236,7 +251,7 @@ fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurr
             Rc::new(HttpPool::new(
                 reactors[i].clone(),
                 admissions[i].clone(),
-                concurrency,
+                if i == 1 { relay_limit } else { concurrency },
             ))
         })
         .collect();
@@ -377,6 +392,9 @@ fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurr
                 break;
             }
             scope.check().unwrap();
+            for pool in &pools {
+                pool.poll_peer_waiters();
+            }
             for r in &reactors {
                 r.poll_budgeted(256).unwrap();
             }
@@ -416,7 +434,7 @@ fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurr
             let listener = Rc::new(OwnedFd::from(listeners[i + 1].try_clone().unwrap()));
             active.push(async move {
                 let mut connections = FuturesUnordered::new();
-                for _ in 0..concurrency {
+                for _ in 0..if i == 1 { relay_limit } else { concurrency } {
                     let fd = reactor.accept(listener.clone(), scope).await?;
                     let mut connection = ConnectionLease::from_accepted(fd, admission)?;
                     connections.push(async move {
@@ -585,6 +603,12 @@ fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurr
         layers.served.get(),
         LAYERS * 5 + if send_pressure { 2 * concurrency } else { 0 }
     );
+    if relay_limit < concurrency {
+        assert!(
+            pools[1].peer_waits.get() > 0,
+            "exercise relay neighbor admission"
+        );
+    }
     for pool in &pools {
         pool.close();
     }

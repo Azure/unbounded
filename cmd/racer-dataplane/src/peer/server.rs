@@ -45,6 +45,11 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    pub fn poll_admission_deadlines(&self) {
+        if let Some(transfers) = &self.transfers {
+            transfers.http.poll_peer_waiters();
+        }
+    }
     /// Accept bounded neighbor HTTP connections on the owning reactor. The shared
     /// codec frames input before signatures are verified and operations decoded.
     pub fn listen<'a>(

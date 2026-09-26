@@ -195,7 +195,7 @@ impl Transfers {
             };
             p::push(&mut head, "content-length", 0);
             p::push_binary(&mut head, "racer-probe", &probe);
-            let connection = self.http.checkout(&endpoint, scope).await?;
+            let connection = self.http.checkout_peer(&endpoint, scope).await?;
             let response = self.io.exchange_head(connection, head, scope).await?;
             if !matches!(response.value.start, StartLine::Response { status: 200 }) {
                 return Err(Error::Unauthorized);
@@ -306,7 +306,7 @@ impl Transfers {
                 hops: Vec::new(),
             };
             let head = WireCodec::encode(&envelope, false, 0)?;
-            let connection = self.http.checkout(&endpoint, scope).await?;
+            let connection = self.http.checkout_peer(&endpoint, scope).await?;
             let sent = self.io.send_head(connection, head, scope).await?;
             let received = self.io.receive_head(sent.connection, scope).await?;
             let (response, length) = WireCodec::decode(received.value, true)?;
@@ -375,7 +375,7 @@ impl Transfers {
             if let Some((_, accept, _)) = &native {
                 super::native::attach(&mut head, accept)?;
             }
-            let connection = self.http.checkout(&endpoint, scope).await?;
+            let connection = self.http.checkout_peer(&endpoint, scope).await?;
             let sent = self.io.send_head(connection, head, scope).await?;
             let mut received = self.io.receive_head(sent.connection, scope).await?;
             let control = super::native::detach(&mut received.value)?;

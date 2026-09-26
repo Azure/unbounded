@@ -19,10 +19,18 @@ impl Drop for Process {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_uses_fill_receive_capacity() {
+    sdk_fixture(false);
+}
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_sliding_range_waits_for_busy_peer_slots() {
+    sdk_fixture(true);
+}
+fn sdk_fixture(busy_peers: bool) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(format!("stream-sdk-{}", std::process::id()));
+        .join(format!("stream-sdk-{}-{busy_peers}", std::process::id()));
     fs::create_dir_all(&output).unwrap();
     let overlay = output.join("overlay.json");
     fs::write(&overlay,serde_json::to_vec(&serde_json::json!({"Replace":{root.join("pkg/racersdk/production_stream_fixture_test.go").to_str().unwrap():root.join("cmd/racer-dataplane/tests/conformance/production_stream_fixture_test.go.txt")}})).unwrap()).unwrap();
@@ -42,11 +50,11 @@ fn sdk_sliding_range_uses_fill_receive_capacity() {
         .unwrap();
     assert!(status.success(), "SDK fixture build: {status}");
     for warm in [true, false] {
-        run(warm, &binary);
+        run(warm, &binary, busy_peers);
     }
     fs::remove_dir_all(output).unwrap();
 }
-fn run(warm: bool, binary: &std::path::Path) {
+fn run(warm: bool, binary: &std::path::Path, busy_peers: bool) {
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
     for signer in &signers {
@@ -167,13 +175,20 @@ fn run(warm: bool, binary: &std::path::Path) {
     // Four two-page windows must make progress without an eighth full-page charge.
     let nodes: Vec<_> = (0..4)
         .map(|i| {
-            build_node(
+            build_node_with_peer_limit(
                 i,
                 membership.clone(),
                 signers[i].clone(),
                 &discovery[i],
                 data.clone(),
                 if i == 0 { 6 } else { 63 },
+                if busy_peers {
+                    2
+                } else if i == 0 {
+                    7
+                } else {
+                    64
+                },
             )
         })
         .collect();
@@ -199,6 +214,7 @@ fn run(warm: bool, binary: &std::path::Path) {
             }
             scope.check().unwrap();
             for (node, endpoint) in nodes.iter().zip(&mut endpoints) {
+                node.pool.poll_peer_waiters();
                 node.reactor.poll_budgeted(256).unwrap();
                 node.engine.borrow_mut().poll_budgeted(64).unwrap();
                 node.crypto.poll_budgeted(64).unwrap();
@@ -356,6 +372,16 @@ fn run(warm: bool, binary: &std::path::Path) {
         node.writer.discard_unsubmitted();
         node.memory.evict_idle(usize::MAX).unwrap();
     }
+    if busy_peers {
+        assert!(
+            nodes
+                .iter()
+                .map(|node| node.pool.peer_waits.get())
+                .sum::<usize>()
+                > 0,
+            "exercise busy peer admission"
+        );
+    }
     drive(Box::pin(async {
         for node in &nodes {
             node.reactor.drain().await.unwrap();
@@ -375,7 +401,7 @@ fn run(warm: bool, binary: &std::path::Path) {
         }
     }
     eprintln!(
-        "full SDK image: manifest, config, eight layers / 542950400 layer bytes; warm={warm}"
+        "full SDK image: manifest, config, eight layers / 542950400 layer bytes; warm={warm}; busy_peers={busy_peers}"
     );
 }
 fn rand_id() -> [u8; 16] {

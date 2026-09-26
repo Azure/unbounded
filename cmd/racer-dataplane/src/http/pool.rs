@@ -11,11 +11,12 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     rc::{Rc, Weak},
+    task::{Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -41,6 +42,38 @@ struct PoolState {
     entries: HashMap<Endpoint, Entry>,
     next_generation: u64,
     closed: bool,
+    waiters: BTreeMap<u64, PeerWaiter>,
+    next_waiter: u64,
+}
+struct PeerWaiter {
+    endpoint: Endpoint,
+    scope: RequestScope,
+    waker: Waker,
+}
+struct PeerWaitRegistration {
+    state: Weak<RefCell<PoolState>>,
+    id: u64,
+    _reservation: Reservation,
+    _context: Reservation,
+}
+impl Drop for PeerWaitRegistration {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state.borrow_mut().waiters.remove(&self.id);
+        }
+    }
+}
+fn wake_peer_waiters(state: &Rc<RefCell<PoolState>>, endpoint: &Endpoint) {
+    let wakes: Vec<_> = state
+        .borrow()
+        .waiters
+        .values()
+        .filter(|waiter| &waiter.endpoint == endpoint)
+        .map(|waiter| waiter.waker.clone())
+        .collect();
+    for wake in wakes {
+        wake.wake();
+    }
 }
 struct ReturnToPool {
     state: Weak<RefCell<PoolState>>,
@@ -120,10 +153,10 @@ impl Drop for ConnectionLease {
         let Some(target) = &self.pool else {
             return;
         };
-        let Some(state) = target.state.upgrade() else {
+        let Some(pool_state) = target.state.upgrade() else {
             return;
         };
-        let mut state = state.borrow_mut();
+        let mut state = pool_state.borrow_mut();
         let closed = state.closed;
         if let Some(entry) = state.entries.get_mut(&target.endpoint) {
             entry.active = entry.active.saturating_sub(1);
@@ -144,10 +177,14 @@ impl Drop for ConnectionLease {
                 state.entries.remove(&target.endpoint);
             }
         }
+        drop(state);
+        wake_peer_waiters(&pool_state, &target.endpoint);
     }
 }
 
 pub struct HttpPool {
+    #[cfg(test)]
+    pub(crate) peer_waits: std::cell::Cell<usize>,
     reactor: Rc<Reactor>,
     admission: Rc<Admission>,
     per_endpoint: usize,
@@ -173,6 +210,8 @@ impl HttpPool {
         idle_timeout: Duration,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            peer_waits: std::cell::Cell::new(0),
             reactor,
             admission,
             per_endpoint,
@@ -182,7 +221,97 @@ impl HttpPool {
                 entries: HashMap::new(),
                 next_generation: 0,
                 closed: false,
+                waiters: BTreeMap::new(),
+                next_waiter: 0,
             })),
+        }
+    }
+    /// Already-admitted peer work may wait for its selected neighbor's active
+    /// slot. No route attempt is retried, and no connection or byte limit grows.
+    /// The finite waiter table and original scope bound retention under pressure.
+    pub fn checkout_peer<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        Box::pin(async move {
+            let cancellation = scope.cancellation.subscribe()?;
+            let mut registration: Option<PeerWaitRegistration> = None;
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                let mut state = self.state.borrow_mut();
+                if state.closed {
+                    return Poll::Ready(Err(Error::Unavailable));
+                }
+                if state
+                    .entries
+                    .get(endpoint)
+                    .is_none_or(|entry| entry.active < self.per_endpoint)
+                {
+                    return Poll::Ready(Ok(()));
+                }
+                if let Some(registration) = &registration {
+                    state
+                        .waiters
+                        .get_mut(&registration.id)
+                        .ok_or(Error::Internal)?
+                        .waker
+                        .clone_from(cx.waker());
+                } else {
+                    if state.waiters.len() >= self.admission.limits().queue_entries.get() {
+                        return Poll::Ready(Err(Error::Overloaded));
+                    }
+                    let reservation = self.admission.reserve(None, ResourceClass::Waiter, 1)?;
+                    let context = self.admission.reserve(
+                        None,
+                        ResourceClass::RequestContext,
+                        std::mem::size_of::<PeerWaiter>()
+                            + std::mem::size_of::<PeerWaitRegistration>()
+                            + match endpoint {
+                                Endpoint::Peer(value) => value.len(),
+                                Endpoint::Unix(value) => value.as_os_str().len(),
+                            },
+                    )?;
+                    let id = state.next_waiter.checked_add(1).ok_or(Error::Overloaded)?;
+                    #[cfg(test)]
+                    self.peer_waits.set(self.peer_waits.get() + 1);
+                    state.next_waiter = id;
+                    state.waiters.insert(
+                        id,
+                        PeerWaiter {
+                            endpoint: endpoint.clone(),
+                            scope: scope.clone(),
+                            waker: cx.waker().clone(),
+                        },
+                    );
+                    registration = Some(PeerWaitRegistration {
+                        state: Rc::downgrade(&self.state),
+                        id,
+                        _reservation: reservation,
+                        _context: context,
+                    });
+                }
+                Poll::Pending
+            })
+            .await?;
+            drop(registration);
+            self.checkout(endpoint, scope).await
+        })
+    }
+    /// Worker timer tick wakes expired peer admission waiters, even if every
+    /// active exchange is stalled. The table is capped by queue_entries.
+    pub fn poll_peer_waiters(&self) {
+        let wakes: Vec<_> = self
+            .state
+            .borrow()
+            .waiters
+            .values()
+            .filter(|waiter| waiter.scope.check().is_err())
+            .map(|waiter| waiter.waker.clone())
+            .collect();
+        for wake in wakes {
+            wake.wake();
         }
     }
     /// Capacity exhaustion fails immediately with Overloaded: there is no hidden
@@ -316,6 +445,15 @@ impl HttpPool {
         for entry in state.entries.values_mut() {
             entry.idle.clear();
         }
+        let wakes: Vec<_> = state
+            .waiters
+            .values()
+            .map(|waiter| waiter.waker.clone())
+            .collect();
+        drop(state);
+        for wake in wakes {
+            wake.wake();
+        }
     }
 }
 impl Drop for HttpPool {
@@ -342,14 +480,16 @@ struct ConnectingSlot(Option<ReturnToPool>);
 impl Drop for ConnectingSlot {
     fn drop(&mut self) {
         if let Some(target) = &self.0 {
-            if let Some(state) = target.state.upgrade() {
-                let mut state = state.borrow_mut();
+            if let Some(pool_state) = target.state.upgrade() {
+                let mut state = pool_state.borrow_mut();
                 if let Some(entry) = state.entries.get_mut(&target.endpoint) {
                     entry.active = entry.active.saturating_sub(1);
                     if entry.active == 0 && entry.idle.is_empty() {
                         state.entries.remove(&target.endpoint);
                     }
                 }
+                drop(state);
+                wake_peer_waiters(&pool_state, &target.endpoint);
             }
         }
     }
@@ -401,6 +541,9 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
     Ok((unsafe { OwnedFd::from_raw_fd(raw) }, address))
 }
 
+#[cfg(test)]
+#[path = "pool_peer_tests.rs"]
+mod peer_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

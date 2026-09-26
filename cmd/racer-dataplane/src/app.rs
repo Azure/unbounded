@@ -1015,6 +1015,7 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        self.peers.poll_admission_deadlines();
         self.metadata.poll_deadlines(Instant::now(), budget);
         if self.stopping {
             for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
