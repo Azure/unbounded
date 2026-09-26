@@ -643,7 +643,9 @@ impl WorkerEndpoint {
                 }
             }
         }
-        if !self.mailbox.state.lock().unwrap().queue.is_empty() || self.active.len() > work_budget {
+        // Active length is not runnable work: every future may be blocked. Keep
+        // round-robin order; the bounded worker tick reaches the rest of the set.
+        if work_budget != 0 && !self.mailbox.state.lock().unwrap().queue.is_empty() {
             cx.waker().wake_by_ref();
         }
         Ok(())
@@ -652,7 +654,8 @@ impl WorkerEndpoint {
         let waker = futures::task::noop_waker();
         self.poll(&mut Context::from_waker(&waker), work_budget)
     }
-    /// The I/O loop also schedules this deadline when no completion wakes it.
+    /// Earliest caller deadline. The I/O loop currently uses its bounded 1 ms tick
+    /// to check deadlines rather than scheduling this value directly.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         let state = self.mailbox.state.lock().unwrap();
         self.active
@@ -828,6 +831,103 @@ mod tests {
                 key: CacheKey([7; 32]),
             },
             etag: StrongEtag::test_value("v1"),
+        }
+    }
+
+    #[test]
+    fn blocked_endpoint_is_quiet_and_round_robin_is_budgeted() {
+        let directory = Arc::new(directory(4));
+        let mut endpoint = WorkerEndpoint {
+            mailbox: directory.mailboxes[0].clone(),
+            directory,
+            local: crate::app::tests::wake_test_coordinator(),
+            active: VecDeque::new(),
+        };
+        let count = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        for id in 0..3 {
+            let order = order.clone();
+            endpoint.active.push_back(Active {
+                scope: scope(),
+                caller: scope(),
+                reply: Arc::new(Reply {
+                    generation: id,
+                    abandoned: AtomicBool::new(false),
+                    state: Mutex::new(ReplyState {
+                        completion: None,
+                        waker: None,
+                        finished: false,
+                    }),
+                }),
+                future: Box::pin(std::future::poll_fn(move |_| {
+                    order.borrow_mut().push(id);
+                    Poll::Pending
+                })),
+            });
+        }
+        endpoint.poll(&mut cx, 0).unwrap();
+        assert!(order.borrow().is_empty());
+        for _ in 0..6 {
+            endpoint.poll(&mut cx, 1).unwrap();
+        }
+        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(
+            count.count(),
+            0,
+            "active length does not imply runnable work"
+        );
+        endpoint.active.clear(); // Test futures have no accepted I/O to fence.
+    }
+
+    #[test]
+    fn mailbox_and_reply_notifications_cover_both_registration_orders() {
+        for submit_before_poll in [false, true] {
+            for complete_before_poll in [false, true] {
+                let directory = Arc::new(directory(4));
+                let mut endpoint = WorkerEndpoint {
+                    mailbox: directory.mailboxes[0].clone(),
+                    directory: directory.clone(),
+                    local: crate::app::tests::wake_test_coordinator(),
+                    active: VecDeque::new(),
+                };
+                let count = Arc::new(crate::test_support::WakeCounter::default());
+                let waker = Waker::from(count.clone());
+                let mut cx = Context::from_waker(&waker);
+                if !submit_before_poll {
+                    endpoint.poll(&mut cx, 0).unwrap();
+                }
+                let sender = directory.clone();
+                let mut receipt = std::thread::spawn(move || {
+                    sender
+                        .submit(
+                            WorkerId(0),
+                            Work::Publish(crate::model::metadata::VersionMetadata {
+                                version: version(),
+                                length: 0,
+                            }),
+                            &scope(),
+                            None,
+                        )
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+                assert_eq!(count.count(), usize::from(!submit_before_poll));
+                if !complete_before_poll {
+                    assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
+                }
+                let before = count.count();
+                endpoint.poll(&mut cx, 1).unwrap();
+                assert_eq!(count.count(), before + usize::from(!complete_before_poll));
+                let Poll::Ready(Ok(completion)) = Pin::new(&mut receipt).poll(&mut cx) else {
+                    panic!("completion was lost across registration");
+                };
+                assert!(matches!(completion.value, Ok(Value::Published)));
+                drop(receipt);
+                assert!(endpoint.is_drained());
+            }
         }
     }
     #[test]

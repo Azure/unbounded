@@ -273,6 +273,123 @@ fn drive<T>(
 }
 
 #[test]
+fn blocked_metadata_leader_and_follower_notify_without_spinning() {
+    use crate::{
+        model::metadata::MetadataSelector,
+        read::metadata::{MetadataDependencies, MetadataService},
+        test_support::WakeCounter,
+    };
+    use std::{cell::RefCell, task::Waker};
+    struct GatedOrigin(RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>);
+    impl Origin for GatedOrigin {
+        fn metadata<'a>(
+            &'a self,
+            _: &'a super::super::candidates::OriginAuthority,
+            _: &'a OriginContext,
+            _: MetadataSelector,
+            _: &'a RequestScope,
+        ) -> Operation<'a, MetadataReply> {
+            let receive = self.0.borrow_mut().take().unwrap();
+            Box::pin(async move { receive.await.map_err(|_| Error::Unavailable) })
+        }
+        fn page<'a>(
+            &'a self,
+            _: &'a super::super::candidates::OriginAuthority,
+            _: &'a OriginContext,
+            _: &'a PageId,
+            _: &'a RequestScope,
+        ) -> Operation<'a, OriginPage> {
+            Box::pin(async { panic!("metadata-only refresh") })
+        }
+    }
+    for cancel_leader in [false, true] {
+        let f = fixture();
+        let (send, receive) = futures::channel::oneshot::channel();
+        let service = MetadataService::new(
+            f.fill.dependencies.candidates.clone(),
+            Rc::new(GatedOrigin(RefCell::new(Some(receive)))),
+            f.fill.dependencies.peers.clone(),
+            f.fill.dependencies.credentials.clone(),
+            4,
+            MetadataDependencies {
+                index: Rc::new(Index::new(WorkerId(0), 4)),
+                owners: f.fill.dependencies.metadata_owner.clone(),
+                fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+            },
+        );
+        let follower_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+        let mut leader = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        let mut follower = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &follower_scope,
+        );
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(leader.as_mut().poll(&mut cx).is_pending());
+        assert!(follower.as_mut().poll(&mut cx).is_pending());
+        let settled = count.count();
+        for _ in 0..4 {
+            assert!(leader.as_mut().poll(&mut cx).is_pending());
+            assert!(follower.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            count.count(),
+            settled,
+            "external metadata waits must not self-wake"
+        );
+        let canceled = if cancel_leader {
+            &f.scope
+        } else {
+            &follower_scope
+        };
+        canceled.cancel().unwrap();
+        assert!(
+            count.count() > settled,
+            "cancellation registration survives polling"
+        );
+        if cancel_leader {
+            assert!(matches!(
+                leader.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+        } else {
+            assert!(matches!(
+                follower.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+        }
+        let before = count.count();
+        send.send(MetadataReply {
+            metadata: f.origin.metadata.clone(),
+            page_zero: None,
+        })
+        .ok()
+        .unwrap();
+        assert!(
+            count.count() > before,
+            "origin completion reaches registered driver"
+        );
+        if cancel_leader {
+            // Finish the retained driver after caller cancellation without electing
+            // a replacement supplier in this test.
+            drop(follower);
+            super::super::drivers::poll(&mut cx, 64);
+        } else {
+            assert!(matches!(leader.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        assert_eq!(super::super::drivers::pending(), 0);
+    }
+}
+
+#[test]
 fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() {
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);

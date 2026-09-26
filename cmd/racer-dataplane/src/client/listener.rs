@@ -132,7 +132,9 @@ impl ClientListeners {
     }
     /// Called by the owning I/O worker alongside reactor completion polling.
     /// Work is bounded across accepts and futures; no background executor exists.
-    pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
+    /// Forward the driver's real context. The bounded worker tick covers deadlines,
+    /// nonblocking accepts, and round-robin entries beyond this pass's budget.
+    pub fn poll_budgeted(&self, cx: &mut Context<'_>, budget: usize) -> Result<usize> {
         let mut cleaned = 0;
         // Commit only retires owners; pathname cleanup runs on worker polling.
         if budget != 0 {
@@ -143,8 +145,6 @@ impl ClientListeners {
         }
         let budget = budget.saturating_sub(cleaned);
         let mut worked = 0;
-        let waker = futures::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
         let reserve_accept = usize::from(
             self.accepting.get()
                 && !self.listeners.borrow().is_empty()
@@ -165,7 +165,7 @@ impl ClientListeners {
             if active.retired.get() && active.idle.get() {
                 let _ = active.cancellation.cancel();
             }
-            match active.operation.as_mut().poll(&mut context) {
+            match active.operation.as_mut().poll(cx) {
                 Poll::Pending => self.active.borrow_mut().push_back(active),
                 Poll::Ready(_) => {}
             }
@@ -233,6 +233,9 @@ impl ClientListeners {
                         cancellation,
                         operation,
                     });
+                    // This operation has not been polled and cannot have registered
+                    // an I/O wake yet. Continue promptly without exceeding the budget.
+                    cx.waker().wake_by_ref();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -301,7 +304,7 @@ impl ClientListeners {
                     let _ = self.cancel_cache(cache);
                     return Poll::Ready(Err(error));
                 }
-                if let Err(error) = self.poll_budgeted(64) {
+                if let Err(error) = self.poll_budgeted(cx, 64) {
                     return Poll::Ready(Err(error));
                 }
                 if self.active_connections_for(cache) == 0 {
@@ -334,7 +337,7 @@ impl ClientListeners {
                     // Keep completion owners until the worker polls them out.
                     return Poll::Ready(Err(error));
                 }
-                if let Err(error) = self.poll_budgeted(64) {
+                if let Err(error) = self.poll_budgeted(cx, 64) {
                     return Poll::Ready(Err(error));
                 }
                 if self.active.borrow().is_empty() {
@@ -713,7 +716,12 @@ mod tests {
             stream
         }
         fn pump(&self, budget: usize) {
-            self.listeners.poll_budgeted(budget).unwrap();
+            self.listeners
+                .poll_budgeted(
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    budget,
+                )
+                .unwrap();
             self.reactor.poll_budgeted(64).unwrap();
         }
         fn receive(&self, socket: &mut UnixStream, eof: bool) -> Vec<u8> {
@@ -744,6 +752,95 @@ mod tests {
             "0".repeat(64)
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
+        use crate::test_support::WakeCounter;
+        use std::{sync::Arc, task::Waker};
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let _socket = fixture.connect();
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 0).unwrap(), 0);
+        assert_eq!(count.count(), 0);
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
+        assert_eq!(fixture.listeners.active_connections(), 1);
+        assert_eq!(
+            count.count(),
+            1,
+            "accepted task has no I/O registration yet"
+        );
+        // Replace the not-yet-polled socket operation with deterministic futures
+        // at the actual listener driver seam, avoiding kernel timing dependencies.
+        fixture.listeners.active.borrow_mut().clear();
+        fixture.listeners.accepting.set(false);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut senders = Vec::new();
+        for id in 0..3 {
+            let (send, mut receive) = futures::channel::oneshot::channel::<()>();
+            senders.push(send);
+            let order = order.clone();
+            fixture.listeners.active.borrow_mut().push_back(Active {
+                cache: definition().id,
+                retired: Rc::new(Cell::new(false)),
+                idle: Rc::new(Cell::new(false)),
+                cancellation: Cancellation::new().unwrap(),
+                operation: Box::pin(std::future::poll_fn(move |cx| {
+                    order.borrow_mut().push(id);
+                    std::pin::Pin::new(&mut receive)
+                        .poll(cx)
+                        .map(|r| r.map_err(|_| Error::Unavailable))
+                })),
+            });
+        }
+        for _ in 0..6 {
+            assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
+        }
+        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(count.count(), 1, "blocked clients do not self-wake");
+        std::thread::spawn(move || {
+            for send in senders {
+                send.send(()).unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            count.count(),
+            4,
+            "listener forwards the real completion waker"
+        );
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 2).unwrap(), 2);
+        assert_eq!(fixture.listeners.active_connections(), 1);
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 2).unwrap(), 1);
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        let mut yielded = false;
+        fixture.listeners.active.borrow_mut().push_back(Active {
+            cache: definition().id,
+            retired: Rc::new(Cell::new(false)),
+            idle: Rc::new(Cell::new(false)),
+            cancellation: Cancellation::new().unwrap(),
+            operation: Box::pin(std::future::poll_fn(move |cx| {
+                if yielded {
+                    Poll::Ready(Ok(()))
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })),
+        });
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
+        assert_eq!(
+            count.count(),
+            5,
+            "cooperative client continuation reaches driver"
+        );
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
+        assert_eq!(fixture.listeners.active_connections(), 0);
     }
 
     struct Bodies {

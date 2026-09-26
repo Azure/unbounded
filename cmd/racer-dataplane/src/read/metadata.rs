@@ -394,9 +394,8 @@ impl MetadataService {
                 match registration.event(cx.waker()) {
                     Poll::Ready(event) => Poll::Ready(Ok(event)),
                     Poll::Pending => {
-                        // The scope has cancellation notification but no deadline
-                        // timer registration. Yield and recheck its original deadline.
-                        cx.waker().wake_by_ref();
+                        // Completion/re-election and cancellation notify us. The
+                        // worker's bounded 1 ms tick rechecks the original deadline.
                         Poll::Pending
                     }
                 }
@@ -462,6 +461,7 @@ impl MetadataService {
                         Ok(())
                     }));
                     let (result, remaining) = poll_fn(|cx| {
+                        scope.cancellation.register(cx.waker())?;
                         super::drivers::poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
@@ -470,7 +470,8 @@ impl MetadataService {
                                 if let Err(error) = scope.check() {
                                     return Poll::Ready(Err(error));
                                 }
-                                cx.waker().wake_by_ref();
+                                // The oneshot and cancellation provide notifications;
+                                // deadline-only progress uses the bounded worker tick.
                                 Poll::Pending
                             }
                         }
@@ -806,6 +807,47 @@ mod tests {
             metadata: metadata("v1", 0),
             page: None,
         }
+    }
+
+    #[test]
+    fn refresh_notifications_cover_registration_completion_and_reelection_order() {
+        for complete_first in [false, true] {
+            let table = Rc::new(RefreshTable::default());
+            let leader = table.join(key(), 1).unwrap();
+            let follower = table.join(key(), 1).unwrap();
+            let count = Arc::new(crate::test_support::WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            assert!(matches!(
+                leader.event(&noop_waker()),
+                Poll::Ready(RefreshEvent::Lead)
+            ));
+            if !complete_first {
+                assert!(follower.event(&waker).is_pending());
+                assert_eq!(count.count(), 0);
+            }
+            leader.finish(Ok(output()));
+            assert_eq!(count.count(), usize::from(!complete_first));
+            assert!(matches!(
+                follower.event(&waker),
+                Poll::Ready(RefreshEvent::Complete(Ok(_)))
+            ));
+        }
+        let table = Rc::new(RefreshTable::default());
+        let leader = table.join(key(), 1).unwrap();
+        let follower = table.join(key(), 1).unwrap();
+        let count = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        assert!(matches!(
+            leader.event(&noop_waker()),
+            Poll::Ready(RefreshEvent::Lead)
+        ));
+        assert!(follower.event(&waker).is_pending());
+        leader.retry();
+        assert_eq!(count.count(), 1);
+        assert!(matches!(
+            follower.event(&waker),
+            Poll::Ready(RefreshEvent::Lead)
+        ));
     }
 
     #[test]

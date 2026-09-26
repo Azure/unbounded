@@ -229,7 +229,7 @@ impl WorkerApplication {
         // A committed removal may already own its replacement listeners. Do not
         // accept from them until every worker has installed removal tombstones.
         if !self.retirement_registered {
-            self.clients.poll_budgeted(64)?;
+            self.clients.poll_budgeted(cx, 64)?;
         }
         for task in [
             &mut self.peer_task,

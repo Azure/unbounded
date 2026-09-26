@@ -697,7 +697,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     );
     for _ in 0..8 {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
     }
     // Retire an omitted epoch through the actual serving loop. A held key lease
     // must keep material alive even after all worker/kernel/checkpoint barriers.
@@ -801,7 +806,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let until = Instant::now() + Duration::from_secs(5);
     for _ in 0..8 {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
     }
     assert!(
         fixture.directory.join("slabs/checkpoint.0").is_file(),
@@ -812,7 +822,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         engine.poll_budgeted(64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         assert!(
             Instant::now() < until,
             "checkpoint invalidation was not submitted"
@@ -822,7 +837,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let in_flight = runtime.reactor.in_flight();
     assert!(in_flight > 0);
     for _ in 0..4 {
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         assert!(worker.retirement_checkpoint.is_some());
         assert_eq!(runtime.reactor.in_flight(), in_flight);
         assert!(
@@ -840,7 +860,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         engine.poll_budgeted(64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         runtime.reactor.wait(Duration::from_millis(1)).unwrap();
         assert!(
             Instant::now() < until,
@@ -872,7 +897,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     drop(lease);
     while !worker.keys.pending_retirements().unwrap().is_empty() || worker.retiring {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         runtime.reactor.wait(Duration::from_millis(1)).unwrap();
         assert!(
             Instant::now() < until,
@@ -880,7 +910,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         );
     }
     runtime.reactor.poll_budgeted(64).unwrap();
-    worker.poll_budgeted(64).unwrap();
+    worker
+        .poll_budgeted(
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
     assert!(node.observations.health.ready());
     let shutdown = scope(Duration::from_secs(5)).unwrap();
     drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();

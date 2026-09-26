@@ -57,7 +57,10 @@ cache UIDs remain serving. Global shutdown cannot be reversed by a prepared comm
 
 `ClientListeners::new` is side-effect-free. The worker calls
 `reconcile(&[CacheDefinition], &RequestScope)` to bind sockets, then
-`poll_budgeted(usize)` alongside reactor polling. `stop_admission()` retires
+`poll_budgeted(&mut Context, usize)` with the retained worker driver waker alongside
+reactor polling. Cooperative continuations and completion notifications wake the
+worker; its bounded 1 ms fallback still drives deadlines, nonblocking accepts, and
+round-robin passes over blocked connections. `stop_admission()` retires
 listeners and idle keepalive connections; `drain(&RequestScope)` bounds active
 response completion. Removed cache generations cannot begin another request.
 

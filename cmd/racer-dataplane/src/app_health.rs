@@ -51,7 +51,7 @@ impl Observations {
     }
 }
 impl WorkerApplication {
-    pub(super) fn start_diagnostics(&mut self) -> Result<()> {
+    pub(super) fn start_diagnostics(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if self.control.is_none() {
             return Ok(());
         }
@@ -65,8 +65,7 @@ impl WorkerApplication {
         self.diagnostic_task = Some(Box::pin(async move {
             telemetry.serve(address, &task_scope).await
         }));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        if let Some(result) = poll_task(&mut self.diagnostic_task, &mut cx) {
+        if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
             result?;
             return Err(Error::Unavailable);
         }

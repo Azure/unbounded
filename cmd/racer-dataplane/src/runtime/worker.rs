@@ -37,6 +37,8 @@ use std::{
 };
 
 const WORK_BUDGET: usize = 64;
+// Deadline checks, nonblocking accepts, and bounded round-robin passes still need
+// a tick when no registered completion or cooperative continuation wakes us.
 const IDLE_WAIT: Duration = Duration::from_millis(1);
 
 /// Constructed on I/O; never move the local graph to the crypto thread.
@@ -121,7 +123,9 @@ pub trait WorkerFactory: Sync {
 pub trait WorkerService {
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
     /// Reap crypto completions before new admission, including abandoned results.
-    fn poll_budgeted(&mut self, work_budget: usize) -> Result<()>;
+    /// Forward the retained driver context to all service futures so cooperative
+    /// continuations and cross-worker notifications interrupt the bounded idle wait.
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()>;
     fn stop_admission(&mut self) -> Result<()>;
     /// The future drives service-local tasks itself while the group independently
     /// polls reactor and crypto completions (the service is mutably borrowed).
@@ -756,15 +760,16 @@ fn io_thread(
         if check_scope {
             record(&control, startup.cancellation.register(&waker));
         }
+        let mut cx = Context::from_waker(&waker);
         while !control.stopping(&startup) {
             runtime.crypto.register_driver(&waker);
             if let Err(error) =
-                poll_runtime(&runtime).and_then(|()| service.poll_budgeted(WORK_BUDGET))
+                poll_runtime(&runtime).and_then(|()| service.poll_budgeted(&mut cx, WORK_BUDGET))
             {
                 control.fail(error);
                 break;
             }
-            // A short bounded wait prevents monopolizing a shared single CPU.
+            // Real wakes interrupt this fallback for deadlines and nonblocking accepts.
             if let Err(error) = runtime.reactor.wait(IDLE_WAIT) {
                 control.fail(error);
                 break;
@@ -943,6 +948,7 @@ mod tests {
     struct TestIo {
         factory: TestFactory,
         local: Rc<()>,
+        driver: Option<Waker>,
     }
     struct TestCrypto {
         factory: TestFactory,
@@ -978,6 +984,7 @@ mod tests {
             Ok(Box::new(TestIo {
                 factory: self.clone(),
                 local: Rc::new(()),
+                driver: None,
             }))
         }
         fn build_crypto(
@@ -1001,12 +1008,17 @@ mod tests {
     }
     impl WorkerService for TestIo {
         fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
-            Box::pin(async move {
+            Box::pin(std::future::poll_fn(move |cx| {
+                self.driver = Some(cx.waker().clone());
                 self.factory.event("io-start");
-                Ok(())
-            })
+                Poll::Ready(Ok(()))
+            }))
         }
-        fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+            assert!(
+                self.driver.as_ref().unwrap().will_wake(cx.waker()),
+                "steady-state polling must retain the lifecycle driver waker"
+            );
             assert!(budget <= WORK_BUDGET);
             assert_eq!(Rc::strong_count(&self.local), 1);
             if self.factory.stop_on_poll {

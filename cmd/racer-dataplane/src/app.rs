@@ -870,7 +870,7 @@ impl WorkerApplication {
             .await?;
             self.refresh_snapshot(startup).await?;
             self.activate_native(startup).await?;
-            self.start_diagnostics()?;
+            std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
             self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
             if self.control.is_some() {
                 let listener_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
@@ -883,8 +883,9 @@ impl WorkerApplication {
                 self.listener_scope = Some(listener_scope);
                 // The first poll actually binds the socket. A failed bind is a
                 // startup error, never a successful readiness transition.
-                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-                if let Some(result) = poll_task(&mut self.peer_task, &mut cx) {
+                if let Some(result) =
+                    std::future::poll_fn(|cx| Poll::Ready(poll_task(&mut self.peer_task, cx))).await
+                {
                     result?;
                     return Err(Error::Unavailable);
                 }
@@ -1006,27 +1007,26 @@ impl WorkerApplication {
         result
     }
 
-    fn poll_services(&mut self, work_budget: usize) -> Result<()> {
+    fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         if work_budget == 0 {
             return Ok(());
         }
         let budget = work_budget.min(64);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         if self.stopping {
             for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
-                if let Some(result) = poll_task(task, &mut cx) {
+                if let Some(result) = poll_task(task, cx) {
                     result?;
                 }
             }
         }
-        if !self.stopping && self.poll_retirement(&mut cx)? {
+        if !self.stopping && self.poll_retirement(cx)? {
             self.observe_health()?;
             return Ok(());
         }
         if !self.stopping {
-            self.poll_cache_preparation(&mut cx)?;
+            self.poll_cache_preparation(cx)?;
         }
-        if let Some(result) = poll_task(&mut self.diagnostic_task, &mut cx) {
+        if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
             if !self.stopping {
                 result?;
                 return Err(Error::Unavailable);
@@ -1039,14 +1039,14 @@ impl WorkerApplication {
             }
         }
         if let Some(endpoint) = &mut self.endpoint {
-            endpoint.poll(&mut cx, budget)?;
+            endpoint.poll(cx, budget)?;
         }
-        self.flights.poll_with_context(&mut cx, budget)?;
-        self.clients.poll_budgeted(budget)?;
+        self.flights.poll_with_context(cx, budget)?;
+        self.clients.poll_budgeted(cx, budget)?;
         if let Some(rdma) = &self.rdma {
             rdma.progress()?;
         }
-        if let Some(result) = poll_task(&mut self.peer_task, &mut cx) {
+        if let Some(result) = poll_task(&mut self.peer_task, cx) {
             if !self.stopping {
                 result?;
                 return Err(Error::Unavailable);
@@ -1058,7 +1058,7 @@ impl WorkerApplication {
                 result?;
             }
         }
-        if let Some(result) = poll_task(&mut self.writer_task, &mut cx)
+        if let Some(result) = poll_task(&mut self.writer_task, cx)
             && !matches!(
                 result,
                 Err(Error::Io
@@ -1079,10 +1079,10 @@ impl WorkerApplication {
             }));
         }
         if !self.stopping {
-            self.poll_control(&mut cx)?;
+            self.poll_control(cx)?;
             let current_scope = scope(self.timeout)?;
             let mut refresh = Box::pin(self.refresh_snapshot(&current_scope));
-            match refresh.as_mut().poll(&mut cx) {
+            match refresh.as_mut().poll(cx) {
                 Poll::Ready(result) => result?,
                 Poll::Pending => return Err(Error::InvalidConfiguration),
             }
@@ -1214,14 +1214,14 @@ impl WorkerService for WorkerApplication {
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::start(self, scope)
     }
-    fn poll_budgeted(&mut self, work_budget: usize) -> Result<()> {
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         if !self.started {
             return Err(Error::Unavailable);
         }
         if STOP_REQUESTED.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
-        self.poll_services(work_budget)
+        self.poll_services(cx, work_budget)
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.stopping = true;
@@ -1264,7 +1264,7 @@ impl WorkerService for WorkerApplication {
                 {
                     first_error.get_or_insert(error);
                 }
-                if let Err(error) = self.poll_services(64) {
+                if let Err(error) = self.poll_services(cx, 64) {
                     first_error.get_or_insert(error);
                 }
                 if !clients_done && let Poll::Ready(result) = client_drain.as_mut().poll(cx) {
@@ -1349,13 +1349,77 @@ impl WorkerService for WorkerApplication {
 mod integration_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::runtime::{
         admission::Admission,
         crypto::{self, CryptoClient},
         reactor::Reactor,
     };
+
+    pub(crate) fn wake_test_worker() -> WorkerApplication {
+        let config = crate::test_support::cluster::config(false);
+        let admission = Rc::new(Admission::new(config.limits.clone()));
+        let (io, _engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
+        WorkerApplication::assemble(
+            &config,
+            &NodeState::default(),
+            WorkerId(0),
+            WorkerRuntime {
+                reactor: Rc::new(Reactor::new(admission.clone())),
+                admission,
+                crypto: Rc::new(CryptoClient::new(io)),
+            },
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
+        wake_test_worker().coordinator
+    }
+
+    #[test]
+    fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
+        let mut worker = wake_test_worker();
+        // Exercise the production WorkerService entry point with side-effect-free
+        // tasks. Stopping bypasses control publication and snapshot requirements.
+        worker.started = true;
+        worker.stopping = true;
+        let count = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = std::task::Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (send, receive) = futures::channel::oneshot::channel::<()>();
+        worker.peer_task = Some(Box::pin(async move {
+            receive.await.map_err(|_| Error::Unavailable)
+        }));
+        let mut yielded = false;
+        worker.diagnostic_task = Some(Box::pin(std::future::poll_fn(move |cx| {
+            if yielded {
+                Poll::Ready(Ok(()))
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })));
+        worker.poll_budgeted(&mut cx, 0).unwrap();
+        assert_eq!(count.count(), 0);
+        worker.poll_budgeted(&mut cx, 1).unwrap();
+        assert_eq!(count.count(), 1, "cooperative continuation reaches driver");
+        worker.poll_budgeted(&mut cx, 1).unwrap();
+        assert_eq!(count.count(), 1, "blocked task does not spin");
+        std::thread::spawn(move || send.send(()).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(
+            count.count(),
+            2,
+            "registered completion wakes driver across threads"
+        );
+        worker.poll_budgeted(&mut cx, 1).unwrap();
+        assert!(worker.peer_task.is_none());
+        assert!(worker.diagnostic_task.is_none());
+    }
 
     #[test]
     fn composes_http_and_optional_rdma_without_operational_side_effects() {
@@ -1416,8 +1480,9 @@ mod tests {
                     && Rc::strong_count(&worker.coordinator) == 2,
                 "client and peer share one dispatcher and local coordinator"
             );
-            assert_eq!(worker.poll_budgeted(0), Err(Error::Unavailable));
-            assert_eq!(worker.poll_budgeted(1), Err(Error::Unavailable));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
+            assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
             // Hold every old generation at the configured limit while installing
             // the current generation on both actual application networks.
             for network in [&worker.network, &second.network] {
