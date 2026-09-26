@@ -614,10 +614,12 @@ func NewDefault() *Config {
 		MaxCachedRangeBytes:         4 << 20,
 		IndexPrefetchHeadBytes:      256 << 10,
 		IndexPrefetchTailBytes:      2 << 20,
-		IndexPrefetchConcurrency:    16,
-		IndexPrefetchJitter:         500 * time.Millisecond,
-		HRWTopologyScope:            "cluster",
-		ZoneLabelKey:                "topology.kubernetes.io/zone",
+		// Measured at 1000 nodes: concurrency 16 with 500ms spread moved p90
+		// from 15s to 42s. Warming harder makes the nodes fight each other.
+		IndexPrefetchConcurrency: 8,
+		IndexPrefetchJitter:      2 * time.Second,
+		HRWTopologyScope:         "cluster",
+		ZoneLabelKey:             "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
 		CoordRequireChairAssignment: false,
