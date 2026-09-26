@@ -68,12 +68,6 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create"]
-  - apiGroups: ["racer.unbounded-cloud.io"]
-    resources: ["clustercaches"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: ["scheduling.k8s.io"]
     # The gantry component installs a low-priority PriorityClass (gantry-low)
     # so its agents are preemptible under cluster pressure.

@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -126,7 +125,6 @@ func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
 		"apps/v1":     appsv1.AddToScheme,
 		"core/v1":     corev1.AddToScheme,
 		"machina API": unboundedv1alpha3.AddToScheme,
-		"racer API":   racerv1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add %s to scheme: %v", name, err)

@@ -77,58 +77,7 @@ The serving files are loaded at startup, so replacing deployment TLS certificate
 requires a controller restart. Rotating node issuer roots are read live. Bootstrap
 recovery must omit expired client certificates; snapshot always requires mTLS.
 
-## Operator-managed installation
-
-When `unbounded-operator` is installed, create a cluster-scoped `ClusterCache`
-to install Racer automatically. No Site is required:
-
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: default
-spec: {}
-```
-
-The operator bootstraps the ClusterCache CRD and provisions Racer in its own
-namespace. It persists a permanent cluster UUID, creates serving TLS and bootstrap
-trust, applies RBAC and configuration, and runs `job/racer-initialize` once with
-retries disabled. After validating the consumed installation marker and its bound
-version counters, it installs `deployment/racer-controller`. The elected Racer
-controller creates and maintains `daemonset/racer-dataplane`. Both images use the
-operator's configured registry and version tag.
-
-While any ClusterCache exists, the operator repairs the controller installation
-and renews serving certificates. Configuration and certificate changes restart
-the controller using a Recreate deployment strategy: only the leader is ready, so
-a rolling update would stall waiting for a ready replacement follower. Expect a
-control-plane interruption during these updates. The `racer` Deployment supports
-the operator's workload overrides.
-
-Deleting the last ClusterCache retains all Racer resources and stops operator
-reconciliation of the installation. To remove the running components manually,
-first ensure there are no ClusterCaches, then stop the controller and wait for
-its pods before deleting the dataplane. Otherwise the controller will recreate
-the DaemonSet:
-
-```sh
-kubectl get clustercaches
-kubectl -n unbounded-system delete deployment racer-controller --cascade=foreground --wait=true
-kubectl -n unbounded-system wait --for=delete pod -l app=racer-controller --timeout=120s
-kubectl -n unbounded-system delete daemonset racer-dataplane --wait=true
-```
-
-Use your operator namespace if it differs from `unbounded-system`. Retain the
-ConfigMaps `racer-installation`, `racer-version`, `racer-config`, and
-`racer-bootstrap-trust`, and Secrets `racer-controller-tls`, `racer-issuer`, and
-`racer-keyring`. A later ClusterCache recreates the workloads using this identity
-and counter history, without rerunning initialization. Missing or corrupt durable
-state fails closed; restore consistent state rather than deleting the marker or
-rerunning the initialization Job. Inspect operator logs and the initialization
-Job if installation does not complete. On Sites, `RacerReady` reports the
-operator's reconciliation result, not workload availability.
-
-## First installation without the operator
+## First installation
 
 1. Choose a **new permanent cluster UUID**, namespace, controller image, and
    compatible dataplane image. Provision the namespace and deployment TLS/trust
