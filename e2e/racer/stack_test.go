@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -124,10 +123,9 @@ func TestOperatorImagePull(t *testing.T) {
 	h.kubectl("rollout", "status", "daemonset/gantry-racer-e2e", "-n", namespace, "--timeout=180s")
 
 	racerPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "-o", "jsonpath={.items[0].metadata.name}"))
-	racerURL := h.forward(racerPod, "9090")
-	h.waitHTTP(racerURL + "/readyz")
+	racerURL := h.forward(racerPod, "9090", "/readyz")
 	gantryPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app=gantry-racer-e2e", "-o", "jsonpath={.items[0].metadata.name}"))
-	mirrorURL, err := url.Parse(h.forward(gantryPod, "5000"))
+	mirrorURL, err := url.Parse(h.forward(gantryPod, "5000", "/v2/"))
 	require.NoError(t, err)
 
 	proxy := httputil.NewSingleHostReverseProxy(mirrorURL)
@@ -243,32 +241,19 @@ func (h *harness) serve(handler http.Handler) string {
 	return port
 }
 
-func (h *harness) forward(pod, port string) string {
+func (h *harness) forward(pod, port, readyPath string) string {
 	h.t.Helper()
-	logPath := filepath.Join(h.artifacts, "forward-"+port+".log")
-	log, err := os.Create(logPath)
-	require.NoError(h.t, err)
-	cmd := exec.Command("kubectl", "--kubeconfig", h.kubeconfig, "-n", namespace, "port-forward", "pod/"+pod, ":"+port)
-	cmd.Stdout, cmd.Stderr = log, log
-	require.NoError(h.t, cmd.Start())
-	h.t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait(); log.Close() })
 
-	var address string
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 
-	require.Eventually(h.t, func() bool {
-		data, _ := os.ReadFile(logPath)
+	address, stop, err := forwardHTTP(ctx, func() *exec.Cmd {
+		return exec.Command("kubectl", "--kubeconfig", h.kubeconfig, "-n", namespace, "port-forward", "pod/"+pod, ":"+port)
+	}, filepath.Join(h.artifacts, "forward-"+port), readyPath)
+	require.NoError(h.t, err, "pod %s port %s not ready", pod, port)
+	h.t.Cleanup(stop)
 
-		match := regexp.MustCompile(`Forwarding from (127\.0\.0\.1:\d+)`).FindSubmatch(data)
-		if len(match) != 2 {
-			return false
-		}
-
-		address = string(match[1])
-
-		return true
-	}, 30*time.Second, 100*time.Millisecond)
-
-	return "http://" + address
+	return address
 }
 
 func (h *harness) waitHTTP(endpoint string) {

@@ -39,4 +39,7 @@ deployed Rust dataplane, and Gantry's origin adapter.
   `kind delete cluster --name <name>` before another run on resource-limited hosts.
 - Generated fixtures, kubeconfig, pod/event diagnostics, and port-forward logs
   stay in the reported `tmp/racer-e2e-*` directory, including after failures.
+- Readiness checks recreate port-forward processes that exit while the remote
+  listener is starting. Each attempt retains a `forward-<port>-<attempt>.log`;
+  an HTTP 200 is required within the readiness deadline.
 - The cluster is deleted by default. No existing cluster is used.
