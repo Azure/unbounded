@@ -317,6 +317,8 @@ func TestPollFanoutSharesOnePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
+
 	next := reconcileTopology(t, r, ctx)
 
 	wg.Wait()

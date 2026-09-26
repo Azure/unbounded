@@ -179,6 +179,47 @@ control API directly. If the replacement cannot serve, correct the configuration
 or roll back to the previous working pod template; recovery uses the same Recreate
 interruption. Never rerun initialization for an update or rollback.
 
+## Cache catalog capacity and rotation
+
+The default rotation policy (24-hour interval, 1-hour preparation, 48-hour
+retention) admits **at most 356 ClusterCaches**. This is a conservative service
+admission limit, not a Kubernetes object-create limit. Additional valid objects
+remain stored but are omitted from the served catalog and receive no cache keys.
+The controller logs `cache catalog admission rejected` with the cache name, UID,
+`reason=rotation_capacity`, and computed capacity. Check these leader logs when a
+created cache does not appear in snapshots; there is no per-cache status condition.
+
+Admission reserves the 512 KiB wire budget before creating keys: both key purposes,
+active and prepared generations, and `ceil(RetainFor / (Interval + PrepareFor))`
+retiring generations. It includes all 20 generation-counter digits, the longest
+key-state spelling, and a 1 KiB DER allowance per issuer root (enforced on generated
+roots). The reserve intentionally includes a prepared generation even when the
+oldest retiree would expire before preparation. Custom Go `RotationPolicy` values
+therefore change the maximum; these durations are not environment settings.
+Policies whose trust-root reserve alone cannot fit fail before credential
+initialization consumes its one-way claim.
+
+Existing admitted UIDs take priority, using both active key scopes in the committed
+Secret as the durable admission record. Free slots are filled in ascending UID
+order; a fresh installation accepts that sorted prefix. A new lower UID cannot
+evict a working cache. Deleting a rejected object changes nothing; deleting an
+admitted object frees a slot for the next waiting UID. Recreation has a new UID
+and unrelated keys. Topology reads authoritative inputs and publishes additions
+only after their keys commit; a Secret watch drives that follow-up reconciliation.
+Catalog and keyring reconciliation share a leader-local gate to prevent a stale
+in-progress topology candidate from racing key pruning. Kubelet projection and
+snapshot delivery are still asynchronous, not an atomic dataplane transaction.
+
+Capacity rejection alone preserves usable admitted credentials, rotation, and
+issuer readiness. Retiring material is never evicted early to accept growth.
+This is not automatic repair of previously overcommitted installations: before
+upgrading an older controller or changing rotation policy, reduce the admitted
+catalog to the new limit and allow old retiring generations to drain under the
+old policy. An established admitted catalog above the reserve fails closed rather
+than silently evicting caches. Missing/corrupt durable credentials, counter
+exhaustion, and malformed catalog inputs also retain their intentional fail-closed
+behavior. Do not reset initialization state to work around these failures.
+
 ## Measured limits
 
 The 100,000-waiter test verifies bounded admission and shared publication ownership.

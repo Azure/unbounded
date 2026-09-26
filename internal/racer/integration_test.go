@@ -79,6 +79,7 @@ func TestEnvtestServer(t *testing.T) {
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
 	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
+	t.Run("catalog-capacity", func(t *testing.T) { integrationCatalogCapacity(t, c) })
 	t.Run("workload-readiness", func(t *testing.T) { integrationWorkloadReadiness(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })
 	t.Run("manager-election-HTTPS-failover", func(t *testing.T) { integrationManagers(t, rc, scheme, c) })

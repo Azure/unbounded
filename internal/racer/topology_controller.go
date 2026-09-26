@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"errors"
+	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -27,12 +28,18 @@ type TopologyReconciler struct {
 	Config       Config
 	Publications *Publications
 	Accepted     AcceptedMembers
+	CatalogMu    *sync.Mutex
 }
 
 // Reconcile builds from the synchronized cache, reads the version ConfigMap
 // authoritatively, commits counters/hashes with CAS, then installs the result.
 // Conflicts requeue from fresh inputs; missing established counters fail closed.
 func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	if r.CatalogMu != nil {
+		r.CatalogMu.Lock()
+		defer r.CatalogMu.Unlock()
+	}
+
 	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
@@ -72,13 +79,37 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	}
 
 	var caches racerv1.ClusterCacheList
-	if err := r.List(ctx, &caches); err != nil {
+	if err := r.APIReader.List(ctx, &caches); err != nil {
 		return err
 	}
 
 	catalog, err := BuildCatalog(caches.Items)
 	if err != nil {
 		return err
+	}
+
+	// The committed keyring is the admission authority. A cache event can arrive
+	// before its keys exist; only the subsequent Secret event may publish it.
+	// Read authoritatively so a stale informer cannot admit rejected growth.
+	if claim := cm.Annotations[credentialClaim]; claim != "" {
+		_, _, bundle, _, _, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+		if err != nil {
+			r.Publications.Suspend()
+			return err
+		}
+
+		keyed := keyedCaches(bundle)
+
+		accepted := catalog[:0]
+		for _, cache := range catalog {
+			if keyed[cache.ID] {
+				accepted = append(accepted, cache)
+			}
+		}
+
+		catalog = accepted
+	} else {
+		catalog = nil
 	}
 
 	var ds appsv1.DaemonSet
@@ -146,6 +177,7 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(r.Config))).
 		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.DaemonSetName))).
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.IssuerSecretName, r.Config.KeyringSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)

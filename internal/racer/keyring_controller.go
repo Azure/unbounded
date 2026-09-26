@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -44,12 +45,18 @@ type KeyringReconciler struct {
 	Issuer    *Issuer
 	Lifecycle *Lifecycle
 	Now       func() time.Time
+	CatalogMu *sync.Mutex
 }
 
 // Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
 // stages trust before using a new issuer, and returns RequeueAfter for deadlines.
 // Enforce projected size bounds including overlapping keys before committing.
 func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	if r.CatalogMu != nil {
+		r.CatalogMu.Lock()
+		defer r.CatalogMu.Unlock()
+	}
+
 	result, err := r.reconcileKeys(ctx)
 	if ctx.Err() != nil {
 		err = ctx.Err()

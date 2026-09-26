@@ -81,6 +81,10 @@ func generateIssuer(now time.Time, cfg Config) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
+	if len(cert) > reservedRootBytes {
+		return nil, nil, wire.TooLarge
+	}
+
 	encoded, err := x509.MarshalPKCS8PrivateKey(key)
 
 	return cert, encoded, err

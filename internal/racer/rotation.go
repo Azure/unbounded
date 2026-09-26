@@ -245,6 +245,11 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return ctrl.Result{}, err
 	}
 
+	catalog, err = admitCatalog(ctx, r.Config, catalog, b)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	now := r.now()
 	// Downtime may exhaust a staged root's useful lifetime. Cancel that unused
 	// preparation and stage a fresh replacement with a full new preparation delay.
@@ -429,6 +434,11 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 	id := rootID(cert)
 	b := wire.KeyringBundle{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster, Generation: 1, PeerTrustRoots: [][]byte{cert}}
 	s := RotationState{ActiveIssuer: id, NextRotation: now.Add(r.Config.Rotation.Interval), Retiring: map[string]time.Time{}}
+
+	catalog, err = admitCatalog(ctx, r.Config, catalog, b)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	b, s, err = r.PlanRotation(b, s, catalog, now)
 	if err != nil {

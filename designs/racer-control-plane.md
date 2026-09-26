@@ -36,7 +36,8 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
   node issuer/trust and shared cache key transitions, persisting timestamps beside
   bundle.json. RequeueAfter schedules rotation; no extra rotation goroutine or
   persistent jobs. Stage roots/keys before activation, retain retiring material,
-  and enforce the 512 KiB bundle bound including overlap. No acknowledgments.
+  and reserve the 512 KiB bundle bound before admitting catalog growth, including
+  active, prepared, and all retiring generations. No acknowledgments.
 - `WorkloadReconciler` manages the DaemonSet. Its desired spec includes a projected
   racer-control token, common keyring and bootstrap trust, node-private identity
   storage, slabs, client/origin socket mounts, and exclusion-label affinity.
@@ -144,10 +145,12 @@ Missing annotations reset to defaults. Missing managed DaemonSets are endpoint g
 Callers supply installation-namespace Pods and the current managed DaemonSet UID;
 endpoint selection checks the `apps/v1` DaemonSet controller owner reference.
 
-`BuildCatalog` returns a UID-sorted catalog or rejects the whole candidate. It
+`BuildCatalog` returns a UID-sorted desired catalog or rejects the whole candidate. It
 defaults socket mode to 0660, preserves explicit zero permissions, and delegates
-canonical path validation to the wire package. Nodes and caches remain present
-until absent from the input lists (or explicitly excluded for Nodes); only Pod
+canonical path validation to the wire package. Capacity admission then retains
+existing keyed UIDs and fills free slots in UID order. Topology publishes only
+caches with both active key purposes in the committed keyring. Nodes remain present
+until absent from the input lists (or explicitly excluded); only Pod
 endpoint selection filters deletion timestamps. Complete publication byte bounds
 and canonical hashes are checked by `wire.ContentHashes` before version assignment.
 
@@ -163,6 +166,16 @@ make keyring reconciliation unready. Names are immutable: delete the invalid
 ClusterCache and create a validly named replacement, updating adapters to its new
 socket paths. The replacement has a new UID/cache identity and cold cache state.
 Complete this cleanup before expecting the controller to become ready.
+
+Cache capacity is a controller service-admission policy rather than a CRD object
+count limit. The default maximum is 356 caches. See the controller README's
+[capacity policy](../cmd/racer-controller/README.md#cache-catalog-capacity-and-rotation)
+for the reserve formula, rejection diagnostics, stable existing-UID priority,
+deletion/recreation behavior, and upgrade/policy-change prerequisites. Active key
+scopes in the existing Secret retain admission across restart; no additional
+catalog checkpoint is introduced. Topology and keyring reconciliation share a
+leader-local mutex, use authoritative catalog/credential reads, and watch common
+Secret changes so additions are published only after their keys commit.
 
 ## Authentication
 
@@ -301,7 +314,12 @@ establishes 100,000-node HTTPS capacity.
   activation. Caches added during an existing preparation retain their initial
   active keys until the next cycle. Removed cache UIDs lose their key scopes;
   recreation receives unrelated keys.
-- Before staging, encode the complete overlapping candidate under the 512 KiB
+- Before accepting growth, reserve active/prepared keys and
+  `ceil(RetainFor / (Interval + PrepareFor))` retiring generations, with both key
+  purposes, worst-case generation digits, and bounded root encoding. Capacity
+  rejection logs the omitted cache name/UID and limit without resetting issuer
+  readiness or displacing an existing admitted UID. Before staging, encode the
+  complete overlapping candidate under the 512 KiB
   limit, including its incremented generation. Then persist new private issuer
   material first and publish its root and prepared cache keys in one common-Secret
   CAS. An interrupted staging write reuses the pending private issuer. Activation
@@ -314,7 +332,7 @@ establishes 100,000-node HTTPS capacity.
   in a loop. Long downtime that exhausts a prepared root cancels that unused
   preparation and stages fresh material with a full preparation delay. Expired
   active issuers remain unready until activation recovers usable signing state.
-  Generation exhaustion, malformed state, missing material, and size overflow
+  Generation exhaustion, malformed state, missing material, and durable overcommit
   fail closed without resetting generation or overwriting corrupt state.
 - `Issuer.Issue(ctx, NodeIdentity, wire.BootstrapRequest)` verifies Ed25519 CSR
   proof of possession and response bounds, discards requested names/extensions,

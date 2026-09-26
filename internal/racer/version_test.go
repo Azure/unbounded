@@ -371,6 +371,8 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
+
 	catalog := reconcileTopology(t, r, ctx)
 	if v := catalog.Version(); v.Sequence != 2 || v.MembershipVersion != 1 {
 		t.Fatalf("catalog counters: %+v", v)

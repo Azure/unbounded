@@ -507,6 +507,8 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 
 func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, initial, _, _ := keyState(t, r)
 
 	for n := range 800 {
 		cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("cache-%d", n), UID: types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", n+1))}}
@@ -516,20 +518,44 @@ func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	}
 
 	runKeys(t, r)
-	shared, _, state, _ := keyState(t, r)
-	*now = state.NextRotation
+	shared, admitted, state, _ := keyState(t, r)
 
+	capacity, err := catalogCapacity(r.Config, admitted)
+	if err != nil || len(admitted.CacheKeys) != 2*capacity || capacity >= 801 || !r.Lifecycle.issuer {
+		t.Fatalf("rotation capacity not enforced: %d, %v", capacity, err)
+	}
+
+	for _, key := range initial.CacheKeys {
+		found := false
+		for _, accepted := range admitted.CacheKeys {
+			found = found || key.EqualMaterial(accepted)
+		}
+
+		if !found {
+			t.Fatal("growth evicted an existing cache key")
+		}
+	}
+
+	base := r.Client
 	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
-		t.Fatal("oversized overlap wrote durable state")
+		t.Fatal("rejected growth wrote durable state")
 		return nil
 	}})
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); !errors.Is(err, wire.TooLarge) {
-		t.Fatalf("oversized overlap: %v", err)
-	}
+	runKeys(t, r)
 
 	unchanged, _, _, _ := keyState(t, r)
 	if unchanged.ResourceVersion != shared.ResourceVersion {
-		t.Fatal("oversized rotation consumed generation")
+		t.Fatal("rejected growth consumed generation")
+	}
+
+	r.Client = base
+	*now = state.NextRotation
+
+	runKeys(t, r)
+
+	_, staged, _, _ := keyState(t, r)
+	if len(staged.CacheKeys) != 4*capacity || !r.Lifecycle.issuer {
+		t.Fatal("admitted catalog could not rotate")
 	}
 }
 
