@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -227,6 +228,58 @@ func TestWorkloadReconcileCreateRepairAndNoop(t *testing.T) {
 
 	if version != ds.ResourceVersion {
 		t.Fatal("no-op wrote again")
+	}
+}
+
+func TestWorkloadMaxUnavailable(t *testing.T) {
+	for _, want := range []intstr.IntOrString{intstr.FromInt32(1), intstr.FromInt32(5), intstr.FromString("25%"), intstr.FromString("100%")} {
+		t.Run(want.String(), func(t *testing.T) {
+			r := workloadFixture(t)
+			r.Config.DataplaneMaxUnavailable = want
+
+			ds, err := r.DesiredDaemonSet()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			strategy := ds.Spec.UpdateStrategy
+			if strategy.Type != appsv1.RollingUpdateDaemonSetStrategyType || strategy.RollingUpdate == nil || strategy.RollingUpdate.MaxUnavailable == nil || *strategy.RollingUpdate.MaxUnavailable != want || strategy.RollingUpdate.MaxSurge == nil || *strategy.RollingUpdate.MaxSurge != intstr.FromInt32(0) {
+				t.Fatalf("unexpected rollout strategy: %+v", strategy)
+			}
+
+			ctx := context.Background()
+			// Existing installations must adopt the configured value instead of 1.
+			ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = ptr.To(intstr.FromInt32(1))
+			if err := r.Create(ctx, ds); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.Get(ctx, client.ObjectKeyFromObject(ds), ds); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable; got == nil || *got != want {
+				t.Fatalf("reconciled maxUnavailable = %v, want %v", got, want)
+			}
+
+			version := ds.ResourceVersion
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.Get(ctx, client.ObjectKeyFromObject(ds), ds); err != nil {
+				t.Fatal(err)
+			}
+
+			if ds.ResourceVersion != version {
+				t.Fatal("stable rollout configuration wrote again")
+			}
+		})
 	}
 }
 

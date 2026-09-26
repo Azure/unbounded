@@ -120,7 +120,7 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels}, Spec: appsv1.DaemonSetSpec{
 		Selector:       &metav1.LabelSelector{MatchLabels: labels},
-		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: ptr.To(intstr.FromInt32(1)), MaxSurge: ptr.To(intstr.FromInt32(0))}},
+		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: ptr.To(c.DataplaneMaxUnavailable), MaxSurge: ptr.To(intstr.FromInt32(0))}},
 		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
 			ServiceAccountName: c.DataplaneServiceAccount, AutomountServiceAccountToken: ptr.To(false),
 			RestartPolicy: corev1.RestartPolicyAlways, DNSPolicy: corev1.DNSClusterFirst, SchedulerName: corev1.DefaultSchedulerName,

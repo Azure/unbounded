@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -25,6 +27,7 @@ type Config struct {
 	TLSPrivateKeyFile         string
 	BootstrapTrustConfigMap   string
 	DataplaneImage            string
+	DataplaneMaxUnavailable   intstr.IntOrString
 	PeerPort                  uint16
 	DataplaneServiceAccount   string
 	DaemonSetName             string
@@ -66,6 +69,7 @@ func LoadConfig() (Config, error) {
 		ControlAddress: env("RACER_CONTROL_ADDRESS", ":8443"), MetricsAddress: env("RACER_METRICS_ADDRESS", ":8080"), ProbeAddress: env("RACER_PROBE_ADDRESS", ":8081"),
 		ControlURL: env("RACER_CONTROL_URL", ""), TLSCertificateFile: env("RACER_TLS_CERTIFICATE_FILE", "/etc/racer/tls/tls.crt"), TLSPrivateKeyFile: env("RACER_TLS_PRIVATE_KEY_FILE", "/etc/racer/tls/tls.key"),
 		BootstrapTrustConfigMap: env("RACER_BOOTSTRAP_TRUST_CONFIGMAP", "racer-bootstrap-trust"), DataplaneImage: env("RACER_DATAPLANE_IMAGE", ""), PeerPort: uint16(port),
+		DataplaneMaxUnavailable: intstr.Parse(env("RACER_DATAPLANE_MAX_UNAVAILABLE", "1")),
 		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"), DaemonSetName: env("RACER_DAEMONSET_NAME", "racer-dataplane"),
 		IssuerSecretName: env("RACER_ISSUER_SECRET_NAME", "racer-issuer"), KeyringSecretName: env("RACER_KEYRING_SECRET_NAME", "racer-keyring"),
 		VersionConfigMapName: env("RACER_VERSION_CONFIGMAP_NAME", "racer-version"), InstallationConfigMapName: env("RACER_INSTALLATION_CONFIGMAP_NAME", "racer-installation"),
@@ -77,6 +81,22 @@ func LoadConfig() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	// MaxSurge is zero, so maxUnavailable must allow at least one pod to update.
+	validUnavailable := false
+
+	switch c.DataplaneMaxUnavailable.Type {
+	case intstr.Int:
+		validUnavailable = c.DataplaneMaxUnavailable.IntVal > 0
+	case intstr.String:
+		value := c.DataplaneMaxUnavailable.StrVal
+		percent, err := strconv.ParseUint(strings.TrimSuffix(value, "%"), 10, 8)
+		validUnavailable = err == nil && percent > 0 && percent <= 100 && len(validation.IsValidPercent(value)) == 0
+	}
+
+	if !validUnavailable {
+		return fmt.Errorf("RACER_DATAPLANE_MAX_UNAVAILABLE must be a positive integer or a percentage from 1%% to 100%%: %w", wire.InvalidRequest)
+	}
+
 	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort == 0 {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}

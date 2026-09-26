@@ -128,6 +128,29 @@ rerunning the initialization Job. Inspect operator logs and the initialization
 Job if installation does not complete. On Sites, `RacerReady` reports the
 operator's reconciliation result, not workload availability.
 
+## Dataplane rollout configuration
+
+Set `RACER_DATAPLANE_MAX_UNAVAILABLE` in the **racer-controller** container's
+environment to configure the managed dataplane DaemonSet's rolling-update
+`maxUnavailable`. When unset, it defaults to integer `1`. Accepted values are
+positive integers (up to 2147483647) or whole-number percentages from `1%` through
+`100%`. Empty, zero, negative, malformed, and out-of-range values fail controller
+startup. `maxSurge` remains `0`.
+
+To allow an aggressive rollout across all dataplane nodes, set:
+
+```yaml
+env:
+  - name: RACER_DATAPLANE_MAX_UNAVAILABLE
+    value: "100%"
+```
+
+Restart the controller after changing its environment. It reconciles this value
+onto both new and existing dataplane DaemonSets; direct edits to the DaemonSet's
+rollout strategy are overwritten. `100%` permits all dataplane pods to be
+unavailable simultaneously during an update. For an operator-managed installation,
+persist the environment setting through the `racer` Deployment workload override.
+
 ## First installation without the operator
 
 1. Choose a **new permanent cluster UUID**, namespace, controller image, and
