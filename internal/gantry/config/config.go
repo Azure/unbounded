@@ -409,6 +409,23 @@ type Config struct {
 	// Bootstrap is the chair prefetch path's job.
 	LayerSeedOriginFallback bool `yaml:"layer_seed_origin_fallback"`
 
+	// RangeCacheDir holds ranges fetched from peers or origin. It defaults to a
+	// subdirectory of the libp2p hostPath because that is the only node-backed
+	// writable mount the agent already has; the container root is read-only and
+	// /tmp is an emptyDir subject to ephemeral-storage eviction. Empty disables
+	// range caching.
+	RangeCacheDir string `yaml:"range_cache_dir"`
+
+	// RangeCacheMaxBytes caps the on-disk range cache. Once reached the cache
+	// stops admitting new blobs rather than evicting, so a steady read pattern
+	// keeps its working set.
+	RangeCacheMaxBytes int64 `yaml:"range_cache_max_bytes"`
+
+	// MaxCachedRangeBytes is the largest single range worth caching. Index
+	// reads are a few KiB; anything large is bulk layer traffic that would
+	// evict the small reads that actually gate container start.
+	MaxCachedRangeBytes int64 `yaml:"max_cached_range_bytes"`
+
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
 	// stream completion is the fast path that makes finishers discoverable
@@ -578,6 +595,9 @@ func NewDefault() *Config {
 		LayerSeedConcurrency:        8,
 		LayerSeedPeerPatience:       45 * time.Minute, // peer-only seeding keeps polling the swarm instead of giving up
 		LayerSeedBudget:             time.Hour,
+		RangeCacheDir:               "/var/lib/gantry/libp2p/rangecache",
+		RangeCacheMaxBytes:          4 << 30,
+		MaxCachedRangeBytes:         4 << 20,
 		HRWTopologyScope:            "cluster",
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
@@ -706,6 +726,17 @@ func (c *Config) LoadEnv(env func(string) string) error {
 			*dst = n
 		}
 	}
+	setInt64 := func(key string, dst *int64) {
+		if v, ok := lookup(env, key); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+				return
+			}
+
+			*dst = n
+		}
+	}
 	setDur := func(key string, dst *time.Duration) {
 		if v, ok := lookup(env, key); ok {
 			d, err := time.ParseDuration(v)
@@ -809,6 +840,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
 	setInt("TRANSFER_MAX_CONCURRENT_RANGE_SERVES", &c.TransferMaxConcurrentRangeServes)
 	setBool("LAYER_SEED_ORIGIN_FALLBACK", &c.LayerSeedOriginFallback)
+	setStr("RANGE_CACHE_DIR", &c.RangeCacheDir)
+	setInt64("RANGE_CACHE_MAX_BYTES", &c.RangeCacheMaxBytes)
+	setInt64("MAX_CACHED_RANGE_BYTES", &c.MaxCachedRangeBytes)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)

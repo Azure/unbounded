@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
@@ -68,6 +69,15 @@ type Server struct {
 	// rangeSem, when non-nil, admits small bounded ranges independently of
 	// serveSem so index reads are never queued behind bulk layer streams.
 	rangeSem chan struct{}
+	// ranges, when set, answers range requests for blobs this node has only
+	// partially fetched. Without it a peer cannot serve any part of a layer
+	// until it holds all of it, which is why a cold image has no peer source.
+	ranges RangeSource
+}
+
+// RangeSource serves byte ranges of blobs that are not present in full.
+type RangeSource interface {
+	OpenRange(ctx context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error)
 }
 
 // fastRangeMaxBytes bounds the range lane. Anything larger is a bulk transfer
@@ -157,6 +167,14 @@ func WithMaxConcurrentRangeServes(n int) Option {
 		if n > 0 {
 			s.rangeSem = make(chan struct{}, n)
 		}
+	}
+}
+
+// WithRangeSource lets the server answer Range requests for blobs it holds
+// only partially, so cached OverlayBD index reads become peer-servable.
+func WithRangeSource(rs RangeSource) Option {
+	return func(s *Server) {
+		s.ranges = rs
 	}
 }
 
@@ -258,6 +276,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	if err != nil {
 		var enf *ifaces.ErrNotFound
 		if errors.As(err, &enf) {
+			if s.serveCachedRange(w, r, d, kind) {
+				return
+			}
+
 			if s.metrics.onPeerMiss != nil {
 				s.metrics.onPeerMiss()
 			}
@@ -393,6 +415,52 @@ func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
 	}
+}
+
+// serveCachedRange answers an exact Range request from partially-held content.
+// It reports whether it wrote a response.
+func (s *Server) serveCachedRange(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) bool {
+	if s.ranges == nil || kind != ifaces.KindBlob {
+		return false
+	}
+
+	requested, err := httprange.ParseExact(r.Header.Get("Range"))
+	if err != nil {
+		return false
+	}
+
+	body, total, err := s.ranges.OpenRange(r.Context(), d, requested)
+	if err != nil {
+		return false
+	}
+
+	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
+
+	w.Header().Set("Docker-Content-Digest", d.String())
+	w.Header().Set("Content-Type", contentTypeFor(kind, s.lookupMediaType(d), ""))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", requested.Start, requested.End, total))
+	w.Header().Set("Content-Length", strconv.FormatInt(requested.Length(), 10))
+
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusPartialContent)
+		s.bumpServe()
+
+		return true
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+
+	written, err := streamcopy.CopyN(w, body, requested.Length())
+	s.bumpServeBytes(kind, written)
+
+	if err != nil {
+		s.logger.Debug("transfer: cached range copy failed", slog.Any("err", err))
+	}
+
+	s.bumpServe()
+
+	return true
 }
 
 func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {

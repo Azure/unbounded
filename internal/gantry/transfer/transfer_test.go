@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 )
@@ -351,6 +352,84 @@ func TestSmallRangeBypassesSaturatedBlobCap(t *testing.T) {
 	}
 
 	_ = shed.Body.Close() //nolint:errcheck // best-effort body close
+}
+
+// cachedRanges serves a single fixed range, standing in for the rangecache.
+type cachedRanges struct {
+	digest digest.Digest
+	start  int64
+	body   []byte
+	total  int64
+}
+
+func (c *cachedRanges) OpenRange(_ context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error) {
+	if d != c.digest || requested.Start < c.start || requested.End > c.start+int64(len(c.body))-1 {
+		return nil, -1, &ifaces.ErrNotFound{Digest: d}
+	}
+
+	offset := requested.Start - c.start
+
+	return io.NopCloser(bytes.NewReader(c.body[offset : offset+requested.Length()])), c.total, nil
+}
+
+// A peer holding no complete blob must still be able to answer an index read,
+// otherwise a cold image has no peer source at all.
+func TestServesRangeFromCacheWhenBlobAbsent(t *testing.T) {
+	cache := fakes.NewCache()
+	d := mustDigest([]byte("a layer this node never finished downloading"))
+
+	s := New(cache, WithRangeSource(&cachedRanges{digest: d, start: 100, body: []byte("INDEXDATA"), total: 1 << 30}))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Range", "bytes=102-106")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Content-Range"); got != "bytes 102-106/1073741824" {
+		t.Errorf("Content-Range = %q, want bytes 102-106/1073741824", got)
+	}
+
+	got, _ := io.ReadAll(resp.Body) //nolint:errcheck // body already validated
+	if string(got) != "DEXDA" {
+		t.Errorf("body = %q, want DEXDA", got)
+	}
+}
+
+// Without a cached range the answer must stay 404 so the requester moves on.
+func TestUncachedRangeStillMisses(t *testing.T) {
+	cache := fakes.NewCache()
+	d := mustDigest([]byte("absent"))
+
+	s := New(cache, WithRangeSource(&cachedRanges{digest: d, start: 0, body: []byte("xy"), total: 10}))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Range", "bytes=500-600")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
 }
 
 func TestIsFastRange(t *testing.T) {
