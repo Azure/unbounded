@@ -614,8 +614,8 @@ func NewDefault() *Config {
 		MaxCachedRangeBytes:         4 << 20,
 		IndexPrefetchHeadBytes:      256 << 10,
 		IndexPrefetchTailBytes:      2 << 20,
-		IndexPrefetchConcurrency:    8,
-		IndexPrefetchJitter:         2 * time.Second,
+		IndexPrefetchConcurrency:    16,
+		IndexPrefetchJitter:         500 * time.Millisecond,
 		HRWTopologyScope:            "cluster",
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
