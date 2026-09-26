@@ -375,8 +375,16 @@ deployment integration check and is not exercised by envtest.
   Pod of the current managed DaemonSet and ServiceAccount. Node certificates bind
   Node UIDs rather than Pod UIDs, so replacement authorized Pods on the same Node
   can continue using a locally persisted valid identity. UID-only certificates
-  currently require an authoritative Node list followed by a namespace-scoped Pod
-  list filtered by `spec.nodeName`; Phase 7 measures this API load below.
+  use an informer Node UID index and a namespace-scoped managed-Pod-by-Node index
+  solely to discover names. Live GETs validate Node UID/exclusion, Pod UID and
+  assignment/state/owner, current DaemonSet UID, and ServiceAccount existence/state.
+  Bootstrap still checks the TokenReview ServiceAccount UID. No authorization
+  positive is cached. Missing/stale hints fail closed until convergence; a Pod
+  recreation must be observed before its new UID can authorize the Node. More than
+  four candidate Pods returns unavailable, bounding even stale-candidate API work.
+  Production explicitly wires discovery to the manager cache and security reads
+  to APIReader. Cache sync and leadership readiness gates remain in effect, and
+  the final post-wait authorization repeats live reads rather than reusing facts.
 - `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
   and verifies optional client certificates using fresh roots per handshake, and
@@ -568,40 +576,63 @@ Race timings are correctness instrumentation results, not production performance
 
 ### Live HTTPS/API authorization cost
 
-The envtest measurement uses the actual HTTPS handler with a real certificate and
-an instrumented authoritative client; the connection is warmed first. Ten sequential
-snapshot requests each perform two authorization passes. Each pass reads installation,
-version, issuer, and common Secret state, lists Nodes and assigned Pods, and gets
-the DaemonSet and ServiceAccount. This is **16 API requests and two full Node lists
-per response**, plus four trust reads on a new TLS handshake. Source:
-`internal/racer/server.go:374` and `:65`, `internal/racer/certificates.go:116`
-and `:259`, and `internal/racer/authorization.go:64`.
+The envtest measurement uses the actual HTTPS handler with a real certificate,
+the elected manager's indexed informer cache, and an instrumented authoritative
+client; the connection is warmed first. Ten sequential snapshot requests each
+perform two authorization passes. Each pass reads installation, version, issuer,
+and common Secret state, then GETs the Node, candidate Pod, DaemonSet, and
+ServiceAccount. With one candidate this is **16 live GETs per response, zero live
+Node or Pod lists**, plus four trust reads on a new TLS handshake. Source:
+`internal/racer/server.go:376` (`serveSnapshot`),
+`internal/racer/certificates.go:120` (`loadSigning`) and `:264`
+(`AuthenticateCertificate`), and `internal/racer/authorization.go:98`
+(`authorizeNode`). The previous implementation's full lists have been removed.
 
-A race-instrumented run with envtest QPS=1000/burst=2000 measured:
+A September 26, 2026 Go 1.26.6 race-instrumented run with Kubernetes 1.37 envtest
+QPS=1000/burst=2000 measured:
 
-| Live Nodes | Snapshots | Elapsed | API requests | Node lists | API response bytes |
+| Live Nodes | Snapshots | Elapsed | API GETs | Node/Pod lists | API response bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 10 | 246.773746 ms | 160 | 20 | 273,340 |
-| 1,001 | 10 | 966.947811 ms | 160 | 20 | 7,058,860 |
+| 1 | 10 | 360.130223 ms | 160 | 0 / 0 | 300,320 |
+| 1,001 | 10 | 320.395616 ms | 160 | 0 / 0 | 300,320 |
 
-That standalone race envtest run passed in 15.532 s (14.45 s inside the test),
-including a 4.647877135 s forced-Lease-loss-to-authenticated-recovery interval with
-unchanged sequence/membership 2/2. The final full relevant race suite, including
-the added real workload-drift and normal-cancellation assertions, passed:
-`internal/racer` 27.873 s, `internal/racer/wire` 17.342 s, and `deploy/racer`
-1.093 s; API and controller command packages compiled with no test files. Targeted
-`make fmt` and lint reported zero issues. Manifest rendering and controller build
-also passed. These elapsed values are observations from this host, not guarantees.
+That race envtest run passed in 15.929 s, including a 4.528091977 s forced-Lease-loss
+to authenticated recovery interval with unchanged sequence/membership 2/2. These
+elapsed values are host observations, not guarantees. The test waits for all 1,001
+Nodes to reach the actual informer, asserts the exact request count and zero live
+lists at both sizes, and allows only 1 KiB byte variation for unrelated version
+metadata. The added Nodes are excluded from membership. Watch/list traffic used
+to maintain discovery is outside the request measurement; response bytes count API
+bodies, not TLS framing. Frozen-cache unit tests exercise stale positives, deletion,
+recreation, exclusion, owner changes, missing/terminating ServiceAccounts, API
+failure, candidate overflow, and eventual recovery. Pooled TLS and post-wait
+revocation tests use frozen hints; trust retirement and leadership tests still run.
 
-The added Nodes are excluded from membership but still appear in authoritative
-Node lists. Response-byte totals count API bodies, not TLS framing. This is a small
-sequential cost measurement, not a throughput or concurrent HTTPS capacity result.
-At 100,000 clients polling every 30 seconds, the current algorithm would require
-about 53,333 API requests/s and 666.7 million Node entries/s when the cluster also
-has 100,000 Nodes, before reconnects and changes. Those are arithmetic extrapolations,
-not measured achieved rates. Production capacity at that size is unverified and
-the full-list authorization path is a known scaling limitation. Changing live
-authorization lookup/freshness needs a separately reviewed server design.
+Each pass permits at most four live Pod candidates: the conservative maximum is
+4 credential GETs + 1 Node GET + 4*(Pod + DaemonSet + ServiceAccount) GETs, or 17
+per pass and 34 per response. Excess candidates fail before any Pod GET. Normal
+DaemonSet rollout overlap fits this bound; abnormal excess denies service until
+resolved. Index lookup avoids scanning unrelated cached Nodes/Pods; informer
+storage and index maintenance still scale with watched objects. The cache's index
+implementation can materialize all matching references before its result limit,
+so this is a live-read bound, not a claim of constant memory under arbitrary
+same-Node candidate inflation.
+
+Credential reads deliberately remain live on both passes: installation UID/claim,
+Secret deletion/corruption, and rotation consistency cannot be replaced by stale
+positive trust. The fix removes cluster-size amplification, not the constant
+credential-read and parsing cost. At 100,000 clients polling every 30 seconds,
+the normal path still implies about 53,333 API GETs/s before reconnects or changes.
+This is arithmetic, not measured throughput, and 100,000-client HTTPS capacity
+remains unverified. Full credential bundles also vary with catalog/rotation size.
+
+Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:115`); the pinned
+controller-runtime v0.25.1 `pkg/client/config/config.go:96-105` sets default QPS=-1,
+disabling client-side throttling in favor of API priority/fairness. It does not
+inherit standalone client-go's zero-config 5-QPS/10-burst defaults. The envtest
+rate settings and small sequential sample do not demonstrate API-server capacity;
+authentication concurrency/deadlines remain the local bounds. No new throttling
+override or cross-request authorization/trust cache is introduced.
 
 Full snapshot distribution also sends one copy over the network per recipient:
 the measured 21.5 MB publication would require about 2.15 TB per 100,000-recipient

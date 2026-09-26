@@ -336,6 +336,7 @@ func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
 	for _, scenario := range []string{"excluded", "recreated node", "pod gone", "expired"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newServingFixture(t)
+			f.a.Server.Hints = frozenAuthorizationHints(t, f.a)
 
 			cert := f.certificate
 			if scenario == "expired" {
@@ -957,6 +958,7 @@ func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 
 func TestTLSRevocationWhilePolling(t *testing.T) {
 	f := newServingFixture(t)
+	f.a.Server.Hints = frozenAuthorizationHints(t, f.a)
 	endpoint := f.start(t)
 	c := f.client(t, &f.certificate)
 

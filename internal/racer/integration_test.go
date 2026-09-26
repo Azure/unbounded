@@ -754,7 +754,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	t.Helper()
 	// A separate handler shares the elected application's lifecycle/publication.
 	// Its reader records actual API responses without mutating running dependencies.
-	var requests, nodeLists, received atomic.Int64
+	var requests, nodeLists, podLists, received atomic.Int64
 
 	connection := rest.CopyConfig(rc)
 	connection.WrapTransport = func(base http.RoundTripper) http.RoundTripper {
@@ -763,6 +763,10 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 			if req.URL.Path == "/api/v1/nodes" {
 				nodeLists.Add(1)
+			}
+
+			if strings.HasSuffix(req.URL.Path, "/pods") {
+				podLists.Add(1)
 			}
 
 			response, err := base.RoundTrip(req)
@@ -781,6 +785,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 	measured := Assemble(a.Server.Config, reader, reader).Server
 	measured.Lifecycle, measured.Publications = a.Lifecycle, a.Server.Publications
+	measured.Hints = a.Server.Hints
 
 	config, err := measured.TLSConfig(t.Context())
 	if err != nil {
@@ -804,6 +809,8 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	response, err := peer.Get(endpoint)
 	responseBody(t, response, err, 200)
 
+	var baselineBytes int64
+
 	for _, count := range []int{1, 1001} {
 		if count > 1 {
 			for i := range 1000 {
@@ -813,9 +820,16 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 				}
 			}
 		}
+		// Include all added Nodes in the real informer before measuring indexed
+		// discovery. Watch traffic is deliberately outside the request budget.
+		eventually(t, "authorization discovery cache convergence", func() bool {
+			var nodes corev1.NodeList
+			return a.Server.Hints.List(t.Context(), &nodes) == nil && len(nodes.Items) == count
+		})
 
 		requests.Store(0)
 		nodeLists.Store(0)
+		podLists.Store(0)
 		received.Store(0)
 
 		start := time.Now()
@@ -825,11 +839,17 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 			responseBody(t, response, err, 200)
 		}
 
-		if requests.Load() != 160 || nodeLists.Load() != 20 {
-			t.Fatalf("authorization API budget drift: requests=%d node_lists=%d", requests.Load(), nodeLists.Load())
+		if requests.Load() != 160 || nodeLists.Load() != 0 || podLists.Load() != 0 {
+			t.Fatalf("authorization API budget drift: requests=%d node_lists=%d pod_lists=%d", requests.Load(), nodeLists.Load(), podLists.Load())
 		}
 
-		t.Logf("real HTTPS authorization: live_nodes=%d snapshots=10 elapsed=%s API_requests=%d Node_lists=%d API_response_bytes=%d (warm TLS; envtest QPS=1000 burst=2000)", count, time.Since(start), requests.Load(), nodeLists.Load(), received.Load())
+		if count == 1 {
+			baselineBytes = received.Load()
+		} else if received.Load() > baselineBytes+1024 {
+			t.Fatalf("authorization bytes grew with unrelated Nodes: baseline=%d current=%d", baselineBytes, received.Load())
+		}
+
+		t.Logf("real HTTPS authorization: live_nodes=%d snapshots=10 elapsed=%s API_requests=%d Node_lists=%d Pod_lists=%d API_response_bytes=%d (warm TLS; envtest QPS=%g burst=%d)", count, time.Since(start), requests.Load(), nodeLists.Load(), podLists.Load(), received.Load(), rc.QPS, rc.Burst)
 	}
 	// Live revocation on a pooled TLS connection must still forbid snapshot data.
 	node := &corev1.Node{}

@@ -260,7 +260,8 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 // AuthenticateCertificate requires a verified chain, the client-auth usage,
 // cluster-scoped Node URI SAN, current validity, and authorization. Recheck on
 // every poll: an existing TLS connection must not bypass certificate expiry.
-func AuthenticateCertificate(ctx context.Context, reader client.Reader, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
+// reader supplies authoritative facts; hints supplies only indexed informer discovery.
+func AuthenticateCertificate(ctx context.Context, reader, hints client.Reader, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
 	if err := ctx.Err(); err != nil {
 		return NodeIdentity{}, err
 	}
@@ -321,7 +322,7 @@ func AuthenticateCertificate(ctx context.Context, reader client.Reader, cfg Conf
 		}
 	}
 
-	if err := authorizeNode(ctx, reader, cfg, node); err != nil {
+	if err := authorizeNode(ctx, reader, hints, cfg, node); err != nil {
 		return NodeIdentity{}, err
 	}
 

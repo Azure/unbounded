@@ -223,9 +223,31 @@ behavior. Do not reset initialization state to work around these failures.
 ## Measured limits
 
 The 100,000-waiter test verifies bounded admission and shared publication ownership.
-It does not send 100,000 HTTPS responses. Real snapshot authorization currently
-performs two full Node lists and 14 other API reads per successful response on a
-warm TLS connection. Authentication is bounded to 32 concurrent operations and
-snapshot writes to 128; overload returns 429. A 100,000-node HTTPS capacity claim
-has not been established. Envtest cannot verify kubelet Secret/token projection,
+It does not send 100,000 HTTPS responses. Snapshot authorization uses informer
+indexes for Node UID/name and managed Pod discovery, then live GETs for all
+authorization facts. There are no per-request live Node or Pod lists and no
+cached positive authorization. A stale/missing hint can deny service until cache
+convergence; a recreated Pod must have its new UID discovered. More than four
+managed Pod candidates on one Node returns 503 rather than unbounded live reads.
+Node, Pod, DaemonSet, ServiceAccount, and credential checks run before and after
+the long poll, including on pooled TLS connections.
+
+With one candidate, a warm successful response still costs **16 live GETs**:
+eight per pass, including four installation/version/credential reads. Those four
+reads are retained to detect deletion, invalid installation claims, corrupt state,
+and retired trust without a freshness window. The maximum with four candidates
+is 34 GETs across both passes; a new TLS handshake adds four trust reads.
+Race-instrumented Kubernetes 1.37 envtest measured ten sequential snapshots with
+both 1 and 1,001 live Nodes: **160 GETs, zero Node/Pod lists, and 300,320 API-body
+bytes** in each case. This bounds read amplification with cluster size, not API
+server throughput or 100,000-client HTTPS capacity. See
+`designs/racer-control-plane.md` for the measured setup and remaining costs.
+
+Production `Run` uses controller-runtime v0.25.1's `ctrl.GetConfig()`, which sets
+default QPS to -1 (client-side throttling disabled), rather than client-go's
+standalone 5-QPS/10-burst defaults. Envtest uses QPS=1000/burst=2000; its timings
+do not establish production capacity. Authentication is bounded to 32 concurrent
+operations and snapshot writes to 128; overload returns 429. API priority/fairness,
+credential size, informer memory, full snapshot bandwidth, and cache convergence
+remain operational limits. Envtest cannot verify kubelet Secret/token projection,
 host-directory permissions, scheduling, or client runtime behavior.

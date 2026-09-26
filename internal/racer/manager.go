@@ -32,6 +32,8 @@ type Application struct {
 }
 
 // Assemble performs no Kubernetes calls, I/O, cryptography, or goroutine startup.
+// c supplies indexed discovery (configured by SetupWithManager in production);
+// reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	publications := NewPublications(cfg.Limits)
 	lifecycle := newLifecycle(publications)
@@ -45,12 +47,21 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogMu: catalogMu},
 		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle, CatalogMu: catalogMu},
 		Workload:  &WorkloadReconciler{Client: c, APIReader: reader, Config: cfg},
-		Server:    &Server{Config: cfg, APIReader: reader, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Server:    &Server{Config: cfg, APIReader: reader, Hints: c, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
 		Lifecycle: lifecycle,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
+	a.Server.Hints = mgr.GetCache()
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Node{}, nodeUIDIndex, nodeUIDKeys); err != nil {
+		return fmt.Errorf("index authorization Nodes: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, authorizationPodIndex, authorizationPodKeys(a.Server.Config)); err != nil {
+		return fmt.Errorf("index authorization Pods: %w", err)
+	}
+
 	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
 	if err := mgr.Add(a.Lifecycle); err != nil {
 		return fmt.Errorf("register leader lifecycle: %w", err)
@@ -99,6 +110,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	// controller-runtime disables default client-side QPS throttling here;
+	// serving admission bounds concurrency and API priority/fairness governs load.
 	restConfig, err := ctrl.GetConfig()
 	if err != nil {
 		return err
