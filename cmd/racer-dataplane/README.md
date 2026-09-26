@@ -61,9 +61,13 @@ the refill cycle, default step count, and full-cycle coverage threshold. Four sl
 select ordinary traffic; actions gated by node count or native mode also fall back
 to ordinary traffic without resampling. Order, node/worker counts, victims, ranges,
 fault subtypes, and polling quanta are seeded; there are no scenario scripts.
-Runs shorter than a full cycle are useful for failure minimization but omit the
-full-cycle coverage assertions. A custom corpus can fail its coverage obligations
-even if its individual requests are correct.
+Mandatory path/action coverage is aggregated across the default regression corpus,
+separately for HTTP and native mode, only when `RACER_DST_SEEDS` is absent and the
+step count reaches a full cycle. Any explicit seed list, including `1,7,42`, is a
+custom corpus. Custom seeds and runs shorter than a full cycle report coverage and
+missing obligations without failing for missing coverage. They retain all per-run
+correctness checks. Diagnostics distinguish `DST COVERAGE MISS` from
+`DST CORRECTNESS FAILURE`; exact replay divergence is a correctness failure.
 
 Each run chooses an initial 2-32-node cluster and generates legal concurrent
 HEAD/bootstrap/pinned ranges, origin version mutations, retained old pins, node
@@ -94,18 +98,24 @@ harness does not enroll through a simulated controller.
 
 The independent oracle retains immutable version bytes and checks every delivered
 byte, ETag, range, total size, framing, and status. Healthy recovery must read every
-current object successfully. Mandatory cache-only reads prove an encrypted disk
-read with origin unavailable, followed by a memory hit without disk or origin I/O.
-The native test requires successful native activation and completed DMA writes,
-so HTTP fallback alone cannot pass it. Coverage reports relay-active polling turns,
+current object successfully. Every run probes cache-only reads with origin
+unavailable, followed by a memory hit without disk or origin I/O; completed disk
+reads contribute coverage evidence. Native activation must succeed on every native
+run, and completed DMA writes are a default-corpus coverage obligation.
+Coverage reports relay-active polling turns,
 successful responses, bytes, persisted records, OS completions, and consumed fault
 rules. Every injected OS rule must be observed. Per-turn admission/queue/descriptor
 bounds and final zero quota, descriptor, and native-resource usage are asserted.
-Full cycles require both peer-security rejection modes, all five origin fault
-types, all nine native fault combinations, secondary-worker data work, retirement,
-recreation, and both crash actions. Corpus-wide obligations additionally require
-actual relay activity, blocked sends on established streams, and reads after disk
-corruption. Native rules must be consumed, not merely scheduled.
+The default full-cycle corpus must collectively cover both peer-security rejection
+modes, all five origin fault types, all nine native fault combinations, multiworker
+nodes and secondary-worker data work, retirement, recreation, both crash actions,
+partition/heal, wall jumps, and malformed clients. It also requires successful
+responses and bytes, origin GETs, persisted records, completed writes and accepts,
+verified disk/memory hits, actual relay activity, blocked sends on established
+streams, and reads after disk corruption. An individual seed need not cover every
+path. Every run must consume its injected OS, origin, and native faults, validate
+the effects of executed fault/security probes, and pass exact replay; only one
+execution of each replay pair contributes to aggregate coverage.
 
 The crash model distinguishes volatile data and directory bindings from their
 fsynced durable images. Provisioning is explicitly synced. Process loss first

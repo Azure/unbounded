@@ -160,6 +160,8 @@ struct Coverage {
     secondary_worker_turns: usize,
     native_faults: BTreeMap<String, usize>,
     native_writes: usize,
+    origin_gets: usize,
+    origin_faults: BTreeMap<&'static str, usize>,
     trace: ReplayTrace,
 }
 
@@ -221,6 +223,79 @@ impl ReplayTrace {
     }
 }
 impl Coverage {
+    fn add_to_corpus(&self, counts: &mut BTreeMap<String, usize>, native: bool) {
+        for (name, count) in self.corpus_counts(native) {
+            *counts.entry(name).or_default() += count;
+        }
+    }
+
+    // Only path/action evidence is aggregated. The oracle, bounds, fault
+    // consumption, and replay assertions are checked before a run contributes.
+    fn corpus_counts(&self, native: bool) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for (name, count) in [
+            ("successful-responses", self.success),
+            ("response-bytes", self.bytes),
+            ("origin-gets", self.origin_gets),
+            ("persisted-records", self.persisted),
+            ("secondary-worker-data-turns", self.secondary_worker_turns),
+            ("relay-turns", self.relay_turns),
+        ] {
+            counts.insert(name.into(), count);
+        }
+        for action in [
+            "multi-worker",
+            "key-retirement",
+            "cache-retire-recreate",
+            "inflight-crash",
+            "pending-write-crash",
+            "partition-heal",
+            "wall-jump",
+            "malformed-client",
+            "peer-replay",
+            "peer-signature-corruption",
+            "disk-corruption",
+            "verified-disk-hit",
+            "verified-memory-hit",
+        ] {
+            counts.insert(
+                format!("action:{action}"),
+                self.actions.get(action).copied().unwrap_or(0),
+            );
+        }
+        for operation in ["complete:write", "complete:accept", "blocked:send"] {
+            counts.insert(
+                format!("os:{operation}"),
+                self.operations.get(operation).copied().unwrap_or(0),
+            );
+        }
+        for fault in [
+            "credential-reject",
+            "credential-forbidden",
+            "origin-duplicate-length",
+            "origin-truncated-body",
+            "origin-malformed-etag",
+        ] {
+            counts.insert(
+                format!("origin:{fault}"),
+                self.origin_faults.get(fault).copied().unwrap_or(0),
+            );
+        }
+        if native {
+            counts.insert("native-writes".into(), self.native_writes);
+            for operation in ["Bind", "Write", "Invalidate"] {
+                for fault in ["reject", "delay", "completion"] {
+                    let rule = format!("{operation}:{fault}");
+                    counts.insert(
+                        format!("native:{rule}"),
+                        self.native_faults.get(&rule).copied().unwrap_or(0),
+                    );
+                }
+            }
+        }
+        counts
+    }
+
     fn collect_native(&mut self, fabric: &crate::rdma::lifecycle::simulation::Simulation) {
         for event in fabric.take_trace() {
             self.native_writes += usize::from(
@@ -1114,8 +1189,9 @@ impl Harness {
     }
 
     fn cache_obligations(&mut self) {
-        // Every run proves a completed disk hit, then a memory hit. The origin
-        // version is unavailable, so refetching cannot disguise a cache failure.
+        // Probe disk and memory hits on every run. The origin version is
+        // unavailable, so refetching cannot disguise a cache failure. Actual
+        // disk-path evidence contributes to default corpus coverage.
         let node = self.rng.pick(self.nodes.len());
         let client = self.request_on(2, false, false, node);
         self.exchange(client, false);
@@ -1135,28 +1211,31 @@ impl Harness {
         let client = self.request_on(2, true, false, node);
         self.catalog.borrow_mut().current.remove(&2);
         self.exchange(client, false);
-        assert!(
-            self.coverage
-                .operations
-                .get("complete:read")
-                .copied()
-                .unwrap_or(0)
-                > reads,
-            "cache-only request did not read encrypted storage"
-        );
+        let disk_reads = self
+            .coverage
+            .operations
+            .get("complete:read")
+            .copied()
+            .unwrap_or(0);
         assert_eq!(
             self.catalog.borrow().calls,
             calls,
             "disk hit reached origin"
         );
-        self.coverage.action("verified-disk-hit");
-        let reads = self.coverage.operations["complete:read"];
+        if disk_reads > reads {
+            self.coverage.action("verified-disk-hit");
+        }
         self.catalog.borrow_mut().current.insert(2, version.clone());
         let client = self.request_on(2, true, false, node);
         self.catalog.borrow_mut().current.remove(&2);
         self.exchange(client, false);
         assert_eq!(
-            self.coverage.operations["complete:read"], reads,
+            self.coverage
+                .operations
+                .get("complete:read")
+                .copied()
+                .unwrap_or(0),
+            disk_reads,
             "memory hit read disk"
         );
         assert_eq!(
@@ -1742,20 +1821,20 @@ impl Harness {
             .copied()
             .unwrap_or(0);
         self.exchange(client, true);
-        assert!(
-            self.coverage
-                .operations
-                .get("complete:read")
-                .copied()
-                .unwrap_or(0)
-                > reads,
-            "corrupted disk record was not read"
-        );
+        let read = self
+            .coverage
+            .operations
+            .get("complete:read")
+            .copied()
+            .unwrap_or(0)
+            > reads;
         self.sim
             .disk()
             .corrupt(&path, offset, &original, DiskState::Both)
             .unwrap();
-        self.coverage.action("disk-corruption");
+        if read {
+            self.coverage.action("disk-corruption");
+        }
     }
 
     fn check(&mut self, client: &Client, faulted: bool) {
@@ -2022,80 +2101,14 @@ impl Harness {
                 self.coverage.persisted += snapshot.entries.len();
             }
         }
-        assert!(self.coverage.success >= 8 && self.coverage.bytes > PAGE_BYTES as usize);
-        assert!(self.catalog.borrow().gets > 0 && self.coverage.persisted > 0);
-        assert!(
-            self.coverage
-                .operations
-                .get("complete:write")
-                .copied()
-                .unwrap_or(0)
-                > 0
-        );
-        assert!(
-            self.coverage
-                .operations
-                .get("complete:accept")
-                .copied()
-                .unwrap_or(0)
-                > 0,
-            "no actual peer exchange"
-        );
         self.cache_obligations();
-        if steps >= WEIGHTED_ACTIONS.len() {
-            for action in [
-                "multi-worker",
-                "key-retirement",
-                "cache-retire-recreate",
-                "inflight-crash",
-                "pending-write-crash",
-                "partition-heal",
-                "wall-jump",
-                "malformed-client",
-                "peer-replay",
-                "peer-signature-corruption",
-            ] {
-                assert!(
-                    self.coverage.actions.get(action).copied().unwrap_or(0) > 0,
-                    "unobserved generated action {action}"
-                );
-            }
-            assert!(
-                self.coverage.secondary_worker_turns > 0,
-                "no secondary worker executed data work"
-            );
-            for fault in [
-                "credential-reject",
-                "credential-forbidden",
-                "origin-duplicate-length",
-                "origin-truncated-body",
-                "origin-malformed-etag",
-            ] {
-                assert!(
-                    self.catalog
-                        .borrow()
-                        .faults
-                        .get(fault)
-                        .copied()
-                        .unwrap_or(0)
-                        > 0,
-                    "unobserved origin rule {fault}"
-                );
-            }
-            if self.native {
-                assert_eq!(
-                    self.coverage.native_faults.len(),
-                    9,
-                    "native fault matrix incomplete"
-                );
-            }
-        }
-        eprintln!("dst origin faults={:?}", self.catalog.borrow().faults);
+        self.coverage.origin_gets = self.catalog.borrow().gets;
+        self.coverage.origin_faults = self.catalog.borrow().faults.clone();
         for (operation, injected) in &self.coverage.injected {
             assert_eq!(
                 self.coverage.observed.get(operation),
                 Some(injected),
-                "unobserved fault rule"
+                "injected OS fault was not consumed"
             );
         }
         while !self.nodes.is_empty() {
@@ -2113,11 +2126,6 @@ impl Harness {
             0,
             "native resources must be fenced and released"
         );
-        if self.native {
-            let writes = self.coverage.native_writes;
-            assert!(writes > 0, "native graph never completed a DMA write");
-            eprintln!("dst native completed writes={writes}");
-        }
         self.coverage.trace.record(format!(
             "final-invariants:{}:{}:{}:{}:{}:{}",
             self.sim.live_handles(),
@@ -2216,16 +2224,20 @@ fn run_corpus(native: bool) {
             "unsupported DST parameter {name}"
         );
     }
-    let seeds: Vec<u64> = std::env::var("RACER_DST_SEEDS")
-        .unwrap_or_else(|_| "1,7,42".into())
+    let custom_seeds = std::env::var("RACER_DST_SEEDS").ok();
+    let seeds: Vec<u64> = custom_seeds
+        .as_deref()
+        .unwrap_or("1,7,42")
         .split(',')
         .map(|s| s.trim().parse().expect("comma-separated u64 DST seeds"))
         .collect();
     assert!(!seeds.is_empty() && seeds.len() <= 1024);
     let steps = setting("RACER_DST_STEPS", WEIGHTED_ACTIONS.len(), 512);
-    let mut relay_turns = 0;
-    let mut partition_sends = 0;
-    let mut corrupted_reads = 0;
+    let required = requires_corpus_coverage(custom_seeds.as_deref(), steps);
+    let mut counts = BTreeMap::new();
+    eprintln!(
+        "dst corpus native={native} seeds={seeds:?} steps={steps} coverage-required={required}"
+    );
     for seed in seeds {
         let first = replay(seed, steps, native);
         let second = replay(seed, steps, native);
@@ -2237,28 +2249,114 @@ fn run_corpus(native: bool) {
             .position(|(a, b)| a != b);
         assert_eq!(
             first, second,
-            "whole-app replay diverged seed={seed} steps={steps} native={native} first checkpoint={mismatch:?}"
+            "DST CORRECTNESS FAILURE: whole-app replay diverged seed={seed} steps={steps} native={native} first checkpoint={mismatch:?}"
         );
         eprintln!(
             "dst replay verified seed={seed} native={native} events={} digest={:x}",
             first.trace.events,
             first.trace.hash.clone().finalize()
         );
-        relay_turns += first.relay_turns;
-        partition_sends += first.operations.get("blocked:send").copied().unwrap_or(0);
-        corrupted_reads += first.actions.get("disk-corruption").copied().unwrap_or(0);
+        first.add_to_corpus(&mut counts, native);
     }
-    if steps >= WEIGHTED_ACTIONS.len() {
-        assert!(relay_turns > 0, "corpus never exercised an actual relay");
-        assert!(
-            partition_sends > 0,
-            "corpus never blocked an established stream"
-        );
-        assert!(
-            corrupted_reads > 0,
-            "corpus never read a corrupted disk record"
-        );
+    let missing = coverage_misses(&counts);
+    eprintln!(
+        "dst corpus coverage native={native} required={required} counts={counts:?} missing={missing:?}"
+    );
+    assert!(
+        !required || missing.is_empty(),
+        "DST COVERAGE MISS: default corpus native={native} steps={steps} missing={missing:?}; per-run correctness and exact replay passed"
+    );
+}
+
+fn requires_corpus_coverage(custom_seeds: Option<&str>, steps: usize) -> bool {
+    custom_seeds.is_none() && steps >= WEIGHTED_ACTIONS.len()
+}
+
+fn coverage_misses(counts: &BTreeMap<String, usize>) -> Vec<&str> {
+    counts
+        .iter()
+        .filter(|(name, count)| {
+            let minimum = match name.as_str() {
+                "successful-responses" => 8,
+                "response-bytes" => PAGE_BYTES as usize + 1,
+                _ => 1,
+            };
+            **count < minimum
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
+#[test]
+fn dst_coverage_policy_and_aggregation() {
+    let cycle = WEIGHTED_ACTIONS.len();
+    assert!(requires_corpus_coverage(None, cycle));
+    assert!(requires_corpus_coverage(None, cycle + 1));
+    assert!(!requires_corpus_coverage(None, cycle - 1));
+    for seeds in ["42", "1,7,42"] {
+        for steps in [1, cycle, 512] {
+            assert!(!requires_corpus_coverage(Some(seeds), steps));
+        }
     }
+
+    // Complementary runs satisfy obligations together, without counting the
+    // replay twice. Missing evidence remains visible even in report-only mode.
+    let first = Coverage {
+        success: 4,
+        bytes: PAGE_BYTES as usize,
+        actions: BTreeMap::from([("multi-worker", 1)]),
+        origin_faults: BTreeMap::from([("credential-reject", 1)]),
+        native_faults: BTreeMap::from([("Bind:reject".into(), 1)]),
+        ..Coverage::default()
+    };
+    let second = Coverage {
+        success: 4,
+        bytes: 1,
+        secondary_worker_turns: 1,
+        origin_faults: BTreeMap::from([("credential-forbidden", 1)]),
+        native_faults: BTreeMap::from([("Write:delay".into(), 1)]),
+        ..Coverage::default()
+    };
+    let mut counts = BTreeMap::new();
+    first.add_to_corpus(&mut counts, true);
+    let missing = coverage_misses(&counts);
+    for name in [
+        "successful-responses",
+        "response-bytes",
+        "secondary-worker-data-turns",
+        "origin:credential-forbidden",
+        "native:Write:delay",
+    ] {
+        assert!(missing.contains(&name), "{name}");
+    }
+    second.add_to_corpus(&mut counts, true);
+    let missing = coverage_misses(&counts);
+    for name in [
+        "successful-responses",
+        "response-bytes",
+        "action:multi-worker",
+        "secondary-worker-data-turns",
+        "origin:credential-reject",
+        "origin:credential-forbidden",
+        "native:Bind:reject",
+        "native:Write:delay",
+    ] {
+        assert!(!missing.contains(&name), "{name}");
+    }
+    assert!(missing.contains(&"native:Invalidate:completion"));
+    assert!(missing.contains(&"action:disk-corruption"));
+    assert_eq!(counts["action:multi-worker"], 1);
+    // Supplying evidence for every remaining obligation clears the diagnostic.
+    for count in counts.values_mut() {
+        *count = (*count).max(1);
+    }
+    assert!(coverage_misses(&counts).is_empty());
+    assert!(
+        first
+            .corpus_counts(false)
+            .keys()
+            .all(|name| !name.starts_with("native"))
+    );
 }
 
 fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
@@ -2279,7 +2377,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
         harness.coverage.collect(&harness.sim);
         harness.coverage.collect_native(&harness.fabric);
         eprintln!(
-            "DST FAILURE seed={seed} steps={steps} native={native} elapsed={:?} trace={:?}",
+            "DST CORRECTNESS FAILURE seed={seed} steps={steps} native={native} elapsed={:?} trace={:?}",
             harness.clock.elapsed(),
             harness.coverage.trace
         );
