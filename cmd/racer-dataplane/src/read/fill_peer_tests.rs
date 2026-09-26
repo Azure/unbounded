@@ -247,8 +247,11 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                     .iter()
                     .all(|(_, copy, _, links, deadline)| *copy == rank.is_some()
                         && *links == 4
-                        && *deadline == f.scope.deadline.0)
+                        && *deadline < f.scope.deadline.0)
             );
+            // Both probes retain later candidates or local origin as a fallback.
+            // A fast unusable copy leaves more time for the next ranked attempt.
+            assert!(calls[0].4 < calls[1].4);
             let spent: u32 = calls.iter().map(|(_, _, credits, _, _)| 1 + credits).sum();
             assert_eq!(
                 budget.remaining_attempts(),

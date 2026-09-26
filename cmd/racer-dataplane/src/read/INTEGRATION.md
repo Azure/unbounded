@@ -94,11 +94,13 @@ CredentialCrypto::open_charged returns a quota-owning context. Driver queue perm
 are acquired before retaining a FlightOperation; submission is infallible after
 reservation. No credential-bearing context enters a completed flight or cache.
 
-Fill::reserve_progress performs one bounded reclamation pass on overload: discard
-only unsubmitted disposable writes, evict idle memory, retry admission. Busy
+Fill::reserve_progress reclaims only the exhausted resource class's deficit,
+restricting fair-share reclamation to the requesting cache. Bounded passes stop
+after sufficient idle memory or unsubmitted write capacity is released. Busy
 reader/ciphertext leases and submitted writes remain pinned. Dirty-only saturation
-permits memory-only completion. Local disk staging gets one reclamation retry;
-writer enqueue staging overload is disposable and never fails plaintext delivery.
+permits memory-only completion without reclamation. Bootstrap and local disk
+staging use the same policy; writer enqueue staging overload is disposable and
+never fails plaintext delivery.
 Fresh origin bootstrap uses Fill::reserve_bootstrap for the same bounded
 reclamation before network work, even when no fresh metadata pointer exists.
 
