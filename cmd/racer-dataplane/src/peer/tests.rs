@@ -630,7 +630,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
             Box::pin(async { panic!("direct request must not relay") })
         }
     }
-    struct Local;
+    struct Local(Rc<std::cell::Cell<usize>>);
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
             &'a self,
@@ -642,6 +642,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
                 // The authenticated request has its own budget, independent of
                 // the server's five-second header cap.
                 assert_eq!(scope.deadline.0, request.request().route.deadline.0);
+                self.0.set(self.0.get() + 1);
                 assert_eq!(
                     request
                         .request()
@@ -732,11 +733,12 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         )
         .with_network(destination_network.clone()),
     );
+    let served = Rc::new(std::cell::Cell::new(0));
     let server = server::PeerServer::new(
         io,
         destination_auth,
         admission.clone(),
-        Rc::new(Local),
+        Rc::new(Local(served.clone())),
         relay,
     )
     .with_request_timeout(Duration::from_secs(5))
@@ -747,7 +749,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         paths,
         Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
-        source_handshake,
+        source_handshake.clone(),
         transfers,
     )
     .with_network(source_network);
@@ -762,13 +764,44 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         let fd = reactor
             .accept(Rc::new(OwnedFd::from(listener)), &scope)
             .await?;
-        let connection = ConnectionLease::from_accepted(fd, &admission)?;
-        let connection = server.serve_connection(connection, &listener_scope).await?;
-        let connection = server.serve_connection(connection, &listener_scope).await?;
-        server.serve_connection(connection, &listener_scope).await?;
+        let mut connection = ConnectionLease::from_accepted(fd, &admission)?;
+        // Each repeated request uses one exchange, not a probe plus handshake.
+        // With the fixture's 100-entry replay window, redundant negotiation also
+        // exhausts replay admission before this sequence can complete.
+        let mut exchanges = 0;
+        while served.get() < 66 {
+            connection = server.serve_connection(connection, &listener_scope).await?;
+            exchanges += 1;
+        }
+        assert_eq!(exchanges, 66 + 2 * 2);
         Ok::<(), Error>(())
     };
-    let exchange = async { futures::try_join!(requester.request(local, &scope), server_work) };
+    let requests = async {
+        let response = requester.request(local, &scope).await?;
+        assert!(matches!(response.response(), PeerResponse::Miss));
+        for attempt in 2..66 {
+            let response = requester
+                .request(request(&admission, attempt), &scope)
+                .await?;
+            assert!(matches!(response.response(), PeerResponse::Miss));
+        }
+        // Explicit invalidation rediscovers the authenticated challenge and
+        // capabilities before the next request, as required after peer restart.
+        source_handshake.invalidate(&NodeId(C.into()));
+        let response = requester.request(request(&admission, 66), &scope).await?;
+        // The server has closed. A failed exchange invalidates negotiation so a
+        // later attempt can discover a restarted receiver's new challenge.
+        assert!(matches!(
+            requester.request(request(&admission, 67), &scope).await,
+            Err(Error::Io)
+        ));
+        assert_eq!(
+            source_handshake.negotiate(&NodeId(C.into())).await,
+            Err(Error::Unavailable)
+        );
+        Ok::<_, Error>(response)
+    };
+    let exchange = async { futures::try_join!(requests, server_work) };
     let mut exchange = std::pin::pin!(exchange);
     let mut context = Context::from_waker(futures::task::noop_waker_ref());
     let (response, ()) = loop {

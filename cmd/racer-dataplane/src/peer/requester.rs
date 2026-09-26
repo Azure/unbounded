@@ -159,6 +159,13 @@ impl PeerTransport for Requester {
             self.transfers
                 .exchange_planned(endpoint, request, plan, &scope)
                 .await
+                .inspect_err(|error| {
+                    // A restarted peer has a new receiver challenge. Rediscover it
+                    // on the next attempt instead of retaining a stale cache hit.
+                    if matches!(error, Error::Io | Error::Unauthorized | Error::Replay) {
+                        self.handshake.invalidate(&next);
+                    }
+                })
         })
     }
 }

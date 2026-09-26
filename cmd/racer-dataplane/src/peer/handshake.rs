@@ -1,7 +1,7 @@
 //! Certificate-authenticated capabilities and signed RDMA setup over HTTP.
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::NodeId,
+    model::identity::{MembershipVersion, NodeId},
     rdma::session::Sessions,
     runtime::deadline::RequestScope,
     security::signing::Signatures,
@@ -31,7 +31,7 @@ pub struct Handshake {
     signatures: Rc<Signatures>,
     rdma: Option<Rc<Sessions>>,
     exchange: Option<Rc<dyn HandshakeExchange>>,
-    cache: RefCell<HashMap<NodeId, (Capabilities, Instant)>>,
+    cache: RefCell<HashMap<NodeId, CachedCapabilities>>,
     capacity: usize,
     http: Option<(Rc<super::PeerNetwork>, Rc<super::transfer::Transfers>)>,
     discovery: Option<(
@@ -39,6 +39,11 @@ pub struct Handshake {
         Rc<crate::security::certificates::Certificates>,
         Rc<crate::security::replay::ReplayWindow>,
     )>,
+}
+struct CachedCapabilities {
+    capabilities: Capabilities,
+    expires: Instant,
+    membership: Option<MembershipVersion>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
@@ -131,17 +136,20 @@ impl Handshake {
             use crate::security::{protocol as p, signing::signed_digest};
             scope.check()?;
             let (network, transfers) = self.http.as_ref().ok_or(Error::InvalidConfiguration)?;
+            // Even a cache hit must use a retained membership and a current neighbor.
+            let endpoint = network.endpoint(membership, peer)?;
+            if let Some(cached) = self.cache.borrow().get(peer) {
+                if cached.membership == Some(membership) && cached.expires > Instant::now() {
+                    return Ok(cached.capabilities);
+                }
+            }
             if let Some((_, certificates, _)) = &self.discovery {
                 let probe = crate::security::session::ChallengeProbe::new(
                     network.local.clone(),
                     peer.clone(),
                 )?;
                 let reply = transfers
-                    .exchange_probe(
-                        network.endpoint(membership, peer)?,
-                        probe.request_bytes(),
-                        scope,
-                    )
+                    .exchange_probe(endpoint.clone(), probe.request_bytes(), scope)
                     .await?;
                 let challenge = probe.verify(
                     certificates,
@@ -168,9 +176,7 @@ impl Handshake {
             );
             let signed = self.signatures.sign(head)?;
             let binding = signed_digest(&signed)?;
-            let response = transfers
-                .exchange_head(network.endpoint(membership, peer)?, signed, scope)
-                .await?;
+            let response = transfers.exchange_head(endpoint, signed, scope).await?;
             let verified = self.signatures.verify(response)?;
             let head = &verified.signed.head;
             if verified.peer.node() != peer
@@ -198,14 +204,19 @@ impl Handshake {
             scope.check()?;
             self.cache
                 .borrow_mut()
-                .retain(|_, (_, expiry)| *expiry > Instant::now());
+                .retain(|_, cached| cached.expires > Instant::now());
             if self.cache.borrow().len() >= self.capacity && !self.cache.borrow().contains_key(peer)
             {
                 return Err(Error::Overloaded);
             }
-            self.cache
-                .borrow_mut()
-                .insert(peer.clone(), (capabilities, scope.deadline.0));
+            self.cache.borrow_mut().insert(
+                peer.clone(),
+                CachedCapabilities {
+                    capabilities,
+                    expires: scope.deadline.0,
+                    membership: Some(membership),
+                },
+            );
             Ok(capabilities)
         })
     }
@@ -291,8 +302,8 @@ impl Handshake {
             self.cache
                 .borrow()
                 .get(peer)
-                .filter(|(_, expiry)| *expiry > Instant::now())
-                .map(|(capabilities, _)| *capabilities)
+                .filter(|cached| cached.expires > Instant::now())
+                .map(|cached| cached.capabilities)
                 .ok_or(Error::Unavailable)
         })
     }
@@ -303,17 +314,17 @@ impl Handshake {
     ) -> Operation<'a, Capabilities> {
         Box::pin(async move {
             scope.check()?;
-            if let Some((capabilities, _)) = self
+            if let Some(cached) = self
                 .cache
                 .borrow()
                 .get(peer)
-                .filter(|(_, expiry)| *expiry > Instant::now())
+                .filter(|cached| cached.expires > Instant::now())
             {
-                return Ok(*capabilities);
+                return Ok(cached.capabilities);
             }
             self.cache
                 .borrow_mut()
-                .retain(|_, (_, expiry)| *expiry > Instant::now());
+                .retain(|_, cached| cached.expires > Instant::now());
             if self.cache.borrow().len() >= self.capacity {
                 return Err(Error::Overloaded);
             }
@@ -331,9 +342,14 @@ impl Handshake {
             if capabilities.rdma && (!capabilities.scoped_grants || result.setup.is_none()) {
                 return Err(Error::InvalidRequest);
             }
-            self.cache
-                .borrow_mut()
-                .insert(peer.clone(), (capabilities, result.expires));
+            self.cache.borrow_mut().insert(
+                peer.clone(),
+                CachedCapabilities {
+                    capabilities,
+                    expires: result.expires,
+                    membership: None,
+                },
+            );
             Ok(capabilities)
         })
     }
@@ -346,5 +362,104 @@ fn bit(head: &crate::http::codec::MessageHead, field: &str) -> Result<bool> {
     }
 }
 #[cfg(test)]
-mod tests { /* Capability tampering, QP/rail binding, expired certs, downgrade policy. */
+mod tests {
+    use super::*;
+    use crate::{
+        http::{codec::Codec, io::HttpIo, pool::HttpPool},
+        model::identity::RequestId,
+        peer::{PeerNetwork, transfer::Transfers},
+        runtime::{admission::Admission, reactor::Reactor},
+        topology::membership::{Member, Membership},
+    };
+    use std::{num::NonZeroU32, sync::Arc, time::Duration};
+
+    #[test]
+    fn cached_negotiation_requires_live_scope_retained_membership_and_same_generation() {
+        let signers = crate::peer::tests::signers();
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let io = Rc::new(HttpIo::with_admission(
+            reactor.clone(),
+            Codec::new(32768, 16777232),
+            admission.clone(),
+        ));
+        let transfers = Rc::new(Transfers::new(
+            Rc::new(HttpPool::new(reactor, admission, 2)),
+            io,
+            None,
+        ));
+        let network = Rc::new(PeerNetwork::new(signers[0].node().clone(), 2).unwrap());
+        for version in [1, 2] {
+            network
+                .install(Arc::new(
+                    Membership::validate(
+                        MembershipVersion(version),
+                        signers[..2]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, signer)| Member {
+                                node: signer.node().clone(),
+                                shares: NonZeroU32::new(1).unwrap(),
+                                peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                                rails: vec![],
+                                alignment_enabled: false,
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
+        let handshake =
+            Handshake::new(signers[0].clone(), None).with_http(network.clone(), transfers);
+        let peer = signers[1].node();
+        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let capabilities = Capabilities {
+            rdma: false,
+            scoped_grants: false,
+        };
+        handshake.cache.borrow_mut().insert(
+            peer.clone(),
+            CachedCapabilities {
+                capabilities,
+                expires: scope.deadline.0,
+                membership: Some(MembershipVersion(1)),
+            },
+        );
+        assert_eq!(
+            futures::executor::block_on(handshake.negotiate_at(peer, MembershipVersion(1), &scope)),
+            Ok(capabilities)
+        );
+        // No authenticated challenge exists after removal, so a required fresh
+        // negotiation fails before any I/O rather than returning the stale entry.
+        signers[0].remove_peer_challenge(peer);
+        assert_eq!(
+            futures::executor::block_on(handshake.negotiate_at(peer, MembershipVersion(2), &scope)),
+            Err(Error::Unauthorized)
+        );
+        handshake.cache.borrow_mut().get_mut(peer).unwrap().expires = Instant::now();
+        assert_eq!(
+            futures::executor::block_on(handshake.negotiate_at(peer, MembershipVersion(1), &scope)),
+            Err(Error::Unauthorized)
+        );
+        handshake.cache.borrow_mut().get_mut(peer).unwrap().expires = scope.deadline.0;
+        network.retire(MembershipVersion(1));
+        assert_eq!(
+            futures::executor::block_on(handshake.negotiate_at(peer, MembershipVersion(1), &scope)),
+            Err(Error::IncompatibleMembership)
+        );
+        let mut expired = scope.clone();
+        expired.deadline.0 = Instant::now();
+        assert_eq!(
+            futures::executor::block_on(handshake.negotiate_at(
+                peer,
+                MembershipVersion(2),
+                &expired
+            )),
+            Err(Error::DeadlineExceeded)
+        );
+    }
 }
