@@ -50,6 +50,14 @@ leases on evicting segments, and waits for leases before recycling. No live byte
 are copied. Bounded state is independently limited by configured slab capacity,
 page entries, metadata entries, dirty bytes, ciphertext bytes, and queue entries.
 
+When a new page encounters a full page index, serialized writer progress runs at
+most two rotations of the same segment-level second-chance clock, independently
+of free slab space. It forgets the cold victim segment's mappings, including those
+in a still-open segment, without changing its bytes, append position, or generation.
+Normal slab reclamation still fences recycling on leases. Existing-page replacements
+need no index eviction. Queue and staging limits bound acceptance before this pass;
+failed writes may leave fewer cached mappings, since the cache is disposable.
+
 Enqueue retains a credential-free CiphertextCopy and dirty reservation and reserves
 the exact padded staging charge before accepting a queue entry. Original
 ciphertext and aligned staging are separately charged. Index publication follows

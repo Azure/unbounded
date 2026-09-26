@@ -2,6 +2,8 @@
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 #[path = "production/bootstrap_pressure.rs"]
 mod bootstrap_pressure;
+#[path = "production/index_pressure.rs"]
+mod index_pressure;
 
 use base64::Engine;
 use racer_dataplane::{

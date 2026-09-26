@@ -130,8 +130,12 @@ impl StoreWriter {
         if self.closed.get() {
             return Err(Error::Unavailable);
         }
-        self.index
-            .preflight_capacity(&page.ciphertext.envelope().page)?;
+        // Configured writers can turn over the index in serialized progress.
+        // Queue/staging bounds still apply; enqueue itself never evicts mappings.
+        if self.clock.borrow().is_none() {
+            self.index
+                .preflight_capacity(&page.ciphertext.envelope().page)?;
+        }
         let logical = RecordCodec.logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.slabs.owns_reservation(&dirty)
@@ -317,7 +321,11 @@ impl StoreWriter {
         // Enqueue does not reserve slots: earlier queued pages may fill the index.
         // Production has one writer per index, and progress holds Busy across this
         // await through publication, so no other writer can consume a free slot.
-        self.index.preflight_capacity(id)?;
+        if let Some(clock) = self.clock.borrow().as_ref() {
+            clock.reclaim_index_for(id)?;
+        } else {
+            self.index.preflight_capacity(id)?;
+        }
         let alignment = self.slabs.alignment()?;
         let disk_bytes = alignment
             .extent(0, RecordCodec.logical_length(page)?)?

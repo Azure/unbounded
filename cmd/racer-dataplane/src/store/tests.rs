@@ -1,4 +1,6 @@
 use super::*;
+#[path = "index_pressure_tests.rs"]
+mod index_pressure;
 use crate::{
     error::{Error, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
@@ -254,8 +256,14 @@ fn segment_images(
 
 #[test]
 fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_io() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let alignment = futures::executor::block_on(f.store.open()).unwrap();
+    // A writer without a configured clock must still reject safely, before I/O.
+    f.store.writer = Rc::new(writer::StoreWriter::new(
+        f.store.writer.index().clone(),
+        f.store.writer.segments_for_test().clone(),
+        f.store.writer.slabs().clone(),
+    ));
     let index = f.store.writer.index();
     index.set_page_capacity(1).unwrap();
     // Both pages can enqueue while the one index slot is still free.
@@ -351,17 +359,13 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     );
     assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
     let original = index.lookup(&first_id).unwrap().unwrap().location;
-    let before = segment_images(&f);
-
-    // The second queued page must finish synchronously without another append
-    // or reactor submission now that the first page occupies the only slot.
+    // The queued page now turns over the full index and performs real I/O.
     let mut progress = f.store.writer.progress(1, &request);
-    assert_eq!(progress.as_mut().poll(&mut cx), Poll::Ready(Ok(1)));
-    drop(progress);
-    assert_eq!(segment_images(&f), before);
-    assert!(index.lookup(&second_id).unwrap().is_none());
-    assert_eq!(index.lookup(&first_id).unwrap().unwrap().location, original);
-    assert_eq!(f.store.writer.discarded_count(), 1);
+    assert!(progress.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
+    assert!(index.lookup(&second_id).unwrap().is_some());
+    assert!(index.lookup(&first_id).unwrap().is_none());
+    assert_eq!(f.store.writer.discarded_count(), 0);
     assert!(f.store.writer.is_idle());
     assert_eq!(f.store.writer.queued_count(), 0);
     assert_eq!(f.store.writer.writes_in_flight(), 0);
@@ -383,8 +387,13 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
         .unwrap();
     assert_eq!(read.ciphertext.bytes(), &[1; 80]);
     drop(read);
-    assert!(matches!(f.enqueue(f.copy(2, 64)), Err(Error::Overloaded)));
+    // An actual same-key replacement remains admissible at capacity.
+    f.enqueue(f.copy(1, 64)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+    let latest = index.lookup(&first_id).unwrap().unwrap().location;
+    assert_ne!(latest, replacement);
     index.remove_if_matches(&first_id, &replacement).unwrap();
+    assert_eq!(index.lookup(&first_id).unwrap().unwrap().location, latest);
     f.enqueue(f.copy(2, 64)).unwrap();
     assert_eq!(
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
