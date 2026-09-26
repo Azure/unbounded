@@ -401,6 +401,14 @@ type Config struct {
 	// for large-layer streams. Zero leaves ranges on the blob cap.
 	TransferMaxConcurrentRangeServes int `yaml:"transfer_max_concurrent_range_serves"`
 
+	// LayerSeedOriginFallback lets a seeding node pull a layer straight from
+	// origin when no peer has it. Leave this off at fleet scale: every node
+	// seeds every layer, so an origin fallback turns one cold image into
+	// nodes x layers concurrent origin pulls, which saturates the registry and
+	// starves the latency-critical range reads that gate container start.
+	// Bootstrap is the chair prefetch path's job.
+	LayerSeedOriginFallback bool `yaml:"layer_seed_origin_fallback"`
+
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
 	// stream completion is the fast path that makes finishers discoverable
@@ -567,8 +575,8 @@ func NewDefault() *Config {
 		PrefetchCoordinatorReplicas: 3,
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
-		LayerSeedConcurrency:        4,
-		LayerSeedPeerPatience:       10 * time.Minute,
+		LayerSeedConcurrency:        8,
+		LayerSeedPeerPatience:       45 * time.Minute, // peer-only seeding keeps polling the swarm instead of giving up
 		LayerSeedBudget:             time.Hour,
 		HRWTopologyScope:            "cluster",
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
@@ -800,6 +808,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
 	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
 	setInt("TRANSFER_MAX_CONCURRENT_RANGE_SERVES", &c.TransferMaxConcurrentRangeServes)
+	setBool("LAYER_SEED_ORIGIN_FALLBACK", &c.LayerSeedOriginFallback)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
@@ -910,6 +919,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
 	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
 	fs.IntVar(&c.TransferMaxConcurrentRangeServes, "transfer-max-concurrent-range-serves", c.TransferMaxConcurrentRangeServes, "cap on concurrent small bounded-range serves, admitted separately from blob streams (0 = use the blob cap)")
+	fs.BoolVar(&c.LayerSeedOriginFallback, "layer-seed-origin-fallback", c.LayerSeedOriginFallback, "allow layer seeding to pull from origin when no peer has the layer (unsafe at fleet scale)")
 	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
