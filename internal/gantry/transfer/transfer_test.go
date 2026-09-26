@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -231,7 +232,7 @@ func TestServeCapShedsBlobGetWith429(t *testing.T) {
 	}
 
 	// Occupy the single serve slot so the server is at capacity.
-	release, ok := s.tryAcquireServe()
+	release, ok := s.tryAcquireServe("")
 	if !ok {
 		t.Fatal("expected to acquire the only serve slot")
 	}
@@ -295,6 +296,84 @@ func TestRangeRequest(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != "2345" {
 		t.Errorf("body = %q, want 2345", got)
+	}
+}
+
+func TestSmallRangeBypassesSaturatedBlobCap(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("0123456789ABCDEF")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	s := New(cache, WithMaxConcurrentServes(1), WithMaxConcurrentRangeServes(2))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(rangeHeader string) *http.Response {
+		t.Helper()
+
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+		req.Header.Set(MirroredHeader, "1")
+
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return resp
+	}
+
+	// Saturate the bulk lane, as a node streaming full layers would.
+	release, ok := s.tryAcquireServe("")
+	if !ok {
+		t.Fatal("expected to acquire the only blob serve slot")
+	}
+
+	defer release()
+
+	// A bounded index-sized read still gets through.
+	resp := get("bytes=2-5")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("small range at blob capacity: status = %d, want 206", resp.StatusCode)
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+	// An open-ended range has unknown length, so it stays on the bulk cap and
+	// cannot use the range lane to smuggle a whole layer through.
+	shed := get("bytes=2-")
+	if shed.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("open-ended range at blob capacity: status = %d, want 429", shed.StatusCode)
+	}
+
+	_ = shed.Body.Close() //nolint:errcheck // best-effort body close
+}
+
+func TestIsFastRange(t *testing.T) {
+	cases := []struct {
+		header string
+		want   bool
+	}{
+		{"bytes=0-1023", true},
+		{"bytes=1081000000-1081016383", true},
+		{"bytes=0-" + strconv.Itoa(fastRangeMaxBytes-1), true},
+		{"bytes=0-" + strconv.Itoa(fastRangeMaxBytes), false},
+		{"bytes=0-", false},
+		{"bytes=-500", false},
+		{"bytes=0-99,200-299", false},
+		{"bytes=5-1", false},
+		{"", false},
+		{"items=0-10", false},
+	}
+
+	for _, tc := range cases {
+		if got := isFastRange(tc.header); got != tc.want {
+			t.Errorf("isFastRange(%q) = %v, want %v", tc.header, got, tc.want)
+		}
 	}
 }
 

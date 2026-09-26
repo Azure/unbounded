@@ -65,7 +65,14 @@ type Server struct {
 	// channel means the server is at capacity and further blob GETs are
 	// shed with 429 so the requester re-discovers another provider.
 	serveSem chan struct{}
+	// rangeSem, when non-nil, admits small bounded ranges independently of
+	// serveSem so index reads are never queued behind bulk layer streams.
+	rangeSem chan struct{}
 }
+
+// fastRangeMaxBytes bounds the range lane. Anything larger is a bulk transfer
+// wearing a Range header and stays on the blob cap.
+const fastRangeMaxBytes = 1 << 20
 
 // Describer is an optional capability that callers (typically the
 // containerdstore.Store) may implement to surface cached media-type
@@ -136,6 +143,19 @@ func WithMaxConcurrentServes(n int) Option {
 	return func(s *Server) {
 		if n > 0 {
 			s.serveSem = make(chan struct{}, n)
+		}
+	}
+}
+
+// WithMaxConcurrentRangeServes caps concurrent serves of small, explicitly
+// bounded ranges separately from full-blob streams. Artifact Streaming issues
+// these for OverlayBD index reads: they are tiny and latency-critical, so the
+// per-stream bandwidth guard that WithMaxConcurrentServes exists to provide is
+// the wrong control for them. n <= 0 leaves small ranges on the blob cap.
+func WithMaxConcurrentRangeServes(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.rangeSem = make(chan struct{}, n)
 		}
 	}
 }
@@ -220,9 +240,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	// Shed load on a saturated seed so the requester re-discovers another
 	// provider (the cascade) instead of queueing behind us. Only full
 	// blob-body GETs are capped: HEADs are cheap and manifests are small and
-	// needed for discovery/verification.
+	// needed for discovery/verification. Small bounded ranges take a separate
+	// class so they are not held behind bulk streams.
 	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
-		release, ok := s.tryAcquireServe()
+		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
 		if !ok {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
@@ -384,20 +405,53 @@ func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
 
 // tryAcquireServe reserves a serve slot without blocking. The returned release
 // func MUST be called when the serve completes. ok is false when the server is
-// already at its configured serve cap; callers should shed the request (429)
-// rather than block. When no cap is configured (serveSem nil), it always
-// succeeds with a no-op release.
-func (s *Server) tryAcquireServe() (release func(), ok bool) {
-	if s.serveSem == nil {
+// already at the cap for the request's class; callers should shed the request
+// (429) rather than block. When no cap applies, it always succeeds with a
+// no-op release.
+func (s *Server) tryAcquireServe(rangeHeader string) (release func(), ok bool) {
+	sem := s.serveSem
+	if s.rangeSem != nil && isFastRange(rangeHeader) {
+		sem = s.rangeSem
+	}
+
+	if sem == nil {
 		return func() {}, true
 	}
 
 	select {
-	case s.serveSem <- struct{}{}:
-		return func() { <-s.serveSem }, true
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
 	default:
 		return nil, false
 	}
+}
+
+// isFastRange reports whether value is a single range with both bounds present
+// and a length within fastRangeMaxBytes. Open-ended and suffix forms are
+// excluded because their length is not knowable from the header alone, so an
+// unbounded transfer cannot claim the range lane.
+func isFastRange(value string) bool {
+	spec, found := strings.CutPrefix(strings.TrimSpace(value), "bytes=")
+	if !found || strings.Contains(spec, ",") {
+		return false
+	}
+
+	first, last, found := strings.Cut(strings.TrimSpace(spec), "-")
+	if !found {
+		return false
+	}
+
+	start, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+	if err != nil || start < 0 {
+		return false
+	}
+
+	end, err := strconv.ParseInt(strings.TrimSpace(last), 10, 64)
+	if err != nil || end < start {
+		return false
+	}
+
+	return end-start+1 <= fastRangeMaxBytes
 }
 
 // lookupMediaType returns the describer's cached mediaType for d, or

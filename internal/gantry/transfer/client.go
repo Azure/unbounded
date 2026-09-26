@@ -26,7 +26,12 @@ import (
 // Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
-	hc          *http.Client
+	hc *http.Client
+	// rangeHC carries FetchRangeFromPeer on its own transport, and therefore
+	// its own h2 connections. Sharing hc would put latency-critical range
+	// reads behind bulk layer streams on one connection, where they contend
+	// for the same flow-control window and share its idle-ping fate.
+	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
 
@@ -77,10 +82,24 @@ func NewClient(opts ...ClientOption) *Client {
 		fn(&o)
 	}
 
+	return &Client{
+		hc: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   o.requestTimeout,
+		},
+		rangeHC: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   o.requestTimeout,
+		},
+		onBytesRead: o.onBytesRead,
+	}
+}
+
+func newPeerTransport(o clientOptions) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 
-	tr := &http.Transport{
+	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.DialContext(ctx, network, addr)
@@ -90,14 +109,6 @@ func NewClient(opts ...ClientOption) *Client {
 			SendPingTimeout:  o.readIdleTimeout,
 			MaxReadFrameSize: peerMaxReadFrameSize,
 		},
-	}
-
-	return &Client{
-		hc: &http.Client{
-			Transport: tr,
-			Timeout:   o.requestTimeout,
-		},
-		onBytesRead: o.onBytesRead,
 	}
 }
 
@@ -226,7 +237,7 @@ func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d dige
 	req.Header.Set("Range", requested.HeaderValue())
 	req.URL.Scheme = "http"
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.rangeHC.Do(req)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
 	}
