@@ -517,6 +517,112 @@ func TestStore_WriterAbortIdempotent(t *testing.T) {
 	}
 }
 
+type abortFailureStore struct {
+	*fakeStore
+	failErr error
+	calls   int
+}
+
+func (s *abortFailureStore) Abort(ctx context.Context, ref string) error {
+	s.calls++
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if s.failErr != nil {
+		return s.failErr
+	}
+
+	return s.fakeStore.Abort(ctx, ref)
+}
+
+func TestStore_WriterAbortRetry(t *testing.T) {
+	transientErr := errors.New("containerd temporarily unavailable")
+
+	for _, failure := range []error{context.Canceled, transientErr} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			cs := &abortFailureStore{fakeStore: newFake()}
+			s := New(cs)
+			d := mustDigest(t, []byte("partial-ingest"))
+			ref := DefaultRefPrefix + d.String()
+
+			w, err := s.Writer(context.Background(), d)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := w.Write([]byte("partial")); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			if errors.Is(failure, context.Canceled) {
+				cancel()
+			} else {
+				cs.failErr = failure
+			}
+
+			if err := w.Abort(ctx); !errors.Is(err, failure) {
+				t.Fatalf("Abort = %v; want %v", err, failure)
+			}
+
+			if _, err := cs.Status(context.Background(), ref); err != nil {
+				t.Fatalf("failed Abort removed ingest: %v", err)
+			}
+
+			if !cs.writers[ref].closed {
+				t.Fatal("failed Abort did not close the writer")
+			}
+
+			cs.failErr = nil
+
+			if err := w.Abort(context.Background()); err != nil {
+				t.Fatalf("retry Abort: %v", err)
+			}
+
+			if _, err := cs.Status(context.Background(), ref); !errors.Is(err, cerrdefs.ErrNotFound) {
+				t.Fatalf("ingest after retry = %v; want not found", err)
+			}
+
+			if err := w.Abort(context.Background()); err != nil {
+				t.Fatalf("idempotent Abort: %v", err)
+			}
+
+			if cs.calls != 2 {
+				t.Fatalf("Abort RPCs = %d; want 2", cs.calls)
+			}
+		})
+	}
+}
+
+func TestStore_WriterAbortNotFoundIsTerminal(t *testing.T) {
+	cs := &abortFailureStore{fakeStore: newFake()}
+	s := New(cs)
+	d := mustDigest(t, []byte("already-removed-ingest"))
+
+	w, err := s.Writer(context.Background(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cs.fakeStore.Abort(context.Background(), DefaultRefPrefix+d.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		if err := w.Abort(context.Background()); err != nil {
+			t.Fatalf("Abort missing ingest: %v", err)
+		}
+	}
+
+	if cs.calls != 1 {
+		t.Fatalf("Abort RPCs = %d; want 1", cs.calls)
+	}
+}
+
 // TestStore_Inventory enumerates the content store via Walk and skips
 // non-sha256 algorithms.
 func TestStore_Inventory(t *testing.T) {

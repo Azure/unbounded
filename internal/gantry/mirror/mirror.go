@@ -1309,7 +1309,12 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	var directVerifier *digestpipe.Writer // non-nil only when caching is unavailable
 
 	if cwerr == nil {
-		defer func() { _ = cw.Abort(ctx) }() //nolint:errcheck // no-op after Commit
+		defer func() {
+			abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			_ = cw.Abort(abortCtx) //nolint:errcheck // best-effort; no-op after Commit
+		}()
 
 		dest = io.MultiWriter(w, cw)
 	} else {
@@ -2363,7 +2368,12 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
 	}
 
-	defer func() { _ = cw.Abort(pCtx) }() //nolint:errcheck // best-effort abort
+	defer func() {
+		abortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_ = cw.Abort(abortCtx) //nolint:errcheck // best-effort abort
+	}()
 
 	_, err = io.Copy(cw, rc)
 	if err != nil {

@@ -526,17 +526,15 @@ func (w *contentWriter) Abort(ctx context.Context) error {
 		return nil
 	}
 
-	w.committedOrAborted = true
 	// Close releases any buffered state. We tolerate the error: the
 	// authoritative cancellation is IngestManager.Abort below.
 	_ = w.inner.Close() //nolint:errcheck // best-effort
-	if err := w.store.cs.Abort(w.store.withNS(ctx), w.ref); err != nil {
-		if errors.Is(err, cerrdefs.ErrNotFound) {
-			return nil
-		}
-
+	if err := w.store.cs.Abort(w.store.withNS(ctx), w.ref); err != nil && !errors.Is(err, cerrdefs.ErrNotFound) {
 		return fmt.Errorf("containerdstore: Abort: %w", err)
 	}
+
+	// Failed cleanup must remain retryable with a fresh context.
+	w.committedOrAborted = true
 
 	return nil
 }
