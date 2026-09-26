@@ -69,6 +69,7 @@ struct Active {
 }
 
 pub struct ClientListeners {
+    metrics: crate::telemetry::metrics::Metrics,
     reads: Rc<dyn ReadService>,
     parser: RequestParser,
     responses: Rc<Responses>,
@@ -93,6 +94,7 @@ impl ClientListeners {
         admission: Rc<Admission>,
     ) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             reads,
             parser,
             responses,
@@ -113,6 +115,10 @@ impl ClientListeners {
     /// Response streaming shares the operation deadline without renewing it.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -222,6 +228,7 @@ impl ClientListeners {
                     let io = self.io.clone();
                     let admission = self.admission.clone();
                     let task_cache = cache.clone();
+                    let metrics = self.metrics.clone();
                     let operation = Box::pin(async move {
                         serve_connection(
                             connection,
@@ -235,6 +242,7 @@ impl ClientListeners {
                             task_retired,
                             task_idle,
                             timeout,
+                            &metrics,
                         )
                         .await
                     });
@@ -377,6 +385,7 @@ async fn serve_connection(
     retired: Rc<Cell<bool>>,
     idle: Rc<Cell<bool>>,
     timeout: Duration,
+    metrics: &crate::telemetry::metrics::Metrics,
 ) -> Result<()> {
     loop {
         if retired.get() {
@@ -399,6 +408,7 @@ async fn serve_connection(
             return Ok(());
         }
         idle.set(false);
+        let mut observation = metrics.request()?;
         // Idle/header admission has its own bound. A healthy pooled connection
         // gets a fresh operation budget only after each complete request head.
         let scope = new_scope(timeout, cancellation.clone())?;
@@ -406,6 +416,7 @@ async fn serve_connection(
         let request = match received.value.and_then(|head| parser.parse(cache, head)) {
             Ok(request) => request,
             Err(error) => {
+                observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
                 return Ok(());
             }
@@ -420,11 +431,13 @@ async fn serve_connection(
                 } else {
                     error
                 };
+                observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
                 return Ok(());
             }
         };
         if let Err(error) = scope.check() {
+            observation.fail(error);
             responses.send_error(connection, error, scope).await?;
             return Ok(());
         }
@@ -435,13 +448,24 @@ async fn serve_connection(
             return Ok(());
         }
         if let Err(error) = responses.validate(&kind, &response) {
+            observation.fail(error);
             responses.send_error(connection, error, scope).await?;
             return Ok(());
         }
-        connection = responses.send(connection, response, scope).await?;
+        connection = match responses
+            .send_observed(connection, response, scope, &mut observation)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                observation.fail(error);
+                return Err(error);
+            }
+        };
         if !connection.is_reusable() {
             return Ok(());
         }
+        drop(observation);
         let mut yielded = false;
         std::future::poll_fn(|cx| {
             if yielded {

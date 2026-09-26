@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 14;
+pub const EVENT_COUNT: usize = 16;
 pub const GAUGE_COUNT: usize = 3;
 #[derive(Clone, Default)]
 pub struct Metrics(Arc<Counters>);
@@ -17,6 +17,8 @@ struct Counters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum Event {
+    Request,
+    RequestError,
     MemoryHit,
     DiskHit,
     PeerHit,
@@ -33,6 +35,8 @@ pub enum Event {
     DiagnosticTimeout,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
+    Event::Request,
+    Event::RequestError,
     Event::MemoryHit,
     Event::DiskHit,
     Event::PeerHit,
@@ -51,6 +55,8 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
 impl Event {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Request => "racer_requests_total",
+            Self::RequestError => "racer_request_errors_total",
             Self::MemoryHit => "racer_memory_hits_total",
             Self::DiskHit => "racer_disk_hits_total",
             Self::PeerHit => "racer_peer_hits_total",
@@ -94,12 +100,45 @@ pub struct GaugeLease {
     metrics: Metrics,
     gauge: Gauge,
 }
+/// One complete client head through final delivery, including cancellation/drop.
+pub(crate) struct RequestMetrics {
+    active: GaugeLease,
+    succeeded: bool,
+    overloaded: bool,
+}
+impl RequestMetrics {
+    pub(crate) fn success(&mut self) {
+        self.succeeded = true;
+    }
+    pub(crate) fn fail(&mut self, error: crate::error::Error) {
+        if error == crate::error::Error::Overloaded && !self.overloaded {
+            let _ = self.active.metrics.record(Event::Overload, 1);
+            self.overloaded = true;
+        }
+    }
+}
+impl Drop for RequestMetrics {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            let _ = self.active.metrics.record(Event::RequestError, 1);
+        }
+    }
+}
 impl Drop for GaugeLease {
     fn drop(&mut self) {
         self.metrics.0.gauges[self.gauge as usize].fetch_sub(1, Ordering::Relaxed);
     }
 }
 impl Metrics {
+    pub(crate) fn request(&self) -> Result<RequestMetrics> {
+        let active = self.lease(Gauge::ActiveRequests)?;
+        self.record(Event::Request, 1)?;
+        Ok(RequestMetrics {
+            active,
+            succeeded: false,
+            overloaded: false,
+        })
+    }
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) -> Result<()> {
         let _ = self.0.events[event as usize].fetch_update(

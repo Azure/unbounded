@@ -14,6 +14,7 @@ use crate::{
 };
 use std::rc::Rc;
 pub struct StoreReader {
+    metrics: crate::telemetry::metrics::Metrics,
     clock: Rc<super::eviction::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
@@ -40,12 +41,22 @@ impl StoreReader {
         buffers: Rc<BufferPool>,
     ) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             clock,
             index,
             segments,
             slabs,
             buffers,
         }
+    }
+    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+    fn corrupt_miss(&self) {
+        let _ = self
+            .metrics
+            .record(crate::telemetry::metrics::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index.remove_if_matches(&token.page, &token.location)
@@ -104,7 +115,10 @@ impl StoreReader {
                 .await
             {
                 Ok(b) => b,
-                Err(Error::Io | Error::CorruptRecord) => {
+                Err(error @ (Error::Io | Error::CorruptRecord)) => {
+                    if error == Error::CorruptRecord {
+                        self.corrupt_miss();
+                    }
                     self.invalidate(&token)?;
                     return Ok(None);
                 }
@@ -113,6 +127,7 @@ impl StoreReader {
             let decoded = match RecordCodec.parse(&buffer, entry.location.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
+                    self.corrupt_miss();
                     self.invalidate(&token)?;
                     return Ok(None);
                 }
@@ -122,6 +137,7 @@ impl StoreReader {
                 || decoded.header.metadata != entry.metadata
                 || decoded.header.envelope.key_id != entry.key_id
             {
+                self.corrupt_miss();
                 self.invalidate(&token)?;
                 return Ok(None);
             }

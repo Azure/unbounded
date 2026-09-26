@@ -32,6 +32,7 @@ struct Dirty {
     staging: Option<Reservation>,
 }
 pub struct StoreWriter {
+    metrics: crate::telemetry::metrics::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slabs>,
@@ -58,6 +59,7 @@ impl DirtyTicket {
 impl StoreWriter {
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, slabs: Rc<Slabs>) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             index,
             segments,
             slabs,
@@ -73,6 +75,10 @@ impl StoreWriter {
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }
+    }
+    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
     pub fn configure(
         &self,
@@ -219,6 +225,9 @@ impl StoreWriter {
         self.discarded.get()
     }
     fn note_discard(&self, count: usize) {
+        let _ = self
+            .metrics
+            .record(crate::telemetry::metrics::Event::DirtyDiscard, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
     }
