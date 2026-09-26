@@ -270,10 +270,14 @@ impl Simulator {
         amount: usize,
     ) -> Option<Reservation> {
         self.touched.insert(w);
-        let result =
-            self.workers[w]
-                .admission
-                .reserve(Some(&CacheId(cache.to_string())), class, amount);
+        // Match HttpPool/ConnectionLease and PipePool's global transport charges.
+        let cache = match class {
+            ResourceClass::Pipe | ResourceClass::Connection => None,
+            _ => Some(CacheId(cache.to_string())),
+        };
+        let result = self.workers[w]
+            .admission
+            .reserve(cache.as_ref(), class, amount);
         if result.is_err() {
             self.report.rejections[class as usize] += 1;
         }
@@ -730,5 +734,6 @@ impl Simulator {
 }
 
 mod fidelity;
+mod global_admission;
 mod queues;
 mod scenarios;
