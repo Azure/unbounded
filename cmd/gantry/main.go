@@ -215,6 +215,7 @@ func runAgent(args []string) error {
 			p2.peerServeBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
 		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
+		transfer.WithMaxConcurrentRangeServes(c.TransferMaxConcurrentRangeServes),
 	}
 	transferSrv := transfer.New(cstore, transferOpts...)
 
@@ -395,6 +396,22 @@ func runAgent(args []string) error {
 		OnPullDuration: func(kind string, seconds float64) { inst.originPullDuration.WithLabelValues(kind).Observe(seconds) },
 	})
 
+	// Every node that is served a manifest pulls that image's layers into its
+	// own content store, so later reads hit local disk instead of the network.
+	layerSeedTotal := newLayerSeedMetric(reg)
+	layerSeed := newLayerSeeder(layerSeederOptions{
+		Store:        cstore,
+		DHT:          disco,
+		Peer:         peerClient,
+		Origin:       pullOriginClient,
+		MarkPresent:  func(ctx context.Context, d digest.Digest) bool { return adv.Notify(ctx, d, true) },
+		Logger:       logger,
+		Concurrency:  c.LayerSeedConcurrency,
+		PeerPatience: c.LayerSeedPeerPatience,
+		Budget:       c.LayerSeedBudget,
+		OnOutcome:    func(outcome string) { layerSeedTotal.WithLabelValues(outcome).Inc() },
+	})
+
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -493,7 +510,7 @@ func runAgent(args []string) error {
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
@@ -503,7 +520,7 @@ func runAgent(args []string) error {
 	}
 
 	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, layerSeed, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -869,10 +886,6 @@ func runAgent(args []string) error {
 	readyCheck := func() (string, bool) {
 		if !cacheReady.Load() {
 			return "cache scan not complete", false
-		}
-
-		if chairManager != nil && !chairManager.Ready() {
-			return "no selectable Lease chair", false
 		}
 
 		if checkDialable && noDialableP2PAddrs {
@@ -1414,6 +1427,7 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 type layerPrefetchAdapter struct {
 	resolver   manifestPrefetchResolver
 	cache      ifaces.LocalContentStore
+	seeder     *layerSeeder
 	logger     *slog.Logger
 	onManifest func(digest.Digest, []manifest.TypedChild)
 }
@@ -1481,12 +1495,14 @@ func advertiseOnCommit(ctx context.Context, adv *advertise.Advertiser, store ifa
 func newLayerPrefetcher(
 	r manifestPrefetchResolver,
 	cache ifaces.LocalContentStore,
+	seeder *layerSeeder,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
 ) mirror.LayerPrefetcher {
 	return &layerPrefetchAdapter{
 		resolver:   r,
 		cache:      cache,
+		seeder:     seeder,
 		logger:     logger.With(slog.String("subsystem", "prefetch")),
 		onManifest: onManifest,
 	}
@@ -1529,14 +1545,15 @@ func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest
 	return nil, lastErr
 }
 
-func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil && p.onManifest == nil {
+func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	if p.resolver == nil && p.onManifest == nil && p.seeder == nil {
 		return
 	}
 	// Use a fresh deadline so the prefetch survives the request
 	// context that just finished; cap at 30s so a stuck prefetch
-	// can't pin a goroutine forever.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// can't pin a goroutine forever. Seeding moves whole layers, so it runs
+	// off baseCtx under its own budget.
+	ctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
 	defer cancel()
 
 	rc, err := p.openManifest(ctx, manifestDigest)
@@ -1585,7 +1602,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		p.onManifest(manifestDigest, children)
 	}
 
-	if len(children) == 0 || p.resolver == nil {
+	if len(children) == 0 {
 		// Image index or no children - nothing to fan out.
 		return
 	}
@@ -1615,12 +1632,18 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
-		p.logger.Debug("prefetch: PrefetchChildren reported errors",
-			slog.String("manifest", manifestDigest.String()),
-			slog.Int("children", len(pending)),
-			slog.Any("err", err),
-		)
+	if p.resolver != nil {
+		if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
+			p.logger.Debug("prefetch: PrefetchChildren reported errors",
+				slog.String("manifest", manifestDigest.String()),
+				slog.Int("children", len(pending)),
+				slog.Any("err", err),
+			)
+		}
+	}
+
+	if p.seeder != nil {
+		go p.seeder.Seed(baseCtx, registry, repository, pending)
 	}
 }
 

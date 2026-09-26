@@ -303,6 +303,21 @@ type layerProgressTracker struct {
 	oldLabels       [][]string
 }
 
+// newLayerSeedMetric counts post-manifest local layer seeding outcomes. A node
+// is fully seeded for an image when no layer is left outside present/peer/origin.
+func newLayerSeedMetric(reg *metrics.Registry) *prometheus.CounterVec {
+	m := reg.NewCounterVec("mirror", prometheus.CounterOpts{
+		Name: "gantry_layer_seed_total",
+		Help: "Local layer seeding outcomes after a manifest serve, labeled by outcome.",
+	}, []string{"outcome"})
+
+	for _, outcome := range []string{"present", "peer", "origin", "failed", "canceled"} {
+		m.WithLabelValues(outcome).Add(0)
+	}
+
+	return m
+}
+
 const maxEarlyLayerCompletions = 256
 
 func newLayerProgressTracker(gauge *prometheus.GaugeVec, node string, now func() time.Time) *layerProgressTracker {
