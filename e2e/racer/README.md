@@ -9,7 +9,7 @@ for component in unbounded-operator racer-controller racer-dataplane gantry; do
     -t "docker.io/library/$component:e2e" . || break
 done
 
-go test -tags=e2e ./e2e/racer -run TestOperatorImagePull -count=1 -v -timeout=10m
+make e2e-racer
 ```
 
 The test uses these local images and creates an isolated kind cluster with one

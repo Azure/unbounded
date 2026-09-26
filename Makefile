@@ -271,6 +271,7 @@ help: ## Show this help
 	@echo "  vulncheck                        Run govulncheck; fails only on fixable vulnerabilities"
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
+	@echo "  e2e-racer                        Run the operator-installed Racer e2e suite (prebuilt images)"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
@@ -559,6 +560,11 @@ endif
 e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
 		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
+
+.PHONY: e2e-racer
+e2e-racer: ## Run the operator-installed Racer e2e suite with prebuilt Docker images
+	KIND_EXPERIMENTAL_PROVIDER=docker PATH="$(CURDIR)/bin:$$PATH" \
+		$(GOTEST) -tags=e2e -count=1 -timeout=10m -v ./e2e/racer
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m

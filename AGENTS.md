@@ -39,6 +39,7 @@ unbounded-kube is organized into several directories:
 - `images/` - where OCI image definitions and related assets for building container images are located.
 - `e2e/` - end-to-end integration test suites.
   - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
+  - `racer/` - kind-based full-stack image pull through Gantry and operator-installed Racer (guarded by `//go:build e2e`).
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
@@ -54,6 +55,7 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
+- `make e2e-racer` runs the operator-installed Racer and Gantry image-pull e2e suite with a 10-minute timeout. Requires Linux, Docker, kind, kubectl, and prebuilt `docker.io/library/{unbounded-operator,racer-controller,racer-dataplane,gantry}:e2e` images. Build instructions and diagnostic options are in `e2e/racer/README.md`; image builds are separate from the test timeout.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
