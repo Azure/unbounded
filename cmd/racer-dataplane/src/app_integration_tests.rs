@@ -35,6 +35,17 @@ pub(super) fn local_worker(
     )
 }
 
+#[test]
+fn assembly_applies_configured_client_request_timeout() {
+    for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
+        let mut config = crate::test_support::cluster::config(false);
+        config.request_timeout = timeout;
+        config.reader_stall_timeout = timeout;
+        let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+        assert_eq!(app.clients.request_timeout(), timeout);
+    }
+}
+
 pub(super) fn definition() -> crate::control::caches::CacheDefinition {
     let (client_socket, origin_socket) =
         crate::control::caches::canonical_socket_paths("app-lifecycle").unwrap();

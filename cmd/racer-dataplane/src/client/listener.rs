@@ -109,6 +109,18 @@ impl ClientListeners {
             request_timeout: Duration::from_secs(30),
         }
     }
+    /// Bound header/idle admission and each operation with separate fixed budgets.
+    /// Response streaming shares the operation deadline without renewing it.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     pub fn reconcile<'a>(
         &'a self,
         caches: &'a [CacheDefinition],
@@ -757,6 +769,133 @@ mod tests {
         .into_bytes()
     }
 
+    struct GatedRead {
+        inner: Rc<dyn ReadService>,
+        scopes: RefCell<Vec<RequestScope>>,
+        release: Cell<bool>,
+    }
+    impl ReadService for GatedRead {
+        fn read<'a>(
+            &'a self,
+            request: ClientRequest,
+            scope: &'a RequestScope,
+        ) -> Operation<'a, ReadResponse> {
+            Box::pin(async move {
+                self.scopes.borrow_mut().push(scope.clone());
+                std::future::poll_fn(|_| {
+                    if let Err(error) = scope.check() {
+                        Poll::Ready(Err(error))
+                    } else if self.release.get() {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await?;
+                self.inner.read(request, scope).await
+            })
+        }
+    }
+
+    fn sleep_until(deadline: Instant) {
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    }
+
+    #[test]
+    fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
+        for mode in ["idle", "partial", "keepalive"] {
+            let mut fixture = Fixture::new();
+            assert_eq!(fixture.listeners.request_timeout(), Duration::from_secs(30));
+            let timeout = Duration::from_millis(200);
+            fixture.listeners = fixture.listeners.with_request_timeout(timeout);
+            fixture.reconcile(&[definition()]).unwrap();
+            let mut socket = fixture.connect();
+            if mode == "keepalive" {
+                socket.write_all(&request("HEAD", "")).unwrap();
+                assert!(
+                    fixture
+                        .receive(&mut socket, false)
+                        .starts_with(b"HTTP/1.1 200 ")
+                );
+            }
+            for _ in 0..16 {
+                fixture.pump(16);
+            }
+            assert_eq!(fixture.listeners.active_connections(), 1);
+            assert_no_head(&mut socket);
+            // Make progress inside the header budget, then cross its original
+            // deadline before a renewed budget could expire.
+            let started = Instant::now();
+            if mode == "partial" {
+                sleep_until(started + timeout / 2);
+                socket.write_all(b"HEAD /v1/objects/").unwrap();
+                for _ in 0..16 {
+                    fixture.pump(16);
+                }
+                assert_no_head(&mut socket);
+            }
+            sleep_until(started + timeout + Duration::from_millis(20));
+            for _ in 0..64 {
+                fixture.pump(16);
+            }
+            assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
+            assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
+            assert_eq!(fixture.reads.calls.get(), usize::from(mode == "keepalive"));
+            assert_no_body_leases(&fixture);
+        }
+    }
+
+    #[test]
+    fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
+        let mut fixture = Fixture::new();
+        let timeout = Duration::from_millis(500);
+        fixture.listeners = fixture.listeners.with_request_timeout(timeout);
+        let reads = Rc::new(GatedRead {
+            inner: fixture.reads.clone(),
+            scopes: RefCell::new(Vec::new()),
+            release: Cell::new(false),
+        });
+        fixture.listeners.reads = reads.clone();
+        fixture.reconcile(&[definition()]).unwrap();
+        let mut socket = fixture.connect();
+        let head = request("HEAD", "");
+        socket.write_all(&head[..head.len() - 2]).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        assert!(reads.scopes.borrow().is_empty());
+        std::thread::sleep(Duration::from_millis(100));
+        let before = Instant::now();
+        socket.write_all(b"\r\n").unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        let first = reads.scopes.borrow()[0].clone();
+        assert!(first.deadline.0 >= before + timeout);
+        assert!(first.deadline.0 <= Instant::now() + timeout);
+        reads.release.set(true);
+        assert!(
+            fixture
+                .receive(&mut socket, false)
+                .starts_with(b"HTTP/1.1 200 ")
+        );
+        reads.release.set(false);
+        socket.write_all(&head).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        let second = reads.scopes.borrow()[1].clone();
+        assert_ne!(first.request, second.request);
+        assert!(second.deadline.0 > first.deadline.0);
+        assert_no_head(&mut socket);
+        sleep_until(second.deadline.0 + Duration::from_millis(20));
+        let output = fixture.receive(&mut socket, true);
+        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
+        assert!(output.ends_with(b"\r\n\r\n"));
+        assert_eq!(fixture.reads.calls.get(), 1);
+        assert_no_body_leases(&fixture);
+    }
+
     #[test]
     fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
         use crate::test_support::WakeCounter;
@@ -1041,6 +1180,14 @@ mod tests {
     }
 
     fn body_fixture(queue: usize, unseeded: bool) -> (Fixture, Rc<PipePool>) {
+        body_fixture_with_large_page(queue, unseeded, false)
+    }
+
+    fn body_fixture_with_large_page(
+        queue: usize,
+        unseeded: bool,
+        large_page: bool,
+    ) -> (Fixture, Rc<PipePool>) {
         use crate::{
             model::identity::WorkerId,
             read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
@@ -1069,7 +1216,7 @@ mod tests {
         fixture.listeners.reads = Rc::new(Bodies {
             admission,
             streams: RangeStreams::from_directory(directory, delivery, 1),
-            late_failure: false,
+            late_failure: large_page,
             unseeded,
         });
         fixture.reconcile(&[definition()]).unwrap();
@@ -1111,6 +1258,69 @@ mod tests {
     }
 
     #[test]
+    fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
+        let (mut fixture, _pipes) = body_fixture_with_large_page(2, false, true);
+        let timeout = Duration::from_millis(800);
+        fixture.listeners = fixture.listeners.with_request_timeout(timeout);
+        let reads = Rc::new(GatedRead {
+            inner: fixture.listeners.reads.clone(),
+            scopes: RefCell::new(Vec::new()),
+            release: Cell::new(false),
+        });
+        fixture.listeners.reads = reads.clone();
+        let mut socket = fixture.connect();
+        socket
+            .write_all(&request(
+                "GET",
+                "If-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n",
+            ))
+            .unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        let scope = reads.scopes.borrow()[0].clone();
+        // Consume part of the total budget before committing response headers.
+        sleep_until(scope.deadline.0 - timeout / 2);
+        reads.release.set(true);
+        let mut output = fixture.receive(&mut socket, false);
+        assert!(output.starts_with(b"HTTP/1.1 206 "));
+        let head_end = output
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let mut bytes = [0; 8192];
+        // Keep making observable body progress without draining the whole page.
+        for _ in 0..4 {
+            loop {
+                fixture.pump(16);
+                match socket.read(&mut bytes) {
+                    Ok(n) if n != 0 => {
+                        output.extend_from_slice(&bytes[..n]);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < scope.deadline.0);
+                    }
+                    result => panic!("expected streaming progress: {result:?}"),
+                }
+            }
+        }
+        assert!(output.len() > head_end);
+        assert_eq!(fixture.listeners.active_connections(), 1);
+        sleep_until(scope.deadline.0 + Duration::from_millis(20));
+        for _ in 0..64 {
+            fixture.pump(16);
+        }
+        // A reset at response start or on body progress would still be live.
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        output.extend(fixture.receive(&mut socket, true));
+        assert!(output.len() - head_end < crate::model::range::PAGE_BYTES as usize);
+        assert!(output[head_end..].iter().all(|byte| *byte == b'x'));
+        assert_no_body_leases(&fixture);
+    }
+
+    #[test]
     fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
         let (fixture, pipes) = body_fixture(2, false);
         let held = pipes.acquire().unwrap();
@@ -1146,7 +1356,9 @@ mod tests {
     fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
         for cancel in [false, true] {
             let (mut fixture, pipes) = body_fixture(2, false);
-            fixture.listeners.request_timeout = Duration::from_millis(200);
+            fixture.listeners = fixture
+                .listeners
+                .with_request_timeout(Duration::from_millis(200));
             let held = pipes.acquire().unwrap();
             let mut socket = start_body(&fixture);
             assert_no_head(&mut socket);

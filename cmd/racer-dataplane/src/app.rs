@@ -734,13 +734,16 @@ impl WorkerApplication {
         );
         let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
         let responses = Rc::new(Responses::new(io.clone(), delivery));
-        let clients = Rc::new(ClientListeners::new(
-            dispatcher.clone(),
-            RequestParser::new(config.limits.header_bytes.get()),
-            responses,
-            io,
-            admission,
-        ));
+        let clients = Rc::new(
+            ClientListeners::new(
+                dispatcher.clone(),
+                RequestParser::new(config.limits.header_bytes.get()),
+                responses,
+                io,
+                admission,
+            )
+            .with_request_timeout(config.request_timeout),
+        );
 
         let mut telemetry = Telemetry::default();
         telemetry.health = node.observations.health.clone();
