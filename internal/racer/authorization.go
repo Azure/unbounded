@@ -97,8 +97,9 @@ func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *co
 
 func authorizeNode(ctx context.Context, reader, hints client.Reader, cfg Config, id wire.NodeID) error {
 	// Indexes discover names only. No positive authorization is cached, and no
-	// cache miss falls back to a live list. Stale/missing hints can deny service
-	// until convergence, but every security fact below comes from live GETs.
+	// cache miss falls back to a live list. Discovery uncertainty is retryable:
+	// denying service until convergence must not terminate the client's worker.
+	// Every positive security fact below still comes from live GETs.
 	if hints == nil || reader == nil {
 		return wire.Unavailable
 	}
@@ -109,7 +110,7 @@ func authorizeNode(ctx context.Context, reader, hints client.Reader, cfg Config,
 	}
 
 	if len(nodes.Items) != 1 || nodes.Items[0].Name == "" || wire.NodeID(nodes.Items[0].UID) != id {
-		return wire.Forbidden
+		return wire.Unavailable
 	}
 
 	var node corev1.Node
@@ -159,5 +160,10 @@ func authorizeNode(ctx context.Context, reader, hints client.Reader, cfg Config,
 		}
 	}
 
-	return wire.Forbidden
+	// Even live rejection of every hinted Pod (including its workload checks)
+	// cannot establish that discovery includes every replacement candidate.
+	// Keep denying bytes, but allow retry with the same Node certificate. Only
+	// the live Node checks above establish a terminal identity denial here;
+	// bootstrap's directly bound Pod authorization retains its own live errors.
+	return wire.Unavailable
 }

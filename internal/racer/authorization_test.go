@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptrace"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,6 +39,138 @@ func frozenAuthorizationHints(t *testing.T, a *Application) client.WithWatch {
 	return fake.NewClientBuilder().WithScheme(a.Topology.Scheme()).WithLists(&nodes, &pods).
 		WithIndex(&corev1.Node{}, nodeUIDIndex, nodeUIDKeys).
 		WithIndex(&corev1.Pod{}, authorizationPodIndex, authorizationPodKeys(a.Server.Config)).Build()
+}
+
+func TestHTTPSDiscoveryUncertaintyRetriesAfterConvergence(t *testing.T) {
+	for _, scenario := range []string{"node miss", "pod miss", "pod recreated", "pod deleted", "pod owner revoked", "ds recreated"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newServingFixture(t)
+			hints := frozenAuthorizationHints(t, f.a)
+			f.a.Server.Hints = hints
+			node := &corev1.Node{}
+			pod := &corev1.Pod{}
+
+			if err := hints.Get(t.Context(), client.ObjectKey{Name: "worker"}, node); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := hints.Get(t.Context(), client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod); err != nil {
+				t.Fatal(err)
+			}
+
+			replacement := pod.DeepCopy()
+
+			switch scenario {
+			case "node miss":
+				if err := hints.Delete(t.Context(), node); err != nil {
+					t.Fatal(err)
+				}
+			case "pod miss":
+				if err := hints.Delete(t.Context(), pod); err != nil {
+					t.Fatal(err)
+				}
+			case "pod recreated", "pod deleted", "pod owner revoked", "ds recreated":
+				if scenario == "pod owner revoked" {
+					pod.OwnerReferences[0].UID = "revoked-owner"
+					if err := f.a.Topology.Update(t.Context(), pod); err != nil {
+						t.Fatal(err)
+					}
+				} else if scenario == "ds recreated" {
+					ds := &appsv1.DaemonSet{}
+					if err := f.a.Topology.Get(t.Context(), client.ObjectKey{Namespace: "racer", Name: "racer-dataplane"}, ds); err != nil {
+						t.Fatal(err)
+					}
+
+					ds.UID = "replacement-ds"
+					if err := f.a.Topology.Update(t.Context(), ds); err != nil {
+						t.Fatal(err)
+					}
+
+					replacement.OwnerReferences[0].UID = ds.UID
+				} else if err := f.a.Topology.Delete(t.Context(), pod); err != nil {
+					t.Fatal(err)
+				}
+
+				replacement.UID, replacement.ResourceVersion = "replacement-pod", ""
+				if scenario != "pod recreated" {
+					replacement.Name = "replacement-pod"
+				}
+
+				if err := f.a.Topology.Create(t.Context(), replacement); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			endpoint := f.start(t)
+			peer := f.client(t, &f.certificate)
+			response, err := peer.Get(endpoint + wire.SnapshotPath)
+
+			body := responseBody(t, response, err, http.StatusServiceUnavailable)
+			if string(body) != `{"code":"unavailable"}` {
+				t.Fatalf("discovery error: %s", body)
+			}
+			// responseBody also requires Retry-After: 1. Simulate watch convergence
+			// without replacing the certificate, server, or pooled TLS connection.
+			for _, obj := range []client.Object{node, pod} {
+				if err := hints.Delete(t.Context(), obj); err != nil && !apierrors.IsNotFound(err) {
+					t.Fatal(err)
+				}
+			}
+
+			for _, obj := range []client.Object{node, replacement} {
+				obj.SetResourceVersion("")
+
+				if err := hints.Create(t.Context(), obj); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			reused := false
+			ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }})
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+wire.SnapshotPath, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response, err = peer.Do(req)
+			responseBody(t, response, err, http.StatusOK)
+
+			if !reused {
+				t.Fatal("convergence recovery did not reuse TLS connection")
+			}
+		})
+	}
+}
+
+func TestHTTPSDiscoveryFinalRecheckRetryable(t *testing.T) {
+	f := newServingFixture(t)
+	hints := frozenAuthorizationHints(t, f.a)
+	lookups := 0
+	f.a.Server.Hints = interceptor.NewClient(hints, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if err := c.List(ctx, list, opts...); err != nil {
+			return err
+		}
+
+		if nodes, ok := list.(*corev1.NodeList); ok {
+			lookups++
+			if lookups == 2 {
+				nodes.Items = nil
+			}
+		}
+
+		return nil
+	}})
+	endpoint := f.start(t)
+	peer := f.client(t, &f.certificate)
+
+	response, err := peer.Get(endpoint + wire.SnapshotPath)
+	if body := responseBody(t, response, err, http.StatusServiceUnavailable); string(body) != `{"code":"unavailable"}` {
+		t.Fatalf("final discovery recheck leaked snapshot: %s", body)
+	}
+
+	response, err = peer.Get(endpoint + wire.SnapshotPath)
+	responseBody(t, response, err, http.StatusOK)
 }
 
 func TestAuthorizationStaleHintsRequireLiveFacts(t *testing.T) {
@@ -124,13 +258,13 @@ func TestAuthorizationStaleHintsRequireLiveFacts(t *testing.T) {
 				},
 			})
 			err := authorizeNode(ctx, live, hints, a.Server.Config, wire.NodeID(testNodeUID))
-			want := error(wire.Forbidden)
+			want := error(wire.Unavailable)
 
 			switch scenario {
 			case "success":
 				want = nil
-			case "API failure", "canceled":
-				want = wire.Unavailable
+			case "node deleted", "node recreated", "node excluded", "node terminating":
+				want = wire.Forbidden
 			}
 
 			if !errors.Is(err, want) || reads > 4 {
@@ -141,7 +275,7 @@ func TestAuthorizationStaleHintsRequireLiveFacts(t *testing.T) {
 }
 
 func TestAuthorizationHintMissesAndCandidateBound(t *testing.T) {
-	for _, scenario := range []string{"node miss", "pod miss", "cache failure", "too many pods", "stale pods", "live rejected pods", "replacement converges"} {
+	for _, scenario := range []string{"node miss", "ambiguous node", "pod miss", "cache failure", "too many pods", "stale pods", "live rejected pods", "replacement converges"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, _, _ := authFixture(t)
 			hints := frozenAuthorizationHints(t, a)
@@ -159,6 +293,11 @@ func TestAuthorizationHintMissesAndCandidateBound(t *testing.T) {
 			switch scenario {
 			case "node miss":
 				if err := hints.Delete(t.Context(), node); err != nil {
+					t.Fatal(err)
+				}
+			case "ambiguous node":
+				node.Name, node.ResourceVersion = "ambiguous-worker", ""
+				if err := hints.Create(t.Context(), node); err != nil {
 					t.Fatal(err)
 				}
 			case "pod miss":
@@ -198,8 +337,8 @@ func TestAuthorizationHintMissesAndCandidateBound(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				if err := authorizeNode(t.Context(), a.Server.APIReader, hints, a.Server.Config, wire.NodeID(testNodeUID)); err != wire.Forbidden {
-					t.Fatalf("stale Pod UID accepted: %v", err)
+				if err := authorizeNode(t.Context(), a.Server.APIReader, hints, a.Server.Config, wire.NodeID(testNodeUID)); err != wire.Unavailable {
+					t.Fatalf("stale Pod UID must allow retry: %v", err)
 				}
 
 				hints = frozenAuthorizationHints(t, a)
@@ -228,10 +367,10 @@ func TestAuthorizationHintMissesAndCandidateBound(t *testing.T) {
 				},
 			})
 			err := authorizeNode(t.Context(), live, hints, a.Server.Config, wire.NodeID(testNodeUID))
-			want, budget := error(wire.Forbidden), 1
+			want, budget := error(wire.Unavailable), 1
 
 			switch scenario {
-			case "node miss":
+			case "node miss", "ambiguous node":
 				budget = 0
 			case "cache failure":
 				want, budget = wire.Unavailable, 0

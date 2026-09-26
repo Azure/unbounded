@@ -393,8 +393,12 @@ func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
 			response, err = c.Do(req)
 
 			want := 403
-			if scenario == "expired" {
+
+			switch scenario {
+			case "expired":
 				want = 401
+			case "pod gone":
+				want = 503
 			}
 
 			responseBody(t, response, err, want)

@@ -379,8 +379,17 @@ deployment integration check and is not exercised by envtest.
   solely to discover names. Live GETs validate Node UID/exclusion, Pod UID and
   assignment/state/owner, current DaemonSet UID, and ServiceAccount existence/state.
   Bootstrap still checks the TokenReview ServiceAccount UID. No authorization
-  positive is cached. Missing/stale hints fail closed until convergence; a Pod
-  recreation must be observed before its new UID can authorize the Node. More than
+  positive is cached. Missing/stale hints fail closed with retryable 503
+  `unavailable` and `Retry-After: 1` until convergence; a Pod recreation must be
+  observed before its new UID can authorize the Node. Exhausting candidates is
+  also discovery uncertainty, even when live checks reject their owners or
+  workload state: an eligible replacement may exist outside the stale cache.
+  Live Node deletion/recreation/termination/exclusion still returns 403, and
+  bootstrap retains direct bound-Pod/ServiceAccount authorization errors.
+  This distinction is required by the Rust client's terminal 403 versus transient
+  503 handling (`cmd/racer-dataplane/src/control/client.rs:466-504`), both at
+  startup (`cmd/racer-dataplane/src/app.rs:837-853`) and during normal operation
+  (`cmd/racer-dataplane/src/app.rs:1097-1104`). More than
   four candidate Pods returns unavailable, bounding even stale-candidate API work.
   Production explicitly wires discovery to the manager cache and security reads
   to APIReader. Cache sync and leadership readiness gates remain in effect, and
@@ -607,6 +616,10 @@ bodies, not TLS framing. Frozen-cache unit tests exercise stale positives, delet
 recreation, exclusion, owner changes, missing/terminating ServiceAccounts, API
 failure, candidate overflow, and eventual recovery. Pooled TLS and post-wait
 revocation tests use frozen hints; trust retirement and leadership tests still run.
+HTTP discovery tests assert the exact 503 wire code and retry header, then recover
+to 200 on the same certificate and pooled TLS connection after hints converge,
+including replacement Pods after owner/DaemonSet revocation. A final-recheck hint
+miss denies snapshot delivery with the same retryable response.
 
 Each pass permits at most four live Pod candidates: the conservative maximum is
 4 credential GETs + 1 Node GET + 4*(Pod + DaemonSet + ServiceAccount) GETs, or 17

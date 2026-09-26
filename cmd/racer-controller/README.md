@@ -226,9 +226,16 @@ The 100,000-waiter test verifies bounded admission and shared publication owners
 It does not send 100,000 HTTPS responses. Snapshot authorization uses informer
 indexes for Node UID/name and managed Pod discovery, then live GETs for all
 authorization facts. There are no per-request live Node or Pod lists and no
-cached positive authorization. A stale/missing hint can deny service until cache
-convergence; a recreated Pod must have its new UID discovered. More than four
-managed Pod candidates on one Node returns 503 rather than unbounded live reads.
+cached positive authorization. Discovery uncertainty denies bytes with retryable
+503 `unavailable` and `Retry-After: 1`: missing/ambiguous Node hints, no Pod hints,
+and exhausted stale or rejected Pod candidates all allow retry until convergence.
+A live rejection of a hinted Pod or its owner does not prove that no eligible
+replacement exists outside the cache. A recreated Pod must have its new UID
+discovered. Live Node deletion, recreation, termination, or exclusion still
+returns 403 `forbidden`; bootstrap's directly bound live negatives retain 403.
+The Rust client treats 403 as terminal, so discovery alone must not produce it.
+More than four managed Pod candidates on one Node returns 503 rather than
+unbounded live reads.
 Node, Pod, DaemonSet, ServiceAccount, and credential checks run before and after
 the long poll, including on pooled TLS connections.
 
