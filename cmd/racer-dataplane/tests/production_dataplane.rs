@@ -521,7 +521,6 @@ impl Rig {
                     name: "production-fixture".into(),
                     client_socket,
                     origin_socket,
-                    socket_mode: 0o600,
                 }],
             })
             .unwrap();

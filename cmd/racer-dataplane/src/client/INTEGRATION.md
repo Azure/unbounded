@@ -29,7 +29,7 @@ resources. Keep prepare/commit/drop serialized with stop/cancel/drain lifecycle
 operations. Only one listener transition may be outstanding (`Overloaded` otherwise).
 
 Preparation binds randomly named sockets in pinned no-symlink client directories,
-sets permissions before publishing any changed path, then uses `renameat2` with
+sets fixed `0666` permissions before publishing any changed path, then uses `renameat2` with
 `RENAME_EXCHANGE` for owned replacements or `RENAME_NOREPLACE` for additions.
 Old accepted connections and listener owners remain alive. **During preparation,
 changed canonical paths already route new connections to the prepared socket's
@@ -42,8 +42,8 @@ restoration cannot be guaranteed without overwriting that foreign entry.
 
 Commit swaps listener maps and retires old generations entirely in memory.
 Worker `poll_budgeted` subsequently cleans up old owned socket names. Unchanged
-definitions preserve descriptors. Permission changes and UID/name reuse create a
-new listener generation rather than chmod an active socket. `reconcile` remains
+definitions preserve descriptors. UID/name reuse creates a new listener generation.
+Selective pod volume mounts control client access. `reconcile` remains
 compatible as prepare + commit + immediate cleanup.
 
 `stop_cache` retires admission and idle keepalives but lets active responses finish.

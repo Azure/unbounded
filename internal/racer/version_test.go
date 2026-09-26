@@ -368,7 +368,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 		t.Fatal("unchanged install replaced shared allocation")
 	}
 
-	cache := catalogCache("cache-a", testNodeUID, nil)
+	cache := catalogCache("cache-a", testNodeUID)
 	if err := r.Create(ctx, &cache); err != nil {
 		t.Fatal(err)
 	}

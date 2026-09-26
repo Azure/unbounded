@@ -54,7 +54,6 @@ pub(super) fn definition() -> crate::control::caches::CacheDefinition {
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
-        socket_mode: 0o600,
     }
 }
 
@@ -293,6 +292,11 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
             let (config, node, ready) = (&config, &node, &ready);
             threads.spawn(move || {
                 let (mut app, runtime, mut engine) = local_worker(config, node, id);
+                use crate::telemetry::metrics::Event;
+                app.telemetry
+                    .metrics
+                    .record(Event::MemoryHit, u64::from(id) + 1)
+                    .unwrap();
                 drive(
                     &runtime,
                     &mut engine,
@@ -301,6 +305,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 .unwrap();
                 ready.wait();
                 assert!(node.observations.health.ready());
+                assert_eq!(app.telemetry.metrics.count(Event::MemoryHit), 3);
                 assert_eq!(app.peer_task.is_some(), id == 0);
                 ready.wait();
                 drive(

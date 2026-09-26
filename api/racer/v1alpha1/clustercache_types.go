@@ -5,18 +5,8 @@ package v1alpha1
 
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-// ClusterCacheSpec configures a cache's client socket. Origin sockets belong to adapters.
-type ClusterCacheSpec struct {
-	// SocketMode contains Unix permission bits, expressed as a decimal integer.
-	// Paths are derived from metadata.name, never supplied independently.
-	// +optional
-	// +kubebuilder:default=432
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=511
-	SocketMode *int32 `json:"socketMode,omitempty"`
-}
-
 // ClusterCache names a disposable cache. Its Kubernetes UID is its wire identity.
+// Socket paths are derived from metadata.name. Client access is controlled by pod volume mounts.
 // The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
 // Each DNS label is limited to 63 characters to match the wire contract;
 // Kubernetes metadata validation enforces DNS subdomain spelling.
@@ -27,7 +17,6 @@ type ClusterCacheSpec struct {
 type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              ClusterCacheSpec `json:"spec,omitempty"`
 }
 
 // +kubebuilder:object:root=true

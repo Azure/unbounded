@@ -206,7 +206,7 @@ func validatePublication(v Publication, counters bool) error {
 
 	names := map[string]bool{}
 	for _, c := range v.Caches {
-		if !validUUID(string(c.ID)) || ids[c.ID] || names[c.Name] || c.SocketMode > 0o777 {
+		if !validUUID(string(c.ID)) || ids[c.ID] || names[c.Name] {
 			return InvalidRequest
 		}
 

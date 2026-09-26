@@ -237,6 +237,22 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
             let result = acquire(&mut f, &mut budget).unwrap();
             assert_published(&f, &result, rank.is_some());
             assert_eq!(f.origin.calls.get(), usize::from(use_origin));
+            assert_eq!(
+                f.fill.metrics.count(Event::OriginFill),
+                u64::from(use_origin)
+            );
+            assert_eq!(f.fill.metrics.count(Event::PeerHit), u64::from(!use_origin));
+            assert_eq!(
+                f.fill.metrics.count(Event::CorruptMiss),
+                if missing_key {
+                    0
+                } else if use_origin {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
             if !use_origin {
                 assert_eq!(result.ciphertext.bytes(), good.ciphertext.bytes());
             }

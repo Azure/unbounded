@@ -166,6 +166,9 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     assert_response(&response, "200 OK", None);
     let text = std::str::from_utf8(&response).unwrap();
     assert!(text.contains("racer_diagnostic_ready_total 4\n"));
+    assert!(text.contains("racer_requests_total 0\n"));
+    assert!(text.contains("racer_request_errors_total 0\n"));
+    assert!(text.contains("racer_active_requests 0\n"));
     assert!(text.contains("racer_ready 0\n"));
     assert!(!text.contains("synthetic"));
     assert!(!text.contains("Authorization"));

@@ -102,7 +102,7 @@ fn hash_semantics() {
     p.members[0].rails.reverse();
     assert_eq!(content_hashes(&p).unwrap(), hashes);
     assert_eq!(p.members[0].rails[0].rail.0, 65535, "caller input mutated");
-    p.caches[0].socket_mode = 0o600;
+    p.caches[0].id = CacheId("66666666-6666-4666-8666-666666666666".into());
     let changed = content_hashes(&p).unwrap();
     assert_ne!(changed.0, hashes.0);
     assert_eq!(changed.1, hashes.1);

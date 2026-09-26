@@ -112,7 +112,7 @@ func cacheChanges() predicate.Predicate {
 			return false
 		}
 
-		return x.UID == y.UID && x.Name == y.Name && reflect.DeepEqual(x.Spec, y.Spec)
+		return x.UID == y.UID && x.Name == y.Name
 	})
 }
 

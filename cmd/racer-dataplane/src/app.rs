@@ -116,6 +116,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    metrics: crate::telemetry::metrics::Metrics,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
     replay: Arc<ReplayState>,
@@ -148,6 +149,7 @@ impl NodeState {
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         Ok(Self {
             publications: Arc::new(PublishedState::default()),
+            metrics: crate::telemetry::metrics::Metrics::default(),
             keys: Arc::new(KeyEpochs::default()),
             replay: Arc::new(ReplayState::default()),
             control_worker: WorkerId(0),
@@ -578,14 +580,20 @@ impl WorkerApplication {
             config.slab_bytes,
             config.segment_bytes,
         ));
-        let disk = Rc::new(StoreReader::new(
-            eviction.clone(),
-            index.clone(),
-            segments.clone(),
-            slabs.clone(),
-            buffers.clone(),
-        ));
-        let writer = Rc::new(StoreWriter::new(index.clone(), segments.clone(), slabs));
+        let disk = Rc::new(
+            StoreReader::new(
+                eviction.clone(),
+                index.clone(),
+                segments.clone(),
+                slabs.clone(),
+                buffers.clone(),
+            )
+            .with_metrics(node.metrics.clone()),
+        );
+        let writer = Rc::new(
+            StoreWriter::new(index.clone(), segments.clone(), slabs)
+                .with_metrics(node.metrics.clone()),
+        );
         writer.configure(
             admission.clone(),
             eviction.clone(),
@@ -677,20 +685,23 @@ impl WorkerApplication {
                 .with_buffers(admission.clone(), buffers.clone()),
         );
         let flights = Rc::new(Flights::new(admission.clone()));
-        let fill = Rc::new(Fill::new(FillDependencies {
-            memory: memory.clone(),
-            buffers,
-            disk,
-            writer,
-            peers: requester.clone(),
-            origin: origin.clone(),
-            candidates: candidates.clone(),
-            flights: flights.clone(),
-            crypto,
-            credentials: credentials.clone(),
-            admission: admission.clone(),
-            metadata_owner: node.workers.clone(),
-        }));
+        let fill = Rc::new(
+            Fill::new(FillDependencies {
+                memory: memory.clone(),
+                buffers,
+                disk,
+                writer,
+                peers: requester.clone(),
+                origin: origin.clone(),
+                candidates: candidates.clone(),
+                flights: flights.clone(),
+                crypto,
+                credentials: credentials.clone(),
+                admission: admission.clone(),
+                metadata_owner: node.workers.clone(),
+            })
+            .with_metrics(node.metrics.clone()),
+        );
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,
@@ -751,10 +762,12 @@ impl WorkerApplication {
                 io,
                 admission,
             )
-            .with_request_timeout(config.request_timeout),
+            .with_request_timeout(config.request_timeout)
+            .with_metrics(node.metrics.clone()),
         );
 
         let mut telemetry = Telemetry::default();
+        telemetry.metrics = node.metrics.clone();
         telemetry.health = node.observations.health.clone();
         Ok(Self {
             http,

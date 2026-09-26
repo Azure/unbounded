@@ -122,7 +122,7 @@ func TestCanonicalHashSemantics(t *testing.T) {
 		t.Fatal("hash mutated input", err)
 	}
 
-	v.Caches[0].SocketMode = 0o600
+	v.Caches[0].ID = "66666666-6666-4666-8666-666666666666"
 
 	p2, m2, err = ContentHashes(v)
 	if err != nil || ph == p2 || mh != m2 {

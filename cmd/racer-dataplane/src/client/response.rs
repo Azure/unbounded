@@ -100,9 +100,29 @@ impl Responses {
     /// Errors after success headers are terminal and close the incomplete body.
     pub fn send<'a>(
         &'a self,
+        connection: ConnectionLease,
+        response: ReadResponse,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        self.send_inner(connection, response, scope, None)
+    }
+
+    pub(crate) fn send_observed<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        response: ReadResponse,
+        scope: &'a RequestScope,
+        observation: &'a mut crate::telemetry::metrics::RequestMetrics,
+    ) -> Operation<'a, ConnectionLease> {
+        self.send_inner(connection, response, scope, Some(observation))
+    }
+
+    fn send_inner<'a>(
+        &'a self,
         mut connection: ConnectionLease,
         mut response: ReadResponse,
         scope: &'a RequestScope,
+        mut observation: Option<&'a mut crate::telemetry::metrics::RequestMetrics>,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
@@ -122,6 +142,9 @@ impl Responses {
                     }
                     result => {
                         let error = result.err().unwrap_or(Error::BadGateway);
+                        if let Some(observation) = observation {
+                            observation.fail(error);
+                        }
                         // Drop the stream only after the error head is sent: its
                         // destructor cancels the shared request scope.
                         return self.send_error(connection, error, scope).await;
@@ -153,6 +176,9 @@ impl Responses {
                 return Err(Error::BadGateway);
             }
             connection.finish_exchange()?;
+            if let Some(observation) = observation.as_mut() {
+                observation.success();
+            }
             Ok(connection)
         })
     }

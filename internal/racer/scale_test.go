@@ -116,7 +116,7 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 
 	caches := &racerv1.ClusterCacheList{TypeMeta: metav1.TypeMeta{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterCacheList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
 	for i := range 16 {
-		caches.Items = append(caches.Items, catalogCache(fmt.Sprintf("cache-%d", i), types.UID(fmt.Sprintf("%08x-1111-4000-8000-000000000000", i)), nil))
+		caches.Items = append(caches.Items, catalogCache(fmt.Sprintf("cache-%d", i), types.UID(fmt.Sprintf("%08x-1111-4000-8000-000000000000", i))))
 		if err := r.Create(t.Context(), &caches.Items[i]); err != nil {
 			t.Fatal(err)
 		}

@@ -33,6 +33,7 @@ struct Dirty {
     staging: Option<Reservation>,
 }
 pub struct StoreWriter {
+    metrics: crate::telemetry::metrics::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slabs>,
@@ -59,6 +60,7 @@ impl DirtyTicket {
 impl StoreWriter {
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, slabs: Rc<Slabs>) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             index,
             segments,
             slabs,
@@ -74,6 +76,10 @@ impl StoreWriter {
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }
+    }
+    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
     pub fn configure(
         &self,
@@ -220,6 +226,9 @@ impl StoreWriter {
         self.discarded.get()
     }
     fn note_discard(&self, count: usize) {
+        let _ = self
+            .metrics
+            .record(crate::telemetry::metrics::Event::DirtyDiscard, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
     }
@@ -319,8 +328,9 @@ impl StoreWriter {
                 };
                 // Install cleanup BEFORE allocation, reclamation or submission.
                 // Every attempted copy leaves the queue, including disposable failures.
-                let _cleanup = DirtyCleanup {
+                let mut cleanup = DirtyCleanup {
                     writer: self,
+                    persisted: false,
                     page: id.clone(),
                     ticket: self
                         .pending
@@ -330,13 +340,13 @@ impl StoreWriter {
                         .ticket,
                 };
                 let result = self.persist(&id, &page, scope).await;
+                cleanup.persisted = result.is_ok();
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
                 }
                 // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
-                    self.note_discard(1);
                     if !matches!(
                         error,
                         Error::Overloaded
@@ -420,6 +430,8 @@ impl StoreWriter {
                     key_id: page.ciphertext.envelope().key_id,
                 },
             )?;
+        } else if self.pending.borrow().contains_key(id) {
+            self.note_discard(1);
         }
         Ok(())
     }
@@ -460,11 +472,13 @@ impl StoreWriter {
         }
         self.retired.borrow_mut().insert((cache.clone(), key));
         let mut pending = self.pending.borrow_mut();
+        let before = pending.len();
         pending.retain(|_, d| {
             let e = d.page.ciphertext.envelope();
             &e.page.version.object.cache != cache || e.key_id != key
         });
         self.queue.borrow_mut().retain(|p| pending.contains_key(p));
+        self.note_discard(before - pending.len());
         Ok(self.index.retire_key(cache, key))
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
@@ -472,9 +486,10 @@ impl StoreWriter {
             return Err(Error::Overloaded);
         }
         self.removed.borrow_mut().insert(cache.clone());
-        self.pending
-            .borrow_mut()
-            .retain(|p, _| &p.version.object.cache != cache);
+        let mut pending = self.pending.borrow_mut();
+        let before = pending.len();
+        pending.retain(|p, _| &p.version.object.cache != cache);
+        self.note_discard(before - pending.len());
         self.queue
             .borrow_mut()
             .retain(|p| &p.version.object.cache != cache);
@@ -494,6 +509,7 @@ impl Drop for Busy<'_> {
 }
 struct DirtyCleanup<'a> {
     writer: &'a StoreWriter,
+    persisted: bool,
     page: PageId,
     ticket: u64,
 }
@@ -505,6 +521,9 @@ impl Drop for DirtyCleanup<'_> {
             .is_some_and(|dirty| dirty.ticket == self.ticket)
         {
             pending.remove(&self.page);
+            if !self.persisted {
+                self.writer.note_discard(1);
+            }
         }
     }
 }

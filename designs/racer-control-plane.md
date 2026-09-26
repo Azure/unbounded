@@ -146,8 +146,9 @@ Callers supply installation-namespace Pods and the current managed DaemonSet UID
 endpoint selection checks the `apps/v1` DaemonSet controller owner reference.
 
 `BuildCatalog` returns a UID-sorted desired catalog or rejects the whole candidate. It
-defaults socket mode to 0660, preserves explicit zero permissions, and delegates
-canonical path validation to the wire package. Capacity admission then retains
+delegates canonical path validation to the wire package. Client sockets use fixed
+0666 permissions, with access controlled by selective pod volume mounts.
+Capacity admission then retains
 existing keyed UIDs and fills free slots in UID order. Topology publishes only
 caches with both active key purposes in the committed keyring. Nodes remain present
 until absent from the input lists (or explicitly excluded); only Pod

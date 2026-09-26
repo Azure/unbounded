@@ -28,7 +28,6 @@
   {"name":"unbracketed IPv6","file":"publication.json","old":"[2001:db8::1]:7443","new":"2001:db8::1:7443","code":"invalid_request"},
   {"name":"path traversal","file":"publication.json","old":"cache-a","new":"..","code":"invalid_request"},
   {"name":"wrong path","file":"publication.json","old":"/run/racer/cache-a/client/socket","new":"/tmp/client.sock","code":"invalid_request"},
-  {"name":"special mode bits","file":"publication.json","old":"\"socket_mode\":432","new":"\"socket_mode\":4095","code":"invalid_request"},
   {"name":"truncated DER CSR","file":"bootstrap-request.json","old":"MIGWMEoCAQAwFzEVMBMGA1UEAxMMd2lyZSBmaXh0dXJlMCowBQYDK2VwAyEArvwqpxb5Obl8EI7xTvFeRVFowzucRaHW7prXgx4k1s+gADAFBgMrZXADQQDSTQKGW5jhUBgOR94nvtS/uvCoTtmLzs+rP/gbcET6MtUP/DqTZ4IUzajFPMA89sHWRFECjQNiRhuz21Moa7cO","new":"MAA=","code":"invalid_request"},
   {"name":"unknown purpose","file":"bundle.json","old":"\"purpose\":\"page\"","new":"\"purpose\":\"future\"","code":"invalid_request"},
   {"name":"unknown state","file":"bundle.json","old":"\"state\":\"prepared\"","new":"\"state\":\"future\"","code":"invalid_request"},

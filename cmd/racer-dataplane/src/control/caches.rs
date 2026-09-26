@@ -20,7 +20,6 @@ pub struct CacheDefinition {
     pub client_socket: PathBuf,
     /// Must equal /run/racer/<name>/origin/socket, not an arbitrary supplied path.
     pub origin_socket: PathBuf,
-    pub socket_mode: u32,
 }
 pub enum CacheEvent {
     Add(CacheDefinition),
@@ -75,11 +74,7 @@ pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
     let mut ids = HashSet::default();
     let mut names = HashSet::default();
     for d in definitions {
-        if !super::wire::valid_uuid(&d.id.0)
-            || !ids.insert(&d.id)
-            || !names.insert(&d.name)
-            || d.socket_mode > 0o777
-        {
+        if !super::wire::valid_uuid(&d.id.0) || !ids.insert(&d.id) || !names.insert(&d.name) {
             return Err(Error::InvalidRequest);
         }
         let (client, origin) = canonical_socket_paths(&d.name)?;
@@ -145,7 +140,8 @@ mod tests {
         bad[0].name = "..".into();
         assert!(registry.reconcile(&bad).is_err());
         assert!(registry.reconcile(&defs).unwrap().is_empty());
-        defs[0].socket_mode = 0o600;
+        defs[0].name = "renamed".into();
+        (defs[0].client_socket, defs[0].origin_socket) = canonical_socket_paths("renamed").unwrap();
         assert!(matches!(
             registry.reconcile(&defs).unwrap().as_slice(),
             [CacheEvent::Update(_)]

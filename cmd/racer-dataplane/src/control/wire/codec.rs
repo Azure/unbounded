@@ -145,7 +145,6 @@ struct CacheDto {
     name: String,
     client_socket: String,
     origin_socket: String,
-    socket_mode: u32,
 }
 #[derive(Serialize, Deserialize)]
 struct PublicationDto {
@@ -239,8 +238,7 @@ impl PublicationDto {
         let mut ids = HashSet::default();
         let mut names = HashSet::default();
         for c in &self.caches {
-            if !uuid(&c.id) || !ids.insert(&c.id) || !names.insert(&c.name) || c.socket_mode > 0o777
-            {
+            if !uuid(&c.id) || !ids.insert(&c.id) || !names.insert(&c.name) {
                 return Err(ProtocolFailure::InvalidRequest);
             }
             let (client, origin) = paths(&c.name)?;
@@ -328,7 +326,6 @@ impl PublicationDto {
                             .to_str()
                             .ok_or(ProtocolFailure::InvalidRequest)?
                             .into(),
-                        socket_mode: c.socket_mode,
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -369,7 +366,6 @@ impl PublicationDto {
                     name: c.name,
                     client_socket: c.client_socket.into(),
                     origin_socket: c.origin_socket.into(),
-                    socket_mode: c.socket_mode,
                 })
                 .collect(),
         }

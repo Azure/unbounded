@@ -140,6 +140,7 @@ struct Active {
 }
 
 pub struct ClientListeners {
+    metrics: crate::telemetry::metrics::Metrics,
     reads: Rc<dyn ReadService>,
     parser: RequestParser,
     responses: Rc<Responses>,
@@ -164,6 +165,7 @@ impl ClientListeners {
         admission: Rc<Admission>,
     ) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             reads,
             parser,
             responses,
@@ -184,6 +186,10 @@ impl ClientListeners {
     /// Response streaming shares the operation deadline without renewing it.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -292,6 +298,7 @@ impl ClientListeners {
                     let io = self.io.clone();
                     let admission = self.admission.clone();
                     let task_cache = cache.clone();
+                    let metrics = self.metrics.clone();
                     let operation = Box::pin(async move {
                         serve_connection(
                             connection,
@@ -305,6 +312,7 @@ impl ClientListeners {
                             task_retired,
                             task_idle,
                             timeout,
+                            &metrics,
                         )
                         .await
                     });
@@ -447,6 +455,7 @@ async fn serve_connection(
     retired: Rc<Cell<bool>>,
     idle: Rc<Cell<bool>>,
     timeout: Duration,
+    metrics: &crate::telemetry::metrics::Metrics,
 ) -> Result<()> {
     loop {
         if retired.get() {
@@ -469,6 +478,7 @@ async fn serve_connection(
             return Ok(());
         }
         idle.set(false);
+        let mut observation = metrics.request()?;
         // Idle/header admission has its own bound. A healthy pooled connection
         // gets a fresh operation budget only after each complete request head.
         let scope = new_scope(timeout, cancellation.clone())?;
@@ -476,6 +486,7 @@ async fn serve_connection(
         let request = match received.value.and_then(|head| parser.parse(cache, head)) {
             Ok(request) => request,
             Err(error) => {
+                observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
                 return Ok(());
             }
@@ -490,11 +501,13 @@ async fn serve_connection(
                 } else {
                     error
                 };
+                observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
                 return Ok(());
             }
         };
         if let Err(error) = scope.check() {
+            observation.fail(error);
             responses.send_error(connection, error, scope).await?;
             return Ok(());
         }
@@ -505,13 +518,24 @@ async fn serve_connection(
             return Ok(());
         }
         if let Err(error) = responses.validate(&kind, &response) {
+            observation.fail(error);
             responses.send_error(connection, error, scope).await?;
             return Ok(());
         }
-        connection = responses.send(connection, response, scope).await?;
+        connection = match responses
+            .send_observed(connection, response, scope, &mut observation)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                observation.fail(error);
+                return Err(error);
+            }
+        };
         if !connection.is_reusable() {
             return Ok(());
         }
+        drop(observation);
         let mut yielded = false;
         std::future::poll_fn(|cx| {
             if yielded {
@@ -602,13 +626,7 @@ fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<Boun
             retired: Rc::new(Cell::new(false)),
             basename: RefCell::new(basename.into()),
         };
-        set_socket_mode(
-            &bound.directory,
-            bound.device,
-            bound.inode,
-            bound.definition.socket_mode,
-            basename,
-        )?;
+        allow_socket_access(&bound.directory, bound.device, bound.inode, basename)?;
         return Ok(bound);
     }
     let root = open_directory(root)?;
@@ -631,21 +649,14 @@ fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<Boun
         .listener
         .set_nonblocking(true)
         .map_err(|_| Error::Io)?;
-    set_socket_mode(
-        &bound.directory,
-        bound.device,
-        bound.inode,
-        bound.definition.socket_mode,
-        basename,
-    )?;
+    allow_socket_access(&bound.directory, bound.device, bound.inode, basename)?;
     Ok(bound)
 }
 
-fn set_socket_mode(
+fn allow_socket_access(
     directory: &Directory,
     device: u64,
     inode: u64,
-    mode: u32,
     basename: &str,
 ) -> Result<()> {
     #[cfg(test)]
@@ -658,7 +669,7 @@ fn set_socket_mode(
         if FAIL_CHMOD.with(|fail| fail.replace(false)) {
             return Err(Error::Io);
         }
-        return sim.chmod(&path, mode).map_err(|_| Error::Io);
+        return sim.chmod(&path, 0o666).map_err(|_| Error::Io);
     }
     // Pin the final inode too: a replacement symlink must not redirect chmod.
     let socket = OpenOptions::new()
@@ -674,7 +685,9 @@ fn set_socket_mode(
     if FAIL_CHMOD.with(|fail| fail.replace(false)) {
         return Err(Error::Io);
     }
-    fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(mode)).map_err(|_| Error::Io)
+    // Pod volume mounts control access; every UID/GID with the mount can connect.
+    // Apply explicitly so the process umask cannot restrict client access.
+    fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(0o666)).map_err(|_| Error::Io)
 }
 #[cfg(test)]
 thread_local! {
@@ -717,13 +730,15 @@ mod tests {
         .unwrap();
         let path = PathBuf::from("/run/racer/example/client/socket");
         let inode = sim.metadata(&path).unwrap().0;
+        assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
         let mut changed = definition.clone();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let prepared =
             futures::executor::block_on(listeners.prepare(&[changed], &scope())).unwrap();
         assert_ne!(sim.metadata(&path).unwrap().0, inode);
         drop(prepared);
         assert_eq!(sim.metadata(&path).unwrap().0, inode);
+        assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
         let client = sim.connect(SocketAddress::Unix(path)).unwrap();
         let Descriptor::Sim(client) = client else {
             unreachable!()
@@ -827,7 +842,6 @@ mod tests {
             name: "example".into(),
             client_socket: "/run/racer/example/client/socket".into(),
             origin_socket: "/run/racer/example/origin/socket".into(),
-            socket_mode: 0o600,
         }
     }
     fn scope() -> RequestScope {
@@ -907,6 +921,12 @@ mod tests {
         }
         fn socket(&self) -> PathBuf {
             self.root.0.join("example/client/socket")
+        }
+        fn assert_metrics(&self, requests: u64, errors: u64, active: u64) {
+            use crate::telemetry::metrics::{Event, Gauge};
+            assert_eq!(self.listeners.metrics.count(Event::Request), requests);
+            assert_eq!(self.listeners.metrics.count(Event::RequestError), errors);
+            assert_eq!(self.listeners.metrics.gauge(Gauge::ActiveRequests), active);
         }
         fn connect(&self) -> UnixStream {
             // /proc keeps sun_path short even in deeply nested CI worktrees.
@@ -1535,6 +1555,7 @@ mod tests {
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
         assert!(output.ends_with(b"\r\n\r\n"));
         assert_no_body_leases(&fixture);
+        fixture.assert_metrics(1, 1, 0);
     }
 
     #[test]
@@ -1547,6 +1568,7 @@ mod tests {
             let held = pipes.acquire().unwrap();
             let mut socket = start_body(&fixture);
             assert_no_head(&mut socket);
+            fixture.assert_metrics(1, 0, 1);
             if cancel {
                 fixture.listeners.cancel_cache(&definition().id).unwrap();
             } else {
@@ -1558,6 +1580,7 @@ mod tests {
             drop(held);
             futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
             assert_no_body_leases(&fixture);
+            fixture.assert_metrics(1, 1, 0);
         }
     }
 
@@ -1612,6 +1635,7 @@ mod tests {
                 assert!(text.contains("racer-expires-at: 0\r\n"));
                 assert!(text.contains("content-type: application/octet-stream\r\n"));
             }
+            fixture.assert_metrics(if cancelled { 2 } else { 1 }, u64::from(cancelled), 0);
         }
     }
 
@@ -1622,7 +1646,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         let mut idle = fixture.connect();
         fixture.pump(1);
@@ -1818,6 +1842,7 @@ mod tests {
             (Error::Cancelled, "", 503, None),
             (Error::OriginRejected, "", 401, None),
             (Error::OriginForbidden, "", 403, None),
+            (Error::Overloaded, "", 503, None),
         ] {
             fixture.listeners.reads = Rc::new(Failing(error));
             let mut socket = fixture.connect();
@@ -1833,6 +1858,14 @@ mod tests {
             assert!(text.ends_with("\r\n\r\n"));
         }
         struct WrongIdentity(bool);
+        fixture.assert_metrics(7, 7, 0);
+        assert_eq!(
+            fixture
+                .listeners
+                .metrics
+                .count(crate::telemetry::metrics::Event::Overload),
+            1
+        );
         impl ReadService for WrongIdentity {
             fn read<'a>(
                 &'a self,
@@ -1882,7 +1915,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let mut added = definition();
         added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
         added.name = "blocked".into();
@@ -1900,7 +1933,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         FAIL_CHMOD.with(|fail| fail.set(true));
         assert!(
@@ -1910,7 +1943,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         let prepared =
             futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
@@ -1918,7 +1951,7 @@ mod tests {
         assert_ne!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         assert!(matches!(
             futures::executor::block_on(fixture.listeners.prepare(&[], &scope())),
@@ -1945,7 +1978,7 @@ mod tests {
         fixture.pump(16);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         assert!(fixture.receive(&mut socket, true).is_empty());
     }
@@ -1956,7 +1989,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let definitions = [changed];
         let scope = scope();
         let mut future = fixture.listeners.prepare(&definitions, &scope);
@@ -1990,7 +2023,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let mut added = definition();
         added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
         added.name = "added".into();
@@ -2004,7 +2037,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         assert_eq!(
             fs::read_dir(fixture.socket().parent().unwrap())
@@ -2052,7 +2085,7 @@ mod tests {
                 .borrow()
                 .contains_key(&replacement.id)
         );
-        replacement.socket_mode = 0o660;
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let prepared =
             futures::executor::block_on(fixture.listeners.prepare(&[replacement], &scope()))
                 .unwrap();
@@ -2130,11 +2163,11 @@ mod tests {
         fs::write(origin.join("socket"), b"adapter owned").unwrap();
         fixture.reconcile(&[definition()]).unwrap();
         let mut updated = definition();
-        updated.socket_mode = 0o660;
+        updated.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         fixture.reconcile(&[updated]).unwrap();
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         // Replacing the pathname does not give us ownership of its replacement.
         fs::remove_file(fixture.socket()).unwrap();

@@ -34,6 +34,7 @@ use crate::{
     },
     security::{aead::PageCrypto, credentials::CredentialCrypto},
     store::{reader::StoreReader, writer::StoreWriter},
+    telemetry::metrics::{Event, Gauge, Metrics},
     topology::membership::MembershipLease,
 };
 use std::{rc::Rc, sync::Arc};
@@ -58,6 +59,7 @@ pub struct FillDependencies {
 }
 pub struct Fill {
     dependencies: FillDependencies,
+    metrics: Metrics,
 }
 impl Fill {
     /// Admit required memory first; dirty-only saturation skips persistence without
@@ -152,7 +154,14 @@ impl Fill {
         dependencies
             .candidates
             .set_credentials(dependencies.credentials.clone());
-        Self { dependencies }
+        Self {
+            dependencies,
+            metrics: Metrics::default(),
+        }
+    }
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
     /// Local shard's memory/pending/disk descriptors, without starting acquisition.
     /// Used by WorkerDirectory's bounded retained-metadata lookup on a pinned miss.
@@ -227,6 +236,7 @@ impl Fill {
             }
             if let Some(result) = self.dependencies.memory.get(&page)? {
                 result.validate_for(&page)?;
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(result);
             }
             let mut waiter = match self.dependencies.flights.join(
@@ -268,13 +278,17 @@ impl Fill {
                             acquisition.scope.request,
                             attempt,
                         )?;
-                        let operation = self.dependencies.flights.retain_operation(&leader, ())?;
+                        let operation = self
+                            .dependencies
+                            .flights
+                            .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
                         let mut owned_budget = acquisition.budget.transfer();
                         let owned_scope = acquisition.scope.clone();
                         let owned_membership = acquisition.membership.clone();
                         let owned_page = page.clone();
                         let prefetched = prefetch.take();
-                        let fill = Fill::new(self.dependencies.clone());
+                        let fill =
+                            Fill::new(self.dependencies.clone()).with_metrics(self.metrics.clone());
                         let flights = self.dependencies.flights.clone();
                         let (send, mut receive) = futures::channel::oneshot::channel();
                         driver_permit.submit(Box::pin(async move {
@@ -404,6 +418,7 @@ impl Fill {
         };
         result.validate_for(page)?;
         self.publish(result.clone(), dirty, scope).await?;
+        self.metrics.record(Event::OriginFill, 1)?;
         Ok(result)
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -418,17 +433,23 @@ impl Fill {
             scope.check()?;
             if let Some(copy) = self.dependencies.memory.ciphertext(page)? {
                 validate_copy(&copy, page)?;
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             if let Some(copy) = self.dependencies.writer.copy_only(page)? {
                 validate_copy(&copy, page)?;
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             match self.dependencies.disk.read(page, scope).await {
                 Ok(Some(copy)) if validate_copy(&copy, page).is_ok() => {
+                    self.metrics.record(Event::DiskHit, 1)?;
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }
-                Ok(_) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {}
+                Ok(Some(_)) | Err(Error::CorruptRecord) => {
+                    self.metrics.record(Event::CorruptMiss, 1)?;
+                }
+                Ok(None) | Err(Error::MissingKey | Error::Io) => {}
                 Err(error) => return Err(error),
             }
             match self.dependencies.flights.join_copy(page, scope)? {
@@ -490,9 +511,20 @@ impl Fill {
             match self.decrypt(page, copy, reservation.plaintext, scope).await {
                 Ok(result) => {
                     self.publish(result.clone(), None, scope).await?;
+                    self.metrics.record(
+                        if token.is_some() {
+                            Event::DiskHit
+                        } else {
+                            Event::MemoryHit
+                        },
+                        1,
+                    )?;
                     return Ok(result);
                 }
-                Err(Error::CorruptRecord | Error::MissingKey) => {
+                Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
+                    if error == Error::CorruptRecord {
+                        self.metrics.record(Event::CorruptMiss, 1)?;
+                    }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
                     }
@@ -529,6 +561,7 @@ impl Fill {
                 },
             )
             .await?;
+        let mut source = Event::PeerHit;
         let result = match resolution {
             CandidateResolution::Copy(result) => result,
             CandidateResolution::Origin(authority) => {
@@ -546,6 +579,7 @@ impl Fill {
                     .await
                 {
                     Ok(origin) => {
+                        source = Event::OriginFill;
                         if origin.metadata.version != page.version {
                             return Err(Error::CorruptRecord);
                         }
@@ -600,6 +634,7 @@ impl Fill {
         scope.check()?;
         self.publish(result.clone(), reservation.dirty, scope)
             .await?;
+        self.metrics.record(source, 1)?;
         Ok(result)
     }
 
@@ -611,12 +646,22 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
-        let copy = response_copy(response.response(), page)?;
+        let copy = response_copy(response.response(), page).inspect_err(|error| {
+            if *error == Error::CorruptRecord {
+                let _ = self.metrics.record(Event::CorruptMiss, 1);
+            }
+        })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
             None => self.reserve_bootstrap(&page.version.object.cache)?,
         };
-        self.decrypt(page, copy, reservation, scope).await
+        self.decrypt(page, copy, reservation, scope)
+            .await
+            .inspect_err(|error| {
+                if *error == Error::CorruptRecord {
+                    let _ = self.metrics.record(Event::CorruptMiss, 1);
+                }
+            })
     }
 
     async fn decrypt(
@@ -842,6 +887,7 @@ mod tests {
         }
     }
     struct Rig {
+        reactor: Rc<crate::runtime::reactor::Reactor>,
         fill: Rc<Fill>,
         origin: Rc<BytesOrigin>,
         engine: crate::security::aead::PageCryptoEngine,
@@ -886,7 +932,7 @@ mod tests {
         let slabs = Rc::new(Slabs::new(
             WorkerId(0),
             directory.clone(),
-            reactor,
+            reactor.clone(),
             1024 * 1024 * 1024,
             64 * 1024 * 1024,
         ));
@@ -965,6 +1011,7 @@ mod tests {
             number: PageNumber(0),
         };
         Rig {
+            reactor,
             directory,
             fill,
             origin,
@@ -975,21 +1022,28 @@ mod tests {
         }
     }
     fn drive<T>(
+        reactor: &crate::runtime::reactor::Reactor,
         engine: &mut crate::security::aead::PageCryptoEngine,
         client: &crate::runtime::crypto::CryptoClient,
         mut future: Operation<'_, T>,
     ) -> Result<T> {
         use crate::runtime::worker::CryptoService;
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            reactor.poll_budgeted(64)?;
             super::super::drivers::poll(&mut cx, 64);
             engine.poll_budgeted(64)?;
             client.poll_budgeted(64)?;
             if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut cx) {
                 return result;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded local pipeline failed to make progress"
+            );
+            reactor.wait(std::time::Duration::from_millis(1))?;
         }
-        panic!("bounded local pipeline failed to make progress")
     }
     #[test]
     fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
@@ -1006,6 +1060,7 @@ mod tests {
         .unwrap();
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 8, 8);
         let result = drive(
+            &rig.reactor,
             &mut rig.engine,
             &rig.client,
             rig.fill.acquire(
@@ -1034,6 +1089,7 @@ mod tests {
             .unwrap();
         assert_eq!(pending.ciphertext.bytes(), result.ciphertext.bytes());
         let second = drive(
+            &rig.reactor,
             &mut rig.engine,
             &rig.client,
             rig.fill.acquire(
@@ -1047,5 +1103,47 @@ mod tests {
         .unwrap();
         assert_eq!(second.ciphertext.bytes(), result.ciphertext.bytes());
         assert_eq!(rig.origin.calls.get(), 1);
+        assert_eq!(rig.fill.metrics.count(Event::OriginFill), 1);
+        assert_eq!(rig.fill.metrics.count(Event::MemoryHit), 2);
+        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 0);
+        assert_eq!(rig.fill.metrics.count(Event::PeerHit), 0);
+        assert_eq!(rig.fill.metrics.gauge(Gauge::ActiveFills), 0);
+        rig.reactor.init().unwrap();
+        futures::executor::block_on(rig.fill.dependencies.writer.open()).unwrap();
+        drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.dependencies.writer.progress(1, &scope),
+        )
+        .unwrap();
+        drop((result, second, copy, pending));
+        assert!(rig.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);
+        let disk_copy = drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.copy_only(&rig.page, &scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disk_copy.0.version, rig.page.version);
+        let disk_result = drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.acquire(
+                rig.page.clone(),
+                rig.membership.clone(),
+                &context,
+                &scope,
+                &mut budget,
+            ),
+        )
+        .unwrap();
+        assert_eq!(disk_result.plaintext.bytes(), b"abc");
+        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 2);
+        assert_eq!(rig.fill.metrics.count(Event::OriginFill), 1);
+        assert_eq!(rig.fill.metrics.count(Event::MemoryHit), 2);
     }
 }
