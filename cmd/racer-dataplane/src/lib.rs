@@ -27,4 +27,7 @@ pub mod telemetry;
 pub mod topology;
 
 #[cfg(test)]
+mod contention;
+
+#[cfg(test)]
 pub(crate) mod test_support;
