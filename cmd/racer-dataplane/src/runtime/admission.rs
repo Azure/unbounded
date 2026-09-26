@@ -120,6 +120,41 @@ impl Admission {
             ResourceClass::Relay => self.limits.relay_transfers.get(),
         }
     }
+    fn fair_limit(&self, class: ResourceClass, active: usize) -> usize {
+        let limit = self.limit(class);
+        let progress = match class {
+            ResourceClass::Plaintext => PAGE_BYTES as usize,
+            ResourceClass::Ciphertext
+            | ResourceClass::DirtyCiphertext
+            | ResourceClass::Registered => PAGE_BYTES as usize + 16,
+            _ => 1,
+        };
+        (limit / active.max(1)).max(progress).min(limit)
+    }
+    /// Diagnose byte pressure after a failed reserve. A fair-share deficit must
+    /// be reclaimed from this cache; global pressure may use any idle cache.
+    /// Impossible allocations and cache-accounting saturation have no byte remedy.
+    pub(crate) fn reclamation(
+        &self,
+        cache: &CacheId,
+        class: ResourceClass,
+        amount: usize,
+    ) -> Option<(Option<CacheId>, usize)> {
+        let caches = self.caches.borrow();
+        let local = caches.get(cache)?;
+        let fair = self.fair_limit(class, caches.len());
+        if amount > fair {
+            return None;
+        }
+        let local_deficit = local.used[index(class)]
+            .load(Ordering::Acquire)
+            .saturating_sub(fair - amount);
+        if local_deficit != 0 {
+            return Some((Some(cache.clone()), local_deficit));
+        }
+        let deficit = self.used(class).saturating_sub(self.limit(class) - amount);
+        (deficit != 0).then_some((None, deficit))
+    }
     pub fn reserve(
         &self,
         cache: Option<&CacheId>,
@@ -173,14 +208,7 @@ impl Admission {
         // wait for their natural release/idle eviction before its first admission.
         if let Some(local) = local.as_ref().filter(|_| !completing) {
             let active = self.caches.borrow().len().max(1);
-            let progress = match class {
-                ResourceClass::Plaintext => PAGE_BYTES as usize,
-                ResourceClass::Ciphertext
-                | ResourceClass::DirtyCiphertext
-                | ResourceClass::Registered => PAGE_BYTES as usize + 16,
-                _ => 1,
-            };
-            let fair_limit = (limit / active).max(progress).min(limit);
+            let fair_limit = self.fair_limit(class, active);
             if local.used[index(class)]
                 .load(Ordering::Acquire)
                 .checked_add(amount)

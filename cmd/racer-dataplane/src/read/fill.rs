@@ -19,7 +19,9 @@ use crate::{
     model::{
         context::OriginContext,
         identity::PageId,
+        limits::ResourceClass,
         metadata::{ObjectMetadata, VersionMetadata},
+        range::PAGE_BYTES,
     },
     origin::client::Origin,
     peer::{
@@ -58,33 +60,84 @@ pub struct Fill {
     dependencies: FillDependencies,
 }
 impl Fill {
-    /// One bounded reclamation pass, then one retry. Submitted writes and reader
-    /// leases remain owned; only disposable queued writes and idle cache entries
-    /// are released. Scanning at most the bounded cache avoids pressure spin loops.
+    /// Admit required memory first; dirty-only saturation skips persistence without
+    /// disturbing queued writes or unrelated idle pages. Failure rolls charges back.
     fn reserve_progress(
         &self,
         cache: &crate::model::identity::CacheId,
         persist: bool,
     ) -> Result<crate::runtime::admission::FillReservation> {
-        match self
-            .reserve_with_reclamation(|| self.dependencies.admission.reserve_fill(cache, persist))
-        {
-            Err(Error::Overloaded) if persist => {
-                self.dependencies.admission.reserve_fill(cache, false)
+        let plaintext =
+            self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        let ciphertext = self.reserve_with_reclamation(
+            cache,
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize + 16,
+        )?;
+        let dirty = if persist {
+            match self.dependencies.admission.reserve(
+                Some(cache),
+                ResourceClass::DirtyCiphertext,
+                PAGE_BYTES as usize + 16,
+            ) {
+                Ok(dirty) => Some(dirty),
+                Err(Error::Overloaded) => None,
+                Err(error) => return Err(error),
             }
-            result => result,
-        }
+        } else {
+            None
+        };
+        Ok(crate::runtime::admission::FillReservation {
+            plaintext,
+            ciphertext,
+            dirty,
+        })
     }
 
-    fn reserve_with_reclamation<T>(&self, reserve: impl Fn() -> Result<T>) -> Result<T> {
-        match reserve() {
-            Err(Error::Overloaded) => {
-                self.dependencies.writer.discard_unsubmitted();
-                self.dependencies.memory.evict_idle(usize::MAX)?;
-                reserve()
+    fn reserve_with_reclamation(
+        &self,
+        cache: &crate::model::identity::CacheId,
+        class: ResourceClass,
+        amount: usize,
+    ) -> Result<Reservation> {
+        let reserve = || {
+            self.dependencies
+                .admission
+                .reserve(Some(cache), class, amount)
+        };
+        let mut result = reserve();
+        // At most a cache-fairness pass and a global-deficit pass. No await allows
+        // new local charges to interleave; remote completions can only free bytes.
+        for _ in 0..2 {
+            if !matches!(result, Err(Error::Overloaded)) {
+                break;
             }
-            result => result,
+            let Some((owner, bytes)) = self
+                .dependencies
+                .admission
+                .reclamation(cache, class, amount)
+            else {
+                break;
+            };
+            let mut released =
+                self.dependencies
+                    .memory
+                    .reclaim_idle(class, owner.as_ref(), bytes, |page| {
+                        self.dependencies.writer.discard_idle_copy(page)
+                    });
+            if released < bytes && matches!(class, ResourceClass::Ciphertext) {
+                released = released.saturating_add(
+                    self.dependencies
+                        .writer
+                        .reclaim_ciphertext(owner.as_ref(), bytes - released),
+                );
+            }
+            result = reserve();
+            if released == 0 {
+                break;
+            }
         }
+        result
     }
 
     /// Fresh metadata has no page identity yet. Admit its page-zero plaintext
@@ -93,13 +146,7 @@ impl Fill {
         &self,
         cache: &crate::model::identity::CacheId,
     ) -> Result<Reservation> {
-        self.reserve_with_reclamation(|| {
-            self.dependencies.admission.reserve(
-                Some(cache),
-                crate::model::limits::ResourceClass::Plaintext,
-                crate::model::range::PAGE_BYTES as usize,
-            )
-        })
+        self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
     pub fn new(dependencies: FillDependencies) -> Self {
         dependencies
@@ -330,21 +377,11 @@ impl Fill {
         if !self.dependencies.candidates.is_candidate(&candidates) {
             return Err(Error::Unauthorized);
         }
-        let reserve = || {
-            self.dependencies.admission.reserve(
-                Some(&page.version.object.cache),
-                ResourceClass::Ciphertext,
-                PAGE_BYTES as usize + 16,
-            )
-        };
-        let ciphertext = match reserve() {
-            Err(Error::Overloaded) => {
-                self.dependencies.writer.discard_unsubmitted();
-                self.dependencies.memory.evict_idle(usize::MAX)?;
-                reserve()?
-            }
-            result => result?,
-        };
+        let ciphertext = self.reserve_with_reclamation(
+            &page.version.object.cache,
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize + 16,
+        )?;
         let dirty = match self.dependencies.admission.reserve(
             Some(&page.version.object.cache),
             ResourceClass::DirtyCiphertext,
@@ -423,27 +460,27 @@ impl Fill {
             .candidates_async(membership, &page.version.object, page.number)
             .await?;
         let persist = self.dependencies.candidates.is_candidate(&candidates);
-        // Atomically reserve progress, including dirty capacity on candidates,
-        // before touching transport. Retrying a bad local copy releases this batch.
+        // Reserve progress before touching transport, optionally including dirty
+        // capacity on candidates. Retrying a bad local copy releases this batch.
         let mut reservation = self.reserve_progress(&context.object.cache, persist)?;
         let local = self.dependencies.writer.copy_only(page)?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
-            None => match self.dependencies.disk.read_with_token(page, scope).await {
+            None => match self
+                .dependencies
+                .disk
+                .read_with_token_reclaim(page, scope, |amount| {
+                    self.reserve_with_reclamation(
+                        &page.version.object.cache,
+                        ResourceClass::Ciphertext,
+                        amount,
+                    )
+                })
+                .await
+            {
                 Ok(Some((copy, token))) => (Some(copy), Some(token)),
                 Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
                     (None, None)
-                }
-                Err(Error::Overloaded) => {
-                    self.dependencies.writer.discard_unsubmitted();
-                    self.dependencies.memory.evict_idle(usize::MAX)?;
-                    match self.dependencies.disk.read_with_token(page, scope).await {
-                        Ok(Some((copy, token))) => (Some(copy), Some(token)),
-                        Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
-                            (None, None)
-                        }
-                        Err(error) => return Err(error),
-                    }
                 }
                 Err(error) => return Err(error),
             },

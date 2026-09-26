@@ -8,6 +8,7 @@ use crate::{
     model::{
         envelope::KeyId,
         identity::{CacheId, ObjectVersion, PageId},
+        limits::ResourceClass,
         metadata::VersionMetadata,
     },
 };
@@ -109,6 +110,44 @@ impl MemoryCache {
             false
         });
         Ok(released)
+    }
+    /// One bounded LRU pass, counting only the exhausted class. The callback may
+    /// release a queued writer's sole extra ciphertext reference, never a reader.
+    pub(crate) fn reclaim_idle(
+        &self,
+        class: ResourceClass,
+        cache: Option<&CacheId>,
+        bytes: usize,
+        mut release_queued: impl FnMut(&PageResult) -> usize,
+    ) -> usize {
+        if !matches!(class, ResourceClass::Plaintext | ResourceClass::Ciphertext) {
+            return 0;
+        }
+        let mut released = 0usize;
+        self.entries.borrow_mut().retain(|entry| {
+            if released >= bytes
+                || cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+                || Arc::strong_count(&entry.plaintext.inner) != 1
+            {
+                return true;
+            }
+            let staging = release_queued(entry);
+            if matches!(class, ResourceClass::Ciphertext) {
+                released = released.saturating_add(staging);
+            }
+            if released >= bytes {
+                return true;
+            }
+            if !idle(entry) {
+                return true;
+            }
+            released = released.saturating_add(match class {
+                ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
+                _ => entry.ciphertext.inner.reservation.amount(),
+            });
+            false
+        });
+        released
     }
     /// Stop late publications and remove lookup visibility. Existing owners keep
     /// their charges until their completion fences release them.

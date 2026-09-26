@@ -63,10 +63,11 @@ The original repro now exercises the fixed path.
   fixture executor. Delivery now uses the bounded 40-second request timeout
   (`tests/production_dataplane.rs:536`). This is not evidence of a production
   delivery failure; production has a paired crypto worker.
-- A drained writer does not imply every fetched page persisted. Fill explicitly
-  discards unsubmitted writes and may retry without dirty admission under pressure
-  (`src/read/fill.rs:69-78`). The initial complete offline replay assertion was
-  intermittently false for this reason, not established corruption. The full-cache
+- A drained writer does not imply every fetched page persisted. Fill skips
+  persistence under dirty-only pressure and selectively discards unsubmitted writes
+  when required to reclaim a memory-class deficit (`src/read/fill.rs`,
+  `reserve_progress` and `reserve_with_reclamation`). The initial complete offline
+  replay assertion was intermittently false for this reason, not established corruption. The full-cache
   test now has sufficient dirty capacity and asserts six records; the pressure
   test demands offline reads only for records actually published in the disk index.
 

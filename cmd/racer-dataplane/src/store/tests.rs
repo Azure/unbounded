@@ -681,6 +681,117 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
 }
 
 #[test]
+fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_queue() {
+    let f = Fixture::new();
+    f.store.configure(f.admission.clone(), 3, 16).unwrap();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    f.enqueue(f.copy(1, 64)).unwrap();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    f.enqueue(f.copy(3, 64)).unwrap();
+    let request = scope();
+    let mut write = f.store.writer.progress(1, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    let before = f.admission.used(ResourceClass::Ciphertext);
+    let released = f
+        .store
+        .writer
+        .reclaim_ciphertext(Some(&CacheId("cache".into())), 1);
+    assert!(released > 0);
+    assert_eq!(
+        before - f.admission.used(ResourceClass::Ciphertext),
+        released
+    );
+    assert_eq!(f.store.writer.discarded_count(), 1);
+    assert_eq!(f.store.writer.queued_count(), 1);
+    assert_eq!(f.store.writer.pending_count(), 2);
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    assert!(!f.store.writer.is_idle());
+    drive(&f.reactor, write).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&request)).unwrap();
+    assert_eq!(f.store.writer.index().snapshot().unwrap().entries.len(), 2);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
+
+#[test]
+fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 64);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    let request = scope();
+    drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+    let disk_bytes = f
+        .store
+        .writer
+        .index()
+        .lookup(&id)
+        .unwrap()
+        .unwrap()
+        .location
+        .location
+        .extent
+        .length();
+    f.enqueue(f.copy(2, 64)).unwrap();
+    let last = f.copy(3, 64);
+    let last_id = last.ciphertext.envelope().page.clone();
+    f.enqueue(last).unwrap();
+    let _pressure = f
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            f.admission.limit(ResourceClass::Ciphertext)
+                - f.admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    let allocations = std::cell::RefCell::new(Vec::new());
+    let (read, _) = drive(
+        &f.reactor,
+        f.store
+            .reader
+            .read_with_token_reclaim(&id, &request, |amount| {
+                allocations.borrow_mut().push(amount);
+                match f.admission.reserve(
+                    Some(&id.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    amount,
+                ) {
+                    Err(Error::Overloaded) => {
+                        let (cache, bytes) = f
+                            .admission
+                            .reclamation(
+                                &id.version.object.cache,
+                                ResourceClass::Ciphertext,
+                                amount,
+                            )
+                            .unwrap();
+                        f.store.writer.reclaim_ciphertext(cache.as_ref(), bytes);
+                        f.admission.reserve(
+                            Some(&id.version.object.cache),
+                            ResourceClass::Ciphertext,
+                            amount,
+                        )
+                    }
+                    result => result,
+                }
+            }),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(*allocations.borrow(), [disk_bytes, 80]);
+    assert_eq!(read.ciphertext.bytes(), &[1; 80]);
+    assert_eq!(f.store.writer.discarded_count(), 1);
+    assert_eq!(f.store.writer.queued_count(), 1);
+    assert!(f.store.writer.copy_only(&last_id).unwrap().is_some());
+}
+
+#[test]
 fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();

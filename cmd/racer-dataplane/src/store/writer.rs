@@ -247,6 +247,50 @@ impl StoreWriter {
         self.note_discard(removed);
         removed
     }
+    /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
+    /// must be that bundle and this queued write, not a submitted operation/reader.
+    pub(crate) fn discard_idle_copy(&self, page: &crate::memory::page::PageResult) -> usize {
+        let id = page.plaintext.page();
+        let mut queue = self.queue.borrow_mut();
+        let Some(position) = queue.iter().position(|queued| queued == id) else {
+            return 0;
+        };
+        let mut pending = self.pending.borrow_mut();
+        if pending.get(id).is_some_and(|dirty| {
+            std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &page.ciphertext.inner)
+                && std::sync::Arc::strong_count(&page.ciphertext.inner) == 2
+        }) {
+            queue.remove(position);
+            let dirty = pending.remove(id).expect("located queued copy");
+            self.note_discard(1);
+            return dirty.staging.as_ref().map_or(0, Reservation::amount);
+        }
+        0
+    }
+    /// Release only enough queued ciphertext/staging charges to cover a deficit.
+    /// Submitted writes are absent from queue and keep all completion-owned charges.
+    pub(crate) fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
+        let mut released = 0usize;
+        let mut removed = 0;
+        let mut pending = self.pending.borrow_mut();
+        self.queue.borrow_mut().retain(|id| {
+            if released >= bytes || cache.is_some_and(|cache| cache != &id.version.object.cache) {
+                return true;
+            }
+            if let Some(dirty) = pending.remove(id) {
+                released =
+                    released.saturating_add(dirty.staging.as_ref().map_or(0, Reservation::amount));
+                if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
+                    released =
+                        released.saturating_add(dirty.page.ciphertext.inner.reservation.amount());
+                }
+                removed += 1;
+            }
+            false
+        });
+        self.note_discard(removed);
+        released
+    }
     /// Drive at most `budget` writes. Keep polling this future through reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
         Box::pin(async move {

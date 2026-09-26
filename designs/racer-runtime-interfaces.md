@@ -86,8 +86,18 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
   pipe data can be spliced without retaining userspace page pointers; readiness
   and asynchronous fallback operations retain all required connection/page leases.
 - `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` block late
-  publication. `evict_idle(bytes)` releases only idle bundles; admission pressure
-  must call this from the read owner before retrying an allocation.
+  publication. `evict_idle(bytes)` releases idle bundles and reports combined
+  plaintext/ciphertext charges; it is not a class-specific admission budget.
+  Read-owner pressure uses `reclaim_idle` with the exhausted class and its exact
+  deficit. Fair-share pressure reclaims only the requesting cache; global pressure
+  may reclaim other idle caches. Each pass stops at the deficit, counting reserved
+  final-page slack and separately charged write staging. Queued writes are discarded
+  selectively to unpin otherwise-idle bundles or release needed ciphertext staging;
+  busy readers and submitted completion owners retain their leases. Admission is
+  retried after at most a fair-share pass and a global pass, without pressure loops.
+  Dirty-only fill saturation skips persistence without evicting memory or queued
+  writes. Bootstrap and disk-read allocations use the same class-aware policy;
+  disk reads reclaim for padded staging and decoded ciphertext separately.
 
 ## Verification
 

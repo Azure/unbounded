@@ -55,6 +55,22 @@ impl StoreReader {
         page: &'a PageId,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
+        self.read_with_token_reclaim(page, scope, |amount| {
+            self.slabs.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Ciphertext,
+                amount,
+            )
+        })
+    }
+    /// The read owner may reclaim for each exact ciphertext allocation separately:
+    /// padded disk staging, then decoded ciphertext while staging is still owned.
+    pub(crate) fn read_with_token_reclaim<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        reserve: impl Fn(usize) -> Result<crate::runtime::admission::Reservation> + 'a,
+    ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         Box::pin(async move {
             scope.check()?;
             let entry = match self.index.lookup(page)? {
@@ -80,10 +96,8 @@ impl StoreReader {
                     return Ok(None);
                 }
             };
-            let buffer = self.slabs.allocate(
-                entry.location.location.extent.length(),
-                Some(&page.version.object.cache),
-            )?;
+            let length = entry.location.location.extent.length();
+            let buffer = self.slabs.alignment()?.allocate(length, reserve(length)?)?;
             let buffer = match self
                 .slabs
                 .read(entry.location.location, buffer, lease, scope)
@@ -117,11 +131,7 @@ impl StoreReader {
             }) {
                 return Ok(None);
             }
-            let reservation = self.slabs.reserve(
-                Some(&page.version.object.cache),
-                ResourceClass::Ciphertext,
-                decoded.ciphertext.len(),
-            )?;
+            let reservation = reserve(decoded.ciphertext.len())?;
             let ciphertext = self.buffers.ciphertext(
                 reservation,
                 decoded.header.envelope,
