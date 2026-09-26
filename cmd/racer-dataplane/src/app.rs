@@ -424,6 +424,7 @@ pub struct WorkerApplication {
     clients: Rc<ClientListeners>,
     peers: Rc<PeerServer>,
     coordinator: Rc<Coordinator>,
+    metadata: Rc<MetadataService>,
     dispatcher: Rc<Dispatcher>,
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
@@ -692,7 +693,7 @@ impl WorkerApplication {
         ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.clone(),
-            metadata,
+            metadata.clone(),
             fill,
             streams,
             credentials,
@@ -744,6 +745,7 @@ impl WorkerApplication {
             clients,
             peers,
             coordinator,
+            metadata,
             dispatcher,
             flights,
             rdma,
@@ -1012,6 +1014,7 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        self.metadata.poll_deadlines(Instant::now(), budget);
         if self.stopping {
             for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
                 if let Some(result) = poll_task(task, cx) {
@@ -1419,6 +1422,56 @@ pub(crate) mod tests {
         worker.poll_budgeted(&mut cx, 1).unwrap();
         assert!(worker.peer_task.is_none());
         assert!(worker.diagnostic_task.is_none());
+    }
+
+    #[test]
+    fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
+        use futures::{Stream, stream::FuturesUnordered};
+        let mut worker = wake_test_worker();
+        worker.started = true;
+        worker.stopping = true;
+        assert_eq!(
+            Rc::strong_count(&worker.metadata),
+            2,
+            "worker and coordinator retain the same metadata service"
+        );
+        let count = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = std::task::Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut children = FuturesUnordered::new();
+        for _ in 0..65 {
+            children.push(crate::read::metadata::tests::deadline_probe(
+                &worker.metadata,
+                Instant::now(),
+            ));
+        }
+        assert!(
+            std::pin::Pin::new(&mut children)
+                .poll_next(&mut cx)
+                .is_pending()
+        );
+        let completed = Rc::new(std::cell::Cell::new(0));
+        let observed = completed.clone();
+        worker.peer_task = Some(Box::pin(std::future::poll_fn(move |cx| {
+            while let Poll::Ready(Some(result)) = std::pin::Pin::new(&mut children).poll_next(cx) {
+                assert_eq!(result, Err(Error::DeadlineExceeded));
+                observed.set(observed.get() + 1);
+            }
+            Poll::Pending
+        })));
+        worker.poll_budgeted(&mut cx, 0).unwrap();
+        assert_eq!(completed.get(), 0);
+        worker.poll_budgeted(&mut cx, usize::MAX).unwrap();
+        assert_eq!(
+            completed.get(),
+            64,
+            "deadline hook clamps before polling peers"
+        );
+        worker.poll_budgeted(&mut cx, 1).unwrap();
+        assert_eq!(completed.get(), 65);
+        let settled = count.count();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
+        assert_eq!(count.count(), settled);
     }
 
     #[test]

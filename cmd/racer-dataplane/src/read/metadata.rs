@@ -27,7 +27,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::{Future, poll_fn},
     pin::Pin,
     rc::Rc,
@@ -224,6 +224,83 @@ fn take_wakers(state: &mut Refresh) -> Vec<Waker> {
 }
 
 #[derive(Default)]
+struct IngressDeadlines {
+    next: Cell<u64>,
+    pending: RefCell<BTreeMap<(Instant, u64), Rc<RefCell<IngressDeadlineState>>>>,
+}
+#[derive(Default)]
+struct IngressDeadlineState {
+    expired: bool,
+    waker: Option<Waker>,
+}
+/// One entry per admitted resolve, shared across its follower and leader waits.
+/// The refresh registration quota bounds these entries. Drivers never own this
+/// guard: ingress expiry must not release their acquisition or completion fences.
+struct IngressDeadline {
+    table: Rc<IngressDeadlines>,
+    key: (Instant, u64),
+    state: Rc<RefCell<IngressDeadlineState>>,
+}
+impl IngressDeadlines {
+    fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
+        let id = self.next.get();
+        self.next.set(id.checked_add(1).ok_or(Error::Overloaded)?);
+        let key = (deadline, id);
+        let state = Rc::new(RefCell::new(IngressDeadlineState::default()));
+        self.pending.borrow_mut().insert(key, state.clone());
+        Ok(IngressDeadline {
+            table: self.clone(),
+            key,
+            state,
+        })
+    }
+
+    fn poll(&self, now: Instant, budget: usize) -> usize {
+        let mut wakers = Vec::new();
+        let mut expired = 0;
+        {
+            let mut pending = self.pending.borrow_mut();
+            while expired < budget
+                && pending
+                    .first_key_value()
+                    .is_some_and(|(key, _)| key.0 <= now)
+            {
+                let (_, state) = pending.pop_first().expect("due ingress deadline");
+                let mut state = state.borrow_mut();
+                state.expired = true;
+                if let Some(waker) = state.waker.take() {
+                    wakers.push(waker);
+                }
+                expired += 1;
+            }
+        }
+        // Waking can schedule code that touches either table or ingress state.
+        for waker in wakers {
+            waker.wake();
+        }
+        expired
+    }
+}
+impl IngressDeadline {
+    fn check(&self, scope: &RequestScope, waker: &Waker) -> Result<()> {
+        scope.check()?;
+        let mut state = self.state.borrow_mut();
+        if state.expired {
+            return Err(Error::DeadlineExceeded);
+        }
+        if state.waker.as_ref().is_none_or(|old| !old.will_wake(waker)) {
+            state.waker = Some(waker.clone());
+        }
+        Ok(())
+    }
+}
+impl Drop for IngressDeadline {
+    fn drop(&mut self) {
+        self.table.pending.borrow_mut().remove(&self.key);
+    }
+}
+
+#[derive(Default)]
 struct Clock {
     sample: Option<(SystemTime, Instant)>,
     epoch: u64,
@@ -289,6 +366,7 @@ pub struct MetadataService {
     capacity: usize,
     storage: MetadataDependencies,
     refreshes: Rc<RefreshTable>,
+    deadlines: Rc<IngressDeadlines>,
     clock: Rc<RefCell<Clock>>,
 }
 impl MetadataService {
@@ -313,9 +391,16 @@ impl MetadataService {
             capacity,
             storage,
             refreshes: Rc::new(RefreshTable::default()),
+            deadlines: Rc::new(IngressDeadlines::default()),
             clock: Rc::new(RefCell::new(Clock::default())),
         }
     }
+    /// Wake actual ingress children, including those parked in FuturesUnordered.
+    /// The worker tick calls this during normal polling, retirement, and drain.
+    pub(crate) fn poll_deadlines(&self, now: Instant, budget: usize) -> usize {
+        self.deadlines.poll(now, budget)
+    }
+
     /// Missing pinned metadata may require a conditional page-zero probe; never
     /// substitute current-version length to resolve a suffix or final-page range.
     pub fn resolve<'a>(
@@ -383,21 +468,19 @@ impl MetadataService {
             let registration = self
                 .refreshes
                 .join(RefreshKey::new(&context.object, &selector), self.capacity)?;
+            let deadline = self.deadlines.register(scope.deadline.0)?;
+            let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
                 super::drivers::poll(cx, 64);
-                if let Err(error) = scope.cancellation.register(cx.waker()) {
-                    return Poll::Ready(Err(error));
-                }
-                if let Err(error) = scope.check() {
+                cancellation.register(cx.waker());
+                if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
                 }
                 match registration.event(cx.waker()) {
                     Poll::Ready(event) => Poll::Ready(Ok(event)),
-                    Poll::Pending => {
-                        // Completion/re-election and cancellation notify us. The
-                        // worker's bounded 1 ms tick rechecks the original deadline.
-                        Poll::Pending
-                    }
+                    // Completion/re-election, cancellation, and the worker's
+                    // metadata deadline hook notify this specific child.
+                    Poll::Pending => Poll::Pending,
                 }
             })
             .await?;
@@ -461,7 +544,8 @@ impl MetadataService {
                         Ok(())
                     }));
                     let (result, remaining) = poll_fn(|cx| {
-                        scope.cancellation.register(cx.waker())?;
+                        cancellation.register(cx.waker());
+                        deadline.check(scope, cx.waker())?;
                         super::drivers::poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
@@ -470,8 +554,7 @@ impl MetadataService {
                                 if let Err(error) = scope.check() {
                                     return Poll::Ready(Err(error));
                                 }
-                                // The oneshot and cancellation provide notifications;
-                                // deadline-only progress uses the bounded worker tick.
+                                // The same ingress deadline guard spans both waits.
                                 Poll::Pending
                             }
                         }
@@ -777,7 +860,7 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
     Ok(())
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{
         identity::{CacheId, CacheKey, WorkerId},
@@ -807,6 +890,103 @@ mod tests {
             metadata: metadata("v1", 0),
             page: None,
         }
+    }
+
+    pub(crate) fn deadline_probe(
+        service: &MetadataService,
+        due: Instant,
+    ) -> Operation<'static, ()> {
+        let deadline = service.deadlines.register(due).unwrap();
+        let scope = RequestScope::new(
+            crate::model::identity::RequestId([0; 16]),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap();
+        Box::pin(poll_fn(move |cx| {
+            match deadline.check(&scope, cx.waker()) {
+                Ok(()) => Poll::Pending,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        }))
+    }
+
+    pub(crate) fn assert_ingress_counts(
+        service: &MetadataService,
+        deadlines: usize,
+        refreshes: usize,
+    ) {
+        assert_eq!(service.deadlines.pending.borrow().len(), deadlines);
+        assert_eq!(service.refreshes.registrations.get(), refreshes);
+    }
+
+    #[test]
+    fn ingress_deadlines_are_ordered_budgeted_and_wake_latest_child_once() {
+        let table = Rc::new(IngressDeadlines::default());
+        let now = Instant::now();
+        let due = now + Duration::from_secs(60);
+        let scope = RequestScope::new(crate::model::identity::RequestId([0; 16]), due).unwrap();
+        let old = Arc::new(crate::test_support::WakeCounter::default());
+        let latest = Arc::new(crate::test_support::WakeCounter::default());
+        let later = table.register(due + Duration::from_secs(1)).unwrap();
+        let first = table.register(due).unwrap();
+        let second = table.register(due).unwrap();
+        first.check(&scope, &Waker::from(old.clone())).unwrap();
+        first.check(&scope, &Waker::from(latest.clone())).unwrap();
+        second.check(&scope, &Waker::from(latest.clone())).unwrap();
+        later.check(&scope, &Waker::from(latest.clone())).unwrap();
+        assert_eq!(table.poll(due - Duration::from_nanos(1), 64), 0);
+        assert_eq!(table.poll(due, 0), 0);
+        assert_eq!(latest.count(), 0);
+        assert_eq!(table.poll(due, 1), 1);
+        assert_eq!(old.count(), 0);
+        assert_eq!(latest.count(), 1);
+        assert_eq!(
+            first.check(&scope, &noop_waker()),
+            Err(Error::DeadlineExceeded)
+        );
+        assert_eq!(second.check(&scope, &Waker::from(latest.clone())), Ok(()));
+        assert_eq!(table.poll(due, 1), 1);
+        assert_eq!(latest.count(), 2);
+        assert_eq!(table.poll(due, 64), 0);
+        assert_eq!(latest.count(), 2);
+        assert_eq!(table.pending.borrow().len(), 1);
+        drop(later);
+        assert!(table.pending.borrow().is_empty());
+        assert_eq!(table.poll(due + Duration::from_secs(1), 64), 0);
+    }
+
+    #[test]
+    fn ingress_deadline_drop_reclaims_entries_and_refresh_capacity_without_stale_keys() {
+        let table = Rc::new(IngressDeadlines::default());
+        let refreshes = Rc::new(RefreshTable::default());
+        let due = Instant::now() + Duration::from_secs(60);
+        for _ in 0..2 * MAX_WAITERS {
+            let registration = refreshes.join(key(), 1).unwrap();
+            let deadline = table.register(due).unwrap();
+            assert_eq!(table.pending.borrow().len(), 1);
+            registration.finish(Ok(output()));
+            drop(deadline);
+            drop(registration);
+            assert!(table.pending.borrow().is_empty());
+            assert_eq!(refreshes.registrations.get(), 0);
+        }
+        let entries: Vec<_> = (0..MAX_WAITERS)
+            .map(|_| {
+                (
+                    refreshes.join(key(), 1).unwrap(),
+                    table.register(due).unwrap(),
+                )
+            })
+            .collect();
+        assert!(matches!(refreshes.join(key(), 1), Err(Error::Overloaded)));
+        assert_eq!(table.pending.borrow().len(), MAX_WAITERS);
+        drop(entries);
+        assert!(table.pending.borrow().is_empty());
+        assert!(refreshes.active.borrow().is_empty());
+        assert_eq!(refreshes.registrations.get(), 0);
+        table.next.set(u64::MAX);
+        assert!(matches!(table.register(due), Err(Error::Overloaded)));
+        assert!(table.pending.borrow().is_empty());
     }
 
     #[test]

@@ -22,9 +22,10 @@ use crate::{
     },
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     future::Future,
     num::NonZeroU32,
+    pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -272,6 +273,33 @@ fn drive<T>(
     panic!("bounded test executor did not complete");
 }
 
+struct GatedMetadataOrigin {
+    receive: RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>,
+    calls: Cell<usize>,
+}
+impl Origin for GatedMetadataOrigin {
+    fn metadata<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: crate::model::metadata::MetadataSelector,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        self.calls.set(self.calls.get() + 1);
+        let receive = self.receive.borrow_mut().take().unwrap();
+        Box::pin(async move { receive.await.map_err(|_| Error::Unavailable) })
+    }
+    fn page<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        Box::pin(async { panic!("metadata-only refresh") })
+    }
+}
+
 #[test]
 fn blocked_metadata_leader_and_follower_notify_without_spinning() {
     use crate::{
@@ -279,35 +307,16 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
         read::metadata::{MetadataDependencies, MetadataService},
         test_support::WakeCounter,
     };
-    use std::{cell::RefCell, task::Waker};
-    struct GatedOrigin(RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>);
-    impl Origin for GatedOrigin {
-        fn metadata<'a>(
-            &'a self,
-            _: &'a super::super::candidates::OriginAuthority,
-            _: &'a OriginContext,
-            _: MetadataSelector,
-            _: &'a RequestScope,
-        ) -> Operation<'a, MetadataReply> {
-            let receive = self.0.borrow_mut().take().unwrap();
-            Box::pin(async move { receive.await.map_err(|_| Error::Unavailable) })
-        }
-        fn page<'a>(
-            &'a self,
-            _: &'a super::super::candidates::OriginAuthority,
-            _: &'a OriginContext,
-            _: &'a PageId,
-            _: &'a RequestScope,
-        ) -> Operation<'a, OriginPage> {
-            Box::pin(async { panic!("metadata-only refresh") })
-        }
-    }
+    use std::task::Waker;
     for cancel_leader in [false, true] {
         let f = fixture();
         let (send, receive) = futures::channel::oneshot::channel();
         let service = MetadataService::new(
             f.fill.dependencies.candidates.clone(),
-            Rc::new(GatedOrigin(RefCell::new(Some(receive)))),
+            Rc::new(GatedMetadataOrigin {
+                receive: RefCell::new(Some(receive)),
+                calls: Cell::new(0),
+            }),
             f.fill.dependencies.peers.clone(),
             f.fill.dependencies.credentials.clone(),
             4,
@@ -386,6 +395,156 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
             assert!(matches!(leader.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
         }
         assert_eq!(super::super::drivers::pending(), 0);
+    }
+}
+
+#[test]
+fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
+    use crate::{
+        model::metadata::MetadataSelector,
+        read::metadata::{MetadataDependencies, MetadataService, tests::assert_ingress_counts},
+        test_support::WakeCounter,
+    };
+    use futures::{Stream, stream::FuturesUnordered};
+    use std::task::Waker;
+
+    for (budget_earlier, expire_leader) in [(false, false), (true, false), (false, true)] {
+        let f = fixture();
+        let admission = &f.fill.dependencies.admission;
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let (send, receive) = futures::channel::oneshot::channel();
+        let origin = Rc::new(GatedMetadataOrigin {
+            receive: RefCell::new(Some(receive)),
+            calls: Cell::new(0),
+        });
+        let service = MetadataService::new(
+            f.fill.dependencies.candidates.clone(),
+            origin.clone(),
+            f.fill.dependencies.peers.clone(),
+            f.fill.dependencies.credentials.clone(),
+            1,
+            MetadataDependencies {
+                index: Rc::new(Index::new(WorkerId(0), 4)),
+                owners: f.fill.dependencies.metadata_owner.clone(),
+                fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+            },
+        );
+        let due = Instant::now() + Duration::from_secs(60);
+        let follower_scope = RequestScope::new(
+            RequestId([2; 16]),
+            if budget_earlier {
+                f.scope.deadline.0
+            } else {
+                due
+            },
+        )
+        .unwrap();
+        let mut budget = AcquisitionBudget::new(
+            if budget_earlier {
+                due
+            } else {
+                f.scope.deadline.0
+            },
+            4,
+            8,
+        );
+        let leader_polls = Cell::new(0);
+        let follower_polls = Cell::new(0);
+        let mut leader = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        let mut follower = service.resolve_with_budget(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &follower_scope,
+            &mut budget,
+        );
+        let mut stream = FuturesUnordered::<
+            futures::future::LocalBoxFuture<'_, (bool, Result<ObjectMetadata>)>,
+        >::new();
+        stream.push(Box::pin(std::future::poll_fn(|cx| {
+            leader_polls.set(leader_polls.get() + 1);
+            leader.as_mut().poll(cx).map(|result| (true, result))
+        })));
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        stream.push(Box::pin(std::future::poll_fn(|cx| {
+            follower_polls.set(follower_polls.get() + 1);
+            follower.as_mut().poll(cx).map(|result| (false, result))
+        })));
+        // Drain initial scheduling notifications, then only poll the parent stream.
+        for _ in 0..4 {
+            assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        }
+        assert_eq!(origin.calls.get(), 1);
+        assert_ingress_counts(&service, 2, 2);
+        let retained = admission.used(ResourceClass::RequestContext);
+        assert!(retained > baseline);
+        let parked = (leader_polls.get(), follower_polls.get(), count.count());
+        for _ in 0..4 {
+            assert_eq!(service.poll_deadlines(due - Duration::from_nanos(1), 64), 0);
+            assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        }
+        assert_eq!(
+            (leader_polls.get(), follower_polls.get(), count.count()),
+            parked
+        );
+        assert_eq!(service.poll_deadlines(due, 0), 0);
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        assert_eq!(service.poll_deadlines(due, 1), 1);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some((false, Err(Error::DeadlineExceeded))))
+        ));
+        assert_eq!(leader_polls.get(), parked.0);
+        assert_eq!(follower_polls.get(), parked.1 + 1);
+        assert_eq!(origin.calls.get(), 1);
+        assert_eq!(super::super::drivers::pending(), 1);
+        assert_ingress_counts(&service, 1, 1);
+        assert_eq!(admission.used(ResourceClass::RequestContext), retained);
+        let after_expiry = count.count();
+        assert_eq!(service.poll_deadlines(due, 64), 0);
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        assert_eq!(count.count(), after_expiry);
+        if expire_leader {
+            assert_eq!(service.poll_deadlines(f.scope.deadline.0, 1), 1);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_next(&mut cx),
+                Poll::Ready(Some((true, Err(Error::DeadlineExceeded))))
+            ));
+            // Ingress timeout detaches only its guard. The driver still owns the
+            // refresh registration, original budget, and charged origin context.
+            assert_ingress_counts(&service, 0, 1);
+            assert_eq!(super::super::drivers::pending(), 1);
+            assert_eq!(admission.used(ResourceClass::RequestContext), retained);
+            assert_eq!(origin.calls.get(), 1);
+        }
+        send.send(MetadataReply {
+            metadata: f.origin.metadata.clone(),
+            page_zero: None,
+        })
+        .ok()
+        .unwrap();
+        super::super::drivers::poll(&mut cx, 64);
+        if !expire_leader {
+            assert!(matches!(Pin::new(&mut stream).poll_next(&mut cx),
+                Poll::Ready(Some((true, Ok(metadata)))) if metadata == f.origin.metadata));
+        }
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(service.poll_deadlines(f.scope.deadline.0, 64), 0);
+        assert_eq!(super::super::drivers::pending(), 0);
+        assert_ingress_counts(&service, 0, 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(origin.calls.get(), 1);
     }
 }
 
