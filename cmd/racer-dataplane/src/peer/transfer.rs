@@ -15,6 +15,19 @@ use crate::{
 };
 use std::rc::Rc;
 
+/// Read-only send owner. The reactor retains the page and its existing charge
+/// through partial sends and cancellation completion, without a staging copy.
+pub(crate) struct SendPage(pub(crate) CiphertextPage);
+impl crate::runtime::reactor::sealed::Sealed for SendPage {}
+impl IoBuffer for SendPage {
+    fn bytes(&self) -> Result<&[u8]> {
+        Ok(self.0.bytes())
+    }
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        Err(Error::InvalidRequest)
+    }
+}
+
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
 pub(crate) struct WireBuffer {
     bytes: Box<[u8]>,
@@ -373,5 +386,116 @@ impl Transfers {
     }
 }
 #[cfg(test)]
-mod tests { /* HTTP fallback, exact ciphertext preservation, bounded transfer credits. */
+mod tests {
+    use super::*;
+    use crate::{
+        memory::pool::BufferPool,
+        model::{
+            envelope::{KeyId, Nonce, PageEnvelope},
+            identity::*,
+        },
+        runtime::reactor::Reactor,
+    };
+    use std::{
+        os::unix::net::UnixStream,
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn send_page_is_immutable_and_completion_owned() {
+        for outcome in ["complete", "cancel", "drop", "deadline"] {
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let reactor = Reactor::new(admission.clone());
+            let length = 1024 * 1024 + 16;
+            let cache = CacheId("cache".into());
+            let page = BufferPool::new(admission.clone())
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+                        .unwrap(),
+                    PageEnvelope {
+                        page: PageId {
+                            version: ObjectVersion {
+                                object: ObjectId {
+                                    cache,
+                                    key: CacheKey([1; 32]),
+                                },
+                                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+                            },
+                            number: PageNumber(0),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: (length - 16) as u32,
+                        ciphertext_length: length as u32,
+                    },
+                    vec![91; length],
+                )
+                .unwrap();
+            let mut buffer = SendPage(page.clone());
+            assert_eq!(buffer.bytes().unwrap().as_ptr(), page.bytes().as_ptr());
+            assert_eq!(buffer.bytes_mut(), Err(Error::InvalidRequest));
+            drop(page);
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let fd = Rc::new(std::os::fd::OwnedFd::from(socket));
+            let scope =
+                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut work = reactor.send(fd, buffer, (), &scope);
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+            if outcome == "drop" {
+                drop(work);
+                assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+            } else {
+                if outcome == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                if outcome == "deadline" {
+                    std::thread::sleep(Duration::from_millis(2010));
+                }
+                let result = loop {
+                    if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                        break result;
+                    }
+                    assert!(Instant::now() < scope.deadline.0 + Duration::from_secs(2));
+                    reactor.poll_budgeted(128).unwrap();
+                    reactor.wait(Duration::from_millis(1)).unwrap();
+                };
+                if outcome == "complete" {
+                    use std::io::Read;
+                    let completion = result.unwrap();
+                    assert!(
+                        completion.bytes > 0 && completion.bytes < length,
+                        "partial socket send required"
+                    );
+                    let mut received = vec![0; completion.bytes];
+                    peer.read_exact(&mut received).unwrap();
+                    assert!(received.iter().all(|b| *b == 91));
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+                    drop(completion);
+                } else {
+                    assert!(
+                        matches!(result, Err(error) if error == if outcome == "cancel" { Error::Cancelled } else { Error::DeadlineExceeded })
+                    );
+                }
+                drop(work);
+            }
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut drain = reactor.drain();
+            while drain.as_mut().poll(&mut cx).is_pending() {
+                assert!(Instant::now() < end);
+                reactor.poll_budgeted(128).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            assert_eq!(reactor.in_flight(), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0, "{outcome}");
+        }
+    }
 }

@@ -76,7 +76,7 @@ impl LocalPageService for Layers {
             Ok(PeerResponse::Page {
                 metadata: ObjectMetadata {
                     version: page.version.clone(),
-                    length: 4 * PAGE_BYTES + 17,
+                    length: object_length(page.version.object.key.0[0]),
                     expires_at: ExpiresAt(SystemTime::now() + Duration::from_secs(60)),
                 },
                 ciphertext,
@@ -85,12 +85,42 @@ impl LocalPageService for Layers {
     }
 }
 fn plaintext(page: &PageId) -> Vec<u8> {
+    if page.version.object.key.0[0] >= 8 {
+        assert_eq!(page.number.0, 0);
+        return image_metadata(page.version.object.key.0[0]);
+    }
     let length = if page.number.0 == 4 {
         17
     } else {
         PAGE_BYTES as usize
     };
     vec![page.version.object.key.0[0].wrapping_add(page.number.0 as u8); length]
+}
+fn object_length(object: u8) -> u64 {
+    if object < 8 {
+        4 * PAGE_BYTES + 17
+    } else {
+        image_metadata(object).len() as u64
+    }
+}
+fn image_metadata(object: u8) -> Vec<u8> {
+    if object == 8 {
+        return br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#.to_vec();
+    }
+    let config = image_metadata(8);
+    let layers: Vec<_> = (0..8u8).map(|layer| {
+        let mut hash = Sha256::new();
+        for number in 0..5u8 {
+            hash.update(vec![layer + number; if number == 4 { 17 } else { PAGE_BYTES as usize }]);
+        }
+        serde_json::json!({"mediaType":"application/vnd.oci.image.layer.v1.tar", "size":4 * PAGE_BYTES + 17, "digest":format!("sha256:{:x}", hash.finalize())})
+    }).collect();
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":2,
+        "mediaType":"application/vnd.oci.image.manifest.v1+json",
+        "config":{"mediaType":"application/vnd.oci.image.config.v1+json", "size":config.len(), "digest":format!("sha256:{:x}", Sha256::digest(&config))},
+        "layers":layers
+    })).unwrap()
 }
 struct Never;
 impl LocalPageService for Never {
@@ -115,18 +145,26 @@ impl PeerTransport for Never {
 #[test]
 #[ignore = "full eight-layer TCP integrity regression: run with --release"]
 fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
-    full_image_through_relay(false, 4);
+    full_image_through_relay(false, false, 4);
 }
 
 #[test]
 #[ignore = "full eight-layer TCP integrity regression: run with --release"]
 fn full_image_through_relay_transfers_receive_charge() {
     for concurrency in [1, 4] {
-        full_image_through_relay(true, concurrency);
+        full_image_through_relay(true, false, concurrency);
     }
 }
 
-fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
+#[test]
+#[ignore = "full eight-layer TCP integrity regression: run with --release"]
+fn full_image_through_relay_sends_admitted_ciphertext() {
+    for concurrency in [1, 4] {
+        full_image_through_relay(false, true, concurrency);
+    }
+}
+
+fn full_image_through_relay(receive_pressure: bool, send_pressure: bool, concurrency: usize) {
     const LAYERS: usize = 8;
     let (signers, discovery) = identities_with_replay_capacity(4096);
     for signer in &signers {
@@ -172,6 +210,10 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
                 limits.ciphertext_bytes =
                     NonZeroUsize::new((3 * concurrency + 1) * (PAGE_BYTES as usize + 16) - 1)
                         .unwrap();
+            }
+            if send_pressure && i == 1 {
+                limits.ciphertext_bytes =
+                    NonZeroUsize::new(2 * concurrency * (PAGE_BYTES as usize + 16)).unwrap();
             }
             Rc::new(Admission::new(limits))
         })
@@ -398,11 +440,21 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
         Ok::<(), Error>(())
     };
     let clients = async {
+        let mut batches = Vec::new();
+        if send_pressure {
+            batches.extend([vec![9; concurrency], vec![8; concurrency]]);
+        }
         for batch in 0..LAYERS / concurrency {
+            batches.push((batch * concurrency..(batch + 1) * concurrency).collect());
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(&image_metadata(9)).unwrap();
+        for batch in batches {
             let completed: Vec<_> = (0..5).map(|_| Cell::new(0)).collect();
             let mut jobs = FuturesUnordered::new();
-            for layer in batch * concurrency..(batch + 1) * concurrency {
+            for layer in batch {
                 let completed = &completed;
+                let manifest = &manifest;
+                let relay_admission = &admissions[1];
                 let (auth, transfers, admission, scope, endpoint) = (
                     &auth[0],
                     &transfers[0],
@@ -415,7 +467,11 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
                     let mut actual = Sha256::new();
                     let mut size = 0;
                     let mut pressure = None;
+                    let mut relay_pressure = None;
                     for (number, completed) in completed.iter().enumerate() {
+                        if layer >= LAYERS && number != 0 {
+                            break;
+                        }
                         // Two other live pages leave room for the received page,
                         // but not a second charge for its exact same allocation.
                         // Page zero succeeds first, reproducing a late 16 MiB cut.
@@ -424,6 +480,16 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
                                 Some(&CacheId(CACHE.into())),
                                 ResourceClass::Ciphertext,
                                 2 * (PAGE_BYTES as usize + 16),
+                            ).unwrap());
+                        }
+                        if send_pressure && number == 1 {
+                            assert_eq!(size, PAGE_BYTES as usize);
+                            // Retain one other live page at the relay. Its quota
+                            // still fits each received page, but not a send copy.
+                            relay_pressure = Some(relay_admission.reserve(
+                                Some(&CacheId(CACHE.into())),
+                                ResourceClass::Ciphertext,
+                                PAGE_BYTES as usize + 16,
                             ).unwrap());
                         }
                         let mut local = request(admission, (layer * 5 + number + 1) as u8);
@@ -463,7 +529,7 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
                                 "layer {layer} page {number}: relay did not return a complete page"
                             )
                         };
-                        assert_eq!(metadata.length, 4 * PAGE_BYTES + 17);
+                        assert_eq!(metadata.length, object_length(layer as u8));
                         assert_eq!(ciphertext.envelope().page, page);
                         let mut body = ciphertext.bytes().to_vec();
                         XChaCha20Poly1305::new((&[7; 32]).into())
@@ -491,9 +557,17 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
                             }).await.unwrap();
                         }
                     }
-                    assert_eq!(size as u64, 4 * PAGE_BYTES + 17);
-                    assert_eq!(actual.finalize(), expected.finalize());
+                    assert_eq!(size as u64, object_length(layer as u8));
+                    let digest = actual.finalize();
+                    assert_eq!(digest, expected.finalize());
+                    if layer < LAYERS {
+                        assert_eq!(manifest["layers"][layer]["digest"], format!("sha256:{digest:x}"));
+                        assert_eq!(manifest["layers"][layer]["size"], size);
+                    } else if layer == 8 {
+                        assert_eq!(manifest["config"]["digest"], format!("sha256:{digest:x}"));
+                    }
                     drop(pressure);
+                    drop(relay_pressure);
                 });
             }
             while jobs.next().await.is_some() {}
@@ -507,7 +581,10 @@ fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
             }
         }
     }));
-    assert_eq!(layers.served.get(), LAYERS * 5);
+    assert_eq!(
+        layers.served.get(),
+        LAYERS * 5 + if send_pressure { 2 * concurrency } else { 0 }
+    );
     for pool in &pools {
         pool.close();
     }

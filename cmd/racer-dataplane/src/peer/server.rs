@@ -144,7 +144,7 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::pool::ConnectionLease> {
         Box::pin(async move {
-            use super::{transfer::WireBuffer, wire::WireCodec};
+            use super::{transfer::SendPage, wire::WireCodec};
             use crate::runtime::reactor::IoBuffer;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -268,21 +268,20 @@ impl PeerServer {
                     return Ok(connection);
                 }
             }
-            let body = match &response.response {
-                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes(),
-                _ => &[],
+            let body = match response.response {
+                PeerResponse::Page { ciphertext, .. } => Some(SendPage(ciphertext)),
+                _ => None,
             };
-            let head = WireCodec::encode(&response.authentication, true, body.len())?;
+            let length = body.as_ref().map_or(0, |body| body.0.bytes().len());
+            let head = WireCodec::encode(&response.authentication, true, length)?;
             let sent = self.io.send_head(connection, head, &request_scope).await?;
             let mut connection = sent.connection;
-            if !body.is_empty() {
-                let mut buffer = WireBuffer::new(&self.admission, body.len())?;
-                buffer.bytes_mut()?.copy_from_slice(body);
+            if let Some(buffer) = body {
                 let sent = self
                     .io
                     .write_body(connection, buffer, &request_scope)
                     .await?;
-                if sent.bytes != body.len() {
+                if sent.bytes != length {
                     return Err(Error::Io);
                 }
                 connection = sent.lease;
