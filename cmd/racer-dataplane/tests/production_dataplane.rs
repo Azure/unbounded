@@ -370,6 +370,15 @@ impl Rig {
         Self::with_dirty_pages(length, zero_ttl, pages, pages)
     }
     fn with_dirty_pages(length: u64, zero_ttl: bool, pages: usize, dirty_pages: usize) -> Self {
+        Self::with_limits(length, zero_ttl, pages, dirty_pages, None)
+    }
+    fn with_limits(
+        length: u64,
+        zero_ttl: bool,
+        pages: usize,
+        dirty_pages: usize,
+        configure: Option<fn(&mut Limits)>,
+    ) -> Self {
         let scratch = Scratch::new();
         fs::create_dir_all(scratch.path.join("production-fixture/origin")).unwrap();
         let origin_path = scratch.socket("production-fixture/origin/socket");
@@ -377,6 +386,9 @@ impl Rig {
         let adapter = Adapter::start(&origin_path, length, zero_ttl);
         let mut budget = limits(pages);
         budget.dirty_bytes = nz(dirty_pages * (P as usize + 16));
+        if let Some(configure) = configure {
+            configure(&mut budget);
+        }
         let admission = Rc::new(Admission::new(budget));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
@@ -502,7 +514,7 @@ impl Rig {
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],
-                64,
+                admission.limits().queue_entries.get(),
             )
             .unwrap(),
         );
@@ -706,6 +718,63 @@ fn check(reply: &Reply, version: u8, start: u64, end: u64, total: u64) {
             "body offset {offset}"
         );
     }
+}
+
+#[test]
+fn concurrent_full_layer_streams_verify_every_byte() {
+    let length = 4 * P + 113;
+    let rig = Rig::with_limits(
+        length,
+        false,
+        4,
+        4,
+        Some(|limits| {
+            // Isolate delivery pressure: 64 accepted streams also need origin
+            // connection headroom and two page-window commands per reader.
+            limits.client_connections = nz(128);
+            limits.queue_entries = nz(256);
+            limits.request_context_bytes = nz(16 * 1024 * 1024);
+            limits.pipes = nz(8);
+        }),
+    );
+    assert_eq!(rig.request("HEAD", "").status, 200);
+    let mut sockets = Vec::new();
+    let mut readers = Vec::new();
+    for _ in 0..64 {
+        let (local, mut remote) = UnixStream::pair().unwrap();
+        sockets.push(local);
+        readers.push(thread::spawn(move || {
+            remote
+                .write_all(request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n").as_bytes())
+                .unwrap();
+            remote.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let head = read_head(&mut remote).unwrap();
+            assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+            assert_eq!(fields(&head)["content-length"], length.to_string());
+            let mut scratch = [0; 65536];
+            let mut offset = 0;
+            while offset < length {
+                let count = scratch.len().min((length - offset) as usize);
+                remote.read_exact(&mut scratch[..count]).unwrap();
+                for (i, actual) in scratch[..count].iter().enumerate() {
+                    assert_eq!(*actual, byte(1, offset + i as u64));
+                }
+                offset += count as u64;
+            }
+            assert_eq!(remote.read(&mut scratch[..1]).unwrap(), 0);
+        }));
+    }
+    let results = rig.drive(futures::future::join_all(
+        sockets
+            .into_iter()
+            .map(|socket| async { rig.serve(socket, &scope()).await }),
+    ));
+    let joined: Vec<_> = readers.into_iter().map(|reader| reader.join()).collect();
+    assert!(
+        results.iter().all(Result::is_ok),
+        "stream results: {results:?}"
+    );
+    assert!(joined.iter().all(std::result::Result::is_ok));
 }
 
 #[test]

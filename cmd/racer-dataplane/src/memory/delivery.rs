@@ -1,11 +1,11 @@
 //! Independent reader cursors with owned sockets and bounded stall deadlines.
 //!
 //! Delivery copies immutable bytes into a bounded pipe, then splices to a socket.
-//! Unsupported sockets fall back to nonblocking send from the last accepted byte.
+//! Pipe pressure or unsupported sockets use nonblocking send from the accepted byte.
 //! Neither path lends userspace page pointers to the socket after return. Only
 //! raw-socket readiness is asynchronous. On HTTP backpressure, an accounted send
 //! transfers the entire connection/reader lease to the reactor, retaining admission
-//! through abandonment and the final completion fence. Subsequent chunks splice.
+//! through abandonment and the final completion fence.
 use super::{
     pipe::{PipeLease, PipePool},
     pool::VerifiedPage,
@@ -35,11 +35,11 @@ pub struct Delivery {
     stall_timeout: Duration,
 }
 
-/// A reader pins an immutable page and a separately admitted pipe for its lifetime.
-/// Each reader has its own staging pipe and socket-accepted cursor.
+/// A reader pins an immutable page and, when available, a separately admitted pipe.
+/// Pipe pressure selects bounded copying with the same socket-accepted cursor.
 pub struct ReaderLease {
     page: VerifiedPage,
-    pipe: PipeLease,
+    pipe: Option<PipeLease>,
     slice: PageSlice,
     sent: usize,
     connection: Option<Rc<OwnedFd>>,
@@ -73,7 +73,7 @@ impl ReaderLease {
         let start = self.slice.offset as usize + self.sent;
         let count = self.remaining().min(SEND_CHUNK_BYTES);
         let bytes = &self.page.bytes()[start..start + count];
-        if copying {
+        if copying || self.pipe.is_none() {
             // SAFETY: send copies the live slice synchronously. DONTWAIT also
             // works for blocking descriptors; NOSIGNAL makes disconnect an error.
             let sent = unsafe {
@@ -91,10 +91,11 @@ impl ReaderLease {
             };
         }
         // Refill only an empty pipe: a partial splice leaves the exact suffix.
-        if self.pipe.buffered() == 0 && self.pipe.try_write(bytes)? == 0 {
+        let pipe = self.pipe.as_mut().expect("splice requires a pipe");
+        if pipe.buffered() == 0 && pipe.try_write(bytes)? == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
-        self.pipe.try_splice_to(connection, count)
+        pipe.try_splice_to(connection, count)
     }
 }
 
@@ -113,9 +114,18 @@ impl Delivery {
         if slice.page != page.page().number || end > page.bytes().len() {
             return Err(Error::InvalidRange);
         }
+        let pipe = match self.pipes.acquire() {
+            Ok(pipe) => Some(pipe),
+            // Pipes accelerate delivery, but are not required for correctness.
+            // Do not abort an admitted HTTP body just because other readers hold
+            // every pipe. Copy directly, retaining the normal send ownership and
+            // request-context charge for asynchronous backpressure staging.
+            Err(Error::Overloaded) => None,
+            Err(error) => return Err(error),
+        };
         Ok(ReaderLease {
             page,
-            pipe: self.pipes.acquire()?,
+            pipe,
             slice,
             sent: 0,
             connection: None,
@@ -170,7 +180,7 @@ impl Delivery {
             validate_socket(&*socket)?;
             drop(socket);
             let mut stalled_at = Instant::now();
-            let mut copying = false;
+            let mut copying = reader.pipe.is_none();
             let mut budget = 0;
             let mut calls = 0;
             while reader.remaining() != 0 {
@@ -206,11 +216,19 @@ impl Delivery {
                                 &reader.page.bytes()[start..start + count],
                             )?
                         } else {
-                            OwnedBuffer::new(self.pipes.admission(), reader.pipe.buffered())?
+                            OwnedBuffer::new(
+                                self.pipes.admission(),
+                                reader.pipe.as_ref().expect("splice pipe").buffered(),
+                            )?
                         };
                         let count = buffer.bytes()?.len();
                         if !copying {
-                            match reader.pipe.try_read(buffer.bytes_mut()?) {
+                            match reader
+                                .pipe
+                                .as_mut()
+                                .expect("splice pipe")
+                                .try_read(buffer.bytes_mut()?)
+                            {
                                 Ok(read) if read == count && count != 0 => {}
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                                     yield_once().await;
@@ -294,7 +312,7 @@ impl Delivery {
         let mut stalled_at = Instant::now();
         let mut budget = 0;
         let mut calls = 0;
-        let mut copying = false;
+        let mut copying = reader.pipe.is_none();
         while reader.remaining() != 0 {
             scope.check()?;
             let stall_deadline = stalled_at
@@ -522,10 +540,20 @@ mod tests {
         let mut reader = delivery.attach(page, slice(1, 8)).unwrap();
         let (socket, mut peer) = UnixStream::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        reader.pipe.try_write(b"12345678").unwrap();
-        reader.sent = reader.pipe.try_splice_to(&socket, 3).unwrap();
+        reader
+            .pipe
+            .as_mut()
+            .unwrap()
+            .try_write(b"12345678")
+            .unwrap();
+        reader.sent = reader
+            .pipe
+            .as_mut()
+            .unwrap()
+            .try_splice_to(&socket, 3)
+            .unwrap();
         assert_eq!(reader.sent, 3);
-        assert_eq!(reader.pipe.buffered(), 5);
+        assert_eq!(reader.pipe.as_ref().unwrap().buffered(), 5);
         // A blocking FD is deliberately unsupported by the splice API, but the
         // send fallback still cannot block and must not resend the accepted prefix.
         socket.set_nonblocking(false).unwrap();
@@ -1032,6 +1060,68 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         drop(completed);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+
+    #[test]
+    fn pipe_pressure_copy_fallback_retains_owners_until_send_fence() {
+        for failure in [Error::Cancelled, Error::Io, Error::DeadlineExceeded] {
+            let (admission, reactor, delivery) = setup(1, Duration::from_millis(25));
+            let held_pipe = delivery.pipes.acquire().unwrap();
+            let page = page(&admission, vec![0x5a; 3 * 1024 * 1024]);
+            let weak = Arc::downgrade(&page.inner);
+            let reader = delivery.attach(page, slice(0, 3 * 1024 * 1024)).unwrap();
+            assert!(reader.pipe.is_none());
+            let (socket, peer) = UnixStream::pair().unwrap();
+            small_send_buffer(&socket);
+            let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            connection.tx_remaining = Some(3 * 1024 * 1024);
+            let scope = scope();
+            let mut operation = delivery.finish_to(reader, connection, &scope);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(reactor.in_flight(), 1);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            match failure {
+                Error::Cancelled => scope.cancel().unwrap(),
+                Error::Io => drop(peer),
+                _ => {}
+            }
+            assert!(matches!(drive(&reactor, operation), Err(error) if error == failure));
+            assert_eq!(reactor.in_flight(), 0);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            drop(held_pipe);
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        }
+    }
+
+    #[test]
+    fn abandoned_pipe_pressure_copy_send_keeps_page_and_connection_until_fenced() {
+        let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+        let held_pipe = delivery.pipes.acquire().unwrap();
+        let page = page(&admission, vec![0x5a; 3 * 1024 * 1024]);
+        let weak = Arc::downgrade(&page.inner);
+        let reader = delivery.attach(page, slice(0, 3 * 1024 * 1024)).unwrap();
+        assert!(reader.pipe.is_none());
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        small_send_buffer(&socket);
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        connection.tx_remaining = Some(3 * 1024 * 1024);
+        let scope = scope();
+        let mut operation = delivery.finish_to(reader, connection, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        drop(operation);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        drive(&reactor, reactor.drain()).unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        drop(held_pipe);
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
     }
 
     #[test]

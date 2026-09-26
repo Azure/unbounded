@@ -85,6 +85,9 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
   connection ownership. `finish_to_socket` handles owned unframed sockets. Copied
   pipe data can be spliced without retaining userspace page pointers; readiness
   and asynchronous fallback operations retain all required connection/page leases.
+  Pipe admission pressure selects nonblocking copying instead of failing a body
+  after its headers. Backpressured HTTP copies use at most 64 KiB of separately
+  admitted request-context staging per pending send, retained through its fence.
 - `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` block late
   publication. `evict_idle(bytes)` releases only idle bundles; admission pressure
   must call this from the read owner before retrying an allocation.
