@@ -7,9 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/netip"
 	"path"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -132,11 +135,11 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				diagnosticsPort = "9091"
 			}
 			// Rust Config::from_lookup consumes these settings after kubelet expands
-			// the Pod IP helper into the diagnostics address.
+			// the Pod IP helper into both listener addresses.
 			expected := map[string]string{
 				"RACER_CLUSTER_ID":            string(r.Config.Cluster),
 				"RACER_CONTROL_ENDPOINT":      r.Config.ControlURL,
-				"RACER_PEER_LISTEN":           "0.0.0.0:" + strconv.Itoa(int(port)),
+				"RACER_PEER_LISTEN":           "[$(RACER_POD_IP)]:" + strconv.Itoa(int(port)),
 				"RACER_POD_IP":                "",
 				"RACER_DIAGNOSTICS_LISTEN":    "[$(RACER_POD_IP)]:" + diagnosticsPort,
 				"RACER_TRUST_BUNDLE":          "/etc/racer/bootstrap/ca.crt",
@@ -160,6 +163,7 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 			}
 
 			assertWorkloadReadiness(t, ds)
+			assertWorkloadPeerMembership(t, ds, port)
 
 			mounts := map[string]string{}
 			for _, mount := range container.VolumeMounts {
@@ -178,6 +182,57 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Exercise the ordered downward-API expansion and membership contract together,
+// including against the API-defaulted DaemonSet in envtest (which has no kubelet).
+func assertWorkloadPeerMembership(t *testing.T, ds *appsv1.DaemonSet, peerPort uint16) {
+	t.Helper()
+
+	for _, ips := range [][]string{{"192.0.2.1"}, {"2001:db8::1"}, {"192.0.2.1", "2001:db8::1"}, {"2001:db8::1", "192.0.2.1"}} {
+		pod := memberPod("peer", 1, ips[0])
+		for _, ip := range ips {
+			pod.Status.PodIPs = append(pod.Status.PodIPs, corev1.PodIP{IP: ip})
+		}
+
+		podIP, listen := "", ""
+
+		for _, env := range ds.Spec.Template.Spec.Containers[0].Env {
+			switch env.Name {
+			case "RACER_POD_IP":
+				if podIP != "" || env.Value != "" || !reflect.DeepEqual(env.ValueFrom, &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}) {
+					t.Fatal("peer bind address must come from status.podIP")
+				}
+
+				podIP = pod.Status.PodIP
+			case "RACER_PEER_LISTEN":
+				if podIP == "" || listen != "" || env.ValueFrom != nil || env.Value != "[$(RACER_POD_IP)]:"+strconv.Itoa(int(peerPort)) {
+					t.Fatal("peer listener must expand the preceding Pod IP and configured peer port")
+				}
+
+				listen = strings.ReplaceAll(env.Value, "$(RACER_POD_IP)", podIP)
+			}
+		}
+
+		host, port, err := net.SplitHostPort(listen)
+		if err != nil {
+			t.Fatalf("expanded peer listener %q: %v", listen, err)
+		}
+
+		ip, err := netip.ParseAddr(host)
+		if err != nil || ip.IsUnspecified() || port != strconv.Itoa(int(peerPort)) {
+			t.Fatalf("peer listener must bind the exact Pod IP and peer port: %q", listen)
+		}
+
+		members, diagnostics, err := ReconcileMembers([]corev1.Node{memberNode()}, []corev1.Pod{pod}, testDaemonSetUID, nil, peerPort)
+		if err != nil || len(diagnostics) != 0 || len(members) != 1 {
+			t.Fatalf("unready Pod with IPs %v must be published: %v, %v", ips, diagnostics, err)
+		}
+
+		if endpoint := members[testNodeUID].PeerEndpoint; endpoint != netip.AddrPortFrom(ip, peerPort).String() {
+			t.Fatalf("membership endpoint %q disagrees with listener %q for Pod IPs %v", endpoint, listen, ips)
+		}
 	}
 }
 

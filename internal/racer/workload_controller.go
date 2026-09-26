@@ -143,10 +143,10 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 				Env: []corev1.EnvVar{
 					{Name: "RACER_CLUSTER_ID", Value: string(c.Cluster)},
 					{Name: "RACER_CONTROL_ENDPOINT", Value: c.ControlURL},
-					{Name: "RACER_PEER_LISTEN", Value: "0.0.0.0:" + strconv.Itoa(int(c.PeerPort))},
 					// This is only a bind address, never an authority for node identity.
 					// Define it first so kubelet expands either Pod IP family below.
 					{Name: "RACER_POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}},
+					{Name: "RACER_PEER_LISTEN", Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(c.PeerPort))},
 					{Name: "RACER_DIAGNOSTICS_LISTEN", Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(diagnosticsPort))},
 					{Name: "RACER_TRUST_BUNDLE", Value: "/etc/racer/bootstrap/ca.crt"},
 					{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},

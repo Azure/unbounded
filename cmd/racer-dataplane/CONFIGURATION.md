@@ -19,7 +19,7 @@ most 4096 bytes, with no control characters.
 | `RACER_CONTROL_ENDPOINT` | Required | HTTPS authority, optional port and single trailing slash |
 | `RACER_MAX_THREADS` | `8` | Total userspace thread cap, 2 through 256; odd caps floor to complete pairs |
 | `RACER_ENABLE_RDMA` | `false` | Optional RDMA; hardware/capability failure retains HTTP fallback |
-| `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Numeric local IP:port, IPv6 bracketed |
+| `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Numeric local IP:port; brackets accepted for either IP family, required for IPv6 |
 | `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Numeric local IP:port, loopback by default; brackets accepted for either IP family |
 | `RACER_TRUST_BUNDLE` | `/etc/racer/trust/ca.crt` | Deployment bootstrap/server CA file |
 | `RACER_SERVICE_ACCOUNT_TOKEN` | `/var/run/secrets/racer-control/token` | Projected token file with audience `racer-control` |
@@ -37,10 +37,16 @@ covering dual-stack wildcard conflicts. A deployment exposing diagnostics outsid
 loopback must explicitly change its address. The controller-managed peer port
 must match `RACER_PEER_LISTEN`; config does not publish membership endpoints.
 
-The managed DaemonSet overrides diagnostics with `[$(RACER_POD_IP)]:9090`
-(9091 when the peer port is 9090). Kubelet supplies `RACER_POD_IP` from
-`status.podIP` and expands it before process startup. Bracketed IPv4 is accepted
-for this family-independent template; ordinary IPv4 and bracketed IPv6 retain
+The managed DaemonSet sets `RACER_PEER_LISTEN` to
+`[$(RACER_POD_IP)]:<configured-peer-port>` and overrides diagnostics with
+`[$(RACER_POD_IP)]:9090` (9091 when the peer port is 9090). Kubelet supplies
+`RACER_POD_IP` from `status.podIP`, defined before both listener variables, and
+expands it before process startup. The peer listener binds that exact Pod IP and
+port, matching the endpoint published in controller membership for IPv4-only,
+IPv6-only, and dual-stack Pods. For dual-stack Pods, both use the primary
+`status.podIP`, not every address in `status.podIPs`; no wildcard or IPv4-mapped
+IPv6 fallback is needed. Bracketed IPv4 is accepted for these family-independent
+templates; ordinary IPv4 and bracketed IPv6 retain
 their existing syntax and validation. The dataplane does not expand environment
 references itself. `RACER_POD_IP` supplies only the bind address, never Node identity.
 

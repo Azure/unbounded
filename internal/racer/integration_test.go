@@ -92,23 +92,31 @@ func integrationWorkloadReadiness(t *testing.T, c client.Client) {
 	key := client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName}
 	ds := &appsv1.DaemonSet{}
 
-	for _, scenario := range []string{"create", "upgrade", "repair"} {
+	for _, scenario := range []string{"create", "upgrade", "peer-listen-upgrade", "repair"} {
 		t.Run(scenario, func(t *testing.T) {
 			if scenario != "create" {
 				container := &ds.Spec.Template.Spec.Containers[0]
-				if scenario == "upgrade" {
+
+				switch scenario {
+				case "upgrade":
 					container.ReadinessProbe = nil
 					container.Env = slices.DeleteFunc(container.Env, func(env corev1.EnvVar) bool {
 						return env.Name == "RACER_POD_IP" || env.Name == "RACER_DIAGNOSTICS_LISTEN"
 					})
 					container.Ports = container.Ports[:1]
 					ds.Spec.MinReadySeconds = 0
-				} else {
+				case "repair":
 					container.ReadinessProbe.HTTPGet.Path = "/healthz"
 					container.ReadinessProbe.HTTPGet.Host = "127.0.0.1"
 					container.LivenessProbe = container.ReadinessProbe.DeepCopy()
 					container.StartupProbe = container.ReadinessProbe.DeepCopy()
 					ds.Spec.MinReadySeconds = 1
+				}
+
+				for i := range container.Env {
+					if container.Env[i].Name == "RACER_PEER_LISTEN" {
+						container.Env[i].Value = "0.0.0.0:7443"
+					}
 				}
 
 				ds.Spec.Template.Annotations = map[string]string{"rollout": "preserve"}
@@ -126,6 +134,7 @@ func integrationWorkloadReadiness(t *testing.T, c client.Client) {
 			}
 
 			assertWorkloadReadiness(t, ds)
+			assertWorkloadPeerMembership(t, ds, r.Config.PeerPort)
 
 			if scenario != "create" && ds.Spec.Template.Annotations["rollout"] != "preserve" {
 				t.Fatal("repair lost rollout annotation")

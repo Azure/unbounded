@@ -137,11 +137,10 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
-        let peer_listen = text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?
-            .parse()
-            .map_err(|_| Error::InvalidConfiguration)?;
+        let peer_listen =
+            parse_listener_address(&text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?)?;
         let diagnostics_listen =
-            parse_diagnostics_listen(&text("RACER_DIAGNOSTICS_LISTEN", Some("127.0.0.1:9090"))?)?;
+            parse_listener_address(&text("RACER_DIAGNOSTICS_LISTEN", Some("127.0.0.1:9090"))?)?;
         let trust_bundle = text("RACER_TRUST_BUNDLE", Some("/etc/racer/trust/ca.crt"))?.into();
         let service_account_token = text(
             "RACER_SERVICE_ACCOUNT_TOKEN",
@@ -501,7 +500,7 @@ fn valid_uuid(value: &str) -> bool {
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.
 // SocketAddr already accepts bracketed IPv6; normalize only bracketed IPv4 here.
-fn parse_diagnostics_listen(value: &str) -> Result<SocketAddr> {
+fn parse_listener_address(value: &str) -> Result<SocketAddr> {
     if let Some((host, port)) = value.strip_prefix('[').and_then(|v| v.split_once("]:"))
         && let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
     {
@@ -1110,6 +1109,104 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn peer_accepts_expanded_pod_ip_of_either_family() {
+        for (address, expected) in [
+            ("192.0.2.1:7443", "192.0.2.1:7443"),
+            ("[192.0.2.1]:7443", "192.0.2.1:7443"),
+            ("[2001:db8::1]:7443", "[2001:db8::1]:7443"),
+            ("[192.0.2.1]:65535", "192.0.2.1:65535"),
+        ] {
+            let config = parse(&[("RACER_PEER_LISTEN", address)]).unwrap();
+            assert_eq!(config.peer_listen, expected.parse().unwrap());
+            assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
+        }
+        assert_eq!(
+            parse(&[]).unwrap().peer_listen,
+            "0.0.0.0:7443".parse().unwrap()
+        );
+        for address in [
+            "[$(RACER_POD_IP)]:7443",
+            "[]:7443",
+            "[localhost]:7443",
+            "[192.0.2.1]:0",
+            "[192.0.2.1]:65536",
+            "[192.0.2.1]:+7443",
+            "[192.0.2.1]:7443extra",
+            "[[192.0.2.1]]:7443",
+            "[224.0.0.1]:7443",
+            "[255.255.255.255]:7443",
+            "[::ffff:192.0.2.1]:7443",
+            "[fe80::1%eth0]:7443",
+            "[ff02::1]:7443",
+            "2001:db8::1:7443",
+        ] {
+            assert!(
+                parse(&[("RACER_PEER_LISTEN", address)]).is_err(),
+                "{address}"
+            );
+        }
+        for ip in ["192.0.2.1", "2001:db8::1"] {
+            let peer = format!("[{ip}]:9090");
+            let diagnostics = format!("[{ip}]:9091");
+            assert!(
+                parse(&[
+                    ("RACER_PEER_LISTEN", &peer),
+                    ("RACER_DIAGNOSTICS_LISTEN", &diagnostics),
+                ])
+                .is_ok()
+            );
+            assert!(
+                parse(&[
+                    ("RACER_PEER_LISTEN", &peer),
+                    ("RACER_DIAGNOSTICS_LISTEN", &peer),
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    fn peer_listener_round_trip(ip: &str) {
+        use std::{
+            io::Write,
+            net::{TcpListener, TcpStream},
+        };
+
+        let address = format!("[{ip}]:7443");
+        let mut config = parse(&[("RACER_PEER_LISTEN", &address)]).unwrap();
+        assert_eq!(config.peer_listen.ip(), ip.parse::<IpAddr>().unwrap());
+        // Production rejects port zero. Allocate an ephemeral test port after
+        // configuration validation, using the same exact bind as PeerServer.
+        config.peer_listen.set_port(0);
+        let listener = TcpListener::bind(config.peer_listen).unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert_eq!(bound.ip(), config.peer_listen.ip());
+        let mut client = TcpStream::connect_timeout(&bound, Duration::from_secs(2)).unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"peer").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        assert_eq!(accepted.local_addr().unwrap(), bound);
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut body = [0; 4];
+        accepted.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"peer");
+    }
+
+    #[test]
+    fn peer_listener_binds_exact_ipv4() {
+        peer_listener_round_trip("127.0.0.1");
+    }
+
+    #[test]
+    fn peer_listener_binds_exact_ipv6() {
+        peer_listener_round_trip("::1");
     }
 
     #[test]
