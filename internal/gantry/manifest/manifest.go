@@ -247,6 +247,9 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 type TypedChild struct {
 	Digest digest.Digest
 	Kind   ifaces.OriginRefKind
+	// Size is the descriptor's byte length, or 0 when absent. Locating a
+	// layer's trailing index requires it.
+	Size int64
 }
 
 // TypedChildren is the kind-preserving cousin of ChildDigests. Source
@@ -274,7 +277,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 	out := make([]TypedChild, 0, 1+len(m.Layers))
 	if m.Config.Digest != "" {
 		if d, err := digest.Parse(m.Config.Digest); err == nil {
-			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig})
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig, Size: m.Config.Size})
 		}
 	}
 
@@ -289,7 +292,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 		}
 
 		if d, err := digest.Parse(l.Digest); err == nil {
-			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob})
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob, Size: l.Size})
 		}
 	}
 

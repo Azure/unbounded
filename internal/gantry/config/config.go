@@ -426,6 +426,20 @@ type Config struct {
 	// evict the small reads that actually gate container start.
 	MaxCachedRangeBytes int64 `yaml:"max_cached_range_bytes"`
 
+	// IndexPrefetchHeadBytes and IndexPrefetchTailBytes bound the regions
+	// warmed when a manifest is served. OverlayBD reads a layer's head and its
+	// trailing index at mount time and nothing else, so these cover container
+	// start at a fraction of a percent of the image.
+	IndexPrefetchHeadBytes int64 `yaml:"index_prefetch_head_bytes"`
+	IndexPrefetchTailBytes int64 `yaml:"index_prefetch_tail_bytes"`
+
+	// IndexPrefetchConcurrency caps simultaneous layer warms per node.
+	IndexPrefetchConcurrency int `yaml:"index_prefetch_concurrency"`
+
+	// IndexPrefetchJitter spreads the fleet's first wave so a cold image does
+	// not put every node on origin in the same instant.
+	IndexPrefetchJitter time.Duration `yaml:"index_prefetch_jitter"`
+
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
 	// stream completion is the fast path that makes finishers discoverable
@@ -598,6 +612,10 @@ func NewDefault() *Config {
 		RangeCacheDir:               "/var/lib/gantry/libp2p/rangecache",
 		RangeCacheMaxBytes:          4 << 30,
 		MaxCachedRangeBytes:         4 << 20,
+		IndexPrefetchHeadBytes:      256 << 10,
+		IndexPrefetchTailBytes:      2 << 20,
+		IndexPrefetchConcurrency:    8,
+		IndexPrefetchJitter:         2 * time.Second,
 		HRWTopologyScope:            "cluster",
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
@@ -843,6 +861,10 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("RANGE_CACHE_DIR", &c.RangeCacheDir)
 	setInt64("RANGE_CACHE_MAX_BYTES", &c.RangeCacheMaxBytes)
 	setInt64("MAX_CACHED_RANGE_BYTES", &c.MaxCachedRangeBytes)
+	setInt64("INDEX_PREFETCH_HEAD_BYTES", &c.IndexPrefetchHeadBytes)
+	setInt64("INDEX_PREFETCH_TAIL_BYTES", &c.IndexPrefetchTailBytes)
+	setInt("INDEX_PREFETCH_CONCURRENCY", &c.IndexPrefetchConcurrency)
+	setDur("INDEX_PREFETCH_JITTER", &c.IndexPrefetchJitter)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)

@@ -457,6 +457,25 @@ func runAgent(args []string) error {
 		OnOutcome:    func(outcome string) { layerSeedTotal.WithLabelValues(outcome).Inc() },
 	})
 
+	// Warms the head and trailing index of every layer so the first TCMU
+	// mount attempt succeeds instead of waiting out kubelet's backoff.
+	var indexPrefetch *indexPrefetcher
+
+	if rangeCache != nil {
+		indexPrefetch = newIndexPrefetcher(indexPrefetchOptions{
+			Cache:       rangeCache,
+			DHT:         disco,
+			Peer:        peerClient,
+			Origin:      pullOriginClient,
+			MarkCached:  func(d digest.Digest) { go adv.Notify(context.WithoutCancel(ctx), d, true) },
+			Logger:      logger,
+			HeadBytes:   c.IndexPrefetchHeadBytes,
+			TailBytes:   c.IndexPrefetchTailBytes,
+			Concurrency: c.IndexPrefetchConcurrency,
+			MaxJitter:   c.IndexPrefetchJitter,
+		})
+	}
+
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
@@ -555,7 +574,7 @@ func runAgent(args []string) error {
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, layerSeed, indexPrefetch, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
@@ -565,7 +584,7 @@ func runAgent(args []string) error {
 	}
 
 	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, layerSeed, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, layerSeed, indexPrefetch, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -1488,6 +1507,7 @@ type layerPrefetchAdapter struct {
 	resolver   manifestPrefetchResolver
 	cache      ifaces.LocalContentStore
 	seeder     *layerSeeder
+	indexes    *indexPrefetcher
 	logger     *slog.Logger
 	onManifest func(digest.Digest, []manifest.TypedChild)
 }
@@ -1556,6 +1576,7 @@ func newLayerPrefetcher(
 	r manifestPrefetchResolver,
 	cache ifaces.LocalContentStore,
 	seeder *layerSeeder,
+	indexes *indexPrefetcher,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
 ) mirror.LayerPrefetcher {
@@ -1563,6 +1584,7 @@ func newLayerPrefetcher(
 		resolver:   r,
 		cache:      cache,
 		seeder:     seeder,
+		indexes:    indexes,
 		logger:     logger.With(slog.String("subsystem", "prefetch")),
 		onManifest: onManifest,
 	}
@@ -1665,6 +1687,12 @@ func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registr
 	if len(children) == 0 {
 		// Image index or no children - nothing to fan out.
 		return
+	}
+
+	// Warm the mount-critical regions first. Everything below moves whole
+	// layers, which the container does not wait on.
+	if p.indexes != nil {
+		go p.indexes.Prefetch(baseCtx, registry, repository, children)
 	}
 
 	// Filter out digests already present locally; they don't need
