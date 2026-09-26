@@ -184,7 +184,9 @@ impl Config {
             client_connections: limit("RACER_CLIENT_CONNECTIONS", 128)?,
             pipes: limit("RACER_PIPES", 16)?,
             range_window_pages: limit("RACER_RANGE_WINDOW_PAGES", 2)?,
-            replay_entries: limit("RACER_REPLAY_ENTRIES", 4096)?,
+            // This is a freshness-window rate budget, not an in-flight limit.
+            // Retain 65 seconds of requests, responses, and relay envelopes.
+            replay_entries: limit("RACER_REPLAY_ENTRIES", 262_144)?,
             header_bytes: limit("RACER_HEADER_BYTES", 32 * 1024)?,
             // Counts edges plus meeting-node comparisons, not just vertices.
             // Cover healthy four-link searches through 100,000 members.
@@ -1047,6 +1049,60 @@ mod tests {
                     _ => None,
                 }))
         })
+    }
+
+    #[test]
+    fn default_replay_budget_sustains_peer_rate_and_explicit_limits_stay_hard() {
+        use crate::security::replay::{
+            Freshness, MAX_AGE, MAX_FUTURE_SKEW, ReplayNonce, ReplayState, ReplayWindow,
+        };
+        use std::{sync::Arc, time::SystemTime};
+
+        let config = parse(&[]).unwrap();
+        let state = Arc::new(ReplayState::default());
+        let window = ReplayWindow::new(state.clone(), config.limits.replay_entries.get());
+        let other_worker = ReplayWindow::new(state, config.limits.replay_entries.get());
+        let challenge = window.challenge().unwrap();
+        let start = SystemTime::now();
+        let node = NodeId("00000000-0000-4000-8000-000000000001".into());
+        let retention = MAX_AGE + MAX_FUTURE_SKEW;
+        // Live diagnostics measured 1116 admissions/sec. Exercise 2000/sec for
+        // two entire retention periods, including maximum sender clock skew.
+        for second in 0..2 * retention.as_secs() {
+            let now = start + Duration::from_secs(second);
+            for sequence in 0..2000u64 {
+                let mut nonce = [0; 24];
+                nonce[..8].copy_from_slice(&(second * 2000 + sequence).to_le_bytes());
+                let timestamp = now + MAX_FUTURE_SKEW;
+                let timestamp = std::time::UNIX_EPOCH
+                    + Duration::from_millis(
+                        timestamp
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                    );
+                let fresh = Freshness {
+                    nonce: ReplayNonce(nonce),
+                    timestamp,
+                    session_challenge: challenge,
+                };
+                assert_eq!(window.admit_at(&node, b"cert", &fresh, now), Ok(()));
+                assert_eq!(
+                    other_worker.admit_at(&node, b"cert", &fresh, now),
+                    Err(Error::Replay)
+                );
+            }
+        }
+        let configured = parse(&[("RACER_REPLAY_ENTRIES", "1")]).unwrap();
+        let limited = ReplayWindow::new(
+            Arc::new(ReplayState::default()),
+            configured.limits.replay_entries.get(),
+        );
+        let first = Freshness::generate(limited.challenge().unwrap()).unwrap();
+        assert_eq!(limited.admit(&node, &first), Ok(()));
+        let next = Freshness::generate(limited.challenge().unwrap()).unwrap();
+        assert_eq!(limited.admit(&node, &next), Err(Error::Overloaded));
+        assert_eq!(limited.admit(&node, &first), Err(Error::Replay));
     }
 
     #[test]

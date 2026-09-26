@@ -163,7 +163,7 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_CLIENT_CONNECTIONS` | `128` | 65536 |
 | `RACER_PIPES` | `16` | 65536 |
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
-| `RACER_REPLAY_ENTRIES` | `4096` | 1048576 |
+| `RACER_REPLAY_ENTRIES` | `262144` | 1048576 |
 | `RACER_HEADER_BYTES` | `32768` | 32768 |
 | `RACER_ROUTE_SEARCH_WORK` | `150000` | 1048576 |
 | `RACER_CACHED_RANKINGS` | `128` | 1048576 |
@@ -171,6 +171,16 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
+
+Replay capacity budgets the admitted envelope rate over the entire freshness
+window, not just concurrent requests. Entries can remain live for 65 seconds
+(60-second age plus 5-second future skew); requests, responses, handshakes, and
+relay envelopes all consume the same node-wide budget. The default supports about
+4032 admissions/second over that interval. The former 4096 default supported only
+about 63/second and saturated under 64-client/node load even with cached handshakes.
+Size explicit overrides for the node's aggregate peer rate, including bursts.
+The table allocates as it grows, never evicts live entries, and still rejects new
+nonces at the configured ceiling. This limit is not multiplied by worker count.
 
 Route-search work counts edge examinations plus meeting-node comparisons, not
 just members. The default covers healthy four-link searches at 100,000 members

@@ -39,6 +39,9 @@ const CACHE: &str = "cccccccc-1111-4111-8111-111111111111";
 const CLUSTER: &str = "dddddddd-1111-4111-8111-111111111111";
 type Discovery = (Rc<Keyring>, Rc<Certificates>, Rc<ReplayWindow>);
 fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
+    identities_with_replay_capacity(100)
+}
+fn identities_with_replay_capacity(capacity: usize) -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -89,12 +92,18 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
         .unwrap();
         keys.install_signing_identity(Arc::new(identity)).unwrap();
         let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-        let replay = Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 100));
+        let replay = Rc::new(ReplayWindow::new(
+            Arc::new(ReplayState::default()),
+            capacity,
+        ));
         discovery.push((keys.clone(), certificates.clone(), replay.clone()));
         signers.push(Rc::new(Signatures::new(keys, certificates, replay)));
     }
     (signers, discovery)
 }
+
+#[path = "replay_load_tests.rs"]
+mod replay_load_tests;
 pub(super) fn signers() -> Vec<Rc<Signatures>> {
     let (signers, _) = identities();
     for signer in &signers {
