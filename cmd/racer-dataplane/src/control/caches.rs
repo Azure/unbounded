@@ -5,15 +5,12 @@
 //! mount only the endpoint authorized by a future admission controller. The
 //! dataplane owns the client listener; the application adapter owns the origin
 //! listener. Never unlink an adapter-owned origin socket during cache removal.
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::identity::CacheId,
 };
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
-};
+use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheDefinition {
     pub id: CacheId,
@@ -75,8 +72,8 @@ pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((client.into(), origin.into()))
 }
 pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
-    let mut ids = HashSet::new();
-    let mut names = HashSet::new();
+    let mut ids = HashSet::default();
+    let mut names = HashSet::default();
     for d in definitions {
         if !super::wire::valid_uuid(&d.id.0)
             || !ids.insert(&d.id)

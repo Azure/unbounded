@@ -14,7 +14,9 @@ use crate::{
     topology::paths::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROFILE: &str = "racer-peer-v1";
 pub const MAX_HOPS: usize = 8;

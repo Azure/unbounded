@@ -1,7 +1,8 @@
 //! Readiness observations expire unless every required worker keeps progressing.
 use super::*;
+use crate::runtime::collections::HashMap;
 use crate::telemetry::health::{Health, Resources, State};
-use std::{collections::HashMap, time::UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 #[derive(Default)]
 pub(super) struct Observations {

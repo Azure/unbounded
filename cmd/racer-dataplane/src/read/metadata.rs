@@ -8,6 +8,7 @@ use super::{
     candidates::{CandidatePolicy, CandidateResolution},
     flight::AcquisitionBudget,
 };
+use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     model::{
@@ -27,7 +28,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     future::{Future, poll_fn},
     pin::Pin,
     rc::Rc,

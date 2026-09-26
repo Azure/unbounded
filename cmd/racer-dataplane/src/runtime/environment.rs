@@ -18,9 +18,32 @@ pub struct Environment {
 
 #[cfg(test)]
 thread_local! {
+    static REQUIRE_SIMULATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURRENT: std::cell::RefCell<Environment> = const {
         std::cell::RefCell::new(Environment { simulated: None })
     };
+}
+
+/// Fail closed if a simulated role accidentally selects real clock/entropy.
+#[cfg(test)]
+pub(crate) fn require_simulated() -> SimulationRequired {
+    SimulationRequired(
+        REQUIRE_SIMULATED.with(|required| required.replace(true)),
+        PhantomData,
+    )
+}
+#[cfg(test)]
+pub(crate) struct SimulationRequired(bool, PhantomData<Rc<()>>);
+#[cfg(test)]
+impl Drop for SimulationRequired {
+    fn drop(&mut self) {
+        REQUIRE_SIMULATED.with(|required| required.set(self.0));
+    }
+}
+#[cfg(test)]
+fn check_host_access() {
+    REQUIRE_SIMULATED
+        .with(|required| assert!(!required.get(), "DST escaped into host time/entropy"));
 }
 
 /// A guard belongs to the thread that entered it. Never hold it across an await;
@@ -87,12 +110,21 @@ impl<F> Drop for Scoped<F> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn simulation_seed() -> Option<u64> {
+    Environment::current()
+        .simulated
+        .map(|sim| sim.clock.0.lock().unwrap().seed)
+}
+
 pub fn now() -> Instant {
     #[cfg(test)]
     if let Some(sim) = Environment::current().simulated {
         let clock = sim.clock.0.lock().unwrap();
         return clock.monotonic + clock.elapsed;
     }
+    #[cfg(test)]
+    check_host_access();
     Instant::now()
 }
 
@@ -102,6 +134,8 @@ pub fn wall_now() -> SystemTime {
         let clock = sim.clock.0.lock().unwrap();
         return clock.wall;
     }
+    #[cfg(test)]
+    check_host_access();
     SystemTime::now()
 }
 
@@ -113,6 +147,8 @@ pub fn clock_anchor() -> (Instant, SystemTime) {
         let clock = sim.clock.0.lock().unwrap();
         return (clock.monotonic, clock.wall_origin);
     }
+    #[cfg(test)]
+    check_host_access();
     static ANCHOR: OnceLock<(Instant, SystemTime)> = OnceLock::new();
     *ANCHOR.get_or_init(|| (Instant::now(), SystemTime::now()))
 }
@@ -138,6 +174,8 @@ pub fn fill_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
         }
         return Ok(());
     }
+    #[cfg(test)]
+    check_host_access();
     getrandom::getrandom(bytes)
 }
 
@@ -251,6 +289,29 @@ mod tests {
     use super::*;
     use crate::{error::Error, model::identity::RequestId, runtime::deadline::RequestScope};
     use std::time::Duration;
+
+    #[test]
+    fn strict_simulation_rejects_real_role_fallback() {
+        let _strict = require_simulated();
+        let _real = Environment::default().enter();
+        let reads: [fn(); 4] = [
+            || {
+                let _ = now();
+            },
+            || {
+                let _ = wall_now();
+            },
+            || {
+                let _ = clock_anchor();
+            },
+            || {
+                let _ = fill_random(&mut [0; 1]);
+            },
+        ];
+        for read in reads {
+            assert!(std::panic::catch_unwind(read).is_err());
+        }
+    }
 
     #[test]
     fn replay_and_nested_worlds_preserve_time_entropy_and_deadlines() {

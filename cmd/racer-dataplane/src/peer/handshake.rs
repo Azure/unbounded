@@ -1,4 +1,5 @@
 //! Certificate-authenticated capabilities and signed RDMA setup over HTTP.
+use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     model::identity::NodeId,
@@ -6,7 +7,7 @@ use crate::{
     runtime::deadline::RequestScope,
     security::signing::Signatures,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 /// The security implementation owns challenge establishment, certificate checks,
 /// and signing bytes. Negotiation never trusts unsigned capability advertisements.
@@ -51,7 +52,7 @@ impl Handshake {
             signatures,
             rdma,
             exchange: None,
-            cache: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::default()),
             capacity: 36,
             http: None,
             discovery: None,

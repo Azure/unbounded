@@ -6,6 +6,7 @@ use super::{
     segment::Segments,
     slab::Slabs,
 };
+use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
@@ -22,7 +23,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     rc::Rc,
 };
 struct Dirty {
@@ -62,14 +63,14 @@ impl StoreWriter {
             segments,
             slabs,
             clock: RefCell::new(None),
-            pending: RefCell::new(HashMap::new()),
+            pending: RefCell::new(HashMap::default()),
             queue: RefCell::new(VecDeque::new()),
             next: Cell::new(1),
             capacity: Cell::new(64),
             busy: Cell::new(false),
             active_scope: RefCell::new(None),
-            retired: RefCell::new(HashSet::new()),
-            removed: RefCell::new(HashSet::new()),
+            retired: RefCell::new(HashSet::default()),
+            removed: RefCell::new(HashSet::default()),
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }

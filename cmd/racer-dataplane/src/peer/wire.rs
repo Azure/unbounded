@@ -162,7 +162,7 @@ impl WireCodec {
         let mut version = false;
         let mut length = None;
         let mut hops = std::collections::BTreeMap::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::runtime::collections::HashSet::default();
         let mut total = 0usize;
         for header in head.headers {
             total = total

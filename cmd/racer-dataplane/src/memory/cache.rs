@@ -3,6 +3,7 @@ use super::{
     page::{CiphertextCopy, PageResult},
     pool::BufferPool,
 };
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::{
@@ -12,12 +13,7 @@ use crate::{
         metadata::VersionMetadata,
     },
 };
-use std::{
-    cell::RefCell,
-    collections::{HashSet, VecDeque},
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 pub struct MemoryCache {
     pool: Rc<BufferPool>,
     entries: RefCell<VecDeque<PageResult>>,
@@ -29,8 +25,8 @@ impl MemoryCache {
         Self {
             pool,
             entries: RefCell::new(VecDeque::new()),
-            retired: RefCell::new(HashSet::new()),
-            removed: RefCell::new(HashSet::new()),
+            retired: RefCell::new(HashSet::default()),
+            removed: RefCell::new(HashSet::default()),
         }
     }
     pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {

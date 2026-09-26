@@ -1,5 +1,6 @@
 //! Bounded nonblocking TCP/Unix pools. Unfinished exchanges never return to idle.
 use super::io::OwnedBuffer;
+use crate::runtime::collections::HashMap;
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
@@ -12,7 +13,7 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     future::poll_fn,
     net::SocketAddr,
     path::PathBuf,
@@ -221,7 +222,7 @@ impl HttpPool {
             max_endpoints,
             idle_timeout,
             state: Rc::new(RefCell::new(PoolState {
-                entries: HashMap::new(),
+                entries: HashMap::default(),
                 next_generation: 0,
                 closed: false,
                 waiting: VecDeque::new(),

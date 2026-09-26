@@ -4,7 +4,7 @@ use crate::rdma::{
     device::FabricPort,
     lifecycle::{IoPort, NativePort, WithNative},
 };
-use std::collections::HashMap;
+use crate::runtime::collections::HashMap;
 
 #[derive(Default)]
 pub(super) struct NativePairs {

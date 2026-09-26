@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod affinity;
 pub mod channel;
+pub(crate) mod collections;
 pub mod crypto;
 pub mod deadline;
 pub mod environment;

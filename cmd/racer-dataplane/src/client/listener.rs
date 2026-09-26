@@ -13,6 +13,8 @@ use crate::{
         deadline::{Cancellation, RequestScope},
     },
 };
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -28,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[path = "transition.rs"]

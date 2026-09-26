@@ -15,13 +15,9 @@ use crate::{
 };
 #[cfg(test)]
 use std::net::TcpListener;
-use std::{
-    cell::Cell,
-    fmt::Write,
-    rc::Rc,
-    task::Poll,
-    time::{Duration, Instant},
-};
+#[cfg(test)]
+use std::time::Instant;
+use std::{cell::Cell, fmt::Write, rc::Rc, task::Poll, time::Duration};
 use zeroize::Zeroize;
 
 pub const MAX_CONNECTIONS: usize = 4;

@@ -3,13 +3,14 @@
 //! Capacity includes every live nonce across workers and signers. Saturation never
 //! evicts a live nonce. A receiver challenge is generated once per shared state;
 //! discarding/restarting that state invalidates all previously signed envelopes.
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::identity::NodeId,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -99,7 +100,7 @@ impl ReplayWindow {
                 challenge,
                 capacity: self.capacity,
                 high_water: now,
-                seen: HashSet::new(),
+                seen: HashSet::default(),
                 expiry: BTreeSet::new(),
             });
         }
@@ -235,7 +236,7 @@ mod tests {
                     challenge: [7; 32],
                     capacity,
                     high_water: time(),
-                    seen: HashSet::new(),
+                    seen: HashSet::default(),
                     expiry: BTreeSet::new(),
                 })),
             }),

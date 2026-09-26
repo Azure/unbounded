@@ -1,7 +1,7 @@
 //! One node-wide checkpoint decision, validated before any owner installs a shard.
 use super::*;
+use crate::runtime::collections::{HashMap, HashSet};
 use crate::store::checkpoint_format::CheckpointImage;
-use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub(super) struct RecoveryCut {
@@ -52,7 +52,7 @@ impl WorkerApplication {
                         self.runtime.admission.limits().metadata_entries.get(),
                         &self.keys,
                     );
-                    cut.shards = selected.map_or_else(HashMap::new, |image| {
+                    cut.shards = selected.map_or_else(HashMap::default, |image| {
                         image.shards.into_iter().map(|s| (s.worker, s)).collect()
                     });
                     cut.selected = true;
@@ -175,7 +175,9 @@ mod tests {
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
         let node = NodeState::default();
         let keys = crate::security::keyring::tests::keys();
-        let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())].into();
+        let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
+            .into_iter()
+            .collect();
         let candidates = vec![
             image(1, &[WorkerId(0), WorkerId(1)]),
             image(2, &[WorkerId(0)]),
@@ -242,7 +244,9 @@ mod tests {
         };
         let node = NodeState::default();
         let keys = crate::security::keyring::tests::keys();
-        let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())].into();
+        let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
+            .into_iter()
+            .collect();
         let object = ObjectId {
             cache: CacheId(crate::security::identity::tests::CACHE.into()),
             key: CacheKey([3; 32]),

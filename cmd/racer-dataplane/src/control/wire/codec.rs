@@ -1,5 +1,6 @@
 //! Strict bounded JSON and canonical publication content shared with Go.
 use super::*;
+use crate::runtime::collections::HashSet;
 use crate::topology::rails::{RailId, RailMapping};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{
@@ -8,7 +9,7 @@ use serde::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fmt, io::Read, net::SocketAddr, num::NonZeroU32};
+use std::{fmt, io::Read, net::SocketAddr, num::NonZeroU32};
 use x509_parser::prelude::{FromDer, X509Certificate, X509CertificationRequest};
 
 type Result<T> = std::result::Result<T, ProtocolFailure>;
@@ -213,7 +214,7 @@ impl PublicationDto {
         if self.members.len() > MAX_MEMBERS {
             return Err(ProtocolFailure::TooLarge);
         }
-        let mut nodes = HashSet::new();
+        let mut nodes = HashSet::default();
         for m in &self.members {
             if !uuid(&m.node) || !nodes.insert(&m.node) || m.shares == 0 {
                 return Err(ProtocolFailure::InvalidRequest);
@@ -225,7 +226,7 @@ impl PublicationDto {
             if endpoint.port() == 0 {
                 return Err(ProtocolFailure::InvalidRequest);
             }
-            let mut rails = HashSet::new();
+            let mut rails = HashSet::default();
             for r in &m.rails {
                 if !rails.insert(r.rail)
                     || r.fabric.is_empty()
@@ -235,8 +236,8 @@ impl PublicationDto {
                 }
             }
         }
-        let mut ids = HashSet::new();
-        let mut names = HashSet::new();
+        let mut ids = HashSet::default();
+        let mut names = HashSet::default();
         for c in &self.caches {
             if !uuid(&c.id) || !ids.insert(&c.id) || !names.insert(&c.name) || c.socket_mode > 0o777
             {
@@ -639,14 +640,14 @@ fn validate_bundle(v: &KeyringBundle) -> Result<()> {
         return Err(ProtocolFailure::TooLarge);
     }
     certificates(&v.peer_trust_roots, MAX_BUNDLE_BYTES)?;
-    let mut roots = HashSet::new();
+    let mut roots = HashSet::default();
     for root in &v.peer_trust_roots {
         if !roots.insert(root) {
             return Err(ProtocolFailure::InvalidRequest);
         }
     }
-    let mut keys = HashSet::new();
-    let mut active = std::collections::HashMap::new();
+    let mut keys = HashSet::default();
+    let mut active = crate::runtime::collections::HashMap::default();
     for k in &v.cache_keys {
         if !uuid(&k.key.cache.0)
             || !keys.insert((&k.key.cache.0, purpose(k.key.purpose), k.key.id.0))

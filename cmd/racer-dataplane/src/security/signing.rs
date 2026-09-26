@@ -15,11 +15,13 @@ use crate::{
     model::identity::NodeId,
 };
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::time::SystemTime;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 pub struct Signatures {
     keys: Rc<Keyring>,

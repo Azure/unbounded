@@ -2,6 +2,7 @@
 //!
 //! Wire values follow pkg/racersdk: canonical lowercase keys, quoted strong pins,
 //! signed-63-bit decimal ranges, and byte-preserving opaque context.
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     http::codec::{MessageHead, StartLine},
@@ -11,7 +12,6 @@ use crate::{
         range::{ByteRange, PAGE_BYTES},
     },
 };
-use std::collections::HashSet;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub const MAX_FIELD_BYTES: usize = 8192;
@@ -94,7 +94,7 @@ impl RequestParser {
         // Bound manually constructed input data as well, without pretending this
         // is a wire-length check. Framing owns start-line/colon/OWS/CRLF accounting.
         let mut decoded_bytes = method.len().saturating_add(target.len());
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut host = None;
         let mut pin = None;
         let mut range = None;

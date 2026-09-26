@@ -19,13 +19,9 @@ use crate::{
 };
 #[cfg(test)]
 use std::os::fd::AsRawFd;
-use std::{
-    future::poll_fn,
-    io,
-    rc::Rc,
-    task::Poll,
-    time::{Duration, Instant},
-};
+#[cfg(test)]
+use std::time::Instant;
+use std::{future::poll_fn, io, rc::Rc, task::Poll, time::Duration};
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;

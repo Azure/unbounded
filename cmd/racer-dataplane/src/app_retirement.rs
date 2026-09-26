@@ -1,8 +1,8 @@
 //! Node-wide quiescent epoch retirement. Admission resumes only after every owner
 //! has fenced accepted work and the sole coordinator invalidated recoverable cuts.
 use super::*;
+use crate::runtime::collections::HashSet;
 use crate::{control::wire::CacheKeyRef, security::keyring::RetirementBarriers};
-use std::collections::HashSet;
 
 #[derive(Default)]
 pub(super) struct RetirementState {
@@ -492,7 +492,7 @@ mod resume_tests {
         *node.retirement.state.lock().unwrap() = RetirementState {
             cache_transition: true,
             complete: true,
-            resumed: [WorkerId(0)].into(),
+            resumed: [WorkerId(0)].into_iter().collect(),
             ..Default::default()
         };
         worker.retiring = true;

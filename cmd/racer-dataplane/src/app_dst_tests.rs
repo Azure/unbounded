@@ -14,6 +14,7 @@ use crate::{
     security::identity::{PendingIdentity, SigningIdentity},
 };
 use ed25519_dalek::pkcs8::EncodePrivateKey;
+use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};
 
 const MAX_NODES: usize = 32;
@@ -68,7 +69,7 @@ enum OriginFault {
     Truncate,
     WrongEtag,
 }
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq)]
 struct Coverage {
     actions: BTreeMap<&'static str, usize>,
     operations: BTreeMap<String, usize>,
@@ -81,13 +82,91 @@ struct Coverage {
     relay_turns: usize,
     secondary_worker_turns: usize,
     native_faults: BTreeMap<String, usize>,
+    native_writes: usize,
+    trace: ReplayTrace,
+}
+
+/// Ordered streaming digest plus bounded diagnostic history. No host addresses,
+/// debug Instants, or allocator identities enter this normalized trace. Resource
+/// IDs are the simulators' world-local IDs and are intentionally NOT reordered.
+struct ReplayTrace {
+    hash: Sha256,
+    events: u64,
+    recent: VecDeque<String>,
+    checkpoints: Vec<(u64, [u8; 32])>,
+}
+impl std::fmt::Debug for ReplayTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayTrace")
+            .field("events", &self.events)
+            .field(
+                "digest",
+                &format_args!("{:x}", self.hash.clone().finalize()),
+            )
+            .field("recent", &self.recent)
+            .finish()
+    }
+}
+impl Default for ReplayTrace {
+    fn default() -> Self {
+        Self {
+            hash: Sha256::new(),
+            events: 0,
+            recent: VecDeque::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+}
+impl PartialEq for ReplayTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.events == other.events
+            && self.digest() == other.digest()
+            && self.checkpoints == other.checkpoints
+    }
+}
+impl Eq for ReplayTrace {}
+impl ReplayTrace {
+    fn record(&mut self, event: String) {
+        self.hash.update((event.len() as u64).to_le_bytes());
+        self.hash.update(event.as_bytes());
+        self.events += 1;
+        if self.recent.len() == 32 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(event);
+    }
+    fn digest(&self) -> [u8; 32] {
+        self.hash.clone().finalize().into()
+    }
+    fn checkpoint(&mut self) {
+        assert!(self.checkpoints.len() < 514, "bounded replay checkpoints");
+        self.checkpoints.push((self.events, self.digest()));
+    }
 }
 impl Coverage {
+    fn collect_native(&mut self, fabric: &crate::rdma::lifecycle::simulation::Simulation) {
+        for event in fabric.take_trace() {
+            self.native_writes += usize::from(
+                event.operation == crate::rdma::lifecycle::simulation::Operation::Write
+                    && event.completion
+                    && event.result == 0,
+            );
+            self.trace.record(format!(
+                "native:{:?}:{}:{:?}:{}:{}",
+                event.operation, event.resource, event.work_id, event.result, event.completion
+            ));
+        }
+    }
     fn action(&mut self, name: &'static str) {
+        self.trace.record(format!("action:{name}"));
         *self.actions.entry(name).or_default() += 1;
     }
     fn collect(&mut self, sim: &Simulation) {
         for event in sim.take_trace() {
+            self.trace.record(format!(
+                "os:{}:{}:{}",
+                event.operation, event.resource, event.result
+            ));
             if let Some(op) = event.operation.strip_prefix("fault:") {
                 *self.observed.entry(op.into()).or_default() += 1;
             }
@@ -436,6 +515,10 @@ impl Harness {
             Random(self.seed ^ (object as u64).rotate_left(17) ^ revision.rotate_left(37));
         let bytes: Vec<u8> = (0..length).map(|_| random.next() as u8).collect();
         let tag = format!("\"object-{object}-v{revision}\"");
+        self.coverage.trace.record(format!(
+            "update:{object}:{revision}:{length}:{:x}",
+            Sha256::digest(&bytes)
+        ));
         self.oracle.insert((object, tag.clone()), bytes.clone());
         self.catalog
             .borrow_mut()
@@ -513,6 +596,10 @@ impl Harness {
         config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
         config.limits.request_context_bytes = NonZeroUsize::new(4 * 1024 * 1024).unwrap();
         let worker_count = 1 + self.rng.pick(2);
+        self.coverage.trace.record(format!(
+            "node:{id}:{restart:?}:{worker_count}:{}",
+            self.generation
+        ));
         let worker_ids: Vec<_> = (0..worker_count).map(|i| WorkerId(i as u16)).collect();
         let node = Arc::new(NodeState::new(worker_ids.clone(), 64).unwrap());
         if self.native {
@@ -681,6 +768,10 @@ impl Harness {
         self.clock.advance(Duration::from_millis(1));
         let start = self.rng.pick(self.nodes.len());
         let budget = 1 + self.rng.pick(64);
+        self.coverage.trace.record(format!(
+            "tick:{}:{start}:{budget}",
+            self.clock.elapsed().as_nanos()
+        ));
         for offset in 0..self.nodes.len() {
             let index = (start + offset) % self.nodes.len();
             let _endpoint = self
@@ -688,6 +779,21 @@ impl Harness {
                 .enter_endpoint(SocketAddress::Inet(self.nodes[index].config.peer_listen));
             self.nodes[index].adapter.poll(&self.catalog);
             self.nodes[index].poll(budget);
+            for worker in &self.nodes[index].workers {
+                let used: Vec<_> = CLASSES
+                    .iter()
+                    .map(|class| worker.runtime.admission.used(*class))
+                    .collect();
+                self.coverage.trace.record(format!(
+                    "invariant:{}:{}:{used:?}:{}:{}:{}:{}",
+                    self.nodes[index].id,
+                    worker.app.worker.0,
+                    worker.app.drivers.pending(),
+                    worker.runtime.crypto.outstanding(),
+                    worker.runtime.reactor.in_flight(),
+                    worker.app.store.writer.pending_count()
+                ));
+            }
             self.coverage.secondary_worker_turns += self.nodes[index]
                 .workers
                 .iter()
@@ -707,6 +813,7 @@ impl Harness {
             );
         }
         self.coverage.collect(&self.sim);
+        self.coverage.collect_native(&self.fabric);
         assert!(
             self.sim.live_handles()
                 <= self.nodes.iter().map(|n| n.workers.len()).sum::<usize>() * 256 + 32,
@@ -718,6 +825,9 @@ impl Harness {
     }
     fn retire(&mut self, index: usize, crash: bool) -> usize {
         let mut node = self.nodes.remove(index);
+        self.coverage
+            .trace
+            .record(format!("retire:{}:{crash}", node.id));
         let shutdown = scope(Duration::from_secs(30)).unwrap();
         if crash {
             self.sim
@@ -790,6 +900,10 @@ impl Harness {
             admissions.push(admission);
         }
         for admission in admissions {
+            let used: Vec<_> = CLASSES.iter().map(|class| admission.used(*class)).collect();
+            self.coverage
+                .trace
+                .record(format!("retired-invariants:{id}:{used:?}"));
             for class in CLASSES {
                 assert_eq!(
                     admission.used(class),
@@ -854,6 +968,11 @@ impl Harness {
                 cache(self.nodes[node].id).client_socket,
             ))
             .unwrap();
+        self.coverage.trace.record(format!(
+            "request:{}:{object}:{first}:{end}:{head}:{pinned}:{:x}",
+            self.nodes[node].id,
+            Sha256::digest(&request)
+        ));
         Client {
             fd: Some(fd),
             request,
@@ -1299,6 +1418,11 @@ impl Harness {
     }
 
     fn raw_peer(&mut self, node: usize, request: Vec<u8>) -> Vec<u8> {
+        self.coverage.trace.record(format!(
+            "peer-request:{}:{:x}",
+            self.nodes[node].id,
+            Sha256::digest(&request)
+        ));
         let fd = self
             .sim
             .connect(SocketAddress::Inet(self.nodes[node].config.peer_listen))
@@ -1344,6 +1468,11 @@ impl Harness {
             finished,
             "peer probe timed out without an observed rejection or response"
         );
+        self.coverage.trace.record(format!(
+            "peer-response:{}:{:x}",
+            self.nodes[node].id,
+            Sha256::digest(&response)
+        ));
         response
     }
 
@@ -1554,6 +1683,18 @@ impl Harness {
     }
 
     fn check(&mut self, client: &Client, faulted: bool) {
+        self.coverage.trace.record(format!(
+            "client:{}:{}:{}:{}:{}:{}:{}:{faulted}:{}:{:x}",
+            client.object,
+            client.tag,
+            client.first,
+            client.end,
+            client.head,
+            client.pinned,
+            client.disconnected,
+            client.response.len(),
+            Sha256::digest(&client.response)
+        ));
         if !client.response.windows(4).any(|w| w == b"\r\n\r\n") {
             assert!(faulted, "healthy client disconnected before headers");
             self.coverage.failures += 1;
@@ -1638,6 +1779,11 @@ impl Harness {
             }
             let selected = self.rng.pick(actions.len());
             let action = actions.swap_remove(selected);
+            self.coverage.trace.record(format!(
+                "step:{step}:{action}:{}:{}",
+                self.nodes.len(),
+                self.rng.0
+            ));
             eprintln!(
                 "dst seed={} step={step} action={action} nodes={}",
                 self.seed,
@@ -1780,6 +1926,7 @@ impl Harness {
                     self.traffic(count, false);
                 }
             }
+            self.coverage.trace.checkpoint();
         }
         // Recovery liveness is a mandatory oracle obligation, independent of the
         // generator's action mix: every current object must still be readable.
@@ -1874,6 +2021,7 @@ impl Harness {
             self.remove(0);
         }
         self.coverage.collect(&self.sim);
+        self.coverage.collect_native(&self.fabric);
         assert_eq!(
             self.sim.live_handles(),
             0,
@@ -1885,18 +2033,20 @@ impl Harness {
             "native resources must be fenced and released"
         );
         if self.native {
-            let trace = self.fabric.trace();
-            let writes = trace
-                .iter()
-                .filter(|e| {
-                    e.operation == crate::rdma::lifecycle::simulation::Operation::Write
-                        && e.completion
-                        && e.result == 0
-                })
-                .count();
+            let writes = self.coverage.native_writes;
             assert!(writes > 0, "native graph never completed a DMA write");
             eprintln!("dst native completed writes={writes}");
         }
+        self.coverage.trace.record(format!(
+            "final-invariants:{}:{}:{}:{}:{}:{}",
+            self.sim.live_handles(),
+            self.fabric.live_resources(),
+            self.coverage.success,
+            self.coverage.failures,
+            self.coverage.bytes,
+            self.coverage.persisted
+        ));
+        self.coverage.trace.checkpoint();
         eprintln!("dst seed={} coverage={:?}", self.seed, self.coverage);
     }
 }
@@ -1996,26 +2146,26 @@ fn run_corpus(native: bool) {
     let mut partition_sends = 0;
     let mut corrupted_reads = 0;
     for seed in seeds {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(seed);
-        let environment = clock.environment(0);
-        let _time = environment.enter();
-        let mut harness = Harness::new(seed, sim, clock, native);
-        harness.generated(steps);
-        relay_turns += harness.coverage.relay_turns;
-        partition_sends += harness
-            .coverage
-            .operations
-            .get("blocked:send")
-            .copied()
-            .unwrap_or(0);
-        corrupted_reads += harness
-            .coverage
-            .actions
-            .get("disk-corruption")
-            .copied()
-            .unwrap_or(0);
+        let first = replay(seed, steps, native);
+        let second = replay(seed, steps, native);
+        let mismatch = first
+            .trace
+            .checkpoints
+            .iter()
+            .zip(&second.trace.checkpoints)
+            .position(|(a, b)| a != b);
+        assert_eq!(
+            first, second,
+            "whole-app replay diverged seed={seed} steps={steps} native={native} first checkpoint={mismatch:?}"
+        );
+        eprintln!(
+            "dst replay verified seed={seed} native={native} events={} digest={:x}",
+            first.trace.events,
+            first.trace.hash.clone().finalize()
+        );
+        relay_turns += first.relay_turns;
+        partition_sends += first.operations.get("blocked:send").copied().unwrap_or(0);
+        corrupted_reads += first.actions.get("disk-corruption").copied().unwrap_or(0);
     }
     if steps >= 41 {
         assert!(relay_turns > 0, "corpus never exercised an actual relay");
@@ -2028,6 +2178,33 @@ fn run_corpus(native: bool) {
             "corpus never read a corrupted disk record"
         );
     }
+}
+
+fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(seed);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(seed, sim, clock, native);
+    harness
+        .coverage
+        .trace
+        .record(format!("run:{seed}:{steps}:{native}"));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.generated(steps)));
+    if let Err(error) = result {
+        harness.coverage.collect(&harness.sim);
+        harness.coverage.collect_native(&harness.fabric);
+        eprintln!(
+            "DST FAILURE seed={seed} steps={steps} native={native} elapsed={:?} trace={:?}",
+            harness.clock.elapsed(),
+            harness.coverage.trace
+        );
+        std::panic::resume_unwind(error);
+    }
+    harness.coverage
 }
 
 fn member(config: &Config) -> crate::topology::membership::Member {

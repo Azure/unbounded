@@ -6,6 +6,7 @@ use super::{
     metadata::BootstrapResult,
     serve::{Coordinator, ReadResponse, ReadService},
 };
+use crate::runtime::collections::HashMap;
 use crate::{
     client::request::ClientRequest,
     error::{Error, Operation, Result},
@@ -26,7 +27,7 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     rc::{Rc, Weak},
@@ -39,7 +40,7 @@ use std::{
 
 thread_local! {
     // Installed only on the owning I/O thread. No Rc enters the shared directory.
-    static LOCALS: RefCell<HashMap<usize, (WorkerId, Weak<Coordinator>)>> = RefCell::new(HashMap::new());
+    static LOCALS: RefCell<HashMap<usize, (WorkerId, Weak<Coordinator>)>> = RefCell::new(HashMap::default());
 }
 
 struct Mailbox {

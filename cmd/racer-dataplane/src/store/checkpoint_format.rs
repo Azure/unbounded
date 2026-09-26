@@ -15,6 +15,7 @@ use super::{
     segment::{Generation, SegmentId, SegmentSnapshot, SegmentState, Segments},
     slab::{SlabId, SlabLocation},
 };
+use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
     model::{
@@ -26,7 +27,6 @@ use crate::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
 
 pub const CHECKPOINT_VERSION: u32 = 1;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -139,8 +139,8 @@ impl ShardImage {
         segments.validate_restore(&self.segments)?;
         // Restoring the isolated table seals open segments, exactly as recovery does.
         segments.restore(self.segments.clone())?;
-        let mut pages = HashSet::new();
-        let mut versions = HashSet::new();
+        let mut pages = HashSet::default();
+        let mut versions = HashSet::default();
         let mut extents = Vec::with_capacity(self.index.entries.len());
         for metadata in &self.index.metadata {
             validate_descriptor(metadata)?;
@@ -380,9 +380,9 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
     {
         return Err(Error::CorruptRecord);
     }
-    let mut workers = HashSet::new();
-    let mut pages = HashSet::new();
-    let mut lengths = HashMap::new();
+    let mut workers = HashSet::default();
+    let mut pages = HashSet::default();
+    let mut lengths = HashMap::default();
     for shard in &image.shards {
         if !workers.insert(shard.worker) {
             return Err(Error::CorruptRecord);

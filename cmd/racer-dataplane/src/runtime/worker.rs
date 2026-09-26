@@ -25,6 +25,8 @@ use crate::{
     },
 };
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     collections::HashSet,
     marker::PhantomData,
@@ -33,7 +35,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, MutexGuard},
     task::{Context, Poll, Wake, Waker},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const WORK_BUDGET: usize = 64;

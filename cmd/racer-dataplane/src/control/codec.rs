@@ -1,5 +1,6 @@
 //! Exact-name JSON with duplicate rejection, including unknown nested fields.
 use super::*;
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     topology::rails::{RailId, RailMapping},
@@ -10,11 +11,7 @@ use serde::{
     de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, HashSet},
-    fmt,
-    num::NonZeroU32,
-};
+use std::{collections::BTreeMap, fmt, num::NonZeroU32};
 
 struct Strict(usize);
 impl<'de> DeserializeSeed<'de> for Strict {
@@ -313,7 +310,7 @@ pub fn decode_publication(b: &[u8]) -> Result<Publication> {
     if p.members.len() > MAX_MEMBERS {
         return Err(Error::Overloaded);
     }
-    let mut nodes = HashSet::new();
+    let mut nodes = HashSet::default();
     let mut members = Vec::with_capacity(p.members.len());
     for m in p.members {
         uuid(&m.node)?;
@@ -325,7 +322,7 @@ pub fn decode_publication(b: &[u8]) -> Result<Publication> {
         if endpoint.port() == 0 || m.peer_endpoint.contains('%') {
             return Err(Error::InvalidRequest);
         }
-        let mut ids = HashSet::new();
+        let mut ids = HashSet::default();
         let mut rails = Vec::new();
         for r in m.rails {
             if !ids.insert(r.rail) || r.fabric.is_empty() || r.fabric.contains(['\0', '\r', '\n']) {
@@ -493,7 +490,7 @@ pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         return Err(Error::InvalidRequest);
     }
     let mut keys = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut active = BTreeMap::new();
     for k in r.cache_keys {
         uuid(&k.cache)?;

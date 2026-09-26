@@ -150,7 +150,7 @@ impl Recovery {
 
 fn filter_keys(shard: &mut ShardImage, available: Option<&[KeyId]>) {
     if let Some(available) = available {
-        let keys: std::collections::HashSet<_> = available.iter().copied().collect();
+        let keys: crate::runtime::collections::HashSet<_> = available.iter().copied().collect();
         shard
             .index
             .entries

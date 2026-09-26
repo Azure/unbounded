@@ -81,6 +81,8 @@ use crate::{
     telemetry::Telemetry,
     topology::{health::LinkHealth, paths::Paths, placement::Placement, rails::Rails},
 };
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
@@ -90,7 +92,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[path = "app_caches.rs"]
@@ -127,7 +129,7 @@ pub struct NodeState {
     native: native::NativePairs,
     cache_cut: Mutex<caches::CacheCut>,
     retirement: Arc<retirement::Retirement>,
-    membership_owners: Mutex<std::collections::HashMap<usize, usize>>,
+    membership_owners: Mutex<crate::runtime::collections::HashMap<usize, usize>>,
 }
 #[derive(Default)]
 struct CheckpointCut {
@@ -158,7 +160,7 @@ impl NodeState {
             native: native::NativePairs::default(),
             cache_cut: Mutex::new(caches::CacheCut::default()),
             retirement: Arc::new(retirement::Retirement::new(count)),
-            membership_owners: Mutex::new(std::collections::HashMap::new()),
+            membership_owners: Mutex::new(crate::runtime::collections::HashMap::default()),
         })
     }
 }
@@ -1178,7 +1180,7 @@ impl WorkerApplication {
 fn update_memberships(
     network: &PeerNetwork,
     memberships: &mut VecDeque<crate::topology::membership::MembershipLease>,
-    owners: &Mutex<std::collections::HashMap<usize, usize>>,
+    owners: &Mutex<crate::runtime::collections::HashMap<usize, usize>>,
     current: &crate::topology::membership::MembershipLease,
 ) -> Result<()> {
     // Each installed worker owns exactly two structural references: its queue and
@@ -1612,7 +1614,7 @@ pub(crate) mod tests {
     #[test]
     fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
         use crate::{model::identity::MembershipVersion, topology::membership::Membership};
-        let owners = Mutex::new(std::collections::HashMap::new());
+        let owners = Mutex::new(crate::runtime::collections::HashMap::default());
         let publication = crate::control::wire::decode_publication(include_bytes!(
             "control/testdata/publication.json"
         ))

@@ -1,4 +1,5 @@
 //! I/O-local admission authority with completion-safe cross-thread quota release.
+use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Result},
     model::{
@@ -9,7 +10,6 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -82,7 +82,7 @@ impl Admission {
         Self {
             limits,
             totals: Arc::new(Counters::new()),
-            caches: RefCell::new(HashMap::new()),
+            caches: RefCell::new(HashMap::default()),
             stopped: Cell::new(false),
         }
     }

@@ -5,9 +5,9 @@ use super::{
 };
 use crate::error::{Error, Operation, Result};
 use crate::model::identity::PageId;
+use crate::runtime::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
-    collections::HashSet,
     rc::Rc,
 };
 pub struct SegmentClock {
@@ -24,7 +24,7 @@ impl SegmentClock {
             segments,
             free_reserve,
             hand: Cell::new(0),
-            recent: RefCell::new(HashSet::new()),
+            recent: RefCell::new(HashSet::default()),
         }
     }
     pub fn mark_read(&self, segment: SegmentId) -> Result<()> {

@@ -4,6 +4,7 @@
 //! Shares and rail alignment come exclusively from accepted controller membership.
 //! See ../CONFIGURATION.md for environment names, defaults, and startup obligations.
 
+use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::{
@@ -15,7 +16,6 @@ use crate::{
     store::format::MAX_HEADER_BYTES,
 };
 use std::{
-    collections::HashSet,
     io::Read,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
@@ -369,8 +369,8 @@ pub(crate) fn validate_fabric_ports(ports: &[FabricPort]) -> Result<()> {
     if ports.len() > 64 {
         return Err(Error::InvalidConfiguration);
     }
-    let mut fabrics = HashSet::new();
-    let mut physical = HashSet::new();
+    let mut fabrics = HashSet::default();
+    let mut physical = HashSet::default();
     for port in ports {
         if port.fabric.is_empty()
             || port.fabric.len() > 4096

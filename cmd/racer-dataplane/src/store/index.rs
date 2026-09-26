@@ -4,6 +4,7 @@ use super::{
     slab::SlabLocation,
 };
 use crate::model::envelope::KeyId;
+use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
     model::{
@@ -13,7 +14,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordLocation {
@@ -56,7 +57,7 @@ impl IndexSnapshot {
     /// Structural checkpoint validation, in addition to checksum, ownership,
     /// capacity, geometry, and generation checks performed during recovery.
     pub fn validate_metadata(&self) -> Result<()> {
-        let mut lengths = std::collections::HashMap::new();
+        let mut lengths = HashMap::default();
         for metadata in self
             .metadata
             .iter()
@@ -253,8 +254,8 @@ impl Index {
         {
             return Err(Error::CorruptRecord);
         }
-        let mut pages = HashSet::new();
-        let mut versions = HashSet::new();
+        let mut pages = HashSet::default();
+        let mut versions = HashSet::default();
         if snapshot.entries.iter().any(|(p, _)| !pages.insert(p))
             || snapshot
                 .metadata

@@ -15,6 +15,7 @@
 //! independently of futures/tokens. Dropping a token must schedule detach/abandon
 //! on that worker, never free live resources. Register/recheck wakeups before
 //! parking. Bound entries, waiters, retry attempts, and retained completions.
+use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::PageResult,
@@ -28,7 +29,7 @@ use crate::{
 use std::{
     any::Any,
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     future::poll_fn,
     rc::Rc,
     task::{Context, Poll, Waker},
@@ -652,8 +653,8 @@ impl Flights {
                         },
                         state: FlightState::RetryPending,
                         leader: None,
-                        waiters: HashMap::new(),
-                        operations: HashMap::new(),
+                        waiters: HashMap::default(),
+                        operations: HashMap::default(),
                         outcome: None,
                         result: None,
                         error: None,

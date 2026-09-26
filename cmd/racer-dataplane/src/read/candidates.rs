@@ -22,7 +22,9 @@ use crate::{
         placement::{Candidates, Placement},
     },
 };
-use std::{cell::RefCell, rc::Rc, time::Instant};
+#[cfg(test)]
+use std::time::Instant;
+use std::{cell::RefCell, rc::Rc};
 
 pub struct OriginAuthority {
     membership: MembershipLease,

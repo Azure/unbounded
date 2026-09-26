@@ -93,6 +93,7 @@ struct World {
     resources: BTreeMap<u32, Resource>,
     faults: VecDeque<(Operation, Option<u32>, Fault)>,
     trace: Vec<Event>,
+    sequence: u64,
 }
 enum Resource {
     Device(Device),
@@ -212,6 +213,9 @@ impl Simulation {
     pub fn trace(&self) -> Vec<Event> {
         self.world.borrow().trace.clone()
     }
+    pub fn take_trace(&self) -> Vec<Event> {
+        std::mem::take(&mut self.world.borrow_mut().trace)
+    }
     pub fn live_resources(&self) -> usize {
         self.world.borrow().resources.len()
     }
@@ -306,13 +310,14 @@ impl World {
         completion: bool,
     ) {
         self.trace.push(Event {
-            sequence: self.trace.len() as u64,
+            sequence: self.sequence,
             operation,
             resource: resource.into(),
             work_id,
             result,
             completion,
         });
+        self.sequence += 1;
     }
     fn fault(&mut self, operation: Operation, resource: u32) -> Option<Fault> {
         let i = self.faults.iter().position(|(op, target, _)| {
