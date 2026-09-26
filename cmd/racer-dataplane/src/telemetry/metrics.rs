@@ -192,6 +192,29 @@ impl Metrics {
 mod tests {
     use super::*;
     #[test]
+    fn request_drop_counts_failure_once_and_workers_share_counters() {
+        let metrics = Metrics::default();
+        let worker = metrics.clone();
+        std::thread::spawn(move || {
+            let mut success = worker.request().unwrap();
+            success.success();
+            drop(success);
+            let mut overloaded = worker.request().unwrap();
+            overloaded.fail(crate::error::Error::Overloaded);
+            overloaded.fail(crate::error::Error::Overloaded);
+            drop(overloaded);
+            let abandoned = worker.request().unwrap();
+            assert_eq!(worker.gauge(Gauge::ActiveRequests), 1);
+            drop(abandoned);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(metrics.count(Event::Request), 3);
+        assert_eq!(metrics.count(Event::RequestError), 2);
+        assert_eq!(metrics.count(Event::Overload), 1);
+        assert_eq!(metrics.gauge(Gauge::ActiveRequests), 0);
+    }
+    #[test]
     fn fixed_series_saturate_and_leases_return_to_baseline() {
         let metrics = Metrics::default();
         for event in EVENTS {

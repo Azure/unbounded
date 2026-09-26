@@ -41,6 +41,37 @@ are accepted. `tracing.event(RequestId, Option<AttemptId>, Stage)` stores at mos
 128 typed correlation records. No text, headers, keys, credentials, formatting
 callbacks, or logging sinks can be attached. Trace records are not HTTP output.
 
+## Dataplane metrics
+
+The application shares one `Metrics` handle across all workers, client listeners,
+page fills, and store readers/writers. Scrape GET `/metrics` on the existing
+diagnostics listener. Every series is label-free and process-wide; Prometheus can
+attach target labels. Counters reset on process restart and saturate at `u64::MAX`.
+
+| Metric | Meaning |
+| --- | --- |
+| `racer_requests_total` | Client UDS exchanges admitted after header reception, including rejected parsed heads. Idle connections and header I/O failures are excluded. |
+| `racer_request_errors_total` | Admitted exchanges that did not finish successful response delivery: protocol/read errors, cancellation, timeout, truncated delivery, or abandonment. |
+| `racer_active_requests` | Admitted client exchanges still processing or delivering a response. |
+| `racer_memory_hits_total` | Successful page acquisitions/copy-only reads from memory or pending dirty ciphertext. |
+| `racer_disk_hits_total` | Successful page acquisitions/copy-only reads from disk. |
+| `racer_peer_hits_total` | Successfully validated and published peer page fills. |
+| `racer_origin_fills_total` | Successfully encrypted and published origin pages, including bootstrap page zero. |
+| `racer_active_fills` | Elected page acquisitions retained through their operation completion fence, including local disk/decrypt work. Coalesced waiters are excluded. |
+| `racer_overloads_total` | Admitted client exchanges that encountered `Overloaded`, at most once per exchange. Optional persistence skips and internal recovered pressure are excluded. |
+| `racer_corrupt_misses_total` | Disk or peer copies rejected for corrupt framing, identity, or AEAD validation. Missing keys and ordinary I/O misses are excluded. |
+| `racer_dirty_discards_total` | Accepted queued dirty copies discarded before persistence, including reclamation, retirement, cancellation, and persistence failure. Declined enqueue attempts are excluded. |
+
+Page-source counters measure actual successful source work, including peer-serving
+copy-only reads. They do not count coalesced waiter deliveries again and are not
+request counts: HEAD requests need no page and ranges may need many pages. Empty
+origin bootstrap responses do not fill a page. `racer_active_requests` tracks the
+exchange task lifetime; `racer_active_fills` remains set after a waiting request
+disappears until retained fill work is fenced.
+
+The existing `racer_live`, `racer_ready`, and `racer_diagnostic_*` series remain
+available. Diagnostics do not increment client request counters.
+
 ## Bounds and runtime integration constraint
 
 Only HTTP/1.1 GET `/healthz`, `/readyz`, and `/metrics` are served. Responses close

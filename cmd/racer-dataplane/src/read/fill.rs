@@ -886,6 +886,7 @@ mod tests {
         }
     }
     struct Rig {
+        reactor: Rc<crate::runtime::reactor::Reactor>,
         fill: Rc<Fill>,
         origin: Rc<BytesOrigin>,
         engine: crate::security::aead::PageCryptoEngine,
@@ -930,7 +931,7 @@ mod tests {
         let slabs = Rc::new(Slabs::new(
             WorkerId(0),
             directory.clone(),
-            reactor,
+            reactor.clone(),
             1024 * 1024 * 1024,
             64 * 1024 * 1024,
         ));
@@ -1009,6 +1010,7 @@ mod tests {
             number: PageNumber(0),
         };
         Rig {
+            reactor,
             directory,
             fill,
             origin,
@@ -1019,21 +1021,28 @@ mod tests {
         }
     }
     fn drive<T>(
+        reactor: &crate::runtime::reactor::Reactor,
         engine: &mut crate::security::aead::PageCryptoEngine,
         client: &crate::runtime::crypto::CryptoClient,
         mut future: Operation<'_, T>,
     ) -> Result<T> {
         use crate::runtime::worker::CryptoService;
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            reactor.poll_budgeted(64)?;
             super::super::drivers::poll(&mut cx, 64);
             engine.poll_budgeted(64)?;
             client.poll_budgeted(64)?;
             if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut cx) {
                 return result;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded local pipeline failed to make progress"
+            );
+            reactor.wait(std::time::Duration::from_millis(1))?;
         }
-        panic!("bounded local pipeline failed to make progress")
     }
     #[test]
     fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
@@ -1050,6 +1059,7 @@ mod tests {
         .unwrap();
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 8, 8);
         let result = drive(
+            &rig.reactor,
             &mut rig.engine,
             &rig.client,
             rig.fill.acquire(
@@ -1078,6 +1088,7 @@ mod tests {
             .unwrap();
         assert_eq!(pending.ciphertext.bytes(), result.ciphertext.bytes());
         let second = drive(
+            &rig.reactor,
             &mut rig.engine,
             &rig.client,
             rig.fill.acquire(
@@ -1091,5 +1102,47 @@ mod tests {
         .unwrap();
         assert_eq!(second.ciphertext.bytes(), result.ciphertext.bytes());
         assert_eq!(rig.origin.calls.get(), 1);
+        assert_eq!(rig.fill.metrics.count(Event::OriginFill), 1);
+        assert_eq!(rig.fill.metrics.count(Event::MemoryHit), 2);
+        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 0);
+        assert_eq!(rig.fill.metrics.count(Event::PeerHit), 0);
+        assert_eq!(rig.fill.metrics.gauge(Gauge::ActiveFills), 0);
+        rig.reactor.init().unwrap();
+        futures::executor::block_on(rig.fill.dependencies.writer.open()).unwrap();
+        drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.dependencies.writer.progress(1, &scope),
+        )
+        .unwrap();
+        drop((result, second, copy, pending));
+        assert!(rig.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);
+        let disk_copy = drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.copy_only(&rig.page, &scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disk_copy.0.version, rig.page.version);
+        let disk_result = drive(
+            &rig.reactor,
+            &mut rig.engine,
+            &rig.client,
+            rig.fill.acquire(
+                rig.page.clone(),
+                rig.membership.clone(),
+                &context,
+                &scope,
+                &mut budget,
+            ),
+        )
+        .unwrap();
+        assert_eq!(disk_result.plaintext.bytes(), b"abc");
+        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 2);
+        assert_eq!(rig.fill.metrics.count(Event::OriginFill), 1);
+        assert_eq!(rig.fill.metrics.count(Event::MemoryHit), 2);
     }
 }

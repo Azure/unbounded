@@ -747,6 +747,12 @@ mod tests {
         fn socket(&self) -> PathBuf {
             self.root.0.join("example/client/socket")
         }
+        fn assert_metrics(&self, requests: u64, errors: u64, active: u64) {
+            use crate::telemetry::metrics::{Event, Gauge};
+            assert_eq!(self.listeners.metrics.count(Event::Request), requests);
+            assert_eq!(self.listeners.metrics.count(Event::RequestError), errors);
+            assert_eq!(self.listeners.metrics.gauge(Gauge::ActiveRequests), active);
+        }
         fn connect(&self) -> UnixStream {
             // /proc keeps sun_path short even in deeply nested CI worktrees.
             let directory = File::open(self.socket().parent().unwrap()).unwrap();
@@ -1374,6 +1380,7 @@ mod tests {
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
         assert!(output.ends_with(b"\r\n\r\n"));
         assert_no_body_leases(&fixture);
+        fixture.assert_metrics(1, 1, 0);
     }
 
     #[test]
@@ -1386,6 +1393,7 @@ mod tests {
             let held = pipes.acquire().unwrap();
             let mut socket = start_body(&fixture);
             assert_no_head(&mut socket);
+            fixture.assert_metrics(1, 0, 1);
             if cancel {
                 fixture.listeners.cancel_cache(&definition().id).unwrap();
             } else {
@@ -1397,6 +1405,7 @@ mod tests {
             drop(held);
             futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
             assert_no_body_leases(&fixture);
+            fixture.assert_metrics(1, 1, 0);
         }
     }
 
@@ -1451,6 +1460,7 @@ mod tests {
                 assert!(text.contains("racer-expires-at: 0\r\n"));
                 assert!(text.contains("content-type: application/octet-stream\r\n"));
             }
+            fixture.assert_metrics(if cancelled { 2 } else { 1 }, u64::from(cancelled), 0);
         }
     }
 
@@ -1657,6 +1667,7 @@ mod tests {
             (Error::Cancelled, "", 503, None),
             (Error::OriginRejected, "", 401, None),
             (Error::OriginForbidden, "", 403, None),
+            (Error::Overloaded, "", 503, None),
         ] {
             fixture.listeners.reads = Rc::new(Failing(error));
             let mut socket = fixture.connect();
@@ -1672,6 +1683,14 @@ mod tests {
             assert!(text.ends_with("\r\n\r\n"));
         }
         struct WrongIdentity(bool);
+        fixture.assert_metrics(7, 7, 0);
+        assert_eq!(
+            fixture
+                .listeners
+                .metrics
+                .count(crate::telemetry::metrics::Event::Overload),
+            1
+        );
         impl ReadService for WrongIdentity {
             fn read<'a>(
                 &'a self,

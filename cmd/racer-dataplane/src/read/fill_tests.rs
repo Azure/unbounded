@@ -581,6 +581,9 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
     let b = b.unwrap();
     assert_eq!(f.origin.calls.get(), 1);
     assert!(Arc::ptr_eq(&a.plaintext.inner, &b.plaintext.inner));
+    assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), 0);
+    assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert!(Arc::ptr_eq(&a.ciphertext.inner, &b.ciphertext.inner));
     assert_eq!(a.plaintext.bytes(), b"abc");
     let copy = drive(
@@ -1043,6 +1046,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
         "origin bytes accepted for crypto before cancellation"
     );
     drop(first);
+    assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 1);
     let mut second = f.fill.acquire(
         f.page.clone(),
         f.membership.clone(),
@@ -1068,6 +1072,8 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     let result = drive(second, &mut f.engine, &f.crypto).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
     assert_eq!(f.origin.calls.get(), 2);
+    assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
+    assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
 
 #[test]

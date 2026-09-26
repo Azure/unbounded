@@ -205,6 +205,12 @@ template supports either Pod IP family, independently of peer listener configura
 Deploy a dataplane image containing the bracketed-IPv4 diagnostics parser together
 with this controller; older images reject the expanded IPv4 bind address.
 
+Scrape HTTP `/metrics` through that same named `diagnostics` port. Metrics aggregate
+all dataplane workers and expose client requests/errors, active requests/fills,
+memory/disk/peer hits, origin fills, overloads, corrupt misses, and dirty discards.
+See [metric semantics](src/telemetry/INTEGRATION.md#dataplane-metrics) for counting
+boundaries. All series have fixed names and no application-supplied labels.
+
 Rolling updates use `maxUnavailable: 1`, no surge, and `minReadySeconds: 10`:
 replacement Pods must sustain observed readiness across probe periods before
 the next replacement. The endpoint requires usable resources and fresh progress

@@ -47,6 +47,7 @@ impl Drop for Directory {
     }
 }
 struct Fixture {
+    metrics: crate::telemetry::metrics::Metrics,
     store: Store,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
@@ -56,6 +57,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let directory = Directory::new();
+        let metrics = crate::telemetry::metrics::Metrics::default();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -75,18 +77,20 @@ impl Fixture {
             64 * 1024 * 1024,
             32 * 1024 * 1024,
         ));
-        let reader = Rc::new(reader::StoreReader::new(
-            eviction.clone(),
-            index.clone(),
-            segments.clone(),
-            slabs.clone(),
-            pool.clone(),
-        ));
-        let writer = Rc::new(writer::StoreWriter::new(
-            index.clone(),
-            segments.clone(),
-            slabs,
-        ));
+        let reader = Rc::new(
+            reader::StoreReader::new(
+                eviction.clone(),
+                index.clone(),
+                segments.clone(),
+                slabs.clone(),
+                pool.clone(),
+            )
+            .with_metrics(metrics.clone()),
+        );
+        let writer = Rc::new(
+            writer::StoreWriter::new(index.clone(), segments.clone(), slabs)
+                .with_metrics(metrics.clone()),
+        );
         let store = Store {
             reader,
             writer,
@@ -100,6 +104,7 @@ impl Fixture {
         };
         store.configure(admission.clone(), 2, 16).unwrap();
         Self {
+            metrics,
             store,
             admission,
             reactor,
@@ -226,6 +231,11 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     assert_eq!(f.enqueue(first).unwrap().id(), ticket.id());
     f.enqueue(f.copy(2, 3)).unwrap();
     assert!(matches!(f.enqueue(f.copy(3, 3)), Err(Error::Overloaded)));
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DirtyDiscard),
+        0
+    );
     assert!(f.store.writer.copy_only(&id).unwrap().is_some());
     f.store
         .writer
@@ -234,6 +244,11 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     assert!(matches!(f.enqueue(f.copy(4, 3)), Err(Error::MissingKey)));
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DirtyDiscard),
+        2
+    );
 }
 
 fn segment_images(
@@ -480,6 +495,11 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
             .is_none()
     );
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::CorruptMiss),
+        1
+    );
 }
 
 #[test]
@@ -498,6 +518,11 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
     assert!(f.reactor.in_flight() > 0);
     drop(operation);
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DirtyDiscard),
+        1
+    );
     assert_eq!(f.store.writer.pending_count(), 0);
     assert!(f.admission.used(ResourceClass::Ciphertext) > 0);
     assert!(!f.store.writer.is_idle());
