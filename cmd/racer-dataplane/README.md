@@ -30,6 +30,67 @@ cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir 
 
 `make racer-test` also runs the Go server checks before the complete Rust suite.
 
+## Generated datapath DST
+
+Run both HTTP and connected-native generated-traffic oracles with the normal `dst`
+test filter. The wrapper verifies a cgroup-v2 limit of at most 16 GiB and zero
+swap for the entire build/test process tree before executing Cargo:
+
+```sh
+bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
+# Replay a seed or an explicit comma-separated corpus:
+RACER_DST_SEEDS=42 RACER_DST_STEPS=32 \
+  bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
+# Select only the connected native graph:
+RACER_DST_SEEDS=1,7,42 \
+  bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst \
+  RACER_DST_FILTER=dst_generated_native RACER_TEST_ARGS=--nocapture
+```
+
+`src/app_dst_tests.rs` defaults to seeds `1,7,42` and 32 generated actions per
+seed. `RACER_DST_STEPS` accepts 1 through 4096; the seed list accepts at most 1024
+unsigned decimal 64-bit values. Failures print seed, action index, cluster size,
+and observed coverage. Replaying requires the same source revision: the seeded
+scheduler consumes random choices as the production graph progresses.
+
+Each run chooses an initial 2-32-node cluster and generates legal concurrent
+HEAD/bootstrap/pinned ranges, origin version mutations, retained old pins, node
+addition/removal, checkpoint restart, quiescent process loss without checkpoint,
+peer listener outage/heal, client disconnect, memory eviction, short I/O,
+connection rejection, delayed writes, and failed dirty writes. Membership can
+also change while a client request is in progress. Scheduling uses bounded random
+poll quanta and a virtual clock. Process incarnations have distinct deterministic
+entropy streams. A 16 MiB-plus-tail object exercises page boundaries alongside
+empty and short objects.
+
+Workers use `WorkerApplication::assemble` and production startup/recovery, client
+listeners, dispatch, candidate selection, peer challenge/signature/replay checks,
+credential encryption, origin HTTP, page crypto queues, encrypted storage,
+checkpointing, and shutdown. Client and origin fixtures exchange raw bytes over
+hostless `Descriptor::Sim` sockets. Canonical cache names differ per simulated
+node while sharing a cache UID, isolating UDS paths inside the shared simulated OS.
+Accepted certificates, key bundles, and publications are fixture inputs; this
+harness does not enroll through a simulated controller.
+
+The independent oracle retains immutable version bytes and checks every delivered
+byte, ETag, range, total size, framing, and status. Healthy recovery must read every
+current object successfully. Mandatory cache-only reads prove an encrypted disk
+read with origin unavailable, followed by a memory hit without disk or origin I/O.
+The native test requires successful native activation and completed DMA writes,
+so HTTP fallback alone cannot pass it. Coverage reports relay-active polling turns,
+successful responses, bytes, persisted records, OS completions, and consumed fault
+rules. Every injected OS rule must be observed. Per-turn admission/queue/descriptor
+bounds and final zero quota, descriptor, and native-resource usage are asserted.
+
+Coverage boundaries: peer listener outages are not pairwise network partitions;
+process loss is currently injected only after requests settle, not during DMA or
+partial persistent writes. The OS model retains completed writes across restart
+and does not model power-loss durability. Native fault-rule generation, key/cache
+retirement, wall-clock jumps, credential rejection, and multiple worker pairs per
+node are not yet generated here. Relay activity is reported, but arbitrary custom
+seeds are not required to traverse a relay. These are explicit gaps rather than
+claims implied by the `dst` filter. Component tests cover additional boundaries.
+
 Constructors connect dependencies without opening files, accepting requests, or
 spawning threads. Activation is explicit through the application lifecycle. See
 [configuration](CONFIGURATION.md) for environment variables, resource limits, and

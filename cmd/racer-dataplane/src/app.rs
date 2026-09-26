@@ -1382,6 +1382,10 @@ impl WorkerService for WorkerApplication {
 }
 
 #[cfg(test)]
+#[path = "app_dst_tests.rs"]
+mod dst;
+
+#[cfg(test)]
 #[path = "app_integration_tests.rs"]
 mod integration_tests;
 
