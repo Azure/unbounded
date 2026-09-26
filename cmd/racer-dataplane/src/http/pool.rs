@@ -241,7 +241,12 @@ impl HttpPool {
                     ));
                 }
             }
-            let reservation = self.admission.reserve(None, ResourceClass::Connection, 1)?;
+            let reservation = match self.admission.reserve(None, ResourceClass::Connection, 1) {
+                Err(Error::Overloaded) if self.reclaim_idle_connection() => {
+                    self.admission.reserve(None, ResourceClass::Connection, 1)?
+                }
+                result => result?,
+            };
             let (fd, address) = create_socket(endpoint)?;
             let connection = ConnectionLease::new(Rc::new(fd), reservation, slot.0.take());
             // Retain socket, admission and pool slot in the reactor through the
@@ -260,6 +265,36 @@ impl HttpPool {
                 .retain(|idle| now.duration_since(idle.since) < self.idle_timeout);
             entry.active != 0 || !entry.idle.is_empty()
         });
+    }
+    /// An idle connection is an optimization, not a reason to reject work for
+    /// another neighbor. Reclaim only one completed lease; active and connecting
+    /// operations retain their permits through their existing completion fences.
+    fn reclaim_idle_connection(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let oldest = state
+            .entries
+            .iter()
+            .flat_map(|(endpoint, entry)| {
+                entry
+                    .idle
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, idle)| (endpoint, index, idle.since))
+            })
+            .min_by_key(|(_, _, since)| *since);
+        let Some((endpoint, index, _)) = oldest else {
+            return false;
+        };
+        let endpoint = endpoint.clone();
+        let entry = state
+            .entries
+            .get_mut(&endpoint)
+            .expect("selected idle endpoint");
+        entry.idle.swap_remove(index);
+        if entry.active == 0 && entry.idle.is_empty() {
+            state.entries.remove(&endpoint);
+        }
+        true
     }
     /// Invalidate an endpoint generation without closing active operations. Old
     /// leases finish normally but cannot enter the new generation's idle pool.
@@ -370,6 +405,79 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn checkout_reclaims_idle_connections_before_rejecting_a_new_neighbor() {
+        use crate::model::identity::RequestId;
+        use std::{num::NonZeroUsize, task::Context};
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.client_connections = NonZeroUsize::new(2).unwrap();
+        let admission = Rc::new(Admission::new(limits));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
+        let mut peers = Vec::new();
+        for n in 0..2 {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            peers.push(peer);
+            pool.state.borrow_mut().entries.insert(
+                Endpoint::Peer(format!("127.0.0.1:{}", n + 1)),
+                Entry {
+                    idle: vec![Idle {
+                        fd: Rc::new(socket.into()),
+                        reservation: admission
+                            .reserve(None, ResourceClass::Connection, 1)
+                            .unwrap(),
+                        since: Instant::now(),
+                    }],
+                    ..Entry::default()
+                },
+            );
+        }
+        let scope =
+            RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
+        let mut work = pool.checkout(&endpoint, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let connection = loop {
+            if let std::task::Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                break result.expect("idle peers must not prevent a new neighbor connection");
+            }
+            scope.check().unwrap();
+            reactor.poll_budgeted(32).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        };
+        assert_eq!(admission.used(ResourceClass::Connection), 2);
+        assert_eq!(
+            pool.state
+                .borrow()
+                .entries
+                .values()
+                .map(|e| e.idle.len())
+                .sum::<usize>(),
+            1
+        );
+        // Active operations cannot be reclaimed, and per-neighbor limits still apply.
+        assert!(matches!(
+            futures::executor::block_on(pool.checkout(&endpoint, &scope)),
+            Err(Error::Overloaded)
+        ));
+        // Once every slot belongs to active work, another endpoint still fails.
+        assert!(pool.reclaim_idle_connection());
+        let active = admission
+            .reserve(None, ResourceClass::Connection, 1)
+            .unwrap();
+        let other = Endpoint::Peer("127.0.0.1:3".into());
+        assert!(matches!(
+            futures::executor::block_on(pool.checkout(&other, &scope)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(admission.used(ResourceClass::Connection), 2);
+        drop(active);
+        drop(connection);
+        pool.close();
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
 
     #[test]
     fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota() {

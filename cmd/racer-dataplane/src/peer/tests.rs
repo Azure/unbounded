@@ -102,6 +102,8 @@ fn identities_with_replay_capacity(capacity: usize) -> (Vec<Rc<Signatures>>, Vec
     (signers, discovery)
 }
 
+#[path = "fleet_layer_tests.rs"]
+mod fleet_layer_tests;
 #[path = "replay_load_tests.rs"]
 mod replay_load_tests;
 pub(super) fn signers() -> Vec<Rc<Signatures>> {
