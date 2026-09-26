@@ -390,14 +390,23 @@ impl Simulator {
         active.attempts += 1;
         if active.attempts >= self.config.max_attempts {
             self.report.failed += 1;
-            self.release(active);
+            self.release(id, active);
         } else {
             self.report.retries += 1;
             self.active.insert(id, active);
             self.schedule(self.now + self.config.retry_ticks, Event::Pump(id));
         }
     }
-    fn release(&mut self, active: Active) {
+    fn release(&mut self, id: usize, mut active: Active) {
+        if active.queued {
+            let w = active.worker;
+            let was_head = self.workers[w].pipe_queue.front() == Some(&id);
+            self.workers[w].pipe_queue.retain(|queued| *queued != id);
+            active.queued = false;
+            if was_head {
+                self.wake_pipe(w);
+            }
+        }
         let until = active
             .sending_until
             .unwrap_or(self.now)
@@ -405,12 +414,15 @@ impl Simulator {
         self.schedule(until, Event::Release(active));
     }
     fn wake_pipe(&mut self, w: usize) {
-        while let Some(id) = self.workers[w].pipe_queue.pop_front() {
-            if let Some(active) = self.active.get_mut(&id) {
-                active.queued = false;
-                self.schedule(self.now, Event::Pump(id));
-                break;
-            }
+        if self.workers[w].admission.used(ResourceClass::Pipe)
+            >= self.workers[w].admission.limit(ResourceClass::Pipe)
+        {
+            return;
+        }
+        // Notification does not relinquish FIFO position. Only acquisition or
+        // cancellation removes the head, just like PipePool's Waiting guard.
+        if let Some(&id) = self.workers[w].pipe_queue.front() {
+            self.schedule(self.now, Event::Pump(id));
         }
     }
     fn pump(&mut self, id: usize) {
@@ -420,22 +432,29 @@ impl Simulator {
         let w = active.worker;
         let cache = active.request.cache;
         self.touched.insert(w);
-        if active.queued {
-            self.active.insert(id, active);
-            return;
-        }
         if active.pipe.is_none() {
-            active.pipe = self.reserve(w, cache, ResourceClass::Pipe, 1);
+            let head = self.workers[w].pipe_queue.front().copied();
+            if head.is_none() || head == Some(id) {
+                active.pipe = self.reserve(w, cache, ResourceClass::Pipe, 1);
+            }
             if active.pipe.is_none() {
-                if self.workers[w].pipe_queue.len() >= self.config.queue_entries {
-                    self.report.failed += 1;
-                    self.release(active);
-                } else {
+                if !active.queued {
+                    if self.workers[w].pipe_queue.len() >= self.config.queue_entries {
+                        self.report.failed += 1;
+                        self.release(id, active);
+                        return;
+                    }
                     active.queued = true;
                     self.workers[w].pipe_queue.push_back(id);
-                    self.active.insert(id, active);
                 }
+                self.active.insert(id, active);
                 return;
+            }
+            if active.queued {
+                assert_eq!(self.workers[w].pipe_queue.pop_front(), Some(id));
+                active.queued = false;
+                // Several pipes may have been released before this pump ran.
+                self.wake_pipe(w);
             }
         }
         let end = active.request.first_page + active.request.pages as u64;
@@ -622,7 +641,7 @@ impl Simulator {
                         {
                             self.report.completed += 1;
                             self.report.latency_ticks.push(self.now - active.request.at);
-                            self.release(active);
+                            self.release(id, active);
                         } else {
                             self.active.insert(id, active);
                             self.schedule(self.now, Event::Pump(id));
@@ -641,14 +660,17 @@ impl Simulator {
                         } else {
                             self.report.failed += 1;
                         }
-                        self.release(active);
+                        self.release(id, active);
                     }
                 }
                 Event::Release(active) => {
                     let w = active.worker;
+                    let had_pipe = active.pipe.is_some();
                     drop(active);
                     self.touched.insert(w);
-                    self.wake_pipe(w);
+                    if had_pipe {
+                        self.wake_pipe(w);
+                    }
                 }
             }
             self.sample();
@@ -659,7 +681,7 @@ impl Simulator {
             assert!(worker.cache.values().all(Bundle::idle));
             worker.cache.clear();
             worker.lru.clear();
-            worker.pipe_queue.clear();
+            assert!(worker.pipe_queue.is_empty());
             for (i, class) in CLASSES.iter().enumerate() {
                 self.report.final_used[i] += worker.admission.used(*class);
             }
@@ -708,4 +730,5 @@ impl Simulator {
 }
 
 mod fidelity;
+mod queues;
 mod scenarios;

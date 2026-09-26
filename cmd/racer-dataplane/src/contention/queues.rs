@@ -47,6 +47,103 @@ fn request_ownership(sim: &Simulator) -> [usize; 3] {
     .map(|class| sim.workers[0].admission.used(class))
 }
 
+fn pump_next(sim: &mut Simulator, expected: usize) {
+    let ((at, _), event) = sim.events.pop_first().unwrap();
+    assert_eq!(at, sim.now);
+    assert!(matches!(event, Event::Pump(id) if id == expected));
+    sim.pump(expected);
+}
+
+#[test]
+fn same_tick_newer_pump_cannot_bypass_a_notified_head() {
+    for pipes in [1, 2] {
+        let mut sim = Simulator::new(Config { pipes, ..config() });
+        let held: Vec<_> = (0..pipes)
+            .map(|_| sim.reserve(0, 0, ResourceClass::Pipe, 1).unwrap())
+            .collect();
+        for id in 1..=2 {
+            sim.arrive(id, request());
+            pump_next(&mut sim, id);
+        }
+
+        drop(held);
+        // The newcomer already has a pump scheduled ahead of the release wake.
+        sim.arrive(3, request());
+        sim.wake_pipe(0);
+        assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([1, 2]));
+        assert!(sim.active[&1].queued);
+        pump_next(&mut sim, 3);
+        assert!(sim.active[&3].pipe.is_none());
+        assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([1, 2, 3]));
+
+        pump_next(&mut sim, 1);
+        assert!(sim.active[&1].pipe.is_some());
+        assert!(!sim.active[&1].queued);
+        assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([2, 3]));
+        if pipes == 1 {
+            // Return the only pipe to let the second waiter make progress.
+            drop(sim.active.get_mut(&1).unwrap().pipe.take());
+            sim.wake_pipe(0);
+        }
+        // With two free pipes, acquiring the head must notify its successor.
+        pump_next(&mut sim, 2);
+        assert!(sim.active[&2].pipe.is_some());
+        assert!(sim.active[&3].pipe.is_none());
+        assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([3]));
+    }
+}
+
+#[test]
+fn cancellation_removes_every_queue_position_before_delayed_release() {
+    for canceled in 1..=3 {
+        let mut sim = Simulator::new(config());
+        let held = sim.reserve(0, 0, ResourceClass::Pipe, 1).unwrap();
+        for id in 1..=3 {
+            sim.arrive(id, request());
+            pump_next(&mut sim, id);
+        }
+
+        let active = sim.active.remove(&canceled).unwrap();
+        sim.release(canceled, active);
+        let survivors: VecDeque<_> = (1..=3).filter(|id| *id != canceled).collect();
+        assert_eq!(sim.workers[0].pipe_queue, survivors);
+        assert_eq!(request_ownership(&sim), [3 * CONTEXT, 3, 1]);
+        assert!(
+            sim.events
+                .values()
+                .all(|event| !matches!(event, Event::Pump(_)))
+        );
+        // Queue capacity is reusable even while canceled context ownership is
+        // retained by the completion event. One spare context admits this request.
+        sim.arrive(4, request());
+        pump_next(&mut sim, 4);
+        assert!(sim.active[&4].queued);
+        assert_eq!(sim.workers[0].pipe_queue.back(), Some(&4));
+        assert_eq!(sim.workers[0].pipe_queue.len(), 3);
+        assert_eq!(sim.report.failed, 0);
+        drop(held);
+    }
+}
+
+#[test]
+fn canceling_a_notified_head_wakes_its_successor_before_delayed_release() {
+    let mut sim = Simulator::new(config());
+    let held = sim.reserve(0, 0, ResourceClass::Pipe, 1).unwrap();
+    for id in 1..=2 {
+        sim.arrive(id, request());
+        pump_next(&mut sim, id);
+    }
+    drop(held);
+    sim.wake_pipe(0);
+    let head = sim.active.remove(&1).unwrap();
+    sim.release(1, head);
+    assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([2]));
+    pump_next(&mut sim, 1); // The canceled head's scheduled pump is harmless.
+    pump_next(&mut sim, 2);
+    assert!(sim.active[&2].pipe.is_some());
+    assert!(sim.workers[0].pipe_queue.is_empty());
+}
+
 #[test]
 fn one_pipe_drains_a_full_bounded_queue_sequentially() {
     let config = config();
@@ -74,7 +171,8 @@ fn one_pipe_drains_a_full_bounded_queue_sequentially() {
     assert_outcomes(&report, count, 0, 0);
     assert_eq!(report.peak_requests, count);
     assert_eq!(report.peak_worker[ResourceClass::Pipe as usize], 1);
-    assert_eq!(report.rejections[ResourceClass::Pipe as usize], count - 1);
+    // Once the queue exists, newcomers wait without attempting raw admission.
+    assert_eq!(report.rejections[ResourceClass::Pipe as usize], 1);
     assert_eq!(report.retries, 0, "pipe waiters should be event-driven");
     assert_eq!(report.fills, 1);
     assert_eq!(report.hits, count - 1);
@@ -281,7 +379,7 @@ fn canceled_send_keeps_page_and_pipe_until_their_scheduled_completions() {
         // Use the same ownership transition as Terminate, then inspect the
         // events before the dispatcher could hide an early release by draining.
         let active = sim.active.remove(&0).unwrap();
-        sim.release(active);
+        sim.release(0, active);
         let release_at = sent_at.max(sim.now + sim.config.completion_ticks);
         assert!(sim.events.iter().any(|(&(at, _), event)| {
             at == release_at && matches!(event, Event::Release(active) if active.pipe.is_some())
