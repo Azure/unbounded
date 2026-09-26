@@ -1,4 +1,6 @@
-//! Small allocation-backed oracles for the payload-free ownership abstraction.
+//! Allocation-backed oracles for the simulator's Bundle and page reclamation.
+//! Dirty Fill and crypto checks below cover production contracts against explicit
+//! Bundle owner traces, not the simulator's event scheduling or completion timing.
 use super::*;
 use crate::{
     error::{Error, Operation},
@@ -54,23 +56,30 @@ use std::{
 
 // The abstract side owns no payload. Production pages put the same non-cloneable
 // charges inside Arc<VerifiedBytes>/Arc<CiphertextBytes> (memory/pool.rs:41-58).
-#[derive(Clone)]
 struct MetadataOwners {
-    plaintext: Arc<Reservation>,
-    ciphertext: Arc<Reservation>,
+    bundle: super::Bundle,
 }
 
 impl MetadataOwners {
     fn reserve(admission: &Admission, cache: &CacheId) -> Self {
         let reserved = admission.reserve_fill(cache, false).unwrap();
         Self {
-            plaintext: Arc::new(reserved.plaintext),
-            ciphertext: Arc::new(reserved.ciphertext),
+            bundle: super::Bundle {
+                plain: Arc::new(reserved.plaintext),
+                cipher: Arc::new(reserved.ciphertext),
+            },
         }
     }
+}
 
-    fn idle(&self) -> bool {
-        Arc::strong_count(&self.plaintext) == 1 && Arc::strong_count(&self.ciphertext) == 1
+impl Clone for MetadataOwners {
+    fn clone(&self) -> Self {
+        Self {
+            bundle: super::Bundle {
+                plain: self.bundle.plain.clone(),
+                cipher: self.bundle.cipher.clone(),
+            },
+        }
     }
 }
 
@@ -170,9 +179,12 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
     let page = allocated_page(&real, &cache, "v1", PLAIN);
     let id = page.plaintext.page().clone();
     memory.publish(page).unwrap();
+    assert!(retained.bundle.idle(), "published bundle has no readers");
     checkpoint("publish", &model, &real, [PLAIN, CIPHER, 0]);
 
     let duplicate = retained.clone();
+    assert!(!retained.bundle.idle());
+    assert!(!duplicate.bundle.idle());
     let read = memory.get(&id).unwrap().unwrap();
     let again = memory.get(&id).unwrap().unwrap();
     assert!(Arc::ptr_eq(&read.plaintext.inner, &again.plaintext.inner));
@@ -184,26 +196,32 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
         &real,
         [PLAIN, CIPHER, 0],
     );
-    assert!(!retained.idle());
+    assert!(!retained.bundle.idle());
     assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
 
     // Either allocation protects the whole bundle, memory/cache.rs:184-186.
-    drop(duplicate.plaintext);
+    drop(duplicate.bundle.plain);
     drop(read.plaintext);
-    assert!(!retained.idle());
+    assert!(!retained.bundle.idle());
     assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
     checkpoint("ciphertext-only reader", &model, &real, [PLAIN, CIPHER, 0]);
-    let plain_owner = retained.plaintext.clone();
-    let plain = memory.get(&id).unwrap().unwrap().plaintext;
-    drop(duplicate.ciphertext);
+    drop(duplicate.bundle.cipher);
     drop(read.ciphertext);
-    assert!(!retained.idle());
+    assert!(retained.bundle.idle(), "last ciphertext reader released");
+    checkpoint("readers released", &model, &real, [PLAIN, CIPHER, 0]);
+    let plain_owner = retained.bundle.plain.clone();
+    let plain = memory.get(&id).unwrap().unwrap().plaintext;
+    assert!(!retained.bundle.idle());
     assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
     checkpoint("plaintext-only reader", &model, &real, [PLAIN, CIPHER, 0]);
 
     // Lookup removal is not a completion fence, memory/cache.rs:148-180.
     let last_plain = plain_owner.clone();
     let last_real_plain = plain.clone();
+    assert!(
+        !retained.bundle.idle(),
+        "live readers before lookup removal"
+    );
     drop(retained);
     memory.remove_cache(&cache).unwrap();
     assert!(memory.get(&id).unwrap().is_none());
@@ -225,22 +243,50 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
 fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
     // Short final pages keep full-page charges; execute class cases sequentially.
     for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
-        let model = admission(4);
+        let mut model = Simulator::new(Config {
+            nodes: 1,
+            workers: 1,
+            pages_per_worker: 4,
+            dirty_pages: 1,
+            queue_entries: 16,
+            ..Config::default()
+        });
         let real = admission(4);
         let memory = MemoryCache::new(Rc::new(BufferPool::new(real.clone())));
-        let a = CacheId("a".into());
-        let b = CacheId("b".into());
-        let mut owners = VecDeque::new();
+        // reserve_page uses numeric cache IDs, including for fair-share scope.
+        let a = CacheId("0".into());
+        let b = CacheId("1".into());
+        let keys = [(1, 0, 0), (0, 1, 0), (0, 2, 0)];
         let mut ids = Vec::new();
-        for (cache, version) in [(&b, "other"), (&a, "old"), (&a, "new")] {
-            owners.push_back(MetadataOwners::reserve(&model, cache));
+        for (key, (cache, version)) in
+            keys.into_iter()
+                .zip([(&b, "other"), (&a, "old"), (&a, "new")])
+        {
+            let bundle = Bundle {
+                plain: Arc::new(
+                    model
+                        .reserve_page(0, key.0, ResourceClass::Plaintext, PLAIN)
+                        .unwrap(),
+                ),
+                cipher: Arc::new(
+                    model
+                        .reserve_page(0, key.0, ResourceClass::Ciphertext, CIPHER)
+                        .unwrap(),
+                ),
+            };
+            assert!(bundle.idle());
+            // Seed retained pages without scheduling network/disk service. All
+            // reservation, idle selection, and eviction run the shared model code.
+            model.workers[0].cache.insert(key, bundle);
+            model.workers[0].lru.push_back(key);
+            model.directory.entry(key).or_default().insert(0);
             let page = allocated_page(&real, cache, version, 3);
             ids.push(page.plaintext.page().clone());
             memory.publish(page).unwrap();
         }
         checkpoint(
             "three retained final pages",
-            &model,
+            &model.workers[0].admission,
             &real,
             [3 * PLAIN, 3 * CIPHER, 0],
         );
@@ -249,7 +295,9 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
         } else {
             CIPHER
         };
-        for admission in [&model, &real] {
+        assert_eq!(model.report.evictions, 0);
+        assert!(model.workers[0].cache.values().all(Bundle::idle));
+        for admission in [&model.workers[0].admission, real.as_ref()] {
             assert!(matches!(
                 admission.reserve(Some(&a), class, amount),
                 Err(Error::Overloaded)
@@ -263,34 +311,111 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
         }
         checkpoint(
             "failed reservation is unchanged",
-            &model,
+            &model.workers[0].admission,
             &real,
             [3 * PLAIN, 3 * CIPHER, 0],
         );
-        assert!(owners[1].idle());
-        drop(owners.remove(1).unwrap());
+        // Either kind of external owner must prevent reserve_page from evicting
+        // A's pages, even though B is idle and global capacity remains available.
+        let pins: Vec<_> = keys[1..]
+            .iter()
+            .map(|key| {
+                let bundle = &model.workers[0].cache[key];
+                if matches!(class, ResourceClass::Plaintext) {
+                    bundle.plain.clone()
+                } else {
+                    bundle.cipher.clone()
+                }
+            })
+            .collect();
+        let reads: Vec<_> = ids[1..]
+            .iter()
+            .map(|id| {
+                let page = memory.get(id).unwrap().unwrap();
+                if matches!(class, ResourceClass::Plaintext) {
+                    (Some(page.plaintext), None)
+                } else {
+                    (None, Some(page.ciphertext))
+                }
+            })
+            .collect();
+        assert!(model.workers[0].cache[&keys[0]].idle());
+        assert!(
+            keys[1..]
+                .iter()
+                .all(|key| !model.workers[0].cache[key].idle())
+        );
+        assert!(model.reserve_page(0, 0, class, amount).is_none());
+        assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_| 0), 0);
+        assert_eq!(model.report.evictions, 0);
+        assert_eq!(
+            model.workers[0].lru.iter().copied().collect::<Vec<_>>(),
+            keys
+        );
+        assert_eq!(model.workers[0].cache.len(), 3);
+        assert_eq!(model.directory.len(), 3);
+        checkpoint(
+            "busy requesting-cache pages survive",
+            &model.workers[0].admission,
+            &real,
+            [3 * PLAIN, 3 * CIPHER, 0],
+        );
+        drop((pins, reads));
+        assert!(model.workers[0].cache.values().all(Bundle::idle));
+
+        let model_next = model
+            .reserve_page(0, 0, class, amount)
+            .expect("reclaim and retry must admit one page");
         assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_| 0), amount);
+        assert_eq!(occupancy(&real), [2 * PLAIN, 2 * CIPHER, 0]);
         assert!(memory.get(&ids[1]).unwrap().is_none());
         assert!(memory.get(&ids[0]).unwrap().is_some());
         assert!(memory.get(&ids[2]).unwrap().is_some());
-        checkpoint(
-            "only oldest requesting-cache bundle reclaimed",
-            &model,
-            &real,
-            [2 * PLAIN, 2 * CIPHER, 0],
+        assert_eq!(model.report.evictions, 1);
+        assert!(!model.workers[0].cache.contains_key(&keys[1]));
+        assert_eq!(model.workers[0].cache.len(), 2);
+        assert_eq!(
+            model.workers[0].lru.iter().copied().collect::<Vec<_>>(),
+            [keys[0], keys[2]]
         );
-        let model_next = model.reserve(Some(&a), class, amount).unwrap();
+        assert!(!model.directory.contains_key(&keys[1]));
+        assert_eq!(model.directory.len(), 2);
+        for key in [keys[0], keys[2]] {
+            assert!(model.workers[0].cache[&key].idle());
+            assert_eq!(
+                model.directory[&key].iter().copied().collect::<Vec<_>>(),
+                [0]
+            );
+        }
         let real_next = real.reserve(Some(&a), class, amount).unwrap();
         let expected = if matches!(class, ResourceClass::Plaintext) {
             [3 * PLAIN, 2 * CIPHER, 0]
         } else {
             [2 * PLAIN, 3 * CIPHER, 0]
         };
-        checkpoint("retry admitted", &model, &real, expected);
+        checkpoint(
+            "retry admitted",
+            &model.workers[0].admission,
+            &real,
+            expected,
+        );
         drop((model_next, real_next));
-        drop(owners);
+        assert!(model.workers[0].cache.values().all(Bundle::idle));
+        checkpoint(
+            "only oldest requesting-cache bundle reclaimed",
+            &model.workers[0].admission,
+            &real,
+            [2 * PLAIN, 2 * CIPHER, 0],
+        );
+        for key in [keys[0], keys[2]] {
+            model.evict(0, key);
+        }
+        assert!(model.workers[0].cache.is_empty());
+        assert!(model.workers[0].lru.is_empty());
+        assert!(model.directory.is_empty());
+        assert_eq!(model.report.evictions, 3);
         assert_eq!(memory.evict_idle(usize::MAX), Ok(2 * (PLAIN + CIPHER)));
-        checkpoint("drained", &model, &real, [0, 0, 0]);
+        checkpoint("drained", &model.workers[0].admission, &real, [0, 0, 0]);
     }
 }
 
@@ -335,6 +460,8 @@ fn scope() -> RequestScope {
 
 #[test]
 fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
+    // Standalone Fill contract: dirty overload skips persistence while preserving
+    // the read and idle working set. No simulator dirty event is driven here.
     let model = admission(4);
     let real = admission(4);
     let cache = CacheId(crate::security::identity::tests::CACHE.into());
@@ -350,11 +477,15 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let old = allocated_page(&real, &cache, "old", 3);
     let old_id = old.plaintext.page().clone();
     memory.publish(old).unwrap();
+    assert!(old_model.bundle.idle());
     let next_model = MetadataOwners::reserve(&model, &cache);
+    assert!(next_model.bundle.idle());
     assert!(matches!(
         model.reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER),
         Err(Error::Overloaded)
     ));
+    assert!(old_model.bundle.idle());
+    assert!(next_model.bundle.idle());
 
     let worker = WorkerId(0);
     let index = Rc::new(Index::new(worker, 16));
@@ -456,6 +587,10 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     }
     let result = result.expect("dirty pressure must not fail or stall the bootstrap read");
     drop(read);
+    let result_model = next_model.clone();
+    assert!(old_model.bundle.idle());
+    assert!(!next_model.bundle.idle());
+    assert!(!result_model.bundle.idle());
     assert_eq!(result.plaintext.bytes(), b"abc");
     assert_eq!(result.ciphertext.bytes().len(), 19);
     // Actual Fill overload-to-None policy, read/fill.rs:400-408,720-726.
@@ -469,6 +604,9 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         [2 * PLAIN, 2 * CIPHER, CIPHER],
     );
     drop(result);
+    drop(result_model);
+    assert!(old_model.bundle.idle());
+    assert!(next_model.bundle.idle());
     drop(fill);
     assert_eq!(crate::read::drivers::pending(), 0);
     drop((old_model, next_model, model_dirty, real_dirty));
@@ -479,11 +617,16 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
 
 #[test]
 fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
+    // Standalone crypto contract: a manually retained Bundle represents accepted
+    // work through reap. This does not verify Simulator's cancellation scheduling.
     let model = admission(1);
     let real = admission(1);
     let cache = CacheId(crate::security::identity::tests::CACHE.into());
     let caller = MetadataOwners::reserve(&model, &cache);
+    assert!(caller.bundle.idle());
     let completion_owner = caller.clone();
+    assert!(!caller.bundle.idle());
+    assert!(!completion_owner.bundle.idle());
     let reserved = real.reserve_fill(&cache, false).unwrap();
     let buffers = BufferPool::new(real.clone());
     let plaintext = buffers.plaintext(reserved.plaintext, 3).unwrap();
@@ -504,14 +647,21 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(work.as_mut().poll(&mut cx).is_pending());
     assert_eq!(client.outstanding(), 1);
+    assert!(!caller.bundle.idle());
+    assert!(!completion_owner.bundle.idle());
     checkpoint("accepted crypto", &model, &real, [PLAIN, CIPHER, 0]);
     scope.cancel().unwrap();
     assert!(work.as_mut().poll(&mut cx).is_pending());
+    assert!(!caller.bundle.idle());
+    assert!(!completion_owner.bundle.idle());
     drop(work);
     drop(caller);
     model.stop();
     real.stop();
     client.poll_budgeted(1).unwrap();
+    // Unique ownership is idle by Bundle's predicate, but this owner is held by
+    // the completion trace, not a worker cache eligible for reclamation.
+    assert!(completion_owner.bundle.idle());
     checkpoint(
         "canceled caller is not a fence",
         &model,
@@ -522,6 +672,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     // Failed inputs survive the engine as well, security/aead.rs:259-260;
     // abandoned completion release occurs in runtime/crypto.rs:497-518.
     engine.poll_budgeted(1).unwrap();
+    assert!(completion_owner.bundle.idle());
     checkpoint(
         "completion published but not reaped",
         &model,
@@ -530,6 +681,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     );
     assert_eq!(client.outstanding(), 1);
     client.poll_budgeted(1).unwrap();
+    assert!(completion_owner.bundle.idle());
     drop(completion_owner);
     assert_eq!(client.outstanding(), 0);
     checkpoint(
