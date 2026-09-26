@@ -310,6 +310,18 @@ type Config struct {
 	// node derives a stable delay in [0, jitter) from itself and the manifest.
 	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
 
+	// LayerSeedConcurrency caps simultaneous local layer downloads started
+	// after a manifest serve.
+	LayerSeedConcurrency int `yaml:"layer_seed_concurrency"`
+
+	// LayerSeedPeerPatience is how long a seeding node waits for a peer to
+	// advertise a layer before falling back to origin. It exists so a large
+	// rollout does not convert into one origin pull per node.
+	LayerSeedPeerPatience time.Duration `yaml:"layer_seed_peer_patience"`
+
+	// LayerSeedBudget bounds total local seeding time for one manifest.
+	LayerSeedBudget time.Duration `yaml:"layer_seed_budget"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -380,6 +392,14 @@ type Config struct {
 	// hosts.toml (mirror-only, no origin fall-through), where a shed request
 	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
+
+	// TransferMaxConcurrentRangeServes caps concurrent serves of small bounded
+	// ranges, admitted separately from full blob streams. Artifact Streaming
+	// reads OverlayBD indexes as a few KiB at a time; those reads are on the
+	// container-start critical path and cost almost no bandwidth, so they must
+	// not consume the scarce slots that TransferMaxConcurrentServes reserves
+	// for large-layer streams. Zero leaves ranges on the blob cap.
+	TransferMaxConcurrentRangeServes int `yaml:"transfer_max_concurrent_range_serves"`
 
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
@@ -547,6 +567,9 @@ func NewDefault() *Config {
 		PrefetchCoordinatorReplicas: 3,
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
+		LayerSeedConcurrency:        4,
+		LayerSeedPeerPatience:       10 * time.Minute,
+		LayerSeedBudget:             time.Hour,
 		HRWTopologyScope:            "cluster",
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
@@ -559,7 +582,10 @@ func NewDefault() *Config {
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
-		AdvertiseReconcileInterval:  time.Minute,
+		// Index reads are small and on the start path; the bound here exists
+		// only to keep goroutines and disk seeks finite, not to ration bandwidth.
+		TransferMaxConcurrentRangeServes: 512,
+		AdvertiseReconcileInterval:       time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behavior)
@@ -773,6 +799,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
 	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
 	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
+	setInt("TRANSFER_MAX_CONCURRENT_RANGE_SERVES", &c.TransferMaxConcurrentRangeServes)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
@@ -882,6 +909,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
 	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
 	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
+	fs.IntVar(&c.TransferMaxConcurrentRangeServes, "transfer-max-concurrent-range-serves", c.TransferMaxConcurrentRangeServes, "cap on concurrent small bounded-range serves, admitted separately from blob streams (0 = use the blob cap)")
 	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
@@ -1255,6 +1283,10 @@ func (c *Config) Validate() error {
 
 	if c.TransferMaxConcurrentServes < 0 {
 		errs = append(errs, fmt.Errorf("transfer_max_concurrent_serves: must be >= 0, got %d", c.TransferMaxConcurrentServes))
+	}
+
+	if c.TransferMaxConcurrentRangeServes < 0 {
+		errs = append(errs, fmt.Errorf("transfer_max_concurrent_range_serves: must be >= 0, got %d", c.TransferMaxConcurrentRangeServes))
 	}
 
 	if c.AdvertiseReconcileInterval <= 0 {
