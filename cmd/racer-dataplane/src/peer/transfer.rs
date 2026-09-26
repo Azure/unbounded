@@ -22,10 +22,17 @@ pub(crate) struct WireBuffer {
 }
 impl WireBuffer {
     pub(crate) fn new(admission: &Admission, length: usize) -> Result<Self> {
+        Self::for_cache(admission, None, length)
+    }
+    fn for_cache(
+        admission: &Admission,
+        cache: Option<&crate::model::identity::CacheId>,
+        length: usize,
+    ) -> Result<Self> {
         if length > crate::model::range::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
-        let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
+        let reservation = admission.reserve(cache, ResourceClass::Ciphertext, length)?;
         Ok(Self {
             bytes: vec![0; length].into_boxed_slice(),
             _reservation: reservation,
@@ -297,10 +304,14 @@ impl Transfers {
                     .await;
             }
             let mut connection = received.connection;
-            let (body, _staging_reservation) = if length == 0 {
+            let (body, reservation) = if length == 0 {
                 (Vec::new(), None)
             } else {
-                let mut buffer = WireBuffer::new(admission, length)?;
+                let mut buffer = WireBuffer::for_cache(
+                    admission,
+                    Some(&request.request.origin.object.cache),
+                    length,
+                )?;
                 let mut offset = 0;
                 while offset < length {
                     let completion = self
@@ -318,7 +329,9 @@ impl Transfers {
                 (bytes, Some(reservation))
             };
             scope.check()?;
-            let response = codec.response(authentication, body, scope)?;
+            // Decoding moves this allocation; transfer its charge too. Reserving
+            // it again can reject an already received page under fleet pressure.
+            let response = codec.response_reserved(authentication, body, reservation, scope)?;
             // Logical decoding must account for every body byte before pooling.
             match &response.response {
                 PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == length => {}

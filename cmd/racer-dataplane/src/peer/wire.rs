@@ -95,6 +95,17 @@ pub trait LogicalCodec {
         authentication: ForwardedHead,
         body: Vec<u8>,
         scope: &crate::runtime::deadline::RequestScope,
+    ) -> Result<SignedResponse> {
+        self.response_reserved(authentication, body, None, scope)
+    }
+    /// Move a transport allocation's existing cache-bound charge into the page.
+    /// Decoders must validate its owner, cache, class, and capacity before use.
+    fn response_reserved(
+        &self,
+        authentication: ForwardedHead,
+        body: Vec<u8>,
+        reservation: Option<crate::runtime::admission::Reservation>,
+        scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<SignedResponse>;
 }
 pub use super::decode::SecurityCodec;

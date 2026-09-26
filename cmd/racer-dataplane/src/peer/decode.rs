@@ -223,10 +223,11 @@ impl LogicalCodec for SecurityCodec {
             request,
         })
     }
-    fn response(
+    fn response_reserved(
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,
+        reservation: Option<crate::runtime::admission::Reservation>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         scope.check()?;
@@ -254,11 +255,14 @@ impl LogicalCodec for SecurityCodec {
                 {
                     return Err(Error::InvalidRequest);
                 }
-                let reservation = self.admission.reserve(
-                    Some(&metadata.version.object.cache),
-                    ResourceClass::Ciphertext,
-                    body.len(),
-                )?;
+                let reservation = match reservation {
+                    Some(reservation) => reservation,
+                    None => self.admission.reserve(
+                        Some(&metadata.version.object.cache),
+                        ResourceClass::Ciphertext,
+                        body.capacity(),
+                    )?,
+                };
                 PeerResponse::Page {
                     metadata,
                     ciphertext: self.buffers.ciphertext(reservation, envelope, body)?,

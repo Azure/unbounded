@@ -1129,6 +1129,55 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let encoded = Codec::new(64 * 1024, crate::model::range::PAGE_BYTES + 16)
         .encode_head(&WireCodec::encode(&authentication, true, body.len()).unwrap())
         .unwrap();
+    // The moved receive allocation must retain exactly one owned cache charge.
+    // Invalid supplied charges must fail closed and release their accounting.
+    let scope = request(&admission, 99).origin.scope().clone();
+    let baseline = admission.used(ResourceClass::Ciphertext);
+    for case in ["valid", "owner", "cache", "class", "size", "body"] {
+        let other = Admission::new(crate::test_support::cluster::config(false).limits);
+        let owner = if case == "owner" { &other } else { &admission };
+        let cache = CacheId(if case == "cache" { A } else { CACHE }.into());
+        let reservation = owner
+            .reserve(
+                Some(&cache),
+                if case == "class" {
+                    ResourceClass::Plaintext
+                } else {
+                    ResourceClass::Ciphertext
+                },
+                if case == "size" { 1 } else { body.len() },
+            )
+            .unwrap();
+        let result = codec(&admission).response_reserved(
+            ForwardedHead {
+                original: authentication.original.clone(),
+                hops: vec![],
+            },
+            if case == "body" {
+                vec![0; 1]
+            } else {
+                body.clone()
+            },
+            Some(reservation),
+            &scope,
+        );
+        if case == "valid" {
+            let result = result.unwrap();
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                baseline + body.len()
+            );
+            drop(result);
+        } else {
+            assert!(result.is_err(), "{case}");
+        }
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            baseline,
+            "{case}"
+        );
+        assert_eq!(other.used(ResourceClass::Ciphertext), 0, "{case}");
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
     let expected = body.clone();

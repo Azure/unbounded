@@ -115,8 +115,19 @@ impl PeerTransport for Never {
 #[test]
 #[ignore = "full eight-layer TCP integrity regression: run with --release"]
 fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
+    full_image_through_relay(false, 4);
+}
+
+#[test]
+#[ignore = "full eight-layer TCP integrity regression: run with --release"]
+fn full_image_through_relay_transfers_receive_charge() {
+    for concurrency in [1, 4] {
+        full_image_through_relay(true, concurrency);
+    }
+}
+
+fn full_image_through_relay(receive_pressure: bool, concurrency: usize) {
     const LAYERS: usize = 8;
-    const CONCURRENCY: usize = 4;
     let (signers, discovery) = identities_with_replay_capacity(4096);
     for signer in &signers {
         for peer in &signers {
@@ -157,6 +168,11 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.client_connections = NonZeroUsize::new(if i == 1 { 16 } else { 32 }).unwrap();
             limits.ciphertext_bytes = NonZeroUsize::new(512 * 1024 * 1024).unwrap();
+            if receive_pressure && i == 0 {
+                limits.ciphertext_bytes =
+                    NonZeroUsize::new((3 * concurrency + 1) * (PAGE_BYTES as usize + 16) - 1)
+                        .unwrap();
+            }
             Rc::new(Admission::new(limits))
         })
         .collect();
@@ -178,7 +194,7 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
             Rc::new(HttpPool::new(
                 reactors[i].clone(),
                 admissions[i].clone(),
-                CONCURRENCY,
+                concurrency,
             ))
         })
         .collect();
@@ -358,7 +374,7 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
             let listener = Rc::new(OwnedFd::from(listeners[i + 1].try_clone().unwrap()));
             active.push(async move {
                 let mut connections = FuturesUnordered::new();
-                for _ in 0..CONCURRENCY {
+                for _ in 0..concurrency {
                     let fd = reactor.accept(listener.clone(), scope).await?;
                     let mut connection = ConnectionLease::from_accepted(fd, admission)?;
                     connections.push(async move {
@@ -382,9 +398,11 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
         Ok::<(), Error>(())
     };
     let clients = async {
-        for batch in 0..LAYERS / CONCURRENCY {
+        for batch in 0..LAYERS / concurrency {
+            let completed: Vec<_> = (0..5).map(|_| Cell::new(0)).collect();
             let mut jobs = FuturesUnordered::new();
-            for layer in batch * CONCURRENCY..(batch + 1) * CONCURRENCY {
+            for layer in batch * concurrency..(batch + 1) * concurrency {
+                let completed = &completed;
                 let (auth, transfers, admission, scope, endpoint) = (
                     &auth[0],
                     &transfers[0],
@@ -396,7 +414,18 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
                     let mut expected = Sha256::new();
                     let mut actual = Sha256::new();
                     let mut size = 0;
-                    for number in 0..5 {
+                    let mut pressure = None;
+                    for (number, completed) in completed.iter().enumerate() {
+                        // Two other live pages leave room for the received page,
+                        // but not a second charge for its exact same allocation.
+                        // Page zero succeeds first, reproducing a late 16 MiB cut.
+                        if receive_pressure && number == 1 {
+                            pressure = Some(admission.reserve(
+                                Some(&CacheId(CACHE.into())),
+                                ResourceClass::Ciphertext,
+                                2 * (PAGE_BYTES as usize + 16),
+                            ).unwrap());
+                        }
                         let mut local = request(admission, (layer * 5 + number + 1) as u8);
                         let page = PageId {
                             version: ObjectVersion {
@@ -421,7 +450,7 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
                                 transfers
                                     .exchange(endpoint.clone(), signed, scope)
                                     .await
-                                    .unwrap(),
+                                    .unwrap_or_else(|e| panic!("layer {layer} page {number}, received {size} bytes: {e:?}")),
                                 &binding,
                             )
                             .unwrap();
@@ -447,9 +476,24 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
                         expected.update(plaintext(&page));
                         actual.update(&body);
                         size += body.len();
+                        if receive_pressure {
+                            // Hold every completed page until this concurrent
+                            // window arrives, making the peak deterministic.
+                            completed.set(completed.get() + 1);
+                            std::future::poll_fn(|cx| {
+                                scope.check()?;
+                                if completed.get() == concurrency {
+                                    std::task::Poll::Ready(Ok::<(), Error>(()))
+                                } else {
+                                    cx.waker().wake_by_ref();
+                                    std::task::Poll::Pending
+                                }
+                            }).await.unwrap();
+                        }
                     }
                     assert_eq!(size as u64, 4 * PAGE_BYTES + 17);
                     assert_eq!(actual.finalize(), expected.finalize());
+                    drop(pressure);
                 });
             }
             while jobs.next().await.is_some() {}
@@ -478,7 +522,7 @@ fn full_image_through_relay_reclaims_idle_neighbor_capacity() {
         assert_eq!(admission.used(ResourceClass::Relay), 0);
     }
     eprintln!(
-        "verified {LAYERS} full layers through two TCP links, four concurrent layers, {} bytes",
+        "verified {LAYERS} full layers through two TCP links, {concurrency} concurrent layers, {} bytes",
         LAYERS as u64 * (4 * PAGE_BYTES + 17)
     );
 }
