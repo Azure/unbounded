@@ -394,6 +394,7 @@ impl Simulator {
         active.attempts += 1;
         if active.attempts >= self.config.max_attempts {
             self.report.failed += 1;
+            self.detach_waiters(active.worker, id);
             self.release(id, active);
         } else {
             self.report.retries += 1;
@@ -416,6 +417,25 @@ impl Simulator {
             .unwrap_or(self.now)
             .max(self.now + self.config.completion_ticks);
         self.schedule(until, Event::Release(active));
+    }
+    fn detach_waiters(&mut self, w: usize, id: usize) {
+        // Registrations belong to the request; bundles and source pins belong to
+        // the flight until Fill completes, even when its last waiter detaches.
+        for flight in self.workers[w].flights.values_mut() {
+            flight.waiters.retain(|(waiter, _, _)| *waiter != id);
+        }
+        self.touched.insert(w);
+    }
+    fn terminate(&mut self, id: usize, canceled: bool) {
+        if let Some(active) = self.active.remove(&id) {
+            if canceled {
+                self.report.canceled += 1;
+            } else {
+                self.report.failed += 1;
+            }
+            self.detach_waiters(active.worker, id);
+            self.release(id, active);
+        }
     }
     fn wake_pipe(&mut self, w: usize) {
         if self.workers[w].admission.used(ResourceClass::Pipe)
@@ -657,16 +677,7 @@ impl Simulator {
                     drop((cipher, dirty));
                     self.touched.insert(w);
                 }
-                Event::Terminate(id, canceled) => {
-                    if let Some(active) = self.active.remove(&id) {
-                        if canceled {
-                            self.report.canceled += 1;
-                        } else {
-                            self.report.failed += 1;
-                        }
-                        self.release(id, active);
-                    }
-                }
+                Event::Terminate(id, canceled) => self.terminate(id, canceled),
                 Event::Release(active) => {
                     let w = active.worker;
                     let had_pipe = active.pipe.is_some();
@@ -737,3 +748,4 @@ mod fidelity;
 mod global_admission;
 mod queues;
 mod scenarios;
+mod waiter_detach;
