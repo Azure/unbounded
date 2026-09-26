@@ -158,7 +158,7 @@ impl RdmaTransfer {
             if buffer.len() != envelope.ciphertext_length as usize {
                 return Err(Error::InvalidRange);
             }
-            let bytes = buffer.to_vec()?;
+            let bytes = buffer.read(scope).await?;
             BufferPool::new(admission.clone()).ciphertext(reservation, envelope, bytes)
         })
     }

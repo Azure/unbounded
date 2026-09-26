@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, TryLockError, atomic::Ordering},
     task::{Context, Poll},
 };
 
@@ -85,6 +85,23 @@ impl Region {
             .mailbox
             .try_lock()
             .map_err(|_| Error::Overloaded)?;
+        self.copy_bytes(&mailbox)
+    }
+    pub(crate) fn poll_copy_to(&self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
+        self.lease.slot.waiter.register(cx.waker());
+        if !self.lease.slot.fenced.load(Ordering::Acquire) {
+            return Poll::Ready(Err(Error::Unavailable));
+        }
+        let mailbox = match self.lease.slot.mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            // The native role can still hold the mailbox after publishing the
+            // fence. Retry on the bounded lifecycle tick, without blocking I/O.
+            Err(TryLockError::WouldBlock) => return Poll::Pending,
+            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(Error::Io)),
+        };
+        Poll::Ready(self.copy_bytes(&mailbox))
+    }
+    fn copy_bytes(&self, mailbox: &super::lifecycle::Mailbox) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(self.length)
@@ -181,6 +198,9 @@ impl QueuePairHandle {
         Err(Error::Overloaded)
     }
     fn submit(&self, command: Command, window: Option<Rc<Window>>) -> Result<Ticket> {
+        self.try_submit(command, window)?.ok_or(Error::Overloaded)
+    }
+    fn try_submit(&self, command: Command, window: Option<Rc<Window>>) -> Result<Option<Ticket>> {
         if self.lease.slot.cancel.load(Ordering::Acquire)
             || self.lease.shared.closed.load(Ordering::Acquire)
         {
@@ -194,12 +214,11 @@ impl QueuePairHandle {
         {
             return Err(Error::Overloaded);
         }
-        let mut mailbox = self
-            .lease
-            .slot
-            .mailbox
-            .try_lock()
-            .map_err(|_| Error::Overloaded)?;
+        let mut mailbox = match self.lease.slot.mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::Io),
+        };
         if mailbox.command.is_some() {
             return Err(Error::Overloaded);
         }
@@ -212,7 +231,7 @@ impl QueuePairHandle {
         }));
         *self.pending.borrow_mut() = Some(ticket.clone());
         self.lease.shared.engine.wake();
-        Ok(ticket)
+        Ok(Some(ticket))
     }
     pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
         remote.validate()?;
@@ -254,6 +273,22 @@ impl QueuePairHandle {
             return Err(Error::Unavailable);
         }
         self.submit(Command::Invalidate, None)
+    }
+    pub(crate) fn poll_invalidate(
+        &self,
+        window: Rc<Window>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Ticket>> {
+        self.lease.slot.waiter.register(cx.waker());
+        if !self.ready() || !Rc::ptr_eq(&window._region.lease, &self.lease) {
+            return Poll::Ready(Err(Error::Unavailable));
+        }
+        match self.try_submit(Command::Invalidate, None)? {
+            // No command was accepted on contention. Keep the grant and retry
+            // on a service wake or the runtime's bounded lifecycle tick.
+            None => Poll::Pending,
+            Some(ticket) => Poll::Ready(Ok(ticket)),
+        }
     }
     pub(crate) fn write(&self, region: Rc<Region>, address: u64, key: u32) -> Result<Ticket> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {

@@ -520,6 +520,10 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
 }
 
 #[cfg(test)]
+#[path = "receive_tests.rs"]
+mod receive_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rdma::{
@@ -529,7 +533,10 @@ mod tests {
     };
     use std::task::Context;
 
-    fn provision_test(service: &mut NativeService, index: usize) -> Rc<std::cell::Cell<usize>> {
+    pub(super) fn provision_test(
+        service: &mut NativeService,
+        index: usize,
+    ) -> Rc<std::cell::Cell<usize>> {
         let (qp, region, charged) = backend::lifetime_tests::fresh_fixture();
         let device = qp.device().clone();
         let slot = &service.port.shared.slots[index];
@@ -549,14 +556,14 @@ mod tests {
         });
         charged
     }
-    fn claim(io: &Rc<IoPort>) -> Rc<QueuePairHandle> {
+    pub(super) fn claim(io: &Rc<IoPort>) -> Rc<QueuePairHandle> {
         QueuePairHandle::new(Rc::new(DeviceHandle {
             port: io.clone(),
             rail: RailId(0),
         }))
         .unwrap()
     }
-    fn mark_connected(qp: &QueuePairHandle, service: &mut NativeService) {
+    pub(super) fn mark_connected(qp: &QueuePairHandle, service: &mut NativeService) {
         qp.connect(qp.endpoint).unwrap();
         assert!(!qp.ready(), "connect is not executed on the I/O caller");
         service.poll_budgeted(8).unwrap();

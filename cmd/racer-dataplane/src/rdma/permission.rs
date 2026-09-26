@@ -206,7 +206,7 @@ impl Grant {
                 return Err(Error::Unauthorized);
             }
             self.bound.result().ok_or(Error::Unavailable)??;
-            let invalidated = self.qp.invalidate(self.window.clone())?;
+            let mut invalidated = None;
             let cancellation = scope.cancellation.subscribe()?;
             poll_fn(|cx| {
                 cancellation.register(cx.waker());
@@ -219,7 +219,14 @@ impl Grant {
                 if let Err(error) = self.qp.progress() {
                     return Poll::Ready(Err(error));
                 }
-                invalidated.poll(cx)
+                if invalidated.is_none() {
+                    match self.qp.poll_invalidate(self.window.clone(), cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Ok(ticket)) => invalidated = Some(ticket),
+                    }
+                }
+                invalidated.as_ref().unwrap().poll(cx)
             })
             .await?;
             futures::future::poll_fn(|cx| self.qp.poll_stopped(cx)).await?;

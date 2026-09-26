@@ -286,6 +286,16 @@ impl Drop for SessionLease {
     }
 }
 impl SessionLease {
+    #[cfg(test)]
+    pub(crate) fn test(qp: Rc<QueuePairHandle>, peer: NodeId) -> Self {
+        Self {
+            qp,
+            peer,
+            rail: RailId(0),
+            binding: [7; 32],
+            claimed: Cell::new(false),
+        }
+    }
     /// Connecting is genuinely asynchronous. Await this before preparing a
     /// receive grant; send_to also waits internally.
     pub fn wait_ready<'a>(

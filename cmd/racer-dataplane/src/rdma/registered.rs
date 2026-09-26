@@ -1,8 +1,8 @@
 //! Registered allocations carry their physical quota through the terminal fence.
 use super::{device::Devices, session::SessionLease, verbs::Region};
 use crate::{
-    error::{Error, Result},
-    runtime::admission::Admission,
+    error::{Error, Operation, Result},
+    runtime::{admission::Admission, deadline::RequestScope},
     topology::rails::RailId,
 };
 use std::rc::Rc;
@@ -57,6 +57,17 @@ impl RegisteredLease {
     }
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         self.region.copy_to()
+    }
+    pub(crate) fn read<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Vec<u8>> {
+        Box::pin(async move {
+            let cancellation = scope.cancellation.subscribe()?;
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                self.region.poll_copy_to(cx)
+            })
+            .await
+        })
     }
 }
 

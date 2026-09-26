@@ -52,6 +52,13 @@ The crypto role can block inside provider resource syscalls, but the I/O role
 continues socket/reactor/HTTP work. This is genuine cross-thread completion,
 not an async fn executing a syscall on its caller's thread.
 
+An admitted receive completion waits on mailbox contention while submitting local
+invalidation or copying fenced ciphertext. These waits retain the grant/buffer and
+ciphertext reservation, honor cancellation and the original deadline, and retry on
+service wakes or the bounded lifecycle tick. They do not retry quota exhaustion or
+allocation failure. A published terminal fence can precede the native role's
+mailbox unlock, so it alone does not make synchronous readback contention-free.
+
 The runtime's bounded crypto/lifecycle timer tick drives pending CQ work and
 retries failed fences. The service does not spin or spawn timer threads. Failed
 native fence retries have a 10 ms backoff on the crypto role. Slot reuse waits
