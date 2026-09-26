@@ -604,6 +604,7 @@ impl MetadataService {
                     return Err(RefreshFailure::Rejected(Error::OriginForbidden));
                 }
                 PeerResponse::VersionUnavailable => return Err(Error::VersionUnavailable.into()),
+                PeerResponse::NotFound => return Err(Error::NotFound.into()),
                 PeerResponse::Overloaded => return Err(Error::Overloaded.into()),
                 PeerResponse::Miss | PeerResponse::Unavailable => {
                     return Err(Error::Unavailable.into());

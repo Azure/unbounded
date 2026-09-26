@@ -150,20 +150,22 @@ impl CandidatePolicy {
                     )
                     .await
                 {
-                    Ok(response) => match classify(response.response(), &operation)? {
-                        None => return Ok(CandidateResolution::Copy(response)),
-                        Some(outcome) => {
-                            saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                            saw_transient |= matches!(
-                                outcome,
-                                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
-                            );
-                            evidence.push(outcome);
-                            if saw_transient {
-                                budget.note_route_failure();
+                    Ok(response) => {
+                        match classify(response.response(), &operation, rank.is_none())? {
+                            None => return Ok(CandidateResolution::Copy(response)),
+                            Some(outcome) => {
+                                saw_version |= outcome == ProbeOutcome::VersionUnavailable;
+                                saw_transient |= matches!(
+                                    outcome,
+                                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                                );
+                                evidence.push(outcome);
+                                if saw_transient {
+                                    budget.note_route_failure();
+                                }
                             }
                         }
-                    },
+                    }
                     Err(Error::Unavailable | Error::Io) => {
                         evidence.push(ProbeOutcome::Unreachable);
                         saw_transient = true;
@@ -226,7 +228,7 @@ impl CandidatePolicy {
                     )
                     .await
                 {
-                    Ok(response) => match classify(response.response(), operation)? {
+                    Ok(response) => match classify(response.response(), operation, false)? {
                         None => return Ok(Some(response)),
                         Some(ProbeOutcome::Unreachable | ProbeOutcome::Overloaded) => {
                             transient = true
@@ -357,9 +359,22 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
         },
     }
 }
-fn classify(response: &PeerResponse, operation: &PeerOperation) -> Result<Option<ProbeOutcome>> {
+// `acquire` describes the actual probe, which may be CopyOnly even when the
+// caller's operation requests acquisition (predecessors and remaining copies).
+fn classify(
+    response: &PeerResponse,
+    operation: &PeerOperation,
+    acquire: bool,
+) -> Result<Option<ProbeOutcome>> {
     match response {
         PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
+        PeerResponse::NotFound => match operation {
+            PeerOperation::Metadata {
+                selector: MetadataSelector::Fresh,
+                ..
+            } if acquire => Err(Error::NotFound),
+            _ => Err(Error::Unauthorized),
+        },
         PeerResponse::VersionUnavailable => Ok(Some(ProbeOutcome::VersionUnavailable)),
         PeerResponse::Unavailable => Ok(Some(ProbeOutcome::Unreachable)),
         PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
@@ -645,16 +660,43 @@ mod tests {
             mode: FetchMode::CopyOnly,
         };
         assert_eq!(
-            classify(&PeerResponse::OriginRejected, &operation),
+            classify(&PeerResponse::OriginRejected, &operation, false),
             Err(Error::OriginRejected)
         );
         assert_eq!(
-            classify(&PeerResponse::VersionUnavailable, &operation),
+            classify(&PeerResponse::VersionUnavailable, &operation, false),
             Ok(Some(ProbeOutcome::VersionUnavailable))
         );
         assert_eq!(
-            classify(&PeerResponse::Overloaded, &operation),
+            classify(&PeerResponse::Overloaded, &operation, false),
             Ok(Some(ProbeOutcome::Overloaded))
+        );
+    }
+    #[test]
+    fn authoritative_absence_is_terminal_only_for_actual_fresh_acquire() {
+        let mut operation = PeerOperation::Metadata {
+            object: object(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        };
+        assert_eq!(
+            classify(&PeerResponse::NotFound, &operation, true),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            classify(&PeerResponse::NotFound, &operation, false),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            classify(&PeerResponse::Miss, &operation, true),
+            Ok(Some(ProbeOutcome::CopyMiss))
+        );
+        if let PeerOperation::Metadata { selector, .. } = &mut operation {
+            *selector = MetadataSelector::Pinned(StrongEtag::test_value("old"));
+        }
+        assert_eq!(
+            classify(&PeerResponse::NotFound, &operation, true),
+            Err(Error::Unauthorized)
         );
     }
     #[test]
@@ -673,18 +715,18 @@ mod tests {
             expires_at: ExpiresAt(std::time::UNIX_EPOCH),
         };
         assert_eq!(
-            classify(&PeerResponse::Metadata(metadata.clone()), &operation),
+            classify(&PeerResponse::Metadata(metadata.clone()), &operation, false),
             Ok(None)
         );
         metadata.version.etag = StrongEtag::test_value("v2");
         assert_eq!(
-            classify(&PeerResponse::Metadata(metadata.clone()), &operation),
+            classify(&PeerResponse::Metadata(metadata.clone()), &operation, false),
             Err(Error::CorruptRecord)
         );
         metadata.version.etag = StrongEtag::test_value("v1");
         metadata.version.object.key = CacheKey([1; 32]);
         assert_eq!(
-            classify(&PeerResponse::Metadata(metadata), &operation),
+            classify(&PeerResponse::Metadata(metadata), &operation, false),
             Err(Error::CorruptRecord)
         );
     }

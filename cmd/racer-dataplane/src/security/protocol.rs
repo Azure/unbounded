@@ -363,6 +363,7 @@ pub fn response_head(
             ("metadata", 0)
         }
         PeerResponse::Miss => ("miss", 0),
+        PeerResponse::NotFound => ("not-found", 0),
         PeerResponse::VersionUnavailable => ("version-unavailable", 0),
         PeerResponse::Unavailable => ("unavailable", 0),
         PeerResponse::Overloaded => ("overloaded", 0),
@@ -371,6 +372,7 @@ pub fn response_head(
     };
     head.start = StartLine::Response {
         status: match response {
+            PeerResponse::NotFound => 404,
             PeerResponse::OriginRejected => 401,
             PeerResponse::OriginForbidden => 403,
             _ => 200,

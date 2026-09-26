@@ -433,6 +433,7 @@ fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
 }
 fn peer_error(error: Error) -> Result<PeerResponse> {
     match error {
+        Error::NotFound => Ok(PeerResponse::NotFound),
         Error::VersionUnavailable => Ok(PeerResponse::VersionUnavailable),
         Error::Overloaded => Ok(PeerResponse::Overloaded),
         Error::OriginRejected => Ok(PeerResponse::OriginRejected),
@@ -530,6 +531,10 @@ mod tests {
     }
     #[test]
     fn peer_failures_are_not_copy_misses() {
+        assert!(matches!(
+            peer_error(Error::NotFound),
+            Ok(PeerResponse::NotFound)
+        ));
         assert!(matches!(
             peer_error(Error::VersionUnavailable),
             Ok(PeerResponse::VersionUnavailable)

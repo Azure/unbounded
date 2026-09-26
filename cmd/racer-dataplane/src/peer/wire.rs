@@ -51,6 +51,8 @@ pub enum PeerResponse {
     },
     Metadata(ObjectMetadata),
     Miss,
+    /// Authoritative origin absence, only for fresh metadata Acquire.
+    NotFound,
     VersionUnavailable,
     Unavailable,
     Overloaded,

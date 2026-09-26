@@ -240,6 +240,183 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
 }
 
 #[test]
+fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
+    use crate::{http::codec::StartLine, security::protocol as p};
+    let signers = signers();
+    let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let codec = codec(&admission);
+    for role in ["fresh", "copy", "pinned", "page", "relay"] {
+        let mut local = request(&admission, 20);
+        let object = local.origin.object.clone();
+        local.operation = if role == "page" {
+            Operation::Page {
+                page: PageId {
+                    version: ObjectVersion {
+                        object,
+                        etag: StrongEtag::test_value("old"),
+                    },
+                    number: PageNumber(0),
+                },
+                mode: FetchMode::Acquire,
+            }
+        } else {
+            Operation::Metadata {
+                object,
+                selector: if role == "pinned" {
+                    MetadataSelector::Pinned(StrongEtag::test_value("old"))
+                } else {
+                    MetadataSelector::Fresh
+                },
+                mode: if role == "copy" {
+                    FetchMode::CopyOnly
+                } else {
+                    FetchMode::Acquire
+                },
+            }
+        };
+        let scope = local.origin.scope().clone();
+        let (signed, outstanding) = auth[0].sign_request_to(local, signers[1].node()).unwrap();
+        let relay = auth[1].verify_request(signed).unwrap();
+        let reverse = relay.binding().clone();
+        let mut budget = relay.request().route.clone();
+        budget.visited.push(signers[1].node().clone());
+        budget.remaining_links -= 1;
+        if role == "relay" {
+            assert!(matches!(
+                auth[1].sign_response(&reverse, PeerResponse::NotFound),
+                Err(Error::Unauthorized)
+            ));
+        }
+        let forwarded = auth[1]
+            .append_request(relay, signers[2].node(), budget)
+            .unwrap();
+        let admitted = auth[2].verify_request(forwarded).unwrap();
+        if matches!(role, "copy" | "pinned" | "page") {
+            assert!(matches!(
+                auth[2].sign_response(admitted.binding(), PeerResponse::NotFound),
+                Err(Error::Unauthorized)
+            ));
+        }
+        // Construct valid signatures directly to exercise receiver-side role
+        // enforcement independently of the signing facade's checks.
+        let signer = if role == "relay" { 1 } else { 2 };
+        let path: Vec<_> = signers[..=signer]
+            .iter()
+            .map(|s| s.node().clone())
+            .collect();
+        let mut head = p::response_head(
+            &PeerResponse::NotFound,
+            &crate::security::signing::signed_digest(&admitted.signed().authentication.original)
+                .unwrap(),
+            &path,
+        )
+        .unwrap();
+        p::push(&mut head, "racer-receiver", &signers[signer - 1].node().0);
+        let response = wire::SignedResponse {
+            authentication: crate::security::forwarding::ForwardedHead {
+                original: Arc::new(signers[signer].sign(head).unwrap()),
+                hops: vec![],
+            },
+            response: PeerResponse::NotFound,
+        };
+        if role != "fresh" {
+            let (receiver, binding) = if role == "relay" {
+                (0, &outstanding)
+            } else {
+                (1, &reverse)
+            };
+            assert!(matches!(
+                auth[receiver].verify_response(response, binding),
+                Err(Error::Unauthorized)
+            ));
+            continue;
+        }
+        assert!(matches!(
+            response.authentication.original.head.start,
+            StartLine::Response { status: 404 }
+        ));
+        let original = response.authentication.original.clone();
+        let reverse_response = auth[1]
+            .append_response(
+                auth[1].verify_response(response, &reverse).unwrap(),
+                signers[0].node(),
+            )
+            .unwrap();
+        assert_eq!(
+            reverse_response.authentication.original.signature,
+            original.signature
+        );
+        // The outer HTTP status is framing, while the inner 404 and outcome are signed.
+        let envelope = WireCodec::encode(&reverse_response.authentication, true, 0).unwrap();
+        assert!(matches!(
+            envelope.start,
+            StartLine::Response { status: 200 }
+        ));
+        let (envelope, length) = WireCodec::decode(envelope, true).unwrap();
+        assert_eq!(length, 0);
+        let decoded = codec.response(envelope, vec![], &scope).unwrap();
+        let (_, other) = auth[0]
+            .sign_request_to(request(&admission, 21), signers[1].node())
+            .unwrap();
+        assert!(auth[0].verify_response(decoded, &other).is_err());
+        assert!(matches!(
+            auth[0]
+                .verify_response(reverse_response, &outstanding)
+                .unwrap()
+                .response(),
+            PeerResponse::NotFound
+        ));
+        for (field, value) in [
+            ("status", "200"),
+            ("racer-outcome", "miss"),
+            ("racer-outcome", "unknown"),
+        ] {
+            let mut changed = crate::security::signing::tests::clone_head(&original);
+            if field == "status" {
+                changed.head.start = StartLine::Response { status: 200 };
+            } else {
+                changed
+                    .head
+                    .headers
+                    .iter_mut()
+                    .find(|h| h.name == field)
+                    .unwrap()
+                    .value = value.as_bytes().to_vec();
+            }
+            let envelope = crate::security::forwarding::ForwardedHead {
+                original: Arc::new(changed),
+                hops: vec![],
+            };
+            assert!(codec.response(envelope, vec![], &scope).is_err());
+        }
+        let mut changed = crate::security::signing::tests::clone_head(&original);
+        // A structurally valid alternate outcome/status still needs a valid signature.
+        changed.head.start = StartLine::Response { status: 200 };
+        changed
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-outcome")
+            .unwrap()
+            .value = b"miss".to_vec();
+        let envelope = crate::security::forwarding::ForwardedHead {
+            original: Arc::new(changed),
+            hops: vec![],
+        };
+        let decoded = codec.response(envelope, vec![], &scope).unwrap();
+        assert!(auth[1].verify_response(decoded, &reverse).is_err());
+        let envelope = crate::security::forwarding::ForwardedHead {
+            original,
+            hops: vec![],
+        };
+        assert!(codec.response(envelope, vec![1], &scope).is_err());
+    }
+}
+
+#[test]
 fn changed_operation_credentials_replay_and_deadlines_fail() {
     let signers = signers();
     let sender = Forwarding::new(signers[0].clone());

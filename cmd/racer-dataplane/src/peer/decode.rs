@@ -271,6 +271,7 @@ impl LogicalCodec for SecurityCodec {
                 match outcome {
                     "metadata" => PeerResponse::Metadata(metadata(head)?),
                     "miss" => PeerResponse::Miss,
+                    "not-found" => PeerResponse::NotFound,
                     "version-unavailable" => PeerResponse::VersionUnavailable,
                     "unavailable" => PeerResponse::Unavailable,
                     "overloaded" => PeerResponse::Overloaded,

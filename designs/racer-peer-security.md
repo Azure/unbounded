@@ -109,6 +109,27 @@ The outer peer transport frame remains status 200 and contains the unchanged sig
 application head; it is not the application result. Client/origin mapping preserves
 403 versus 401 and neither outcome is a peer-authentication failure.
 
+### Authoritative origin absence
+
+`PeerResponse::NotFound` serializes `racer-outcome: not-found` with signed
+application `@status` 404 and zero content length, inside the outer 200 envelope.
+It is valid only for metadata Acquire with selector Fresh, and only the requested
+destination may sign the original response. Both signing and verification enforce
+these restrictions. Relays preserve and countersign the destination's response;
+they cannot originate authoritative absence. The exact request binding and every
+reverse-hop signature cover the outcome and status as with other responses.
+
+CopyOnly cache absence remains `miss`, never `not-found`. Pinned metadata and page
+acquisition retain `version-unavailable`, including permitted alternate cached
+version probes before claiming version absence. A fresh authoritative absence is
+terminal at noncandidate ingress and maps to client 404.
+
+This is an additive outcome in the existing v1 envelope/profile/signature tag;
+existing outcomes and signature encodings are unchanged. There is no outcome
+capability negotiation. Older v1 requesters or relays reject the unknown outcome
+rather than treating it as a cache miss. Thus mixed-version paths do not guarantee
+client 404 until every requester/relay on the path understands `not-found`.
+
 ### Native setup/grant/completion security review
 
 Reviewed the live closed schema in `peer/native.rs`, the bindings in
@@ -231,7 +252,8 @@ Certificate checks must require Ed25519 digital-signature usage and client-auth 
 and reject absent/mismatched usage; bounds apply to the total chain as well as each
 certificate. The certificate leaf must not be a CA.
 
-Successful page/metadata responses must be signed by the requested destination.
+Successful page/metadata and authoritative NotFound responses must be signed by
+the requested destination.
 Relays can return request-bound unavailable/error outcomes but cannot impersonate
 the destination by choosing a self-consistent shorter response path. Response
 verification checks the outstanding request deadline before admitting a result.

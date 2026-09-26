@@ -344,6 +344,7 @@ impl PeerServer {
             };
             let response = match self.local.serve_peer(request, &scope).await {
                 Ok(response) => response,
+                Err(Error::NotFound) => PeerResponse::NotFound,
                 Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,
                 Err(Error::Overloaded) => PeerResponse::Overloaded,
                 Err(Error::Unauthorized) => PeerResponse::OriginRejected,

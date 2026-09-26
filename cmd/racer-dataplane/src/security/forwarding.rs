@@ -570,6 +570,13 @@ fn response_hop_head(
 }
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
+    if outcome == "not-found"
+        && (field(request, "racer-operation")? != "metadata"
+            || field(request, "racer-mode")? != "acquire"
+            || field(request, "racer-selector")? != "fresh")
+    {
+        return Err(Error::Unauthorized);
+    }
     if outcome != "page" && outcome != "metadata" {
         return Ok(());
     }
@@ -592,7 +599,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
     Ok(())
 }
 /// A relay may report its own failure, but only the requested destination may
-/// assert successful metadata or page data, even when a shorter path is valid.
+/// assert successful data or authoritative absence, even with a valid shorter path.
 fn response_authority(
     response: &MessageHead,
     request: &MessageHead,
@@ -600,7 +607,7 @@ fn response_authority(
 ) -> Result<()> {
     if matches!(
         field(response, "racer-outcome")?.as_str(),
-        "page" | "metadata"
+        "page" | "metadata" | "not-found"
     ) && signer != &node_field(request, "racer-route-destination")?
     {
         return Err(Error::Unauthorized);
