@@ -165,12 +165,20 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
 | `RACER_REPLAY_ENTRIES` | `4096` | 1048576 |
 | `RACER_HEADER_BYTES` | `32768` | 32768 |
-| `RACER_ROUTE_SEARCH_WORK` | `4096` | 1048576 |
+| `RACER_ROUTE_SEARCH_WORK` | `150000` | 1048576 |
 | `RACER_CACHED_RANKINGS` | `128` | 1048576 |
 | `RACER_CACHED_PATHS` | `128` | 1048576 |
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
+
+Route-search work counts edge examinations plus meeting-node comparisons, not
+just members. The default covers healthy four-link searches at 100,000 members
+and eight-link searches at 1,500 members. The former 4096 default could reject
+healthy 1,500-member routes with `Overloaded` before any peer request, leaving
+Gantry pulls failing with HTTP 503 even while local candidate reads succeeded.
+Explicit lower limits remain hard bounds; larger failure searches may need a
+higher setting. Searches still yield cooperatively and honor their deadlines.
 
 Additional progress requirements (checked here for one worker; integration must
 recheck them after partitioning and reduce the pair count if needed):

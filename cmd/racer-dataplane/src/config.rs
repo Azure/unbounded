@@ -186,7 +186,9 @@ impl Config {
             range_window_pages: limit("RACER_RANGE_WINDOW_PAGES", 2)?,
             replay_entries: limit("RACER_REPLAY_ENTRIES", 4096)?,
             header_bytes: limit("RACER_HEADER_BYTES", 32 * 1024)?,
-            route_search_work: limit("RACER_ROUTE_SEARCH_WORK", 4096)?,
+            // Counts edges plus meeting-node comparisons, not just vertices.
+            // Cover healthy four-link searches through 100,000 members.
+            route_search_work: limit("RACER_ROUTE_SEARCH_WORK", 150_000)?,
             cached_rankings: limit("RACER_CACHED_RANKINGS", 128)?,
             cached_paths: limit("RACER_CACHED_PATHS", 128)?,
             retained_snapshots: limit("RACER_RETAINED_SNAPSHOTS", 2)?,
@@ -1045,6 +1047,93 @@ mod tests {
                     _ => None,
                 }))
         })
+    }
+
+    #[test]
+    fn default_route_budget_serves_large_memberships() {
+        use crate::{
+            model::identity::{AttemptId, MembershipVersion, NodeId, RequestId},
+            runtime::deadline::Deadline,
+            topology::{
+                graph::Graph,
+                health::LinkHealth,
+                membership::{Member, Membership},
+                paths::{Paths, RouteBudget},
+            },
+        };
+        use std::{num::NonZeroU32, rc::Rc, sync::Arc, time::Instant};
+
+        let config = parse(&[]).unwrap();
+        for (count, source, destination, links) in [
+            (1500, 403, 1120, 4),
+            (1500, 403, 226, 4),
+            (1500, 403, 635, 4),
+            (1500, 546, 1120, 4),
+            (1500, 403, 635, 8),
+            (100_000, 0, 99_999, 4),
+            (100_000, 50_000, 17, 4),
+        ] {
+            let members = Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    (0..count)
+                        .map(|index| Member {
+                            node: NodeId(format!("node-{index:06}")),
+                            shares: NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: "127.0.0.1:8082".into(),
+                            rails: vec![],
+                            alignment_enabled: true,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let budget = RouteBudget {
+                membership: members.version,
+                request: RequestId([1; 16]),
+                attempt: AttemptId([2; 16]),
+                destination: members.members()[destination].node.clone(),
+                visited: vec![],
+                remaining_links: links,
+                remaining_attempts: 0,
+                deadline: Deadline(Instant::now() + Duration::from_secs(30)),
+            };
+            let paths = Paths::new(
+                Rc::new(LinkHealth),
+                1,
+                config.limits.route_search_work.get(),
+            );
+            let route = futures::executor::block_on(paths.shortest_async(
+                members.clone(),
+                &members.members()[source].node,
+                &budget,
+            ))
+            .unwrap_or_else(|error| {
+                panic!("{count} nodes, {source}->{destination}, {links} links: {error:?}")
+            });
+            assert_eq!(route.nodes.first(), Some(&members.members()[source].node));
+            assert_eq!(route.nodes.last(), Some(&budget.destination));
+            assert!(route.nodes.len() <= usize::from(links) + 1);
+            let graph = Graph::new(members.clone());
+            for pair in route.nodes.windows(2) {
+                assert!(graph.neighbors(&pair[0]).unwrap().contains(&pair[1]));
+            }
+
+            // Explicit operator limits remain hard bounds, including values too
+            // small to finish the same healthy search.
+            let limited = parse(&[("RACER_ROUTE_SEARCH_WORK", "4096")]).unwrap();
+            let paths = Paths::new(
+                Rc::new(LinkHealth),
+                1,
+                limited.limits.route_search_work.get(),
+            );
+            assert_eq!(
+                paths
+                    .shortest(members.clone(), &members.members()[source].node, &budget)
+                    .unwrap_err(),
+                Error::Overloaded
+            );
+        }
     }
 
     #[test]
