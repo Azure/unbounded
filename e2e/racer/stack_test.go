@@ -10,11 +10,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	randv2 "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -321,10 +322,16 @@ func digest(body []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(
 
 func newImage(t *testing.T) *image {
 	t.Helper()
-	// Incompressible content crosses the 16 MiB Racer page boundary on the wire.
-	payload := make([]byte, 17<<20)
-	random := rand.NewChaCha8([32]byte{42})
-	_, err := random.Read(payload)
+	// Incompressible content slides beyond the two-page acquisition window.
+	payload := make([]byte, 65<<20)
+
+	var seed [32]byte
+
+	_, err := rand.Read(seed[:])
+	require.NoError(t, err)
+
+	random := randv2.NewChaCha8(seed)
+	_, err = random.Read(payload)
 	require.NoError(t, err)
 
 	var layer bytes.Buffer
@@ -337,7 +344,7 @@ func newImage(t *testing.T) *image {
 	require.NoError(t, err)
 	require.NoError(t, archive.Close())
 	require.NoError(t, compressed.Close())
-	require.Greater(t, layer.Len(), 16<<20)
+	require.Greater(t, layer.Len(), 64<<20)
 
 	config, err := json.Marshal(map[string]any{"architecture": runtime.GOARCH, "os": "linux", "rootfs": map[string]any{"type": "layers", "diff_ids": []string{fmt.Sprintf("sha256:%x", diffHash.Sum(nil))}}})
 	require.NoError(t, err)

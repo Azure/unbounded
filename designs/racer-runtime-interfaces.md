@@ -91,6 +91,12 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
 - `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` block late
   publication. `evict_idle(bytes)` releases only idle bundles; admission pressure
   must call this from the read owner before retrying an allocation.
+- Admitted page-fill drivers wait for transient progress-memory pressure under
+  the original cancellation and acquisition deadline. Worker timer ticks retry
+  admission without self-waking or spending route credits. Disk reads share one
+  worker-local record-staging slot and consume the fill's existing ciphertext
+  output reservation on a validated hit. Staging overload after reclamation may
+  use the already-reserved authorized acquisition path.
 
 ## Verification
 
@@ -99,3 +105,24 @@ partial I/O, cancellation CQE ordering, abandonment, quota release, driver wakes
 affinity, one-CPU paired startup/drain and rollback. Memory tests cover real
 copied-splice delivery, framing, stalls, disconnects and completion-owned release.
 The host used for verification supports io_uring; those tests actually execute.
+
+### Large-layer stream-window regression
+
+Local kind validation against baseline `a168f85a7f967ac93b54089f02470c123dbed816`
+used the existing Gantry/controller images and replaced only the dataplane.
+Five-page compressed layers were approximately 68,163,250 bytes. The baseline
+returned HTTP 200 with unexpected EOF at page boundaries, including 16 MiB;
+an intermediate candidate also reproduced the reported exact 32 MiB cutoff.
+Temporary diagnostic instrumentation identified ciphertext `Overloaded` errors,
+not HTTP framing or a fixed maximum object size. The production-graph regression
+also failed in disk output admission before the fix.
+
+The final implementation passed five retained-kind runs at four concurrent
+readers and three runs at 64 concurrent readers. Each run first verified three
+sequential responses and then complete concurrent lengths and SHA-256 hashes
+through Gantry. The disk-only production regression disables origin and checks
+every byte under a 64 MiB ciphertext quota. Admission tests cover capacity release,
+cancellation, the earlier acquisition deadline, and absence of busy self-wakes.
+The all-feature release Rust suite and focused e2e Go lint passed. A separate
+fresh-kind containerd pull check stopped at its 120-second worker-join deadline,
+before Racer deployment; its partial cluster was cleaned up.

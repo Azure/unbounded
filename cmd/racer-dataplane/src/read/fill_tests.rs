@@ -301,6 +301,86 @@ impl Origin for GatedMetadataOrigin {
 }
 
 #[test]
+fn progress_pressure_waits_without_spinning_or_spending_and_honors_cancellation() {
+    use crate::test_support::WakeCounter;
+    use std::task::Waker;
+    for cancel in [false, true] {
+        let mut f = fixture();
+        let admission = f.fill.dependencies.admission.clone();
+        let held = admission
+            .reserve(
+                Some(&f.context.object.cache),
+                ResourceClass::Ciphertext,
+                admission.limit(ResourceClass::Ciphertext),
+            )
+            .unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let mut future = Box::pin(f.fill.acquire_once(
+            &f.page,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ));
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..4 {
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(count.count(), 0);
+        assert_eq!(f.origin.calls.get(), 0);
+        if cancel {
+            f.scope.cancel().unwrap();
+            assert!(count.count() > 0);
+        }
+        drop(held);
+        let result = drive(future, &mut f.engine, &f.crypto);
+        if cancel {
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(budget.remaining_attempts(), 4);
+        } else {
+            assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+            assert_eq!(f.origin.calls.get(), 1);
+            assert_eq!(budget.remaining_attempts(), 3);
+        }
+    }
+}
+
+#[test]
+fn progress_pressure_preserves_earlier_acquisition_deadline() {
+    let f = fixture();
+    let admission = &f.fill.dependencies.admission;
+    let _held = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    let due = Instant::now() + Duration::from_millis(20);
+    let mut budget = AcquisitionBudget::new(due, 4, 8);
+    let mut future = Box::pin(f.fill.acquire_once(
+        &f.page,
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::DeadlineExceeded))
+    ));
+    drop(future);
+    assert_eq!(budget.remaining_attempts(), 4);
+    assert_eq!(budget.remaining_links(), 8);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
 fn blocked_metadata_leader_and_follower_notify_without_spinning() {
     use crate::{
         model::metadata::MetadataSelector,

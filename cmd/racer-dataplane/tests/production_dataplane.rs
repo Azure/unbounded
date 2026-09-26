@@ -721,6 +721,80 @@ fn check(reply: &Reply, version: u8, start: u64, end: u64, total: u64) {
 }
 
 #[test]
+fn stream_window_under_production_ciphertext_limit() {
+    let length = 4 * P + 113;
+    let rig = Rig::with_limits(
+        length,
+        false,
+        4,
+        2,
+        Some(|limits| {
+            limits.ciphertext_bytes = nz(64 * 1024 * 1024);
+        }),
+    );
+    for _ in 0..3 {
+        check(
+            &rig.request("GET", "Range: bytes=0-16777215\r\n"),
+            1,
+            0,
+            P,
+            length,
+        );
+        check(
+            &rig.request("GET", &format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
+            1,
+            P,
+            length,
+            length,
+        );
+        rig.flush();
+        rig.memory.evict_idle(usize::MAX).unwrap();
+    }
+}
+
+#[test]
+fn disk_stream_reuses_fill_ciphertext_reservation_without_origin() {
+    let length = 4 * P + 113;
+    let rig = Rig::with_limits(
+        length,
+        false,
+        4,
+        2,
+        Some(|limits| {
+            limits.ciphertext_bytes = nz(64 * 1024 * 1024);
+        }),
+    );
+    assert_eq!(rig.request("HEAD", "").status, 200);
+    for number in 0..5 {
+        let start = number * P;
+        let end = (start + P).min(length);
+        check(
+            &rig.request(
+                "GET",
+                &format!("If-Match: \"v1\"\r\nRange: bytes={start}-{}\r\n", end - 1),
+            ),
+            1,
+            start,
+            end,
+            length,
+        );
+        rig.flush();
+        rig.memory.evict_idle(usize::MAX).unwrap();
+    }
+    assert_eq!(rig.writer.index().snapshot().unwrap().entries.len(), 5);
+    let calls = rig.adapter.calls().len();
+    rig.adapter.offline();
+    check(
+        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        1,
+        0,
+        length,
+        length,
+    );
+    assert_eq!(rig.adapter.calls().len(), calls);
+}
+
+#[test]
 fn concurrent_full_layer_streams_verify_every_byte() {
     let length = 4 * P + 113;
     let rig = Rig::with_limits(

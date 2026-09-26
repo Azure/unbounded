@@ -10,7 +10,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
     model::{identity::PageId, limits::ResourceClass},
-    runtime::{deadline::RequestScope, reactor::IoBuffer},
+    runtime::{admission::Reservation, deadline::RequestScope, reactor::IoBuffer},
 };
 use std::rc::Rc;
 pub struct StoreReader {
@@ -19,6 +19,7 @@ pub struct StoreReader {
     segments: Rc<Segments>,
     slabs: Rc<Slabs>,
     buffers: Rc<BufferPool>,
+    staging: futures::lock::Mutex<()>,
 }
 #[derive(Clone)]
 pub struct ReadToken {
@@ -45,6 +46,7 @@ impl StoreReader {
             segments,
             slabs,
             buffers,
+            staging: futures::lock::Mutex::new(()),
         }
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
@@ -55,8 +57,29 @@ impl StoreReader {
         page: &'a PageId,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
+        Box::pin(async move { self.read_reserved(page, scope, &mut None).await })
+    }
+    /// Consume a fill's output reservation only on a validated disk hit. A miss
+    /// or staging failure leaves the charge available for origin acquisition.
+    pub(crate) fn read_reserved<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        reservation: &'a mut Option<Reservation>,
+    ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         Box::pin(async move {
             scope.check()?;
+            // One record staging allocation per worker fits the range window's
+            // single-record progress margin. Waiting readers retain their own
+            // output charges, not another full aligned record.
+            let mut lock = std::pin::pin!(self.staging.lock());
+            let cancellation = scope.cancellation.subscribe()?;
+            let _staging = std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                std::future::Future::poll(lock.as_mut(), cx).map(Ok)
+            })
+            .await?;
             let entry = match self.index.lookup(page)? {
                 Some(e) => e,
                 None => return Ok(None),
@@ -117,11 +140,14 @@ impl StoreReader {
             }) {
                 return Ok(None);
             }
-            let reservation = self.slabs.reserve(
-                Some(&page.version.object.cache),
-                ResourceClass::Ciphertext,
-                decoded.ciphertext.len(),
-            )?;
+            let reservation = match reservation.take() {
+                Some(reservation) => reservation,
+                None => self.slabs.reserve(
+                    Some(&page.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    decoded.ciphertext.len(),
+                )?,
+            };
             let ciphertext = self.buffers.ciphertext(
                 reservation,
                 decoded.header.envelope,

@@ -28,7 +28,7 @@ mode with the same UID as the dataplane.
 The acceptance check is a digest-pinned containerd image pull and unpack from an
 empty content namespace. Its only registry endpoint is a recording proxy to
 Gantry; there is no direct upstream fallback. The fixture includes a compressed
-layer larger than Racer's 16 MiB page size. The test verifies:
+65 MiB incompressible layer spanning five Racer pages. The test verifies:
 
 - Racer readiness before and after the pull.
 - Complete manifest, config, and layer delivery with `Gantry-Mirrored: 1`.
@@ -50,3 +50,20 @@ deployed Rust dataplane, and Gantry's origin adapter.
   listener is starting. Each attempt retains a `forward-<port>-<attempt>.log`;
   an HTTP 200 is required within the readiness deadline.
 - The cluster is deleted by default. No existing cluster is used.
+
+For local streaming regression iteration, explicitly select a retained e2e kind
+cluster (the test rejects other context names):
+
+```sh
+RACER_E2E_KUBECONFIG=/absolute/path/to/retained/kubeconfig \
+RACER_E2E_STREAM_CONCURRENCY=64 \
+  timeout 600s go test -tags=e2e ./e2e/racer -run '^TestRetainedKindStream$' \
+  -parallel=64 -count=1 -timeout=9m -v
+```
+
+This test updates the test Gantry origin ConfigMap and restarts its DaemonSet.
+It creates a fresh five-page layer, verifies three complete sequential responses,
+then verifies full-body SHA-256 and lengths for concurrent readers (default four,
+maximum 64). It preserves the cluster and records diagnostics under `tmp/`.
+Rebuild and load the dataplane image, then replace its local pod before testing a
+new candidate; the test itself does not replace the dataplane or controller.

@@ -405,11 +405,37 @@ impl Fill {
         let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Atomically reserve progress, including dirty capacity on candidates,
         // before touching transport. Retrying a bad local copy releases this batch.
-        let mut reservation = self.reserve_progress(&context.object.cache, persist)?;
+        // An admitted driver can outlive transient pressure from other readers
+        // and submitted persistence. The worker polls drivers on its bounded
+        // timer tick, including when cross-worker page owners release charges.
+        // Do not self-wake/spin, reset the deadline, or spend acquisition credits
+        // before progress memory exists.
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut reservation = std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            if std::time::Instant::now() >= budget.deadline() {
+                return std::task::Poll::Ready(Err(Error::DeadlineExceeded));
+            }
+            match self.reserve_progress(&context.object.cache, persist) {
+                Err(Error::Overloaded) => std::task::Poll::Pending,
+                result => std::task::Poll::Ready(result),
+            }
+        })
+        .await?;
+        // A disk hit transfers this existing output charge into the decoded
+        // ciphertext. Reserving another page alongside record staging can exhaust
+        // the sliding window's progress margin even for a single reader.
+        let mut ciphertext = Some(reservation.ciphertext);
         let local = self.dependencies.writer.copy_only(page)?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
-            None => match self.dependencies.disk.read_with_token(page, scope).await {
+            None => match self
+                .dependencies
+                .disk
+                .read_reserved(page, scope, &mut ciphertext)
+                .await
+            {
                 Ok(Some((copy, token))) => (Some(copy), Some(token)),
                 Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
                     (None, None)
@@ -417,11 +443,20 @@ impl Fill {
                 Err(Error::Overloaded) => {
                     self.dependencies.writer.discard_unsubmitted();
                     self.dependencies.memory.evict_idle(usize::MAX)?;
-                    match self.dependencies.disk.read_with_token(page, scope).await {
+                    match self
+                        .dependencies
+                        .disk
+                        .read_reserved(page, scope, &mut ciphertext)
+                        .await
+                    {
                         Ok(Some((copy, token))) => (Some(copy), Some(token)),
                         Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
                             (None, None)
                         }
+                        // Disk is an optional copy. Keep the already reserved
+                        // origin progress bytes rather than failing an admitted
+                        // stream when concurrent record staging fills the quota.
+                        Err(Error::Overloaded) => (None, None),
                         Err(error) => return Err(error),
                     }
                 }
@@ -438,9 +473,10 @@ impl Fill {
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
                     }
-                    drop(reservation.ciphertext);
+                    drop(ciphertext.take());
                     drop(reservation.dirty);
                     reservation = self.reserve_progress(&context.object.cache, persist)?;
+                    ciphertext = Some(reservation.ciphertext);
                 }
                 Err(error) => return Err(error),
             }
@@ -495,7 +531,7 @@ impl Fill {
                             .encrypt(
                                 page.clone(),
                                 origin.plaintext,
-                                reservation.ciphertext,
+                                ciphertext.take().ok_or(Error::Internal)?,
                                 scope,
                             )
                             .await?;
