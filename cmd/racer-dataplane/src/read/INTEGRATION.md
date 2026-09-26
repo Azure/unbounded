@@ -32,9 +32,12 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
 - Signed initial requests carry `visited=[local]`. `peer::search_budget` removes
   that local sender before topology search; topology and signing intentionally
   consume different representations. Never send an empty signed visited list.
-- Ingress allocates one aggregate allowance: 32 attempts and 96 forwarded links.
+- Client ingress allocates 32 attempts and 96 forwarded links for metadata or
+  bootstrap. A normal pinned client range admits each distinct page once with
+  eight attempts and sixteen aggregate links, under the original request deadline
+  and bounded sliding window. Successful pages do not exhaust a range-wide total.
   Four is the normal per-route ceiling; observed failure permits up to eight from
-  the already allocated allowance. This changes a ceiling, not remaining credits.
+  that acquisition's allocated allowance. This changes a ceiling, not credits.
 - `RouteBudget.remaining_attempts` is signed, decoded, and preserved by forwarding.
   CandidatePolicy removes a remote Acquire allowance from the original budget
   before submission. CopyOnly carries zero acquisition credits. Failed/unknown
@@ -42,10 +45,13 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
   implemented, so unused remote allowance is conservatively spent.
 - Destination Coordinator uses the signed attempt allowance and deducts the final
   incoming link exactly once. It never creates a new default allowance.
-- Metadata, bootstrap, owned drivers, worker handoffs, and range fanout transfer or
-  partition the original budget. Sliding-window children receive at most eight
-  attempts and sixteen aggregate links; completed local children return only their
-  remaining owned credits. Failure mode and the tighter deadline survive handoff.
+- Metadata, bootstrap, owned drivers, worker handoffs, retries, and peer fanout
+  transfer or partition their acquisition's original budget. No same-page retry
+  or remote Acquire receives a fresh allowance. Bootstrap delivers its seeded page
+  without reacquisition. Explicit `read_with_budget`/`open_with_budget` callers
+  retain an aggregate range ceiling: children receive at most eight attempts and
+  sixteen links and return only unused owned credits. Failure mode and the tighter
+  deadline survive handoff.
 - `PeerResponse::OriginForbidden` is separate from OriginRejected, including signed
   outcome encoding and read mapping. Both fail only the credential supplier;
   Unauthorized remains a terminal peer authentication failure.

@@ -115,6 +115,12 @@ SDK validation also rejects an apparently successful callback with a mismatched
 ETag as 502. Dataplane client ranges are split into whole-page origin fetches by
 the dataplane, not by the Go client.
 
+Pinned client ranges have no successful-page-count limit. The dataplane bounds
+acquisition attempts and forwarded links per page, and keeps a bounded page
+window under the original request deadline. Progress to a distinct page gets a
+new page allowance; retries and peer forwarding within that page do not. Deadline,
+overload, or acquisition failure can still terminate a stream after headers.
+
 Fresh HEAD/bootstrap missing objects return 404. A valid pin whose version no
 longer exists (including object deletion) returns 412. Credential rejection remains
 401/403, and transient failures remain 503, not 412. Resolve version before range

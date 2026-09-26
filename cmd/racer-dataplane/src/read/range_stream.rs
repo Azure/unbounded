@@ -24,7 +24,41 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
+
+/// Only client range progress creates a new allowance. An explicit aggregate
+/// budget is conserved across pages, just like budgets passed to peer acquisition.
+enum RangeBudget {
+    ClientPages { deadline: Instant },
+    Shared(AcquisitionBudget),
+}
+impl RangeBudget {
+    fn next_page(&mut self, pending: bool) -> Result<Option<AcquisitionBudget>> {
+        match self {
+            Self::ClientPages { deadline } => {
+                if Instant::now() >= *deadline {
+                    return Err(Error::DeadlineExceeded);
+                }
+                Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
+            }
+            Self::Shared(budget) => {
+                let attempts = budget.remaining_attempts().min(8);
+                let links = budget.remaining_links().min(16);
+                if pending && (attempts == 0 || links < 4) {
+                    return Ok(None);
+                }
+                budget.partition(attempts, links).map(Some)
+            }
+        }
+    }
+    fn complete(&mut self, remaining: AcquisitionBudget) -> Result<()> {
+        match self {
+            Self::ClientPages { .. } => Ok(()),
+            Self::Shared(budget) => budget.reunite(remaining),
+        }
+    }
+}
 
 enum WindowPage {
     Waiting(Operation<'static, (Result<PageResult>, AcquisitionBudget)>),
@@ -54,7 +88,7 @@ pub struct RangeStream {
     directory: Arc<WorkerDirectory>,
     delivery: Rc<Delivery>,
     window_pages: usize,
-    budget: AcquisitionBudget,
+    budget: RangeBudget,
     next_page: Option<PageNumber>,
     ready: VecDeque<(PageNumber, WindowPage)>,
     terminated: bool,
@@ -91,6 +125,8 @@ impl RangeStreams {
     pub fn directory(&self) -> &Arc<WorkerDirectory> {
         &self.directory
     }
+    /// Open a client range with a bounded allowance for each distinct page and
+    /// the original request deadline. Use open_with_budget for an aggregate cap.
     pub fn open(
         &self,
         metadata: ObjectMetadata,
@@ -99,8 +135,10 @@ impl RangeStreams {
         membership: MembershipLease,
         scope: RequestScope,
     ) -> Result<RangeStream> {
-        let budget = super::serve::default_budget(&scope);
-        self.open_with_budget(metadata, range, context, membership, scope, budget, None)
+        let budget = RangeBudget::ClientPages {
+            deadline: scope.deadline.0,
+        };
+        self.open_budget(metadata, range, context, membership, scope, budget, None)
     }
     /// Bootstrap supplies its already acquired page zero. The same original
     /// budget then belongs to the stream, with no retry/fanout reset.
@@ -113,6 +151,27 @@ impl RangeStreams {
         membership: MembershipLease,
         scope: RequestScope,
         budget: AcquisitionBudget,
+        seed: Option<PageResult>,
+    ) -> Result<RangeStream> {
+        self.open_budget(
+            metadata,
+            range,
+            context,
+            membership,
+            scope,
+            RangeBudget::Shared(budget),
+            seed,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn open_budget(
+        &self,
+        metadata: ObjectMetadata,
+        range: ResolvedRange,
+        context: OriginContext,
+        membership: MembershipLease,
+        scope: RequestScope,
+        budget: RangeBudget,
         seed: Option<PageResult>,
     ) -> Result<RangeStream> {
         scope.check()?;
@@ -159,8 +218,10 @@ impl RangeStream {
     fn advance(&mut self, page: PageNumber) {
         self.next_page = (page != self.range.last_page()).then(|| PageNumber(page.0 + 1));
     }
-    /// Partition the original credits across a bounded sliding window. Pending
-    /// futures live in the stream, so dropping next_slice cannot restart a page.
+    /// Admit each distinct page once into a bounded sliding window. Client page
+    /// progress gets its own allowance under the original deadline; explicit
+    /// aggregate budgets partition credits. Pending futures live in the stream,
+    /// so dropping next_slice cannot restart a page or refill its retries.
     pub fn next_slice(&mut self) -> Operation<'_, Option<ReaderLease>> {
         Box::pin(async move {
             if self.terminated {
@@ -175,24 +236,19 @@ impl RangeStream {
                 let Some(number) = self.next_page else {
                     break;
                 };
-                if self.budget.remaining_attempts() == 0 && !self.ready.is_empty() {
-                    break;
-                }
                 let page = PageId {
                     version: self.metadata.version.clone(),
                     number,
                 };
-                // Keep enough credit in each admitted page for the full candidate
-                // chain. Smaller concurrency is preferable to splitting a route
-                // below its four-link normal allowance. Credits are still bounded
-                // by the one ingress budget, not replenished as the window slides.
-                let remaining = self.range.last_page().0 - number.0 + 1;
-                let attempts = self.budget.remaining_attempts().min(8);
-                let links = self.budget.remaining_links().min(16);
-                if !self.ready.is_empty() && remaining > 0 && (attempts == 0 || links < 4) {
-                    break;
-                }
-                let child = self.budget.partition(attempts, links)?;
+                let child = match self.budget.next_page(!self.ready.is_empty()) {
+                    Ok(Some(child)) => child,
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.terminated = true;
+                        self.ready.clear();
+                        return Err(error);
+                    }
+                };
                 let result = self.directory.start_page(
                     page,
                     self.membership.clone(),
@@ -255,14 +311,14 @@ impl RangeStream {
 }
 fn poll_window(
     window: &mut VecDeque<(PageNumber, WindowPage)>,
-    budget: &mut AcquisitionBudget,
+    budget: &mut RangeBudget,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
     for (_, entry) in window.iter_mut() {
         if let WindowPage::Waiting(future) = entry {
             if let Poll::Ready(completion) = future.as_mut().poll(cx) {
                 let result = match completion {
-                    Ok((result, remaining)) => return_credits(budget, remaining).and(result),
+                    Ok((result, remaining)) => budget.complete(remaining).and(result),
                     Err(error) => Err(error),
                 };
                 *entry = WindowPage::Ready(result);
@@ -277,9 +333,6 @@ fn poll_window(
     } else {
         Poll::Pending
     }
-}
-fn return_credits(budget: &mut AcquisitionBudget, remaining: AcquisitionBudget) -> Result<()> {
-    budget.reunite(remaining)
 }
 impl Drop for RangeStream {
     fn drop(&mut self) {
@@ -308,6 +361,180 @@ mod tests {
         metadata::ExpiresAt,
         range::{ByteRange, PAGE_BYTES},
     };
+    fn remaining_credits(budget: &RangeBudget) -> (u32, u8) {
+        let RangeBudget::Shared(budget) = budget else {
+            panic!("expected aggregate budget")
+        };
+        (budget.remaining_attempts(), budget.remaining_links())
+    }
+    #[test]
+    fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut budget = RangeBudget::ClientPages { deadline };
+        // Model a healthy remote page that spends a four-link route and transfers
+        // acquisition credits to its destination. Neither spend can accumulate
+        // into a range-length limit, and unused credits cannot grow later pages.
+        for _ in 0..100 {
+            let mut page = budget.next_page(false).unwrap().unwrap();
+            assert_eq!(page.remaining_attempts(), 8);
+            assert_eq!(page.remaining_links(), 16);
+            assert_eq!(page.begin_attempt(Instant::now(), deadline), Ok(deadline));
+            page.charge_links(4).unwrap();
+            let mut remote = page.partition(4, 4).unwrap();
+            for _ in 0..4 {
+                remote.begin_attempt(Instant::now(), deadline).unwrap();
+            }
+            assert_eq!(
+                remote.begin_attempt(Instant::now(), deadline),
+                Err(Error::Unavailable)
+            );
+            budget.complete(page).unwrap();
+        }
+        let mut page = budget.next_page(false).unwrap().unwrap();
+        for _ in 0..8 {
+            page.begin_attempt(Instant::now(), deadline).unwrap();
+        }
+        assert_eq!(
+            page.begin_attempt(Instant::now(), deadline),
+            Err(Error::Unavailable)
+        );
+        page.charge_links(16).unwrap();
+        assert_eq!(page.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            page.begin_attempt(deadline, deadline),
+            Err(Error::DeadlineExceeded)
+        );
+        let mut expired = RangeBudget::ClientPages {
+            deadline: Instant::now(),
+        };
+        assert!(matches!(
+            expired.next_page(false),
+            Err(Error::DeadlineExceeded)
+        ));
+    }
+    #[test]
+    fn explicit_aggregate_range_budget_never_refills_spent_pages() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut budget = RangeBudget::Shared(AcquisitionBudget::new(deadline, 2, 4));
+        let mut page = budget.next_page(false).unwrap().unwrap();
+        assert!(budget.next_page(true).unwrap().is_none());
+        page.begin_attempt(Instant::now(), deadline).unwrap();
+        page.begin_attempt(Instant::now(), deadline).unwrap();
+        page.charge_links(4).unwrap();
+        budget.complete(page).unwrap();
+        let mut next = budget.next_page(false).unwrap().unwrap();
+        assert_eq!(next.deadline(), deadline);
+        assert_eq!(
+            next.begin_attempt(Instant::now(), deadline),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(next.charge_links(1), Err(Error::HopBudgetExhausted));
+    }
+    #[test]
+    fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
+        use crate::{
+            memory::pipe::PipePool,
+            model::identity::{MembershipVersion, RequestId, WorkerId},
+            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+            topology::membership::Membership,
+        };
+        use std::{cell::Cell, time::Duration};
+        for expire in [false, true] {
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let streams = RangeStreams::from_directory(
+                Arc::new(
+                    WorkerDirectory::new(
+                        Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                        vec![WorkerId(0)],
+                        2,
+                    )
+                    .unwrap(),
+                ),
+                Rc::new(Delivery::new(
+                    Rc::new(PipePool::new(admission, reactor)),
+                    Duration::from_secs(30),
+                )),
+                2,
+            );
+            let mut metadata = metadata();
+            metadata.length = 100 * PAGE_BYTES;
+            let scope =
+                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+            let mut stream = streams
+                .open(
+                    metadata.clone(),
+                    ByteRange::From(0).resolve(metadata.length).unwrap(),
+                    OriginContext {
+                        object: metadata.version.object,
+                        metadata: None,
+                        authorization: None,
+                    },
+                    Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
+                    scope.clone(),
+                )
+                .unwrap();
+            let attempts = Rc::new(Cell::new(0));
+            let gate = Rc::new(Cell::new(false));
+            // Script both admitted acquisitions, avoiding full-page allocation.
+            // A full pending window must prevent admission of page two onward.
+            for number in 0..2 {
+                let mut budget = stream.budget.next_page(number != 0).unwrap().unwrap();
+                let attempts = attempts.clone();
+                let gate = gate.clone();
+                stream.ready.push_back((
+                    PageNumber(number),
+                    WindowPage::Waiting(Box::pin(async move {
+                        for _ in 0..8 {
+                            budget.begin_attempt(Instant::now(), budget.deadline())?;
+                            attempts.set(attempts.get() + 1);
+                        }
+                        poll_fn(|_| {
+                            if gate.get() {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        let result = budget
+                            .begin_attempt(Instant::now(), budget.deadline())
+                            .map(|_| unreachable!("same page received fresh retry credits"));
+                        Ok((result, budget))
+                    })),
+                ));
+                stream.advance(PageNumber(number));
+            }
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..10 {
+                // Each temporary next_slice future is dropped while pending.
+                assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+                assert_eq!(attempts.get(), 16);
+                assert_eq!(stream.buffered_pages(), 2);
+                assert_eq!(stream.next_page, Some(PageNumber(2)));
+            }
+            let expected = if expire {
+                stream.scope.deadline.0 = Instant::now();
+                Error::DeadlineExceeded
+            } else {
+                gate.set(true);
+                Error::Unavailable
+            };
+            assert!(matches!(
+                stream.next_slice().as_mut().poll(&mut cx),
+                Poll::Ready(Err(error)) if error == expected
+            ));
+            assert_eq!(attempts.get(), 16);
+            assert_eq!(stream.buffered_pages(), 0);
+            assert!(matches!(
+                stream.next_slice().as_mut().poll(&mut cx),
+                Poll::Ready(Ok(None))
+            ));
+        }
+    }
     fn metadata() -> ObjectMetadata {
         ObjectMetadata {
             version: ObjectVersion {
@@ -350,6 +577,7 @@ mod tests {
             Ok((Err(Error::VersionUnavailable), first_budget))
         });
         let last = Box::pin(async move { Ok((Err(Error::Unavailable), last_budget)) });
+        let mut budget = RangeBudget::Shared(budget);
         let mut window = VecDeque::from([
             (PageNumber(0), WindowPage::Waiting(first)),
             (PageNumber(1), WindowPage::Waiting(last)),
@@ -361,16 +589,10 @@ mod tests {
             window[1].1,
             WindowPage::Ready(Err(Error::Unavailable))
         ));
-        assert_eq!(
-            (budget.remaining_attempts(), budget.remaining_links()),
-            (2, 1)
-        );
+        assert_eq!(remaining_credits(&budget), (2, 1));
         // Re-polling a completed page must not return its credits twice.
         assert!(poll_window(&mut window, &mut budget, &mut cx).is_pending());
-        assert_eq!(
-            (budget.remaining_attempts(), budget.remaining_links()),
-            (2, 1)
-        );
+        assert_eq!(remaining_credits(&budget), (2, 1));
         gate.set(true);
         assert!(poll_window(&mut window, &mut budget, &mut cx).is_ready());
         assert!(matches!(
@@ -380,6 +602,9 @@ mod tests {
                 WindowPage::Ready(Err(Error::VersionUnavailable))
             ))
         ));
+        let RangeBudget::Shared(budget) = budget else {
+            unreachable!()
+        };
         assert_eq!(
             (
                 budget.remaining_attempts(),
@@ -401,6 +626,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut budget = AcquisitionBudget::new(deadline, 3, 4);
         let child = budget.partition(3, 4).unwrap();
+        let mut budget = RangeBudget::Shared(budget);
         let dropped = Rc::new(std::cell::Cell::new(false));
         let guard = Dropped(dropped.clone());
         let future = Box::pin(async move {
@@ -415,10 +641,7 @@ mod tests {
         );
         window.clear();
         assert!(dropped.get());
-        assert_eq!(
-            (budget.remaining_attempts(), budget.remaining_links()),
-            (0, 0)
-        );
+        assert_eq!(remaining_credits(&budget), (0, 0));
     }
     #[test]
     fn stream_pin_rejects_version_or_length_changes_but_not_expiration() {
@@ -574,7 +797,7 @@ mod tests {
                 directory,
                 delivery: delivery.clone(),
                 window_pages: 4,
-                budget: AcquisitionBudget::new(scope.deadline.0, 0, 0),
+                budget: RangeBudget::Shared(AcquisitionBudget::new(scope.deadline.0, 0, 0)),
                 next_page: None,
                 ready,
                 terminated: false,

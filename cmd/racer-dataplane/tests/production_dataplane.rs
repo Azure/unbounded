@@ -910,6 +910,45 @@ fn expired_nonzero_metadata_keeps_old_version_length_and_disk_bytes() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "35 real crypto pages; run with --release")]
+fn cold_pinned_range_exceeds_32_pages_under_bounded_memory() {
+    let length = 34 * P + 113;
+    let rig = Rig::with_dirty_pages(length, false, 4, 2);
+    let head = rig.request("HEAD", "");
+    assert_eq!(head.status, 200);
+    assert_eq!(head.fields["etag"], "\"v1\"");
+    assert_eq!(head.fields["content-length"], length.to_string());
+    check(
+        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        1,
+        0,
+        length,
+        length,
+    );
+    let calls = rig.adapter.calls();
+    assert_eq!(calls.len(), 36);
+    assert_eq!(calls[0].method, "HEAD");
+    for call in &calls[1..] {
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.pin.as_deref(), Some("\"v1\""));
+    }
+    // Window acquisitions may reach the origin out of order. Compare the exact
+    // multiset to catch missing pages or retries without imposing arrival order.
+    let mut actual: Vec<_> = calls[1..]
+        .iter()
+        .map(|call| call.range.clone().unwrap())
+        .collect();
+    let mut expected: Vec<_> = (0..35)
+        .map(|number| format!("bytes={}-{}", number * P, (number + 1) * P - 1))
+        .collect();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    rig.flush();
+    assert!(rig.admission.used(ResourceClass::Plaintext) <= 4 * P as usize);
+}
+
+#[test]
 fn dirty_drain_and_byte_pressure_keep_long_range_progressing() {
     let length = 7 * P + 113;
     let rig = Rig::with_dirty_pages(length, false, 4, 2);

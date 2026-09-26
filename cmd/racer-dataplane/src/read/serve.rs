@@ -45,6 +45,8 @@ pub struct Coordinator {
     streams: Rc<RangeStreams>,
     credentials: Rc<CredentialCrypto>,
 }
+// Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
+// acquisitions separately; this is not a ceiling on successful pages delivered.
 pub(crate) fn default_budget(scope: &RequestScope) -> AcquisitionBudget {
     AcquisitionBudget::new(scope.deadline.0, 32, 96)
 }
@@ -146,7 +148,16 @@ impl Coordinator {
         &'a self,
         request: ClientRequest,
         scope: &'a RequestScope,
+        budget: AcquisitionBudget,
+    ) -> Operation<'a, ReadResponse> {
+        self.read_budgeted(request, scope, budget, false)
+    }
+    fn read_budgeted<'a>(
+        &'a self,
+        request: ClientRequest,
+        scope: &'a RequestScope,
         mut budget: AcquisitionBudget,
+        client_pages: bool,
     ) -> Operation<'a, ReadResponse> {
         Box::pin(async move {
             scope.check()?;
@@ -241,15 +252,25 @@ impl Coordinator {
                         .await?;
                     validate_metadata(&metadata, &origin.object, &selector)?;
                     let range = resolve_range(range, metadata.length)?;
-                    let body = self.streams.open_with_budget(
-                        metadata.clone(),
-                        range,
-                        origin,
-                        membership,
-                        scope.clone(),
-                        budget,
-                        None,
-                    )?;
+                    let body = if client_pages {
+                        self.streams.open(
+                            metadata.clone(),
+                            range,
+                            origin,
+                            membership,
+                            scope.clone(),
+                        )?
+                    } else {
+                        self.streams.open_with_budget(
+                            metadata.clone(),
+                            range,
+                            origin,
+                            membership,
+                            scope.clone(),
+                            budget,
+                            None,
+                        )?
+                    };
                     Ok(ReadResponse {
                         metadata,
                         range: Some(range),
@@ -266,7 +287,7 @@ impl ReadService for Coordinator {
         request: ClientRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, ReadResponse> {
-        self.read_with_budget(request, scope, default_budget(scope))
+        self.read_budgeted(request, scope, default_budget(scope), true)
     }
 }
 impl LocalPageService for Coordinator {

@@ -133,8 +133,10 @@ impl FlightOperation {
     }
 }
 
-/// Original logical-call budget, lent exclusively to one page acquisition at a
-/// time. Retry never reconstructs it from defaults. Fanout must partition credits;
+/// Original acquisition budget, owned by one metadata/bootstrap operation or
+/// page acquisition. Client range progress admits distinct pages with separate
+/// bounded allowances under the same deadline. Retry never reconstructs an
+/// acquisition budget from defaults. Fanout must partition credits;
 /// route attempts must charge actual forwarded links here as well as on the wire.
 /// No Clone: a replacement caller uses its own remaining credits, not fresh ones.
 /// ```compile_fail
