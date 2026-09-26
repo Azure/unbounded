@@ -83,6 +83,9 @@ const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";
 const TIMEOUT: Duration = Duration::from_secs(40);
 
+#[path = "hotpath/bench.rs"]
+mod hotpath;
+
 fn scope() -> RequestScope {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let mut id = [0; 16];
@@ -124,14 +127,15 @@ struct Scratch {
 }
 impl Scratch {
     fn new() -> Self {
+        Self::under(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+    }
+    fn under(root: &std::path::Path) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "production-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let path = root.join(format!(
+            "production-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         let directory = fs::File::open(&path).unwrap();
         Self { path, directory }
@@ -157,6 +161,7 @@ struct OriginRequest {
     range: Option<String>,
 }
 struct OriginState {
+    benchmark_keys: bool,
     version: u8,
     length: u64,
     zero_ttl: bool,
@@ -175,6 +180,7 @@ impl Adapter {
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let state = Arc::new(Mutex::new(OriginState {
+            benchmark_keys: false,
             version: 1,
             length,
             zero_ttl,
@@ -272,7 +278,14 @@ fn adapter_connection(
         };
         let f = fields(&head);
         let method = head.split_whitespace().next().unwrap();
-        assert!(head.contains(&format!("/v1/objects/{} HTTP/1.1", "ab".repeat(32))));
+        if state.lock().unwrap().benchmark_keys {
+            let target = head.split_whitespace().nth(1).unwrap();
+            let key = target.strip_prefix("/v1/objects/").unwrap();
+            assert_eq!(key.len(), 64);
+            assert!(key.bytes().all(|c| c.is_ascii_hexdigit()));
+        } else {
+            assert!(head.contains(&format!("/v1/objects/{} HTTP/1.1", "ab".repeat(32))));
+        }
         assert_eq!(
             f.get("authorization").map(String::as_str),
             Some("fixture-credential")
@@ -353,7 +366,7 @@ struct Rig {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
-    engine: RefCell<PageCryptoEngine>,
+    engine: Option<RefCell<PageCryptoEngine>>,
     endpoint: RefCell<WorkerEndpoint>,
     flights: Rc<Flights>,
     writer: Rc<StoreWriter>,
@@ -370,15 +383,36 @@ impl Rig {
         Self::with_dirty_pages(length, zero_ttl, pages, pages)
     }
     fn with_dirty_pages(length: u64, zero_ttl: bool, pages: usize, dirty_pages: usize) -> Self {
-        let scratch = Scratch::new();
+        Self::assemble(length, zero_ttl, pages, dirty_pages, None)
+    }
+    fn assemble(
+        length: u64,
+        zero_ttl: bool,
+        pages: usize,
+        dirty_pages: usize,
+        benchmark: Option<(Scratch, racer_dataplane::runtime::worker::WorkerRuntime)>,
+    ) -> Self {
+        let benchmarking = benchmark.is_some();
+        let (scratch, runtime) = match benchmark {
+            Some((scratch, runtime)) => (scratch, Some(runtime)),
+            None => (Scratch::new(), None),
+        };
         fs::create_dir_all(scratch.path.join("production-fixture/origin")).unwrap();
         let origin_path = scratch.socket("production-fixture/origin/socket");
         assert!(origin_path.as_os_str().len() <= 107);
         let adapter = Adapter::start(&origin_path, length, zero_ttl);
+        adapter.state.lock().unwrap().benchmark_keys = benchmarking;
         let mut budget = limits(pages);
         budget.dirty_bytes = nz(dirty_pages * (P as usize + 16));
-        let admission = Rc::new(Admission::new(budget));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let (admission, reactor) = match &runtime {
+            Some(runtime) => (runtime.admission.clone(), runtime.reactor.clone()),
+            None => {
+                let admission = Rc::new(Admission::new(budget));
+                let reactor = Rc::new(Reactor::new(admission.clone()));
+                (admission, reactor)
+            }
+        };
+        let entries = if benchmarking { 512 } else { 64 };
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             Codec::new(32768, P + 16),
@@ -387,13 +421,17 @@ impl Rig {
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
-        let index = Rc::new(Index::new(WorkerId(0), 64));
+        let index = Rc::new(Index::new(WorkerId(0), entries));
         let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
         let slabs = Rc::new(Slabs::new(
             WorkerId(0),
             scratch.path.join("slabs"),
             reactor.clone(),
-            512 * 1024 * 1024,
+            if benchmarking {
+                3 * 1024 * 1024 * 1024
+            } else {
+                512 * 1024 * 1024
+            },
             64 * 1024 * 1024,
         ));
         let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
@@ -406,7 +444,7 @@ impl Rig {
         ));
         let writer = Rc::new(StoreWriter::new(index.clone(), segments, slabs));
         writer
-            .configure(admission.clone(), eviction, 64, 64)
+            .configure(admission.clone(), eviction, 64, entries)
             .unwrap();
         futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
         let keys = Rc::new(Keyring::new(
@@ -495,8 +533,18 @@ impl Rig {
             snapshot.caches[0].origin_socket,
             PathBuf::from("/run/racer/production-fixture/origin/socket")
         );
-        let (port, engine) = crypto::pair(WorkerId(0), 0, nz(64));
-        let crypto = Rc::new(CryptoClient::new(port));
+        let (crypto, engine) = match runtime {
+            Some(runtime) => (runtime.crypto, None),
+            None => {
+                let (port, engine) = crypto::pair(WorkerId(0), 0, nz(64));
+                (
+                    Rc::new(CryptoClient::new(port)),
+                    Some(RefCell::new(PageCryptoEngine::new(CryptoRuntime {
+                        port: engine,
+                    }))),
+                )
+            }
+        };
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let directory = Arc::new(
             WorkerDirectory::new(
@@ -526,7 +574,7 @@ impl Rig {
             origin,
             peers,
             credentials.clone(),
-            64,
+            entries,
             MetadataDependencies {
                 index,
                 fill: fill.clone(),
@@ -561,7 +609,7 @@ impl Rig {
             admission,
             reactor,
             crypto,
-            engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime { port: engine })),
+            engine,
             endpoint,
             flights,
             writer,
@@ -577,7 +625,9 @@ impl Rig {
     fn tick(&self) {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
-        self.engine.borrow_mut().poll_budgeted(64).unwrap();
+        if let Some(engine) = &self.engine {
+            engine.borrow_mut().poll_budgeted(64).unwrap();
+        }
         self.crypto.poll_budgeted(64).unwrap();
         self.endpoint.borrow_mut().poll(&mut cx, 64).unwrap();
         self.flights.poll_with_context(&mut cx, 64).unwrap();

@@ -180,3 +180,62 @@ tests does not establish deployment interoperability or hardware DMA guarantees;
 run the combined suite and applicable native-provider tests for a release.
 `designs/racer-production-validation.md` records real multi-page streaming,
 zero-TTL, cancellation, disk-hit, and memory-pressure validation.
+
+## Hotpath bottleneck benchmark
+
+This ignored, release-only test reuses the production-component fixture with one
+real pinned I/O/crypto worker pair, io_uring, HTTP over Unix socket pairs, and
+encrypted O_DIRECT slabs. It runs 1, 32, and 128 concurrent readers sequentially:
+
+- `memory`: repeated reads of one warmed 16 MiB page.
+- `disk`: 128 distinct persisted pages per sweep, evicting plaintext between
+  sweeps. Origin is offline, so a memory/origin fallback cannot mask disk work.
+- `fill`: 128 distinct cold pages from the streaming fixture origin, including
+  encryption and asynchronous persistence.
+
+Memory and disk each run four sweeps; fill runs one. Each client issues one request
+at a time. This is a bounded, closed-loop saturation probe of one worker pair,
+not a full-node capacity estimate. Socket creation replaces listener acceptance;
+cross-worker routing and peer transports are outside this fixture. The disk case
+measures software overhead on RAM-backed ext4, not physical-storage performance.
+Fill timings also include the fixture origin's byte generation and streaming.
+
+```sh
+sudo -v
+cargo test --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+  --test production_dataplane hotpath::hotpath -- \
+  --ignored --exact --nocapture --test-threads=1
+```
+
+Requires Linux with io_uring, loadable `brd`, ext4 tools, and working `sudo -n`.
+The test owns a 4 GiB RAM block device, formats/mounts it under the crate's
+`target/`, and unmounts/unloads it on success or panic. It refuses an already
+loaded `brd` module. Abrupt process termination cannot run Rust teardown.
+`RACER_BENCH_FAIL_SETUP=1` deliberately panics after mounting to check cleanup.
+It requires at least 16 GiB available host memory and checks visible cgroup-v2
+limits. Per-worker budgets are fixed: 256 MiB plaintext, 512 MiB ciphertext,
+128 MiB dirty data, and 16 delivery pipes. Clients stream into 64 KiB buffers;
+neither device size nor page budgets grow with CPU count or concurrency.
+
+Read the failure counts alongside throughput and latency. Only complete 206
+bodies count as successful requests/bytes; HTTP errors and truncated bodies are
+reported separately, along with server-side error categories. Percentiles cover
+successful requests only. Overload is an observation, not a benchmark assertion
+failure. Warmup validates every byte; timed reads validate headers, lengths, and
+sampled bytes. `read_s` includes all attempts; `drained_s` additionally waits for
+the background writer. Draining does not imply fsync durability or that every
+response was persisted: inspect `fresh_pages_persisted` and `dirty_discards`.
+Cache-only cases assert that origin call counts stay unchanged.
+
+For CPU profiles, build with `CARGO_PROFILE_RELEASE_DEBUG=1` added to the command
+above. While it runs, attach from another terminal to the test process:
+
+```sh
+sudo perf record -F 99 -g --call-graph dwarf -p <test-process-pid> -- sleep 10
+sudo perf report
+```
+
+Correlate the capture with the printed case/sweep. Separate I/O and crypto worker
+stacks from client/origin threads and untimed warmup before attributing a
+bottleneck. Start with admission failures, incomplete responses, and persistence
+shortfalls; a higher successful-read rate alone can hide rejected work.
