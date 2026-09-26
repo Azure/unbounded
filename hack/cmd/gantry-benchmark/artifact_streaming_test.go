@@ -250,15 +250,21 @@ func TestArtifactStreamingRuntimeImageRejectsTagAndOriginalDigest(t *testing.T) 
 
 func TestResolveArtifactStreamingImageReturnsConvertedDigest(t *testing.T) {
 	runner := &artifactStreamingPollingRunner{outputs: [][]byte{
-		[]byte(`{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}`),
+		[]byte("gantry-overlaybd-config-abc"),
+		[]byte("HTTP/1.1 200 OK\r\nDocker-Content-Digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\r\n\r\n"),
 	}}
 	benchmark := &benchmark{
-		config:   benchmarkConfig{GantryACRName: "benchstreamacr"},
+		config: benchmarkConfig{
+			GantryACRName:            "benchstreamacr",
+			ArtifactStreamingTimeout: time.Second,
+			ArtifactStreamingPoll:    time.Millisecond,
+		},
 		commands: runner,
 	}
 	state := benchmarkState{
 		WorkloadRepository:   "gantry-benchmark-pull",
 		GantryACRLoginServer: "benchstreamacr.azurecr.io",
+		GantryNamespace:      "gantry-system",
 	}
 	originalImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	taggedImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted"
@@ -271,15 +277,78 @@ func TestResolveArtifactStreamingImageReturnsConvertedDigest(t *testing.T) {
 	if resolved != want {
 		t.Fatalf("resolved image = %q, want %q", resolved, want)
 	}
-	if len(runner.commands) != 1 || runner.commands[0].name != "az" ||
+	if len(runner.commands) != 2 || runner.commands[0].name != "kubectl" ||
 		!reflect.DeepEqual(runner.commands[0].args, []string{
-			"acr", "manifest", "show-metadata",
-			"--registry", "benchstreamacr",
-			"--name", "gantry-benchmark-pull:converted",
-			"--only-show-errors",
-			"--output", "json",
+			"-n", "gantry-system", "get", "pod",
+			"-l", "app.kubernetes.io/name=gantry,app.kubernetes.io/component=overlaybd-config",
+			"--field-selector=status.phase=Running",
+			"-o", "jsonpath={.items[0].metadata.name}",
 		}) {
-		t.Fatalf("resolver command = %+v", runner.commands)
+		t.Fatalf("resolver pod command = %+v", runner.commands)
+	}
+	request := runner.commands[1]
+	if request.name != "kubectl" || !slices.Contains(request.args, "gantry-overlaybd-config-abc") ||
+		!slices.Contains(request.args, "http://127.0.0.1:8578/v2/gantry-benchmark-pull/manifests/converted?ns=benchstreamacr.azurecr.io") {
+		t.Fatalf("resolver helper command = %s %v", request.name, request.args)
+	}
+}
+
+func TestResolveArtifactStreamingImageWaitsForConvertedDigest(t *testing.T) {
+	runner := &artifactStreamingPollingRunner{outputs: [][]byte{
+		[]byte("gantry-overlaybd-config-abc"),
+		[]byte("HTTP/1.1 200 OK\r\nDocker-Content-Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n"),
+		[]byte("HTTP/1.1 200 OK\r\ndocker-content-digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\r\n\r\n"),
+	}}
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			GantryACRName:            "benchstreamacr",
+			ArtifactStreamingTimeout: time.Second,
+			ArtifactStreamingPoll:    time.Millisecond,
+		},
+		commands: runner,
+		stdout:   io.Discard,
+	}
+	state := benchmarkState{
+		WorkloadRepository:   "gantry-benchmark-pull",
+		GantryACRLoginServer: "benchstreamacr.azurecr.io",
+		GantryNamespace:      "gantry-system",
+	}
+	originalImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	taggedImage := "benchstreamacr.azurecr.io/gantry-benchmark-pull:converted"
+
+	resolved, err := benchmark.resolveArtifactStreamingImage(context.Background(), state, originalImage, taggedImage)
+	if err != nil {
+		t.Fatalf("resolveArtifactStreamingImage: %v", err)
+	}
+	want := "benchstreamacr.azurecr.io/gantry-benchmark-pull@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if resolved != want {
+		t.Fatalf("resolved image = %q, want %q", resolved, want)
+	}
+	if len(runner.commands) != 3 {
+		t.Fatalf("resolver commands = %d, want 3", len(runner.commands))
+	}
+}
+
+func TestArtifactStreamingDigestFromHeaders(t *testing.T) {
+	const want = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+	parsed, err := artifactStreamingDigestFromHeaders([]byte("HTTP/1.1 200 OK\r\ndocker-content-digest: " + want + "\r\n\r\n"))
+	if err != nil {
+		t.Fatalf("artifactStreamingDigestFromHeaders: %v", err)
+	}
+	if parsed.String() != want {
+		t.Fatalf("digest = %q, want %q", parsed, want)
+	}
+
+	for name, headers := range map[string]string{
+		"missing": "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+		"invalid": "HTTP/1.1 200 OK\r\nDocker-Content-Digest: not-a-digest\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := artifactStreamingDigestFromHeaders([]byte(headers)); err == nil {
+				t.Fatal("artifactStreamingDigestFromHeaders unexpectedly succeeded")
+			}
+		})
 	}
 }
 
