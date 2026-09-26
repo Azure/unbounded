@@ -41,12 +41,18 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers)},
 		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle},
 		Workload:  &WorkloadReconciler{Client: c, APIReader: reader, Config: cfg},
-		Server:    &Server{Config: cfg, APIReader: reader, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Server:    &Server{Config: cfg, APIReader: reader, NodeHints: c, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
 		Lifecycle: lifecycle,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Node{}, nodeUIDIndex, nodeUIDKeys); err != nil {
+		return fmt.Errorf("index Node UID hints: %w", err)
+	}
+
+	a.Server.NodeHints = mgr.GetCache()
+
 	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
 	if err := mgr.Add(a.Lifecycle); err != nil {
 		return fmt.Errorf("register leader lifecycle: %w", err)

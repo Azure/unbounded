@@ -50,7 +50,7 @@ func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
 
 	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh"}}
 	objects = append(objects, marker)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Pod{}, podNodeIndex, podNodeKeys).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Pod{}, podNodeIndex, podNodeKeys).WithIndex(&corev1.Node{}, nodeUIDIndex, nodeUIDKeys).Build()
 
 	return Assemble(cfg, c, c).Topology
 }

@@ -61,46 +61,62 @@ func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *co
 	return ctx.Err()
 }
 
-func authorizeNode(ctx context.Context, reader client.Reader, cfg Config, id wire.NodeID) error {
-	// Certificates deliberately contain UIDs only. A live list resolves names
-	// without trusting a stale informer or an untrusted caller-provided name.
+const nodeUIDIndex = "racer.nodeUID"
+
+func nodeUIDKeys(obj client.Object) []string {
+	if obj.GetUID() == "" {
+		return nil
+	}
+
+	return []string{string(obj.GetUID())}
+}
+
+func authorizeNode(ctx context.Context, reader, hints client.Reader, cfg Config, id wire.NodeID) error {
+	// The informer is only a UID-to-name hint. Never authorize from its labels,
+	// deletion state, or UID: a live GET must still match the certificate UID.
+	if hints == nil {
+		return wire.Unavailable
+	}
+
 	var nodes corev1.NodeList
-	if err := reader.List(ctx, &nodes); err != nil {
+	if err := hints.List(ctx, &nodes, client.MatchingFields{nodeUIDIndex: string(id)}); err != nil {
+		return wire.Unavailable
+	}
+
+	// A missing hint may be informer lag, so let the client retry. Never fall
+	// back to a full API list during cold startup or an informer outage.
+	if len(nodes.Items) != 1 || nodes.Items[0].Name == "" || wire.NodeID(nodes.Items[0].UID) != id {
+		return wire.Unavailable
+	}
+
+	var node corev1.Node
+	if err := reader.Get(ctx, client.ObjectKey{Name: nodes.Items[0].Name}, &node); err != nil {
 		return authorizationError(err)
 	}
 
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
-		if wire.NodeID(node.UID) != id {
+	if wire.NodeID(node.UID) != id || !authorizedNode(&node) {
+		return wire.Forbidden
+	}
+
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods, client.InNamespace(cfg.Namespace), client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+		return authorizationError(err)
+	}
+
+	for j := range pods.Items {
+		pod := &pods.Items[j]
+		if pod.Spec.NodeName != node.Name {
 			continue
 		}
 
-		if !authorizedNode(node) {
-			return wire.Forbidden
+		err := authorizePod(ctx, reader, cfg, pod, "")
+		if err == nil {
+			return nil
 		}
 
-		var pods corev1.PodList
-		if err := reader.List(ctx, &pods, client.InNamespace(cfg.Namespace), client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-			return authorizationError(err)
+		if err != wire.Forbidden {
+			return err
 		}
-
-		for j := range pods.Items {
-			pod := &pods.Items[j]
-			if pod.Spec.NodeName != node.Name {
-				continue
-			}
-
-			err := authorizePod(ctx, reader, cfg, pod, "")
-			if err == nil {
-				return nil
-			}
-
-			if err != wire.Forbidden {
-				return err
-			}
-		}
-
-		return wire.Forbidden
 	}
 
 	return wire.Forbidden

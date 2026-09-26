@@ -678,7 +678,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	t.Helper()
 	// A separate handler shares the elected application's lifecycle/publication.
 	// Its reader records actual API responses without mutating running dependencies.
-	var requests, nodeLists, received atomic.Int64
+	var requests, nodeLists, nodeGets, nodeBytes, received atomic.Int64
 
 	connection := rest.CopyConfig(rc)
 	connection.WrapTransport = func(base http.RoundTripper) http.RoundTripper {
@@ -689,9 +689,17 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 				nodeLists.Add(1)
 			}
 
+			isNodeGet := strings.HasPrefix(req.URL.Path, "/api/v1/nodes/")
+			if isNodeGet {
+				nodeGets.Add(1)
+			}
+
 			response, err := base.RoundTrip(req)
 			if err == nil {
 				response.Body = countedBody{ReadCloser: response.Body, bytes: &received}
+				if isNodeGet {
+					response.Body = countedBody{ReadCloser: response.Body, bytes: &nodeBytes}
+				}
 			}
 
 			return response, err
@@ -704,6 +712,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	}
 
 	measured := Assemble(a.Server.Config, reader, reader).Server
+	measured.NodeHints = a.Server.NodeHints
 	measured.Lifecycle, measured.Publications = a.Lifecycle, a.Server.Publications
 
 	config, err := measured.TLSConfig(t.Context())
@@ -728,9 +737,11 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	response, err := peer.Get(endpoint)
 	responseBody(t, response, err, 200)
 
-	for _, count := range []int{1, 1001} {
+	var singleNodeBytes int64
+
+	for _, count := range []int{1, 1501} {
 		if count > 1 {
-			for i := range 1000 {
+			for i := range count - 1 {
 				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("auth-scale-%04d", i), Labels: map[string]string{wire.ExclusionLabel: ""}}}
 				if err := c.Create(t.Context(), node); err != nil {
 					t.Fatal(err)
@@ -740,6 +751,8 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 		requests.Store(0)
 		nodeLists.Store(0)
+		nodeGets.Store(0)
+		nodeBytes.Store(0)
 		received.Store(0)
 
 		start := time.Now()
@@ -749,11 +762,17 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 			responseBody(t, response, err, 200)
 		}
 
-		if requests.Load() != 160 || nodeLists.Load() != 20 {
-			t.Fatalf("authorization API budget drift: requests=%d node_lists=%d", requests.Load(), nodeLists.Load())
+		if requests.Load() != 160 || nodeLists.Load() != 0 || nodeGets.Load() != 20 {
+			t.Fatalf("authorization API budget drift: requests=%d node_lists=%d node_gets=%d", requests.Load(), nodeLists.Load(), nodeGets.Load())
 		}
 
-		t.Logf("real HTTPS authorization: live_nodes=%d snapshots=10 elapsed=%s API_requests=%d Node_lists=%d API_response_bytes=%d (warm TLS; envtest QPS=1000 burst=2000)", count, time.Since(start), requests.Load(), nodeLists.Load(), received.Load())
+		if count == 1 {
+			singleNodeBytes = nodeBytes.Load()
+		} else if nodeBytes.Load() != singleNodeBytes {
+			t.Fatalf("Node authorization bytes grew with cluster size: %d -> %d", singleNodeBytes, nodeBytes.Load())
+		}
+
+		t.Logf("real HTTPS authorization: live_nodes=%d snapshots=10 elapsed=%s API_requests=%d Node_lists=%d Node_gets=%d Node_bytes=%d API_response_bytes=%d (warm TLS)", count, time.Since(start), requests.Load(), nodeLists.Load(), nodeGets.Load(), nodeBytes.Load(), received.Load())
 	}
 	// Live revocation on a pooled TLS connection must still forbid snapshot data.
 	node := &corev1.Node{}

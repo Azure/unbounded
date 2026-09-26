@@ -25,6 +25,7 @@ import (
 type Server struct {
 	Config         Config
 	APIReader      client.Reader
+	NodeHints      client.Reader
 	Bootstrap      *Bootstrap
 	Publications   *Publications
 	Lifecycle      *Lifecycle
@@ -384,7 +385,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
-	identity, err := AuthenticateCertificate(auth, s.APIReader, s.Config, r.TLS)
+	identity, err := AuthenticateCertificate(auth, s.APIReader, s.NodeHints, s.Config, r.TLS)
 
 	cancel()
 	release(s.bootstrapSlots)
@@ -441,7 +442,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth, stop := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
-	_, err = AuthenticateCertificate(auth, s.APIReader, s.Config, r.TLS)
+	_, err = AuthenticateCertificate(auth, s.APIReader, s.NodeHints, s.Config, r.TLS)
 
 	stop()
 	release(s.bootstrapSlots)

@@ -30,6 +30,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -51,6 +52,13 @@ func newServingFixture(t *testing.T) *servingFixture {
 	t.Helper()
 	a, status, token := authFixture(t)
 	installReview(t, a, status, token)
+	// Freeze the hint so live revocation tests also exercise informer lag.
+	var node corev1.Node
+	if err := a.Topology.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node); err != nil {
+		t.Fatal(err)
+	}
+
+	a.Server.NodeHints = fake.NewClientBuilder().WithScheme(a.Topology.Scheme()).WithObjects(&node).WithIndex(&corev1.Node{}, nodeUIDIndex, nodeUIDKeys).Build()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -309,7 +317,7 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 			if err == nil {
 				defer response.Body.Close()
 
-				if response.StatusCode != 401 && response.StatusCode != 403 {
+				if response.StatusCode != 401 && response.StatusCode != 403 && (name != "wrong uid" || response.StatusCode != 503) {
 					t.Fatalf("bad identity admitted: %d", response.StatusCode)
 				}
 			}
@@ -403,6 +411,29 @@ func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPSFirstSnapshotRetriesMissingNodeHint(t *testing.T) {
+	f := newServingFixture(t)
+	hints := fake.NewClientBuilder().WithScheme(f.a.Topology.Scheme()).WithIndex(&corev1.Node{}, nodeUIDIndex, nodeUIDKeys).Build()
+	f.a.Server.NodeHints = hints
+	endpoint := f.start(t)
+	c := f.client(t, &f.certificate)
+	response, err := c.Get(endpoint + wire.SnapshotPath)
+	responseBody(t, response, err, 503)
+
+	var node corev1.Node
+	if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the informer catching up without replacing the persisted identity.
+	node.ResourceVersion = ""
+	if err := hints.Create(f.ctx, &node); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err = c.Get(endpoint + wire.SnapshotPath)
+	responseBody(t, response, err, 200)
 }
 
 func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {

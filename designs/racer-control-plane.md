@@ -344,8 +344,10 @@ deployment integration check and is not exercised by envtest.
   Pod of the current managed DaemonSet and ServiceAccount. Node certificates bind
   Node UIDs rather than Pod UIDs, so replacement authorized Pods on the same Node
   can continue using a locally persisted valid identity. UID-only certificates
-  currently require an authoritative Node list followed by a namespace-scoped Pod
-  list filtered by `spec.nodeName`; Phase 7 measures this API load below.
+  use an informer UID index only to discover the Node name, then authoritatively
+  GET that Node and recheck UID, exclusion, and deletion. Missing/ambiguous hints
+  return retryable unavailable without falling back to a full live Node list.
+  The namespace-scoped live Pod list is filtered by `spec.nodeName`.
 - `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
   and verifies optional client certificates using fresh roots per handshake, and
@@ -525,8 +527,8 @@ Race timings are correctness instrumentation results, not production performance
 
 ### Live HTTPS/API authorization cost
 
-The envtest measurement uses the actual HTTPS handler with a real certificate and
-an instrumented authoritative client; the connection is warmed first. Ten sequential
+The original Phase 7 envtest measurement used the actual HTTPS handler with a real
+certificate and an instrumented authoritative client; the connection was warmed first. Ten sequential
 snapshot requests each perform two authorization passes. Each pass reads installation,
 version, issuer, and common Secret state, lists Nodes and assigned Pods, and gets
 the DaemonSet and ServiceAccount. This is **16 API requests and two full Node lists
@@ -553,12 +555,43 @@ also passed. These elapsed values are observations from this host, not guarantee
 The added Nodes are excluded from membership but still appear in authoritative
 Node lists. Response-byte totals count API bodies, not TLS framing. This is a small
 sequential cost measurement, not a throughput or concurrent HTTPS capacity result.
-At 100,000 clients polling every 30 seconds, the current algorithm would require
+At 100,000 clients polling every 30 seconds, the original algorithm would require
 about 53,333 API requests/s and 666.7 million Node entries/s when the cluster also
 has 100,000 Nodes, before reconnects and changes. Those are arithmetic extrapolations,
 not measured achieved rates. Production capacity at that size is unverified and
-the full-list authorization path is a known scaling limitation. Changing live
-authorization lookup/freshness needs a separately reviewed server design.
+the full-list authorization path was a known scaling limitation. The separately
+approved startup-overload fix below replaces that lookup while retaining live
+authorization freshness.
+
+### Reviewed startup-overload lookup fix
+
+During the 1,500-node rollout on September 26, 2026, full Node lists in both
+snapshot authorization passes competed for the same 32 slots as TLS trust reads.
+One sampled worker run completed initial identity bootstrap, started its worker
+threads, then repeatedly had TLS admission rejected while waiting for its first
+snapshot and exited at its unchanged 30-second worker startup deadline.
+
+The reviewed change uses the synchronized Node informer's `racer.nodeUID` index
+only as a name hint. Each authorization pass still GETs the live Node and checks
+the certificate UID, exclusion, and deletion before checking live Pods, DaemonSet,
+and ServiceAccount. Trust-root reads and post-poll reauthorization are unchanged.
+A stale hint cannot authorize a recreated, excluded, or deleted Node. Cache lag,
+lookup errors, and ambiguous hints fail closed with retryable unavailable; there
+is no full-list fallback. No wire, credential, admission-limit, or timeout changes
+are required.
+
+`TestNodeAuthorizationUsesOnlyLiveStateAfterIndexedHint` covers stale hints,
+revocation, lookup failures, and absence of live Node lists. The pooled TLS tests
+freeze the hint to exercise revocation before informer updates. The real HTTPS
+envtest measurement now checks 1 and 1,501 live Nodes: ten snapshots still perform
+160 authoritative API requests, but exactly 20 Node GETs and zero Node lists, with
+identical Node response-byte totals at both sizes. The historical full-list table
+above is retained as the baseline, not a measurement of the new lookup.
+
+The race-instrumented regression run measured 316.4 ms at 1 Node and 253.6 ms at
+1,501 Nodes for ten snapshots. Node GET response bodies totaled 3,740 bytes in
+both cases. This verifies removal of cluster-size-dependent Node transfer, not
+1,500 concurrent startup capacity; live rollout validation remains separate.
 
 Full snapshot distribution also sends one copy over the network per recipient:
 the measured 21.5 MB publication would require about 2.15 TB per 100,000-recipient
