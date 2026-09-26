@@ -17,6 +17,23 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
+func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
+	r := initializedTopology(t)
+	reconcileTopology(t, r, t.Context())
+
+	if err := r.Publications.Ready(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	l := newLifecycle(r.Publications)
+	l.SetIssuerReady(true)
+	l.SetServingReady(true)
+
+	if err := l.Ready(nil); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("follower with usable state must not receive Service traffic: %v", err)
+	}
+}
+
 func TestLifecycleGatesAndCancellation(t *testing.T) {
 	r := initializedTopology(t)
 

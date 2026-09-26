@@ -7,6 +7,13 @@ metadata:
   namespace: {{ .Namespace | default "unbounded-system" }}
 spec:
   replicas: 3
+  # Only the leader is ready. RollingUpdate cannot retire the last old leader
+  # while preserving an available replica. Accept a control-plane interruption;
+  # running dataplanes retain their last accepted state. See the controller README.
+  strategy:
+    type: Recreate
+    # Clear API-defaulted RollingUpdate settings when updating an existing install.
+    rollingUpdate: null
   selector:
     matchLabels:
       app: racer-controller

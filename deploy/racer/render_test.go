@@ -6,6 +6,7 @@ package racer_test
 import (
 	"bytes"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
@@ -91,6 +93,13 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			decode("controller.yaml", &deployment, &service)
 
+			// With leader-only readiness, even maxUnavailable=2 leaves the last
+			// old leader blocking a three-replica RollingUpdate. Recreate must
+			// remove every old pod without waiting for ready replacement pods.
+			if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || deployment.Spec.Strategy.RollingUpdate != nil {
+				t.Fatalf("leader-only controller updates require Recreate without rollingUpdate settings: %+v", deployment.Spec.Strategy)
+			}
+
 			pod := deployment.Spec.Template.Spec
 			if deployment.Namespace != namespace || *deployment.Spec.Replicas != 3 || pod.Containers[0].Image != data["ControllerImage"] || pod.Containers[0].EnvFrom[0].ConfigMapRef.Name != config.Name {
 				t.Fatal("controller configuration mismatch")
@@ -102,6 +111,21 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			if cfg.ControlURL != "https://"+service.Name+"."+namespace+".svc:8443" || service.Spec.PublishNotReadyAddresses || pod.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" {
 				t.Fatal("service must select ready leader")
+			}
+
+			if len(service.Spec.Selector) == 0 || !maps.Equal(service.Spec.Selector, deployment.Spec.Template.Labels) {
+				t.Fatal("service must route to controller pods through readiness filtering")
+			}
+
+			controller := pod.Containers[0]
+			if controller.ReadinessProbe.HTTPGet.Port.StrVal != "probes" || controller.LivenessProbe.HTTPGet.Path != "/healthz" || controller.LivenessProbe.HTTPGet.Port.StrVal != "probes" {
+				t.Fatal("followers must remain live while readiness gates service routing")
+			}
+
+			if !slices.ContainsFunc(controller.Ports, func(port corev1.ContainerPort) bool {
+				return port.Name == "probes" && port.ContainerPort == 8081
+			}) {
+				t.Fatal("leader readiness probe port must reach the controller probe listener")
 			}
 
 			var (
@@ -141,6 +165,30 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("missing bootstrap permission")
 			}
 		})
+	}
+}
+
+func TestRenderedControllerClearsRollingUpdateBudget(t *testing.T) {
+	out := t.TempDir()
+	if err := render.Render(".", out, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(out, "controller.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var deployment unstructured.Unstructured
+	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 4096).Decode(&deployment); err != nil {
+		t.Fatal(err)
+	}
+
+	// Omitting this field leaves an existing API-defaulted budget behind with
+	// client-side apply. Recreate admission rejects a non-null rollingUpdate.
+	budget, found, err := unstructured.NestedFieldNoCopy(deployment.Object, "spec", "strategy", "rollingUpdate")
+	if err != nil || !found || budget != nil {
+		t.Fatalf("updates must explicitly clear the old rollingUpdate budget: value=%v found=%t err=%v", budget, found, err)
 	}
 }
 

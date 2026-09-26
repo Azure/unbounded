@@ -134,6 +134,51 @@ also fail closed, including a partial first credential initialization. Do not
 reset the marker, delete the initialization claim, or restore individual objects
 from mismatched backups. The design includes the precise crash/rebootstrap rules.
 
+## Controller updates and availability
+
+The three-replica controller Deployment uses **Recreate**. A pod-template update
+(including an image change or `kubectl rollout restart`) terminates all old
+controller pods before starting replacements. Only the elected, fully initialized
+leader passes `/readyz`; followers stay live through `/healthz` but unready. The
+Service keeps normal ready-endpoint filtering; do not enable
+`publishNotReadyAddresses` or change readiness to admit followers.
+
+RollingUpdate is incompatible with this readiness contract when it requires any
+available replica during replacement. The default three-replica budget cannot
+make progress, and even `maxUnavailable: 2` leaves the last old leader blocking
+replacement while new followers cannot become ready. Recreate deliberately accepts
+a control-plane interruption to remove that dependency.
+The rendered strategy also explicitly clears `rollingUpdate` so applying it to an
+existing Deployment removes the old, API-defaulted budget.
+
+During an update, the Service has no ready endpoint until a replacement wins the
+Lease, synchronizes inputs, recovers durable state/credentials, commits a
+publication, and starts its TLS listener. Lease release on shutdown is disabled,
+so recovery can include waiting for the old Lease to expire, plus pod termination,
+scheduling, image pulls, startup, and endpoint propagation. This is an expected
+interruption under healthy cluster conditions, not a fixed outage-time guarantee;
+a bad image, invalid configuration, or unavailable Kubernetes API can prolong it.
+
+Running dataplanes retain their last accepted publication and keys while control
+requests retry. Controller replacement alone does not restart the managed
+DaemonSet. Membership/catalog updates, new enrollment, and certificate renewal
+pause until control service returns. Existing data access still depends on valid
+credentials and reachable peers; retained state does not promise indefinite
+operation through a prolonged outage or a dataplane restart.
+
+Verify an update by checking that the Deployment has observed its new generation,
+all three replicas belong to the new revision, no old controller pods remain, and
+one new pod is ready and present in the Service's ready EndpointSlice endpoints.
+Check the leader's `/readyz` on probe port 8081 and exercise the control API through
+the Service. Two live, unready followers
+are expected. `kubectl rollout status` and waiting for every pod to be Ready are
+not valid completion gates: Kubernetes expects all desired replicas to be
+available, so those checks can time out and the Deployment can report
+`ProgressDeadlineExceeded` despite a serving leader. Monitor the ready leader and
+control API directly. If the replacement cannot serve, correct the configuration
+or roll back to the previous working pod template; recovery uses the same Recreate
+interruption. Never rerun initialization for an update or rollback.
+
 ## Measured limits
 
 The 100,000-waiter test verifies bounded admission and shared publication ownership.

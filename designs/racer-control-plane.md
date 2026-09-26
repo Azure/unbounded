@@ -413,7 +413,19 @@ Projection requires a kubelet and remains deployment verification.
   explicit identity/slab directories. The server's own `RACER_CONTROL_URL` and
   `RACER_PEER_PORT` settings are translated when building the DaemonSet.
 - Existing manifests provide three controller replicas, leader-readiness Service
-  routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Templates
+  routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Controller
+  updates use explicit `Recreate`: all old pods terminate before replacements start.
+  RollingUpdate budgets that preserve one available replica cannot remove the last
+  old leader, because replacements remain unready until they win leadership. The
+  accepted control-service interruption includes Lease expiry (release-on-cancel
+  is disabled), startup/recovery, and endpoint propagation; unhealthy replacements
+  can prolong it. Running dataplanes retain accepted state while control calls retry,
+  subject to credential validity and peer availability. Service routing continues
+  to exclude unready followers. Only one of three replicas becomes ready, so normal
+  Deployment rollout-completion/all-replicas-available checks are unsuitable even
+  after replacement succeeds. See the controller README's
+  [update procedure](../cmd/racer-controller/README.md#controller-updates-and-availability)
+  for verification, outage semantics, and rollback guidance. Templates
   accept `ServingTLSSecret`, `BootstrapTrustConfigMap`, and `ControlURL` overrides.
   Supply the serving TLS Secret externally. Supply the trust ConfigMap externally,
   or render with `BootstrapCA` containing the public PEM CA bundle. An omitted
