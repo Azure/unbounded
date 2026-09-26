@@ -35,18 +35,9 @@ func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error)
 			return nil, fmt.Errorf("cache socket paths: %w", err)
 		}
 
-		mode := int32(0o660)
-		if cache.Spec.SocketMode != nil {
-			mode = *cache.Spec.SocketMode
-		}
-
-		if mode < 0 || mode > 0o777 {
-			return nil, fmt.Errorf("cache socket mode: %w", wire.InvalidRequest)
-		}
-
 		ids[id], names[cache.Name] = true, true
 		catalog = append(catalog, wire.CacheDefinition{
-			ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin, SocketMode: uint32(mode),
+			ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin,
 		})
 	}
 

@@ -76,7 +76,7 @@ remain the enrollment/TLS layer's responsibility. Rails have unique IDs per node
 and nonempty fabric names without NUL, CR, or LF. Endpoint ports are nonzero and
 IP zone identifiers are rejected. Cache names are lowercase DNS subdomains with
 labels of at most 63 bytes; each complete socket path is at most 107 bytes (plus
-the Linux pathname socket's NUL terminator). Socket modes contain only 0777 bits.
+the Linux pathname socket's NUL terminator).
 
 Failures have `{ "code": "..." }`: 400 `invalid_request`, 401 `unauthenticated`,
 403 `forbidden`, 409 `conflict` (including a future cursor), 413 `too_large`,
@@ -88,8 +88,8 @@ may immediately repeat. Keep tokens and key material out of diagnostics.
 ## Publication lifecycle
 
 A publication contains cluster ID, schema version, sequence, membership version,
-members, and cache definitions (UID, resource name, client/origin socket paths,
-socket mode). Socket paths must be `/run/racer/<cache name>/client/socket` and
+members, and cache definitions (UID, resource name, client/origin socket paths).
+Socket paths must be `/run/racer/<cache name>/client/socket` and
 `/run/racer/<cache name>/origin/socket`; validate the name as a single safe path
 component and enforce the platform UDS path-length limit. Separate endpoint
 directories support independently authorized pod mounts.
@@ -114,7 +114,7 @@ The publication-content object's field order is `schema_version`, `cluster`,
 contains counters. Members sort by Node UID, caches by cache UID, and rails by
 numeric rail ID. Member field order is `node`, `shares`, `peer_endpoint`, `rails`,
 `alignment_enabled`; rail field order is `rail`, `fabric`, optional `numa_node`;
-cache field order is `id`, `name`, `client_socket`, `origin_socket`, `socket_mode`.
+cache field order is `id`, `name`, `client_socket`, `origin_socket`.
 JSON strings use short escapes for backspace, tab, newline, form feed, and carriage
 return; remaining control characters use lowercase `\u00xx`. Quote and backslash
 are escaped, as are U+2028/U+2029; other Unicode and `<`, `>`, `&` remain literal.

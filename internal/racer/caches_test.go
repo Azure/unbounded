@@ -17,8 +17,8 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-func catalogCache(name string, uid types.UID, mode *int32) racerv1.ClusterCache {
-	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterCacheSpec{SocketMode: mode}}
+func catalogCache(name string, uid types.UID) racerv1.ClusterCache {
+	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}}
 }
 
 func TestCanonicalSocketPaths(t *testing.T) {
@@ -38,8 +38,7 @@ func TestCanonicalSocketPaths(t *testing.T) {
 }
 
 func TestBuildCatalog(t *testing.T) {
-	zero, maxMode := int32(0), int32(0o777)
-	caches := []racerv1.ClusterCache{catalogCache("cache-b", testOtherUID, &zero), catalogCache("cache-a", testNodeUID, nil), catalogCache("cache-c", testDaemonSetUID, &maxMode)}
+	caches := []racerv1.ClusterCache{catalogCache("cache-b", testOtherUID), catalogCache("cache-a", testNodeUID), catalogCache("cache-c", testDaemonSetUID)}
 
 	original := make([]racerv1.ClusterCache, len(caches))
 	for i := range caches {
@@ -49,9 +48,9 @@ func TestBuildCatalog(t *testing.T) {
 	got, err := BuildCatalog(caches)
 
 	want := []wire.CacheDefinition{
-		{ID: testNodeUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket", SocketMode: 0o660},
-		{ID: testOtherUID, Name: "cache-b", ClientSocket: "/run/racer/cache-b/client/socket", OriginSocket: "/run/racer/cache-b/origin/socket", SocketMode: 0},
-		{ID: wire.CacheID(testDaemonSetUID), Name: "cache-c", ClientSocket: "/run/racer/cache-c/client/socket", OriginSocket: "/run/racer/cache-c/origin/socket", SocketMode: 0o777},
+		{ID: testNodeUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket"},
+		{ID: testOtherUID, Name: "cache-b", ClientSocket: "/run/racer/cache-b/client/socket", OriginSocket: "/run/racer/cache-b/origin/socket"},
+		{ID: wire.CacheID(testDaemonSetUID), Name: "cache-c", ClientSocket: "/run/racer/cache-c/client/socket", OriginSocket: "/run/racer/cache-c/origin/socket"},
 	}
 	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(caches, original) {
 		t.Fatalf("catalog: %#v, %v; inputs: %#v", got, err, caches)
@@ -69,7 +68,7 @@ func TestBuildCatalog(t *testing.T) {
 		t.Fatalf("empty catalog: %#v, %v", empty, err)
 	}
 	// A terminating object still exists; removal follows its absence from inputs.
-	cache := catalogCache("cache-a", testNodeUID, nil)
+	cache := catalogCache("cache-a", testNodeUID)
 	cache.DeletionTimestamp = &metav1.Time{}
 
 	got, err = BuildCatalog([]racerv1.ClusterCache{cache})
@@ -86,19 +85,15 @@ func TestBuildCatalog(t *testing.T) {
 }
 
 func TestBuildCatalogRejectsWholeInvalidCandidate(t *testing.T) {
-	negative, extraBit := int32(-1), int32(0o1000)
-
-	valid := catalogCache("cache-a", testNodeUID, nil)
+	valid := catalogCache("cache-a", testNodeUID)
 	for name, invalid := range map[string]racerv1.ClusterCache{
-		"missing uid":    catalogCache("cache-b", "", nil),
-		"invalid uid":    catalogCache("cache-b", "invalid", nil),
-		"uppercase uid":  catalogCache("cache-b", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", nil),
-		"duplicate uid":  catalogCache("cache-b", testNodeUID, nil),
-		"duplicate name": catalogCache("cache-a", testOtherUID, nil),
-		"unsafe name":    catalogCache("../cache", testOtherUID, nil),
-		"long path":      catalogCache(strings.Repeat("a", 63)+"."+strings.Repeat("b", 19), testOtherUID, nil),
-		"negative mode":  catalogCache("cache-b", testOtherUID, &negative),
-		"extra mode bit": catalogCache("cache-b", testOtherUID, &extraBit),
+		"missing uid":    catalogCache("cache-b", ""),
+		"invalid uid":    catalogCache("cache-b", "invalid"),
+		"uppercase uid":  catalogCache("cache-b", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+		"duplicate uid":  catalogCache("cache-b", testNodeUID),
+		"duplicate name": catalogCache("cache-a", testOtherUID),
+		"unsafe name":    catalogCache("../cache", testOtherUID),
+		"long path":      catalogCache(strings.Repeat("a", 63)+"."+strings.Repeat("b", 19), testOtherUID),
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := BuildCatalog([]racerv1.ClusterCache{valid, invalid})

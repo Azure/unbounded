@@ -555,23 +555,11 @@ fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<Boun
         .listener
         .set_nonblocking(true)
         .map_err(|_| Error::Io)?;
-    set_socket_mode(
-        &bound.directory,
-        bound.device,
-        bound.inode,
-        bound.definition.socket_mode,
-        basename,
-    )?;
+    allow_socket_access(&bound.directory, bound.device, bound.inode, basename)?;
     Ok(bound)
 }
 
-fn set_socket_mode(
-    directory: &File,
-    device: u64,
-    inode: u64,
-    mode: u32,
-    basename: &str,
-) -> Result<()> {
+fn allow_socket_access(directory: &File, device: u64, inode: u64, basename: &str) -> Result<()> {
     // Pin the final inode too: a replacement symlink must not redirect chmod.
     let socket = OpenOptions::new()
         .read(true)
@@ -586,7 +574,9 @@ fn set_socket_mode(
     if FAIL_CHMOD.with(|fail| fail.replace(false)) {
         return Err(Error::Io);
     }
-    fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(mode)).map_err(|_| Error::Io)
+    // Pod volume mounts control access; every UID/GID with the mount can connect.
+    // Apply explicitly so the process umask cannot restrict client access.
+    fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(0o666)).map_err(|_| Error::Io)
 }
 #[cfg(test)]
 thread_local! {
@@ -666,7 +656,6 @@ mod tests {
             name: "example".into(),
             client_socket: "/run/racer/example/client/socket".into(),
             origin_socket: "/run/racer/example/origin/socket".into(),
-            socket_mode: 0o600,
         }
     }
     fn scope() -> RequestScope {
@@ -1471,7 +1460,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         let mut idle = fixture.connect();
         fixture.pump(1);
@@ -1740,7 +1729,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let mut added = definition();
         added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
         added.name = "blocked".into();
@@ -1758,7 +1747,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         FAIL_CHMOD.with(|fail| fail.set(true));
         assert!(
@@ -1768,7 +1757,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         let prepared =
             futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
@@ -1776,7 +1765,7 @@ mod tests {
         assert_ne!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         assert!(matches!(
             futures::executor::block_on(fixture.listeners.prepare(&[], &scope())),
@@ -1803,7 +1792,7 @@ mod tests {
         fixture.pump(16);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         assert!(fixture.receive(&mut socket, true).is_empty());
     }
@@ -1814,7 +1803,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let definitions = [changed];
         let scope = scope();
         let mut future = fixture.listeners.prepare(&definitions, &scope);
@@ -1848,7 +1837,7 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         let inode = fs::metadata(fixture.socket()).unwrap().ino();
         let mut changed = definition();
-        changed.socket_mode = 0o660;
+        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let mut added = definition();
         added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
         added.name = "added".into();
@@ -1862,7 +1851,7 @@ mod tests {
         assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o600
+            0o666
         );
         assert_eq!(
             fs::read_dir(fixture.socket().parent().unwrap())
@@ -1910,7 +1899,7 @@ mod tests {
                 .borrow()
                 .contains_key(&replacement.id)
         );
-        replacement.socket_mode = 0o660;
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         let prepared =
             futures::executor::block_on(fixture.listeners.prepare(&[replacement], &scope()))
                 .unwrap();
@@ -1988,11 +1977,11 @@ mod tests {
         fs::write(origin.join("socket"), b"adapter owned").unwrap();
         fixture.reconcile(&[definition()]).unwrap();
         let mut updated = definition();
-        updated.socket_mode = 0o660;
+        updated.id = CacheId("00000000-0000-4000-8000-000000000003".into());
         fixture.reconcile(&[updated]).unwrap();
         assert_eq!(
             fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o660
+            0o666
         );
         // Replacing the pathname does not give us ownership of its replacement.
         fs::remove_file(fixture.socket()).unwrap();

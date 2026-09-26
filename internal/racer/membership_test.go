@@ -387,7 +387,7 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 		t.Fatalf("order/dedup changed hashes: %v", err)
 	}
 
-	candidate.Caches, err = BuildCatalog([]racerv1.ClusterCache{catalogCache("cache-a", testNodeUID, nil)})
+	candidate.Caches, err = BuildCatalog([]racerv1.ClusterCache{catalogCache("cache-a", testNodeUID)})
 	if err != nil {
 		t.Fatal(err)
 	}

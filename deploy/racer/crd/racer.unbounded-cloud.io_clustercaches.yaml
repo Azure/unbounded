@@ -23,6 +23,7 @@ spec:
       openAPIV3Schema:
         description: |-
           ClusterCache names a disposable cache. Its Kubernetes UID is its wire identity.
+          Socket paths are derived from metadata.name. Client access is controlled by pod volume mounts.
           The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
           Each DNS label is limited to 63 characters to match the wire contract;
           Kubernetes metadata validation enforces DNS subdomain spelling.
@@ -43,20 +44,6 @@ spec:
               More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
-            type: object
-          spec:
-            description: ClusterCacheSpec configures a cache's client socket. Origin
-              sockets belong to adapters.
-            properties:
-              socketMode:
-                default: 432
-                description: |-
-                  SocketMode contains Unix permission bits, expressed as a decimal integer.
-                  Paths are derived from metadata.name, never supplied independently.
-                format: int32
-                maximum: 511
-                minimum: 0
-                type: integer
             type: object
         type: object
         x-kubernetes-validations:

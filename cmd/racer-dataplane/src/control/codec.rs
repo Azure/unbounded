@@ -286,7 +286,6 @@ struct Cache {
     name: String,
     client_socket: String,
     origin_socket: String,
-    socket_mode: u32,
 }
 #[derive(Serialize, Deserialize)]
 struct PublicationDto {
@@ -355,7 +354,6 @@ pub fn decode_publication(b: &[u8]) -> Result<Publication> {
             name: c.name,
             client_socket: c.client_socket.into(),
             origin_socket: c.origin_socket.into(),
-            socket_mode: c.socket_mode,
         })
         .collect();
     crate::control::caches::validate_definitions(&caches)?;
@@ -409,7 +407,6 @@ fn dto(p: &Publication) -> Result<PublicationDto> {
                 .to_str()
                 .ok_or(Error::InvalidRequest)?
                 .into(),
-            socket_mode: c.socket_mode,
         });
     }
     caches.sort_by(|a, b| a.id.cmp(&b.id));
@@ -628,7 +625,7 @@ mod tests {
         let (c, m) = canonical_content(&p).unwrap();
         assert_eq!(
             format!("{:x}", Sha256::digest(c)),
-            "9c9791a4a7c4863990f46383126839d3779c5299e5f4426a9487263c2af2e03b"
+            "9364dc7078f4f7957643e38c5850f981644eac1d864c6d4d8163ccc974ea8486"
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(m)),
@@ -674,7 +671,6 @@ mod tests {
                 "/run/racer/cache-a/client/socket",
                 "/run/racer/cache-a//client/socket",
             ),
-            ("\"socket_mode\":432", "\"socket_mode\":4095"),
         ] {
             assert!(
                 decode_publication(PUBLICATION.replacen(old, new, 1).as_bytes()).is_err(),

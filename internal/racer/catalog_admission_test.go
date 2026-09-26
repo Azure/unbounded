@@ -30,7 +30,7 @@ import (
 func capacityCaches(count int) []racerv1.ClusterCache {
 	caches := make([]racerv1.ClusterCache, count)
 	for i := range caches {
-		caches[i] = catalogCache(fmt.Sprintf("capacity-%d", i), types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)), nil)
+		caches[i] = catalogCache(fmt.Sprintf("capacity-%d", i), types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)))
 	}
 
 	return caches
@@ -295,7 +295,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 		}
 	}
 
-	caches = append(caches, catalogCache("cache", testNodeUID, nil))
+	caches = append(caches, catalogCache("cache", testNodeUID))
 
 	catalog, err := BuildCatalog(caches)
 	if err != nil {

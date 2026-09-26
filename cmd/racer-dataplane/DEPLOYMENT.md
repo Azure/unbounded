@@ -173,10 +173,10 @@ For each accepted cache name the only paths are:
 Mount each authorized client directory into its consumers and the corresponding
 origin directory into the adapter. Racer needs both endpoint paths visible.
 Use directory mounts, not socket-file bind mounts, so listener replacement works.
-Precreate directories with suitable traversal/write permissions; accepted
-`socket_mode` governs the client socket. The dataplane neither changes the
-adapter's ownership nor creates its origin listener
-(`src/control/caches.rs:55-95`, `src/client/listener.rs:498-514`). Avoid symlinked
+Precreate directories with suitable traversal/write permissions. Client sockets
+always use mode `0666`, independent of the process umask; selective pod volume
+mounts control access. The dataplane neither changes the adapter's ownership nor
+creates its origin listener. Avoid symlinked
 ancestors. An existing socket is not blindly unlinked; after a crash, establish
 that its owner is gone before removing a stale client socket.
 

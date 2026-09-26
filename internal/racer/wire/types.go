@@ -57,7 +57,6 @@ type CacheDefinition struct {
 	Name         string  `json:"name"`
 	ClientSocket string  `json:"client_socket"`
 	OriginSocket string  `json:"origin_socket"`
-	SocketMode   uint32  `json:"socket_mode"`
 }
 
 type Publication struct {

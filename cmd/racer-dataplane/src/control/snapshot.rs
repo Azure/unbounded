@@ -183,7 +183,8 @@ mod tests {
         let first = store.publish(publication(1)).unwrap();
         assert!(Arc::ptr_eq(&first, &store.publish(publication(1)).unwrap()));
         let mut changed = publication(1);
-        changed.caches[0].socket_mode = 0o600;
+        changed.caches[0].id =
+            crate::model::identity::CacheId("66666666-6666-4666-8666-666666666666".into());
         assert!(matches!(store.publish(changed), Err(Error::Replay)));
         let second = store.publish(publication(2)).unwrap();
         assert!(matches!(store.publish(publication(1)), Err(Error::Replay)));

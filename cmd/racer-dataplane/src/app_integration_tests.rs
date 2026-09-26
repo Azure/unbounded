@@ -54,7 +54,6 @@ pub(super) fn definition() -> crate::control::caches::CacheDefinition {
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
-        socket_mode: 0o600,
     }
 }
 

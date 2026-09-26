@@ -57,7 +57,7 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 		t.Fatalf("foreign install: %v", err)
 	}
 
-	cache, err := BuildCatalog([]racerv1.ClusterCache{catalogCache("cache", testNodeUID, nil)})
+	cache, err := BuildCatalog([]racerv1.ClusterCache{catalogCache("cache", testNodeUID)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func TestPollFanoutSharesOnePublication(t *testing.T) {
 
 	awaitPolls(t, r.Publications, count)
 
-	cache := catalogCache("cache", testNodeUID, nil)
+	cache := catalogCache("cache", testNodeUID)
 	if err := r.Create(ctx, &cache); err != nil {
 		t.Fatal(err)
 	}
