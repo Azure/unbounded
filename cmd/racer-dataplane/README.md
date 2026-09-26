@@ -8,9 +8,9 @@ The Go control plane is outside this package.
 membership inputs, enrollment, and projected credential rotation.
 
 ```sh
-make racer-dataplane-test
+bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-test
 # Optional test name filter and libtest options:
-make racer-dataplane-test RACER_TEST_ARGS='topology:: --test-threads=1'
+bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-test RACER_TEST_ARGS='topology:: --test-threads=1'
 ```
 
 The standalone target runs library and binary unit tests with all features, using
@@ -24,26 +24,28 @@ For the complete Rust suite, including integration tests and doctests:
 
 ```sh
 cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-targets --all-features
-cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-features
+bash hack/scripts/memory-safe-run.sh -- cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-targets --all-features
+bash hack/scripts/memory-safe-run.sh -- cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-features
 ```
 
-`make racer-test` also runs the Go server checks before the complete Rust suite.
+`bash hack/scripts/memory-safe-run.sh -- make racer-test` also runs the Go server
+checks before the complete Rust suite.
 
 ## Generated datapath DST
 
 Run both HTTP and connected-native generated-traffic oracles with the normal `dst`
-test filter. The wrapper verifies a cgroup-v2 limit of at most 16 GiB and zero
-swap for the entire build/test process tree before executing Cargo:
+test filter. The target invokes the wrapper to verify a cgroup-v2 limit of at most
+16 GiB and zero swap for the entire build/test process tree. It fails before
+executing Cargo if enforcement is unavailable:
 
 ```sh
-bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
+make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
 # Replay a seed or an explicit comma-separated corpus:
 RACER_DST_SEEDS=42 RACER_DST_STEPS=41 \
-  bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
+  make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
 # Select only the connected native graph:
 RACER_DST_SEEDS=1,7,42 \
-  bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst \
+  make racer-dataplane-dst \
   RACER_DST_FILTER=dst_generated_native RACER_TEST_ARGS=--nocapture
 ```
 
@@ -346,7 +348,8 @@ Fill timings also include the fixture origin's byte generation and streaming.
 
 ```sh
 sudo -v
-CARGO_BUILD_JOBS=2 cargo test --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+CARGO_BUILD_JOBS=2 bash hack/scripts/memory-safe-run.sh -- \
+  cargo test --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
   --test production_dataplane hotpath::hotpath -- \
   --ignored --exact --nocapture --test-threads=1
 ```
