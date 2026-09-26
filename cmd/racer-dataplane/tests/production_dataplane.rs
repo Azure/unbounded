@@ -26,7 +26,7 @@ use racer_dataplane::{
         candidates::CandidatePolicy,
         dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
         fill::{Fill, FillDependencies},
-        flight::Flights,
+        flight::{AcquisitionBudget, Flights},
         metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
         serve::{Coordinator, ReadService},
@@ -356,6 +356,9 @@ struct Rig {
     engine: RefCell<PageCryptoEngine>,
     endpoint: RefCell<WorkerEndpoint>,
     flights: Rc<Flights>,
+    fill: Rc<Fill>,
+    page_crypto: Rc<PageCrypto>,
+    membership: racer_dataplane::topology::membership::MembershipLease,
     writer: Rc<StoreWriter>,
     memory: Rc<MemoryCache>,
     dispatcher: Rc<Dispatcher>,
@@ -540,6 +543,7 @@ impl Rig {
             )
         });
         let flights = Rc::new(Flights::new(admission.clone()));
+        let page_crypto = Rc::new(PageCrypto::new(keys, crypto.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
             buffers,
@@ -549,7 +553,7 @@ impl Rig {
             origin: origin.clone(),
             candidates: candidates.clone(),
             flights: flights.clone(),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+            crypto: page_crypto.clone(),
             credentials: credentials.clone(),
             admission: admission.clone(),
             metadata_owner: directory.clone(),
@@ -582,7 +586,7 @@ impl Rig {
         let coordinator = Rc::new(Coordinator::new(
             snapshots,
             metadata,
-            fill,
+            fill.clone(),
             streams,
             credentials,
         ));
@@ -597,6 +601,9 @@ impl Rig {
             engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime { port: engine })),
             endpoint,
             flights,
+            fill,
+            page_crypto,
+            membership: snapshot.membership.clone(),
             writer,
             memory,
             dispatcher,
@@ -1023,6 +1030,83 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
         calls.len(),
         "cache hit contacted disabled origin"
     );
+}
+
+#[test]
+fn zero_attempt_acquire_serves_validated_disk_copy_without_origin() {
+    let rig = Rig::with_limits(
+        P,
+        false,
+        8,
+        4,
+        Some(|limits| {
+            limits.plaintext_bytes = nz(128 * 1024 * 1024);
+            limits.ciphertext_bytes = nz(128 * 1024 * 1024);
+            limits.dirty_bytes = nz(64 * 1024 * 1024);
+            limits.connections_per_neighbor = nz(2);
+            limits.relay_transfers = nz(8);
+        }),
+    );
+    let seeded = rig.request("GET", "Range: bytes=0-16777215\r\n");
+    check(&seeded, 1, 0, P, P);
+    rig.flush();
+    rig.adapter.offline();
+    let origin_calls = rig.adapter.calls().len();
+    let page = PageId {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: CacheId(CACHE.into()),
+                key: CacheKey([0xab; 32]),
+            },
+            etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+        },
+        number: PageNumber(0),
+    };
+    assert_eq!(rig.writer.pending_count(), 0);
+    assert!(rig.memory.evict_idle(usize::MAX).unwrap() > 0);
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(rig.admission.used(ResourceClass::Flight), 0);
+    let scope = scope();
+    let (metadata, ciphertext) = rig
+        .drive(rig.fill.copy_only(&page, &scope))
+        .unwrap()
+        .expect("actual disk CopyOnly must return the retained page");
+    assert_eq!(metadata.version, page.version);
+    let plaintext = rig
+        .drive(
+            rig.page_crypto.decrypt(
+                ciphertext,
+                rig.admission
+                    .reserve(
+                        Some(&page.version.object.cache),
+                        ResourceClass::Plaintext,
+                        P as usize,
+                    )
+                    .unwrap(),
+                &scope,
+            ),
+        )
+        .expect("disk CopyOnly ciphertext must pass actual AEAD validation");
+    assert_eq!(plaintext.bytes(), seeded.body);
+    drop(plaintext);
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(rig.admission.used(ResourceClass::Flight), 0);
+    let context = racer_dataplane::model::context::OriginContext {
+        object: page.version.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let mut budget = AcquisitionBudget::new(scope.deadline.0, 0, 0);
+    let result =
+        rig.drive(
+            rig.fill
+                .acquire(page, rig.membership.clone(), &context, &scope, &mut budget),
+        );
+    assert_eq!(rig.adapter.calls().len(), origin_calls);
+    assert_eq!(budget.remaining_attempts(), 0);
+    assert_eq!(budget.remaining_links(), 0);
+    let result = result.expect("zero attempts must not reject an available validated disk copy");
+    assert_eq!(result.plaintext.bytes(), seeded.body);
 }
 
 #[test]

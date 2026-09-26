@@ -274,6 +274,169 @@ fn drive<T>(
 }
 
 #[test]
+fn zero_attempt_pending_copy_and_failure_boundaries_never_acquire() {
+    for case in [
+        "pending",
+        "miss",
+        "version",
+        "context",
+        "cancel",
+        "deadline",
+        "corrupt",
+        "plaintext",
+    ] {
+        let mut f = if case == "pending" {
+            fixture_with(crate::model::range::PAGE_BYTES, None)
+        } else {
+            fixture()
+        };
+        let mut seed_budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let seeded = drive(
+            f.fill.acquire_once(
+                &f.page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut seed_budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        let expected = seeded.plaintext.bytes().to_vec();
+        let admission = f.fill.dependencies.admission.clone();
+        {
+            // Give pending storage its own ciphertext allocation so an idle
+            // plaintext cache bundle can be evicted independently.
+            let mut bytes = seeded.ciphertext.bytes().to_vec();
+            if case == "corrupt" {
+                bytes[0] ^= 1;
+            }
+            let ciphertext = f
+                .fill
+                .dependencies
+                .buffers
+                .ciphertext(
+                    admission
+                        .reserve(
+                            Some(&f.context.object.cache),
+                            ResourceClass::Ciphertext,
+                            bytes.len(),
+                        )
+                        .unwrap(),
+                    seeded.ciphertext.envelope().clone(),
+                    bytes,
+                )
+                .unwrap();
+            f.fill.dependencies.writer.discard_unsubmitted();
+            f.fill
+                .dependencies
+                .writer
+                .enqueue(
+                    crate::memory::page::CiphertextCopy {
+                        metadata: seeded.metadata.clone(),
+                        ciphertext,
+                    },
+                    admission
+                        .reserve(
+                            Some(&f.context.object.cache),
+                            ResourceClass::DirtyCiphertext,
+                            seeded.ciphertext.bytes().len(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        drop(seeded);
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Flight), 0);
+        assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+        assert!(
+            f.fill
+                .dependencies
+                .writer
+                .index()
+                .snapshot()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let mut page = f.page.clone();
+        match case {
+            "miss" => {
+                f.fill.dependencies.writer.discard_unsubmitted();
+            }
+            "version" => page.version.etag = StrongEtag::parse(b"\"different\"").unwrap(),
+            "context" => f.context.object.key = CacheKey([9; 32]),
+            "cancel" => f.scope.cancel().unwrap(),
+            _ => {}
+        }
+        let deadline = if case == "deadline" {
+            Instant::now()
+        } else {
+            f.scope.deadline.0
+        };
+        let mut budget = AcquisitionBudget::new(deadline, 0, 0);
+        let held_plaintext = (case == "plaintext").then(|| {
+            admission
+                .reserve(
+                    Some(&f.context.object.cache),
+                    ResourceClass::Plaintext,
+                    admission.limit(ResourceClass::Plaintext),
+                )
+                .unwrap()
+        });
+        let result = drive(
+            f.fill.acquire(
+                page,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        );
+        match case {
+            "pending" => assert_eq!(result.unwrap().plaintext.bytes(), expected),
+            _ => {
+                let expected = match case {
+                    "context" => Error::InvalidRequest,
+                    "cancel" => Error::Cancelled,
+                    "deadline" => Error::DeadlineExceeded,
+                    "corrupt" => Error::CorruptRecord,
+                    "plaintext" => Error::Overloaded,
+                    _ => Error::Unavailable,
+                };
+                assert!(matches!(result, Err(error) if error == expected), "{case}");
+            }
+        }
+        assert_eq!(
+            f.origin.calls.get(),
+            1,
+            "{case}: zero-budget request contacted origin"
+        );
+        assert_eq!(
+            (budget.remaining_attempts(), budget.remaining_links()),
+            (0, 0)
+        );
+        drop(held_plaintext);
+        f.fill.dependencies.writer.discard_unsubmitted();
+        f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        for class in [
+            ResourceClass::Plaintext,
+            ResourceClass::Ciphertext,
+            ResourceClass::DirtyCiphertext,
+            ResourceClass::Flight,
+            ResourceClass::Waiter,
+        ] {
+            assert_eq!(admission.used(class), 0, "{case}: {class:?}");
+        }
+    }
+}
+
+#[test]
 fn consumed_peer_output_reacquires_for_origin_and_honors_cancellation() {
     struct FailedBody {
         cancel: bool,

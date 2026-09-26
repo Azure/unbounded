@@ -162,6 +162,43 @@ impl Fill {
                 result.validate_for(&page)?;
                 return Ok(result);
             }
+            if budget.remaining_attempts() == 0 {
+                // Zero credits prohibit acquisition, not use of retained copies.
+                // CopyOnly cannot elect a driver or contact peers/origin. Preserve
+                // the caller's tighter budget deadline through disk and crypto.
+                let mut copy_scope = scope.clone();
+                copy_scope.deadline.0 = copy_scope.deadline.0.min(budget.deadline());
+                copy_scope.check()?;
+                let (metadata, ciphertext) = self
+                    .copy_only(&page, &copy_scope)
+                    .await?
+                    .ok_or(Error::Unavailable)?;
+                let reserve = || {
+                    self.dependencies.admission.reserve(
+                        Some(&page.version.object.cache),
+                        crate::model::limits::ResourceClass::Plaintext,
+                        crate::model::range::PAGE_BYTES as usize,
+                    )
+                };
+                let plaintext = match reserve() {
+                    Err(Error::Overloaded) => {
+                        self.dependencies.memory.evict_idle(usize::MAX)?;
+                        reserve()?
+                    }
+                    result => result?,
+                };
+                return self
+                    .decrypt(
+                        &page,
+                        crate::memory::page::CiphertextCopy {
+                            metadata,
+                            ciphertext,
+                        },
+                        plaintext,
+                        &copy_scope,
+                    )
+                    .await;
+            }
             let mut waiter = match self.dependencies.flights.join(
                 page.clone(),
                 membership,
