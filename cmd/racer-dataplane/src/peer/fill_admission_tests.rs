@@ -461,6 +461,7 @@ fn build_node_with_relay_pressure(
         .with_network(network)
         .with_wire(codec)
         .with_handshake(handshake)
+        .with_reactor(reactor.clone())
         .with_transfers(transfers.clone());
     let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
     let responses = Rc::new(crate::client::response::Responses::new(

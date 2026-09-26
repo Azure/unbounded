@@ -35,7 +35,9 @@ The worker must poll `server.listen(address, scope)` and drive its reactor. HTTP
 connections and ciphertext retain quota through I/O completion. The listener scope
 bounds connection lifetime. At the start of every exchange, including the first
 and each reused keepalive exchange, header reception gets a fixed deadline of
-`min(listener deadline, now + request_timeout)` with the listener's cancellation.
+`min(listener deadline, now + request_timeout)` with exchange-local cancellation.
+Listener cancellation wakes and cancels each exchange, while acquisition cleanup
+can cancel only its own exchange. It cannot cancel the listener or another request.
 This covers idle waiting and the entire head; partial/trickled bytes never renew
 the budget. Application assembly supplies `Config.request_timeout`; the constructor
 default is 30 seconds. Expiry closes the connection, retaining I/O resources and
@@ -52,7 +54,8 @@ bounds, not promises that keepalives remain open.
 After the head, authenticated requests retain the existing signed request deadline
 policy, bounded by the listener deadline, for dispatch and response transfer. The
 header cap does not bound the whole response or reset the signed request budget.
-Challenge and handshake responses retain the listener scope. The listener uses
+Challenge and handshake responses retain the listener deadline and the same
+one-way cancellation propagation. The listener uses
 bounded concurrent connection tasks. Each task serves sequential pooled exchanges.
 Errors close that connection and do not stop other connections.
 The listener retains one outstanding accept across connection task completions,

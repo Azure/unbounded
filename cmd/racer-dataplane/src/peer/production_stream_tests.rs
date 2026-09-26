@@ -19,32 +19,38 @@ impl Drop for Process {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_uses_fill_receive_capacity() {
-    sdk_fixture(false, false, false, false, false);
+    sdk_fixture(false, false, false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_waits_for_busy_peer_slots() {
-    sdk_fixture(true, false, false, false, false);
+    sdk_fixture(true, false, false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_accepts_clients_with_idle_peer_capacity() {
-    sdk_fixture(true, true, false, false, false);
+    sdk_fixture(true, true, false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_with_uniform_peer_memory_pressure() {
-    sdk_fixture(true, false, true, false, false);
+    sdk_fixture(true, false, true, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_reclaims_accepted_peer_keepalives() {
-    sdk_fixture(true, false, true, true, false);
+    sdk_fixture(true, false, true, true, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_waits_for_transient_relay_admission() {
-    sdk_fixture(true, false, true, false, true);
+    sdk_fixture(true, false, true, false, true, false);
+}
+
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_full_image_survives_expired_peer_fill() {
+    sdk_fixture(true, false, true, false, false, true);
 }
 
 /// Select an explicit first hop so this small graph exercises a relay, as the
@@ -91,18 +97,29 @@ impl requester::PeerClient for ViaRelay {
         })
     }
 }
+#[derive(Clone, Copy)]
+struct SdkScenario {
+    busy_peers: bool,
+    idle_pressure: bool,
+    uniform_memory: bool,
+    incoming_pressure: bool,
+    relay_pressure: bool,
+    expired_fill: bool,
+}
+
 fn sdk_fixture(
     busy_peers: bool,
     idle_pressure: bool,
     uniform_memory: bool,
     incoming_pressure: bool,
     relay_pressure: bool,
+    expired_fill: bool,
 ) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!(
-            "stream-sdk-{}-{busy_peers}-{idle_pressure}-{uniform_memory}-{incoming_pressure}-{relay_pressure}",
+            "stream-sdk-{}-{busy_peers}-{idle_pressure}-{uniform_memory}-{incoming_pressure}-{relay_pressure}-{expired_fill}",
             std::process::id()
         ));
     fs::create_dir_all(&output).unwrap();
@@ -127,24 +144,27 @@ fn sdk_fixture(
         run(
             warm,
             &binary,
-            busy_peers,
-            idle_pressure,
-            uniform_memory,
-            incoming_pressure,
-            relay_pressure,
+            SdkScenario {
+                busy_peers,
+                idle_pressure,
+                uniform_memory,
+                incoming_pressure,
+                relay_pressure,
+                expired_fill,
+            },
         );
     }
     fs::remove_dir_all(output).unwrap();
 }
-fn run(
-    warm: bool,
-    binary: &std::path::Path,
-    busy_peers: bool,
-    idle_pressure: bool,
-    uniform_memory: bool,
-    incoming_pressure: bool,
-    relay_pressure: bool,
-) {
+fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
+    let SdkScenario {
+        busy_peers,
+        idle_pressure,
+        uniform_memory,
+        incoming_pressure,
+        relay_pressure,
+        expired_fill,
+    } = scenario;
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
     for signer in &signers {
@@ -217,6 +237,7 @@ fn run(
     let placement = Placement::new(256);
     let mut bytes = HashMap::new();
     let mut descriptors = Vec::new();
+    let mut layer_keys = Vec::new();
     // Four-member placement excludes ingress for every page. Thus continuation
     // must exercise requester Fill plus peer receive, never a local origin escape.
     for layer in 0..8u8 {
@@ -244,6 +265,7 @@ fn run(
         let body = vec![layer; length];
         descriptors.push(serde_json::json!({"raw_key":key.0.to_vec(), "size":length,"digest":format!("sha256:{:x}",Sha256::digest(&body))}));
         bytes.insert(key, body);
+        layer_keys.push(key);
     }
     let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
     let config_key = CacheKey(Sha256::digest(&config).into());
@@ -281,7 +303,7 @@ fn run(
                 },
                 // Match the live two-worker partition: 256 node entries / 2.
                 // Other variants retain their original sixteen-entry fixture.
-                if incoming_pressure || relay_pressure {
+                if incoming_pressure || relay_pressure || expired_fill {
                     128
                 } else {
                     16
@@ -497,7 +519,7 @@ fn run(
             .env("RACER_STREAM_LAYERS", fixture)
             .env(
                 "RACER_STREAM_BARRIER",
-                if incoming_pressure || relay_pressure {
+                if incoming_pressure || relay_pressure || expired_fill {
                     output.as_os_str()
                 } else {
                     std::ffi::OsStr::new("")
@@ -506,12 +528,26 @@ fn run(
             .spawn()
             .unwrap(),
     );
+    let listeners = if expired_fill {
+        // Production PeerServer::listen owns the binds in this runtime-survival
+        // case. Membership retains the selected endpoints.
+        drop(listeners);
+        Vec::new()
+    } else {
+        listeners
+    };
     let servers = async {
         let mut all = FuturesUnordered::new();
-        for (node, listener) in nodes.iter().zip(&listeners) {
-            let fd = Rc::new(OwnedFd::from(listener.try_clone().unwrap()));
+        for (index, node) in nodes.iter().enumerate() {
+            let address = membership.members()[index].peer_endpoint.parse().unwrap();
+            let fd = (!expired_fill)
+                .then(|| Rc::new(OwnedFd::from(listeners[index].try_clone().unwrap())));
             let scope = &scope;
             all.push(async move {
+                if expired_fill {
+                    return node.server.listen(address, scope).await;
+                }
+                let fd = fd.unwrap();
                 let mut active: FuturesUnordered<crate::error::Operation<'_, ()>>=FuturesUnordered::new();
                 loop {
                     let accept=node.reactor.accept(fd.clone(),scope); futures::pin_mut!(accept);
@@ -536,6 +572,91 @@ fn run(
         let node = &nodes[0];
         let mut active = FuturesUnordered::new();
         loop {
+            if expired_fill && !pressure_seeded && ready_path.exists() {
+                // A separate signed acquisition expires while its elected Fill
+                // waits for plaintext held by another live owner. The SDK's four
+                // bootstrapped layer streams must survive that request's cleanup.
+                let key = layer_keys[7];
+                let page = page(key, 3);
+                let rank = placement
+                    .rank(membership.clone(), &object(key), page.number)
+                    .unwrap();
+                let dest = signers
+                    .iter()
+                    .position(|s| s.node() == &rank.ordered[0])
+                    .unwrap();
+                let target = &nodes[dest];
+                target.writer.discard_unsubmitted();
+                target.memory.evict_idle(usize::MAX).unwrap();
+                let held = target
+                    .admission
+                    .reserve(
+                        None,
+                        ResourceClass::Plaintext,
+                        target.admission.limit(ResourceClass::Plaintext)
+                            - target.admission.used(ResourceClass::Plaintext),
+                    )
+                    .unwrap();
+                let started = Instant::now();
+                let request_scope =
+                    RequestScope::new(RequestId(rand_id()), started + Duration::from_millis(100))
+                        .unwrap();
+                let attempt = AttemptId(rand_id());
+                let request = PeerRequest {
+                    operation: Operation::Page {
+                        page: page.clone(),
+                        mode: FetchMode::Acquire,
+                    },
+                    origin: nodes[0]
+                        .credentials
+                        .seal(&context(key), attempt, &request_scope)
+                        .unwrap(),
+                    route: RouteBudget {
+                        membership: membership.version,
+                        request: request_scope.request,
+                        attempt,
+                        destination: signers[dest].node().clone(),
+                        visited: vec![signers[0].node().clone()],
+                        remaining_links: 4,
+                        remaining_attempts: 8,
+                        deadline: request_scope.deadline,
+                    },
+                };
+                let auth = Forwarding::new(signers[0].clone());
+                let (signed, _) = auth.sign_request_to(request, signers[dest].node()).unwrap();
+                let mut transfer = nodes[0].transfers.exchange(
+                    Endpoint::Peer(membership.members()[dest].peer_endpoint.clone()),
+                    signed,
+                    &request_scope,
+                );
+                let mut saw_flight = false;
+                let result = std::future::poll_fn(|cx| {
+                    saw_flight |= target.admission.used(ResourceClass::Flight) > 0;
+                    transfer.as_mut().poll(cx)
+                })
+                .await;
+                drop(transfer);
+                assert!(saw_flight, "signed request must enter production Fill");
+                assert!(
+                    matches!(result, Err(Error::Io | Error::DeadlineExceeded)),
+                    "pressure acquisition must expire"
+                );
+                // Wire deadlines have millisecond precision; remote expiry can
+                // close the socket just before the caller's monotonic deadline.
+                assert!(started.elapsed() >= Duration::from_millis(90));
+                drop(held);
+                // Poll the detached production Fill driver after caller expiry.
+                for _ in 0..4 {
+                    target.flights.poll_budgeted(64).unwrap();
+                }
+                assert!(
+                    scope.check().is_ok(),
+                    "expired peer Fill canceled listener: {:?}",
+                    scope.check()
+                );
+                pressure_seeded = true;
+                fs::write(&release_path, b"release").unwrap();
+            }
             if relay_pressure && !pressure_seeded && ready_path.exists() {
                 // Match the observed 8/8 live boundary with finite competing
                 // owners. The SDK continues on already established connections.
@@ -656,6 +777,9 @@ fn run(
             "SDK must exercise accepted-peer reclamation"
         );
     }
+    if expired_fill {
+        assert!(pressure_seeded, "SDK must cross the expired-Fill barrier");
+    }
     if relay_pressure {
         assert!(
             nodes
@@ -695,6 +819,8 @@ fn run(
             ResourceClass::DirtyCiphertext,
             ResourceClass::Relay,
             ResourceClass::Connection,
+            ResourceClass::Waiter,
+            ResourceClass::Flight,
         ] {
             assert_eq!(node.admission.used(class), 0, "{class:?}");
         }

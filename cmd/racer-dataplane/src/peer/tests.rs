@@ -988,8 +988,16 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             peer.write_all(b"POST /racer/peer/v1/request HTTP/1.1\r\nRacer-")
                 .unwrap();
         }
+        struct WakeCount(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for WakeCount {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let wakes = std::sync::Arc::new(WakeCount(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wakes.clone());
         let mut work = server.serve_connection(connection, &scope);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut cx = Context::from_waker(&waker);
         assert!(work.as_mut().poll(&mut cx).is_pending());
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         assert!(admission.used(ResourceClass::RequestContext) > baseline);
@@ -1006,6 +1014,10 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         if matches!(case, "cancel" | "drop") {
             reactor.poll_budgeted(128).unwrap();
             scope.cancel().unwrap();
+            assert!(
+                wakes.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "listener cancellation must wake its exchange before reactor polling"
+            );
             // Cancellation cannot release the socket or staging before its CQE
             // fence, even when the whole peer exchange future is abandoned.
             assert_eq!(admission.used(ResourceClass::Connection), 1);

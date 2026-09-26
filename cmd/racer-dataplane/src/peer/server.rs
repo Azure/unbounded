@@ -157,12 +157,37 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::pool::ConnectionLease> {
         Box::pin(async move {
+            let parent = scope;
+            let cancellation = parent.cancellation.subscribe()?;
+            let mut exchange = parent.clone();
+            exchange.cancellation = crate::runtime::deadline::Cancellation::new()?;
+            let mut work = self.serve_exchange(connection, &exchange);
+            // A Fill may cancel its acquisition scope after its caller detaches.
+            // That must not cancel the listener or another exchange. Shutdown
+            // still reaches all submitted work, retaining its completion owners.
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                if parent.cancellation.is_cancelled() {
+                    exchange.cancel()?;
+                }
+                work.as_mut().poll(cx)
+            })
+            .await
+        })
+    }
+
+    fn serve_exchange<'a>(
+        &'a self,
+        connection: crate::http::pool::ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, crate::http::pool::ConnectionLease> {
+        Box::pin(async move {
             use super::{transfer::SendPage, wire::WireCodec};
             use crate::runtime::reactor::IoBuffer;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
             // One fixed budget per exchange, never renewed by partial headers.
-            // Clone the listener cancellation, but keep this cap out of dispatch
+            // Clone the exchange cancellation, but keep this cap out of dispatch
             // and response I/O, which use the signed request deadline below.
             let header_scope = header_scope(scope, self.request_timeout, Instant::now())?;
             let mut received = match &self.transfers {
