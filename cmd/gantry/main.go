@@ -399,11 +399,17 @@ func runAgent(args []string) error {
 	// Every node that is served a manifest pulls that image's layers into its
 	// own content store, so later reads hit local disk instead of the network.
 	layerSeedTotal := newLayerSeedMetric(reg)
+	// Origin is deliberately nil unless opted in: see LayerSeedOriginFallback.
+	var layerSeedOrigin ifaces.OriginPuller
+	if c.LayerSeedOriginFallback {
+		layerSeedOrigin = pullOriginClient
+	}
+
 	layerSeed := newLayerSeeder(layerSeederOptions{
 		Store:        cstore,
 		DHT:          disco,
 		Peer:         peerClient,
-		Origin:       pullOriginClient,
+		Origin:       layerSeedOrigin,
 		MarkPresent:  func(ctx context.Context, d digest.Digest) bool { return adv.Notify(ctx, d, true) },
 		Logger:       logger,
 		Concurrency:  c.LayerSeedConcurrency,
