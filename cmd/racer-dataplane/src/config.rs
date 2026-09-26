@@ -140,9 +140,8 @@ impl Config {
         let peer_listen = text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?
             .parse()
             .map_err(|_| Error::InvalidConfiguration)?;
-        let diagnostics_listen = text("RACER_DIAGNOSTICS_LISTEN", Some("127.0.0.1:9090"))?
-            .parse()
-            .map_err(|_| Error::InvalidConfiguration)?;
+        let diagnostics_listen =
+            parse_diagnostics_listen(&text("RACER_DIAGNOSTICS_LISTEN", Some("127.0.0.1:9090"))?)?;
         let trust_bundle = text("RACER_TRUST_BUNDLE", Some("/etc/racer/trust/ca.crt"))?.into();
         let service_account_token = text(
             "RACER_SERVICE_ACCOUNT_TOKEN",
@@ -498,6 +497,19 @@ fn valid_uuid(value: &str) -> bool {
                 b.is_ascii_digit() || matches!(b, b'a'..=b'f')
             }
         })
+}
+
+// Kubernetes expands a single bracketed Pod IP template for both IP families.
+// SocketAddr already accepts bracketed IPv6; normalize only bracketed IPv4 here.
+fn parse_diagnostics_listen(value: &str) -> Result<SocketAddr> {
+    if let Some((host, port)) = value.strip_prefix('[').and_then(|v| v.split_once("]:"))
+        && let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
+    {
+        return format!("{ip}:{port}")
+            .parse()
+            .map_err(|_| Error::InvalidConfiguration);
+    }
+    value.parse().map_err(|_| Error::InvalidConfiguration)
 }
 
 fn validate_socket(address: SocketAddr) -> Result<()> {
@@ -1059,6 +1071,45 @@ mod tests {
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.validate(), Ok(()));
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
+    }
+
+    #[test]
+    fn diagnostics_accepts_expanded_pod_ip_of_either_family() {
+        for (address, expected) in [
+            ("192.0.2.1:9090", "192.0.2.1:9090"),
+            ("[192.0.2.1]:9090", "192.0.2.1:9090"),
+            ("[2001:db8::1]:9090", "[2001:db8::1]:9090"),
+        ] {
+            let config = parse(&[("RACER_DIAGNOSTICS_LISTEN", address)]).unwrap();
+            assert_eq!(config.diagnostics_listen, expected.parse().unwrap());
+            assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
+        }
+        for address in [
+            "[$(RACER_POD_IP)]:9090",
+            "[]:9090",
+            "[localhost]:9090",
+            "[192.0.2.1]:0",
+            "[192.0.2.1]:65536",
+            "[192.0.2.1]:+9090",
+            "[224.0.0.1]:9090",
+            "[255.255.255.255]:9090",
+            "[::ffff:192.0.2.1]:9090",
+            "[fe80::1%eth0]:9090",
+            "[ff02::1]:9090",
+            "[192.0.2.1]:7443",
+        ] {
+            assert!(
+                parse(&[("RACER_DIAGNOSTICS_LISTEN", address)]).is_err(),
+                "{address}"
+            );
+        }
+        assert!(
+            parse(&[
+                ("RACER_PEER_LISTEN", "0.0.0.0:9090"),
+                ("RACER_DIAGNOSTICS_LISTEN", "[192.0.2.1]:9091"),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

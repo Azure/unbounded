@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -83,7 +85,7 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 	}
 
 	for _, env := range pod.Containers[0].Env {
-		if env.ValueFrom != nil {
+		if env.ValueFrom != nil && (env.Name != "RACER_POD_IP" || !reflect.DeepEqual(env.ValueFrom, &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}})) {
 			t.Fatal("node identity must come from verified enrollment")
 		}
 	}
@@ -104,7 +106,7 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 }
 
 func TestWorkloadDataplaneEnvironment(t *testing.T) {
-	for _, port := range []uint16{8082, 7443, 65535} {
+	for _, port := range []uint16{8082, 7443, 9090, 9091, 65535} {
 		t.Run(strconv.Itoa(int(port)), func(t *testing.T) {
 			r := workloadFixture(t)
 			r.Config.PeerPort = port
@@ -118,17 +120,25 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 
 			env := map[string]string{}
 			for _, value := range container.Env {
-				if _, exists := env[value.Name]; exists || value.ValueFrom != nil {
-					t.Fatalf("duplicate or indirect configuration: %s", value.Name)
+				if _, exists := env[value.Name]; exists {
+					t.Fatalf("duplicate configuration: %s", value.Name)
 				}
 
 				env[value.Name] = value.Value
 			}
-			// These names are consumed by the existing Rust Config::from_lookup.
+
+			diagnosticsPort := "9090"
+			if port == 9090 {
+				diagnosticsPort = "9091"
+			}
+			// Rust Config::from_lookup consumes these settings after kubelet expands
+			// the Pod IP helper into the diagnostics address.
 			expected := map[string]string{
 				"RACER_CLUSTER_ID":            string(r.Config.Cluster),
 				"RACER_CONTROL_ENDPOINT":      r.Config.ControlURL,
 				"RACER_PEER_LISTEN":           "0.0.0.0:" + strconv.Itoa(int(port)),
+				"RACER_POD_IP":                "",
+				"RACER_DIAGNOSTICS_LISTEN":    "[$(RACER_POD_IP)]:" + diagnosticsPort,
 				"RACER_TRUST_BUNDLE":          "/etc/racer/bootstrap/ca.crt",
 				"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
 				"RACER_SECRET_DIRECTORY":      "/etc/racer/keyring",
@@ -149,6 +159,8 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				t.Fatal("listener disagrees with advertised peer port")
 			}
 
+			assertWorkloadReadiness(t, ds)
+
 			mounts := map[string]string{}
 			for _, mount := range container.VolumeMounts {
 				mounts[mount.Name] = mount.MountPath
@@ -166,6 +178,67 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// This contract also runs against API-defaulted objects in envtest.
+func assertWorkloadReadiness(t *testing.T, ds *appsv1.DaemonSet) {
+	t.Helper()
+
+	rolling := ds.Spec.UpdateStrategy.RollingUpdate
+	if ds.Spec.UpdateStrategy.Type != appsv1.RollingUpdateDaemonSetStrategyType || rolling == nil || rolling.MaxUnavailable == nil || *rolling.MaxUnavailable != intstr.FromInt32(1) || rolling.MaxSurge == nil || *rolling.MaxSurge != intstr.FromInt32(0) || ds.Spec.MinReadySeconds != 10 {
+		t.Fatal("rollout must wait for sustained readiness with at most one unavailable Pod")
+	}
+
+	container := ds.Spec.Template.Spec.Containers[0]
+
+	expected := &corev1.Probe{
+		ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("diagnostics"), Scheme: corev1.URISchemeHTTP}},
+		PeriodSeconds: 5, TimeoutSeconds: 2, SuccessThreshold: 1, FailureThreshold: 1,
+	}
+	if !reflect.DeepEqual(container.ReadinessProbe, expected) || container.LivenessProbe != nil || container.StartupProbe != nil {
+		t.Fatal("must probe actual Pod-IP readiness without dependency-driven restarts")
+	}
+
+	ports := map[string]int32{}
+
+	for _, port := range container.Ports {
+		if port.Protocol != corev1.ProtocolTCP || port.HostPort != 0 || port.HostIP != "" {
+			t.Fatal("listeners must use Pod TCP ports")
+		}
+
+		ports[port.Name] = port.ContainerPort
+	}
+
+	if ports["diagnostics"] == 0 || ports["diagnostics"] == ports["peer"] {
+		t.Fatal("diagnostics missing or collides with peer listener")
+	}
+
+	podIPSeen, diagnosticsSeen := false, false
+
+	for _, env := range container.Env {
+		switch env.Name {
+		case "RACER_POD_IP":
+			if podIPSeen || env.Value != "" || !reflect.DeepEqual(env.ValueFrom, &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}) {
+				t.Fatal("bind address must come from the downward API Pod IP")
+			}
+
+			podIPSeen = true
+		case "RACER_DIAGNOSTICS_LISTEN":
+			if !podIPSeen || diagnosticsSeen || env.ValueFrom != nil || env.Value != "[$(RACER_POD_IP)]:"+strconv.Itoa(int(ports["diagnostics"])) {
+				t.Fatal("diagnostics must expand the preceding Pod IP and match the probe port")
+			}
+
+			diagnosticsSeen = true
+		default:
+			if env.ValueFrom != nil {
+				t.Fatal("unexpected indirect configuration")
+			}
+		}
+	}
+
+	if !podIPSeen || !diagnosticsSeen {
+		t.Fatal("missing diagnostics bind configuration")
 	}
 }
 
@@ -199,6 +272,9 @@ func TestWorkloadReconcileCreateRepairAndNoop(t *testing.T) {
 	ds.Spec.Template.Annotations = map[string]string{"rollout": "preserve"}
 
 	ds.Spec.Template.Spec.Containers[0].Image = "drift"
+	ds.Spec.Template.Spec.Containers[0].ReadinessProbe = nil
+
+	ds.Spec.MinReadySeconds = 0
 	if err := r.Update(ctx, ds); err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +290,8 @@ func TestWorkloadReconcileCreateRepairAndNoop(t *testing.T) {
 	if ds.Spec.Template.Spec.Containers[0].Image != r.Config.DataplaneImage || ds.Annotations["operator"] != "preserve" || ds.Spec.Template.Annotations["rollout"] != "preserve" {
 		t.Fatal("repair lost metadata or failed")
 	}
+
+	assertWorkloadReadiness(t, ds)
 
 	version := ds.ResourceVersion
 

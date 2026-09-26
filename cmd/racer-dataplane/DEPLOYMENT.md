@@ -196,6 +196,24 @@ container creation as a readiness check. Use HTTP GET `/healthz`, `/readyz`, and
 `/metrics` as documented in `src/telemetry/INTEGRATION.md:46-50`, and allow startup
 time for control availability.
 
+The controller-managed DaemonSet overrides diagnostics to the downward API
+`status.podIP`, on TCP port 9090 (9091 if the peer port is 9090). Kubelet probes
+HTTP `/readyz` through the named `diagnostics` port every 5 seconds, with a
+2-second timeout and one failure withdrawing readiness. Allow node-to-Pod access
+to that port; `/healthz` and `/metrics` share the diagnostics listener. The bind
+template supports either Pod IP family, independently of peer listener configuration.
+Deploy a dataplane image containing the bracketed-IPv4 diagnostics parser together
+with this controller; older images reject the expanded IPv4 bind address.
+
+Rolling updates use `maxUnavailable: 1`, no surge, and `minReadySeconds: 10`:
+replacement Pods must sustain observed readiness across probe periods before
+the next replacement. The endpoint requires usable resources and fresh progress
+from every worker (`src/app_health.rs`). There is no liveness or startup probe:
+enrollment, storage recovery, or control unavailability must not trigger probe
+restart loops. Membership deliberately includes unready owned Pods so they can
+receive the snapshot needed to become ready. Reconciliation repairs probe,
+diagnostics configuration, and rollout-policy drift.
+
 SIGTERM/SIGINT initiate lifecycle shutdown (`src/app.rs:373-404`). Configure
 termination grace longer than `RACER_SHUTDOWN_TIMEOUT_MS` (default 30000) and
 allow completion fencing after admission stops. Do not delete identity, slabs,

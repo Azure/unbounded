@@ -73,6 +73,8 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		current.Spec.Template = desired.Spec.Template
 
 		current.Spec.UpdateStrategy = desired.Spec.UpdateStrategy
+
+		current.Spec.MinReadySeconds = desired.Spec.MinReadySeconds
 		if apiequality.Semantic.DeepEqual(before.Spec, current.Spec) {
 			return ctrl.Result{}, nil
 		}
@@ -117,10 +119,17 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 	}
 
 	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/managed-by": "racer-controller"}
+	// Keep diagnostics separate even when the configured peer port is 9090.
+	diagnosticsPort := int32(9090)
+	if c.PeerPort == uint16(diagnosticsPort) {
+		diagnosticsPort++
+	}
 
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels}, Spec: appsv1.DaemonSetSpec{
 		Selector:       &metav1.LabelSelector{MatchLabels: labels},
 		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: ptr.To(intstr.FromInt32(1)), MaxSurge: ptr.To(intstr.FromInt32(0))}},
+		// Require sustained readiness across probe periods before advancing a rollout.
+		MinReadySeconds: 10,
 		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
 			ServiceAccountName: c.DataplaneServiceAccount, AutomountServiceAccountToken: ptr.To(false),
 			RestartPolicy: corev1.RestartPolicyAlways, DNSPolicy: corev1.DNSClusterFirst, SchedulerName: corev1.DefaultSchedulerName,
@@ -135,6 +144,10 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 					{Name: "RACER_CLUSTER_ID", Value: string(c.Cluster)},
 					{Name: "RACER_CONTROL_ENDPOINT", Value: c.ControlURL},
 					{Name: "RACER_PEER_LISTEN", Value: "0.0.0.0:" + strconv.Itoa(int(c.PeerPort))},
+					// This is only a bind address, never an authority for node identity.
+					// Define it first so kubelet expands either Pod IP family below.
+					{Name: "RACER_POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}},
+					{Name: "RACER_DIAGNOSTICS_LISTEN", Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(diagnosticsPort))},
 					{Name: "RACER_TRUST_BUNDLE", Value: "/etc/racer/bootstrap/ca.crt"},
 					{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
 					{Name: "RACER_SECRET_DIRECTORY", Value: "/etc/racer/keyring"},
@@ -143,7 +156,13 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 					{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},
 					{Name: "RACER_SLAB_DIRECTORY", Value: "/var/lib/racer/slabs"},
 				},
-				Ports:           []corev1.ContainerPort{{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP}},
+				Ports: []corev1.ContainerPort{{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP}, {Name: "diagnostics", ContainerPort: diagnosticsPort, Protocol: corev1.ProtocolTCP}},
+				// Readiness may wait on enrollment/recovery indefinitely without probe
+				// restarts. Membership must continue to include unready Pods.
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("diagnostics"), Scheme: corev1.URISchemeHTTP}},
+					PeriodSeconds: 5, TimeoutSeconds: 2, SuccessThreshold: 1, FailureThreshold: 1,
+				},
 				SecurityContext: &corev1.SecurityContext{AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}},
 				VolumeMounts:    []corev1.VolumeMount{{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true}, {Name: "keyring", MountPath: "/etc/racer/keyring", ReadOnly: true}, {Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true}, {Name: "identity", MountPath: "/var/lib/racer/identity"}, {Name: "slabs", MountPath: "/var/lib/racer/slabs"}, {Name: "sockets", MountPath: "/run/racer"}},
 			}},

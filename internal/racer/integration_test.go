@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -78,8 +79,72 @@ func TestEnvtestServer(t *testing.T) {
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
 	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
+	t.Run("workload-readiness", func(t *testing.T) { integrationWorkloadReadiness(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })
 	t.Run("manager-election-HTTPS-failover", func(t *testing.T) { integrationManagers(t, rc, scheme, c) })
+}
+
+func integrationWorkloadReadiness(t *testing.T, c client.Client) {
+	a := integrationInstallation(t, c, "workload-readiness")
+	r := &WorkloadReconciler{Client: c, APIReader: c, Config: a.Topology.Config}
+	ctx := t.Context()
+	key := client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName}
+	ds := &appsv1.DaemonSet{}
+
+	for _, scenario := range []string{"create", "upgrade", "repair"} {
+		t.Run(scenario, func(t *testing.T) {
+			if scenario != "create" {
+				container := &ds.Spec.Template.Spec.Containers[0]
+				if scenario == "upgrade" {
+					container.ReadinessProbe = nil
+					container.Env = slices.DeleteFunc(container.Env, func(env corev1.EnvVar) bool {
+						return env.Name == "RACER_POD_IP" || env.Name == "RACER_DIAGNOSTICS_LISTEN"
+					})
+					container.Ports = container.Ports[:1]
+					ds.Spec.MinReadySeconds = 0
+				} else {
+					container.ReadinessProbe.HTTPGet.Path = "/healthz"
+					container.ReadinessProbe.HTTPGet.Host = "127.0.0.1"
+					container.LivenessProbe = container.ReadinessProbe.DeepCopy()
+					container.StartupProbe = container.ReadinessProbe.DeepCopy()
+					ds.Spec.MinReadySeconds = 1
+				}
+
+				ds.Spec.Template.Annotations = map[string]string{"rollout": "preserve"}
+				if err := c.Update(ctx, ds); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.Get(ctx, key, ds); err != nil {
+				t.Fatal(err)
+			}
+
+			assertWorkloadReadiness(t, ds)
+
+			if scenario != "create" && ds.Spec.Template.Annotations["rollout"] != "preserve" {
+				t.Fatal("repair lost rollout annotation")
+			}
+
+			version := ds.ResourceVersion
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.Get(ctx, key, ds); err != nil {
+				t.Fatal(err)
+			}
+
+			if ds.ResourceVersion != version {
+				t.Fatal("API defaults caused a repeated workload write")
+			}
+		})
+	}
 }
 
 func integrationInstallation(t *testing.T, c client.Client, namespace string) *Application {

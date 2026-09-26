@@ -20,7 +20,7 @@ most 4096 bytes, with no control characters.
 | `RACER_MAX_THREADS` | `8` | Total userspace thread cap, 2 through 256; odd caps floor to complete pairs |
 | `RACER_ENABLE_RDMA` | `false` | Optional RDMA; hardware/capability failure retains HTTP fallback |
 | `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Numeric local IP:port, IPv6 bracketed |
-| `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Numeric local IP:port, loopback by default |
+| `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Numeric local IP:port, loopback by default; brackets accepted for either IP family |
 | `RACER_TRUST_BUNDLE` | `/etc/racer/trust/ca.crt` | Deployment bootstrap/server CA file |
 | `RACER_SERVICE_ACCOUNT_TOKEN` | `/var/run/secrets/racer-control/token` | Projected token file with audience `racer-control` |
 | `RACER_SECRET_DIRECTORY` | `/etc/racer/keys` | Projected common keyring directory containing `bundle.json` |
@@ -36,6 +36,13 @@ are rejected if addresses match or either address is unspecified, conservatively
 covering dual-stack wildcard conflicts. A deployment exposing diagnostics outside
 loopback must explicitly change its address. The controller-managed peer port
 must match `RACER_PEER_LISTEN`; config does not publish membership endpoints.
+
+The managed DaemonSet overrides diagnostics with `[$(RACER_POD_IP)]:9090`
+(9091 when the peer port is 9090). Kubelet supplies `RACER_POD_IP` from
+`status.podIP` and expands it before process startup. Bracketed IPv4 is accepted
+for this family-independent template; ordinary IPv4 and bracketed IPv6 retain
+their existing syntax and validation. The dataplane does not expand environment
+references itself. `RACER_POD_IP` supplies only the bind address, never Node identity.
 
 All five paths must be absolute, non-root, canonical lexical paths: no empty,
 `.` or `..` components, repeated/trailing slashes, controls, components exceeding
