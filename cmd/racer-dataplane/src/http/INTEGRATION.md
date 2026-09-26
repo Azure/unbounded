@@ -63,6 +63,15 @@ idle timeout. Call `invalidate(endpoint)` on endpoint-generation changes and
 `expire_idle()` from lifecycle polling. `close()` stops checkout and closes idle
 sockets, while active operations retain their owners.
 
+Completed accepted-peer keepalives register a bounded idle readiness wait. Only
+`checkout_peer` may request reclamation of one such idle connection under global
+connection pressure, then wait for its cancellation fence before taking quota.
+Normal `checkout` remains fail-fast. This does not retry a submitted request.
+Queued next-header bytes exclude reclamation; partial headers and active exchanges
+are never registered as idle. Arrival after the empty-socket peek may race with
+pressure closure, as with any peer keepalive closure. Cancellation wins that race
+without consuming the arriving bytes, and FD/quota remain owned until fenced.
+
 Checkout moves the entire ConnectionLease into runtime
 `connect_with_lease<L: 'static>(fd, address, lease, scope) -> Operation<L>`.
 The reactor retains the FD, address, quota and connection slot through original

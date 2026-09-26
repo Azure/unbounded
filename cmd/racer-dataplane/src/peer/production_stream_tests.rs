@@ -19,24 +19,39 @@ impl Drop for Process {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_uses_fill_receive_capacity() {
-    sdk_fixture(false, false);
+    sdk_fixture(false, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sliding_range_waits_for_busy_peer_slots() {
-    sdk_fixture(true, false);
+    sdk_fixture(true, false, false, false);
 }
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_full_image_accepts_clients_with_idle_peer_capacity() {
-    sdk_fixture(true, true);
+    sdk_fixture(true, true, false, false);
 }
-fn sdk_fixture(busy_peers: bool, idle_pressure: bool) {
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_full_image_with_uniform_peer_memory_pressure() {
+    sdk_fixture(true, false, true, false);
+}
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_full_image_reclaims_accepted_peer_keepalives() {
+    sdk_fixture(true, false, true, true);
+}
+fn sdk_fixture(
+    busy_peers: bool,
+    idle_pressure: bool,
+    uniform_memory: bool,
+    incoming_pressure: bool,
+) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!(
-            "stream-sdk-{}-{busy_peers}-{idle_pressure}",
+            "stream-sdk-{}-{busy_peers}-{idle_pressure}-{uniform_memory}-{incoming_pressure}",
             std::process::id()
         ));
     fs::create_dir_all(&output).unwrap();
@@ -58,11 +73,25 @@ fn sdk_fixture(busy_peers: bool, idle_pressure: bool) {
         .unwrap();
     assert!(status.success(), "SDK fixture build: {status}");
     for warm in [true, false] {
-        run(warm, &binary, busy_peers, idle_pressure);
+        run(
+            warm,
+            &binary,
+            busy_peers,
+            idle_pressure,
+            uniform_memory,
+            incoming_pressure,
+        );
     }
     fs::remove_dir_all(output).unwrap();
 }
-fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bool) {
+fn run(
+    warm: bool,
+    binary: &std::path::Path,
+    busy_peers: bool,
+    idle_pressure: bool,
+    uniform_memory: bool,
+    incoming_pressure: bool,
+) {
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
     for signer in &signers {
@@ -183,13 +212,13 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
     // Four two-page windows must make progress without an eighth full-page charge.
     let nodes: Vec<_> = (0..4)
         .map(|i| {
-            build_node_with_peer_limit(
+            build_node_with_queue_limit(
                 i,
                 membership.clone(),
                 signers[i].clone(),
                 &discovery[i],
                 data.clone(),
-                if i == 0 { 6 } else { 63 },
+                if i == 0 || uniform_memory { 6 } else { 63 },
                 if busy_peers {
                     2
                 } else if i == 0 {
@@ -197,6 +226,9 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
                 } else {
                     64
                 },
+                // Match the live two-worker partition: 256 node entries / 2.
+                // Other variants retain their original sixteen-entry fixture.
+                if incoming_pressure { 128 } else { 16 },
             )
         })
         .collect();
@@ -281,6 +313,57 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
     .with_pool(nodes[0].pool.clone())
     .with_root(output.clone());
     let mut idle_servers = Vec::new();
+    let mut incoming_peers = Vec::new();
+    let incoming_idle: RefCell<FuturesUnordered<crate::error::Operation<'_, ()>>> =
+        RefCell::new(FuturesUnordered::new());
+    let ready_path = output.join("sdk-ready");
+    let release_path = output.join("sdk-release");
+    let mut pressure_seeded = false;
+    let mut seed_incoming = async || {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Called only after four SDK streams consumed their bootstrap pages.
+        // Fill the exact existing global quota, including reclaimable outbound
+        // idle slots, without requiring any new SDK acceptance under pressure.
+        for _ in 0..64 {
+            let mut peer =
+                std::net::TcpStream::connect(seed_listener.local_addr().unwrap()).unwrap();
+            let (socket, _) = seed_listener.accept().unwrap();
+            use std::io::Write;
+            let probe = crate::security::session::ChallengeProbe::new(
+                signers[1].node().clone(),
+                signers[0].node().clone(),
+            )
+            .unwrap()
+            .request_bytes();
+            // The public challenge endpoint is a real PeerServer exchange.
+            let body = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &probe);
+            peer.write_all(format!("POST /racer/peer/v1/challenge HTTP/1.1\r\ncontent-length: 0\r\nracer-probe: {body}\r\n\r\n").as_bytes()).unwrap();
+            let connection = match nodes[0].pool.accept(socket.into()) {
+                Ok(connection) => connection,
+                Err(Error::Overloaded) => break,
+                Err(error) => panic!("seed incoming: {error:?}"),
+            };
+            let connection = nodes[0]
+                .server
+                .serve_connection(connection, &scope)
+                .await
+                .unwrap();
+            assert!(connection.is_reusable());
+            let node = &nodes[0];
+            let scope = &scope;
+            incoming_idle.borrow_mut().push(Box::pin(async move {
+                let mut connection = connection;
+                loop {
+                    connection = node.server.serve_connection(connection, scope).await?;
+                    if !connection.is_reusable() {
+                        return Ok(());
+                    }
+                }
+            }));
+            incoming_peers.push(peer);
+        }
+        assert_eq!(nodes[0].admission.used(ResourceClass::Connection), 64);
+    };
     if idle_pressure {
         let (client_socket, origin_socket) = canonical_socket_paths("fixture").unwrap();
         drive(Box::pin(async {
@@ -352,6 +435,14 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
             ])
             .env("RACER_STREAM_SOCKET", socket)
             .env("RACER_STREAM_LAYERS", fixture)
+            .env(
+                "RACER_STREAM_BARRIER",
+                if incoming_pressure {
+                    output.as_os_str()
+                } else {
+                    std::ffi::OsStr::new("")
+                },
+            )
             .spawn()
             .unwrap(),
     );
@@ -361,7 +452,7 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
             let fd = Rc::new(OwnedFd::from(listener.try_clone().unwrap()));
             let scope = &scope;
             all.push(async move {
-                let mut active=FuturesUnordered::new();
+                let mut active: FuturesUnordered<crate::error::Operation<'_, ()>>=FuturesUnordered::new();
                 loop {
                     let accept=node.reactor.accept(fd.clone(),scope); futures::pin_mut!(accept);
                     let accepted=loop {
@@ -369,8 +460,12 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
                         use futures::FutureExt;
                         futures::select_biased! {_ = active.next().fuse()=>{}, result=accept.as_mut().fuse()=>break result}
                     }?;
-                    let mut connection=ConnectionLease::from_accepted(accepted,&node.admission)?;
-                    active.push(async move {loop {connection=node.server.serve_connection(connection,scope).await?; if !connection.is_reusable(){return Ok::<(),Error>(());}}});
+                    let mut connection=match node.pool.accept(accepted) {
+                        Ok(connection)=>connection,
+                        Err(Error::Overloaded) if incoming_pressure => continue,
+                        Err(error)=>return Err(error),
+                    };
+                    active.push(Box::pin(async move {loop {connection=node.server.serve_connection(connection,scope).await?; if !connection.is_reusable(){return Ok::<(),Error>(());}}}));
                 }
                 #[allow(unreachable_code)] Ok::<(),Error>(())
             });
@@ -381,6 +476,11 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
         let node = &nodes[0];
         let mut active = FuturesUnordered::new();
         loop {
+            if incoming_pressure && !pressure_seeded && ready_path.exists() {
+                seed_incoming().await;
+                pressure_seeded = true;
+                fs::write(&release_path, b"release").unwrap();
+            }
             if idle_pressure {
                 std::future::poll_fn(|cx| Poll::Ready(client_listeners.poll_budgeted(cx, 64)))
                     .await
@@ -424,6 +524,7 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
                 });
             }
             let finished = std::future::poll_fn(|cx| {
+                while let Poll::Ready(Some(_)) = incoming_idle.borrow_mut().poll_next_unpin(cx) {}
                 while let Poll::Ready(Some(result)) = active.poll_next_unpin(cx) {
                     eprintln!("client connection: {result:?}");
                 }
@@ -468,6 +569,12 @@ fn run(warm: bool, binary: &std::path::Path, busy_peers: bool, idle_pressure: bo
                 Poll::Pending
             }
         })));
+    }
+    if incoming_pressure {
+        assert!(
+            nodes[0].pool.incoming_reclaims.get() > 0,
+            "SDK must exercise accepted-peer reclamation"
+        );
     }
     for node in &nodes {
         node.pool.close();

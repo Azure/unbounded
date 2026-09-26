@@ -607,13 +607,26 @@ impl Reactor {
         scope: &'a RequestScope,
     ) -> Operation<'a, u32> {
         Box::pin(async move {
+            self.readiness_with_lease(fd, interest, (), scope)
+                .await
+                .map(|(ready, ())| ready)
+        })
+    }
+    pub(crate) fn readiness_with_lease<'a, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        interest: u32,
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, (u32, L)> {
+        Box::pin(async move {
             if interest == 0 || interest & !((libc::POLLIN | libc::POLLOUT) as u32) != 0 {
                 return Err(Error::InvalidRequest);
             }
             let sqe = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build();
             self.submit(sqe, scope, false, move |result| {
                 drop(fd);
-                Ok(result?.value()? as u32)
+                Ok((result?.value()? as u32, lease))
             })?
             .await
         })

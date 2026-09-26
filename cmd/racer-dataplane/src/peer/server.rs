@@ -160,7 +160,14 @@ impl PeerServer {
             // Clone the listener cancellation, but keep this cap out of dispatch
             // and response I/O, which use the signed request deadline below.
             let header_scope = header_scope(scope, self.request_timeout, Instant::now())?;
-            let mut received = self.io.receive_head(connection, &header_scope).await?;
+            let mut received = match &self.transfers {
+                Some(transfers) => {
+                    self.io
+                        .receive_peer_head(connection, &transfers.http, &header_scope)
+                        .await?
+                }
+                None => self.io.receive_head(connection, &header_scope).await?,
+            };
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())
                     .and_then(|n| n.checked_add(h.value.len()))

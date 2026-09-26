@@ -379,6 +379,25 @@ impl Rig {
         dirty_pages: usize,
         configure: Option<fn(&mut Limits)>,
     ) -> Self {
+        Self::with_worker(
+            length,
+            zero_ttl,
+            pages,
+            dirty_pages,
+            configure,
+            WorkerId(0),
+            None,
+        )
+    }
+    fn with_worker(
+        length: u64,
+        zero_ttl: bool,
+        pages: usize,
+        dirty_pages: usize,
+        configure: Option<fn(&mut Limits)>,
+        worker: WorkerId,
+        shared: Option<Arc<WorkerDirectory>>,
+    ) -> Self {
         let scratch = Scratch::new();
         fs::create_dir_all(scratch.path.join("production-fixture/origin")).unwrap();
         let origin_path = scratch.socket("production-fixture/origin/socket");
@@ -399,10 +418,10 @@ impl Rig {
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
-        let index = Rc::new(Index::new(WorkerId(0), 64));
-        let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
+        let index = Rc::new(Index::new(worker, 64));
+        let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
         let slabs = Rc::new(Slabs::new(
-            WorkerId(0),
+            worker,
             scratch.path.join("slabs"),
             reactor.clone(),
             512 * 1024 * 1024,
@@ -507,17 +526,19 @@ impl Rig {
             snapshot.caches[0].origin_socket,
             PathBuf::from("/run/racer/production-fixture/origin/socket")
         );
-        let (port, engine) = crypto::pair(WorkerId(0), 0, nz(64));
+        let (port, engine) = crypto::pair(worker, 0, nz(64));
         let crypto = Rc::new(CryptoClient::new(port));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                admission.limits().queue_entries.get(),
+        let directory = shared.unwrap_or_else(|| {
+            Arc::new(
+                WorkerDirectory::new(
+                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                    vec![WorkerId(0)],
+                    admission.limits().queue_entries.get(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+        });
         let flights = Rc::new(Flights::new(admission.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
@@ -565,8 +586,8 @@ impl Rig {
             streams,
             credentials,
         ));
-        let endpoint = RefCell::new(directory.install(WorkerId(0), coordinator.clone()).unwrap());
-        let dispatcher = Rc::new(Dispatcher::new(WorkerId(0), directory, coordinator));
+        let endpoint = RefCell::new(directory.install(worker, coordinator.clone()).unwrap());
+        let dispatcher = Rc::new(Dispatcher::new(worker, directory, coordinator));
         let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
@@ -849,6 +870,100 @@ fn concurrent_full_layer_streams_verify_every_byte() {
         "stream results: {results:?}"
     );
     assert!(joined.iter().all(std::result::Result::is_ok));
+}
+
+#[test]
+fn two_worker_bootstrap_and_concurrent_continuations_verify_bytes() {
+    let length = 4 * P + 113;
+    let workers = vec![WorkerId(0), WorkerId(1)];
+    let directory = Arc::new(
+        WorkerDirectory::new(
+            Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+            workers,
+            64,
+        )
+        .unwrap(),
+    );
+    let owners: std::collections::HashSet<_> = (0..5)
+        .map(|number| {
+            directory
+                .page_owner(&PageId {
+                    version: ObjectVersion {
+                        object: ObjectId {
+                            cache: CacheId(CACHE.into()),
+                            key: CacheKey([0xab; 32]),
+                        },
+                        etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+                    },
+                    number: PageNumber(number),
+                })
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(owners.len(), 2, "continuation must cross worker ownership");
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    thread::scope(|threads| {
+        let secondary_directory = directory.clone();
+        let secondary_stop = stop.clone();
+        let secondary_ready = ready.clone();
+        threads.spawn(move || {
+            let rig = Rig::with_worker(
+                length,
+                false,
+                8,
+                4,
+                None,
+                WorkerId(1),
+                Some(secondary_directory),
+            );
+            secondary_ready.wait();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !secondary_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                rig.tick();
+                rig.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            rig.flush();
+        });
+        let rig = Rig::with_worker(length, false, 8, 4, None, WorkerId(0), Some(directory));
+        ready.wait();
+        check(
+            &rig.request("GET", "Range: bytes=0-16777215\r\n"),
+            1,
+            0,
+            P,
+            length,
+        );
+        let mut sockets = Vec::new();
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let (local, mut remote) = UnixStream::pair().unwrap();
+            sockets.push(local);
+            readers.push(thread::spawn(move || {
+                remote
+                    .write_all(
+                        request("GET", "If-Match: \"v1\"\r\nRange: bytes=16777216-\r\n").as_bytes(),
+                    )
+                    .unwrap();
+                let reply = receive(remote, false);
+                check(&reply, 1, P, length, length);
+            }));
+        }
+        let results = rig.drive(futures::future::join_all(
+            sockets
+                .into_iter()
+                .map(|socket| async { rig.serve(socket, &scope()).await }),
+        ));
+        stop.store(true, Ordering::Release);
+        assert!(
+            results.iter().all(Result::is_ok),
+            "continuations: {results:?}"
+        );
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        rig.flush();
+    });
 }
 
 #[test]

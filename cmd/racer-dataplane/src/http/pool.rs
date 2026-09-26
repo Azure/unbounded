@@ -5,7 +5,7 @@ use crate::{
     model::limits::ResourceClass,
     runtime::{
         admission::{Admission, Reservation},
-        deadline::RequestScope,
+        deadline::{Cancellation, RequestScope},
         reactor::Reactor,
     },
 };
@@ -44,8 +44,15 @@ struct PoolState {
     closed: bool,
     waiters: BTreeMap<u64, PeerWaiter>,
     next_waiter: u64,
+    incoming_idle: Vec<Weak<IncomingIdle>>,
+}
+pub(crate) struct IncomingIdle {
+    fd: Weak<OwnedFd>,
+    pub(crate) scope: RequestScope,
+    _context: Reservation,
 }
 struct PeerWaiter {
+    global_capacity: bool,
     endpoint: Endpoint,
     scope: RequestScope,
     waker: Waker,
@@ -185,6 +192,8 @@ impl Drop for ConnectionLease {
 pub struct HttpPool {
     #[cfg(test)]
     pub(crate) peer_waits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) incoming_reclaims: std::cell::Cell<usize>,
     reactor: Rc<Reactor>,
     admission: Rc<Admission>,
     per_endpoint: usize,
@@ -193,6 +202,74 @@ pub struct HttpPool {
     state: Rc<RefCell<PoolState>>,
 }
 impl HttpPool {
+    /// Only the peer server calls this after a complete successful exchange.
+    pub(crate) fn register_incoming_idle(
+        &self,
+        connection: &ConnectionLease,
+        scope: &RequestScope,
+    ) -> Result<Rc<IncomingIdle>> {
+        if !connection.is_reusable() || connection.pool.is_some() {
+            return Err(Error::InvalidRequest);
+        }
+        let mut state = self.state.borrow_mut();
+        state
+            .incoming_idle
+            .retain(|entry| entry.strong_count() != 0);
+        if state.closed
+            || state.incoming_idle.len() >= self.admission.limits().client_connections.get()
+        {
+            return Err(Error::Overloaded);
+        }
+        let mut idle_scope = scope.clone();
+        idle_scope.cancellation = Cancellation::new()?;
+        let idle = Rc::new(IncomingIdle {
+            fd: Rc::downgrade(&connection.fd),
+            scope: idle_scope,
+            _context: self.admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                std::mem::size_of::<IncomingIdle>(),
+            )?,
+        });
+        state.incoming_idle.push(Rc::downgrade(&idle));
+        Ok(idle)
+    }
+    fn reclaim_incoming_idle(&self) -> Result<bool> {
+        let candidates: Vec<_> = self
+            .state
+            .borrow()
+            .incoming_idle
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for idle in candidates {
+            if idle.scope.cancellation.is_cancelled() {
+                continue;
+            }
+            let Some(fd) = idle.fd.upgrade() else {
+                continue;
+            };
+            let mut byte = 0u8;
+            // Readiness never consumes bytes. A partial/new head excludes this
+            // connection from reclamation even before its task observes readiness.
+            let count = unsafe {
+                libc::recv(
+                    fd.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if count < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+            {
+                idle.scope.cancel()?;
+                #[cfg(test)]
+                self.incoming_reclaims.set(self.incoming_reclaims.get() + 1);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Accept into the same worker quota as outbound traffic. A completed idle
     /// exchange may yield its slot before a new client or neighbor is rejected.
     /// The accepted FD is retained across the admission retry.
@@ -231,6 +308,8 @@ impl HttpPool {
         Self {
             #[cfg(test)]
             peer_waits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            incoming_reclaims: std::cell::Cell::new(0),
             reactor,
             admission,
             per_endpoint,
@@ -242,6 +321,7 @@ impl HttpPool {
                 closed: false,
                 waiters: BTreeMap::new(),
                 next_waiter: 0,
+                incoming_idle: Vec::new(),
             })),
         }
     }
@@ -299,6 +379,7 @@ impl HttpPool {
                     state.waiters.insert(
                         id,
                         PeerWaiter {
+                            global_capacity: false,
                             endpoint: endpoint.clone(),
                             scope: scope.clone(),
                             waker: cx.waker().clone(),
@@ -315,7 +396,7 @@ impl HttpPool {
             })
             .await?;
             drop(registration);
-            self.checkout(endpoint, scope).await
+            self.checkout_inner(endpoint, scope, true).await
         })
     }
     /// Worker timer tick wakes expired peer admission waiters, even if every
@@ -326,7 +407,12 @@ impl HttpPool {
             .borrow()
             .waiters
             .values()
-            .filter(|waiter| waiter.scope.check().is_err())
+            .filter(|waiter| {
+                waiter.scope.check().is_err()
+                    || (waiter.global_capacity
+                        && self.admission.used(ResourceClass::Connection)
+                            < self.admission.limit(ResourceClass::Connection))
+            })
             .map(|waiter| waiter.waker.clone())
             .collect();
         for wake in wakes {
@@ -339,6 +425,14 @@ impl HttpPool {
         &'a self,
         endpoint: &'a Endpoint,
         scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        self.checkout_inner(endpoint, scope, false)
+    }
+    fn checkout_inner<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        scope: &'a RequestScope,
+        reclaim_incoming: bool,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
@@ -389,7 +483,76 @@ impl HttpPool {
                     ));
                 }
             }
-            let reservation = self.reserve_connection()?;
+            let reservation = match self.reserve_connection() {
+                Err(Error::Overloaded) if reclaim_incoming && self.reclaim_incoming_idle()? => {
+                    // Wait only for the selected idle owner's completion fence.
+                    // No connection/request has been submitted or retried here.
+                    let mut registration: Option<PeerWaitRegistration> = None;
+                    let cancellation = scope.cancellation.subscribe()?;
+                    std::future::poll_fn(|cx| {
+                        cancellation.register(cx.waker());
+                        scope.check()?;
+                        if self.state.borrow().closed {
+                            return Poll::Ready(Err(Error::Unavailable));
+                        }
+                        match self.reserve_connection() {
+                            Err(Error::Overloaded) => {
+                                let mut state = self.state.borrow_mut();
+                                if let Some(registration) = &registration {
+                                    state
+                                        .waiters
+                                        .get_mut(&registration.id)
+                                        .ok_or(Error::Internal)?
+                                        .waker
+                                        .clone_from(cx.waker());
+                                } else {
+                                    if state.waiters.len()
+                                        >= self.admission.limits().queue_entries.get()
+                                    {
+                                        return Poll::Ready(Err(Error::Overloaded));
+                                    }
+                                    let id = state
+                                        .next_waiter
+                                        .checked_add(1)
+                                        .ok_or(Error::Overloaded)?;
+                                    let permit =
+                                        self.admission.reserve(None, ResourceClass::Waiter, 1)?;
+                                    let context = self.admission.reserve(
+                                        None,
+                                        ResourceClass::RequestContext,
+                                        std::mem::size_of::<PeerWaiter>()
+                                            + std::mem::size_of::<PeerWaitRegistration>()
+                                            + match endpoint {
+                                                Endpoint::Peer(value) => value.len(),
+                                                Endpoint::Unix(value) => value.as_os_str().len(),
+                                            },
+                                    )?;
+                                    state.next_waiter = id;
+                                    state.waiters.insert(
+                                        id,
+                                        PeerWaiter {
+                                            global_capacity: true,
+                                            endpoint: endpoint.clone(),
+                                            scope: scope.clone(),
+                                            waker: cx.waker().clone(),
+                                        },
+                                    );
+                                    registration = Some(PeerWaitRegistration {
+                                        state: Rc::downgrade(&self.state),
+                                        id,
+                                        _reservation: permit,
+                                        _context: context,
+                                    });
+                                }
+                                Poll::Pending
+                            }
+                            result => Poll::Ready(result),
+                        }
+                    })
+                    .await?
+                }
+                result => result?,
+            };
             let (fd, address) = create_socket(endpoint)?;
             let connection = ConnectionLease::new(Rc::new(fd), reservation, slot.0.take());
             // Retain socket, admission and pool slot in the reactor through the

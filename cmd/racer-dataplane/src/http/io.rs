@@ -172,6 +172,43 @@ impl HttpIo {
     ) -> Operation<'a, HeadCompletion<MessageHead>> {
         self.receive_head_limited(connection, scope, self.codec.header_limit())
     }
+    /// Preserve the connection and quota through the non-consuming idle wait's
+    /// cancellation fence. Once any bytes arrive the normal fixed head budget
+    /// resumes, with no idle registration capable of canceling a partial head.
+    pub(crate) fn receive_peer_head<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        pool: &'a super::pool::HttpPool,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HeadCompletion<MessageHead>> {
+        Box::pin(async move {
+            if connection.is_reusable() {
+                let parent_cancellation = scope.cancellation.subscribe()?;
+                let idle = pool.register_incoming_idle(&connection, scope)?;
+                let mut wait = self.reactor.readiness_with_lease(
+                    connection.socket(),
+                    libc::POLLIN as u32,
+                    (connection, idle.clone()),
+                    &idle.scope,
+                );
+                let result = std::future::poll_fn(|cx| {
+                    parent_cancellation.register(cx.waker());
+                    if scope.check().is_err() {
+                        let _ = idle.scope.cancel();
+                    }
+                    wait.as_mut().poll(cx)
+                })
+                .await;
+                drop(wait);
+                drop(idle);
+                let (_, (connection, registration)) = result?;
+                drop(registration);
+                scope.check()?;
+                return self.receive_head(connection, scope).await;
+            }
+            self.receive_head(connection, scope).await
+        })
+    }
     /// Applies a caller's smaller head cap before receiving/allocating a head.
     /// Client/origin adapters use 32 KiB even if another protocol raises its cap.
     pub fn receive_head_limited<'a>(

@@ -41,6 +41,14 @@ the budget. Application assembly supplies `Config.request_timeout`; the construc
 default is 30 seconds. Expiry closes the connection, retaining I/O resources and
 admission charges until completion is fenced.
 
+After a completed exchange, global outbound connection pressure may close an
+idle accepted peer before that deadline. An empty-socket peek is the reclamation
+decision point: queued bytes protect the next head, while bytes arriving after
+the peek can race with closure. The idle wait is non-consuming and cancellation
+is fenced before releasing its connection charge. First exchanges, partial heads,
+and active responses do not enter this idle registry. Deadlines remain upper
+bounds, not promises that keepalives remain open.
+
 After the head, authenticated requests retain the existing signed request deadline
 policy, bounded by the listener deadline, for dispatch and response transfer. The
 header cap does not bound the whole response or reset the signed request budget.

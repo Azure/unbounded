@@ -225,7 +225,30 @@ fn build_node_with_peer_limit(
     concurrency: usize,
     peer_limit: usize,
 ) -> Node {
+    build_node_with_queue_limit(
+        i,
+        membership,
+        signer,
+        discovery,
+        data,
+        concurrency,
+        peer_limit,
+        16,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn build_node_with_queue_limit(
+    i: usize,
+    membership: Arc<Membership>,
+    signer: Rc<Signatures>,
+    discovery: &Discovery,
+    data: Rc<Data>,
+    concurrency: usize,
+    peer_limit: usize,
+    queue_limit: usize,
+) -> Node {
     let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.queue_entries = NonZeroUsize::new(queue_limit).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
     limits.plaintext_bytes = NonZeroUsize::new((concurrency + 3) * P).unwrap();
     limits.dirty_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
@@ -401,7 +424,8 @@ fn build_node_with_peer_limit(
     let server = server::PeerServer::new(io, auth, admission.clone(), coordinator.clone(), relay)
         .with_network(network)
         .with_wire(codec)
-        .with_handshake(handshake);
+        .with_handshake(handshake)
+        .with_transfers(transfers.clone());
     let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
     let responses = Rc::new(crate::client::response::Responses::new(
         client_io.clone(),
