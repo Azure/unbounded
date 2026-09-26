@@ -4,7 +4,7 @@
 use super::{BufferOperation, CANCEL_BIT, Descriptor, KernelResult, SocketAddress};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::CString,
     io,
     path::{Path, PathBuf},
@@ -12,6 +12,25 @@ use std::{
 };
 
 thread_local! { static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) }; }
+
+#[path = "simulation_disk.rs"]
+mod disk;
+pub use disk::{CrashDisk, DiskState};
+#[cfg(test)]
+#[path = "simulation_disk_tests.rs"]
+mod disk_tests;
+
+/// Labels new outbound streams with their owning node's listening endpoint.
+/// Enter this scope when polling that node; established sockets retain the label.
+pub struct EndpointEnvironment {
+    sim: Simulation,
+    previous: Option<SocketAddress>,
+}
+impl Drop for EndpointEnvironment {
+    fn drop(&mut self) {
+        self.sim.0.borrow_mut().endpoint = self.previous.take();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Simulation(Rc<RefCell<World>>);
@@ -50,9 +69,13 @@ struct World {
     datagrams: BTreeMap<std::net::SocketAddr, u64>,
     faults: VecDeque<(String, Fault)>,
     trace: Vec<Event>,
+    next_event: u64,
     stream_capacity: usize,
     max_chunk: usize,
     executing: bool,
+    endpoint: Option<SocketAddress>,
+    partitions: BTreeSet<(SocketAddress, SocketAddress)>,
+    disk: disk::State,
 }
 #[derive(Debug)]
 enum Resource {
@@ -60,6 +83,8 @@ enum Resource {
         peer: Option<u64>,
         bytes: VecDeque<u8>,
         connected: bool,
+        local: Option<SocketAddress>,
+        remote: Option<SocketAddress>,
     },
     Datagram {
         address: std::net::SocketAddr,
@@ -73,6 +98,7 @@ enum Resource {
         node: Rc<RefCell<Node>>,
         flags: i32,
         lock_owner: bool,
+        opened_path: PathBuf,
     },
     Pipe {
         bytes: Rc<RefCell<VecDeque<u8>>>,
@@ -85,7 +111,7 @@ struct Node {
     inode: u64,
     mode: u16,
     length: u64,
-    pages: BTreeMap<u64, Box<[u8; 4096]>>,
+    pages: BTreeMap<u64, Rc<[u8; 4096]>>,
     locked: bool,
     symlink: Option<PathBuf>,
 }
@@ -122,6 +148,13 @@ fn errno(n: i32) -> io::Error {
     io::Error::from_raw_os_error(n)
 }
 impl World {
+    fn partitioned(&self, a: &SocketAddress, b: &SocketAddress) -> bool {
+        self.partitions
+            .contains(&endpoint_pair(a.clone(), b.clone()))
+    }
+    fn stream_partitioned(&self, id: u64) -> bool {
+        matches!(self.resources.get(&id), Some(Resource::Socket { local: Some(a), remote: Some(b), .. }) if self.partitioned(a,b))
+    }
     fn id(&mut self) -> u64 {
         let id = self.next;
         self.next += 1;
@@ -129,11 +162,12 @@ impl World {
     }
     fn record(&mut self, op: &str, resource: u64, result: i64) {
         self.trace.push(Event {
-            sequence: self.trace.len() as u64,
+            sequence: self.next_event,
             operation: op.into(),
             resource,
             result,
         });
+        self.next_event += 1;
     }
     fn fault(&mut self, op: &str) -> Option<Fault> {
         if self.executing {
@@ -164,6 +198,9 @@ impl World {
                 let Some(Resource::File { node, .. }) = self.resources.get(&h.id) else {
                     return Err(errno(libc::ENOTDIR));
                 };
+                if node.borrow().mode as u32 & libc::S_IFMT != libc::S_IFDIR {
+                    return Err(errno(libc::ENOTDIR));
+                }
                 self.paths
                     .iter()
                     .find(|(_, n)| Rc::ptr_eq(n, node))
@@ -234,6 +271,9 @@ impl World {
         Err(errno(libc::ELOOP))
     }
 }
+fn endpoint_pair(a: SocketAddress, b: SocketAddress) -> (SocketAddress, SocketAddress) {
+    if a <= b { (a, b) } else { (b, a) }
+}
 fn normalize(path: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::from("/");
     for component in path.components() {
@@ -256,11 +296,16 @@ impl Simulation {
             datagrams: BTreeMap::new(),
             faults: VecDeque::new(),
             trace: Vec::new(),
+            next_event: 0,
             stream_capacity: 64 * 1024,
             max_chunk: usize::MAX,
             executing: false,
+            endpoint: None,
+            partitions: BTreeSet::new(),
+            disk: disk::State::default(),
         })));
         sim.create_dir_all(Path::new("/")).unwrap();
+        sim.disk().sync_all().unwrap();
         sim
     }
     /// Selection is worker-thread scoped. Reactors and descriptors retain their
@@ -272,6 +317,67 @@ impl Simulation {
     }
     pub fn current() -> Option<Self> {
         CURRENT.with(|s| s.borrow().clone())
+    }
+    pub fn disk(&self) -> CrashDisk {
+        CrashDisk(self.clone())
+    }
+    pub fn enter_endpoint(&self, endpoint: SocketAddress) -> EndpointEnvironment {
+        let previous = self.0.borrow_mut().endpoint.replace(endpoint);
+        EndpointEnvironment {
+            sim: self.clone(),
+            previous,
+        }
+    }
+    /// Symmetric blackhole: existing streams and future connects stall until heal
+    /// or their normal production deadlines/cancellation. Received bytes remain
+    /// readable; a partition does not manufacture EOF or discard accepted bytes.
+    pub fn partition(&self, a: SocketAddress, b: SocketAddress) {
+        let mut w = self.0.borrow_mut();
+        w.partitions.insert(endpoint_pair(a, b));
+        w.record("partition", 0, 0);
+    }
+    pub fn heal(&self, a: SocketAddress, b: SocketAddress) {
+        let mut w = self.0.borrow_mut();
+        w.partitions.remove(&endpoint_pair(a, b));
+        w.record("heal", 0, 0);
+    }
+    /// Assign labels to a preexisting socket pair or a socket created outside a
+    /// node scope. Updates the opposite endpoint too, including pending accepts.
+    pub fn label_stream(
+        &self,
+        fd: &Descriptor,
+        local: SocketAddress,
+        remote: SocketAddress,
+    ) -> io::Result<()> {
+        let Descriptor::Sim(h) = fd else {
+            return Err(errno(libc::EXDEV));
+        };
+        if !Rc::ptr_eq(&self.0, &h.sim.0) {
+            return Err(errno(libc::EXDEV));
+        }
+        let mut w = self.0.borrow_mut();
+        let Some(Resource::Socket {
+            peer,
+            local: a,
+            remote: b,
+            ..
+        }) = w.resources.get_mut(&h.id)
+        else {
+            return Err(errno(libc::ENOTSOCK));
+        };
+        *a = Some(local.clone());
+        *b = Some(remote.clone());
+        let peer = *peer;
+        if let Some(Resource::Socket {
+            local: a,
+            remote: b,
+            ..
+        }) = peer.and_then(|id| w.resources.get_mut(&id))
+        {
+            *a = Some(remote);
+            *b = Some(local);
+        }
+        Ok(())
     }
     pub fn inject(&self, operation: &str, fault: Fault) {
         if let Fault::Errno(errno) = &fault {
@@ -336,10 +442,13 @@ impl Simulation {
         if ![libc::AF_INET, libc::AF_INET6, libc::AF_UNIX].contains(&domain) {
             return Err(errno(libc::EAFNOSUPPORT));
         }
+        let local = self.0.borrow().endpoint.clone();
         Ok(self.insert(Resource::Socket {
             peer: None,
             bytes: VecDeque::new(),
             connected: false,
+            local,
+            remote: None,
         }))
     }
     pub fn bind_datagram(&self, mut address: std::net::SocketAddr) -> io::Result<Descriptor> {
@@ -487,7 +596,7 @@ impl Simulation {
                 _ => return Err(errno(libc::EXDEV)),
             }
         }
-        let node = {
+        let (node, opened_path) = {
             let mut w = self.0.borrow_mut();
             if let Some(Fault::Errno(n)) = w.fault("open") {
                 return Err(errno(n));
@@ -536,15 +645,22 @@ impl Simulation {
             }
             if flags & libc::O_TRUNC != 0 {
                 let mut n = node.borrow_mut();
+                if n.mode as u32 & libc::S_IFMT != libc::S_IFREG {
+                    return Err(errno(libc::EISDIR));
+                }
+                if flags & libc::O_ACCMODE == libc::O_RDONLY {
+                    return Err(errno(libc::EINVAL));
+                }
                 n.pages.clear();
                 n.length = 0;
             }
-            node
+            (node, path)
         };
         Ok(self.insert(Resource::File {
             node,
             flags,
             lock_owner: false,
+            opened_path,
         }))
     }
     pub fn write_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -612,8 +728,29 @@ impl Simulation {
         }
         let from = normalize(from)?;
         let to = normalize(to)?;
+        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) != 0
+            || flags == (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
+        {
+            return Err(errno(libc::EINVAL));
+        }
         if !w.paths.contains_key(&from) {
             return Err(errno(libc::ENOENT));
+        }
+        if from == to {
+            return Ok(());
+        }
+        if from == Path::new("/") || to == Path::new("/") {
+            return Err(errno(libc::EBUSY));
+        }
+        let parent = w
+            .paths
+            .get(to.parent().unwrap())
+            .ok_or_else(|| errno(libc::ENOENT))?;
+        if parent.borrow().mode as u32 & libc::S_IFMT != libc::S_IFDIR {
+            return Err(errno(libc::ENOTDIR));
+        }
+        if to.starts_with(&from) || from.starts_with(&to) {
+            return Err(errno(libc::EINVAL));
         }
         if flags & libc::RENAME_NOREPLACE != 0 && w.paths.contains_key(&to) {
             return Err(errno(libc::EEXIST));
@@ -621,10 +758,69 @@ impl Simulation {
         if flags & libc::RENAME_EXCHANGE != 0 && !w.paths.contains_key(&to) {
             return Err(errno(libc::ENOENT));
         }
+        if flags & libc::RENAME_EXCHANGE == 0
+            && let Some(target) = w.paths.get(&to)
+        {
+            let source_dir = w.paths[&from].borrow().mode as u32 & libc::S_IFMT == libc::S_IFDIR;
+            let target_dir = target.borrow().mode as u32 & libc::S_IFMT == libc::S_IFDIR;
+            if source_dir != target_dir {
+                return Err(errno(if source_dir {
+                    libc::ENOTDIR
+                } else {
+                    libc::EISDIR
+                }));
+            }
+            if target_dir && w.paths.keys().any(|p| p != &to && p.starts_with(&to)) {
+                return Err(errno(libc::ENOTEMPTY));
+            }
+        }
+        let descendants: Vec<_> = w
+            .paths
+            .iter()
+            .filter_map(|(path, node)| {
+                if path != &from && path.starts_with(&from) {
+                    Some((
+                        path.clone(),
+                        to.join(path.strip_prefix(&from).unwrap()),
+                        node.clone(),
+                    ))
+                } else if flags & libc::RENAME_EXCHANGE != 0 && path != &to && path.starts_with(&to)
+                {
+                    Some((
+                        path.clone(),
+                        from.join(path.strip_prefix(&to).unwrap()),
+                        node.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (path, _, _) in &descendants {
+            w.paths.remove(path);
+        }
+        for (_, path, node) in descendants {
+            w.paths.insert(path, node);
+        }
         let source = w.paths.remove(&from).unwrap();
         let target = w.paths.insert(to.clone(), source);
         if flags & libc::RENAME_EXCHANGE != 0 {
             w.paths.insert(from.clone(), target.unwrap());
+        }
+        // Keep open-description crash ownership attached to the moved inode.
+        let locations: BTreeMap<_, _> = w
+            .paths
+            .iter()
+            .map(|(path, node)| (node.borrow().inode, path.clone()))
+            .collect();
+        for resource in w.resources.values_mut() {
+            if let Resource::File {
+                node, opened_path, ..
+            } = resource
+                && let Some(path) = locations.get(&node.borrow().inode)
+            {
+                *opened_path = path.clone();
+            }
         }
         let a = w.listeners.remove(&SocketAddress::Unix(from.clone()));
         let b = w.listeners.remove(&SocketAddress::Unix(to.clone()));
@@ -645,6 +841,12 @@ impl Simulation {
             return Err(errno(n));
         }
         let path = normalize(path)?;
+        if w.paths
+            .get(&path)
+            .is_some_and(|n| n.borrow().mode as u32 & libc::S_IFMT == libc::S_IFDIR)
+        {
+            return Err(errno(libc::EISDIR));
+        }
         w.paths.remove(&path).ok_or_else(|| errno(libc::ENOENT))?;
         w.listeners.remove(&SocketAddress::Unix(path));
         w.record("unlink", 0, 0);
@@ -736,6 +938,13 @@ impl Handle {
     }
     pub fn connect(&self, address: &SocketAddress) -> io::Result<()> {
         let mut w = self.sim.0.borrow_mut();
+        let local = match w.resources.get(&self.id) {
+            Some(Resource::Socket { local, .. }) => local.clone(),
+            _ => return Err(errno(libc::ENOTSOCK)),
+        };
+        if local.as_ref().is_some_and(|a| w.partitioned(a, address)) {
+            return Err(errno(libc::EAGAIN));
+        }
         let listener = *w
             .listeners
             .get(address)
@@ -756,14 +965,20 @@ impl Handle {
                 peer: Some(self.id),
                 bytes: VecDeque::new(),
                 connected: true,
+                local: Some(address.clone()),
+                remote: local,
             },
         );
         if let Resource::Socket {
-            peer: p, connected, ..
+            peer: p,
+            connected,
+            remote,
+            ..
         } = w.resources.get_mut(&self.id).unwrap()
         {
             *p = Some(peer);
             *connected = true;
+            *remote = Some(address.clone());
         }
         let Some(Resource::Listener { pending }) = w.resources.get_mut(&listener) else {
             return Err(errno(libc::ECONNREFUSED));
@@ -806,6 +1021,9 @@ impl Handle {
                 libc::ENOTCONN
             })
         })?;
+        if !bytes.is_empty() && w.stream_partitioned(self.id) {
+            return Err(errno(libc::EAGAIN));
+        }
         let Some(Resource::Socket { bytes: output, .. }) = w.resources.get_mut(&peer) else {
             return Err(errno(libc::EPIPE));
         };
@@ -869,7 +1087,7 @@ impl Handle {
                 let remote = peer.and_then(|id| w.resources.get(&id));
                 let mut flags = if bytes.is_empty() { 0 } else { libc::POLLIN };
                 if let Some(Resource::Socket { bytes, .. }) = remote {
-                    if bytes.len() < w.stream_capacity {
+                    if bytes.len() < w.stream_capacity && !w.stream_partitioned(self.id) {
                         flags |= libc::POLLOUT;
                     }
                 } else {
@@ -908,8 +1126,21 @@ impl Handle {
         Ok(stat)
     }
     pub fn set_len(&self, length: u64) -> io::Result<()> {
-        let (node, _) = self.node()?;
-        node.borrow_mut().length = length;
+        let (node, flags) = self.node()?;
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(errno(libc::EBADF));
+        }
+        let mut node = node.borrow_mut();
+        if node.mode as u32 & libc::S_IFMT != libc::S_IFREG {
+            return Err(errno(libc::EINVAL));
+        }
+        node.pages.retain(|page, _| *page < length.div_ceil(4096));
+        if !length.is_multiple_of(4096)
+            && let Some(page) = node.pages.get_mut(&(length / 4096))
+        {
+            Rc::make_mut(page)[(length % 4096) as usize..].fill(0);
+        }
+        node.length = length;
         Ok(())
     }
     pub fn lock(&self) -> io::Result<()> {
@@ -979,9 +1210,11 @@ impl Handle {
         }
         for (index, byte) in bytes.iter().enumerate() {
             let pos = offset + index as u64;
-            node.pages
-                .entry(pos / 4096)
-                .or_insert_with(|| Box::new([0; 4096]))[(pos % 4096) as usize] = *byte;
+            Rc::make_mut(
+                node.pages
+                    .entry(pos / 4096)
+                    .or_insert_with(|| Rc::new([0; 4096])),
+            )[(pos % 4096) as usize] = *byte;
         }
         node.length = node.length.max(end);
         Ok(bytes.len())
@@ -1118,6 +1351,41 @@ pub(super) enum Op {
     },
 }
 impl Op {
+    fn disk_paths(&self, sim: &Simulation) -> Vec<PathBuf> {
+        let w = sim.0.borrow();
+        let file_path = |fd: &Descriptor| match fd {
+            Descriptor::Sim(h) => match w.resources.get(&h.id) {
+                Some(Resource::File { opened_path, .. }) => Some(opened_path.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let path = |dir: Option<&Descriptor>, name: &CString| {
+            use std::os::unix::ffi::OsStrExt;
+            w.path(dir, Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())))
+                .ok()
+        };
+        match self {
+            Self::Buffer {
+                fd,
+                operation: BufferOperation::Read(_) | BufferOperation::Write(_),
+                ..
+            }
+            | Self::Stat { fd, .. }
+            | Self::Sync(fd) => file_path(fd).into_iter().collect(),
+            Self::Open {
+                dir, path: name, ..
+            } => path(dir.as_deref(), name).into_iter().collect(),
+            Self::Mkdir { dir, name } | Self::Unlink { dir, name } => {
+                path(Some(dir), name).into_iter().collect()
+            }
+            Self::Rename { dir, from, to } => [path(Some(dir), from), path(Some(dir), to)]
+                .into_iter()
+                .flatten()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     fn name(&self) -> &'static str {
         match self {
             Self::Buffer { operation, .. } => match operation {
@@ -1217,6 +1485,10 @@ impl Op {
             }
             Self::Sync(fd) => {
                 h(fd)?;
+                let Descriptor::Sim(fd) = &**fd else {
+                    unreachable!()
+                };
+                fd.sync()?;
                 Ok(KernelResult::Value(0))
             }
             Self::Mkdir { dir, name } => {
@@ -1251,6 +1523,8 @@ struct Pending {
     delay: usize,
     limit: usize,
     error: Option<i32>,
+    disk_generation: u64,
+    disk_paths: Vec<PathBuf>,
 }
 pub(super) struct Driver {
     sim: Simulation,
@@ -1269,6 +1543,8 @@ impl Driver {
         let name = op.name();
         let fault = self.sim.0.borrow_mut().fault(name);
         let mut pending = Pending {
+            disk_generation: self.sim.0.borrow().disk.generation,
+            disk_paths: op.disk_paths(&self.sim),
             op,
             delay: 0,
             limit: usize::MAX,
@@ -1314,6 +1590,15 @@ impl Driver {
             let injected = operation.error.take();
             let result = match injected {
                 Some(n) => Err(errno(n)),
+                None if self
+                    .sim
+                    .0
+                    .borrow()
+                    .disk
+                    .crashed_since(operation.disk_generation, &operation.disk_paths) =>
+                {
+                    Err(errno(libc::EIO))
+                }
                 None => operation.op.execute(&self.sim, operation.limit),
             };
             self.sim.0.borrow_mut().executing = false;
@@ -1328,6 +1613,7 @@ impl Driver {
                                 ..
                             } | Op::Poll { .. }
                                 | Op::Accept(_)
+                                | Op::Connect { .. }
                         ) =>
                 {
                     ()
