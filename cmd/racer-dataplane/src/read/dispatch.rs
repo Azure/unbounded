@@ -183,6 +183,38 @@ pub struct WorkerEndpoint {
 }
 
 impl WorkerDirectory {
+    /// A simulated process loss discards queued messages, including the permit
+    /// whose Arc otherwise forms a mailbox -> command -> mailbox ownership cycle.
+    /// Do not execute commands or mark kernel/NIC operations complete here.
+    #[cfg(test)]
+    pub(crate) fn simulation_crash(&self) {
+        for mailbox in &self.mailboxes {
+            let commands = {
+                let mut state = mailbox.state.lock().unwrap();
+                state.closed = true;
+                std::mem::take(&mut state.queue)
+            };
+            drop(commands);
+        }
+    }
+    /// Select a logical worker on the single-threaded simulation scheduler.
+    /// Production gets this isolation from its owning OS thread.
+    #[cfg(test)]
+    pub(crate) fn simulation_scope(
+        &self,
+        local: Option<(WorkerId, Rc<Coordinator>)>,
+    ) -> SimulationLocal {
+        let key = self as *const Self as usize;
+        let previous = LOCALS.with(|locals| {
+            let mut locals = locals.borrow_mut();
+            let previous = locals.remove(&key);
+            if let Some((worker, local)) = local {
+                locals.insert(key, (worker, Rc::downgrade(&local)));
+            }
+            previous
+        });
+        SimulationLocal { key, previous }
+    }
     pub fn new(map: Arc<WorkerMap>, workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
         if workers.is_empty()
             || capacity == 0
@@ -560,7 +592,33 @@ impl WorkerDirectory {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct SimulationLocal {
+    key: usize,
+    previous: Option<(WorkerId, std::rc::Weak<Coordinator>)>,
+}
+#[cfg(test)]
+impl Drop for SimulationLocal {
+    fn drop(&mut self) {
+        LOCALS.with(|locals| {
+            let mut locals = locals.borrow_mut();
+            locals.remove(&self.key);
+            if let Some(previous) = self.previous.take() {
+                locals.insert(self.key, previous);
+            }
+        });
+    }
+}
+
 impl WorkerEndpoint {
+    /// Simulated process loss occurs after the OS crash cut. Drop accepted tasks
+    /// without polling them; the simulated reactor still fences owned buffers.
+    #[cfg(test)]
+    pub(crate) fn simulation_crash(&mut self) {
+        assert!(crate::runtime::reactor::simulation::Simulation::current().is_some());
+        self.directory.simulation_crash();
+        self.active.clear();
+    }
     pub fn stop_admission(&self) {
         self.mailbox.state.lock().unwrap().closed = true;
     }

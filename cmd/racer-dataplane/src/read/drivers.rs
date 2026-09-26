@@ -37,6 +37,14 @@ impl Drop for QueueGuard {
 }
 
 impl DriverQueue {
+    /// Discard simulated process tasks without polling acquisition or write work.
+    #[cfg(test)]
+    pub(crate) fn simulation_crash(&self) {
+        let drivers = std::mem::take(&mut *self.drivers.borrow_mut());
+        let new = std::mem::take(&mut *self.new.borrow_mut());
+        self.count.set(self.count.get() - drivers.len() - new.len());
+        drop((drivers, new));
+    }
     /// Select this queue only during poll/drop, never across an async suspension.
     pub fn scope<F: std::future::Future>(self: &Rc<Self>, future: F) -> Queued<F> {
         Queued {

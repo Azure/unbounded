@@ -57,6 +57,16 @@ struct Catalog {
     current: BTreeMap<usize, Version>,
     calls: usize,
     gets: usize,
+    fault: Option<OriginFault>,
+    faults: BTreeMap<&'static str, usize>,
+}
+#[derive(Clone, Copy, Debug)]
+enum OriginFault {
+    Reject,
+    Forbidden,
+    DuplicateLength,
+    Truncate,
+    WrongEtag,
 }
 #[derive(Default, Debug)]
 struct Coverage {
@@ -69,6 +79,8 @@ struct Coverage {
     bytes: usize,
     persisted: usize,
     relay_turns: usize,
+    secondary_worker_turns: usize,
+    native_faults: BTreeMap<String, usize>,
 }
 impl Coverage {
     fn action(&mut self, name: &'static str) {
@@ -79,7 +91,10 @@ impl Coverage {
             if let Some(op) = event.operation.strip_prefix("fault:") {
                 *self.observed.entry(op.into()).or_default() += 1;
             }
-            if event.operation.starts_with("complete:") && event.result >= 0 {
+            if (event.operation.starts_with("complete:") && event.result >= 0)
+                || event.operation.starts_with("blocked:")
+                || event.operation == "disk:crash"
+            {
                 *self.operations.entry(event.operation).or_default() += 1;
             }
         }
@@ -212,6 +227,40 @@ fn origin_response(bytes: &[u8], catalog: &mut Catalog) -> Vec<u8> {
         Some("Bearer dst-fixture")
     );
     catalog.calls += 1;
+    if let Some(fault) = catalog.fault.take() {
+        let (name, status) = match fault {
+            OriginFault::Reject => ("credential-reject", 401),
+            OriginFault::Forbidden => ("credential-forbidden", 403),
+            OriginFault::DuplicateLength => ("origin-duplicate-length", 0),
+            OriginFault::Truncate => ("origin-truncated-body", 0),
+            OriginFault::WrongEtag => ("origin-malformed-etag", 0),
+        };
+        *catalog.faults.entry(name).or_default() += 1;
+        if status != 0 {
+            return format!(
+                "HTTP/1.1 {status} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes();
+        }
+        let mut response = origin_response(bytes, catalog);
+        match fault {
+            OriginFault::DuplicateLength => (),
+            OriginFault::Truncate => {
+                response.pop();
+            }
+            OriginFault::WrongEtag => {
+                if let Some(at) = response.windows(6).position(|w| w == b"ETag: ") {
+                    response[at + 6] = b'W';
+                }
+            }
+            _ => unreachable!(),
+        }
+        if matches!(fault, OriginFault::DuplicateLength) {
+            let at = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            response.splice(at..at, b"\r\nContent-Length: 999".iter().copied());
+        }
+        return response;
+    }
     let Some(version) = catalog.current.get(&object) else {
         return b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
     };
@@ -252,33 +301,61 @@ fn origin_response(bytes: &[u8], catalog: &mut Catalog) -> Vec<u8> {
 struct Node {
     id: usize,
     config: Config,
+    workers: Vec<LocalWorker>,
+    adapter: Adapter,
+    control: Option<Rc<ControlClient>>,
+}
+struct LocalWorker {
     app: WorkerApplication,
     runtime: WorkerRuntime,
     crypto: Box<dyn CryptoService>,
-    adapter: Adapter,
+}
+impl std::ops::Deref for Node {
+    type Target = LocalWorker;
+    fn deref(&self) -> &LocalWorker {
+        &self.workers[0]
+    }
+}
+impl std::ops::DerefMut for Node {
+    fn deref_mut(&mut self) -> &mut LocalWorker {
+        &mut self.workers[0]
+    }
 }
 impl Node {
     fn poll(&mut self, budget: usize) {
-        self.runtime.reactor.poll_budgeted(budget).unwrap();
-        self.crypto.poll_budgeted(budget).unwrap();
-        self.runtime.crypto.poll_budgeted(budget).unwrap();
-        self.app
-            .poll_budgeted(
-                &mut Context::from_waker(futures::task::noop_waker_ref()),
-                budget,
-            )
-            .unwrap();
-        for class in CLASSES {
+        for worker in &mut self.workers {
+            if worker.app.control.is_some() {
+                worker.app.control_task = Some(Box::pin(std::future::pending()));
+            }
+            let _local = worker
+                .app
+                .directory
+                .simulation_scope(Some((worker.app.worker, worker.app.coordinator.clone())));
+            worker.runtime.reactor.poll_budgeted(budget).unwrap();
+            worker.crypto.poll_budgeted(budget).unwrap();
+            worker.runtime.crypto.poll_budgeted(budget).unwrap();
+            worker
+                .app
+                .poll_budgeted(
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    budget,
+                )
+                .unwrap();
+            for class in CLASSES {
+                assert!(
+                    worker.runtime.admission.used(class) <= worker.runtime.admission.limit(class),
+                    "node {} resource bound",
+                    self.id
+                );
+            }
             assert!(
-                self.runtime.admission.used(class) <= self.runtime.admission.limit(class),
-                "node {} resource bound",
-                self.id
+                worker.app.store.writer.pending_count() <= self.config.limits.queue_entries.get()
+            );
+            assert!(
+                worker.app.clients.active_connections()
+                    <= self.config.limits.client_connections.get()
             );
         }
-        assert!(self.app.store.writer.pending_count() <= self.config.limits.queue_entries.get());
-        assert!(
-            self.app.clients.active_connections() <= self.config.limits.client_connections.get()
-        );
     }
 }
 
@@ -298,6 +375,14 @@ struct Harness {
     clock: SimulationClock,
     fabric: crate::rdma::lifecycle::simulation::Simulation,
     native: bool,
+    key_epoch: u8,
+    cache_epoch: u64,
+    origin_faults: Vec<OriginFault>,
+    security_faults: Vec<bool>,
+    native_rules: Vec<(
+        crate::rdma::lifecycle::simulation::Operation,
+        crate::rdma::lifecycle::simulation::Fault,
+    )>,
 }
 impl Harness {
     fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
@@ -332,6 +417,11 @@ impl Harness {
             clock,
             fabric: crate::rdma::lifecycle::simulation::Simulation::new(),
             native,
+            key_epoch: 0,
+            cache_epoch: 0,
+            origin_faults: vec![],
+            security_faults: vec![],
+            native_rules: vec![],
         }
     }
     fn update(&mut self, object: usize) {
@@ -409,6 +499,7 @@ impl Harness {
         let mut config = crate::test_support::cluster::config(self.native);
         config.node = node_id(id);
         config.peer_listen = format!("127.0.0.1:{}", 20000 + id).parse().unwrap();
+        config.diagnostics_listen = format!("127.0.0.1:{}", 30000 + id).parse().unwrap();
         config.slab_directory = format!("/dst/node-{id}/slabs").into();
         config.slab_bytes = 256 * 1024 * 1024;
         config.free_segment_reserve = 1;
@@ -421,14 +512,16 @@ impl Harness {
         config.limits.metadata_entries = NonZeroUsize::new(128).unwrap();
         config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
         config.limits.request_context_bytes = NonZeroUsize::new(4 * 1024 * 1024).unwrap();
-        let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+        let worker_count = 1 + self.rng.pick(2);
+        let worker_ids: Vec<_> = (0..worker_count).map(|i| WorkerId(i as u16)).collect();
+        let node = Arc::new(NodeState::new(worker_ids.clone(), 64).unwrap());
         if self.native {
             node.native
-                .prepare([WorkerId(0)].into_iter(), &config.limits)
+                .prepare(worker_ids.into_iter(), &config.limits)
                 .unwrap();
         }
         let (mut app, runtime, engine) = integration_tests::local_worker(&config, &node, 0);
-        let mut crypto = node.native.crypto(WorkerId(0), engine).unwrap();
+        let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
         if self.native {
             app.fabric_ports = vec![crate::rdma::device::FabricPort {
                 fabric: "dst-fabric".into(),
@@ -437,55 +530,86 @@ impl Harness {
                 gid: Some(gid),
             }];
         }
-        app.keys
-            .install(wire::KeyringBundle {
-                schema_version: 1,
-                cluster: config.cluster.clone(),
-                generation: wire::BundleGeneration(1),
-                peer_trust_roots: vec![self.ca.der().to_vec()],
-                cache_keys: [
-                    wire::CacheKeyPurpose::Page,
-                    wire::CacheKeyPurpose::OriginCredentials,
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(i, purpose)| wire::CacheEncryptionKey {
-                    key: wire::CacheKeyRef {
-                        cache: cache(id).id,
-                        id: KeyId([7 + i as u8; 16]),
-                        purpose,
-                    },
-                    state: wire::CacheKeyState::Active,
-                    material: [19 + i as u8; 32],
-                })
-                .collect(),
-            })
-            .unwrap();
+        app.keys.install(self.bundle(&config, 1)).unwrap();
         app.keys
             .install_signing_identity(self.identity(&config, id))
             .unwrap();
+        app.telemetry
+            .attach_io(runtime.reactor.clone(), runtime.admission.clone())
+            .unwrap();
+        app.keys
+            .register_retirement_barriers(node.retirement.clone())
+            .unwrap();
         // The harness supplies accepted control inputs; startup/recovery and every
         // datapath dependency remain the production application implementation.
-        app.control = None;
+        let control = app.control.take();
         self.generation += 1;
         let mut publication =
-            integration_tests::publication(&config, self.generation, vec![cache(id)]);
+            integration_tests::publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members();
         publication.members.push(member(&config));
         app.snapshots.publish(publication).unwrap();
         let startup = scope(Duration::from_secs(30)).unwrap();
-        drive_local(&runtime, &mut *crypto, app.start(&startup)).unwrap();
+        let mut workers = vec![LocalWorker {
+            app,
+            runtime,
+            crypto,
+        }];
+        for worker in 1..worker_count {
+            let role = self
+                .clock
+                .environment(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
+            let _role = role.enter();
+            let (mut app, runtime, engine) =
+                integration_tests::local_worker(&config, &node, worker as u16);
+            app.fabric_ports = workers[0].app.fabric_ports.clone();
+            let crypto = node.native.crypto(WorkerId(worker as u16), engine).unwrap();
+            workers.push(LocalWorker {
+                app,
+                runtime,
+                crypto,
+            });
+        }
+        lifecycle(&mut workers, &startup, Lifecycle::Start);
+        // Persist provisioning, not cached page writes. Every ancestor binding is
+        // explicit so a power loss cannot erase the fixture's whole node directory.
+        for path in [
+            std::path::PathBuf::from("/"),
+            "/dst".into(),
+            format!("/dst/node-{id}").into(),
+            config.slab_directory.clone(),
+        ] {
+            self.sim.disk().sync(&path).unwrap();
+        }
+        for worker in &workers {
+            self.sim
+                .disk()
+                .sync(
+                    &config
+                        .slab_directory
+                        .join(format!("worker-{}-slab-0.dat", worker.app.worker.0)),
+                )
+                .unwrap();
+        }
         if self.native {
             assert!(
-                !app.actual_rails.is_empty(),
+                workers.iter().all(|w| !w.app.actual_rails.is_empty()),
                 "native activation must not silently fall back"
             );
         }
+        if worker_count > 1 {
+            self.coverage.action("multi-worker");
+        }
+        let LocalWorker {
+            app,
+            runtime,
+            crypto,
+        } = &mut workers[0];
         drive_local(
-            &runtime,
-            &mut *crypto,
-            app.clients.reconcile(&[cache(id)], &startup),
+            runtime,
+            &mut **crypto,
+            app.clients.reconcile(&[self.definition(id)], &startup),
         )
         .unwrap();
         let peers = app.peers.clone();
@@ -500,10 +624,9 @@ impl Harness {
         self.nodes.push(Node {
             id,
             config,
-            app,
-            runtime,
-            crypto,
+            workers,
             adapter,
+            control,
         });
         self.publish();
         self.tick();
@@ -513,25 +636,68 @@ impl Harness {
     fn members(&self) -> Vec<crate::topology::membership::Member> {
         self.nodes.iter().map(|n| member(&n.config)).collect()
     }
+    fn definition(&self, id: usize) -> CacheDefinition {
+        let mut definition = cache(id);
+        definition.id = CacheId(format!("33333333-3333-4333-8333-{:012x}", self.cache_epoch));
+        definition
+    }
+    fn bundle(&self, config: &Config, generation: u64) -> wire::KeyringBundle {
+        wire::KeyringBundle {
+            schema_version: 1,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(generation),
+            peer_trust_roots: vec![self.ca.der().to_vec()],
+            cache_keys: [
+                wire::CacheKeyPurpose::Page,
+                wire::CacheKeyPurpose::OriginCredentials,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, purpose)| wire::CacheEncryptionKey {
+                key: wire::CacheKeyRef {
+                    cache: self.definition(0).id,
+                    id: KeyId([7 + i as u8 + self.key_epoch * 2; 16]),
+                    purpose,
+                },
+                state: wire::CacheKeyState::Active,
+                material: [19 + i as u8 + self.key_epoch * 2; 32],
+            })
+            .collect(),
+        }
+    }
     fn publish(&mut self) {
         self.generation += 1;
         let members = self.members();
-        for node in &mut self.nodes {
+        let definitions: Vec<_> = self.nodes.iter().map(|n| self.definition(n.id)).collect();
+        for (node, definition) in self.nodes.iter_mut().zip(definitions) {
             let mut p =
-                integration_tests::publication(&node.config, self.generation, vec![cache(node.id)]);
+                integration_tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.clone();
             node.app.snapshots.publish(p).unwrap();
         }
     }
     fn tick(&mut self) {
-        self.clock.advance(Duration::from_micros(10));
+        self.clock.advance(Duration::from_millis(1));
         let start = self.rng.pick(self.nodes.len());
         let budget = 1 + self.rng.pick(64);
         for offset in 0..self.nodes.len() {
             let index = (start + offset) % self.nodes.len();
+            let _endpoint = self
+                .sim
+                .enter_endpoint(SocketAddress::Inet(self.nodes[index].config.peer_listen));
             self.nodes[index].adapter.poll(&self.catalog);
             self.nodes[index].poll(budget);
+            self.coverage.secondary_worker_turns += self.nodes[index]
+                .workers
+                .iter()
+                .skip(1)
+                .filter(|w| {
+                    w.runtime.crypto.outstanding() != 0
+                        || w.app.drivers.pending() != 0
+                        || w.app.store.writer.pending_count() != 0
+                })
+                .count();
             self.coverage.relay_turns += usize::from(
                 self.nodes[index]
                     .runtime
@@ -542,7 +708,8 @@ impl Harness {
         }
         self.coverage.collect(&self.sim);
         assert!(
-            self.sim.live_handles() <= self.nodes.len() * 256 + 32,
+            self.sim.live_handles()
+                <= self.nodes.iter().map(|n| n.workers.len()).sum::<usize>() * 256 + 32,
             "descriptor bound"
         );
     }
@@ -553,39 +720,83 @@ impl Harness {
         let mut node = self.nodes.remove(index);
         let shutdown = scope(Duration::from_secs(30)).unwrap();
         if crash {
-            // Process loss discards memory and omits the graceful checkpoint cut.
-            // The OS completion fence still runs before Rust backing is destroyed.
-            assert_eq!(node.app.drivers.pending(), 0);
-            node.app.stop_admission().unwrap();
-            node.app.peer_task.take();
+            self.sim
+                .disk()
+                .crash_under(std::path::Path::new(&format!("/dst/node-{}", node.id)))
+                .unwrap();
+            node.app.directory.simulation_crash();
+            for worker in &mut node.workers {
+                if let Some(endpoint) = &mut worker.app.endpoint {
+                    endpoint.simulation_crash();
+                }
+                worker.app.drivers.simulation_crash();
+            }
+            node.app.directory.simulation_crash();
         } else {
-            drive_local(&node.runtime, &mut *node.crypto, node.app.drain(&shutdown)).unwrap();
+            lifecycle(&mut node.workers, &shutdown, Lifecycle::Drain);
+            // Production checkpoint publication promises an atomic logical cut,
+            // not fsync durability (store/checkpoint.rs). Power-loss actions may
+            // therefore lose it; never assert durability merely from shutdown.
+            lifecycle(&mut node.workers, &shutdown, Lifecycle::Shutdown);
         }
-        drive_local(
-            &node.runtime,
-            &mut *node.crypto,
-            node.app.shutdown(&shutdown),
-        )
-        .unwrap();
         let id = node.id;
         let Node {
+            workers,
+            adapter,
+            control,
+            ..
+        } = node;
+        drop((adapter, control));
+        let mut admissions = Vec::new();
+        for LocalWorker {
             app,
             runtime,
             mut crypto,
-            adapter,
-            ..
-        } = node;
-        drop((app, adapter));
-        drive_local(&runtime, &mut *crypto, runtime.reactor.drain()).unwrap();
-        assert_eq!(runtime.crypto.outstanding(), 0);
-        let admission = runtime.admission.clone();
-        drop((runtime, crypto));
-        for class in CLASSES {
-            assert_eq!(
-                admission.used(class),
-                0,
-                "retired node {id}, class {class:?}"
-            );
+        } in workers
+        {
+            let _local = app
+                .directory
+                .simulation_scope(Some((app.worker, app.coordinator.clone())));
+            let drivers = app.drivers.clone();
+            let directory = app.directory.clone();
+            drop(app);
+            if crash {
+                drivers.simulation_crash();
+                directory.simulation_crash();
+                // This is only the OS cancellation fence after graph destruction,
+                // not WorkerApplication::drain: no acquisition, persistence, or
+                // checkpoint producer is polled after the process-loss cut.
+                let mut fence = runtime.reactor.drain();
+                let mut done = false;
+                for _ in 0..MAX_TURNS {
+                    runtime.reactor.poll_budgeted(64).unwrap();
+                    if let Poll::Ready(result) = fence
+                        .as_mut()
+                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    {
+                        result.unwrap();
+                        done = true;
+                        break;
+                    }
+                }
+                assert!(done, "crash kernel fence stalled");
+            } else {
+                drive_local(&runtime, &mut *crypto, runtime.reactor.drain()).unwrap();
+                assert_eq!(runtime.crypto.outstanding(), 0);
+            }
+            let admission = runtime.admission.clone();
+            drop((drivers, directory));
+            drop((runtime, crypto));
+            admissions.push(admission);
+        }
+        for admission in admissions {
+            for class in CLASSES {
+                assert_eq!(
+                    admission.used(class),
+                    0,
+                    "retired node {id}, class {class:?}"
+                );
+            }
         }
         self.publish();
         self.coverage.action(if crash { "crash" } else { "remove" });
@@ -594,7 +805,7 @@ impl Harness {
     fn settle(&mut self) {
         for _ in 0..MAX_TURNS {
             self.tick();
-            if self.nodes.iter().all(|n| {
+            if self.nodes.iter().flat_map(|n| &n.workers).all(|n| {
                 n.app.store.writer.is_idle()
                     && n.app.writer_task.is_none()
                     && n.app.clients.active_connections() == 0
@@ -657,6 +868,7 @@ impl Harness {
             pinned,
             done: false,
             disconnected: false,
+            expected_status: None,
         }
     }
 
@@ -720,7 +932,7 @@ impl Harness {
             .get("complete:read")
             .copied()
             .unwrap_or(0);
-        for node in &self.nodes {
+        for node in self.nodes.iter().flat_map(|n| &n.workers) {
             node.app.memory.evict_idle(usize::MAX).unwrap();
         }
         // Construct requests from independent version facts even with origin offline.
@@ -790,6 +1002,557 @@ impl Harness {
         self.traffic(1, false);
     }
 
+    fn partition_traffic(&mut self) {
+        // Partition a generated cut after normal traffic has established pooled
+        // streams. No endpoint invalidation or membership rewrite accompanies it.
+        self.traffic(2, false);
+        let mut clients: Vec<_> = (0..4)
+            .map(|_| {
+                let object = self.rng.pick(8);
+                self.request(object, false, false)
+            })
+            .collect();
+        for _ in 0..16 {
+            self.tick();
+            for client in &mut clients {
+                if !client.done && client.poll() {
+                    self.check(client, false);
+                    client.done = true;
+                    client.fd.take();
+                }
+            }
+        }
+        let cut = 1 + self.rng.pick(self.nodes.len() - 1);
+        let mut links = Vec::new();
+        for a in &self.nodes[..cut] {
+            for b in &self.nodes[cut..] {
+                let pair = (
+                    SocketAddress::Inet(a.config.peer_listen),
+                    SocketAddress::Inet(b.config.peer_listen),
+                );
+                self.sim.partition(pair.0.clone(), pair.1.clone());
+                links.push(pair);
+            }
+        }
+        for _ in 0..100 + self.rng.pick(100) {
+            self.tick();
+            for client in &mut clients {
+                if !client.done && client.poll() {
+                    self.check(client, true);
+                    client.done = true;
+                    client.fd.take();
+                }
+            }
+        }
+        for (a, b) in links {
+            self.sim.heal(a, b);
+        }
+        for client in clients {
+            if !client.done {
+                self.exchange(client, true);
+            }
+        }
+        self.settle();
+        self.coverage.action("partition-heal");
+    }
+
+    fn crash_inflight(&mut self) {
+        let node = self.rng.pick(self.nodes.len());
+        self.update(1);
+        let mut client = self.request_on(1, false, false, node);
+        let mut admitted = false;
+        for _ in 0..MAX_TURNS {
+            self.tick();
+            if client.poll() {
+                break;
+            }
+            if self.nodes[node].workers.iter().any(|w| {
+                w.app.drivers.pending() != 0
+                    || w.runtime.crypto.outstanding() != 0
+                    || w.app.store.writer.slabs().writes_in_flight() != 0
+            }) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted, "crash must interrupt accepted work");
+        let id = self.retire(node, true);
+        self.exchange(client, true);
+        self.add(Some(id));
+        self.coverage.action("inflight-crash");
+    }
+
+    fn crash_pending_write(&mut self) {
+        self.update(7);
+        self.sim.inject("write", Fault::Delay(64));
+        *self.coverage.injected.entry("write".into()).or_default() += 1;
+        let mut client = self.request(7, false, false);
+        let mut completed = false;
+        let mut victim = None;
+        for _ in 0..MAX_TURNS {
+            self.tick();
+            if !completed && client.poll() {
+                self.check(&client, false);
+                completed = true;
+                client.fd.take();
+            }
+            victim = self.nodes.iter().position(|n| {
+                n.workers
+                    .iter()
+                    .any(|w| w.app.store.writer.slabs().writes_in_flight() != 0)
+            });
+            if victim.is_some() {
+                break;
+            }
+        }
+        let victim = victim.expect("generated write never reached OS submission");
+        let id = self.retire(victim, true);
+        if !completed {
+            self.exchange(client, true);
+        }
+        self.add(Some(id));
+        self.coverage.action("pending-write-crash");
+    }
+
+    fn key_retirement(&mut self) {
+        self.key_epoch = self.key_epoch.checked_add(1).expect("key epoch exhausted");
+        assert!(self.key_epoch < 100);
+        self.generation += 1;
+        let bundles: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|n| self.bundle(&n.config, self.generation + 1000))
+            .collect();
+        for (node, bundle) in self.nodes.iter_mut().zip(bundles) {
+            node.app.keys.install(bundle).unwrap();
+            node.app.control = node.control.clone();
+        }
+        let mut finished = false;
+        for _ in 0..MAX_TURNS {
+            self.tick();
+            if self.nodes.iter().all(|n| {
+                n.app.keys.pending_retirements().unwrap().is_empty()
+                    && n.workers.iter().all(|w| !w.app.retiring)
+            }) {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "key retirement stalled");
+        for node in &mut self.nodes {
+            node.app.control = None;
+            node.app.control_task.take();
+        }
+        self.coverage.action("key-retirement");
+    }
+
+    fn cache_recreate(&mut self) {
+        use crate::control::caches::CacheLifecycle;
+        self.generation += 1;
+        let members = self.members();
+        let mut staged = Vec::new();
+        for node in &mut self.nodes {
+            node.app.control = node.control.clone();
+            staged.push(caches::Adapter {
+                node: node.app.node.as_ref().unwrap().clone(),
+                listeners: node.app.prepared_listeners.clone(),
+                capacity: node.config.limits.metadata_entries.get(),
+            });
+        }
+        let mut committed = vec![false; self.nodes.len()];
+        for _ in 0..MAX_TURNS {
+            for (index, adapter) in staged.iter().enumerate() {
+                if committed[index] {
+                    continue;
+                }
+                match adapter.stage(&[]) {
+                    Ok(transition) => {
+                        let node = &self.nodes[index];
+                        let mut publication =
+                            integration_tests::publication(&node.config, self.generation, vec![]);
+                        publication.membership_version = MembershipVersion(self.generation);
+                        publication.members = members.clone();
+                        node.app
+                            .snapshots
+                            .publish_staged(publication, Some(transition))
+                            .unwrap();
+                        committed[index] = true;
+                    }
+                    Err(Error::Unavailable) => (),
+                    Err(error) => panic!("cache stage: {error:?}"),
+                }
+            }
+            self.tick();
+            if committed.iter().all(|v| *v)
+                && self
+                    .nodes
+                    .iter()
+                    .all(|n| n.workers.iter().all(|w| !w.app.retiring))
+            {
+                break;
+            }
+        }
+        assert!(committed.iter().all(|v| *v));
+        self.cache_epoch += 1;
+        self.key_retirement();
+        self.publish();
+        for node in &mut self.nodes {
+            let definitions = node.app.snapshots.current().unwrap().caches.clone();
+            let LocalWorker {
+                app,
+                runtime,
+                crypto,
+            } = &mut node.workers[0];
+            drive_local(
+                runtime,
+                &mut **crypto,
+                app.clients
+                    .reconcile(&definitions, &scope(Duration::from_secs(30)).unwrap()),
+            )
+            .unwrap();
+        }
+        self.coverage.action("cache-retire-recreate");
+    }
+
+    fn native_fault(&mut self) {
+        use crate::rdma::lifecycle::simulation::{
+            Fault as NativeFault, Operation as NativeOperation,
+        };
+        if self.native_rules.is_empty() {
+            for op in [
+                NativeOperation::Bind,
+                NativeOperation::Write,
+                NativeOperation::Invalidate,
+            ] {
+                for fault in [
+                    NativeFault::Reject,
+                    NativeFault::Delay(3 + self.rng.pick(8)),
+                    NativeFault::Completion(1),
+                ] {
+                    self.native_rules.push((op, fault));
+                }
+            }
+        }
+        let index = self.rng.pick(self.native_rules.len());
+        let (operation, fault) = self.native_rules.swap_remove(index);
+        self.fabric.fault(operation, fault);
+        self.coverage.action("native-fault");
+        for _ in 0..32 {
+            self.update(5);
+            let client = self.request(5, false, false);
+            self.exchange(client, true);
+            if self.fabric.pending_faults() == 0 {
+                *self
+                    .coverage
+                    .native_faults
+                    .entry(format!(
+                        "{operation:?}:{}",
+                        match fault {
+                            NativeFault::Reject => "reject",
+                            NativeFault::Delay(_) => "delay",
+                            NativeFault::Completion(_) => "completion",
+                        }
+                    ))
+                    .or_default() += 1;
+                self.coverage.action("native-fault-observed");
+                return;
+            }
+        }
+        panic!("native fault not consumed");
+    }
+
+    fn origin_fault(&mut self) {
+        if self.origin_faults.is_empty() {
+            self.origin_faults.extend([
+                OriginFault::Reject,
+                OriginFault::Forbidden,
+                OriginFault::DuplicateLength,
+                OriginFault::Truncate,
+                OriginFault::WrongEtag,
+            ]);
+        }
+        let index = self.rng.pick(self.origin_faults.len());
+        let fault = self.origin_faults.swap_remove(index);
+        self.catalog.borrow_mut().fault = Some(fault);
+        self.update(6);
+        let client = self.request(6, false, false);
+        self.exchange(client, true);
+        assert!(
+            self.catalog.borrow().fault.is_none(),
+            "origin fault not consumed"
+        );
+        self.coverage.action("origin-fault");
+    }
+
+    fn malformed_client(&mut self) {
+        let mut client = self.request(2, false, false);
+        let (method, fields, status) = match self.rng.pick(3) {
+            0 => ("GET", "Host: racer\r\nHost: racer\r\n", 400),
+            1 => ("POST", "Host: racer\r\n", 405),
+            _ => ("GET", "Host: racer\r\nContent-Length: 1\r\n", 400),
+        };
+        client.request =
+            format!("{method} /v1/objects/{} HTTP/1.1\r\n{fields}\r\n", key(2)).into_bytes();
+        client.expected_status = Some(status);
+        self.exchange(client, false);
+        self.coverage.action("malformed-client");
+    }
+
+    fn raw_peer(&mut self, node: usize, request: Vec<u8>) -> Vec<u8> {
+        let fd = self
+            .sim
+            .connect(SocketAddress::Inet(self.nodes[node].config.peer_listen))
+            .unwrap();
+        let mut sent = 0;
+        let mut response = Vec::new();
+        let mut finished = false;
+        for _ in 0..MAX_TURNS {
+            self.tick();
+            if sent < request.len() {
+                match handle(&fd).send(&request[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(e) if would_block(&e) => (),
+                    Err(_) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            let mut bytes = [0; 32768];
+            match handle(&fd).recv(&mut bytes) {
+                Ok(0) => {
+                    finished = true;
+                    break;
+                }
+                Ok(n) => response.extend_from_slice(&bytes[..n]),
+                Err(e) if would_block(&e) => (),
+                Err(_) => {
+                    finished = true;
+                    break;
+                }
+            }
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                let (_, h, end) = headers(&response);
+                if response.len() >= end + h["content-length"].parse::<usize>().unwrap() {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        drop(fd);
+        assert!(
+            finished,
+            "peer probe timed out without an observed rejection or response"
+        );
+        response
+    }
+
+    fn peer_security(&mut self) {
+        use crate::{
+            http::codec::{Codec, MessageHead, StartLine},
+            peer::wire::WireCodec,
+            security::{
+                protocol as p,
+                replay::ReplayWindow,
+                session::{ChallengeProbe, ChallengeReply},
+            },
+        };
+        let receiver = self.rng.pick(self.nodes.len());
+        let sender = (receiver + 1) % self.nodes.len();
+        let keys = self.nodes[sender].app.keys.clone();
+        let certificates = Rc::new(Certificates::new(
+            self.nodes[sender].config.cluster.clone(),
+            keys.clone(),
+        ));
+        let signatures = Signatures::new(
+            keys,
+            certificates.clone(),
+            Rc::new(ReplayWindow::new(
+                self.nodes[sender].app.node.as_ref().unwrap().replay.clone(),
+                8192,
+            )),
+        );
+        let peer = self.nodes[receiver].config.node.clone();
+        let probe =
+            ChallengeProbe::new(self.nodes[sender].config.node.clone(), peer.clone()).unwrap();
+        let body = probe.request_bytes();
+        let request = format!("POST /racer/peer/v1/challenge HTTP/1.1\r\nContent-Length: 0\r\nracer-probe: {}\r\n\r\n", p::binary(&body)).into_bytes();
+        let response = self.raw_peer(receiver, request);
+        let (_, _, end) = headers(&response);
+        signatures
+            .install_peer_challenge(
+                probe
+                    .verify(
+                        &certificates,
+                        ChallengeReply::decode(&response[end..]).unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut head = MessageHead {
+            start: StartLine::Request {
+                method: "POST".into(),
+                target: "/racer/peer/v1/handshake".into(),
+            },
+            headers: vec![],
+        };
+        p::push(&mut head, "content-length", 0);
+        p::push(&mut head, "racer-kind", "handshake");
+        p::push(&mut head, "racer-wire-version", crate::peer::wire::VERSION);
+        p::push(&mut head, "racer-membership", self.generation);
+        p::push(&mut head, "racer-receiver", &peer.0);
+        p::push_binary(
+            &mut head,
+            "racer-session-challenge",
+            &signatures.challenge().unwrap(),
+        );
+        let signed = signatures.sign(head).unwrap();
+        let envelope = crate::security::forwarding::ForwardedHead {
+            original: Arc::new(signed),
+            hops: vec![],
+        };
+        let wire = WireCodec::encode(&envelope, false, 0).unwrap();
+        let bytes = Codec::new(32768, u64::MAX).encode_head(&wire).unwrap();
+        if self.security_faults.is_empty() {
+            self.security_faults.extend([true, false]);
+        }
+        let selected = self.rng.pick(self.security_faults.len());
+        if self.security_faults.swap_remove(selected) {
+            let valid = self.raw_peer(receiver, bytes.clone());
+            assert!(
+                valid.starts_with(b"HTTP/1.1 200"),
+                "signed peer request did not succeed"
+            );
+            let replay = self.raw_peer(receiver, bytes);
+            assert!(
+                !replay.starts_with(b"HTTP/1.1 200"),
+                "replayed signed request accepted"
+            );
+            self.coverage.action("peer-replay");
+        } else {
+            // WireCodec wraps the signed original in a base64 field. Mutate the
+            // signed signature before encoding so the outer HTTP remains legal.
+            let original = &envelope.original;
+            let mut signed = crate::security::signing::tests::clone_head(original);
+            let signature = signed
+                .head
+                .headers
+                .iter_mut()
+                .find(|h| h.name.eq_ignore_ascii_case("signature"))
+                .unwrap();
+            let at = signature.value.iter().position(|b| *b == b':').unwrap() + 1;
+            signature.value[at] = if signature.value[at] == b'A' {
+                b'B'
+            } else {
+                b'A'
+            };
+            signed.signature[0] ^= 1;
+            let wire = WireCodec::encode(
+                &crate::security::forwarding::ForwardedHead {
+                    original: Arc::new(signed),
+                    hops: vec![],
+                },
+                false,
+                0,
+            )
+            .unwrap();
+            let bytes = Codec::new(32768, u64::MAX).encode_head(&wire).unwrap();
+            let response = self.raw_peer(receiver, bytes);
+            assert!(
+                !response.starts_with(b"HTTP/1.1 200"),
+                "corrupted signature accepted"
+            );
+            self.coverage.action("peer-signature-corruption");
+        }
+    }
+
+    fn disk_corruption(&mut self) {
+        use crate::runtime::reactor::simulation::DiskState;
+        self.settle();
+        let entries: Vec<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(n, node)| {
+                node.workers
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(w, worker)| {
+                        worker
+                            .app
+                            .store
+                            .writer
+                            .index()
+                            .snapshot()
+                            .unwrap()
+                            .entries
+                            .into_iter()
+                            .map(move |entry| (n, w, entry))
+                    })
+            })
+            .collect();
+        if entries.is_empty() {
+            self.traffic(1, false);
+            return;
+        }
+        let (node, worker, (page, entry)) = &entries[self.rng.pick(entries.len())];
+        let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
+        if object == 0
+            || object == 1
+            || self
+                .catalog
+                .borrow()
+                .current
+                .get(&object)
+                .is_none_or(|v| v.tag.as_bytes() != page.version.etag.as_bytes())
+        {
+            self.traffic(1, false);
+            return;
+        }
+        let client = self.request_on(object, true, false, *node);
+        let path = self.nodes[*node]
+            .config
+            .slab_directory
+            .join(format!("worker-{worker}-slab-0.dat"));
+        self.sim.disk().sync_all().unwrap();
+        let offset = entry.location.location.extent.offset();
+        let original = self
+            .sim
+            .disk()
+            .read(&path, offset, 1, DiskState::Durable)
+            .unwrap();
+        self.sim
+            .disk()
+            .corrupt(&path, offset, &[original[0] ^ 0x80], DiskState::Both)
+            .unwrap();
+        for node in &self.nodes {
+            for worker in &node.workers {
+                worker.app.memory.evict_idle(usize::MAX).unwrap();
+            }
+        }
+        let reads = self
+            .coverage
+            .operations
+            .get("complete:read")
+            .copied()
+            .unwrap_or(0);
+        self.exchange(client, true);
+        assert!(
+            self.coverage
+                .operations
+                .get("complete:read")
+                .copied()
+                .unwrap_or(0)
+                > reads,
+            "corrupted disk record was not read"
+        );
+        self.sim
+            .disk()
+            .corrupt(&path, offset, &original, DiskState::Both)
+            .unwrap();
+        self.coverage.action("disk-corruption");
+    }
+
     fn check(&mut self, client: &Client, faulted: bool) {
         if !client.response.windows(4).any(|w| w == b"\r\n\r\n") {
             assert!(faulted, "healthy client disconnected before headers");
@@ -809,7 +1572,8 @@ impl Harness {
                 self.coverage.action("empty-range");
             } else {
                 assert!(
-                    faulted && matches!(status, 502 | 503),
+                    (faulted && matches!(status, 401 | 403 | 502 | 503))
+                        || client.expected_status == Some(status),
                     "unexpected status {status}: {start}"
                 );
                 self.coverage.failures += 1;
@@ -819,6 +1583,10 @@ impl Harness {
         assert_eq!(
             headers["etag"], client.tag,
             "fresh read or pin switched versions"
+        );
+        assert!(
+            client.expected_status.is_none(),
+            "malformed client request was accepted"
         );
         let expected = &self.oracle[&(client.object, headers["etag"].clone())];
         assert_eq!(expected.len(), client.size);
@@ -860,8 +1628,16 @@ impl Harness {
         for _ in 0..initial {
             self.add(None);
         }
+        let mut actions = Vec::new();
         for step in 0..steps {
-            let action = self.rng.pick(18);
+            if actions.is_empty() {
+                actions.extend(0..28);
+                actions.extend([20; 4]);
+                actions.push(25);
+                actions.extend([24; 8]);
+            }
+            let selected = self.rng.pick(actions.len());
+            let action = actions.swap_remove(selected);
             eprintln!(
                 "dst seed={} step={step} action={action} nodes={}",
                 self.seed,
@@ -879,8 +1655,8 @@ impl Harness {
                 }
                 3 => {
                     self.settle();
-                    for node in &self.nodes {
-                        node.app.memory.evict_idle(usize::MAX).unwrap();
+                    for worker in self.nodes.iter().flat_map(|n| &n.workers) {
+                        worker.app.memory.evict_idle(usize::MAX).unwrap();
                     }
                     self.coverage.action("evict");
                     self.traffic(1, false);
@@ -935,10 +1711,7 @@ impl Harness {
                 }
                 9 => self.peer_outage(),
                 10 => {
-                    self.settle();
-                    let index = self.rng.pick(self.nodes.len());
-                    let id = self.retire(index, true);
-                    self.add(Some(id));
+                    self.crash_inflight();
                 }
                 11 => {
                     // Warm the ingress before mutation. This old pin is provably
@@ -974,6 +1747,33 @@ impl Harness {
                     }
                     self.coverage.action("inflight-membership");
                 }
+                18 if self.nodes.len() > 1 => self.partition_traffic(),
+                19 => {
+                    let wall = crate::runtime::environment::wall_now();
+                    let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
+                    self.clock.set_wall_time(if self.rng.pick(2) == 0 {
+                        wall + amount
+                    } else {
+                        wall - amount
+                    });
+                    self.traffic(1, true);
+                    // Replay admission retains a wall high-water mark. Recovery
+                    // advances past it; rolling back again is not a healthy clock.
+                    self.clock.advance(Duration::from_secs(121));
+                    let (anchor, wall_anchor) = crate::runtime::environment::clock_anchor();
+                    self.clock.set_wall_time(
+                        wall_anchor + crate::runtime::environment::now().duration_since(anchor),
+                    );
+                    self.coverage.action("wall-jump");
+                }
+                20 => self.origin_fault(),
+                21 => self.malformed_client(),
+                22 => self.key_retirement(),
+                23 => self.cache_recreate(),
+                24 if self.native => self.native_fault(),
+                25 if self.nodes.len() > 1 => self.peer_security(),
+                26 => self.disk_corruption(),
+                27 => self.crash_pending_write(),
                 _ => {
                     let count = 1 + self.rng.pick(4);
                     self.coverage.action("traffic");
@@ -988,9 +1788,11 @@ impl Harness {
             self.exchange(client, false);
         }
         for node in &self.nodes {
-            let snapshot = node.app.store.writer.index().snapshot().unwrap();
-            assert!(snapshot.entries.len() <= node.config.limits.metadata_entries.get());
-            self.coverage.persisted += snapshot.entries.len();
+            for worker in &node.workers {
+                let snapshot = worker.app.store.writer.index().snapshot().unwrap();
+                assert!(snapshot.entries.len() <= node.config.limits.metadata_entries.get());
+                self.coverage.persisted += snapshot.entries.len();
+            }
         }
         assert!(self.coverage.success >= 8 && self.coverage.bytes > PAGE_BYTES as usize);
         assert!(self.catalog.borrow().gets > 0 && self.coverage.persisted > 0);
@@ -1012,6 +1814,55 @@ impl Harness {
             "no actual peer exchange"
         );
         self.cache_obligations();
+        if steps >= 41 {
+            for action in [
+                "multi-worker",
+                "key-retirement",
+                "cache-retire-recreate",
+                "inflight-crash",
+                "pending-write-crash",
+                "partition-heal",
+                "wall-jump",
+                "malformed-client",
+                "peer-replay",
+                "peer-signature-corruption",
+            ] {
+                assert!(
+                    self.coverage.actions.get(action).copied().unwrap_or(0) > 0,
+                    "unobserved generated action {action}"
+                );
+            }
+            assert!(
+                self.coverage.secondary_worker_turns > 0,
+                "no secondary worker executed data work"
+            );
+            for fault in [
+                "credential-reject",
+                "credential-forbidden",
+                "origin-duplicate-length",
+                "origin-truncated-body",
+                "origin-malformed-etag",
+            ] {
+                assert!(
+                    self.catalog
+                        .borrow()
+                        .faults
+                        .get(fault)
+                        .copied()
+                        .unwrap_or(0)
+                        > 0,
+                    "unobserved origin rule {fault}"
+                );
+            }
+            if self.native {
+                assert_eq!(
+                    self.coverage.native_faults.len(),
+                    9,
+                    "native fault matrix incomplete"
+                );
+            }
+        }
+        eprintln!("dst origin faults={:?}", self.catalog.borrow().faults);
         for (operation, injected) in &self.coverage.injected {
             assert_eq!(
                 self.coverage.observed.get(operation),
@@ -1064,6 +1915,7 @@ struct Client {
     pinned: bool,
     done: bool,
     disconnected: bool,
+    expected_status: Option<u16>,
 }
 impl Client {
     fn poll(&mut self) -> bool {
@@ -1124,13 +1976,25 @@ fn dst_generated_native_traffic_churn_oracle() {
 }
 
 fn run_corpus(native: bool) {
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("RACER_DST_")) {
+        assert!(
+            matches!(
+                name.as_str(),
+                "RACER_DST_SEEDS" | "RACER_DST_STEPS" | "RACER_DST_FILTER"
+            ),
+            "unsupported DST parameter {name}"
+        );
+    }
     let seeds: Vec<u64> = std::env::var("RACER_DST_SEEDS")
         .unwrap_or_else(|_| "1,7,42".into())
         .split(',')
         .map(|s| s.trim().parse().expect("comma-separated u64 DST seeds"))
         .collect();
     assert!(!seeds.is_empty() && seeds.len() <= 1024);
-    let steps = setting("RACER_DST_STEPS", 32, 4096);
+    let steps = setting("RACER_DST_STEPS", 41, 512);
+    let mut relay_turns = 0;
+    let mut partition_sends = 0;
+    let mut corrupted_reads = 0;
     for seed in seeds {
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -1139,6 +2003,30 @@ fn run_corpus(native: bool) {
         let _time = environment.enter();
         let mut harness = Harness::new(seed, sim, clock, native);
         harness.generated(steps);
+        relay_turns += harness.coverage.relay_turns;
+        partition_sends += harness
+            .coverage
+            .operations
+            .get("blocked:send")
+            .copied()
+            .unwrap_or(0);
+        corrupted_reads += harness
+            .coverage
+            .actions
+            .get("disk-corruption")
+            .copied()
+            .unwrap_or(0);
+    }
+    if steps >= 41 {
+        assert!(relay_turns > 0, "corpus never exercised an actual relay");
+        assert!(
+            partition_sends > 0,
+            "corpus never blocked an established stream"
+        );
+        assert!(
+            corrupted_reads > 0,
+            "corpus never read a corrupted disk record"
+        );
     }
 }
 
@@ -1158,6 +2046,61 @@ fn member(config: &Config) -> crate::topology::membership::Member {
         },
         alignment_enabled: config.enable_rdma,
     }
+}
+#[derive(Clone, Copy)]
+enum Lifecycle {
+    Start,
+    Drain,
+    Shutdown,
+}
+fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle) {
+    let mut pending: Vec<_> = workers
+        .iter_mut()
+        .map(|worker| {
+            let directory = worker.app.directory.clone();
+            let coordinator = worker.app.coordinator.clone();
+            let id = worker.app.worker;
+            let installed = std::cell::Cell::new(!matches!(phase, Lifecycle::Start));
+            let operation = match phase {
+                Lifecycle::Start => worker.app.start(scope),
+                Lifecycle::Drain => worker.app.drain(scope),
+                Lifecycle::Shutdown => worker.app.shutdown(scope),
+            };
+            let mut operation = operation;
+            let operation: Operation<'_, ()> = Box::pin(std::future::poll_fn(move |cx| {
+                let _local =
+                    directory.simulation_scope(installed.get().then(|| (id, coordinator.clone())));
+                let result = operation.as_mut().poll(cx);
+                // Installation can happen during a Pending startup poll. The next
+                // poll selects this worker without attempting another installation.
+                if matches!(result, Poll::Ready(_)) {
+                    installed.set(true);
+                }
+                result
+            }));
+            (&worker.runtime, &mut worker.crypto, Some(operation))
+        })
+        .collect();
+    for _ in 0..MAX_TURNS {
+        for (runtime, crypto, operation) in &mut pending {
+            runtime.reactor.poll_budgeted(64).unwrap();
+            crypto.poll_budgeted(64).unwrap();
+            runtime.crypto.poll_budgeted(64).unwrap();
+            if let Some(op) = operation {
+                if let Poll::Ready(result) = op
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    result.unwrap();
+                    *operation = None;
+                }
+            }
+        }
+        if pending.iter().all(|(_, _, op)| op.is_none()) {
+            return;
+        }
+    }
+    panic!("multi-worker lifecycle stalled");
 }
 fn drive_local<T>(
     runtime: &WorkerRuntime,

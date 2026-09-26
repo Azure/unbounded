@@ -215,6 +215,9 @@ impl Simulation {
     pub fn live_resources(&self) -> usize {
         self.world.borrow().resources.len()
     }
+    pub fn pending_faults(&self) -> usize {
+        self.world.borrow().faults.len()
+    }
 }
 impl Default for Simulation {
     fn default() -> Self {

@@ -943,6 +943,7 @@ impl Handle {
             _ => return Err(errno(libc::ENOTSOCK)),
         };
         if local.as_ref().is_some_and(|a| w.partitioned(a, address)) {
+            w.record("blocked:connect", self.id, 0);
             return Err(errno(libc::EAGAIN));
         }
         let listener = *w
@@ -1022,6 +1023,7 @@ impl Handle {
             })
         })?;
         if !bytes.is_empty() && w.stream_partitioned(self.id) {
+            w.record("blocked:send", self.id, bytes.len() as i64);
             return Err(errno(libc::EAGAIN));
         }
         let Some(Resource::Socket { bytes: output, .. }) = w.resources.get_mut(&peer) else {

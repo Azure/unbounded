@@ -39,7 +39,7 @@ swap for the entire build/test process tree before executing Cargo:
 ```sh
 bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
 # Replay a seed or an explicit comma-separated corpus:
-RACER_DST_SEEDS=42 RACER_DST_STEPS=32 \
+RACER_DST_SEEDS=42 RACER_DST_STEPS=41 \
   bash hack/scripts/memory-safe-run.sh -- make racer-dataplane-dst RACER_TEST_ARGS=--nocapture
 # Select only the connected native graph:
 RACER_DST_SEEDS=1,7,42 \
@@ -47,21 +47,37 @@ RACER_DST_SEEDS=1,7,42 \
   RACER_DST_FILTER=dst_generated_native RACER_TEST_ARGS=--nocapture
 ```
 
-`src/app_dst_tests.rs` defaults to seeds `1,7,42` and 32 generated actions per
-seed. `RACER_DST_STEPS` accepts 1 through 4096; the seed list accepts at most 1024
+`src/app_dst_tests.rs` defaults to seeds `1,7,42` and 41 generated actions per
+seed. `RACER_DST_STEPS` accepts 1 through 512; the seed list accepts at most 1024
 unsigned decimal 64-bit values. Failures print seed, action index, cluster size,
 and observed coverage. Replaying requires the same source revision: the seeded
 scheduler consumes random choices as the production graph progresses.
+Unknown `RACER_DST_*` parameters fail immediately. The supported parameters are
+`RACER_DST_SEEDS`, `RACER_DST_STEPS`, and the Makefile's `RACER_DST_FILTER`.
+The generator samples without replacement from a weighted bag of legal actions,
+refilling after each 41-action cycle. Order, node/worker counts, victims, ranges,
+fault subtypes, and polling quanta are seeded; there are no scenario scripts.
+Runs shorter than a full cycle are useful for failure minimization but omit the
+full-cycle coverage assertions. A custom corpus can fail its coverage obligations
+even if its individual requests are correct.
 
 Each run chooses an initial 2-32-node cluster and generates legal concurrent
 HEAD/bootstrap/pinned ranges, origin version mutations, retained old pins, node
-addition/removal, checkpoint restart, quiescent process loss without checkpoint,
+addition/removal, checkpoint restart, in-flight process loss without checkpoint,
+power loss during an accepted delayed disk write, established-link partitions,
 peer listener outage/heal, client disconnect, memory eviction, short I/O,
 connection rejection, delayed writes, and failed dirty writes. Membership can
 also change while a client request is in progress. Scheduling uses bounded random
 poll quanta and a virtual clock. Process incarnations have distinct deterministic
 entropy streams. A 16 MiB-plus-tail object exercises page boundaries alongside
 empty and short objects.
+Nodes have one or two worker pairs and use production cross-worker mailboxes.
+Additional generated actions retire page/credential keys, remove a cache and
+recreate its name under a new UID, jump wall time, reject credentials with 401/403,
+malform origin ETags and framing, truncate bodies, malform client requests, replay
+signed peer handshakes, corrupt signatures, and corrupt stored record bytes.
+Native actions cover Bind/Write/Invalidate crossed with synchronous rejection,
+delayed completion, and failed completion.
 
 Workers use `WorkerApplication::assemble` and production startup/recovery, client
 listeners, dispatch, candidate selection, peer challenge/signature/replay checks,
@@ -81,15 +97,30 @@ so HTTP fallback alone cannot pass it. Coverage reports relay-active polling tur
 successful responses, bytes, persisted records, OS completions, and consumed fault
 rules. Every injected OS rule must be observed. Per-turn admission/queue/descriptor
 bounds and final zero quota, descriptor, and native-resource usage are asserted.
+Full cycles require both peer-security rejection modes, all five origin fault
+types, all nine native fault combinations, secondary-worker data work, retirement,
+recreation, and both crash actions. Corpus-wide obligations additionally require
+actual relay activity, blocked sends on established streams, and reads after disk
+corruption. Native rules must be consumed, not merely scheduled.
 
-Coverage boundaries: peer listener outages are not pairwise network partitions;
-process loss is currently injected only after requests settle, not during DMA or
-partial persistent writes. The OS model retains completed writes across restart
-and does not model power-loss durability. Native fault-rule generation, key/cache
-retirement, wall-clock jumps, credential rejection, and multiple worker pairs per
-node are not yet generated here. Relay activity is reported, but arbitrary custom
-seeds are not required to traverse a relay. These are explicit gaps rather than
-claims implied by the `dst` filter. Component tests cover additional boundaries.
+The crash model distinguishes volatile data and directory bindings from their
+fsynced durable images. Provisioning is explicitly synced. Process loss first
+rolls back the victim disk subtree, then discards queued/active worker tasks and
+drops the application without invoking application drain/shutdown. Test-only
+dispatch/driver hooks model process address-space loss where production Drop
+deliberately retains undrained tasks. Only kernel cancellation fences are polled
+after this cut; no acquisition, writer, or checkpoint producer is resumed.
+Native destructors retain their normal QP/memory fencing. This is a deterministic
+software crash model, not a hardware DMA or filesystem-provider guarantee.
+
+Production checkpoint publication currently promises an atomic logical cut, not
+fsync durability (`src/store/checkpoint.rs:3-4,170-210`). A power loss may therefore
+discard an unsynced checkpoint; recovery must still serve correct bytes. The
+durable model does not invent a persistence guarantee absent from production.
+Control enrollment/TLS remain outside this harness: accepted control inputs are
+injected, while retirement and cache-publication transitions run through the real
+application lifecycle. Signed corruption/replay probes exercise real peer HTTP
+ingress and security, rather than bypassing verification with fabricated tokens.
 
 Constructors connect dependencies without opening files, accepting requests, or
 spawning threads. Activation is explicit through the application lifecycle. See
