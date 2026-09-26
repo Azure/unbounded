@@ -1,15 +1,79 @@
 //! Bounded UDP DNS on the control reactor. TLS, never DNS, authenticates the host.
 use super::transport::ControlIo;
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Result},
     runtime::deadline::RequestScope,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    os::fd::OwnedFd,
     rc::Rc,
     time::{Duration, Instant},
 };
+
+enum Datagram {
+    Real(UdpSocket),
+    #[cfg(test)]
+    Sim(Rc<OwnedFd>),
+}
+impl Datagram {
+    fn connect(server: SocketAddr) -> Result<(Self, Rc<OwnedFd>)> {
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            let fd = sim
+                .bind_datagram(
+                    if server.is_ipv4() {
+                        "127.0.0.1:0"
+                    } else {
+                        "[::1]:0"
+                    }
+                    .parse()
+                    .unwrap(),
+                )
+                .map_err(|_| Error::Io)?;
+            let OwnedFd::Sim(handle) = &fd else {
+                unreachable!()
+            };
+            handle.connect_datagram(server).map_err(|_| Error::Io)?;
+            let fd = Rc::new(fd);
+            return Ok((Self::Sim(fd.clone()), fd));
+        }
+        let socket = UdpSocket::bind(if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .map_err(|_| Error::Io)?;
+        socket.set_nonblocking(true).map_err(|_| Error::Io)?;
+        socket.connect(server).map_err(|_| Error::Io)?;
+        let fd = Rc::new(OwnedFd::from(socket.try_clone().map_err(|_| Error::Io)?));
+        Ok((Self::Real(socket), fd))
+    }
+    fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Real(socket) => socket.send(bytes),
+            #[cfg(test)]
+            Self::Sim(fd) => {
+                let OwnedFd::Sim(h) = &**fd else {
+                    unreachable!()
+                };
+                h.send_datagram(bytes)
+            }
+        }
+    }
+    fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Real(socket) => socket.recv(bytes),
+            #[cfg(test)]
+            Self::Sim(fd) => {
+                let OwnedFd::Sim(h) = &**fd else {
+                    unreachable!()
+                };
+                h.recv_from(bytes).map(|(n, _)| n)
+            }
+        }
+    }
+}
 
 pub(super) async fn resolve(
     io: &dyn ControlIo,
@@ -120,15 +184,7 @@ async fn query(
     request.push(0);
     request.extend_from_slice(&kind.to_be_bytes());
     request.extend_from_slice(&[0, 1]);
-    let socket = UdpSocket::bind(if server.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .map_err(|_| Error::Io)?;
-    socket.set_nonblocking(true).map_err(|_| Error::Io)?;
-    socket.connect(server).map_err(|_| Error::Io)?;
-    let fd = Rc::new(OwnedFd::from(socket.try_clone().map_err(|_| Error::Io)?));
+    let (socket, fd) = Datagram::connect(server)?;
     loop {
         scope.check()?;
         match socket.send(&request) {

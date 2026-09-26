@@ -115,7 +115,7 @@ impl transport::ControlIo for Io {
     }
     fn ready<'a>(
         &'a self,
-        fd: std::rc::Rc<std::os::fd::OwnedFd>,
+        fd: std::rc::Rc<crate::runtime::reactor::Descriptor>,
         read: bool,
         write: bool,
         scope: &'a runtime::deadline::RequestScope,

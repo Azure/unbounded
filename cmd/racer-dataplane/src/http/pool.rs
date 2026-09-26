@@ -1,5 +1,6 @@
 //! Bounded nonblocking TCP/Unix pools. Unfinished exchanges never return to idle.
 use super::io::OwnedBuffer;
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     model::limits::ResourceClass,
@@ -14,7 +15,6 @@ use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
     net::SocketAddr,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     rc::{Rc, Weak},
     task::{Poll, Waker},
@@ -481,18 +481,7 @@ impl Drop for HttpPool {
 }
 
 fn idle_healthy(fd: &OwnedFd) -> bool {
-    let mut byte = 0u8;
-    // SAFETY: a synchronous nonblocking peek uses a valid one-byte destination.
-    // EOF or unsolicited data makes a pooled HTTP exchange unsafe to reuse.
-    let result = unsafe {
-        libc::recv(
-            fd.as_raw_fd(),
-            (&mut byte as *mut u8).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+    fd.idle_healthy()
 }
 struct ConnectingSlot(Option<ReturnToPool>);
 impl Drop for ConnectingSlot {
@@ -512,17 +501,7 @@ impl Drop for ConnectingSlot {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    // SAFETY: fcntl accesses no caller memory; fd remains owned throughout.
-    unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        if flags < 0
-            || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
-            || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0
-        {
-            return Err(Error::Io);
-        }
-    }
-    Ok(())
+    fd.set_nonblocking()
 }
 
 // Runtime's owned address type is used so connect never borrows sockaddr bytes
@@ -543,18 +522,7 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
         }
         Endpoint::Unix(path) => (libc::AF_UNIX, SocketAddress::Unix(path.clone())),
     };
-    // SAFETY: socket returns a new exclusively owned FD or -1.
-    let raw = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return Err(Error::Io);
-    }
-    Ok((unsafe { OwnedFd::from_raw_fd(raw) }, address))
+    Ok((OwnedFd::socket(domain)?, address))
 }
 
 #[cfg(test)]

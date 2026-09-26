@@ -35,10 +35,70 @@ use std::{
 mod transition;
 pub use transition::PreparedListeners;
 
+enum Listener {
+    Real(UnixListener),
+    #[cfg(test)]
+    Sim(crate::runtime::reactor::Descriptor),
+}
+impl Listener {
+    fn accept(&self) -> std::io::Result<(crate::runtime::reactor::Descriptor, ())> {
+        match self {
+            Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
+            #[cfg(test)]
+            Self::Sim(crate::runtime::reactor::Descriptor::Sim(handle)) => {
+                handle.accept().map(|fd| (fd, ()))
+            }
+            #[cfg(test)]
+            Self::Sim(_) => unreachable!(),
+        }
+    }
+    fn set_nonblocking(&self, value: bool) -> std::io::Result<()> {
+        match self {
+            Self::Real(listener) => listener.set_nonblocking(value),
+            #[cfg(test)]
+            Self::Sim(_) => Ok(()),
+        }
+    }
+}
+enum Directory {
+    Real(File),
+    #[cfg(test)]
+    Sim {
+        sim: crate::runtime::reactor::simulation::Simulation,
+        path: PathBuf,
+    },
+}
+impl AsRawFd for Directory {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Real(file) => file.as_raw_fd(),
+            #[cfg(test)]
+            Self::Sim { .. } => panic!("simulated directory reached host syscall"),
+        }
+    }
+}
+trait Anchor {
+    fn anchor(&self) -> PathBuf;
+}
+impl Anchor for File {
+    fn anchor(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.as_raw_fd()))
+    }
+}
+impl Anchor for Directory {
+    fn anchor(&self) -> PathBuf {
+        match self {
+            Self::Real(file) => file.anchor(),
+            #[cfg(test)]
+            Self::Sim { path, .. } => path.clone(),
+        }
+    }
+}
+
 struct BoundListener {
     definition: CacheDefinition,
-    listener: UnixListener,
-    directory: File,
+    listener: Listener,
+    directory: Directory,
     device: u64,
     inode: u64,
     retired: Rc<Cell<bool>>,
@@ -49,6 +109,15 @@ impl Drop for BoundListener {
     fn drop(&mut self) {
         self.retired.set(true);
         let path = anchored(&self.directory).join(self.basename.borrow().as_str());
+        #[cfg(test)]
+        if let Directory::Sim { sim, .. } = &self.directory {
+            if sim.metadata(&path).is_ok_and(|(inode, mode)| {
+                inode == self.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
+            }) {
+                let _ = sim.unlink(&path);
+            }
+            return;
+        }
         if let Ok(metadata) = fs::symlink_metadata(&path) {
             if metadata.file_type().is_socket()
                 && metadata.dev() == self.device
@@ -202,12 +271,11 @@ impl ClientListeners {
             let (_, listener) = listeners.iter().nth(index).ok_or(Error::Internal)?;
             match listener.listener.accept() {
                 Ok((socket, _)) => {
-                    let connection =
-                        match ConnectionLease::from_accepted(socket.into(), &self.admission) {
-                            Ok(connection) => connection,
-                            Err(Error::Overloaded) => break,
-                            Err(error) => return Err(error),
-                        };
+                    let connection = match ConnectionLease::from_accepted(socket, &self.admission) {
+                        Ok(connection) => connection,
+                        Err(Error::Overloaded) => break,
+                        Err(error) => return Err(error),
+                    };
                     let cache = listener.definition.id.clone();
                     let cancellation = Cancellation::new()?;
                     let task_cancellation = cancellation.clone();
@@ -466,8 +534,8 @@ fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestSco
     })
 }
 
-fn anchored(directory: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+fn anchored(directory: &impl Anchor) -> PathBuf {
+    directory.anchor()
 }
 
 fn open_directory(path: &Path) -> Result<File> {
@@ -511,6 +579,36 @@ fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
 }
 
 fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<BoundListener> {
+    #[cfg(test)]
+    if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+        let directory = root.join(&definition.name).join("client");
+        sim.create_dir_all(&directory).map_err(|_| Error::Io)?;
+        let path = directory.join(basename);
+        let listener = sim
+            .listen(crate::runtime::reactor::SocketAddress::Unix(path.clone()))
+            .map_err(|_| Error::Io)?;
+        let (inode, _) = sim.metadata(&path).map_err(|_| Error::Io)?;
+        let bound = BoundListener {
+            definition,
+            listener: Listener::Sim(listener),
+            directory: Directory::Sim {
+                sim,
+                path: directory,
+            },
+            device: 1,
+            inode,
+            retired: Rc::new(Cell::new(false)),
+            basename: RefCell::new(basename.into()),
+        };
+        set_socket_mode(
+            &bound.directory,
+            bound.device,
+            bound.inode,
+            bound.definition.socket_mode,
+            basename,
+        )?;
+        return Ok(bound);
+    }
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
     let directory = child_directory(&cache, b"client")?;
@@ -520,8 +618,8 @@ fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<Boun
     let metadata = fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
     let bound = BoundListener {
         definition,
-        listener,
-        directory,
+        listener: Listener::Real(listener),
+        directory: Directory::Real(directory),
         device: metadata.dev(),
         inode: metadata.ino(),
         retired: Rc::new(Cell::new(false)),
@@ -542,12 +640,24 @@ fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<Boun
 }
 
 fn set_socket_mode(
-    directory: &File,
+    directory: &Directory,
     device: u64,
     inode: u64,
     mode: u32,
     basename: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = directory {
+        let path = path.join(basename);
+        let (actual, kind) = sim.metadata(&path).map_err(|_| Error::Io)?;
+        if device != 1 || actual != inode || kind as u32 & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(Error::Io);
+        }
+        if FAIL_CHMOD.with(|fail| fail.replace(false)) {
+            return Err(Error::Io);
+        }
+        return sim.chmod(&path, mode).map_err(|_| Error::Io);
+    }
     // Pin the final inode too: a replacement symlink must not redirect chmod.
     let socket = OpenOptions::new()
         .read(true)
@@ -571,6 +681,79 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulated_listener_preparation_rollback_and_real_http_exchange() {
+        use crate::runtime::reactor::{Descriptor, SocketAddress, simulation::Simulation};
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let admission = Rc::new(Admission::new(limits()));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let io = Rc::new(HttpIo::with_admission(
+            reactor.clone(),
+            Codec::new(32768, i64::MAX as u64),
+            admission.clone(),
+        ));
+        let delivery = Rc::new(Delivery::new(
+            Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+            Duration::from_secs(2),
+        ));
+        let reads = Rc::new(Heads {
+            calls: Cell::new(0),
+        });
+        let listeners = ClientListeners::new(
+            reads.clone(),
+            RequestParser::new(32768),
+            Rc::new(Responses::new(io.clone(), delivery)),
+            io,
+            admission,
+        );
+        let definition = definition();
+        futures::executor::block_on(
+            listeners.reconcile(std::slice::from_ref(&definition), &scope()),
+        )
+        .unwrap();
+        let path = PathBuf::from("/run/racer/example/client/socket");
+        let inode = sim.metadata(&path).unwrap().0;
+        let mut changed = definition.clone();
+        changed.socket_mode = 0o660;
+        let prepared =
+            futures::executor::block_on(listeners.prepare(&[changed], &scope())).unwrap();
+        assert_ne!(sim.metadata(&path).unwrap().0, inode);
+        drop(prepared);
+        assert_eq!(sim.metadata(&path).unwrap().0, inode);
+        let client = sim.connect(SocketAddress::Unix(path)).unwrap();
+        let Descriptor::Sim(client) = client else {
+            unreachable!()
+        };
+        client.send(&request("HEAD", "")).unwrap();
+        let mut response = Vec::new();
+        let mut bytes = [0; 4096];
+        for _ in 0..1000 {
+            listeners
+                .poll_budgeted(
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    16,
+                )
+                .unwrap();
+            reactor.poll_budgeted(16).unwrap();
+            match client.recv(&mut bytes) {
+                Ok(n) => response.extend_from_slice(&bytes[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("{e}"),
+            }
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(reads.calls.get(), 1);
+        drop(client);
+        listeners.stop_admission();
+        drop(listeners);
+        drop(reactor);
+        assert_eq!(sim.live_handles(), 0);
+    }
     use crate::{
         client::request::ClientRequest,
         http::codec::Codec,

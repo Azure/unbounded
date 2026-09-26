@@ -45,7 +45,6 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     net::TcpListener,
-    os::fd::OwnedFd,
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
@@ -577,7 +576,10 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
     };
     let service = async {
         let fd = reactor
-            .accept(Rc::new(OwnedFd::from(listener)), &scope)
+            .accept(
+                Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
+                &scope,
+            )
             .await?;
         let connection = ConnectionLease::from_accepted(fd, &admission)?;
         let connection = server.serve_connection(connection, &scope).await?;

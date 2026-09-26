@@ -3,6 +3,7 @@
 //! Each lease owns both descriptors and its admission charge. No descriptor or
 //! backing page is recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     model::limits::ResourceClass,
@@ -17,7 +18,7 @@ use std::{
     collections::VecDeque,
     future::poll_fn,
     io,
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd},
     rc::Rc,
     task::{Poll, Waker},
 };
@@ -155,6 +156,18 @@ impl PipePool {
     pub fn acquire(&self) -> Result<PipeLease> {
         let reservation = self.admission.reserve(None, ResourceClass::Pipe, 1)?;
         reservation.validate(ResourceClass::Pipe, 1)?;
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            let (read, write) = sim.pipe(MAX_PIPE_BYTES);
+            return Ok(PipeLease {
+                read,
+                write,
+                capacity: MAX_PIPE_BYTES,
+                buffered: 0,
+                _reservation: reservation,
+                _notify: Notify(self.waiting.clone()),
+            });
+        }
         let mut fds = [-1; 2];
         // SAFETY: pipe2 initializes exactly two descriptors on success.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
@@ -200,6 +213,12 @@ impl PipeLease {
     /// Copy at most the available capacity. WouldBlock and Interrupted are exposed
     /// to the caller; this method never waits or retains a borrowed buffer.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let OwnedFd::Sim(handle) = &self.write {
+            let written = handle.pipe_write(bytes)?;
+            self.buffered += written;
+            return Ok(written);
+        }
         // SAFETY: the initialized slice stays live for this nonblocking syscall.
         // The read end is owned by this lease, so this cannot generate SIGPIPE.
         let written = unsafe {
@@ -216,6 +235,12 @@ impl PipeLease {
 
     /// Read currently buffered bytes, or return WouldBlock for an empty pipe.
     pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let OwnedFd::Sim(handle) = &self.read {
+            let read = handle.pipe_read(bytes)?;
+            self.buffered -= read;
+            return Ok(read);
+        }
         // SAFETY: the destination is exclusively borrowed until read returns.
         let read = unsafe {
             libc::read(
@@ -227,6 +252,16 @@ impl PipeLease {
         let read = syscall_count(read)?;
         self.buffered -= read;
         Ok(read)
+    }
+
+    pub fn try_splice_descriptor(&mut self, socket: &OwnedFd, count: usize) -> io::Result<usize> {
+        #[cfg(test)]
+        if let (OwnedFd::Sim(pipe), OwnedFd::Sim(socket)) = (&self.read, socket) {
+            let sent = pipe.splice(socket, count.min(self.buffered))?;
+            self.buffered -= sent;
+            return Ok(sent);
+        }
+        self.try_splice_to(socket, count)
     }
 
     /// Transfer copied kernel pipe bytes to a nonblocking stream socket. The

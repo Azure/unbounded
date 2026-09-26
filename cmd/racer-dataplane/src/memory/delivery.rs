@@ -10,16 +10,18 @@ use super::{
     pipe::{PipeLease, PipePool},
     pool::VerifiedPage,
 };
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     http::{io::OwnedBuffer, pool::ConnectionLease},
     model::range::PageSlice,
     runtime::{deadline::RequestScope, reactor::IoBuffer},
 };
+#[cfg(test)]
+use std::os::fd::AsRawFd;
 use std::{
     future::poll_fn,
     io,
-    os::fd::{AsFd, AsRawFd, OwnedFd},
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
@@ -74,27 +76,13 @@ impl ReaderLease {
         let count = self.remaining().min(SEND_CHUNK_BYTES);
         let bytes = &self.page.bytes()[start..start + count];
         if copying {
-            // SAFETY: send copies the live slice synchronously. DONTWAIT also
-            // works for blocking descriptors; NOSIGNAL makes disconnect an error.
-            let sent = unsafe {
-                libc::send(
-                    connection.as_raw_fd(),
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            };
-            return if sent < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(sent as usize)
-            };
+            return connection.try_send(bytes);
         }
         // Refill only an empty pipe: a partial splice leaves the exact suffix.
         if self.pipe.buffered() == 0 && self.pipe.try_write(bytes)? == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
-        self.pipe.try_splice_to(connection, count)
+        self.pipe.try_splice_descriptor(connection, count)
     }
 }
 
@@ -176,7 +164,7 @@ impl Delivery {
                 return Err(Error::InvalidRequest);
             }
             let socket = connection.socket();
-            validate_socket(&*socket)?;
+            validate_socket(&socket)?;
             drop(socket);
             let mut stalled_at = Instant::now();
             let mut copying = false;
@@ -375,23 +363,8 @@ fn splice_unsupported(error: &io::Error) -> bool {
     )
 }
 
-fn validate_socket(connection: &impl AsFd) -> Result<()> {
-    let mut kind: libc::c_int = 0;
-    let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
-    // SAFETY: both output pointers reference correctly sized writable values.
-    let result = unsafe {
-        libc::getsockopt(
-            connection.as_fd().as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&mut kind as *mut libc::c_int).cast(),
-            &mut length,
-        )
-    };
-    if result < 0 || kind != libc::SOCK_STREAM {
-        return Err(Error::InvalidRequest);
-    }
-    Ok(())
+fn validate_socket(connection: &OwnedFd) -> Result<()> {
+    connection.validate_socket()
 }
 
 async fn yield_once() {

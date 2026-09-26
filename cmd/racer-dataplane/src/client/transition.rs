@@ -224,6 +224,14 @@ pub(super) fn prepare<'a>(
 }
 
 fn owns(listener: &BoundListener, basename: &str) -> bool {
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = &listener.directory {
+        return sim
+            .metadata(&path.join(basename))
+            .is_ok_and(|(inode, mode)| {
+                inode == listener.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
+            });
+    }
     fs::symlink_metadata(anchored(&listener.directory).join(basename)).is_ok_and(|metadata| {
         metadata.file_type().is_socket()
             && metadata.dev() == listener.device
@@ -231,18 +239,35 @@ fn owns(listener: &BoundListener, basename: &str) -> bool {
     })
 }
 
-fn absent(directory: &File, basename: &str) -> bool {
+fn absent(directory: &Directory, basename: &str) -> bool {
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = directory {
+        return sim
+            .metadata(&path.join(basename))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    }
     fs::symlink_metadata(anchored(directory).join(basename))
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
-fn same_directory(first: &File, second: &File) -> Result<bool> {
-    let first = first.metadata().map_err(|_| Error::Io)?;
-    let second = second.metadata().map_err(|_| Error::Io)?;
-    Ok(first.dev() == second.dev() && first.ino() == second.ino())
+fn same_directory(first: &Directory, second: &Directory) -> Result<bool> {
+    match (first, second) {
+        (Directory::Real(first), Directory::Real(second)) => {
+            let first = first.metadata().map_err(|_| Error::Io)?;
+            let second = second.metadata().map_err(|_| Error::Io)?;
+            Ok(first.dev() == second.dev() && first.ino() == second.ino())
+        }
+        #[cfg(test)]
+        (Directory::Sim { sim, path: first }, Directory::Sim { path: second, .. }) => {
+            Ok(sim.metadata(first).map_err(|_| Error::Io)?.0
+                == sim.metadata(second).map_err(|_| Error::Io)?.0)
+        }
+        #[cfg(test)]
+        _ => Ok(false),
+    }
 }
 
-fn rename(directory: &File, from: &str, to: &str, flags: u32) -> Result<()> {
+fn rename(directory: &Directory, from: &str, to: &str, flags: u32) -> Result<()> {
     #[cfg(test)]
     if FAIL_RENAME_AFTER.with(|remaining| match remaining.get() {
         Some(0) => {
@@ -256,6 +281,12 @@ fn rename(directory: &File, from: &str, to: &str, flags: u32) -> Result<()> {
         None => false,
     }) {
         return Err(Error::Io);
+    }
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = directory {
+        return sim
+            .rename(&path.join(from), &path.join(to), flags)
+            .map_err(|_| Error::Io);
     }
     let from = CString::new(from).map_err(|_| Error::InvalidConfiguration)?;
     let to = CString::new(to).map_err(|_| Error::InvalidConfiguration)?;

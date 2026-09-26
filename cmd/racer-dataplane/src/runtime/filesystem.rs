@@ -237,13 +237,22 @@ impl Reactor {
                     .mode(if flags & libc::O_CREAT != 0 { 0o600 } else { 0 })
                     .resolve(resolve),
             );
-            let sqe = opcode::OpenAt2::new(
-                types::Fd(dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd())),
-                path.as_ptr(),
-                &*how,
-            )
-            .build()
-            .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Open {
+                    dir: dir.clone(),
+                    path: path.clone(),
+                    flags,
+                    resolve
+                },
+                opcode::OpenAt2::new(
+                    types::Fd(dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd())),
+                    path.as_ptr(),
+                    &*how,
+                )
+                .build()
+                .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, true, move |result| {
                 drop((dir, path, how, quota));
                 match result? {
@@ -269,15 +278,22 @@ impl Reactor {
                 std::mem::size_of::<libc::statx>(),
             )?;
             let mut stat: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
-            let sqe = opcode::Statx::new(
-                types::Fd(fd.as_raw_fd()),
-                c"".as_ptr(),
-                (&mut *stat as *mut libc::statx).cast(),
-            )
-            .flags(libc::AT_EMPTY_PATH)
-            .mask(libc::STATX_BASIC_STATS)
-            .build()
-            .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Stat {
+                    fd: fd.clone(),
+                    ptr: &mut *stat
+                },
+                opcode::Statx::new(
+                    types::Fd(fd.as_raw_fd()),
+                    c"".as_ptr(),
+                    (&mut *stat as *mut libc::statx).cast(),
+                )
+                .flags(libc::AT_EMPTY_PATH)
+                .mask(libc::STATX_BASIC_STATS)
+                .build()
+                .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, false, move |result| {
                 let _quota = quota;
                 value(result)?;
@@ -289,9 +305,13 @@ impl Reactor {
     }
     pub fn file_sync<'a>(&'a self, fd: Rc<OwnedFd>, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
-            let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
-                .build()
-                .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Sync(fd.clone()),
+                opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+                    .build()
+                    .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop(fd);
                 value(result).map(|_| ())
@@ -307,10 +327,17 @@ impl Reactor {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
-            let sqe = opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                .mode(0o700)
-                .build()
-                .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Mkdir {
+                    dir: dir.clone(),
+                    name: name.clone()
+                },
+                opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
+                    .mode(0o700)
+                    .build()
+                    .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, name, quota));
                 value(result).map(|_| ())
@@ -327,14 +354,22 @@ impl Reactor {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&from, &to])?;
-            let sqe = opcode::RenameAt::new(
-                types::Fd(dir.as_raw_fd()),
-                from.as_ptr(),
-                types::Fd(dir.as_raw_fd()),
-                to.as_ptr(),
-            )
-            .build()
-            .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Rename {
+                    dir: dir.clone(),
+                    from: from.clone(),
+                    to: to.clone()
+                },
+                opcode::RenameAt::new(
+                    types::Fd(dir.as_raw_fd()),
+                    from.as_ptr(),
+                    types::Fd(dir.as_raw_fd()),
+                    to.as_ptr(),
+                )
+                .build()
+                .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, from, to, quota));
                 value(result).map(|_| ())
@@ -350,9 +385,16 @@ impl Reactor {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
-            let sqe = opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                .build()
-                .flags(squeue::Flags::ASYNC);
+            let sqe = submission!(
+                self,
+                simulation::Op::Unlink {
+                    dir: dir.clone(),
+                    name: name.clone()
+                },
+                opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
+                    .build()
+                    .flags(squeue::Flags::ASYNC)
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, name, quota));
                 value(result).map(|_| ())

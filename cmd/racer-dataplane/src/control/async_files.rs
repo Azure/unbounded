@@ -1,11 +1,12 @@
 //! Bounded file operations issued only through the serving worker's reactor.
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Result},
     runtime::{deadline::RequestScope, reactor::Reactor},
 };
 use std::{
     ffi::{CString, OsStr},
-    os::{fd::OwnedFd, unix::ffi::OsStrExt},
+    os::unix::ffi::OsStrExt,
     path::{Component, Path},
     rc::Rc,
 };
@@ -76,14 +77,19 @@ pub(crate) async fn directory(
     Ok(fd)
 }
 fn check_private(stat: &libc::statx, regular: bool) -> Result<()> {
+    #[cfg(test)]
+    let uid = if crate::runtime::reactor::simulation::Simulation::current().is_some() {
+        0
+    } else {
+        unsafe { libc::geteuid() }
+    };
+    #[cfg(not(test))]
+    let uid = unsafe { libc::geteuid() };
     let mask = libc::STATX_MODE | libc::STATX_UID | libc::STATX_NLINK;
     if stat.stx_mask & mask != mask {
         return Err(Error::Io);
     }
-    if stat.stx_mode & 0o077 != 0
-        || stat.stx_uid != unsafe { libc::geteuid() }
-        || regular && stat.stx_nlink != 1
-    {
+    if stat.stx_mode & 0o077 != 0 || stat.stx_uid != uid || regular && stat.stx_nlink != 1 {
         return Err(Error::Unauthorized);
     }
     Ok(())

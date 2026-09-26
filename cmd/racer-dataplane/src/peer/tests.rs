@@ -794,7 +794,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     };
     use std::{
         net::TcpListener,
-        os::fd::OwnedFd,
         task::{Context, Poll},
     };
     struct NeverTransport;
@@ -937,7 +936,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     .unwrap();
     let server_work = async {
         let fd = reactor
-            .accept(Rc::new(OwnedFd::from(listener)), &scope)
+            .accept(
+                Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
+                &scope,
+            )
             .await?;
         let connection = ConnectionLease::from_accepted(fd, &admission)?;
         let connection = server.serve_connection(connection, &listener_scope).await?;

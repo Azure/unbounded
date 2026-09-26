@@ -168,6 +168,20 @@ impl Drop for Checkpointer {
 }
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+        sim.create_dir_all(directory).map_err(|_| Error::Io)?;
+        let temporary = directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
+        let result = (|| {
+            sim.write_file(&temporary, bytes).map_err(|_| Error::Io)?;
+            sim.rename(&temporary, &directory.join(CHECKPOINT_NAMES[slot]), 0)
+                .map_err(|_| Error::Io)
+        })();
+        if result.is_err() {
+            let _ = sim.unlink(&temporary);
+        }
+        return result;
+    }
     fs::create_dir_all(directory).map_err(|_| Error::Io)?;
     // A stale partial file never prevents a later publication, including after PID
     // reuse. Exactly one application coordinator serializes publications.

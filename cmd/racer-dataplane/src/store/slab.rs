@@ -3,6 +3,7 @@ use super::{
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
     segment::SegmentLease,
 };
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     model::{
@@ -19,10 +20,7 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     fs::{File, OpenOptions},
-    os::{
-        fd::{AsRawFd, OwnedFd},
-        unix::fs::OpenOptionsExt,
-    },
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::PathBuf,
     rc::Rc,
 };
@@ -140,10 +138,36 @@ impl Slabs {
         {
             return Err(Error::InvalidConfiguration);
         }
-        std::fs::create_dir_all(&self.directory).map_err(|_| Error::Io)?;
         let path = self
             .directory
             .join(format!("worker-{}-slab-0.dat", self.worker.0));
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            sim.create_dir_all(&self.directory).map_err(|_| Error::Io)?;
+            let file = sim
+                .open(None, &path, libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT)
+                .map_err(|_| Error::Io)?;
+            let OwnedFd::Sim(handle) = &file else {
+                unreachable!()
+            };
+            handle.lock().map_err(|_| Error::Unavailable)?;
+            let stat = handle.stat().map_err(|_| Error::Io)?;
+            let a = DirectAlignment::validate(
+                stat.stx_dio_mem_align as usize,
+                stat.stx_dio_offset_align as u64,
+                stat.stx_dio_offset_align as usize,
+            )?;
+            self.validate_layout(a, stat.stx_size)?;
+            if stat.stx_size == 0 {
+                handle.set_len(self.slab_bytes).map_err(|_| Error::Io)?;
+            }
+            *self.opened.borrow_mut() = Some(OpenSlab {
+                file: Rc::new(file),
+                alignment: a,
+            });
+            return Ok(a);
+        }
+        std::fs::create_dir_all(&self.directory).map_err(|_| Error::Io)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -158,6 +182,18 @@ impl Slabs {
             return Err(Error::Unavailable);
         }
         let a = discover(&file)?;
+        let size = file.metadata().map_err(|_| Error::Io)?.len();
+        self.validate_layout(a, size)?;
+        if size == 0 {
+            file.set_len(self.slab_bytes).map_err(|_| Error::Io)?;
+        }
+        *self.opened.borrow_mut() = Some(OpenSlab {
+            file: Rc::new(file.into()),
+            alignment: a,
+        });
+        Ok(a)
+    }
+    fn validate_layout(&self, a: DirectAlignment, size: u64) -> Result<()> {
         let largest = a
             .extent(
                 0,
@@ -170,18 +206,10 @@ impl Slabs {
         {
             return Err(Error::InvalidConfiguration);
         }
-        let size = file.metadata().map_err(|_| Error::Io)?.len();
         if size != 0 && size != self.slab_bytes {
             return Err(Error::InvalidConfiguration);
         }
-        if size == 0 {
-            file.set_len(self.slab_bytes).map_err(|_| Error::Io)?;
-        }
-        *self.opened.borrow_mut() = Some(OpenSlab {
-            file: Rc::new(file.into()),
-            alignment: a,
-        });
-        Ok(a)
+        Ok(())
     }
     fn submission(
         &self,

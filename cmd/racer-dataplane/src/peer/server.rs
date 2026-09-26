@@ -56,9 +56,7 @@ impl PeerServer {
             use futures::{StreamExt, stream::FuturesUnordered};
             scope.check()?;
             let reactor = self.reactor.as_ref().ok_or(Error::InvalidConfiguration)?;
-            let listener = std::net::TcpListener::bind(address).map_err(|_| Error::Io)?;
-            listener.set_nonblocking(true).map_err(|_| Error::Io)?;
-            let fd = Rc::new(std::os::fd::OwnedFd::from(listener));
+            let fd = Rc::new(crate::runtime::reactor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self.admission.limits().client_connections.get();
             loop {
@@ -365,9 +363,9 @@ async fn next_accepted<A, C>(
     accept: A,
     active: &mut futures::stream::FuturesUnordered<C>,
     scope: &RequestScope,
-) -> crate::error::Result<std::os::fd::OwnedFd>
+) -> crate::error::Result<crate::runtime::reactor::Descriptor>
 where
-    A: std::future::Future<Output = crate::error::Result<std::os::fd::OwnedFd>>,
+    A: std::future::Future<Output = crate::error::Result<crate::runtime::reactor::Descriptor>>,
     C: std::future::Future,
 {
     use futures::{FutureExt, StreamExt};
@@ -405,7 +403,6 @@ mod tests {
         cell::Cell,
         future::Future,
         io::{Read, Write},
-        os::fd::OwnedFd,
         os::unix::net::UnixStream,
         pin::Pin,
         task::{Context, Poll},
@@ -431,7 +428,9 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<OwnedFd>>> Future for CountedAccept<F> {
+    impl<F: Future<Output = crate::error::Result<crate::runtime::reactor::Descriptor>>> Future
+        for CountedAccept<F>
+    {
         type Output = F::Output;
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             self.counts.polled.set(self.counts.polled.get() + 1);
@@ -538,7 +537,7 @@ mod tests {
                 assert_counts(&counts, 1, 1);
                 // The exact accepted endpoint remains usable until its one
                 // returned owner is dropped, then the peer observes EOF.
-                let mut accepted = UnixStream::from(fd);
+                let mut accepted = UnixStream::from(fd.into_host().unwrap());
                 peer.write_all(b"x").unwrap();
                 let mut byte = [0];
                 accepted.read_exact(&mut byte).unwrap();
@@ -614,7 +613,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(OwnedFd::from(listener));
+                let fd = Rc::new(crate::runtime::reactor::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
@@ -651,7 +650,7 @@ mod tests {
                         peer = Some(TcpStream::connect(address).unwrap());
                     }
                     let accepted = drive(&reactor, work.as_mut()).unwrap();
-                    let mut accepted = TcpStream::from(accepted);
+                    let mut accepted = TcpStream::from(accepted.into_host().unwrap());
                     accepted.write_all(b"x").unwrap();
                     let mut byte = [0];
                     peer.as_mut().unwrap().read_exact(&mut byte).unwrap();

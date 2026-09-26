@@ -52,8 +52,8 @@ impl Telemetry {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let listener = std::net::TcpListener::bind(address).map_err(|_| Error::Io)?;
-            self.serve_listener_with_io(listener, io, scope).await
+            let listener = crate::runtime::reactor::Descriptor::tcp_listener(address)?;
+            server::serve(self, listener, io, scope).await
         })
     }
     /// Ownership-transfer hook also permits port-zero binding and socket tests.
@@ -63,6 +63,6 @@ impl Telemetry {
         io: Rc<server::DiagnosticIo>,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
-        server::serve(self, listener, io, scope)
+        server::serve(self, listener.into(), io, scope)
     }
 }

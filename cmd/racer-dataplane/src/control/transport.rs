@@ -1,5 +1,6 @@
 //! Nonblocking rustls over reactor-owned readiness. No executor or helper thread.
 use super::{client::ControlEndpoint, enrollment::LocalSigningIdentity, wire};
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     runtime::deadline::RequestScope,
@@ -8,7 +9,7 @@ use std::{
     cell::RefCell,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -90,6 +91,19 @@ impl ControlIo for ReactorControlIo {
             if duration.is_zero() {
                 return Ok(());
             }
+            #[cfg(test)]
+            if crate::runtime::reactor::simulation::Simulation::current().is_some() {
+                return std::future::poll_fn(|cx| {
+                    scope.check()?;
+                    if Instant::now() >= until {
+                        std::task::Poll::Ready(Ok(()))
+                    } else {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
             let raw = unsafe {
                 libc::timerfd_create(
                     libc::CLOCK_MONOTONIC,
@@ -127,12 +141,42 @@ pub struct ControlTransport {
     io: RefCell<Option<Rc<dyn ControlIo>>>,
 }
 pub struct ControlConnection {
-    stream: TcpStream,
+    stream: ControlStream,
     fd: Rc<OwnedFd>,
     tls: rustls::ClientConnection,
     io: Rc<dyn ControlIo>,
     host: String,
     expires: Option<SystemTime>,
+}
+enum ControlStream {
+    Real(TcpStream),
+    #[cfg(test)]
+    Sim(Rc<OwnedFd>),
+}
+impl Read for ControlStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Real(stream) => stream.read(bytes),
+            #[cfg(test)]
+            Self::Sim(fd) => fd.try_recv(bytes),
+        }
+    }
+}
+impl Write for ControlStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Real(stream) => stream.write(bytes),
+            #[cfg(test)]
+            Self::Sim(fd) => fd.try_send(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Real(stream) => stream.flush(),
+            #[cfg(test)]
+            Self::Sim(_) => Ok(()),
+        }
+    }
 }
 pub struct HttpResponse {
     pub status: u16,
@@ -268,11 +312,22 @@ impl ControlTransport {
             let mut connected = None;
             for address in addresses {
                 scope.check()?;
+                #[cfg(test)]
+                if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+                    if let Ok(fd) =
+                        sim.connect(crate::runtime::reactor::SocketAddress::Inet(address))
+                    {
+                        let fd = Rc::new(fd);
+                        connected = Some((ControlStream::Sim(fd.clone()), fd));
+                        break;
+                    }
+                    continue;
+                }
                 if let Ok(stream) = connect_socket(address) {
                     let fd = Rc::new(OwnedFd::from(stream.try_clone().map_err(|_| Error::Io)?));
                     io.ready(fd.clone(), false, true, scope).await?;
                     if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                        connected = Some((stream, fd));
+                        connected = Some((ControlStream::Real(stream), fd));
                         break;
                     }
                 }

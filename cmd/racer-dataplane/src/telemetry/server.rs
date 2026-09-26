@@ -3,6 +3,7 @@ use super::{
     Telemetry,
     metrics::{Event, Gauge, GaugeLease},
 };
+use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     model::limits::ResourceClass,
@@ -12,11 +13,11 @@ use crate::{
         reactor::{IoBuffer, Reactor},
     },
 };
+#[cfg(test)]
+use std::net::TcpListener;
 use std::{
     cell::Cell,
     fmt::Write,
-    net::TcpListener,
-    os::fd::OwnedFd,
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
@@ -109,7 +110,7 @@ impl IoBuffer for Buffer {
 
 pub(super) fn serve<'a>(
     telemetry: &'a Telemetry,
-    listener: TcpListener,
+    listener: OwnedFd,
     io: Rc<DiagnosticIo>,
     scope: &'a RequestScope,
 ) -> Operation<'a, ()> {
@@ -119,8 +120,8 @@ pub(super) fn serve<'a>(
             return Err(Error::InvalidConfiguration);
         }
         let _serving = Serving(io.clone());
-        listener.set_nonblocking(true).map_err(|_| Error::Io)?;
-        let listener = Rc::new(OwnedFd::from(listener));
+        listener.set_nonblocking()?;
+        let listener = Rc::new(listener);
         let mut accepting = None;
         let mut connections: Vec<Operation<'_, ()>> = Vec::with_capacity(MAX_CONNECTIONS);
         std::future::poll_fn(|cx| {

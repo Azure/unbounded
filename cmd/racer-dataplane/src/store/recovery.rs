@@ -163,6 +163,41 @@ fn filter_keys(shard: &mut ShardImage, available: Option<&[KeyId]>) {
 pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
     let mut candidates = Vec::new();
     for (slot, name) in CHECKPOINT_NAMES.iter().enumerate() {
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            let fd = match sim.open(
+                None,
+                &directory.join(name),
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+            ) {
+                Ok(fd) => fd,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                    ) || e.raw_os_error() == Some(libc::ELOOP) =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(Error::Io),
+            };
+            let crate::runtime::reactor::Descriptor::Sim(handle) = fd else {
+                unreachable!()
+            };
+            let stat = handle.stat().map_err(|_| Error::Io)?;
+            if stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
+                || stat.stx_size > MAX_CHECKPOINT_BYTES as u64
+            {
+                continue;
+            }
+            let bytes = sim
+                .read_file(&directory.join(name))
+                .map_err(|_| Error::Io)?;
+            if let Ok(image) = CheckpointCodec.decode(&bytes) {
+                candidates.push((slot, image));
+            }
+            continue;
+        }
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

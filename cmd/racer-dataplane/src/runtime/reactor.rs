@@ -21,6 +21,37 @@ use crate::{
     model::limits::ResourceClass,
 };
 use io_uring::{IoUring, opcode, squeue, types};
+#[path = "descriptor.rs"]
+pub mod descriptor;
+use Descriptor as OwnedFd;
+pub use descriptor::Descriptor;
+#[cfg(test)]
+#[path = "simulation.rs"]
+pub mod simulation;
+
+// Only the selected backend constructs a submission, so simulated handles cannot
+// accidentally enter an SQE or be converted to invented raw descriptor numbers.
+macro_rules! submission {
+    ($reactor:expr, $sim:expr, $real:expr) => {{
+        #[cfg(test)]
+        {
+            if $reactor.state.borrow().simulation.is_some() {
+                Submission::Sim($sim)
+            } else {
+                Submission::Real($real)
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Submission::Real($real)
+        }
+    }};
+}
+enum Submission {
+    Real(squeue::Entry),
+    #[cfg(test)]
+    Sim(simulation::Op),
+}
 // Control-owned filesystem extension; shares this reactor's completion fences.
 #[path = "filesystem.rs"]
 pub mod filesystem;
@@ -30,7 +61,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd as HostFd},
         unix::ffi::OsStrExt,
     },
     path::PathBuf,
@@ -49,7 +80,7 @@ pub struct Reactor {
 pub struct IoId(pub u64);
 
 /// An owned address; the encoded sockaddr remains pinned in the in-flight owner.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SocketAddress {
     Inet(SocketAddr),
     Unix(PathBuf),
@@ -60,7 +91,9 @@ const MAX_WAIT: Duration = Duration::from_millis(10);
 
 struct State {
     ring: Option<IoUring>,
-    wake: Option<Arc<OwnedFd>>,
+    wake: Option<Arc<HostFd>>,
+    #[cfg(test)]
+    simulation: Option<simulation::Driver>,
     ring_reservation: Option<Reservation>,
     entries: BTreeMap<IoId, Entry>,
     next: u64,
@@ -157,16 +190,18 @@ impl Drop for Fence<'_> {
 /// Cloneable cross-thread wake endpoint for worker command/crypto producers.
 #[derive(Clone)]
 pub struct ReactorWake {
-    fd: Arc<OwnedFd>,
+    fd: Option<Arc<HostFd>>,
 }
 
 impl ReactorWake {
     pub fn wake(&self) -> Result<()> {
+        let Some(fd) = &self.fd else {
+            return Ok(());
+        };
         let value = 1u64;
         loop {
             // SAFETY: eventfd consumes this initialized, stack-local u64 synchronously.
-            let result =
-                unsafe { libc::write(self.fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            let result = unsafe { libc::write(fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
             if result == 8 {
                 return Ok(());
             }
@@ -326,6 +361,8 @@ impl Reactor {
             state: RefCell::new(State {
                 ring: None,
                 wake: None,
+                #[cfg(test)]
+                simulation: simulation::Simulation::current().map(simulation::Driver::new),
                 ring_reservation: None,
                 entries: BTreeMap::new(),
                 next: 1,
@@ -343,7 +380,7 @@ impl Reactor {
         if state.stopped {
             return Err(Error::Unavailable);
         }
-        if state.ring.is_some() {
+        if state.ring_reservation.is_some() {
             return Ok(());
         }
         let capacity = self.admission.limits().queue_entries.get();
@@ -363,6 +400,11 @@ impl Reactor {
         let ring_reservation =
             self.admission
                 .reserve_completion(None, ResourceClass::RequestContext, ring_bytes)?;
+        #[cfg(test)]
+        if state.simulation.is_some() {
+            state.ring_reservation = Some(ring_reservation);
+            return Ok(());
+        }
         let ring = IoUring::builder()
             .setup_cqsize(cq)
             .build(sq)
@@ -372,7 +414,7 @@ impl Reactor {
         if fd < 0 {
             return Err(Error::Io);
         }
-        state.wake = Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }));
+        state.wake = Some(Arc::new(unsafe { HostFd::from_raw_fd(fd) }));
         state.ring_reservation = Some(ring_reservation);
         state.ring = Some(ring);
         Ok(())
@@ -382,7 +424,7 @@ impl Reactor {
     pub fn waker(&self) -> Result<ReactorWake> {
         self.init()?;
         Ok(ReactorWake {
-            fd: self.state.borrow().wake.as_ref().unwrap().clone(),
+            fd: self.state.borrow().wake.clone(),
         })
     }
 
@@ -392,7 +434,7 @@ impl Reactor {
 
     fn submit<T: 'static>(
         &self,
-        sqe: squeue::Entry,
+        sqe: Submission,
         scope: &RequestScope,
         accept: bool,
         finish: impl FnOnce(Result<KernelResult>) -> Result<T> + 'static,
@@ -453,16 +495,26 @@ impl Reactor {
             },
         );
         // SAFETY: the inserted entry owns all SQE backing until both CQEs arrive.
-        if unsafe {
-            state
-                .ring
-                .as_mut()
-                .unwrap()
-                .submission()
-                .push(&sqe.user_data(id.0))
-        }
-        .is_err()
-        {
+        let published = match sqe {
+            #[cfg(test)]
+            Submission::Sim(op) => {
+                state
+                    .simulation
+                    .as_mut()
+                    .expect("simulation selected")
+                    .push(id.0, op);
+                Ok(())
+            }
+            Submission::Real(sqe) => unsafe {
+                state
+                    .ring
+                    .as_mut()
+                    .unwrap()
+                    .submission()
+                    .push(&sqe.user_data(id.0))
+            },
+        };
+        if published.is_err() {
             state.entries.remove(&id);
             return Err(Error::Overloaded);
         }
@@ -487,35 +539,56 @@ impl Reactor {
                 buffer,
                 lease,
             };
-            let fd = types::Fd(owned.file.as_raw_fd());
             // File issue may block on filesystem work; force it off the worker.
             // Socket opcodes use io_uring's native nonblocking issue/poll path.
-            let sqe = match operation {
-                BufferOperation::Read(_) | BufferOperation::Recv => {
+            let sqe = submission!(
+                self,
+                {
                     let bytes = owned.buffer.bytes_mut()?;
-                    let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                    u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                    simulation::Op::Buffer {
+                        fd: owned.file.clone(),
+                        operation,
+                        ptr: bytes.as_mut_ptr(),
+                        len: bytes.len(),
+                    }
+                },
+                {
+                    let fd = types::Fd(owned.file.as_raw_fd());
                     match operation {
-                        BufferOperation::Read(_) => opcode::Read::new(fd, bytes.as_mut_ptr(), len)
-                            .offset(offset_or_zero(operation))
-                            .build()
-                            .flags(squeue::Flags::ASYNC),
-                        _ => opcode::Recv::new(fd, bytes.as_mut_ptr(), len).build(),
+                        BufferOperation::Read(_) | BufferOperation::Recv => {
+                            let bytes = owned.buffer.bytes_mut()?;
+                            let len =
+                                u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                            match operation {
+                                BufferOperation::Read(_) => {
+                                    opcode::Read::new(fd, bytes.as_mut_ptr(), len)
+                                        .offset(offset_or_zero(operation))
+                                        .build()
+                                        .flags(squeue::Flags::ASYNC)
+                                }
+                                _ => opcode::Recv::new(fd, bytes.as_mut_ptr(), len).build(),
+                            }
+                        }
+                        BufferOperation::Write(_) | BufferOperation::Send => {
+                            let bytes = owned.buffer.bytes()?;
+                            let len =
+                                u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+                            match operation {
+                                BufferOperation::Write(_) => {
+                                    opcode::Write::new(fd, bytes.as_ptr(), len)
+                                        .offset(offset_or_zero(operation))
+                                        .build()
+                                        .flags(squeue::Flags::ASYNC)
+                                }
+                                _ => opcode::Send::new(fd, bytes.as_ptr(), len)
+                                    .flags(libc::MSG_NOSIGNAL)
+                                    .build(),
+                            }
+                        }
                     }
                 }
-                BufferOperation::Write(_) | BufferOperation::Send => {
-                    let bytes = owned.buffer.bytes()?;
-                    let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
-                    match operation {
-                        BufferOperation::Write(_) => opcode::Write::new(fd, bytes.as_ptr(), len)
-                            .offset(offset_or_zero(operation))
-                            .build()
-                            .flags(squeue::Flags::ASYNC),
-                        _ => opcode::Send::new(fd, bytes.as_ptr(), len)
-                            .flags(libc::MSG_NOSIGNAL)
-                            .build(),
-                    }
-                }
-            };
+            );
             self.submit(sqe, scope, false, move |result| {
                 // Destructure inside the closure to retain the FD even when a
                 // caller drops its own last reference while this I/O is pending.
@@ -537,7 +610,8 @@ impl Reactor {
     /// Transfer the FD, buffer, and any reuse-preventing lease (`()` if none).
     /// Owned resources can move from one completed operation to the next:
     /// ```no_run
-    /// use std::{os::fd::OwnedFd, rc::Rc};
+    /// use std::rc::Rc;
+    /// use racer_dataplane::runtime::reactor::Descriptor as OwnedFd;
     /// use racer_dataplane::{error::Result,
     ///     runtime::{deadline::RequestScope, reactor::{Completion, Reactor}},
     ///     store::{direct::AlignedBuffer, segment::SegmentLease}};
@@ -550,7 +624,8 @@ impl Reactor {
     /// ```
     /// The retained lease cannot borrow from the waiting future's caller:
     /// ```compile_fail
-    /// use std::{os::fd::OwnedFd, rc::Rc};
+    /// use std::rc::Rc;
+    /// use racer_dataplane::runtime::reactor::Descriptor as OwnedFd;
     /// use racer_dataplane::{memory::pool::PlaintextBuffer,
     ///     runtime::{deadline::RequestScope, reactor::Reactor},
     ///     store::segment::SegmentLease};
@@ -610,7 +685,14 @@ impl Reactor {
             if interest == 0 || interest & !((libc::POLLIN | libc::POLLOUT) as u32) != 0 {
                 return Err(Error::InvalidRequest);
             }
-            let sqe = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build();
+            let sqe = submission!(
+                self,
+                simulation::Op::Poll {
+                    fd: fd.clone(),
+                    interest
+                },
+                opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build()
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop(fd);
                 Ok(result?.value()? as u32)
@@ -625,13 +707,17 @@ impl Reactor {
         scope: &'a RequestScope,
     ) -> Operation<'a, OwnedFd> {
         Box::pin(async move {
-            let sqe = opcode::Accept::new(
-                types::Fd(fd.as_raw_fd()),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-            .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
-            .build();
+            let sqe = submission!(
+                self,
+                simulation::Op::Accept(fd.clone()),
+                opcode::Accept::new(
+                    types::Fd(fd.as_raw_fd()),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+                .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+                .build()
+            );
             self.submit(sqe, scope, true, move |result| {
                 drop(fd);
                 match result? {
@@ -666,13 +752,22 @@ impl Reactor {
         scope: &'a RequestScope,
     ) -> Operation<'a, L> {
         Box::pin(async move {
+            #[cfg(test)]
+            let destination = address.clone();
             let (address, len) = encode_address(address)?;
-            let sqe = opcode::Connect::new(
-                types::Fd(fd.as_raw_fd()),
-                (&*address as *const libc::sockaddr_storage).cast(),
-                len,
-            )
-            .build();
+            let sqe = submission!(
+                self,
+                simulation::Op::Connect {
+                    fd: fd.clone(),
+                    address: destination
+                },
+                opcode::Connect::new(
+                    types::Fd(fd.as_raw_fd()),
+                    (&*address as *const libc::sockaddr_storage).cast(),
+                    len,
+                )
+                .build()
+            );
             self.submit(sqe, scope, false, move |result| {
                 drop((fd, address));
                 result?.value()?;
@@ -689,22 +784,21 @@ impl Reactor {
             return Ok(0);
         }
         let mut state = self.state.borrow_mut();
-        if state.ring.is_none() {
+        if state.ring_reservation.is_none() {
             return Ok(0);
         }
         let mut finished = Vec::new();
         let mut fence_wakes = Vec::new();
         let mut completed = 0;
         while completed < budget {
-            let cqe = state.ring.as_mut().unwrap().completion().next();
-            let Some(cqe) = cqe else {
+            let cqe = state.next_completion();
+            let Some((tag, result)) = cqe else {
                 break;
             };
             completed += 1;
-            if let Some(entry) = state.complete(cqe.user_data(), cqe.result())? {
+            if let Some(entry) = state.complete(tag, result)? {
                 finished.push(entry);
-                fence_wakes
-                    .extend(state.take_fence_wakers(Some(IoId(cqe.user_data() & !CANCEL_BIT))));
+                fence_wakes.extend(state.take_fence_wakers(Some(IoId(tag & !CANCEL_BIT))));
             }
         }
         if state.entries.is_empty() {
@@ -735,6 +829,12 @@ impl Reactor {
                 };
             }
             if entry.original.is_none() && entry.cancel_reason.is_some() && !entry.cancel_sent {
+                #[cfg(test)]
+                if let Some(driver) = &mut state.simulation {
+                    driver.cancel(id.0);
+                    state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                    continue;
+                }
                 let sqe = opcode::AsyncCancel::new(id.0)
                     .build()
                     .user_data(id.0 | CANCEL_BIT);
@@ -767,6 +867,10 @@ impl Reactor {
         // defer progress to the next worker turn; completion/cancel budgets stay
         // in poll_budgeted, and an absent ring remains uninitialized.
         state.submit_pending()?;
+        #[cfg(test)]
+        if state.simulation.is_some() {
+            return Ok(());
+        }
         let mut fds = [
             libc::pollfd {
                 fd: state.ring.as_ref().map_or(-1, AsRawFd::as_raw_fd),
@@ -853,7 +957,20 @@ fn offset_or_zero(operation: BufferOperation) -> u64 {
 }
 
 impl State {
+    fn next_completion(&mut self) -> Option<(u64, KernelResult)> {
+        #[cfg(test)]
+        if let Some(driver) = &mut self.simulation {
+            return driver.pop();
+        }
+        let cqe = self.ring.as_mut()?.completion().next()?;
+        Some((cqe.user_data(), KernelResult::Value(cqe.result())))
+    }
     fn submit_pending(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(driver) = &self.simulation {
+            driver.submit();
+            return Ok(());
+        }
         match &self.ring {
             Some(ring) => submission_result(ring.submit()),
             None => Ok(()),
@@ -871,7 +988,7 @@ impl State {
             .collect()
     }
 
-    fn complete(&mut self, tag: u64, result: i32) -> Result<Option<Entry>> {
+    fn complete(&mut self, tag: u64, result: impl Into<KernelResult>) -> Result<Option<Entry>> {
         let id = IoId(tag & !CANCEL_BIT);
         let entry = self.entries.get_mut(&id).ok_or(Error::Io)?;
         if tag & CANCEL_BIT != 0 {
@@ -883,11 +1000,13 @@ impl State {
             if entry.original.is_some() {
                 return Err(Error::Io);
             }
-            entry.original = Some(if entry.accept && result >= 0 {
-                // SAFETY: successful single-shot accept CQE transfers a fresh FD.
-                KernelResult::Accepted(unsafe { OwnedFd::from_raw_fd(result) })
-            } else {
-                KernelResult::Value(result)
+            entry.original = Some(match result.into() {
+                // Raw CQEs supplied by the real backend (and fence tests) transfer
+                // ownership here. Simulated opens already carry a typed owner.
+                KernelResult::Value(fd) if entry.accept && fd >= 0 => {
+                    KernelResult::Accepted(unsafe { OwnedFd::from_raw_fd(fd) })
+                }
+                result => result,
             });
             // Cancellation/deadline may precede this CQE without a cancel SQE.
             if entry.cancel_reason.is_none() {
@@ -899,6 +1018,12 @@ impl State {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl From<i32> for KernelResult {
+    fn from(value: i32) -> Self {
+        Self::Value(value)
     }
 }
 
