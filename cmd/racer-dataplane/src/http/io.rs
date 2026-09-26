@@ -643,8 +643,11 @@ mod tests {
                 Instant::now() < deadline,
                 "HTTP operation failed to make progress"
             );
-            reactor.poll_budgeted(128).unwrap();
-            reactor.wait(Duration::from_millis(1)).unwrap();
+            // Repoll completed work before sleeping: a drained CQ has no event
+            // left to wake wait(), adding a timer tick to every streamed chunk.
+            if reactor.poll_budgeted(128).unwrap() == 0 {
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
         }
     }
     fn request(method: &str) -> MessageHead {

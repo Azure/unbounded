@@ -8,10 +8,27 @@ The Go control plane is outside this package.
 membership inputs, enrollment, and projected credential rotation.
 
 ```sh
-cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-cargo check --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
-cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
+make racer-dataplane-test
+# Optional test name filter and libtest options:
+make racer-dataplane-test RACER_TEST_ARGS='topology:: --test-threads=1'
 ```
+
+The standalone target runs library and binary unit tests with all features, using
+the locked dependencies and `bin/racer-cargo` build cache. Override `RACER_CARGO`
+or `RACER_CARGO_TARGET_DIR` as needed. It includes real Linux I/O tests; existing
+hardware-only tests remain ignored. The test profile optimizes the dataplane at
+level 1 and dependencies at level 3, retaining debug assertions, overflow checks,
+and debug information. The first run compiles this profile; later runs reuse it.
+
+For the complete Rust suite, including integration tests and doctests:
+
+```sh
+cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
+cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-targets --all-features
+cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-features
+```
+
+`make racer-test` also runs the Go server checks before the complete Rust suite.
 
 Constructors connect dependencies without opening files, accepting requests, or
 spawning threads. Activation is explicit through the application lifecycle. See

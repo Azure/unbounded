@@ -1587,9 +1587,11 @@ mod tests {
 
     #[test]
     fn accepted_descriptor_is_retained_until_cancel_fence() {
+        use std::io::Read;
         use std::os::fd::IntoRawFd;
         let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
-        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
         let fd = socket.into_raw_fd();
         reactor.state.borrow_mut().entries.insert(
             IoId(1),
@@ -1618,7 +1620,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        let mut byte = [0];
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         reactor
             .state
             .borrow_mut()
@@ -1626,11 +1632,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .finish();
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        // Peer EOF observes this socket closing even if another test reuses fd.
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
     }
 
     #[test]

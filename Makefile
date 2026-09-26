@@ -13,6 +13,7 @@ RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 RACER_CARGO ?= cargo
 RACER_DATAPLANE_BIN ?= bin/racer-dataplane
 RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
+RACER_TEST_ARGS ?=
 RACER_NATIVE_RDMA ?= false
 RACER_NATIVE_LIB ?= bin/libracer_rdma.so.1
 RACER_PREFIX ?= /usr/local
@@ -375,6 +376,7 @@ help: ## Show this help
 	@echo "  racer-controller-build           Build the Go controller scaffold"
 	@echo "  racer-test | racer-generate | racer-manifests  Check/generate/render Racer scaffolds"
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
+	@echo "  racer-dataplane-test              Run Rust library and binary unit tests (RACER_TEST_ARGS)"
 	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
 	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
 	@echo "  image-racer-dataplane-local       Build local image (RACER_NATIVE_RDMA=false|true)"
@@ -576,7 +578,11 @@ racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
-.PHONY: racer-dataplane-build racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+racer-dataplane-test: ## Run Rust unit tests with all features; pass filters/options via RACER_TEST_ARGS
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features --lib --bins -- $(RACER_TEST_ARGS)
+
 racer-dataplane-build: ## Build the locked Rust release binary; optionally enable the RDMA loader
 	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac
 	$(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
@@ -607,9 +613,9 @@ racer-server-test: ## Lint and race-test the Racer server and deployment contrac
 	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
 
 racer-test: racer-server-test ## Check Racer server and committed Rust contracts
-	cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-	cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-targets --all-features
-	cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --all-features
+	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
+	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-targets --all-features
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features
 
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
