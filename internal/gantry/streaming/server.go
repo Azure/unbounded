@@ -35,6 +35,13 @@ type OriginRangeFetcher interface {
 	FetchRange(ctx context.Context, origin OriginURL, requested httprange.Range) (io.ReadCloser, int64, string, error)
 }
 
+// RangeCache retains ranges fetched from peers or origin so the next reader -
+// local or remote - does not have to leave the node for them.
+type RangeCache interface {
+	OpenRange(ctx context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error)
+	Put(d digest.Digest, total, start int64, r io.Reader) (int64, error)
+}
+
 // Tuning values rather than operator configuration: changing one requires a
 // latency measurement, so they live in code with the behavior they affect.
 const (
@@ -54,6 +61,16 @@ type Options struct {
 	StartupGated bool
 	Logger       *slog.Logger
 	Metrics      MetricsHooks
+
+	// Cache, when set, absorbs reads no larger than MaxCachedRangeBytes.
+	// OverlayBD index reads are tiny and every node wants the same ones, so
+	// caching them is what lets peers answer instead of origin.
+	Cache               RangeCache
+	MaxCachedRangeBytes int64
+	// OnCached announces that this node can now serve ranges of d. Peers
+	// discover range sources the same way they discover complete blobs, so
+	// without this a cached range stays invisible to the swarm.
+	OnCached func(d digest.Digest)
 }
 
 type MetricsHooks struct {
@@ -168,6 +185,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.opts.Cache != nil {
+		if cached, cachedTotal, cacheErr := s.opts.Cache.OpenRange(r.Context(), origin.Digest, requested); cacheErr == nil {
+			s.writeResponse(w, cached, cachedTotal, "application/octet-stream", requested, "cache", started)
+
+			return
+		}
+	}
+
 	if errors.Is(err, httprange.ErrUnsatisfiable) && total >= 0 {
 		w.Header().Set("Content-Range", httprange.UnsatisfiedContentRange(total))
 		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
@@ -206,7 +231,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			s.writeResponse(w, peerBody, peerTotal, contentType, requested, "peer", started)
+			s.serveMaybeCaching(w, r, origin.Digest, peerBody, peerTotal, contentType, requested, "peer", started)
 
 			return
 		}
@@ -234,7 +259,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeResponse(w, body, total, contentType, requested, "origin", started)
+	s.serveMaybeCaching(w, r, origin.Digest, body, total, contentType, requested, "origin", started)
+}
+
+// serveMaybeCaching stores a small remote read before serving it. The bytes go
+// to disk first and are then read back, so a 1 GiB range never has to be held
+// in memory to be cached.
+func (s *Server) serveMaybeCaching(w http.ResponseWriter, r *http.Request, d digest.Digest, body io.ReadCloser, total int64, contentType string, requested httprange.Range, source string, started time.Time) {
+	if s.opts.Cache == nil || s.opts.MaxCachedRangeBytes <= 0 || requested.Length() > s.opts.MaxCachedRangeBytes {
+		s.writeResponse(w, body, total, contentType, requested, source, started)
+
+		return
+	}
+
+	stored, err := s.opts.Cache.Put(d, total, requested.Start, io.LimitReader(body, requested.Length()))
+	_ = body.Close() //nolint:errcheck // best-effort close
+
+	if err != nil || stored != requested.Length() {
+		s.opts.Logger.Debug("range cache store incomplete",
+			slog.String("digest", d.String()),
+			slog.Int64("stored", stored),
+			slog.Any("err", err),
+		)
+		s.observe(source, "error", time.Since(started), stored)
+		http.Error(w, "range cache store failed", http.StatusBadGateway)
+
+		return
+	}
+
+	cached, cachedTotal, err := s.opts.Cache.OpenRange(r.Context(), d, requested)
+	if err != nil {
+		s.observe(source, "error", time.Since(started), 0)
+		http.Error(w, "range cache read failed", http.StatusBadGateway)
+
+		return
+	}
+
+	if s.opts.OnCached != nil {
+		s.opts.OnCached(d)
+	}
+
+	s.writeResponse(w, cached, cachedTotal, contentType, requested, source, started)
 }
 
 func (s *Server) writeResponse(w http.ResponseWriter, body io.ReadCloser, total int64, contentType string, requested httprange.Range, source string, started time.Time) {

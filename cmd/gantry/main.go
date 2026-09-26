@@ -48,6 +48,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	streamingapi "github.com/Azure/unbounded/internal/gantry/streaming"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
@@ -204,6 +205,29 @@ func runAgent(args []string) error {
 			p2.peerFetchBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
 	)
+
+	// Ranges fetched for OverlayBD are kept so peers can be served from them.
+	// A cold image has no complete blob anywhere, so without this every node's
+	// index reads go to origin at once.
+	var rangeCache *rangecache.Cache
+
+	if c.RangeCacheDir != "" {
+		rangeCache, err = rangecache.New(c.RangeCacheDir, c.RangeCacheMaxBytes)
+		if err != nil {
+			logger.Warn("range cache disabled", slog.Any("err", err))
+
+			rangeCache = nil
+		} else {
+			defer func() { _ = rangeCache.Close() }() //nolint:errcheck // best-effort close
+
+			logger.Info("range cache ready",
+				slog.String("dir", c.RangeCacheDir),
+				slog.Int64("max_bytes", c.RangeCacheMaxBytes),
+				slog.Int64("max_range_bytes", c.MaxCachedRangeBytes),
+			)
+		}
+	}
+
 	transferOpts := []transfer.Option{
 		transfer.WithLogger(logger),
 		transfer.WithDescriber(cdstore),
@@ -216,6 +240,10 @@ func runAgent(args []string) error {
 		}),
 		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
 		transfer.WithMaxConcurrentRangeServes(c.TransferMaxConcurrentRangeServes),
+	}
+
+	if rangeCache != nil {
+		transferOpts = append(transferOpts, transfer.WithRangeSource(rangeCache))
 	}
 	transferSrv := transfer.New(cstore, transferOpts...)
 
@@ -706,7 +734,7 @@ func runAgent(args []string) error {
 	if c.ArtifactStreamingEnabled {
 		urlPolicy := streamingapi.URLPolicy{AllowedHostSuffixes: c.ArtifactStreamingAllowedHostSuffixes}
 
-		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingapi.Options{
+		streamingOpts := streamingapi.Options{
 			URLPolicy:              urlPolicy,
 			ResolveCanonicalOrigin: newCanonicalOriginResolver(c.UpstreamRegistries),
 			SelfPeerID:             ifaces.NodeID(disco.PeerID().String()),
@@ -731,7 +759,17 @@ func runAgent(args []string) error {
 					streamingMetrics.rejected.WithLabelValues(reason).Inc()
 				},
 			},
-		})
+		}
+
+		if rangeCache != nil {
+			streamingOpts.Cache = rangeCache
+			streamingOpts.MaxCachedRangeBytes = c.MaxCachedRangeBytes
+			streamingOpts.OnCached = func(d digest.Digest) {
+				go adv.Notify(context.WithoutCancel(ctx), d, true)
+			}
+		}
+
+		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingOpts)
 		if err != nil {
 			return fmt.Errorf("artifact streaming server: %w", err)
 		}
