@@ -164,6 +164,20 @@ func (c *Cache) Has(d digest.Digest, requested httprange.Range) bool {
 	return e.have.covers(requested.Start, requested.End)
 }
 
+// HasAny reports whether any range of d is cached, which is enough to make
+// this node a useful provider for it.
+func (c *Cache) HasAny(d digest.Digest) bool {
+	e := c.lookup(d)
+	if e == nil {
+		return false
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return len(e.have) > 0
+}
+
 // Put stores data read from r at start. total is the blob's full size, used for
 // Content-Range on later reads. Put reports the number of bytes stored; a
 // truncated read still records what landed.

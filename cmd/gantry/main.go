@@ -328,7 +328,18 @@ func runAgent(args []string) error {
 	// it returns 1.0.
 	p5 := newPhase5Metrics(reg, disco.Health, func() float64 { return float64(disco.ConnCount()) })
 
-	adv := advertise.New(containerdInv, disco,
+	advInv := advertise.Inventory(containerdInv)
+
+	if rangeCache != nil {
+		wrapped := rangeAwareInventory{inv: containerdInv, cache: rangeCache}
+		if open, ok := containerdInv.(advertise.Openable); ok {
+			wrapped.open = open
+		}
+
+		advInv = wrapped
+	}
+
+	adv := advertise.New(advInv, disco,
 		advertise.WithLogger(logger),
 		advertise.WithReconcileInterval(c.AdvertiseReconcileInterval),
 		advertise.WithMetrics(advertise.MetricsHooks{
@@ -765,6 +776,11 @@ func runAgent(args []string) error {
 			streamingOpts.Cache = rangeCache
 			streamingOpts.MaxCachedRangeBytes = c.MaxCachedRangeBytes
 			streamingOpts.OnCached = func(d digest.Digest) {
+				// Announce once per digest; the reconcile pass keeps it alive.
+				if adv.IsAnnounced(d) {
+					return
+				}
+
 				go adv.Notify(context.WithoutCancel(ctx), d, true)
 			}
 		}
