@@ -146,6 +146,23 @@ pub struct VerifiedResponse {
     origin: VerifiedPeer,
     forwarders: Vec<VerifiedPeer>,
 }
+
+/// Authenticated response fields and reverse chain, not completed page bytes.
+pub struct VerifiedResponseHead {
+    authentication: ForwardedHead,
+    descriptor: protocol::ResponseDescriptor,
+    binding: RequestBinding,
+    origin: VerifiedPeer,
+    forwarders: Vec<VerifiedPeer>,
+}
+impl VerifiedResponseHead {
+    pub fn length(&self) -> usize {
+        match &self.descriptor {
+            protocol::ResponseDescriptor::Page(_, envelope) => envelope.ciphertext_length as usize,
+            _ => 0,
+        }
+    }
+}
 impl VerifiedResponse {
     pub fn response(&self) -> &PeerResponse {
         &self.signed.response
@@ -314,8 +331,45 @@ impl Forwarding {
         response: SignedResponse,
         request: &RequestBinding,
     ) -> Result<VerifiedResponse> {
+        let descriptor = protocol::ResponseDescriptor::from_response(&response.response)?;
+        let verified =
+            self.verify_response_descriptor(response.authentication, descriptor, request)?;
+        Ok(VerifiedResponse {
+            signed: SignedResponse {
+                authentication: verified.authentication,
+                response: response.response,
+            },
+            binding: verified.binding,
+            origin: verified.origin,
+            forwarders: verified.forwarders,
+        })
+    }
+
+    pub fn verify_response_head(
+        &self,
+        authentication: ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+    ) -> Result<VerifiedResponseHead> {
+        let descriptor = crate::peer::decode::response_descriptor(&authentication.original.head)?;
+        let expected = match &descriptor {
+            protocol::ResponseDescriptor::Page(_, envelope) => envelope.ciphertext_length as usize,
+            _ => 0,
+        };
+        if length != expected {
+            return Err(Error::InvalidRequest);
+        }
+        self.verify_response_descriptor(authentication, descriptor, request)
+    }
+
+    fn verify_response_descriptor(
+        &self,
+        authentication: ForwardedHead,
+        descriptor: protocol::ResponseDescriptor,
+        request: &RequestBinding,
+    ) -> Result<VerifiedResponseHead> {
         check_request_deadline(request)?;
-        let auth = &response.authentication;
+        let auth = &authentication;
         if auth.hops.len() >= protocol::MAX_HOPS {
             return Err(Error::HopBudgetExhausted);
         }
@@ -332,8 +386,8 @@ impl Forwarding {
         }
         protocol::agrees(
             &auth.original.head,
-            &protocol::response_head(
-                &response.response,
+            &protocol::response_descriptor_head(
+                &descriptor,
                 &signed_digest(&request.original)?,
                 &path,
             )?,
@@ -376,8 +430,9 @@ impl Forwarding {
         }
         self.signatures
             .admit(previous, forwarders.last().unwrap_or(&origin))?;
-        Ok(VerifiedResponse {
-            signed: response,
+        Ok(VerifiedResponseHead {
+            authentication,
+            descriptor,
             binding: request.clone(),
             origin,
             forwarders,
@@ -421,8 +476,34 @@ impl Forwarding {
         mut response: VerifiedResponse,
         previous_hop: &NodeId,
     ) -> Result<SignedResponse> {
-        check_request_deadline(&response.binding)?;
-        let auth = &mut response.signed.authentication;
+        self.append_response_chain(
+            &mut response.signed.authentication,
+            &response.binding,
+            previous_hop,
+        )?;
+        Ok(response.signed)
+    }
+
+    pub fn append_response_head(
+        &self,
+        mut response: VerifiedResponseHead,
+        previous_hop: &NodeId,
+    ) -> Result<ForwardedHead> {
+        self.append_response_chain(
+            &mut response.authentication,
+            &response.binding,
+            previous_hop,
+        )?;
+        Ok(response.authentication)
+    }
+
+    fn append_response_chain(
+        &self,
+        auth: &mut ForwardedHead,
+        binding: &RequestBinding,
+        previous_hop: &NodeId,
+    ) -> Result<()> {
+        check_request_deadline(binding)?;
         let path =
             protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
         let index = path
@@ -437,13 +518,13 @@ impl Forwarding {
         let mut head = response_hop_head(
             &auth.original,
             previous,
-            &response.binding.original,
+            &binding.original,
             &path,
             index - 1,
         )?;
         push(&mut head, "racer-receiver", &previous_hop.0);
         auth.hops.push(self.signatures.sign(head)?);
-        Ok(response.signed)
+        Ok(())
     }
 }
 #[derive(PartialEq, Eq)]
@@ -1189,6 +1270,77 @@ mod tests {
             );
         }
         a.verify_response(response, &binding).unwrap();
+    }
+    #[test]
+    fn streamed_descriptor_rejects_lengths_binding_signature_and_replay_without_body() {
+        use crate::model::{
+            envelope::PageEnvelope,
+            metadata::{ExpiresAt, ObjectMetadata},
+        };
+        let signatures = network(3);
+        let a = Forwarding::new(signatures[0].clone());
+        let b = Forwarding::new(signatures[2].clone());
+        let mut logical = request(3);
+        let page = PageId {
+            version: ObjectVersion {
+                object: logical.origin.object.clone(),
+                etag: StrongEtag::parse(b"\"stream\"").unwrap(),
+            },
+            number: PageNumber(0),
+        };
+        logical.operation = Operation::Page {
+            page: page.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let (signed, binding) = a.sign_request(logical).unwrap();
+        let admitted = b.verify_request(signed).unwrap();
+        let descriptor = protocol::ResponseDescriptor::Page(
+            ObjectMetadata {
+                version: page.version.clone(),
+                length: 4096,
+                expires_at: ExpiresAt(std::time::SystemTime::now()),
+            },
+            PageEnvelope {
+                page,
+                key_id: KeyId([6; 16]),
+                nonce: Nonce([7; 24]),
+                plaintext_length: 4096,
+                ciphertext_length: 4112,
+            },
+        );
+        let make = || {
+            let mut head = protocol::response_descriptor_head(
+                &descriptor,
+                &signed_digest(&admitted.binding().original).unwrap(),
+                &admitted.binding().path,
+            )
+            .unwrap();
+            push(&mut head, "racer-receiver", node(0).0);
+            ForwardedHead {
+                original: Arc::new(signatures[2].sign(head).unwrap()),
+                hops: vec![],
+            }
+        };
+        for length in [0, 4111, 4113, usize::MAX] {
+            assert!(a.verify_response_head(make(), length, &binding).is_err());
+        }
+        let (_, other) = a.sign_request(request(9)).unwrap();
+        assert!(a.verify_response_head(make(), 4112, &other).is_err());
+        let mut bad = make();
+        Arc::get_mut(&mut bad.original).unwrap().signature[0] ^= 1;
+        assert!(a.verify_response_head(bad, 4112, &binding).is_err());
+        let good = make();
+        let repeated = ForwardedHead {
+            original: good.original.clone(),
+            hops: vec![],
+        };
+        assert_eq!(
+            a.verify_response_head(good, 4112, &binding)
+                .unwrap()
+                .length(),
+            4112
+        );
+        assert!(a.verify_response_head(repeated, 4112, &binding).is_err());
     }
     #[test]
     fn validly_signed_page_must_match_the_requested_version_and_page() {

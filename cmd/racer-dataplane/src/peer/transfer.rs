@@ -32,8 +32,18 @@ impl IoBuffer for SendPage {
 pub(crate) struct WireBuffer {
     bytes: Box<[u8]>,
     _reservation: Reservation,
+    _transit_permit: Option<Reservation>,
 }
 impl WireBuffer {
+    pub(crate) fn transit(reservation: Reservation, permit: Reservation) -> Result<Self> {
+        let length = crate::runtime::admission::TRANSIT_CHUNK;
+        reservation.validate(ResourceClass::Ciphertext, length)?;
+        Ok(Self {
+            bytes: vec![0; length].into_boxed_slice(),
+            _reservation: reservation,
+            _transit_permit: Some(permit),
+        })
+    }
     pub(crate) fn new(admission: &Admission, length: usize) -> Result<Self> {
         Self::for_cache(admission, None, length)
     }
@@ -49,6 +59,7 @@ impl WireBuffer {
         Ok(Self {
             bytes: vec![0; length].into_boxed_slice(),
             _reservation: reservation,
+            _transit_permit: None,
         })
     }
     pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
@@ -71,6 +82,7 @@ impl WireBuffer {
         Ok(Self {
             bytes: vec![0; length].into_boxed_slice(),
             _reservation: output.take().ok_or(Error::Internal)?,
+            _transit_permit: None,
         })
     }
 }
@@ -85,6 +97,12 @@ impl IoBuffer for WireBuffer {
 }
 
 pub struct Transfers {
+    #[cfg(test)]
+    pub(crate) wait_receive_for_test: std::cell::Cell<bool>,
+    #[cfg(test)]
+    receive_wakes_for_test: std::cell::RefCell<Vec<std::task::Waker>>,
+    #[cfg(test)]
+    pub(crate) receive_waits_for_test: std::cell::RefCell<Vec<crate::model::identity::RequestId>>,
     receive_cache: Option<Rc<crate::memory::cache::MemoryCache>>,
     receive_writer: Option<Rc<crate::store::writer::StoreWriter>>,
     #[cfg(test)]
@@ -105,6 +123,12 @@ pub struct Transfers {
 impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
+            #[cfg(test)]
+            wait_receive_for_test: std::cell::Cell::new(false),
+            #[cfg(test)]
+            receive_wakes_for_test: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            receive_waits_for_test: std::cell::RefCell::new(Vec::new()),
             receive_cache: None,
             receive_writer: None,
             #[cfg(test)]
@@ -127,6 +151,42 @@ impl Transfers {
     ) -> Self {
         self.native = Some((signatures, sessions));
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn poll_receive_for_test(&self) {
+        for wake in self.receive_wakes_for_test.take() {
+            wake.wake();
+        }
+    }
+    #[cfg(test)]
+    async fn receive_wait_for_test(
+        &self,
+        admission: &Admission,
+        cache: &crate::model::identity::CacheId,
+        length: usize,
+        scope: &RequestScope,
+    ) -> Result<WireBuffer> {
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut registered = false;
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            match self.receive_buffer(admission, cache, length) {
+                Err(Error::Overloaded) => {
+                    if !registered {
+                        self.receive_waits_for_test.borrow_mut().push(scope.request);
+                        registered = true;
+                    }
+                    let mut wakes = self.receive_wakes_for_test.borrow_mut();
+                    if !wakes.iter().any(|wake| wake.will_wake(cx.waker())) {
+                        wakes.push(cx.waker().clone());
+                    }
+                    std::task::Poll::Pending
+                }
+                result => std::task::Poll::Ready(result),
+            }
+        })
+        .await
     }
     pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
         self.wire = Some((admission, codec));
@@ -180,6 +240,15 @@ impl Transfers {
         probe: Vec<u8>,
         scope: &'a RequestScope,
     ) -> Operation<'a, Vec<u8>> {
+        self.exchange_probe_mode(endpoint, probe, scope, false)
+    }
+    pub(crate) fn exchange_probe_mode<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        probe: Vec<u8>,
+        scope: &'a RequestScope,
+        transit: bool,
+    ) -> Operation<'a, Vec<u8>> {
         Box::pin(async move {
             use crate::http::codec::{MessageHead, StartLine};
             use crate::security::protocol as p;
@@ -195,7 +264,11 @@ impl Transfers {
             };
             p::push(&mut head, "content-length", 0);
             p::push_binary(&mut head, "racer-probe", &probe);
-            let connection = self.http.checkout_peer(&endpoint, scope).await?;
+            let connection = if transit {
+                self.http.checkout(&endpoint, scope).await?
+            } else {
+                self.http.checkout_peer(&endpoint, scope).await?
+            };
             let response = self.io.exchange_head(connection, head, scope).await?;
             if !matches!(response.value.start, StartLine::Response { status: 200 }) {
                 return Err(Error::Unauthorized);
@@ -299,6 +372,15 @@ impl Transfers {
         head: crate::security::signing::SignedHead,
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::security::signing::SignedHead> {
+        self.exchange_head_mode(endpoint, head, scope, false)
+    }
+    pub(crate) fn exchange_head_mode<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        head: crate::security::signing::SignedHead,
+        scope: &'a RequestScope,
+        transit: bool,
+    ) -> Operation<'a, crate::security::signing::SignedHead> {
         Box::pin(async move {
             scope.check()?;
             let envelope = crate::security::forwarding::ForwardedHead {
@@ -306,7 +388,11 @@ impl Transfers {
                 hops: Vec::new(),
             };
             let head = WireCodec::encode(&envelope, false, 0)?;
-            let connection = self.http.checkout_peer(&endpoint, scope).await?;
+            let connection = if transit {
+                self.http.checkout(&endpoint, scope).await?
+            } else {
+                self.http.checkout_peer(&endpoint, scope).await?
+            };
             let sent = self.io.send_head(connection, head, scope).await?;
             let received = self.io.receive_head(sent.connection, scope).await?;
             let (response, length) = WireCodec::decode(received.value, true)?;
@@ -405,6 +491,14 @@ impl Transfers {
                 let mut buffer = if output.is_some() {
                     WireBuffer::reserved(admission, cache, length, output)?
                 } else {
+                    #[cfg(test)]
+                    if self.wait_receive_for_test.get() {
+                        self.receive_wait_for_test(admission, cache, length, scope)
+                            .await?
+                    } else {
+                        self.receive_buffer(admission, cache, length)?
+                    }
+                    #[cfg(not(test))]
                     self.receive_buffer(admission, cache, length)?
                 };
                 let mut offset = 0;

@@ -316,6 +316,58 @@ pub fn response_head(
     request_digest: &[u8; 32],
     path: &[NodeId],
 ) -> Result<MessageHead> {
+    response_descriptor_head(
+        &ResponseDescriptor::from_response(response)?,
+        request_digest,
+        path,
+    )
+}
+
+/// Logical response independent of body storage. A descriptor is not proof that
+/// its body was received or authenticated with the page key.
+#[derive(Clone)]
+pub enum ResponseDescriptor {
+    Page(
+        crate::model::metadata::ObjectMetadata,
+        crate::model::envelope::PageEnvelope,
+    ),
+    Metadata(crate::model::metadata::ObjectMetadata),
+    Miss,
+    VersionUnavailable,
+    Unavailable,
+    Overloaded,
+    OriginRejected,
+    OriginForbidden,
+}
+
+impl ResponseDescriptor {
+    pub fn from_response(response: &PeerResponse) -> Result<Self> {
+        match response {
+            PeerResponse::Page {
+                metadata,
+                ciphertext,
+            } => {
+                if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
+                    return Err(Error::InvalidRequest);
+                }
+                Ok(Self::Page(metadata.clone(), ciphertext.envelope().clone()))
+            }
+            PeerResponse::Metadata(metadata) => Ok(Self::Metadata(metadata.clone())),
+            PeerResponse::Miss => Ok(Self::Miss),
+            PeerResponse::VersionUnavailable => Ok(Self::VersionUnavailable),
+            PeerResponse::Unavailable => Ok(Self::Unavailable),
+            PeerResponse::Overloaded => Ok(Self::Overloaded),
+            PeerResponse::OriginRejected => Ok(Self::OriginRejected),
+            PeerResponse::OriginForbidden => Ok(Self::OriginForbidden),
+        }
+    }
+}
+
+pub(crate) fn response_descriptor_head(
+    descriptor: &ResponseDescriptor,
+    request_digest: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
     let mut head = MessageHead {
         start: StartLine::Response { status: 200 },
         headers: Vec::new(),
@@ -323,16 +375,10 @@ pub fn response_head(
     push(&mut head, "racer-kind", "response");
     push_binary(&mut head, "racer-request-binding", request_digest);
     push(&mut head, "racer-response-path", nodes(path)?);
-    let (outcome, length) = match response {
-        PeerResponse::Page {
-            metadata: m,
-            ciphertext,
-        } => {
-            let e = ciphertext.envelope();
+    let (outcome, length) = match descriptor {
+        ResponseDescriptor::Page(m, e) => {
             m.immutable().validate_page(e)?;
-            if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length)
-                || ciphertext.bytes().len() != e.ciphertext_length as usize
-            {
+            if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length) {
                 return Err(Error::InvalidRequest);
             }
             metadata(&mut head, m)?;
@@ -358,21 +404,21 @@ pub fn response_head(
             );
             ("page", u64::from(e.ciphertext_length))
         }
-        PeerResponse::Metadata(m) => {
+        ResponseDescriptor::Metadata(m) => {
             metadata(&mut head, m)?;
             ("metadata", 0)
         }
-        PeerResponse::Miss => ("miss", 0),
-        PeerResponse::VersionUnavailable => ("version-unavailable", 0),
-        PeerResponse::Unavailable => ("unavailable", 0),
-        PeerResponse::Overloaded => ("overloaded", 0),
-        PeerResponse::OriginRejected => ("origin-rejected", 0),
-        PeerResponse::OriginForbidden => ("origin-forbidden", 0),
+        ResponseDescriptor::Miss => ("miss", 0),
+        ResponseDescriptor::VersionUnavailable => ("version-unavailable", 0),
+        ResponseDescriptor::Unavailable => ("unavailable", 0),
+        ResponseDescriptor::Overloaded => ("overloaded", 0),
+        ResponseDescriptor::OriginRejected => ("origin-rejected", 0),
+        ResponseDescriptor::OriginForbidden => ("origin-forbidden", 0),
     };
     head.start = StartLine::Response {
-        status: match response {
-            PeerResponse::OriginRejected => 401,
-            PeerResponse::OriginForbidden => 403,
+        status: match descriptor {
+            ResponseDescriptor::OriginRejected => 401,
+            ResponseDescriptor::OriginForbidden => 403,
             _ => 200,
         },
     };

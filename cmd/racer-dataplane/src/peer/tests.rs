@@ -125,7 +125,7 @@ pub(super) fn signers() -> Vec<Rc<Signatures>> {
     }
     signers
 }
-fn request(admission: &Admission, attempt: u8) -> PeerRequest {
+pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let object = ObjectId {

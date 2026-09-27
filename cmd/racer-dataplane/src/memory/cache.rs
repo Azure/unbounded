@@ -24,6 +24,15 @@ pub struct MemoryCache {
     removed: RefCell<HashSet<CacheId>>,
 }
 impl MemoryCache {
+    #[cfg(test)]
+    pub(crate) fn corrupt_ciphertext_for_test(&self, page: &PageId) {
+        let mut entries = self.entries.borrow_mut();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.plaintext.page() == page)
+            .unwrap();
+        Arc::get_mut(&mut entry.ciphertext.inner).unwrap().bytes[0] ^= 1;
+    }
     pub fn new(pool: Rc<BufferPool>) -> Self {
         Self {
             pool,

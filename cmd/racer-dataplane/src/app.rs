@@ -252,10 +252,11 @@ fn partition_limits(node: &Limits, workers: usize, rdma: bool) -> Result<Limits>
             .ok_or(Error::InvalidConfiguration)?;
     }
     let page = crate::model::range::PAGE_BYTES as usize;
+    let transit = Admission::transit_capacity(&limits)?;
     let window = limits.range_window_pages.get();
     if limits.plaintext_bytes.get() < (window + 1) * page
         || limits.ciphertext_bytes.get()
-            < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES
+            < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES + transit
         || limits.dirty_bytes.get() < page + 16
         || rdma && limits.registered_bytes.get() < page + 16
         || limits.request_context_bytes.get()

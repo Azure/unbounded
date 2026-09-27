@@ -85,17 +85,29 @@ Page, metadata, and copy-only requests use actual pooled HTTP. Page bodies prese
 ciphertext; AEAD verification belongs to the receiving read coordinator. Relay
 verification preserves the original and every hop signature in both directions.
 
-Authenticated relay requests wait in FIFO order when all relay-transfer permits
-are busy. Waiting retains the original signed deadline and request, without
-starting another attempt or consuming another link. The queue is capped by the
-worker's queue-entry limit and charges waiter/context admission; queue or context
-exhaustion still returns overload. Active transfer limits are unchanged. Permit
-release and cancellation wake queued tasks. The worker must call
-`server.poll_admission_deadlines()` on its timer tick, including when no socket
-completion occurs, to expire waits and observe admission shutdown. Application
-already drives this hook. A queued request retains its incoming connection and
-authenticated header; it acquires no outgoing socket or page buffer before a
-permit. Persistent saturation can still exhaust the queue or original deadline.
+Production HTTP relay requests use cut-through forwarding. Each admitted exchange
+owns one 16 KiB ciphertext chunk and a relay permit through body I/O completion.
+Relay, chunk, and outbound connection admission are nonwaiting, including challenge
+discovery and capability negotiation. Exhaustion returns a bound failure before
+the upstream page head; it never queues while holding another transit resource.
+The buffered `Relay::forward` interface retains its bounded FIFO for standalone
+callers, but production `PeerServer` with Transfers selects the stream path.
+
+The worker protects a derived chunk allowance inside the configured ciphertext
+ceiling. Ordinary fills, storage staging, and native output cannot consume it.
+Partition validation preserves the existing window/storage floor plus this reserve.
+Descriptors and complete signature chains are verified before reverse forwarding;
+the requester still collects and authenticates the whole page before plaintext
+publication. A body failure after the upstream head closes the exchange.
+
+After overload, the acquisition owner may back off 200-250 ms before the next
+existing candidate attempt. It drops its ciphertext output during that wait, uses
+the original deadline/credits, and reacquires output before submitting again.
+There is no relay retry, fresh credit, or deadline extension. Worker driver ticks
+and cancellation subscriptions drive this bounded wait.
+
+The worker must continue calling `server.poll_admission_deadlines()` for local
+peer-pool waiters and buffered-interface waits. Production already does so.
 
 `Requester::exchange` selects the route rail and automatically attempts native
 transfer when the local session provider is ready. The server validates the entire
@@ -103,6 +115,9 @@ signed response path's rail mapping, then exchanges setup, grant, and completion
 controls on the same HTTP connection. Setup unavailability chooses ordinary HTTP.
 Post-offer native failures use a signed fallback handshake and retained ciphertext,
 without repeating acquisition, resetting the deadline, or decrypting credentials.
+Cut-through relay hops do not advertise native acceptance downstream and answer
+upstream native acceptance with the existing ordinary HTTP response. Direct native
+requester/destination exchanges retain their existing setup and fallback fences.
 Both terminal native fences precede fallback data delivery. Cancellation and
 authentication failures terminate the exchange. Standalone legacy `send`/`receive`
 reject unbound work. The native lifecycle service must be activated and driven on

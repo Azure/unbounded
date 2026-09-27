@@ -271,6 +271,33 @@ fn build_node_with_relay_pressure(
     queue_limit: usize,
     relay_pressure: bool,
 ) -> Node {
+    build_node_with_limits_adjustment(
+        i,
+        membership,
+        signer,
+        discovery,
+        data,
+        concurrency,
+        peer_limit,
+        queue_limit,
+        relay_pressure,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_node_with_limits_adjustment(
+    i: usize,
+    membership: Arc<Membership>,
+    signer: Rc<Signatures>,
+    discovery: &Discovery,
+    data: Rc<Data>,
+    concurrency: usize,
+    peer_limit: usize,
+    queue_limit: usize,
+    relay_pressure: bool,
+    adjust: impl FnOnce(&mut crate::model::limits::Limits),
+) -> Node {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = NonZeroUsize::new(queue_limit).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
@@ -281,6 +308,7 @@ fn build_node_with_relay_pressure(
     if relay_pressure {
         limits.relay_transfers = NonZeroUsize::new(8).unwrap();
     }
+    adjust(&mut limits);
     let admission = Rc::new(Admission::new(limits));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let buffers = Rc::new(BufferPool::new(admission.clone()));
@@ -491,6 +519,12 @@ fn build_node_with_relay_pressure(
 
 #[path = "production_stream_tests.rs"]
 mod production_stream_tests;
+
+#[path = "all_node_flow_tests.rs"]
+mod all_node_flow_tests;
+
+#[path = "intersecting_flow_tests.rs"]
+mod intersecting_flow_tests;
 
 #[test]
 #[ignore = "full production Fill/election eight-layer TCP regression: run with --release"]

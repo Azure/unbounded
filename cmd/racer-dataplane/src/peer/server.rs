@@ -32,6 +32,8 @@ pub trait LocalPageService {
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
+    #[cfg(test)]
+    pub(crate) legacy_relay_for_test: bool,
     io: Rc<crate::http::io::HttpIo>,
     forwarding: Rc<Forwarding>,
     admission: Rc<Admission>,
@@ -110,6 +112,8 @@ impl PeerServer {
         relay: Rc<Relay>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            legacy_relay_for_test: false,
             io,
             forwarding,
             admission,
@@ -129,6 +133,9 @@ impl PeerServer {
         self
     }
     pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
+        // Production validates this floor after worker partitioning. Standalone
+        // tiny fixtures may still serve local requests; transit rejects them.
+        let _ = self.admission.enable_transit();
         self.transfers = Some(transfers);
         self
     }
@@ -289,6 +296,24 @@ impl PeerServer {
                 .deadline
                 .0
                 .min(request.request.route.deadline.0);
+            let stream = true;
+            #[cfg(test)]
+            let stream = stream && !self.legacy_relay_for_test;
+            if stream
+                && request.request.route.destination
+                    != self
+                        .network
+                        .as_ref()
+                        .ok_or(Error::InvalidConfiguration)?
+                        .local
+                && let Some(transfers) = &self.transfers
+            {
+                let request = self.forwarding.verify_request(request)?;
+                return self
+                    .relay
+                    .serve_stream(request, received.connection, transfers, &request_scope)
+                    .await;
+            }
             let admitted = match (native_control, &self.transfers) {
                 (Some(control), Some(transfers)) => {
                     transfers.admit_native(&request, control, &request_scope)?

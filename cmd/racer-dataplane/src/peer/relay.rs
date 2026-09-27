@@ -20,6 +20,9 @@ pub struct Relay {
     forwarding: Rc<Forwarding>,
     transport: Rc<dyn PeerTransport>,
     admission: admission::RelayAdmission,
+    resources: Rc<Admission>,
+    #[cfg(test)]
+    overloads: std::cell::Cell<usize>,
     network: Option<Rc<super::PeerNetwork>>,
     handshake: Option<Rc<super::handshake::Handshake>>,
 }
@@ -34,7 +37,10 @@ impl Relay {
             paths,
             forwarding,
             transport,
-            admission: admission::RelayAdmission::new(admission),
+            admission: admission::RelayAdmission::new(admission.clone()),
+            resources: admission,
+            #[cfg(test)]
+            overloads: std::cell::Cell::new(0),
             network: None,
             handshake: None,
         }
@@ -43,12 +49,108 @@ impl Relay {
         self.network = Some(network);
         self
     }
+    pub(crate) async fn serve_stream(
+        &self,
+        request: VerifiedRequest,
+        upstream: crate::http::pool::ConnectionLease,
+        transfers: &super::transfer::Transfers,
+        scope: &RequestScope,
+    ) -> crate::error::Result<crate::http::pool::ConnectionLease> {
+        let scope = super::request_scope(request.request(), scope)?;
+        let binding = request.binding().clone();
+        let prepare = async {
+            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let budget = &request.request().route;
+            let previous = budget.visited.last().ok_or(Error::InvalidRequest)?.clone();
+            network.endpoint(budget.membership, &previous)?;
+            let route = self
+                .paths
+                .shortest_async(
+                    network.membership(budget.membership)?,
+                    &network.local,
+                    &super::search_budget(budget, &network.local)?,
+                )
+                .await?;
+            let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
+            // No wait for another exchange's scarce resources, including the
+            // discovery handshake. A failure unwinds before a page head is sent.
+            let permit =
+                self.resources
+                    .reserve(None, crate::model::limits::ResourceClass::Relay, 1)?;
+            let chunk = self.resources.reserve_transit()?;
+            if let Some(handshake) = &self.handshake {
+                handshake
+                    .negotiate_transit(next, budget.membership, &scope)
+                    .await?;
+            }
+            let endpoint = network.endpoint(budget.membership, next)?;
+            // The signed security profile permits visited+links == MAX_HOPS+1;
+            // preserve the same effective-budget transition as buffered relay.
+            let mut outbound = budget.clone();
+            outbound.visited.push(network.local.clone());
+            outbound.remaining_links = outbound
+                .remaining_links
+                .checked_sub(1)
+                .ok_or(Error::HopBudgetExhausted)?;
+            let signed = self.forwarding.append_request(request, next, outbound)?;
+            super::stream::TransitBody::open(
+                transfers,
+                &endpoint,
+                signed,
+                &scope,
+                chunk,
+                permit,
+                &self.forwarding,
+                &binding,
+                &previous,
+            )
+            .await
+            .inspect_err(|error| {
+                if matches!(error, Error::Io | Error::Unauthorized | Error::Replay)
+                    && let Some(handshake) = &self.handshake
+                {
+                    handshake.invalidate(next);
+                }
+            })
+        }
+        .await;
+        match prepare {
+            Ok((head, body)) => body.send(transfers, upstream, head, &scope).await,
+            Err(error) => {
+                let outcome = match error {
+                    Error::Overloaded => {
+                        #[cfg(test)]
+                        self.overloads.set(self.overloads.get() + 1);
+                        super::wire::PeerResponse::Overloaded
+                    }
+                    Error::Unavailable
+                    | Error::Io
+                    | Error::HopBudgetExhausted
+                    | Error::IncompatibleMembership => super::wire::PeerResponse::Unavailable,
+                    _ => return Err(error),
+                };
+                scope.check()?;
+                let response = self.forwarding.sign_response(&binding, outcome)?;
+                let sent = transfers
+                    .io
+                    .send_head(
+                        upstream,
+                        super::wire::WireCodec::encode(&response.authentication, true, 0)?,
+                        &scope,
+                    )
+                    .await?;
+                let mut connection = sent.connection;
+                connection.finish_exchange()?;
+                Ok(connection)
+            }
+        }
+    }
     pub(super) fn poll_admission_deadlines(&self) {
         self.admission.poll_deadlines();
     }
     #[cfg(test)]
     pub(super) fn admission_waits(&self) -> usize {
-        self.admission.waits.get()
+        self.admission.waits.get() + self.overloads.get()
     }
     pub fn with_handshake(mut self, handshake: Rc<super::handshake::Handshake>) -> Self {
         self.handshake = Some(handshake);

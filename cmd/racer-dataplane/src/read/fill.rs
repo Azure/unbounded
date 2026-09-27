@@ -58,6 +58,10 @@ pub struct Fill {
     dependencies: FillDependencies,
 }
 impl Fill {
+    #[cfg(test)]
+    pub(crate) fn dependencies_for_test(&self) -> FillDependencies {
+        self.dependencies.clone()
+    }
     /// One bounded reclamation pass, then one retry. Submitted writes and reader
     /// leases remain owned; only disposable queued writes and idle cache entries
     /// are released. Scanning at most the bounded cache avoids pressure spin loops.
@@ -82,6 +86,9 @@ impl Fill {
         }
     }
     pub fn new(dependencies: FillDependencies) -> Self {
+        dependencies
+            .candidates
+            .set_retry_resources(dependencies.admission.clone(), dependencies.memory.clone());
         dependencies
             .candidates
             .set_credentials(dependencies.credentials.clone());

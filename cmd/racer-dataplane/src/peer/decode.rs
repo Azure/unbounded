@@ -113,6 +113,24 @@ fn present(head: &MessageHead, name: &str) -> Result<bool> {
         _ => Err(Error::InvalidRequest),
     }
 }
+
+pub(crate) fn response_descriptor(head: &MessageHead) -> Result<p::ResponseDescriptor> {
+    use p::ResponseDescriptor as D;
+    Ok(match p::field(head, "racer-outcome")?.as_str() {
+        "page" => {
+            let (metadata, envelope) = page_descriptor(head)?;
+            D::Page(metadata, envelope)
+        }
+        "metadata" => D::Metadata(metadata(head)?),
+        "miss" => D::Miss,
+        "version-unavailable" => D::VersionUnavailable,
+        "unavailable" => D::Unavailable,
+        "overloaded" => D::Overloaded,
+        "origin-rejected" => D::OriginRejected,
+        "origin-forbidden" => D::OriginForbidden,
+        _ => return Err(Error::InvalidRequest),
+    })
+}
 fn route(head: &MessageHead) -> Result<RouteBudget> {
     let remaining_links = p::number(head, "racer-route-links")?
         .try_into()

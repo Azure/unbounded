@@ -44,6 +44,12 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<dyn PeerClient>,
     credentials: RefCell<Option<Rc<CredentialCrypto>>>,
+    retry_resources: RefCell<
+        Option<(
+            Rc<crate::runtime::admission::Admission>,
+            Rc<crate::memory::cache::MemoryCache>,
+        )>,
+    >,
 }
 impl CandidatePolicy {
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
@@ -52,12 +58,67 @@ impl CandidatePolicy {
             placement,
             peers,
             credentials: RefCell::new(None),
+            retry_resources: RefCell::new(None),
         }
     }
 
     /// Composition hook: shares the same admission and credential domain as Fill.
     pub fn set_credentials(&self, credentials: Rc<CredentialCrypto>) {
         *self.credentials.borrow_mut() = Some(credentials);
+    }
+    pub(crate) fn set_retry_resources(
+        &self,
+        admission: Rc<crate::runtime::admission::Admission>,
+        memory: Rc<crate::memory::cache::MemoryCache>,
+    ) {
+        *self.retry_resources.borrow_mut() = Some((admission, memory));
+    }
+    async fn overload_backoff(
+        &self,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+        output: &mut Option<crate::runtime::admission::Reservation>,
+    ) -> Result<()> {
+        let Some((admission, memory)) = self.retry_resources.borrow().clone() else {
+            return Ok(());
+        };
+        let restore = output
+            .take()
+            .map(|charge| (charge.cache().cloned(), charge.amount()));
+        let mut jitter = [0; 1];
+        getrandom::getrandom(&mut jitter).map_err(|_| Error::Unavailable)?;
+        let until =
+            Instant::now() + std::time::Duration::from_millis(200 + u64::from(jitter[0] % 51));
+        let cancellation = scope.cancellation.subscribe()?;
+        // This runs only in the existing worker-owned acquisition driver, whose
+        // bounded timer tick polls parked work. No socket, output or new credit is
+        // retained during backoff; the next candidate spends the original budget.
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            if Instant::now() >= budget.deadline() {
+                return std::task::Poll::Ready(Err(Error::DeadlineExceeded));
+            }
+            if Instant::now() < until {
+                return std::task::Poll::Pending;
+            }
+            if let Some((cache, amount)) = &restore {
+                match admission.reserve(
+                    cache.as_ref(),
+                    crate::model::limits::ResourceClass::Ciphertext,
+                    *amount,
+                ) {
+                    Ok(charge) => *output = Some(charge),
+                    Err(Error::Overloaded) => {
+                        memory.evict_idle(usize::MAX)?;
+                        return std::task::Poll::Pending;
+                    }
+                    Err(error) => return std::task::Poll::Ready(Err(error)),
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        })
+        .await
     }
 
     pub fn candidates(
@@ -168,6 +229,9 @@ impl CandidatePolicy {
                     Ok(response) => match classify(response.response(), &operation)? {
                         None => return Ok(CandidateResolution::Copy(response)),
                         Some(outcome) => {
+                            if outcome == ProbeOutcome::Overloaded && index + 1 < count {
+                                self.overload_backoff(scope, budget, output).await?;
+                            }
                             saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                             saw_transient |= matches!(
                                 outcome,
@@ -185,6 +249,9 @@ impl CandidatePolicy {
                         budget.note_route_failure();
                     }
                     Err(Error::Overloaded) => {
+                        if index + 1 < count {
+                            self.overload_backoff(scope, budget, output).await?;
+                        }
                         evidence.push(ProbeOutcome::Overloaded);
                         saw_transient = true;
                         budget.note_route_failure();
@@ -490,6 +557,77 @@ mod tests {
     struct ProbePeer {
         calls: RefCell<Vec<(NodeId, bool)>>,
         error: Error,
+    }
+    #[test]
+    fn overload_backoff_releases_output_preserves_budget_and_obeys_cancellation() {
+        use crate::{
+            memory::{cache::MemoryCache, pool::BufferPool},
+            model::limits::ResourceClass,
+            runtime::admission::Admission,
+        };
+        use std::task::{Context, Poll};
+        for case in ["complete", "cancel", "deadline", "drop"] {
+            let (_, placement, _, scope, _) = fixture();
+            let peers = Rc::new(ProbePeer {
+                calls: RefCell::new(vec![]),
+                error: Error::Overloaded,
+            });
+            let policy = CandidatePolicy::new(NodeId("outside".into()), placement, peers);
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            policy.set_retry_resources(
+                admission.clone(),
+                Rc::new(MemoryCache::new(Rc::new(BufferPool::new(
+                    admission.clone(),
+                )))),
+            );
+            let budget = AcquisitionBudget::new(
+                if case == "deadline" {
+                    Instant::now() + std::time::Duration::from_millis(5)
+                } else {
+                    scope.deadline.0
+                },
+                16,
+                24,
+            );
+            let mut output = Some(
+                admission
+                    .reserve(Some(&object().cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+            );
+            let mut work = Box::pin(policy.overload_backoff(&scope, &budget, &mut output));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0, "{case}");
+            if case == "cancel" {
+                scope.cancel().unwrap();
+            }
+            if case != "drop" {
+                let end = Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                        if case == "complete" {
+                            assert_eq!(result, Ok(()));
+                        } else {
+                            assert!(matches!(
+                                result,
+                                Err(Error::Cancelled | Error::DeadlineExceeded)
+                            ));
+                        }
+                        break;
+                    }
+                    assert!(Instant::now() < end);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            drop(work);
+            assert_eq!(output.is_some(), case == "complete");
+            assert_eq!(budget.remaining_attempts(), 16);
+            assert_eq!(budget.remaining_links(), 24);
+            drop(output);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
     }
     impl PeerClient for ProbePeer {
         fn request<'a>(

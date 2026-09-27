@@ -141,6 +141,15 @@ impl PeerTransport for Requester {
     }
 }
 impl Requester {
+    #[cfg(test)]
+    pub(crate) fn exchange_reserved_for_test<'a>(
+        &'a self,
+        request: SignedRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+    ) -> Operation<'a, SignedResponse> {
+        self.exchange_reserved(request, scope, output)
+    }
     fn exchange_reserved<'a>(
         &'a self,
         request: SignedRequest,

@@ -131,6 +131,23 @@ impl Handshake {
         membership: crate::model::identity::MembershipVersion,
         scope: &'a RequestScope,
     ) -> Operation<'a, Capabilities> {
+        self.negotiate_mode(peer, membership, scope, false)
+    }
+    pub(crate) fn negotiate_transit<'a>(
+        &'a self,
+        peer: &'a NodeId,
+        membership: crate::model::identity::MembershipVersion,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Capabilities> {
+        self.negotiate_mode(peer, membership, scope, true)
+    }
+    fn negotiate_mode<'a>(
+        &'a self,
+        peer: &'a NodeId,
+        membership: crate::model::identity::MembershipVersion,
+        scope: &'a RequestScope,
+        transit: bool,
+    ) -> Operation<'a, Capabilities> {
         Box::pin(async move {
             use crate::http::codec::{MessageHead, StartLine};
             use crate::security::{protocol as p, signing::signed_digest};
@@ -149,7 +166,7 @@ impl Handshake {
                     peer.clone(),
                 )?;
                 let reply = transfers
-                    .exchange_probe(endpoint.clone(), probe.request_bytes(), scope)
+                    .exchange_probe_mode(endpoint.clone(), probe.request_bytes(), scope, transit)
                     .await?;
                 let challenge = probe.verify(
                     certificates,
@@ -176,7 +193,9 @@ impl Handshake {
             );
             let signed = self.signatures.sign(head)?;
             let binding = signed_digest(&signed)?;
-            let response = transfers.exchange_head(endpoint, signed, scope).await?;
+            let response = transfers
+                .exchange_head_mode(endpoint, signed, scope, transit)
+                .await?;
             let verified = self.signatures.verify(response)?;
             let head = &verified.signed.head;
             if verified.peer.node() != peer

@@ -22,11 +22,15 @@ fn index(class: ResourceClass) -> usize {
 }
 struct Counters {
     used: [AtomicUsize; CLASSES],
+    transit: AtomicUsize,
+    ordinary_ciphertext: AtomicUsize,
 }
 impl Counters {
     fn new() -> Self {
         Self {
             used: std::array::from_fn(|_| AtomicUsize::new(0)),
+            transit: AtomicUsize::new(0),
+            ordinary_ciphertext: AtomicUsize::new(0),
         }
     }
 }
@@ -36,6 +40,7 @@ pub struct Admission {
     totals: Arc<Counters>,
     caches: RefCell<HashMap<CacheId, Arc<Counters>>>,
     stopped: Cell<bool>,
+    transit_bytes: Cell<usize>,
 }
 
 /// Ownership of a charge, released only when its last containing allocation dies.
@@ -45,6 +50,7 @@ pub struct Reservation {
     cache: Option<CacheId>,
     totals: Arc<Counters>,
     local: Option<Arc<Counters>>,
+    transit: bool,
 }
 impl Reservation {
     pub fn amount(&self) -> usize {
@@ -66,6 +72,13 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if self.transit {
+            self.totals.transit.fetch_sub(self.amount, Ordering::AcqRel);
+        } else if matches!(self.class, ResourceClass::Ciphertext) {
+            self.totals
+                .ordinary_ciphertext
+                .fetch_sub(self.amount, Ordering::AcqRel);
+        }
         self.totals.used[index(self.class)].fetch_sub(self.amount, Ordering::AcqRel);
         if let Some(local) = &self.local {
             local.used[index(self.class)].fetch_sub(self.amount, Ordering::AcqRel);
@@ -84,10 +97,42 @@ impl Admission {
             totals: Arc::new(Counters::new()),
             caches: RefCell::new(HashMap::new()),
             stopped: Cell::new(false),
+            transit_bytes: Cell::new(0),
         }
     }
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+    /// Reserve small transit chunks inside the aggregate ciphertext ceiling.
+    /// Called during graph assembly, before admitting local work.
+    pub fn enable_transit(&self) -> Result<()> {
+        let bytes = Self::transit_capacity(&self.limits)?;
+        self.transit_bytes.set(bytes);
+        Ok(())
+    }
+    pub fn transit_capacity(limits: &Limits) -> Result<usize> {
+        let available = limits
+            .ciphertext_bytes
+            .get()
+            .checked_sub(PAGE_BYTES as usize + 16)
+            .ok_or(Error::InvalidConfiguration)?;
+        let slots = limits
+            .relay_transfers
+            .get()
+            .min(limits.queue_entries.get())
+            .min(limits.client_connections.get() / 2)
+            .min(available / TRANSIT_CHUNK)
+            .min(PAGE_BYTES as usize / TRANSIT_CHUNK);
+        if slots == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(slots * TRANSIT_CHUNK)
+    }
+    pub fn reserve_transit(&self) -> Result<Reservation> {
+        if self.transit_bytes.get() == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.reserve_inner(None, ResourceClass::Ciphertext, TRANSIT_CHUNK, false, true)
     }
     pub fn stop(&self) {
         self.stopped.set(true);
@@ -126,7 +171,7 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        self.reserve_inner(cache, class, amount, false)
+        self.reserve_inner(cache, class, amount, false, false)
     }
     /// Only for already-admitted work during drain. Does not bypass byte/count
     /// bounds; callers must not use this entry point to accept new requests.
@@ -136,7 +181,7 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        self.reserve_inner(cache, class, amount, true)
+        self.reserve_inner(cache, class, amount, true, false)
     }
     fn reserve_inner(
         &self,
@@ -144,6 +189,7 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
         completing: bool,
+        transit: bool,
     ) -> Result<Reservation> {
         if self.stopped.get() && !completing && !matches!(class, ResourceClass::ControlProgress) {
             return Err(Error::Unavailable);
@@ -152,6 +198,21 @@ impl Admission {
             return Err(Error::InvalidConfiguration);
         }
         let limit = self.limit(class);
+        if matches!(class, ResourceClass::Ciphertext) {
+            let used = if transit {
+                self.totals.transit.load(Ordering::Acquire)
+            } else {
+                self.totals.ordinary_ciphertext.load(Ordering::Acquire)
+            };
+            let ceiling = if transit {
+                self.transit_bytes.get()
+            } else {
+                limit.saturating_sub(self.transit_bytes.get())
+            };
+            if used.checked_add(amount).is_none_or(|next| next > ceiling) {
+                return Err(Error::Overloaded);
+            }
+        }
         let local = if let Some(cache) = cache {
             let mut caches = self.caches.borrow_mut();
             caches.retain(|_, counts| counts.used.iter().any(|n| n.load(Ordering::Acquire) != 0));
@@ -197,12 +258,20 @@ impl Admission {
         if let Some(local) = &local {
             local.used[index(class)].fetch_add(amount, Ordering::AcqRel);
         }
+        if transit {
+            self.totals.transit.fetch_add(amount, Ordering::AcqRel);
+        } else if matches!(class, ResourceClass::Ciphertext) {
+            self.totals
+                .ordinary_ciphertext
+                .fetch_add(amount, Ordering::AcqRel);
+        }
         Ok(Reservation {
             class,
             amount,
             cache: cache.cloned(),
             totals: self.totals.clone(),
             local,
+            transit,
         })
     }
     /// All allocation dimensions are acquired together; failure rolls back every charge.
@@ -229,9 +298,63 @@ impl Admission {
         })
     }
 }
+pub const TRANSIT_CHUNK: usize = 16 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transit_floor_partition_and_completion_release_preserve_total_ceiling() {
+        use std::num::NonZeroUsize as N;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        let page = PAGE_BYTES as usize + 16;
+        for bytes in [1, page, page + TRANSIT_CHUNK - 1] {
+            limits.ciphertext_bytes = N::new(bytes).unwrap();
+            assert_eq!(
+                Admission::transit_capacity(&limits),
+                Err(Error::InvalidConfiguration)
+            );
+        }
+        limits.ciphertext_bytes = N::new(page + TRANSIT_CHUNK).unwrap();
+        limits.client_connections = N::new(1).unwrap();
+        assert_eq!(
+            Admission::transit_capacity(&limits),
+            Err(Error::InvalidConfiguration)
+        );
+        limits.client_connections = N::new(2).unwrap();
+        assert_eq!(Admission::transit_capacity(&limits), Ok(TRANSIT_CHUNK));
+        let admission = Admission::new(limits);
+        admission.enable_transit().unwrap();
+        let ordinary = admission
+            .reserve(None, ResourceClass::Ciphertext, page)
+            .unwrap();
+        assert!(matches!(
+            admission.reserve_completion(None, ResourceClass::Ciphertext, 1),
+            Err(Error::Overloaded)
+        ));
+        let chunk = admission.reserve_transit().unwrap();
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page + TRANSIT_CHUNK
+        );
+        assert!(matches!(
+            admission.reserve_transit(),
+            Err(Error::Overloaded)
+        ));
+        std::thread::spawn(move || drop(chunk)).join().unwrap();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), page);
+        let chunk = admission.reserve_transit().unwrap();
+        admission.stop();
+        assert!(matches!(
+            admission.reserve_transit(),
+            Err(Error::Unavailable)
+        ));
+        drop((ordinary, chunk));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(
+            admission.totals.ordinary_ciphertext.load(Ordering::Acquire),
+            0
+        );
+    }
     #[test]
     fn rollback_and_cross_thread_release() {
         let mut limits = crate::test_support::cluster::config(false).limits;
