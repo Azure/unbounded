@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +37,8 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 type Issuer struct {
 	APIReader client.Reader
 	Config    Config
+	Trust     *Trust
+	CatalogMu *sync.Mutex
 	Now       func() time.Time
 }
 
@@ -181,16 +184,44 @@ func (i *Issuer) now() time.Time {
 }
 
 // TrustRoots returns a newly owned pool from authoritative committed credentials.
-// Serving calls this for TLS admission and again on each snapshot request;
-// cached TLS VerifiedChains alone cannot authorize a retired issuer.
+// Issuance and reconciliation use authoritative credentials; serving uses Trust.
 // This pool is unrelated to deployment-provided HTTPS server trust.
 func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
-	state, err := loadSigning(ctx, i.APIReader, i.Config, i.now())
+	state, err := i.loadSigning(ctx, i.now())
 	if err != nil {
 		return nil, err
 	}
 
 	return state.roots, nil
+}
+
+// Issuance can also observe invalid durable authority. It may withdraw trust,
+// but only controller reconciliation can install or restore serving trust.
+func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
+	// Serialize observations with controller installation so an in-flight valid
+	// read cannot restore trust after another operation observes invalidity.
+	if i.CatalogMu != nil {
+		// Controller API work can stall. Waiting for its lock must still honor
+		// the enrollment deadline and release bounded authentication admission.
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for !i.CatalogMu.TryLock() {
+			select {
+			case <-ctx.Done():
+				return signingState{}, ctx.Err()
+			case <-ticker.C:
+			}
+		}
+		defer i.CatalogMu.Unlock()
+	}
+
+	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
+	if observedAuthorityFailure(err) {
+		i.Trust.invalidate()
+	}
+
+	return state, err
 }
 
 // Issue accepts only the identity returned by token authentication. CSR names,
@@ -223,7 +254,7 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 		return wire.BootstrapResponse{}, wire.InvalidRequest
 	}
 
-	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
+	state, err := i.loadSigning(ctx, now)
 	if err != nil {
 		return wire.BootstrapResponse{}, err
 	}
@@ -258,10 +289,10 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 }
 
 // AuthenticateCertificate requires a verified chain, the client-auth usage,
-// cluster-scoped Node URI SAN, current validity, and authorization. Recheck on
+// cluster-scoped Node URI SAN, and current validity against local trust. Recheck on
 // every poll: an existing TLS connection must not bypass certificate expiry.
-// reader supplies authoritative facts; hints supplies only indexed informer discovery.
-func AuthenticateCertificate(ctx context.Context, reader, hints client.Reader, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
+// Membership and Kubernetes workload state are not certificate authorization.
+func AuthenticateCertificate(ctx context.Context, trust *Trust, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
 	if err := ctx.Err(); err != nil {
 		return NodeIdentity{}, err
 	}
@@ -296,11 +327,7 @@ func AuthenticateCertificate(ctx context.Context, reader, hints client.Reader, c
 		return NodeIdentity{}, wire.Forbidden
 	}
 
-	if reader == nil {
-		return NodeIdentity{}, wire.Unavailable
-	}
-
-	roots, err := (&Issuer{APIReader: reader, Config: cfg}).TrustRoots(ctx)
+	roots, err := trust.pool()
 	if err != nil {
 		return NodeIdentity{}, wire.Unavailable
 	}
@@ -320,10 +347,6 @@ func AuthenticateCertificate(ctx context.Context, reader, hints client.Reader, c
 		if cert.NotAfter.Before(expires) {
 			expires = cert.NotAfter
 		}
-	}
-
-	if err := authorizeNode(ctx, reader, hints, cfg, node); err != nil {
-		return NodeIdentity{}, err
 	}
 
 	if err := ctx.Err(); err != nil {

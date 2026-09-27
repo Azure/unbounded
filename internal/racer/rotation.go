@@ -223,7 +223,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 
 	var caches racerv1.ClusterCacheList
 	if err := r.APIReader.List(ctx, &caches); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, authorityReadFailure(err)
 	}
 
 	catalog, err := BuildCatalog(caches.Items)
@@ -399,15 +399,6 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 			return ctrl.Result{}, err
 		}
 	}
-	// Validate the committed pair again, including signing lifetime. Never mark
-	// ready based on an uncommitted candidate or a stale informer read.
-	if _, _, _, _, _, err := readCredentials(ctx, r.APIReader, r.Config, claim); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if _, err := loadSigning(ctx, r.APIReader, r.Config, now); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	return ctrl.Result{RequeueAfter: max(time.Second, state.NextTransition.Sub(now))}, nil
 }
@@ -488,10 +479,6 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		}
 	}
 
-	if _, err := loadSigning(ctx, r.APIReader, r.Config, now); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	return ctrl.Result{RequeueAfter: r.Config.Rotation.Interval}, nil
 }
 
@@ -525,7 +512,7 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 		}
 
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: entry.name}, entry.secret); err != nil {
-			return fail(err)
+			return fail(authorityReadFailure(err))
 		}
 
 		if claim == "" || entry.secret.Annotations[credentialClaim] != claim || entry.secret.DeletionTimestamp != nil || entry.secret.ResourceVersion == "" {

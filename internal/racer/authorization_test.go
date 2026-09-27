@@ -46,7 +46,6 @@ func TestHTTPSDiscoveryUncertaintyRetriesAfterConvergence(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f := newServingFixture(t)
 			hints := frozenAuthorizationHints(t, f.a)
-			f.a.Server.Hints = hints
 			node := &corev1.Node{}
 			pod := &corev1.Pod{}
 
@@ -105,12 +104,8 @@ func TestHTTPSDiscoveryUncertaintyRetriesAfterConvergence(t *testing.T) {
 			peer := f.client(t, &f.certificate)
 			response, err := peer.Get(endpoint + wire.SnapshotPath)
 
-			body := responseBody(t, response, err, http.StatusServiceUnavailable)
-			if string(body) != `{"code":"unavailable"}` {
-				t.Fatalf("discovery error: %s", body)
-			}
-			// responseBody also requires Retry-After: 1. Simulate watch convergence
-			// without replacing the certificate, server, or pooled TLS connection.
+			responseBody(t, response, err, http.StatusOK)
+			// Discovery convergence changes routing, not certificate authorization.
 			for _, obj := range []client.Object{node, pod} {
 				if err := hints.Delete(t.Context(), obj); err != nil && !apierrors.IsNotFound(err) {
 					t.Fatal(err)
@@ -147,7 +142,7 @@ func TestHTTPSDiscoveryFinalRecheckRetryable(t *testing.T) {
 	f := newServingFixture(t)
 	hints := frozenAuthorizationHints(t, f.a)
 	lookups := 0
-	f.a.Server.Hints = interceptor.NewClient(hints, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+	f.a.Server.Bootstrap.APIReader = interceptor.NewClient(hints, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 		if err := c.List(ctx, list, opts...); err != nil {
 			return err
 		}
@@ -165,12 +160,14 @@ func TestHTTPSDiscoveryFinalRecheckRetryable(t *testing.T) {
 	peer := f.client(t, &f.certificate)
 
 	response, err := peer.Get(endpoint + wire.SnapshotPath)
-	if body := responseBody(t, response, err, http.StatusServiceUnavailable); string(body) != `{"code":"unavailable"}` {
-		t.Fatalf("final discovery recheck leaked snapshot: %s", body)
-	}
+	responseBody(t, response, err, http.StatusOK)
 
 	response, err = peer.Get(endpoint + wire.SnapshotPath)
 	responseBody(t, response, err, http.StatusOK)
+
+	if lookups != 0 {
+		t.Fatalf("snapshot consulted discovery: %d", lookups)
+	}
 }
 
 func TestAuthorizationStaleHintsRequireLiveFacts(t *testing.T) {
@@ -337,7 +334,7 @@ func TestAuthorizationHintMissesAndCandidateBound(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				if err := authorizeNode(t.Context(), a.Server.APIReader, hints, a.Server.Config, wire.NodeID(testNodeUID)); err != wire.Unavailable {
+				if err := authorizeNode(t.Context(), a.Topology.APIReader, hints, a.Server.Config, wire.NodeID(testNodeUID)); err != wire.Unavailable {
 					t.Fatalf("stale Pod UID must allow retry: %v", err)
 				}
 

@@ -301,8 +301,9 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 		"future":        {func(c *x509.Certificate) { c.NotBefore = time.Now().Add(time.Minute) }, http.StatusUnauthorized, true},
 		"wrong usage":   {func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }, http.StatusUnauthorized, true},
 		"wrong cluster": {func(c *x509.Certificate) { c.URIs[0].Host = testNodeUID }, http.StatusForbidden, false},
-		// An unknown UID is discovery uncertainty, not a live identity rejection.
-		"wrong uid":        {func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID }, http.StatusServiceUnavailable, false},
+		// A signed, well-formed UID need not appear in routing membership.
+		"wrong uid":        {func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID }, http.StatusOK, false},
+		"bad identity":     {func(c *x509.Certificate) { c.URIs[0].Path = "/node/not-a-uuid" }, http.StatusUnauthorized, false},
 		"ambiguous SAN":    {func(c *x509.Certificate) { c.URIs = append(c.URIs, c.URIs[0]) }, http.StatusUnauthorized, false},
 		"query SAN":        {func(c *x509.Certificate) { c.URIs[0].RawQuery = "admin=true" }, http.StatusUnauthorized, false},
 		"no signing usage": {func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment }, http.StatusUnauthorized, false},
@@ -315,6 +316,10 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 				return
 			}
 
+			if tc.status == http.StatusOK {
+				responseBody(t, response, err, tc.status)
+				return
+			}
 			// Require only the expected wire error, with no snapshot bytes admitted.
 			want := map[int]string{
 				http.StatusUnauthorized:       `{"code":"unauthenticated"}`,
@@ -363,7 +368,6 @@ func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
 	for _, scenario := range []string{"excluded", "recreated node", "pod gone", "expired"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newServingFixture(t)
-			f.a.Server.Hints = frozenAuthorizationHints(t, f.a)
 
 			cert := f.certificate
 			if scenario == "expired" {
@@ -419,13 +423,11 @@ func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
 
 			response, err = c.Do(req)
 
-			want := 403
+			want := 200
 
 			switch scenario {
 			case "expired":
 				want = 401
-			case "pod gone":
-				want = 503
 			}
 
 			responseBody(t, response, err, want)
@@ -486,6 +488,8 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 	if err := f.a.Topology.Update(f.ctx, shared); err != nil {
 		t.Fatal(err)
 	}
+
+	runKeys(t, f.a.Keyring)
 
 	reused := false
 	ctx := httptrace.WithClientTrace(f.ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }})
@@ -597,7 +601,7 @@ func TestAdmissionAndAPIDeadlines(t *testing.T) {
 	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
 	f.a.Server.Config.Limits.WriteTimeout = 100 * time.Millisecond
 	entered := make(chan struct{}, 1)
-	f.a.Server.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 		entered <- struct{}{}
 
 		<-ctx.Done()
@@ -605,7 +609,15 @@ func TestAdmissionAndAPIDeadlines(t *testing.T) {
 		return ctx.Err()
 	}})
 	handler := f.a.Server.Handler()
-	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
+
+	body, err := wire.EncodeBootstrapRequest(f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("POST", wire.BootstrapPath, bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+f.token)
 	r.TLS = f.requestState(t)
 	done := make(chan *httptest.ResponseRecorder, 1)
 
@@ -989,7 +1001,6 @@ func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 
 func TestTLSRevocationWhilePolling(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Hints = frozenAuthorizationHints(t, f.a)
 	endpoint := f.start(t)
 	c := f.client(t, &f.certificate)
 
@@ -1004,7 +1015,12 @@ func TestTLSRevocationWhilePolling(t *testing.T) {
 		defer close(done)
 
 		response, err := c.Get(fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.record.Sequence))
-		responseBody(t, response, err, 403)
+		body := responseBody(t, response, err, 200)
+
+		updated, decodeErr := wire.DecodePublication(bytes.NewReader(body))
+		if decodeErr != nil || len(updated.Members) != 0 {
+			t.Errorf("exclusion must remove routing membership: %v", decodeErr)
+		}
 	}()
 
 	deadline := time.After(5 * time.Second)

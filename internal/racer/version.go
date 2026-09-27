@@ -60,7 +60,7 @@ func (r *TopologyReconciler) installation(ctx context.Context, fresh bool) (*cor
 
 	cm := &corev1.ConfigMap{}
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.InstallationConfigMapName}, cm); err != nil {
-		return nil, err
+		return nil, authorityReadFailure(err)
 	}
 
 	state := "consumed"
@@ -162,7 +162,7 @@ func (r *TopologyReconciler) readVersion(ctx context.Context) (*corev1.ConfigMap
 	}
 
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}, cm); err != nil {
-		return nil, VersionRecord{}, err
+		return nil, VersionRecord{}, authorityReadFailure(err)
 	}
 
 	v, err := parseVersion(cm, r.Config.Cluster, marker.UID)
@@ -195,7 +195,7 @@ func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPubli
 
 	cm, previous, err := r.readVersion(ctx)
 	if err != nil {
-		r.Publications.Suspend()
+		r.suspendInvalidAuthority(err)
 		return nil, err
 	}
 

@@ -29,6 +29,7 @@ type TopologyReconciler struct {
 	Publications *Publications
 	Accepted     AcceptedMembers
 	CatalogMu    *sync.Mutex
+	Trust        *Trust
 }
 
 // Reconcile builds from the synchronized cache, reads the version ConfigMap
@@ -69,7 +70,7 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	cm, previous, err := r.readVersion(ctx)
 	if err != nil {
-		r.Publications.Suspend()
+		r.suspendInvalidAuthority(err)
 		return err
 	}
 
@@ -94,7 +95,7 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	if claim := cm.Annotations[credentialClaim]; claim != "" {
 		_, _, bundle, _, _, err := readCredentials(ctx, r.APIReader, r.Config, claim)
 		if err != nil {
-			r.Publications.Suspend()
+			r.suspendInvalidAuthority(err)
 			return err
 		}
 
@@ -181,6 +182,13 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
+}
+
+func (r *TopologyReconciler) suspendInvalidAuthority(err error) {
+	if observedAuthorityFailure(err) {
+		r.Publications.Suspend()
+		r.Trust.invalidate()
+	}
 }
 
 // singleton coalesces input changes without introducing a singleton CR.

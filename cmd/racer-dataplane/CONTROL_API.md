@@ -156,8 +156,17 @@ recovery all use the same token-authenticated endpoint with a fresh projected
 token. Old verification material serves already-admitted traffic.
 
 The HTTPS listener verifies client certificates when supplied; the snapshot route
-requires a verified node identity. Recheck validity/authorization on every request,
-including pooled connections, and bound long polls by certificate expiration.
+requires an exact same-cluster Node identity and a currently valid chain under
+controller-installed validated trust. Both TLS handshakes and snapshot requests
+use local trust with zero Kubernetes calls. Recheck the chain, identity, and
+validity before and after every poll, including pooled connections, and bound
+polls and writes by certificate expiration. Kubernetes Node/Pod/DaemonSet/ServiceAccount
+authorization is required only at enrollment and renewal. Deletion, recreation,
+exclusion, and membership removal do not revoke an issued certificate: membership
+is routing, not authorization. Any authenticated same-cluster node may connect.
+Controller reconciliation installs trust updates and withdraws trust after observed
+invalid or deleted durable authority. An API read outage may retain accepted local
+state while leadership holds, but cannot restore previously withdrawn trust.
 Bootstrap can connect without a client certificate, including recovery from an
 expired identity. There are no control HTTP signatures or challenge endpoint.
 TLS authenticates responses. Peer HTTP retains its signature/replay machinery.

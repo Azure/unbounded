@@ -259,32 +259,26 @@ behavior. Do not reset initialization state to work around these failures.
 ## Measured limits
 
 The 100,000-waiter test verifies bounded admission and shared publication ownership.
-It does not send 100,000 HTTPS responses. Snapshot authorization uses informer
-indexes for Node UID/name and managed Pod discovery, then live GETs for all
-authorization facts. There are no per-request live Node or Pod lists and no
-cached positive authorization. Discovery uncertainty denies bytes with retryable
-503 `unavailable` and `Retry-After: 1`: missing/ambiguous Node hints, no Pod hints,
-and exhausted stale or rejected Pod candidates all allow retry until convergence.
-A live rejection of a hinted Pod or its owner does not prove that no eligible
-replacement exists outside the cache. A recreated Pod must have its new UID
-discovered. Live Node deletion, recreation, termination, or exclusion still
-returns 403 `forbidden`; bootstrap's directly bound live negatives retain 403.
-The Rust client treats 403 as terminal, so discovery alone must not produce it.
-More than four managed Pod candidates on one Node returns 503 rather than
-unbounded live reads.
-Node, Pod, DaemonSet, ServiceAccount, and credential checks run before and after
-the long poll, including on pooled TLS connections.
+It does not send 100,000 HTTPS responses. Snapshot authentication checks the exact
+Node certificate identity, cluster, chain, usage, and validity against locally
+installed validated controller trust before and after each poll. TLS handshakes,
+warm snapshots, and unchanged 204 responses make **zero Kubernetes API calls**.
+There is no per-request fallback to Kubernetes. The envtest request-budget test
+asserts zero requests and API-body bytes at both 1 and 1,001 live Nodes.
 
-With one candidate, a warm successful response still costs **16 live GETs**:
-eight per pass, including four installation/version/credential reads. Those four
-reads are retained to detect deletion, invalid installation claims, corrupt state,
-and retired trust without a freshness window. The maximum with four candidates
-is 34 GETs across both passes; a new TLS handshake adds four trust reads.
-Race-instrumented Kubernetes 1.37 envtest measured ten sequential snapshots with
-both 1 and 1,001 live Nodes: **160 GETs, zero Node/Pod lists, and 300,320 API-body
-bytes** in each case. This bounds read amplification with cluster size, not API
-server throughput or 100,000-client HTTPS capacity. See
-`designs/racer-control-plane.md` for the measured setup and remaining costs.
+Live TokenReview and Pod/ServiceAccount/DaemonSet/Node authorization remain required
+for enrollment and renewal. An issued certificate remains usable after workload
+deletion, Node recreation, or exclusion until expiration or trust retirement.
+Membership controls routing, not authorization. Startup re-enrollment and renewal
+still resolve recreated Node identities; a changed UID fences and restarts the
+Rust runtime rather than rebinding an active graph.
+
+Trust is installed by controller reconciliation after validating committed durable
+credentials and installation binding. Observed invalidity or deletion withdraws
+trust; subsequent API read failures cannot restore it. Temporary API read outages
+may serve previously accepted local state while leadership holds. Leadership loss,
+certificate expiration on pooled connections, and trust rotation remain enforced.
+See `designs/racer-control-plane.md` for the measurement setup and remaining costs.
 
 Production `Run` uses controller-runtime v0.25.1's `ctrl.GetConfig()`, which sets
 default QPS to -1 (client-side throttling disabled), rather than client-go's

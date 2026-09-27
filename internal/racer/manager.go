@@ -37,31 +37,24 @@ type Application struct {
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	publications := NewPublications(cfg.Limits)
 	lifecycle := newLifecycle(publications)
-	issuer := &Issuer{APIReader: reader, Config: cfg}
+	trust := &Trust{}
+	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 	// Serialize credential admission/pruning with topology's authoritative read
 	// and publication commit. Informer ordering alone cannot provide this gate.
 	catalogMu := &sync.Mutex{}
+	issuer.CatalogMu = catalogMu
 
 	return &Application{
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogMu: catalogMu},
-		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle, CatalogMu: catalogMu},
+		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogMu: catalogMu, Trust: trust},
+		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle, CatalogMu: catalogMu, Trust: trust},
 		Workload:  &WorkloadReconciler{Client: c, APIReader: reader, Config: cfg},
-		Server:    &Server{Config: cfg, APIReader: reader, Hints: c, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Server:    &Server{Config: cfg, Trust: trust, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
 		Lifecycle: lifecycle,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
-	a.Server.Hints = mgr.GetCache()
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Node{}, nodeUIDIndex, nodeUIDKeys); err != nil {
-		return fmt.Errorf("index authorization Nodes: %w", err)
-	}
-
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, authorizationPodIndex, authorizationPodKeys(a.Server.Config)); err != nil {
-		return fmt.Errorf("index authorization Pods: %w", err)
-	}
-
 	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
 	if err := mgr.Add(a.Lifecycle); err != nil {
 		return fmt.Errorf("register leader lifecycle: %w", err)

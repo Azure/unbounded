@@ -16,17 +16,14 @@ import (
 	"sync"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 type Server struct {
-	Config    Config
-	APIReader client.Reader
-	// Hints must be an indexed informer reader, never an authoritative client.
-	Hints          client.Reader
+	Config         Config
+	Trust          *Trust
 	Bootstrap      *Bootstrap
 	Publications   *Publications
 	Lifecycle      *Lifecycle
@@ -66,23 +63,17 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 
 func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tls.Config {
 	base := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{certificate}, ClientAuth: tls.VerifyClientCertIfGiven, SessionTicketsDisabled: true, NextProtos: []string{"http/1.1"}}
-	base.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	base.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-
-		lookup, cancel := context.WithTimeout(hello.Context(), s.Config.Limits.WriteTimeout)
-		defer cancel()
-
-		stop := context.AfterFunc(ctx, cancel)
-		defer stop()
 
 		if !take(s.bootstrapSlots) {
 			return nil, wire.Overloaded
 		}
 		defer release(s.bootstrapSlots)
 
-		roots, err := s.Bootstrap.Issuer.TrustRoots(lookup)
+		roots, err := s.Trust.pool()
 		if err != nil {
 			return nil, wire.Unavailable
 		}
@@ -250,6 +241,10 @@ func (s *Server) Ready(r *http.Request) error {
 		return wire.Unavailable
 	}
 
+	if _, err := s.Trust.pool(); err != nil {
+		return err
+	}
+
 	return s.Lifecycle.Ready(r)
 }
 
@@ -386,7 +381,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
-	identity, err := AuthenticateCertificate(auth, s.APIReader, s.Hints, s.Config, r.TLS)
+	identity, err := AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
 
 	cancel()
 	release(s.bootstrapSlots)
@@ -435,15 +430,15 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeFailure(w, wire.Unavailable)
 		return
 	}
-	// Revalidate after waiting too: a rotation or live revocation during the
-	// poll must not disclose a newly published snapshot to a revoked identity.
+	// Revalidate local trust after waiting: rotation or observed invalidity must
+	// also take effect on pooled connections before returning snapshot bytes.
 	if !take(s.bootstrapSlots) {
 		writeFailure(w, wire.Overloaded)
 		return
 	}
 
 	auth, stop := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
-	_, err = AuthenticateCertificate(auth, s.APIReader, s.Hints, s.Config, r.TLS)
+	_, err = AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
 
 	stop()
 	release(s.bootstrapSlots)

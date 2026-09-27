@@ -43,6 +43,7 @@ type KeyringReconciler struct {
 	APIReader client.Reader
 	Config    Config
 	Issuer    *Issuer
+	Trust     *Trust
 	Lifecycle *Lifecycle
 	Now       func() time.Time
 	CatalogMu *sync.Mutex
@@ -58,12 +59,28 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	}
 
 	result, err := r.reconcileKeys(ctx)
+	// Install only after authoritative validation of the committed credentials,
+	// including installation binding, rotation consistency, and signing lifetime.
+	if err == nil {
+		var state signingState
+
+		state, err = loadSigning(ctx, r.APIReader, r.Config, r.now())
+		if err == nil && r.Trust != nil {
+			r.Trust.install(state.roots)
+		}
+	}
+
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
 
+	if observedAuthorityFailure(err) {
+		r.Trust.invalidate()
+	}
+
 	if r.Lifecycle != nil {
-		r.Lifecycle.SetIssuerReady(err == nil)
+		_, trustErr := r.Trust.pool()
+		r.Lifecycle.SetIssuerReady(trustErr == nil)
 	}
 
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

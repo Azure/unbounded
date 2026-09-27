@@ -785,7 +785,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 	measured := Assemble(a.Server.Config, reader, reader).Server
 	measured.Lifecycle, measured.Publications = a.Lifecycle, a.Server.Publications
-	measured.Hints = a.Server.Hints
+	measured.Trust = a.Server.Trust
 
 	config, err := measured.TLSConfig(t.Context())
 	if err != nil {
@@ -804,12 +804,16 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	t.Cleanup(func() { server.Close() })
 
 	endpoint := "https://" + listener.Addr().String() + wire.SnapshotPath
-	// Warm the TLS connection: subsequent measurements exclude handshake trust
-	// reads, and include both live authorization passes per snapshot.
+	// The first request includes a real TLS handshake. Neither path may read API state.
+	requests.Store(0)
+	received.Store(0)
+
 	response, err := peer.Get(endpoint)
 	responseBody(t, response, err, 200)
 
-	var baselineBytes int64
+	if requests.Load() != 0 || received.Load() != 0 {
+		t.Fatalf("TLS handshake/snapshot used API: requests=%d bytes=%d", requests.Load(), received.Load())
+	}
 
 	for _, count := range []int{1, 1001} {
 		if count > 1 {
@@ -820,11 +824,11 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 				}
 			}
 		}
-		// Include all added Nodes in the real informer before measuring indexed
-		// discovery. Watch traffic is deliberately outside the request budget.
+		// Include all added Nodes in the real informer. Controller watch traffic
+		// is deliberately outside the request budget.
 		eventually(t, "authorization discovery cache convergence", func() bool {
 			var nodes corev1.NodeList
-			return a.Server.Hints.List(t.Context(), &nodes) == nil && len(nodes.Items) == count
+			return a.Topology.List(t.Context(), &nodes) == nil && len(nodes.Items) == count
 		})
 
 		requests.Store(0)
@@ -839,19 +843,17 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 			responseBody(t, response, err, 200)
 		}
 
-		if requests.Load() != 160 || nodeLists.Load() != 0 || podLists.Load() != 0 {
+		if requests.Load() != 0 || nodeLists.Load() != 0 || podLists.Load() != 0 {
 			t.Fatalf("authorization API budget drift: requests=%d node_lists=%d pod_lists=%d", requests.Load(), nodeLists.Load(), podLists.Load())
 		}
 
-		if count == 1 {
-			baselineBytes = received.Load()
-		} else if received.Load() > baselineBytes+1024 {
-			t.Fatalf("authorization bytes grew with unrelated Nodes: baseline=%d current=%d", baselineBytes, received.Load())
+		if received.Load() != 0 {
+			t.Fatalf("snapshot read API bytes: %d", received.Load())
 		}
 
 		t.Logf("real HTTPS authorization: live_nodes=%d snapshots=10 elapsed=%s API_requests=%d Node_lists=%d Pod_lists=%d API_response_bytes=%d (warm TLS; envtest QPS=%g burst=%d)", count, time.Since(start), requests.Load(), nodeLists.Load(), podLists.Load(), received.Load(), rc.QPS, rc.Burst)
 	}
-	// Live revocation on a pooled TLS connection must still forbid snapshot data.
+	// Exclusion changes routing membership, not authorization of issued identities.
 	node := &corev1.Node{}
 	if err := c.Get(t.Context(), client.ObjectKey{Name: "server-node"}, node); err != nil {
 		t.Fatal(err)
@@ -863,7 +865,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	}
 
 	response, err = peer.Get(endpoint)
-	responseBody(t, response, err, 403)
+	responseBody(t, response, err, 200)
 }
 
 func integrationEnrollment(t *testing.T, rc *rest.Config, c client.Client, a *Application, ds *appsv1.DaemonSet, roots *x509.CertPool) *http.Client {

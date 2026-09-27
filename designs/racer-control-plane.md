@@ -348,10 +348,9 @@ establishes 100,000-node HTTPS capacity.
   its authorization expiration, and gate issuance on leadership. There is no
   enrollment receipt ledger. `AuthenticateCertificate` is implemented in Phase 5.
 - `Issuer.TrustRoots(ctx)` returns a new owned pool from authoritative committed
-  credentials, distinct from deployment HTTPS server trust. Phase 5 must use fresh
-  trust for TLS admission and reverify chain, usage, identity, validity, and live
-  authorization on every snapshot request; pooled TLS `VerifiedChains` alone
-  cannot authorize retired roots. Phase 5 uses the existing `Lifecycle.Wait(ctx)`
+  credentials, distinct from deployment HTTPS server trust. Reconciliation installs
+  validated roots locally for TLS admission and snapshot chain verification.
+  Pooled TLS `VerifiedChains` alone cannot authorize retired roots. Serving uses `Lifecycle.Wait(ctx)`
   and `SetServingReady` hooks, and must cancel serving on leadership loss.
 
 Phase 4 fake-client/race tests cover initialization and rotation write boundaries,
@@ -375,44 +374,29 @@ deployment integration check and is not exercised by envtest.
   issuance authorization; raw JWT identities are never used. `Enroll` caps its
   context by that expiration and delegates Ed25519 CSR proof/signing to `Issue`.
 - `AuthenticateCertificate` requires TLS-verified evidence and independently
-  verifies the presented chain against fresh authoritative `TrustRoots` on every
+  verifies the presented chain against controller-installed local trust on every
   request. It checks current chain validity, Ed25519/digital-signature/client-auth
-  usage, one exact cluster/Node URI, live Node UID/exclusion, and a live authorized
-  Pod of the current managed DaemonSet and ServiceAccount. Node certificates bind
-  Node UIDs rather than Pod UIDs, so the server can authorize replacement managed
-  Pods on the same Node with an existing valid certificate. The Rust client now
+  usage, and one exact cluster/Node URI. Kubernetes authorization is confined to
+  enrollment and renewal. Issued identities remain valid after Node/workload
+  deletion, recreation, or exclusion until certificate expiration or trust removal.
+  Membership is routing, not authorization. The Rust client
   reauthenticates its projected token on every startup before constructing or
   activating node-bound runtime state. Retained identity hostPaths therefore
   converge after Node delete/recreate: a verified same-cluster enrollment may
   replace the old UID, including when the disk certificate has expired. During
   renewal, a changed UID triggers a terminal `NodeIdentityChanged`, worker-wide
   drain/fencing, and container restart rather than rebinding a live graph. Snapshot
-  503s also schedule token reauthentication with backoff to escape stale-UID
-  discovery loops. Cross-cluster identity adoption remains forbidden. See
+  503s also schedule token reauthentication with backoff. Cross-cluster identity adoption remains forbidden. See
   `cmd/racer-dataplane/src/control/INTEGRATION.md` for persistence and restart details.
-  UID-only certificates
-  use an informer Node UID index and a namespace-scoped managed-Pod-by-Node index
-  solely to discover names. Live GETs validate Node UID/exclusion, Pod UID and
-  assignment/state/owner, current DaemonSet UID, and ServiceAccount existence/state.
-  Bootstrap still checks the TokenReview ServiceAccount UID. No authorization
-  positive is cached. Missing/stale hints fail closed with retryable 503
-  `unavailable` and `Retry-After: 1` until convergence; a Pod recreation must be
-  observed before its new UID can authorize the Node. Exhausting candidates is
-  also discovery uncertainty, even when live checks reject their owners or
-  workload state: an eligible replacement may exist outside the stale cache.
-  Live Node deletion/recreation/termination/exclusion still returns 403, and
-  bootstrap retains direct bound-Pod/ServiceAccount authorization errors.
-  This distinction is required by the Rust client's terminal 403 versus transient
-  503 handling (`cmd/racer-dataplane/src/control/client.rs:466-504`), both at
-  startup (`cmd/racer-dataplane/src/app.rs:837-853`) and during normal operation
-  (`cmd/racer-dataplane/src/app.rs:1097-1104`). More than
-  four candidate Pods returns unavailable, bounding even stale-candidate API work.
-  Production explicitly wires discovery to the manager cache and security reads
-  to APIReader. Cache sync and leadership readiness gates remain in effect, and
-  the final post-wait authorization repeats live reads rather than reusing facts.
+  Snapshot serving has no Kubernetes reader or discovery dependency. Reconciliation
+  installs public trust only after validating committed installation, version,
+  issuer, bundle, and rotation state. Observed invalidity/deletion withdraws local
+  trust; read outages cannot resurrect it. A temporary API read outage can retain
+  previously accepted trust and durable publication bytes while still leader.
+  No freshness checkpoint, token, or additional lease subsystem is introduced.
 - `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
-  and verifies optional client certificates using fresh roots per handshake, and
+  and verifies optional client certificates using current local roots per handshake, and
   disables session tickets. Bootstrap recovery omits an expired certificate.
   HTTPS server certificate files are loaded at startup; deployment certificate
   replacement requires a controller restart. Peer root rotation remains live.
@@ -422,8 +406,8 @@ deployment integration check and is not exercised by envtest.
   with protocol errors. No ServeMux redirects or implicit HEAD endpoint exists.
   Errors contain only bounded wire codes; 429/503 include `Retry-After: 1`.
 - HTTP admission holds one slot per Node and a global poll bound through response
-  flush, in addition to `Publications.Wait`'s waiting admission. Handshakes' trust
-  reads, request authorization and enrollment share bounded authentication slots;
+  flush, in addition to `Publications.Wait`'s waiting admission. Handshake trust
+  selection, local certificate verification and enrollment share bounded authentication slots;
   slow snapshot writes have separate bounded slots. Saturation rejects immediately.
   Long polls are capped by the earliest verified-chain expiration and reauthorize
   after waiting, before writing. Expiration can return a bounded 401 recovery error.
@@ -543,7 +527,7 @@ the generated ClusterCache CRD. Assertions cover:
 - Real Pod-bound TokenRequest credentials pass real TokenReview over HTTPS;
   wrong-audience tokens fail. The returned identity uses the API-assigned Node UID.
   The managed Pod becomes published through the informer, and mTLS snapshot serving
-  uses that certificate. A pooled connection observes live Node exclusion.
+  uses that certificate. Node exclusion changes routing without revoking that certificate.
 - A transport fault rejects only the leader's Lease renewal writes. The real elector
   loses leadership, manager exits, readiness withdraws, an authenticated pending poll
   terminates without snapshot data, and the old TCP listener closes. The follower
@@ -599,69 +583,52 @@ members, race-instrumented cold/unchanged reconciliation took 17.151336473 s /
 16.843947661 s; all 100,000 waiters received the shared pointer in 1.219179561 s.
 Race timings are correctness instrumentation results, not production performance.
 
-### Live HTTPS/API authorization cost
+### Local HTTPS authentication API budget (approved item 5)
 
 The envtest measurement uses the actual HTTPS handler with a real certificate,
-the elected manager's indexed informer cache, and an instrumented authoritative
-client; the connection is warmed first. Ten sequential snapshot requests each
-perform two authorization passes. Each pass reads installation, version, issuer,
-and common Secret state, then GETs the Node, candidate Pod, DaemonSet, and
-ServiceAccount. With one candidate this is **16 live GETs per response, zero live
-Node or Pod lists**, plus four trust reads on a new TLS handshake. Source:
-`internal/racer/server.go:376` (`serveSnapshot`),
-`internal/racer/certificates.go:120` (`loadSigning`) and `:264`
-(`AuthenticateCertificate`), and `internal/racer/authorization.go:98`
-(`authorizeNode`). The previous implementation's full lists have been removed.
+the elected manager's locally installed trust, and instrumented enrollment API
+dependencies. It asserts **zero API requests and zero API-body bytes** for the
+initial TLS handshake and ten warm snapshot requests at both 1 and 1,001 live
+Nodes. Controller watch/reconcile traffic is outside this request measurement.
+The added Nodes are excluded from membership. Unit HTTPS tests additionally cover
+the unchanged 204 response during an API outage, with an exact zero-call assertion.
 
-A September 26, 2026 Go 1.26.6 race-instrumented run with Kubernetes 1.37 envtest
-QPS=1000/burst=2000 measured:
+A September 27, 2026 Go 1.27.1 race-instrumented Kubernetes 1.37 envtest run
+(QPS=1000/burst=2000) measured:
 
-| Live Nodes | Snapshots | Elapsed | API GETs | Node/Pod lists | API response bytes |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 10 | 360.130223 ms | 160 | 0 / 0 | 300,320 |
-| 1,001 | 10 | 320.395616 ms | 160 | 0 / 0 | 300,320 |
+| Live Nodes | Warm snapshots | Elapsed | API requests | API response bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 10 | 19.585320 ms | 0 | 0 |
+| 1,001 | 10 | 21.218725 ms | 0 | 0 |
 
-That race envtest run passed in 15.929 s, including a 4.528091977 s forced-Lease-loss
-to authenticated recovery interval with unchanged sequence/membership 2/2. These
-elapsed values are host observations, not guarantees. The test waits for all 1,001
-Nodes to reach the actual informer, asserts the exact request count and zero live
-lists at both sizes, and allows only 1 KiB byte variation for unrelated version
-metadata. The added Nodes are excluded from membership. Watch/list traffic used
-to maintain discovery is outside the request measurement; response bytes count API
-bodies, not TLS framing. Frozen-cache unit tests exercise stale positives, deletion,
-recreation, exclusion, owner changes, missing/terminating ServiceAccounts, API
-failure, candidate overflow, and eventual recovery. Pooled TLS and post-wait
-revocation tests use frozen hints; trust retirement and leadership tests still run.
-HTTP discovery tests assert the exact 503 wire code and retry header, then recover
-to 200 on the same certificate and pooled TLS connection after hints converge,
-including replacement Pods after owner/DaemonSet revocation. A final-recheck hint
-miss denies snapshot delivery with the same retryable response.
+The suite passed in 14.608 s, including 4.108568959 s from forced Lease loss to
+authenticated recovery with unchanged sequence/membership 2/2. These are host
+observations, not production throughput guarantees.
 
-Each pass permits at most four live Pod candidates: the conservative maximum is
-4 credential GETs + 1 Node GET + 4*(Pod + DaemonSet + ServiceAccount) GETs, or 17
-per pass and 34 per response. Excess candidates fail before any Pod GET. Normal
-DaemonSet rollout overlap fits this bound; abnormal excess denies service until
-resolved. Index lookup avoids scanning unrelated cached Nodes/Pods; informer
-storage and index maintenance still scale with watched objects. The cache's index
-implementation can materialize all matching references before its result limit,
-so this is a live-read bound, not a claim of constant memory under arbitrary
-same-Node candidate inflation.
+This replaces the previous 16-live-GET warm response and four-GET handshake
+contract. Kubernetes checks remain at enrollment/renewal and in controllers that
+validate and install durable trust/publications. Snapshot requests have no API
+reader, workload discovery, membership authorization, or per-request fallback.
+Any authenticated same-cluster Node identity is accepted even if Kubernetes no
+longer contains that Node or its workload. Certificate expiration, exact identity,
+chain validation, and observed trust changes still apply on pooled connections.
 
-Credential reads deliberately remain live on both passes: installation UID/claim,
-Secret deletion/corruption, and rotation consistency cannot be replaced by stale
-positive trust. The fix removes cluster-size amplification, not the constant
-credential-read and parsing cost. At 100,000 clients polling every 30 seconds,
-the normal path still implies about 53,333 API GETs/s before reconnects or changes.
-This is arithmetic, not measured throughput, and 100,000-client HTTPS capacity
-remains unverified. Full credential bundles also vary with catalog/rotation size.
+Existing security test names and scenarios are retained under the approved
+contract: discovery misses, Pod owner changes, Node recreation and exclusion do
+not revoke certificates. Live issuance authorization tests retain their negative
+cases. Corrupt/deleted durable authority still withdraws serving state. A later API
+read failure cannot automatically accept the withdrawn state; successful controller
+validation is required to restore it. Read outages alone preserve accepted state
+while leadership remains valid. Trust retirement and leadership loss remain tested.
 
 Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:115`); the pinned
 controller-runtime v0.25.1 `pkg/client/config/config.go:96-105` sets default QPS=-1,
 disabling client-side throttling in favor of API priority/fairness. It does not
 inherit standalone client-go's zero-config 5-QPS/10-burst defaults. The envtest
 rate settings and small sequential sample do not demonstrate API-server capacity;
-authentication concurrency/deadlines remain the local bounds. No new throttling
-override or cross-request authorization/trust cache is introduced.
+authentication concurrency/deadlines remain the local bounds. Local public trust
+is installed by reconciliation; there is no new throttling override or freshness
+checkpoint subsystem.
 
 Full snapshot distribution also sends one copy over the network per recipient:
 the measured 21.5 MB publication would require about 2.15 TB per 100,000-recipient
