@@ -275,10 +275,12 @@ pub async fn accept(
     let scope = scope(parent)?;
     let io = &io.capped(65536);
     let incoming = io.receive_head(connection, &scope).await?;
+    scope.check()?;
     let (peer, a, zero) = verify(&signatures, incoming.value, None, "hello", false)?;
     if a == [0; 32] || zero != [0; 32] {
         return Err(Error::Unauthorized);
     }
+    scope.check()?;
     let b = random()?;
     connection = io
         .send_head(
@@ -290,10 +292,12 @@ pub async fn accept(
         .connection;
     connection.next_round()?;
     let incoming = io.receive_head(connection, &scope).await?;
+    scope.check()?;
     let (_, echoed, remote) = verify(&signatures, incoming.value, Some(&peer), "finish", false)?;
     if echoed != a || remote != b {
         return Err(Error::Unauthorized);
     }
+    scope.check()?;
     connection = io
         .send_head(
             incoming.connection,
@@ -356,6 +360,18 @@ pub(crate) mod tests {
     }
     pub(crate) fn signer(session: &Session) -> Rc<Signatures> {
         session.signatures.clone()
+    }
+    pub(crate) fn hello(signatures: &Signatures, peer: &NodeId) -> MessageHead {
+        head(signatures, peer, "hello", &[1; 32], &[0; 32], false).unwrap()
+    }
+    pub(crate) fn finish(
+        signatures: &Signatures,
+        peer: &NodeId,
+        challenge: MessageHead,
+    ) -> MessageHead {
+        let (_, a, b) = verify(signatures, challenge, Some(peer), "challenge", true).unwrap();
+        assert_eq!(a, [1; 32]);
+        head(signatures, peer, "finish", &a, &b, false).unwrap()
     }
     #[test]
     fn historical_proof_requires_fresh_head_and_session_cannot_be_reinstalled() {

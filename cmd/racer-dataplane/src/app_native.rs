@@ -159,6 +159,10 @@ mod tests {
         assert!(!config.enable_rdma);
         assert_eq!(config.max_threads, 8);
         assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            config.limits.request_context_bytes,
+            default_config(false).limits.request_context_bytes
+        );
         let mut plan = four_pair_plan(&config);
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
         assert_eq!(plan.pairs.len(), 4);
@@ -171,7 +175,11 @@ mod tests {
                 3 * (page + 16) + crate::store::format::MAX_HEADER_BYTES,
             ),
             (ResourceClass::DirtyCiphertext, page + 16),
-            (ResourceClass::RequestContext, 128 * 1024),
+            (
+                ResourceClass::RequestContext,
+                crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
+                    + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
+            ),
         ] {
             let reservation = admission.reserve(None, class, floor).unwrap();
             assert_eq!(admission.used(class), floor);
@@ -181,7 +189,7 @@ mod tests {
         assert_eq!(limits.plaintext_bytes.get(), 64 * 1024 * 1024);
         assert_eq!(limits.ciphertext_bytes.get(), 64 * 1024 * 1024);
         assert_eq!(limits.dirty_bytes.get(), 32 * 1024 * 1024);
-        assert_eq!(limits.request_context_bytes.get(), 4 * 1024 * 1024);
+        assert_eq!(limits.request_context_bytes.get(), 16 * 1024 * 1024);
         assert_eq!(admission.used(ResourceClass::Registered), 0);
         // Reducing thread cap or quotas keeps whole pairs and re-partitions the
         // node budget. An impossible byte floor must fail rather than deadlock.

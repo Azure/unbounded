@@ -126,12 +126,16 @@ and leader-only readiness contract described below.
 `racer-dataplane-config` exposes the Rust environment settings, including thread,
 byte-budget, and slab tuning. Defaults use HTTP (`RACER_ENABLE_RDMA=false`), eight
 threads maximum (four I/O/crypto pairs), 256 MiB plaintext, 256 MiB ciphertext,
-128 MiB dirty bytes, 16 MiB request contexts, and a 1 GiB hostPath slab per worker
+128 MiB dirty bytes, 64 MiB request contexts, and a 1 GiB hostPath slab per worker
 (up to 4 GiB at four workers), split into 64 MiB segments with two free segments
 reserved per slab. The 128 MiB registered budget is
 unused in HTTP mode. Runtime affinity and progress checks can reduce worker pairs.
 The deployed profile is parsed by a Rust test that exercises actual worker sizing
 and admission. See [configuration](../racer-dataplane/CONFIGURATION.md).
+Existing ConfigMap values are preserved on upgrade. Installations retaining the
+older 16 MiB request-context setting can update `RACER_REQUEST_CONTEXT_BYTES` to
+`67108864` in `racer-dataplane-config` to fund four workers' peer relay progress;
+the config payload change rolls the dataplane.
 
 The dataplane requests 1 CPU and 1 GiB memory. These are scheduling reservations,
 not throughput guarantees or a proven RSS ceiling. No default CPU or memory limit

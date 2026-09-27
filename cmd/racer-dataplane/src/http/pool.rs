@@ -93,6 +93,8 @@ struct ReturnToPool {
 /// reactor. Drop is a pool return only after explicit successful finish_exchange.
 pub struct ConnectionLease {
     pub(crate) session: Option<crate::security::connection::Session>,
+    // Ingress handshake admission follows socket I/O through cancellation fences.
+    pub(crate) control_reservation: Option<Reservation>,
     pub(crate) fd: Rc<OwnedFd>,
     reusable: bool,
     reservation: Option<Reservation>,
@@ -115,6 +117,7 @@ impl ConnectionLease {
         Self {
             fd,
             session: None,
+            control_reservation: None,
             reusable: false,
             reservation: Some(reservation),
             pool,
