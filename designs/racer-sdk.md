@@ -31,11 +31,10 @@ describe the original design baseline, not the current implementation:
   only comments (`src/client/request.rs:36-38`, `src/origin/page.rs:21-23`,
   `src/model/range.rs:42-45`); they enforce no wire behavior today.
 - `README.md:16-19,34-48,61-66` describes this scaffold and previously unspecified
-  wire details. The v1 contract fills in client/origin details only. The original
-  read-only `tmp/design.md:7-9` (outside this worktree) sketches client pools for
-  concurrent pages. The approved SDK design supersedes that sketch: concurrency
-  across Values is in the SDK, bounded page concurrency within a range is in Racer.
-  The original sketch is not a build input and need not be copied into the repo.
+  wire details. The v1 contract fills in client/origin details only. Phase 4 follows
+  the canonical `/home/azureuser/design.md:48-53`: the SDK schedules bounded
+  concurrent pages within each Value across pooled connections. This supersedes
+  the earlier SDK decision to provide concurrency only across Values.
 
 ## Minimal public surface
 
@@ -106,7 +105,7 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
   Metadata returned from a Value is a copy. Expiry is an admission hint, not a local
   deadline for a pinned stream. No synthetic TTL default or SDK metadata cache.
 
-No object `[]byte` result, SDK page cache/scheduler, public HTTP client injection,
+No object `[]byte` result, SDK page cache, public HTTP client injection,
 retry policy, adapter registry, separate metadata callback, or caller-owned server
 listener is needed. Internal transport/listener seams support tests.
 
@@ -119,12 +118,16 @@ For a fresh full-object Get:
    a page to obtain metadata. Empty bootstrap returns a valid immediately-EOF Value.
 2. Read page zero directly from its HTTP body into the caller's buffer. Pin its
    ETag and total size in Value. Expose no later version, even after expiry.
-3. After each page is consumed, if more bytes remain, lazily issue a pinned GET
+3. After bootstrap is consumed, if more bytes remain, issue a bounded window of pinned GETs
    for `Range: bytes=<offset>-<min(offset+16777216,size)-1>` with the bootstrap
    If-Match and identical context. Each continuation covers at most one 16 MiB
    page; the final range ends exactly at size-1. Validate 206, ETag, unchanged
    total size, and exact boundaries before reading each body. Retain the initial
-   Metadata snapshot if expiry is refreshed. Racer schedules underlying fetches.
+   Metadata snapshot if expiry is refreshed. `ClientConfig.PageWindow` defaults
+   to four and is capped by MaxConnections. Open requests in stream order with
+   connection permits reserved before spawning workers; speculative work never
+   waits for pool capacity. Consume responses in order and replenish at page
+   boundaries. No object-sized page descriptor collection or page buffer exists.
 4. End with EOF only after the full expected count. Do not open a continuation
    for a one-page object. Closing before page zero ends never fetches the remainder.
 
@@ -137,14 +140,14 @@ the dataplane deadline. Get's context can separately bound the full stream.
 Errors received before any continuation's body starts retain their HTTP error
 classification, even after earlier pages succeeded. Truncated bodies remain I/O
 errors with partial counts. Both are terminal for the Value.
-The client holds at most one response body per Value, and no SDK-owned page buffer.
+The client holds at most PageWindow response bodies per Value, and no SDK-owned page buffer.
 `Read` reads directly into `p`; small stdlib framing buffers still exist.
 Use standard `io.Copy` or `io.CopyBuffer` for copying; all reads retain the SDK's
 boundary checks. Do not allocate arrays of page descriptors proportional to object size.
 
 Client is safe for concurrent Get and Close. Value has one consuming goroutine
 (Read, directly or through io.Copy); Close may run concurrently and
-must cancel a blocked read or continuation acquisition. Metadata access is safe
+must cancel every blocked read or continuation acquisition and join its workers. Metadata access is safe
 concurrently. Get's ctx governs the entire Value, not only response headers.
 Each Value has a derived cancel function registered atomically with the client;
 Client.Close rejects new work, cancels pending Get calls and all active Values,

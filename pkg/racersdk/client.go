@@ -6,6 +6,7 @@ package racersdk
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -19,6 +20,9 @@ type ClientConfig struct {
 	Cache CacheName
 	// MaxConnections bounds both connections and live Values (default 16).
 	MaxConnections int
+	// PageWindow bounds concurrent page responses per Value (default 4), capped
+	// by MaxConnections. Bodies stream in order without SDK-owned page buffers.
+	PageWindow int
 	// DialTimeout bounds each Unix dial (default 5 seconds).
 	DialTimeout time.Duration
 	// ResponseHeaderTimeout starts after request headers are written (default 10 seconds).
@@ -34,6 +38,8 @@ type Client struct {
 	closed    bool
 	active    map[*Value]struct{}
 	slots     chan struct{}
+	pages     chan struct{}
+	window    int
 	transport *http.Transport
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -51,13 +57,19 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		return nil, err
 	}
 
-	if config.MaxConnections < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 {
+	if config.MaxConnections < 0 || config.PageWindow < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 {
 		return nil, failure(ErrorInvalidArgument, "client config", nil)
 	}
 
 	if config.MaxConnections == 0 {
 		config.MaxConnections = 16
 	}
+
+	if config.PageWindow == 0 {
+		config.PageWindow = 4
+	}
+
+	config.PageWindow = min(config.PageWindow, config.MaxConnections)
 
 	if config.DialTimeout == 0 {
 		config.DialTimeout = 5 * time.Second
@@ -74,6 +86,8 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	dialer := &net.Dialer{Timeout: config.DialTimeout}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), ctx: ctx, cancel: cancel, dial: dialer.DialContext}
+	c.pages = make(chan struct{}, config.MaxConnections)
+	c.window = config.PageWindow
 	t := &http.Transport{
 		Proxy: nil, DisableCompression: true,
 		MaxConnsPerHost: config.MaxConnections, MaxIdleConns: config.MaxConnections, MaxIdleConnsPerHost: config.MaxConnections,
@@ -111,7 +125,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 
 // Get admits a fresh object using a bootstrap GET and returns as soon as validated
 // headers arrive, without buffering page zero. ctx governs the returned Value's
-// entire lifetime, including capacity waits and its lazy pinned continuations.
+// entire lifetime, including capacity waits and its bounded pinned continuations.
 // The caller owns the Value and should defer Close.
 func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
 	if ctx == nil {
@@ -209,8 +223,43 @@ func (c *Client) Close() error {
 }
 
 func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, error) {
-	if err := validateRequest(r); err != nil {
+	select {
+	case v.client.pages <- struct{}{}:
+	case <-v.ctx.Done():
+		return Metadata{}, 0, ioFailure("get", v.ctx.Err())
+	}
+
+	meta, length, body, err := v.fetch(r, snapshot)
+	if err != nil {
 		return Metadata{}, 0, err
+	}
+
+	v.mu.Lock()
+	if v.terminal != nil {
+		err = v.terminal
+		v.mu.Unlock()
+		closeBody(body)
+
+		return Metadata{}, 0, err
+	}
+
+	v.body = body
+	v.mu.Unlock()
+
+	return meta, length, nil
+}
+
+// fetch consumes an already acquired connection permit. Successful bodies retain
+// it until Close, including after Transport has observed the final body byte.
+func (v *Value) fetch(r OriginRequest, snapshot *Metadata) (_ Metadata, _ int64, body io.ReadCloser, err error) {
+	defer func() {
+		if body == nil {
+			<-v.client.pages
+		}
+	}()
+
+	if err := validateRequest(r); err != nil {
+		return Metadata{}, 0, nil, err
 	}
 
 	state := &responseState{request: r, snapshot: snapshot}
@@ -228,7 +277,7 @@ func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, erro
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://racer"+objectPrefix+r.key.String(), nil)
 	if err != nil {
-		return Metadata{}, 0, ioFailure("request", err)
+		return Metadata{}, 0, nil, ioFailure("request", err)
 	}
 
 	req.Header = requestHeaders(r)
@@ -241,19 +290,19 @@ func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, erro
 		state.mu.Unlock()
 
 		if wireErr != nil {
-			return Metadata{}, 0, wireErr
+			return Metadata{}, 0, nil, wireErr
 		}
 
 		if v.ctx.Err() != nil {
-			return Metadata{}, 0, ioFailure("get", v.ctx.Err())
+			return Metadata{}, 0, nil, ioFailure("get", v.ctx.Err())
 		}
 
 		var typed *Error
 		if errors.As(err, &typed) {
-			return Metadata{}, 0, typed
+			return Metadata{}, 0, nil, typed
 		}
 
-		return Metadata{}, 0, ioFailure("get", err)
+		return Metadata{}, 0, nil, ioFailure("get", err)
 	}
 
 	state.mu.Lock()
@@ -262,20 +311,25 @@ func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, erro
 
 	if wireErr != nil {
 		closeBody(res.Body)
-		return Metadata{}, 0, wireErr
+		return Metadata{}, 0, nil, wireErr
 	}
 
-	v.mu.Lock()
-	if v.terminal != nil {
-		err = v.terminal
-		v.mu.Unlock()
-		closeBody(res.Body)
+	return result.metadata, result.length, &pageBody{ReadCloser: res.Body, permits: v.client.pages}, nil
+}
 
-		return Metadata{}, 0, err
-	}
+type pageBody struct {
+	io.ReadCloser
+	once    sync.Once
+	permits chan struct{}
+}
 
-	v.body = res.Body
-	v.mu.Unlock()
+func (b *pageBody) Close() error {
+	var err error
 
-	return result.metadata, result.length, nil
+	b.once.Do(func() {
+		err = b.ReadCloser.Close()
+		<-b.permits
+	})
+
+	return err
 }

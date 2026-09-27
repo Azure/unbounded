@@ -18,7 +18,10 @@ import (
 func TestFakeClientPages(t *testing.T) {
 	for _, size := range []ByteLength{0, 1, PageSize, PageSize + 13, 3*PageSize + 13} {
 		t.Run(strconv.FormatUint(uint64(size), 10), func(t *testing.T) {
-			var calls atomic.Int32
+			var (
+				calls atomic.Int32
+				seen  sync.Map
+			)
 
 			request := Request{Key: Key{1, 2, 3}, Context: FetchContext{
 				metadata:      AdapterMetadata{value: "opaque, interior  spaces\\\xff"},
@@ -61,8 +64,8 @@ func TestFakeClientPages(t *testing.T) {
 					return m, nil, err
 				}
 
-				if first != ByteOffset(call-1)*ByteOffset(PageSize) {
-					t.Error("page scheduling is not sequential")
+				if _, duplicate := seen.LoadOrStore(first, true); duplicate || uint64(first)%uint64(PageSize) != 0 {
+					t.Error("duplicate or unaligned page scheduling")
 				}
 
 				return m, io.NopCloser(io.LimitReader(&offsetStream{offset: int64(first)}, int64(last-first)+1)), nil
@@ -178,10 +181,17 @@ func TestFakeClientErrors(t *testing.T) {
 func TestFakeClientContinuationErrors(t *testing.T) {
 	for _, failPage := range []int32{1, 2} {
 		t.Run(strconv.Itoa(int(failPage)), func(t *testing.T) {
-			var calls atomic.Int32
-
 			client, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-				if calls.Add(1)-1 == failPage {
+				// Concurrent continuations may arrive out of order. Fail the
+				// selected page, not whichever request the server schedules first.
+				requested, _ := r.Range()
+
+				first, _, err := requested.Resolve(3 * PageSize)
+				if err != nil {
+					return Metadata{}, nil, err
+				}
+
+				if uint64(first)/uint64(PageSize) == uint64(failPage) {
 					return Metadata{}, nil, NewOriginError(ErrorNotFound, nil)
 				}
 

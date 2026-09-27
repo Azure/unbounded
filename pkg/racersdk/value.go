@@ -28,6 +28,16 @@ type Value struct {
 	request   OriginRequest
 	remaining int64
 	offset    int64
+	pending   []*pendingPage
+	workers   sync.WaitGroup
+	next      int64
+}
+
+type pendingPage struct {
+	done   chan struct{}
+	body   io.ReadCloser
+	length int64
+	err    error
 }
 
 // Metadata returns the initial total-size/tag/expiry snapshot, never a remaining
@@ -68,6 +78,8 @@ func (v *Value) finish(err error) {
 
 	v.terminal = err
 	body, slot, stop := v.body, v.slot, v.stop
+	pending := v.pending
+	v.pending = nil
 	v.body, v.slot, v.stop = nil, false, nil
 	v.request = OriginRequest{}
 	v.mu.Unlock()
@@ -81,6 +93,11 @@ func (v *Value) finish(err error) {
 	}
 
 	closeBody(body)
+	v.workers.Wait()
+
+	for _, page := range pending {
+		closeBody(page.body)
+	}
 
 	if v.client != nil {
 		if slot {
@@ -94,7 +111,7 @@ func (v *Value) finish(err error) {
 }
 
 // Read copies directly from the current HTTP body into p. Once bootstrap is
-// consumed, it lazily opens pinned ranges of at most one page each.
+// consumed, it opens a bounded window of pinned pages across pooled connections.
 // A terminal error preserves partial byte counts and never restarts the version.
 func (v *Value) Read(p []byte) (int, error) {
 	if err := v.err(); err != nil {
@@ -126,20 +143,10 @@ func (v *Value) Read(p []byte) (int, error) {
 			return 0, v.err()
 		}
 
-		v.mu.Lock()
-		r := v.request
-		v.mu.Unlock()
-		r.operation, r.pin = OperationPinned, v.metadata.ETag
-		length := min(int64(PageSize), int64(v.metadata.Size)-v.offset)
-		r.byteRange = Range{present: true, first: uint64(v.offset), last: uint64(v.offset + length - 1)}
-
-		_, length, err := v.open(r, &v.metadata)
-		if err != nil {
+		if err := v.advance(); err != nil {
 			v.finish(err)
 			return 0, v.err()
 		}
-
-		v.remaining = length
 	}
 
 	v.mu.Lock()
@@ -178,6 +185,112 @@ func (v *Value) Read(p []byte) (int, error) {
 	}
 
 	return n, nil
+}
+
+// Submit in stream order, reserving actual pool capacity before starting a
+// worker. Speculative pages never wait for capacity and therefore cannot take
+// every connection while the next required page is queued behind them.
+func (v *Value) advance() error {
+	v.mu.Lock()
+	if v.next == 0 {
+		v.next = v.offset
+	}
+	v.mu.Unlock()
+
+	for {
+		v.mu.Lock()
+		if v.terminal != nil {
+			err := v.terminal
+			v.mu.Unlock()
+
+			return err
+		}
+
+		count := len(v.pending)
+		if count >= v.client.window || v.next == int64(v.metadata.Size) {
+			v.mu.Unlock()
+			break
+		}
+		v.mu.Unlock()
+
+		if count == 0 {
+			select {
+			case v.client.pages <- struct{}{}:
+			case <-v.ctx.Done():
+				return ioFailure("continuation", v.ctx.Err())
+			}
+		} else {
+			select {
+			case v.client.pages <- struct{}{}:
+			default:
+				return v.takePage()
+			}
+		}
+
+		v.mu.Lock()
+		if v.terminal != nil {
+			err := v.terminal
+			v.mu.Unlock()
+			<-v.client.pages
+
+			return err
+		}
+
+		r := v.request
+		r.operation, r.pin = OperationPinned, v.metadata.ETag
+		length := min(int64(PageSize), int64(v.metadata.Size)-v.next)
+		r.byteRange = Range{present: true, first: uint64(v.next), last: uint64(v.next + length - 1)}
+		v.next += length
+		page := &pendingPage{done: make(chan struct{})}
+		v.pending = append(v.pending, page)
+		v.workers.Add(1)
+		v.mu.Unlock()
+
+		go func() {
+			defer v.workers.Done()
+
+			_, page.length, page.body, page.err = v.fetch(r, &v.metadata)
+			close(page.done)
+		}()
+	}
+
+	return v.takePage()
+}
+
+func (v *Value) takePage() error {
+	v.mu.Lock()
+	if v.terminal != nil {
+		err := v.terminal
+		v.mu.Unlock()
+
+		return err
+	}
+
+	page := v.pending[0]
+	v.mu.Unlock()
+
+	select {
+	case <-page.done:
+	case <-v.ctx.Done():
+		return ioFailure("continuation", v.ctx.Err())
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.terminal != nil {
+		return v.terminal
+	}
+
+	if page.err != nil {
+		return page.err
+	}
+
+	v.pending[0] = nil
+	v.pending = v.pending[1:]
+	v.body, v.remaining = page.body, page.length
+
+	return nil
 }
 
 // Close cancels in-flight reads/continuation and closes without draining. It is

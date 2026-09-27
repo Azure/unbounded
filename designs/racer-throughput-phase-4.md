@@ -137,3 +137,36 @@ and unresolved goals here. Hardware ignores are not passes; report RDMA, NUMA,
 NIC and unsupported accelerator gaps honestly. Finish with a clean worktree.
 
 Implementation results will be recorded below as each tested increment lands.
+
+### Incremental results
+
+- `8c02fa8e`: plan committed before code.
+- `02b022f8`: sealed immutable SendBuffer, HTTP immutable subranges, peer HTTP and
+  native fallback send original ciphertext directly. Mutable receives retain
+  IoBuffer ownership. Simulation never creates mutable aliases for sends. New
+  tests check backing-pointer identity, short sends, retained charges and both
+  cancellation-completion orders; a compile-fail test rejects ciphertext receives.
+- SDK window increment: ClientConfig.PageWindow defaults to four, capped by the
+  pool. Connection permits precede worker creation, speculative pages never wait
+  for permits, and pending response storage is bounded by the window. Read consumes
+  in order; Close cancels and joins every worker. Bootstrap remains header-only
+  until consumption and continuations start after page zero. Updated SDK prose
+  and fake-origin assertions for concurrent page arrival with exact ordered bytes.
+
+Commands executed from the crate for Rust and worktree root for Go; all tests
+used the mandatory external `timeout --signal=TERM --kill-after=10s 300s` prefix:
+
+| Command after timeout prefix | Result |
+| --- | --- |
+| `cargo fmt` | Passed. |
+| `cargo test --locked --all-features --lib peer:: -j 2 -- --test-threads=2 --quiet` | 31 passed, one explicit ignore. |
+| `cargo test --locked --all-features --lib immutable_ciphertext_send -j 2 -- --test-threads=2 --quiet` | One passed. |
+| `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet` | 740 passed, seven explicit ignores, 56.39 s. |
+| `cargo test --locked --all-features --doc -j 2 -- --test-threads=2` | Six ordinary and 26 compile-fail tests passed. |
+| `env GOTOOLCHAIN=go1.26.6 make fmt GO_PACKAGE_DIRS=./pkg/racersdk GO_PACKAGE_PATTERNS=./pkg/racersdk/...` | Passed, zero lint issues. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m ./pkg/racersdk -run 'TestValueWindow\|TestClient' -count=1` | Passed, 5.214 s after creating missing worktree-local tmp fixture directory. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk -count=1` | Passed, 19.710 s after correcting the two arrival-order assumptions described above. |
+
+No external timeout fired in these increments. These results do not yet establish
+the full Phase 4 exit gates; FD-aware splice, acquisition/bootstrap, recycling,
+CRC64 and rotating request MAC remain to be delivered.
