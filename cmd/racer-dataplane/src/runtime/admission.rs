@@ -9,10 +9,10 @@ use crate::{
     },
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -22,11 +22,13 @@ fn index(class: ResourceClass) -> usize {
 }
 struct Counters {
     used: [AtomicUsize; CLASSES],
+    wake: futures::task::AtomicWaker,
 }
 impl Counters {
     fn new() -> Self {
         Self {
             used: std::array::from_fn(|_| AtomicUsize::new(0)),
+            wake: futures::task::AtomicWaker::new(),
         }
     }
 }
@@ -35,7 +37,7 @@ pub struct Admission {
     limits: Limits,
     totals: Arc<Counters>,
     caches: RefCell<HashMap<CacheId, Arc<Counters>>>,
-    stopped: Cell<bool>,
+    stopped: Arc<AtomicBool>,
 }
 
 /// Ownership of a charge, released only when its last containing allocation dies.
@@ -98,6 +100,12 @@ impl Drop for Reservation {
         if let Some(local) = &self.local {
             local.used[index(self.class)].fetch_sub(self.amount, Ordering::AcqRel);
         }
+        if matches!(
+            self.class,
+            ResourceClass::Connection | ResourceClass::IngressConnection
+        ) {
+            self.totals.wake.wake();
+        }
     }
 }
 pub struct FillReservation {
@@ -110,7 +118,53 @@ pub struct ConnectionReservation {
     _total: Reservation,
     _role: Reservation,
 }
+/// Only socket admission crosses workers; cache admission remains I/O-local.
+#[derive(Clone)]
+pub(crate) struct ConnectionAdmission {
+    totals: Arc<Counters>,
+    stopped: Arc<AtomicBool>,
+    total: usize,
+    ingress: usize,
+}
+impl ConnectionAdmission {
+    pub(crate) fn register(&self, waker: &std::task::Waker) {
+        self.totals.wake.register(waker);
+    }
+    pub(crate) fn reserve(&self) -> Result<ConnectionReservation> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(Error::Unavailable);
+        }
+        let charge = |class, limit| {
+            self.totals.used[index(class)]
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(1).filter(|next| *next <= limit)
+                })
+                .map_err(|_| Error::Overloaded)?;
+            Ok(Reservation {
+                class,
+                amount: 1,
+                cache: None,
+                totals: self.totals.clone(),
+                local: None,
+            })
+        };
+        let role = charge(ResourceClass::IngressConnection, self.ingress)?;
+        let total = charge(ResourceClass::Connection, self.total)?;
+        Ok(ConnectionReservation {
+            _total: total,
+            _role: role,
+        })
+    }
+}
 impl Admission {
+    pub(crate) fn connection_admission(&self) -> ConnectionAdmission {
+        ConnectionAdmission {
+            totals: self.totals.clone(),
+            stopped: self.stopped.clone(),
+            total: self.limit(ResourceClass::Connection),
+            ingress: self.limit(ResourceClass::IngressConnection),
+        }
+    }
     /// Partition the existing socket ceiling. Ingress cannot consume outbound or
     /// control progress slots; outbound traffic cannot consume control slots.
     pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
@@ -134,17 +188,18 @@ impl Admission {
             limits,
             totals: Arc::new(Counters::new()),
             caches: RefCell::new(HashMap::default()),
-            stopped: Cell::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
     pub fn stop(&self) {
-        self.stopped.set(true);
+        self.stopped.store(true, Ordering::Release);
+        self.totals.wake.wake();
     }
     pub fn is_stopped(&self) -> bool {
-        self.stopped.get()
+        self.stopped.load(Ordering::Acquire)
     }
     pub fn used(&self, class: ResourceClass) -> usize {
         self.totals.used[index(class)].load(Ordering::Acquire)
@@ -242,7 +297,7 @@ impl Admission {
         amount: usize,
         completing: bool,
     ) -> Result<Reservation> {
-        if self.stopped.get() && !completing && !matches!(class, ResourceClass::ControlProgress) {
+        if self.is_stopped() && !completing && !matches!(class, ResourceClass::ControlProgress) {
             return Err(Error::Unavailable);
         }
         if amount == 0 {

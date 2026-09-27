@@ -29,12 +29,15 @@ use std::{
     },
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
 #[path = "ownership.rs"]
 mod ownership;
+#[path = "readiness.rs"]
+mod readiness;
 #[path = "transition.rs"]
 mod transition;
 pub use transition::PreparedListeners;
@@ -105,7 +108,7 @@ struct BoundListener {
     directory: Directory,
     device: u64,
     inode: u64,
-    retired: Rc<Cell<bool>>,
+    retired: Arc<crate::runtime::ingress::Retired>,
     basename: RefCell<String>,
     witness: Option<String>,
     owner: Option<Rc<ownership::EndpointOwner>>,
@@ -148,13 +151,17 @@ impl Drop for BoundListener {
 
 struct Active {
     cache: CacheId,
-    retired: Rc<Cell<bool>>,
+    retired: Arc<crate::runtime::ingress::Retired>,
     idle: Rc<Cell<bool>>,
     cancellation: Cancellation,
     operation: Operation<'static, ()>,
 }
 
 pub struct ClientListeners {
+    generation: Rc<Cell<u64>>,
+    readiness: RefCell<readiness::ReadyListeners>,
+    sim_cursor: RefCell<Option<CacheId>>,
+    ingress: Option<Arc<crate::runtime::ingress::Ingress>>,
     metrics: crate::telemetry::metrics::Metrics,
     reads: Rc<dyn ReadService>,
     parser: RequestParser,
@@ -180,6 +187,10 @@ impl ClientListeners {
         admission: Rc<Admission>,
     ) -> Self {
         Self {
+            generation: Rc::new(Cell::new(0)),
+            readiness: RefCell::new(readiness::ReadyListeners::default()),
+            sim_cursor: RefCell::new(None),
+            ingress: None,
             metrics: crate::telemetry::metrics::Metrics::default(),
             reads,
             parser,
@@ -206,6 +217,58 @@ impl ClientListeners {
     pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
         self.metrics = metrics;
         self
+    }
+    pub(crate) fn with_ingress(mut self, ingress: Arc<crate::runtime::ingress::Ingress>) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+    pub(crate) fn install_connection(
+        &self,
+        connection: ConnectionLease,
+        cache: CacheId,
+        retired: Arc<crate::runtime::ingress::Retired>,
+    ) -> Result<()> {
+        if retired.get() || !self.accepting.get() {
+            return Ok(());
+        }
+        let cancellation = Cancellation::new()?;
+        let task_cancellation = cancellation.clone();
+        let task_retired = retired.clone();
+        let idle = Rc::new(Cell::new(true));
+        let task_idle = idle.clone();
+        let timeout = self.request_timeout;
+        let parser = self.parser.clone();
+        let reads = self.reads.clone();
+        let responses = self.responses.clone();
+        let io = self.io.clone();
+        let admission = self.admission.clone();
+        let task_cache = cache.clone();
+        let metrics = self.metrics.clone();
+        let operation = Box::pin(async move {
+            serve_connection(
+                connection,
+                &task_cache,
+                &parser,
+                &*reads,
+                &responses,
+                &io,
+                &admission,
+                task_cancellation,
+                task_retired,
+                task_idle,
+                timeout,
+                &metrics,
+            )
+            .await
+        });
+        self.active.borrow_mut().push_back(Active {
+            cache,
+            retired,
+            idle,
+            cancellation,
+            operation,
+        });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -282,8 +345,7 @@ impl ClientListeners {
         if !self.accepting.get() {
             return Ok(worked + cleaned);
         }
-        let listeners = self.listeners.borrow();
-        let count = listeners.len();
+        let count = self.listeners.borrow().len();
         if count == 0 {
             return Ok(worked + cleaned);
         }
@@ -292,18 +354,70 @@ impl ClientListeners {
             .limit(crate::model::limits::ResourceClass::IngressConnection);
         // Reserve some acceptance opportunity even when all active readers wait.
         let attempts = budget.saturating_sub(worked).min(count);
-        for step in 0..attempts {
+        for _ in 0..attempts {
             if self
                 .admission
                 .used(crate::model::limits::ResourceClass::IngressConnection)
                 >= maximum
+                && self.ingress.is_none()
             {
                 break;
             }
-            let index = (self.accept_cursor.get() + step) % count;
-            let (_, listener) = listeners.iter().nth(index).ok_or(Error::Internal)?;
+            #[cfg(not(test))]
+            let simulated = false;
+            #[cfg(test)]
+            let simulated = crate::runtime::reactor::simulation::Simulation::current().is_some();
+            let listener = if simulated {
+                let listeners = self.listeners.borrow();
+                let key = self.sim_cursor.borrow().clone();
+                let selected = key
+                    .as_ref()
+                    .and_then(|key| {
+                        listeners
+                            .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                            .next()
+                    })
+                    .or_else(|| listeners.first_key_value());
+                let Some((key, listener)) = selected else {
+                    break;
+                };
+                *self.sim_cursor.borrow_mut() = Some(key.clone());
+                listener.clone()
+            } else {
+                let Some(listener) =
+                    self.readiness
+                        .borrow_mut()
+                        .next(self, cx, budget.saturating_sub(worked))?
+                else {
+                    break;
+                };
+                listener
+            };
+            let offer = if let Some(ingress) = &self.ingress {
+                match ingress.reserve(cx.waker()) {
+                    Ok(offer) => Some(offer),
+                    Err(Error::Overloaded) => break,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             match listener.listener.accept() {
                 Ok((socket, _)) => {
+                    if let Some(offer) = offer {
+                        let socket = socket
+                            .into_host()
+                            .map_err(|_| Error::InvalidConfiguration)?;
+                        offer.deliver(
+                            socket,
+                            crate::runtime::ingress::Kind::Client(
+                                listener.definition.id.clone(),
+                                listener.retired.clone(),
+                            ),
+                        )?;
+                        worked += 1;
+                        continue;
+                    }
                     let connection = match ConnectionLease::from_accepted(socket, &self.admission) {
                         Ok(connection) => connection,
                         Err(Error::Overloaded) => break,
@@ -379,6 +493,7 @@ impl ClientListeners {
     /// finish normally unless cancel_cache is also called.
     pub fn stop_cache(&self, cache: &CacheId) {
         if let Some(listener) = self.listeners.borrow_mut().remove(cache) {
+            self.generation.set(self.generation.get().wrapping_add(1));
             listener.retired.set(true);
             self.cleanup.borrow_mut().push_back(listener);
         }
@@ -435,6 +550,7 @@ impl ClientListeners {
 
     pub fn stop_admission(&self) {
         self.accepting.set(false);
+        *self.readiness.borrow_mut() = readiness::ReadyListeners::default();
         for (_, listener) in std::mem::take(&mut *self.listeners.borrow_mut()) {
             listener.retired.set(true);
             self.cleanup.borrow_mut().push_back(listener);
@@ -477,7 +593,7 @@ async fn serve_connection(
     io: &HttpIo,
     admission: &Admission,
     cancellation: Cancellation,
-    retired: Rc<Cell<bool>>,
+    retired: Arc<crate::runtime::ingress::Retired>,
     idle: Rc<Cell<bool>>,
     timeout: Duration,
     metrics: &crate::telemetry::metrics::Metrics,
@@ -653,7 +769,7 @@ fn bind(
             },
             device: 1,
             inode,
-            retired: Rc::new(Cell::new(false)),
+            retired: Arc::new(crate::runtime::ingress::Retired::default()),
             basename: RefCell::new(basename.into()),
             witness: None,
             owner: None,
@@ -683,7 +799,7 @@ fn bind(
         directory: Directory::Real(directory),
         device: metadata.dev(),
         inode: metadata.ino(),
-        retired: Rc::new(Cell::new(false)),
+        retired: Arc::new(crate::runtime::ingress::Retired::default()),
         basename: RefCell::new(basename.into()),
         witness: Some(witness),
         owner: Some(owner),
@@ -1384,7 +1500,7 @@ mod tests {
             let order = order.clone();
             fixture.listeners.active.borrow_mut().push_back(Active {
                 cache: definition().id,
-                retired: Rc::new(Cell::new(false)),
+                retired: Arc::new(crate::runtime::ingress::Retired::default()),
                 idle: Rc::new(Cell::new(false)),
                 cancellation: Cancellation::new().unwrap(),
                 operation: Box::pin(std::future::poll_fn(move |cx| {
@@ -1419,7 +1535,7 @@ mod tests {
         let mut yielded = false;
         fixture.listeners.active.borrow_mut().push_back(Active {
             cache: definition().id,
-            retired: Rc::new(Cell::new(false)),
+            retired: Arc::new(crate::runtime::ingress::Retired::default()),
             idle: Rc::new(Cell::new(false)),
             cancellation: Cancellation::new().unwrap(),
             operation: Box::pin(std::future::poll_fn(move |cx| {

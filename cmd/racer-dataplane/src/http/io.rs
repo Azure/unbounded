@@ -111,6 +111,9 @@ pub struct HeadCompletion<T> {
     pub value: T,
 }
 impl HttpIo {
+    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+        &self.reactor
+    }
     pub fn new(reactor: Rc<Reactor>, codec: super::codec::Codec) -> Self {
         Self {
             reactor,

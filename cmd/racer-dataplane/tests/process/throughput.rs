@@ -471,67 +471,86 @@ fn production_churn_diagnostic() {
 }
 
 #[test]
-#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity; expected ingress limitation"]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity"]
 fn production_ingress_baseline() {
-    let scratch = Scratch::new();
-    let profile = Profile::new(4, 113, 1);
-    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
-    let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
-    let path = socket_path(&process, 0);
-    let before = observe(process.child.id());
-    let mut held = Vec::new();
-    // Partial heads retain accepted leases without issuing data requests.
-    for _ in 0..22 {
-        let mut socket = connect(&path).unwrap();
-        socket.write_all(b"GET /v1/objects/").unwrap();
-        held.push(socket);
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while observe(process.child.id()).socket_fds < before.socket_fds + 22 {
-        assert!(
-            Instant::now() < deadline,
-            "accepted connections never saturated"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    let mut excess = connect(&path).unwrap();
-    excess
-        .set_read_timeout(Some(Duration::from_millis(200)))
+    for pairs in [1, 2, 4] {
+        let scratch = Scratch::new();
+        let profile = Profile::new(pairs, 113, 1);
+        let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+        let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+        let path = socket_path(&process, 0);
+        let before = observe(process.child.id());
+        let mut held = Vec::new();
+        // Partial heads retain accepted leases without issuing data requests.
+        let ingress = 128 - 32 - 2 * pairs;
+        for index in 0..ingress {
+            let mut socket = connect(&path).unwrap();
+            socket.write_all(b"GET /v1/objects/").unwrap();
+            held.push(socket);
+            if index == 21 {
+                assert_eq!(
+                    request(
+                        &path,
+                        0,
+                        &Expected {
+                            start: 0,
+                            end: 113,
+                            length: 113
+                        },
+                        false
+                    ),
+                    Ok(113),
+                    "traffic must progress beyond the old worker-zero ceiling"
+                );
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observe(process.child.id()).socket_fds < before.socket_fds + ingress {
+            assert!(
+                Instant::now() < deadline,
+                "accepted connections never saturated"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut excess = connect(&path).unwrap();
+        excess
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        write!(
+            excess,
+            "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nRange: bytes=0-112\r\n\r\n",
+            0
+        )
         .unwrap();
-    write!(
-        excess,
-        "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nRange: bytes=0-112\r\n\r\n",
-        0
-    )
-    .unwrap();
-    let mut byte = [0];
-    let outcome = excess.read(&mut byte);
-    assert!(
-        matches!(&outcome, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
-        "expected ingress stall: {outcome:?}"
-    );
-    assert_eq!(process.diagnostic("/readyz").unwrap().status, 200);
-    println!(
-        "BASELINE {}",
-        json!({"diagnostic": "worker-zero-ingress", "pairs": 4, "held": held.len(), "aggregate_connection_budget": 128, "result": format!("{outcome:?}"), "accepted_socket_delta": observe(process.child.id()).socket_fds - before.socket_fds})
-    );
-    drop(excess);
-    drop(held);
-    thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        request(
-            &path,
-            0,
-            &Expected {
-                start: 0,
-                end: 113,
-                length: 113
-            },
-            false
-        ),
-        Ok(113)
-    );
-    assert!(process.stop(libc::SIGTERM).success());
+        let mut byte = [0];
+        let outcome = excess.read(&mut byte);
+        assert!(
+            matches!(&outcome, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "expected ingress stall: {outcome:?}"
+        );
+        assert_eq!(process.diagnostic("/readyz").unwrap().status, 200);
+        println!(
+            "BASELINE {}",
+            json!({"diagnostic": "distributed-ingress", "pairs": pairs, "held": held.len(), "aggregate_connection_budget": 128, "result": format!("{outcome:?}"), "accepted_socket_delta": observe(process.child.id()).socket_fds - before.socket_fds})
+        );
+        drop(excess);
+        drop(held);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            request(
+                &path,
+                0,
+                &Expected {
+                    start: 0,
+                    end: 113,
+                    length: 113
+                },
+                false
+            ),
+            Ok(113)
+        );
+        assert!(process.stop(libc::SIGTERM).success());
+    }
 }
 
 #[test]

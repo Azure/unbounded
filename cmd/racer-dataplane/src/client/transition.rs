@@ -11,6 +11,7 @@ struct Replacement {
 /// Owns prepared paths and sockets. Keep this on the listener's worker. Drop
 /// rolls back; commit performs no filesystem or network operations.
 pub struct PreparedListeners {
+    generation: Rc<Cell<u64>>,
     definitions: Vec<CacheDefinition>,
     target: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
     next: BTreeMap<CacheId, Rc<BoundListener>>,
@@ -30,6 +31,7 @@ impl PreparedListeners {
     /// The application serializes prepare/commit with cache stop/drain operations.
     /// Worker polling performs deferred pathname cleanup after this returns.
     pub fn commit(mut self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
         let mut target = self.target.borrow_mut();
         let mut cleanup = self.cleanup.borrow_mut();
         if self.accepting.get() {
@@ -122,6 +124,7 @@ pub(super) fn prepare<'a>(
             return Err(Error::Overloaded);
         }
         let mut prepared = PreparedListeners {
+            generation: owner.generation.clone(),
             definitions: definitions.to_vec(),
             target: owner.listeners.clone(),
             next: BTreeMap::new(),

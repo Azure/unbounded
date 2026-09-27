@@ -35,6 +35,7 @@ pub trait LocalPageService {
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
+    ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
     io: Rc<crate::http::io::HttpIo>,
     forwarding: Rc<Forwarding>,
     admission: Rc<Admission>,
@@ -48,6 +49,13 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    pub(crate) fn with_ingress(
+        mut self,
+        ingress: std::sync::Arc<crate::runtime::ingress::Ingress>,
+    ) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
     #[cfg(test)]
     pub(crate) fn transport_io(&self) -> &Rc<crate::http::io::HttpIo> {
         assert!(Rc::ptr_eq(
@@ -74,6 +82,45 @@ impl PeerServer {
                 .limit(crate::model::limits::ResourceClass::IngressConnection);
             loop {
                 scope.check()?;
+                if let Some(ingress) = &self.ingress {
+                    reactor
+                        .readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
+                        .await?;
+                    let offer = std::future::poll_fn(|cx| {
+                        if let Err(error) = scope
+                            .cancellation
+                            .register(cx.waker())
+                            .and_then(|()| scope.check())
+                        {
+                            return std::task::Poll::Ready(Err(error));
+                        }
+                        match ingress.reserve(cx.waker()) {
+                            Ok(offer) => std::task::Poll::Ready(Ok(offer)),
+                            Err(Error::Overloaded) => std::task::Poll::Pending,
+                            Err(error) => std::task::Poll::Ready(Err(error)),
+                        }
+                    })
+                    .await?;
+                    let accepted = match fd.try_accept() {
+                        Ok(fd) => fd,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return Err(Error::Io),
+                    };
+                    offer.deliver(
+                        accepted
+                            .into_host()
+                            .map_err(|_| Error::InvalidConfiguration)?,
+                        crate::runtime::ingress::Kind::Peer,
+                    )?;
+                    continue;
+                }
                 if active.len() >= maximum {
                     let _ = active.next().await;
                     continue;
@@ -108,6 +155,7 @@ impl PeerServer {
         relay: Rc<Relay>,
     ) -> Self {
         Self {
+            ingress: None,
             io,
             forwarding,
             admission,

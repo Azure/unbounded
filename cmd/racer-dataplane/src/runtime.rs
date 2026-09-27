@@ -7,5 +7,6 @@ pub(crate) mod collections;
 pub mod crypto;
 pub mod deadline;
 pub mod environment;
+pub(crate) mod ingress;
 pub mod reactor;
 pub mod worker;

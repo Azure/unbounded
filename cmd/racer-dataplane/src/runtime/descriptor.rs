@@ -10,6 +10,26 @@ pub enum Descriptor {
 }
 
 impl Descriptor {
+    pub(crate) fn try_accept(&self) -> std::io::Result<Self> {
+        #[cfg(test)]
+        if let Self::Sim(handle) = self {
+            return handle.accept();
+        }
+        // SAFETY: the listener stays owned during this nonblocking syscall; the
+        // returned descriptor is immediately wrapped in its unique owner.
+        let fd = unsafe {
+            libc::accept4(
+                self.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { Self::from_raw_fd(fd) })
+    }
     /// Explicit extraction for host-only adapters. A simulated handle is rejected.
     pub fn into_host(self) -> std::result::Result<OwnedFd, Self> {
         match self {

@@ -115,6 +115,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    ingress: Arc<crate::runtime::ingress::Ingress>,
     metrics: crate::telemetry::metrics::Metrics,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
@@ -144,6 +145,7 @@ impl NodeState {
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         Ok(Self {
+            ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             publications: Arc::new(PublishedState::default()),
             metrics: crate::telemetry::metrics::Metrics::default(),
             keys: Arc::new(KeyEpochs::default()),
@@ -414,6 +416,7 @@ impl Drop for SignalGuard {
 /// Node-level control events enter through bounded worker commands. Mutable state
 /// is not implicitly made global by Arc/Mutex or by a background async runtime.
 pub struct WorkerApplication {
+    ingress_peers: futures::stream::FuturesUnordered<Operation<'static, ()>>,
     next_health: std::time::Instant,
     environment: crate::runtime::environment::Environment,
     drivers: Rc<crate::read::drivers::DriverQueue>,
@@ -476,6 +479,7 @@ impl WorkerApplication {
         let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
+        node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.limits();
         let snapshots = Rc::new(SnapshotStore::new(
@@ -724,39 +728,50 @@ impl WorkerApplication {
             node.workers.clone(),
             coordinator.clone(),
         ));
-        let peers = Rc::new(
-            PeerServer::new(
-                io.clone(),
-                forwarding,
-                admission.clone(),
-                dispatcher.clone(),
-                relay,
-            )
-            .with_request_timeout(config.request_timeout)
-            .with_network(network.clone())
-            .with_wire(wire)
-            .with_handshake(handshake)
-            .with_transfers(transfers)
-            .with_reactor(reactor.clone()),
-        );
+        let peers = PeerServer::new(
+            io.clone(),
+            forwarding,
+            admission.clone(),
+            dispatcher.clone(),
+            relay,
+        )
+        .with_request_timeout(config.request_timeout)
+        .with_network(network.clone())
+        .with_wire(wire)
+        .with_handshake(handshake)
+        .with_transfers(transfers)
+        .with_reactor(reactor.clone());
+        #[cfg(not(test))]
+        let distributed = true;
+        #[cfg(test)]
+        let distributed = crate::runtime::reactor::simulation::Simulation::current().is_none();
+        let peers = Rc::new(if distributed {
+            peers.with_ingress(node.ingress.clone())
+        } else {
+            peers
+        });
         let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
         let responses = Rc::new(Responses::new(io.clone(), delivery));
-        let clients = Rc::new(
-            ClientListeners::new(
-                dispatcher.clone(),
-                RequestParser::new(config.limits.header_bytes.get()),
-                responses,
-                io,
-                admission,
-            )
-            .with_request_timeout(config.request_timeout)
-            .with_metrics(node.metrics.clone()),
-        );
+        let clients = ClientListeners::new(
+            dispatcher.clone(),
+            RequestParser::new(config.limits.header_bytes.get()),
+            responses,
+            io,
+            admission,
+        )
+        .with_request_timeout(config.request_timeout)
+        .with_metrics(node.metrics.clone());
+        let clients = Rc::new(if distributed {
+            clients.with_ingress(node.ingress.clone())
+        } else {
+            clients
+        });
 
         let mut telemetry = Telemetry::default();
         telemetry.metrics = node.metrics.clone();
         telemetry.health = node.observations.health.clone();
         Ok(Self {
+            ingress_peers: futures::stream::FuturesUnordered::new(),
             http,
             environment,
             drivers,
@@ -1040,6 +1055,45 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        if let Some(node) = &self.node {
+            for _ in 0..budget {
+                let Some(accepted) = node.ingress.pop(self.worker, cx.waker())? else {
+                    break;
+                };
+                let connection = crate::http::pool::ConnectionLease::from_reserved(
+                    accepted.fd.into(),
+                    accepted.reservation,
+                )?;
+                match accepted.kind {
+                    crate::runtime::ingress::Kind::Client(cache, retired) => {
+                        self.clients
+                            .install_connection(connection, cache, retired)?;
+                    }
+                    crate::runtime::ingress::Kind::Peer => {
+                        let peers = self.peers.clone();
+                        let scope = self.task_scope.clone().ok_or(Error::Unavailable)?;
+                        self.ingress_peers.push(Box::pin(async move {
+                            let mut connection = connection;
+                            loop {
+                                connection = peers.serve_connection(connection, &scope).await?;
+                                if !connection.is_reusable() {
+                                    return Ok(());
+                                }
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        for _ in 0..budget {
+            use futures::Stream;
+            if !matches!(
+                std::pin::Pin::new(&mut self.ingress_peers).poll_next(cx),
+                Poll::Ready(Some(_))
+            ) {
+                break;
+            }
+        }
         self.http.poll_waiters(budget);
         self.metadata
             .poll_deadlines(crate::runtime::environment::now(), budget);
@@ -1206,6 +1260,12 @@ impl WorkerService for WorkerApplication {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
         self.stopping = true;
+        if let Some(node) = &self.node {
+            node.ingress.close(self.worker);
+        }
+        if let Some(scope) = &self.task_scope {
+            scope.cancel()?;
+        }
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
         if self.telemetry.health.state()? != crate::telemetry::health::State::Stopped {
@@ -1275,6 +1335,7 @@ impl WorkerService for WorkerApplication {
                         .as_ref()
                         .is_none_or(WorkerEndpoint::is_drained)
                     && self.peer_task.is_none()
+                    && self.ingress_peers.is_empty()
                     && self.writer_task.is_none()
                     && self.store.writer.is_idle()
                 {

@@ -128,12 +128,12 @@ excluded from the exact userspace worker-pair count.
 - `production_multicache_disk_baseline` now permanently requires a verified cold
   full-page disk hit with two active caches at four pairs, no overload and no
   origin refetch. A small tail remains readable. Phase 2 fixes the Phase 1 failure.
-- `production_ingress_baseline` holds 22 partial client heads at four pairs,
-  observes acceptance via process socket FDs, proves excess ingress stalls,
-  checks readiness, releases the clients, and verifies recovery. Its 200 ms
-  probe timeout is a diagnostic bound, not a production timeout change.
-  The existing 32-connection worker budget reserves eight outbound and two control
-  slots. Phase 3 owns distribution of ingress across workers.
+- `production_ingress_baseline` holds the full aggregate ingress partition at
+  1/2/4 pairs (94/92/88 partial heads), verifies traffic beyond the historical
+  worker-zero ceiling, proves excess ingress stalls, checks readiness, releases
+  clients, and verifies recovery. The 200 ms probe is a diagnostic bound. At four
+  pairs each existing 32-socket worker partition retains eight outbound and two
+  control slots while accepting 22 ingress sockets.
 - `production_churn_diagnostic` reads 512 distinct small objects across two
   caches with concurrency two at 1/2/4 pairs. It allows only HTTP 503 failures,
   records exact successes and failures, and checks server-counter consistency.

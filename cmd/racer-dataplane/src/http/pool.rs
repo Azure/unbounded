@@ -115,8 +115,11 @@ impl ConnectionLease {
     /// Takes ownership of an accepted socket, configures NONBLOCK/CLOEXEC, and
     /// reserves connection admission. No pool return is associated with this FD.
     pub fn from_accepted(fd: OwnedFd, admission: &Admission) -> Result<Self> {
-        set_nonblocking(&fd)?;
         let reservation = admission.reserve_connection(ResourceClass::IngressConnection)?;
+        Self::from_reserved(fd, reservation)
+    }
+    pub(crate) fn from_reserved(fd: OwnedFd, reservation: ConnectionReservation) -> Result<Self> {
+        set_nonblocking(&fd)?;
         Ok(Self::new(Rc::new(fd), reservation, None))
     }
     fn new(
