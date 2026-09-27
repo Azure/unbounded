@@ -106,6 +106,32 @@ impl Codec {
     pub fn limited(&self, header_limit: usize) -> Self {
         Self::new(self.header_limit.min(header_limit), self.body_limit)
     }
+    /// Exact representation upper bound, checked before decoded allocations.
+    /// Four wire bytes is the minimum valid field ("X:\r\n"); retain every
+    /// previously legal field count rather than imposing an arbitrary small cap.
+    pub(crate) fn decoded_allocation(&self, bytes: &[u8]) -> Result<usize> {
+        let end = bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|n| n + 4)
+            .ok_or(Error::InvalidRequest)?;
+        if end > self.header_limit {
+            return Err(Error::HeaderTooLarge);
+        }
+        let fields = bytes[..end]
+            .windows(2)
+            .filter(|w| *w == b"\r\n")
+            .count()
+            .saturating_sub(2);
+        if fields > self.header_limit / 4 {
+            return Err(Error::HeaderTooLarge);
+        }
+        fields
+            .checked_mul(std::mem::size_of::<Header>())
+            .and_then(|n| n.checked_add(end))
+            .and_then(|n| n.checked_add(std::mem::size_of::<MessageHead>()))
+            .ok_or(Error::HeaderTooLarge)
+    }
 
     /// Returns bytes consumed from a possibly larger read, never body bytes.
     /// Content-Length is representation metadata on HEAD responses, so the body
@@ -131,18 +157,21 @@ impl Codec {
         if invalid_line_endings(&bytes[..end]) {
             return Err(Error::InvalidRequest);
         }
-        // Allocate parser slots from the bounded head size, not an untrusted
-        // field count or body length. httparse supplies vetted syntax validation.
+        self.decoded_allocation(&bytes[..end])?;
+        // Validate the start line with constant parser scratch. Header syntax is
+        // validated below without allocating one httparse slot per field.
         let count = bytes[..end].windows(2).filter(|w| *w == b"\r\n").count();
-        let mut slots = vec![httparse::EMPTY_HEADER; count.saturating_sub(2)];
+        let first = bytes[..end]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or(Error::InvalidRequest)?;
+        let mut slots = [];
         let start = if bytes.starts_with(b"HTTP/") {
             let mut response = httparse::Response::new(&mut slots);
-            if response
-                .parse(&bytes[..end])
-                .map_err(|_| Error::InvalidRequest)?
-                != httparse::Status::Complete(end)
-                || response.version != Some(1)
-            {
+            response
+                .parse(&bytes[..first + 2])
+                .map_err(|_| Error::InvalidRequest)?;
+            if response.version != Some(1) {
                 return Err(Error::InvalidRequest);
             }
             StartLine::Response {
@@ -150,12 +179,10 @@ impl Codec {
             }
         } else {
             let mut request = httparse::Request::new(&mut slots);
-            if request
-                .parse(&bytes[..end])
-                .map_err(|_| Error::InvalidRequest)?
-                != httparse::Status::Complete(end)
-                || request.version != Some(1)
-            {
+            request
+                .parse(&bytes[..first + 2])
+                .map_err(|_| Error::InvalidRequest)?;
+            if request.version != Some(1) {
                 return Err(Error::InvalidRequest);
             }
             StartLine::Request {
@@ -169,7 +196,7 @@ impl Codec {
             .windows(2)
             .position(|w| w == b"\r\n")
             .ok_or(Error::InvalidRequest)?;
-        let mut headers = Vec::with_capacity(slots.len());
+        let mut headers = Vec::with_capacity(count.saturating_sub(2));
         for line in bytes[first + 2..end - 2].split(|b| *b == b'\n') {
             if line.is_empty() {
                 continue;
@@ -324,6 +351,36 @@ fn decimal(value: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn maximum_wire_heads_and_maximum_field_count_have_checked_decoded_bounds() {
+        for limit in [MAX_HEAD_BYTES, crate::peer::wire::MAX_ENVELOPE_HEAD] {
+            let codec = Codec::new(limit, 16);
+            let mut bytes = b"GET / HTTP/1.1\r\nX: ".to_vec();
+            bytes.resize(limit - 4, b'a');
+            bytes.extend_from_slice(b"\r\n\r\n");
+            let (head, used) = codec.decode_head(&bytes).unwrap().unwrap();
+            assert_eq!(used, limit);
+            assert_eq!(codec.encode_head(&head).unwrap(), bytes);
+            let allocation = codec.decoded_allocation(&bytes).unwrap();
+            assert!(allocation >= head.headers[0].value.len() + std::mem::size_of::<Header>());
+            let mut fields = b"GET / HTTP/1.1\r\n".to_vec();
+            while fields.len() + 6 <= limit {
+                fields.extend_from_slice(b"X:\r\n");
+            }
+            fields.extend_from_slice(b"\r\n");
+            let count = (fields.len() - 18) / 4;
+            let allocation = codec.decoded_allocation(&fields).unwrap();
+            assert!(allocation >= count * std::mem::size_of::<Header>());
+            assert_eq!(
+                codec.decode_head(&fields).unwrap().unwrap().0.headers.len(),
+                count
+            );
+            assert!(matches!(
+                Codec::new(limit - 1, 16).decoded_allocation(&bytes),
+                Err(Error::HeaderTooLarge)
+            ));
+        }
+    }
     #[test]
     fn fragmented_head_preserves_opaque_values_and_duplicates() {
         let codec = Codec::new(1024, 16);

@@ -109,6 +109,8 @@ pub struct HttpIo {
 pub struct HeadCompletion<T> {
     pub connection: ConnectionLease,
     pub value: T,
+    // Retained alongside the decoded value, including its field descriptors.
+    _decoded: Option<Reservation>,
 }
 impl HttpIo {
     pub(crate) fn reactor(&self) -> &Rc<Reactor> {
@@ -194,6 +196,7 @@ impl HttpIo {
             Ok(HeadCompletion {
                 connection: completed.connection,
                 value: completed.value?,
+                _decoded: completed._decoded,
             })
         })
     }
@@ -224,7 +227,11 @@ impl HttpIo {
             }
             connection.begin_io();
             let codec = self.codec.limited(header_limit);
-            let mut buffer = self.buffer(codec.header_limit())?;
+            let ahead_length = connection
+                .read_ahead
+                .as_ref()
+                .map_or(0, |(_, range)| range.len());
+            let mut buffer = self.buffer(codec.header_limit().min(4096.max(ahead_length)))?;
             let mut used = 0;
             let mut scanned: usize = 0;
             if let Some((ahead, range)) = connection.read_ahead.take() {
@@ -250,6 +257,17 @@ impl HttpIo {
                                 && buffer.bytes[i + 1] != b'\n')
                     });
                 scanned = used;
+                let decoded_charge = if complete {
+                    let size = codec.decoded_allocation(&buffer.bytes[..used])?;
+                    Some(
+                        self.admission
+                            .as_deref()
+                            .ok_or(Error::InvalidConfiguration)?
+                            .reserve(None, ResourceClass::RequestContext, size)?,
+                    )
+                } else {
+                    None
+                };
                 let decoded = match if complete || malformed || used == codec.header_limit() {
                     codec.decode_head(&buffer.bytes[..used])
                 } else {
@@ -294,7 +312,20 @@ impl HttpIo {
                     return Ok(HeadCompletion {
                         connection,
                         value: Ok(head),
+                        _decoded: decoded_charge,
                     });
+                }
+                if used == buffer.bytes.len() {
+                    let size = used.saturating_mul(2).min(codec.header_limit());
+                    if size <= used {
+                        return Ok(rejected_head(connection, Error::HeaderTooLarge));
+                    }
+                    // The previous receive completed before growth. Both old and
+                    // new allocations remain admitted during the copy; drop wipes
+                    // the old head before the new allocation is submitted.
+                    let mut larger = self.buffer(size)?;
+                    larger.bytes[..used].copy_from_slice(&buffer.bytes[..used]);
+                    buffer = larger;
                 }
                 let end = buffer.bytes.len();
                 let completion = self
@@ -377,6 +408,7 @@ impl HttpIo {
             Ok(HeadCompletion {
                 connection,
                 value: (),
+                _decoded: None,
             })
         })
     }
@@ -631,10 +663,40 @@ fn rejected_head(
     HeadCompletion {
         connection,
         value: Err(error),
+        _decoded: None,
     }
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decoded_field_storage_is_admitted_before_parser_allocations() {
+        let (admission, reactor, io, scope) = setup();
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let held = admission
+            .reserve(
+                None,
+                ResourceClass::RequestContext,
+                admission.limit(ResourceClass::RequestContext) - baseline - 8192,
+            )
+            .unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut head = b"GET / HTTP/1.1\r\n".to_vec();
+        for _ in 0..500 {
+            head.extend_from_slice(b"X:\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        peer.write_all(&head).unwrap();
+        assert!(matches!(
+            drive(&reactor, io.receive_head(connection, &scope)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        drop(held);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+    }
     use super::*;
     use crate::{
         http::{
@@ -750,6 +812,8 @@ mod tests {
         )
         .unwrap()
         .connection;
+        drop(received.value);
+        drop(received._decoded);
         assert_eq!(connection.finish_exchange(), Err(Error::InvalidRequest));
         let mut buffer = io.buffer(8192).unwrap();
         buffer.bytes_mut().unwrap().fill(91);
@@ -917,6 +981,8 @@ mod tests {
         assert_eq!(connection.remaining_body(), Some(0));
         drop(connection);
         drop(bytes);
+        drop(received.value);
+        drop(received._decoded);
         thread.join().unwrap();
         drain(&reactor);
         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
@@ -1046,6 +1112,8 @@ mod tests {
             drive(&reactor, io.collect_body(received.connection, 9, &scope)),
             Err(Error::Io)
         ));
+        drop(received.value);
+        drop(received._decoded);
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
         let mut future = io.receive_head(connection, &scope);

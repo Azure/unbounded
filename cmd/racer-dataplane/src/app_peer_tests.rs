@@ -349,10 +349,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
     writer.join().unwrap();
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     // No I/O or signing begins when receive staging or send scratch cannot fit.
-    for (send, available) in [
-        (false, wire::MAX_ENVELOPE_HEAD - 1),
-        (true, 2 * wire::MAX_ENVELOPE_HEAD - 1),
-    ] {
+    for (send, available) in [(false, 4096 - 1), (true, 2 * wire::MAX_ENVELOPE_HEAD - 1)] {
         let held = admission
             .reserve(
                 None,
