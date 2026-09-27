@@ -142,6 +142,7 @@ func (a Authorization) ForOrigin() string   { return a.value }
 func (m AdapterMetadata) Format(s fmt.State, _ rune) {
 	writeDiagnostic(s, "AdapterMetadata([redacted])")
 }
+
 func (a Authorization) Format(s fmt.State, _ rune) { writeDiagnostic(s, "Authorization([redacted])") }
 
 // FetchContext is an immutable pair of optional origin fields. Zero is absent.

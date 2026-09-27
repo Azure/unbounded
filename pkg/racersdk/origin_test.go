@@ -336,6 +336,7 @@ func (b *blockedBody) Read(p []byte) (int, error) {
 
 	return 0, context.Canceled
 }
+
 func (b *blockedBody) Close() error { b.closed.Add(1); b.once.Do(func() { close(b.done) }); return nil }
 
 func TestOriginProbeCancellation(t *testing.T) {

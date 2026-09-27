@@ -1,4 +1,5 @@
 use super::*;
+use racer_dataplane::model::limits::ResourceClass;
 use std::{
     fs,
     os::{fd::AsRawFd, unix::net::UnixListener},
@@ -59,7 +60,7 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
         std::process::id(),
         directory.as_raw_fd()
     ));
-    for size in [0, 3, 3 * P + 13] {
+    for size in [0, 3, P, 2 * P, 3 * P + 13] {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut child = Process(
@@ -87,6 +88,8 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
             }
         };
         let rig = Rig::new();
+        rig.reactor.init().unwrap();
+        let context_baseline = rig.admission.used(ResourceClass::RequestContext);
         rig.drive(async {
             let mut connection = rig.lease(accepted);
             // Empty objects still perform one bootstrap exchange. Nonempty
@@ -186,6 +189,12 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
                 connection.finish_exchange().unwrap();
             }
         });
+        assert_eq!(rig.admission.used(ResourceClass::Connection), 0);
+        assert_eq!(
+            rig.admission.used(ResourceClass::RequestContext),
+            context_baseline,
+            "SDK exchanges retained request buffers"
+        );
         let until = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {

@@ -76,6 +76,20 @@ func TestRustWireClientFixture(t *testing.T) {
 	if n, err := value.Read(one[:]); n != 0 || err != io.EOF {
 		t.Fatal("missing terminal EOF")
 	}
+
+	client.mu.Lock()
+	active := len(client.active)
+	client.mu.Unlock()
+	if len(client.slots) != 0 || active != 0 {
+		t.Fatal("finished stream retained client capacity")
+	}
+
+	if err := value.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := value.Read(one[:]); n != 0 || err != io.EOF {
+		t.Fatal("closing finished stream changed terminal EOF")
+	}
 }
 
 type rustWireSink struct{ offset int64 }
