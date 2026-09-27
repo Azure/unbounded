@@ -230,8 +230,8 @@ impl Sessions {
             Ok(())
         })
     }
-    /// Nonterminal accepted-operation cut for cache/key retirement. Call after
-    /// pausing affected producers; unrelated future sessions remain admissible.
+    /// Explicit nonterminal maintenance cut. Cache/key publication does not call
+    /// this; live transfers drain under their own leases and terminal fences.
     /// The captured Rc owners survive request cancellation and are fenced on the
     /// paired native role. A timeout never turns cancellation into successful DMA
     /// release. Callers may keep driving unrelated HTTP while this awaits.

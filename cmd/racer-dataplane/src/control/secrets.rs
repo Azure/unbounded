@@ -27,7 +27,7 @@ impl SecretWatcher {
     }
     /// Load common bundle.json from one coherent projected generation; malformed
     /// reloads retain the last valid bundle. Local signing identity is independent.
-    /// Never retire ciphertext keys ahead of lease barriers.
+    /// Installation closes new key admission; accepted leases own their secrets.
     /// Generation is local diagnostics only, never a controller acknowledgment.
     pub fn reload<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, BundleGeneration> {
         Box::pin(async move {

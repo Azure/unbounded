@@ -163,7 +163,7 @@ fn retirement_during_pressure_write_prevents_late_publication() {
     assert!(f.store.writer.is_idle());
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
-    assert!(matches!(f.enqueue(f.copy(3, 113)), Err(Error::MissingKey)));
+    assert!(f.enqueue(f.copy(3, 113)).is_ok());
 }
 
 #[test]

@@ -10,18 +10,9 @@ use std::cell::RefCell;
 #[derive(Default)]
 pub(super) struct CacheCut {
     generation: u64,
-    definitions: Vec<CacheDefinition>,
+    pub(super) definitions: Vec<CacheDefinition>,
     prepared: HashSet<WorkerId>,
     pub(super) committed: bool,
-    removing: bool,
-    pub(super) removed: HashSet<crate::model::identity::CacheId>,
-}
-impl CacheCut {
-    pub(super) fn invalidate(&mut self, worker: WorkerId) {
-        if !self.committed {
-            self.prepared.remove(&worker);
-        }
-    }
 }
 pub(super) struct Adapter {
     pub(super) node: Arc<NodeState>,
@@ -66,41 +57,16 @@ impl Drop for Transition {
 impl CacheLifecycle for Adapter {
     fn stage(&self, definitions: &[CacheDefinition]) -> Result<Box<dyn CacheTransition>> {
         crate::control::caches::validate_definitions(definitions)?;
-        let current = self.node.publications.current().ok();
         let mut cut = self.node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
         if cut.generation == 0 || cut.definitions != definitions {
-            let removals: Vec<_> = current
-                .as_ref()
-                .into_iter()
-                .flat_map(|current| &current.caches)
-                .filter(|old| !definitions.iter().any(|new| new.id == old.id))
-                .map(|old| old.id.clone())
-                .collect();
-            // Bound the cumulative tombstones before pausing any accepted service.
-            // Every worker independently confirms its partition during preparation.
-            if definitions.iter().any(|new| cut.removed.contains(&new.id)) {
-                return Err(Error::Unavailable);
-            }
-            if definitions.len() > self.capacity
-                || cut.removed.len()
-                    + removals
-                        .iter()
-                        .filter(|id| !cut.removed.contains(id))
-                        .count()
-                    > self.capacity.min(65536)
-            {
+            if definitions.len() > self.capacity {
                 return Err(Error::Overloaded);
-            }
-            let removing = !removals.is_empty() || cut.removing && !cut.committed;
-            if removing {
-                self.node.retirement.remove(removals)?;
             }
             self.listeners.borrow_mut().take();
             cut.generation = cut.generation.checked_add(1).ok_or(Error::Unavailable)?;
             cut.definitions = definitions.to_vec();
             cut.prepared.clear();
             cut.committed = false;
-            cut.removing = removing;
             return Err(Error::Unavailable);
         }
         if cut.prepared.len() != self.node.count {
@@ -151,17 +117,6 @@ impl WorkerApplication {
         if generation == 0 || committed {
             return Ok(());
         }
-        // Removal pauses producers first. Commit publishes the decision, then all
-        // owners install tombstones before any listener is polled again.
-        if node
-            .cache_cut
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .removing
-            && !node.retirement.quiescent()?
-        {
-            return Ok(());
-        }
         if self.cache_preparing_generation != generation {
             self.cache_prepare_task.take();
             self.prepared_listeners.borrow_mut().take();
@@ -179,31 +134,6 @@ impl WorkerApplication {
         // Reject a publication that cannot fit the worker-local metadata catalog.
         if definitions.len() > self.runtime.admission.limits().metadata_entries.get() {
             return Ok(());
-        }
-        {
-            let cut = node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
-            let newly_removed = self
-                .caches
-                .iter()
-                .filter(|old| {
-                    !definitions.iter().any(|new| new.id == old.id)
-                        && !cut.removed.contains(&old.id)
-                })
-                .count();
-            if cut.removed.len() + newly_removed
-                > self
-                    .runtime
-                    .admission
-                    .limits()
-                    .metadata_entries
-                    .get()
-                    .min(65536)
-            {
-                return Ok(());
-            }
-            if definitions.iter().any(|new| cut.removed.contains(&new.id)) {
-                return Ok(());
-            }
         }
         if self.control.is_some() && self.prepared_listeners.borrow().is_none() {
             if self.cache_prepare_task.is_none() {
@@ -290,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_failure_keeps_last_good_generation_and_superseded_removal_can_retain_cache() {
+    fn capacity_failure_keeps_last_good_generation_and_uid_reuse_needs_no_tombstones() {
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
         let definition = super::super::integration_tests::definition();
@@ -307,22 +237,19 @@ mod tests {
             listeners: Rc::new(RefCell::new(None)),
             capacity: 0,
         };
-        assert!(matches!(adapter.stage(&[]), Err(Error::Overloaded)));
-        assert!(!node.retirement.active().unwrap());
+        assert!(matches!(
+            adapter.stage(&[definition.clone()]),
+            Err(Error::Overloaded)
+        ));
         assert_eq!(node.cache_cut.lock().unwrap().generation, 0);
         adapter.capacity = 16;
         assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
-        assert!(node.retirement.active().unwrap());
         let previous = node.cache_cut.lock().unwrap().generation;
         assert!(matches!(
             adapter.stage(&[definition]),
             Err(Error::Unavailable)
         ));
         assert_eq!(node.cache_cut.lock().unwrap().generation, previous + 1);
-        assert!(
-            node.cache_cut.lock().unwrap().removing,
-            "superseding response still completes the pause/resume rendezvous"
-        );
         assert_eq!(
             store.cursor().unwrap(),
             Some(crate::control::wire::PublicationSequence(1))

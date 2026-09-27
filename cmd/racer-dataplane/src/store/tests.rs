@@ -243,7 +243,9 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
         .unwrap();
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
-    assert!(matches!(f.enqueue(f.copy(4, 3)), Err(Error::MissingKey)));
+    // Eviction alone has no permanent tombstone; production admission is the
+    // current positive cache/key set, independently tested through the app.
+    assert!(f.enqueue(f.copy(4, 3)).is_ok());
     assert_eq!(
         f.metrics
             .count(crate::telemetry::metrics::Event::DirtyDiscard),
@@ -554,8 +556,15 @@ fn retirement_during_write_fences_late_publication() {
         .writer
         .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
         .unwrap();
+    // Reinsert the same immutable page while the original submitted write still
+    // owns its segment/buffer. The old completion cannot publish or remove it.
+    let replacement = f.enqueue(f.copy(1, 64)).unwrap();
+    assert!(replacement.id() > 1);
     drive(&f.reactor, operation).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    assert_eq!(f.store.writer.pending_count(), 1);
+    drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }

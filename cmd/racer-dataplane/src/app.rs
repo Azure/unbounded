@@ -8,8 +8,8 @@
 //! Shutdown stops admission, drains reads/relays and dirty writes to the deadline,
 //! optionally checkpoints a consistent all-worker cut, revokes RDMA permissions,
 //! fences kernel/NIC references, then destroys buffers/devices and owned sockets.
-//! Cache removal applies the same ordering within that cache. Startup failures roll
-//! back already-created resources. Constructors perform no operational I/O.
+//! Cache removal closes new admission; accepted resource owners drain independently.
+//! Startup failures roll back created resources. Constructors perform no operational I/O.
 
 use crate::{
     client::{listener::ClientListeners, request::RequestParser, response::Responses},
@@ -101,8 +101,6 @@ mod health;
 mod native;
 #[path = "app_recovery.rs"]
 mod recovery;
-#[path = "app_retirement.rs"]
-mod retirement;
 
 pub struct Application {
     config: Arc<Config>,
@@ -126,7 +124,6 @@ pub struct NodeState {
     observations: health::Observations,
     native: native::NativePairs,
     cache_cut: Mutex<caches::CacheCut>,
-    retirement: Arc<retirement::Retirement>,
 }
 #[derive(Default)]
 struct CheckpointCut {
@@ -156,7 +153,6 @@ impl NodeState {
             observations: health::Observations::default(),
             native: native::NativePairs::default(),
             cache_cut: Mutex::new(caches::CacheCut::default()),
-            retirement: Arc::new(retirement::Retirement::new(count)),
         })
     }
 }
@@ -330,7 +326,6 @@ fn bootstrap(
             identity.node().clone(),
             node.keys.clone(),
         ));
-        keys.register_retirement_barriers(node.retirement.clone())?;
         control.bind_keyring(keys)?;
         Ok(identity.node().clone())
     });
@@ -461,13 +456,6 @@ pub struct WorkerApplication {
     cache_prepare_task: Option<Operation<'static, ()>>,
     cache_preparing_generation: u64,
     control_scope: Option<RequestScope>,
-    retiring: bool,
-    retirement_registered: bool,
-    retirement_native_started: bool,
-    retirement_scope: Option<RequestScope>,
-    retirement_native: Option<Operation<'static, ()>>,
-    retirement_resume: Option<Operation<'static, ()>>,
-    retirement_checkpoint: Option<Operation<'static, ()>>,
 }
 
 impl WorkerApplication {
@@ -497,6 +485,10 @@ impl WorkerApplication {
             node.keys.clone(),
         ));
         let certificates = Rc::new(Certificates::new(config.cluster.clone(), keys.clone()));
+        let availability = Rc::new(crate::control::availability::Availability::new(
+            node.publications.clone(),
+            keys.clone(),
+        ));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
@@ -547,11 +539,15 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
-        let memory = Rc::new(MemoryCache::new(buffers.clone()));
+        let memory =
+            Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(Delivery::new(pipes, config.reader_stall_timeout));
 
-        let index = Rc::new(Index::new(worker, limits.metadata_entries.get()));
+        let index = Rc::new(
+            Index::new(worker, limits.metadata_entries.get())
+                .with_availability(availability.clone()),
+        );
         let segments = Rc::new(Segments::new(worker, config.segment_bytes));
         let eviction = Rc::new(SegmentClock::new(
             index.clone(),
@@ -577,6 +573,7 @@ impl WorkerApplication {
         );
         let writer = Rc::new(
             StoreWriter::new(index.clone(), segments.clone(), slabs)
+                .with_availability(availability.clone())
                 .with_metrics(node.metrics.clone()),
         );
         writer.configure(
@@ -690,13 +687,16 @@ impl WorkerApplication {
             delivery.clone(),
             config.limits.range_window_pages.get(),
         ));
-        let coordinator = Rc::new(Coordinator::new(
-            snapshots.clone(),
-            metadata.clone(),
-            fill,
-            streams,
-            credentials,
-        ));
+        let coordinator = Rc::new(
+            Coordinator::new(
+                snapshots.clone(),
+                metadata.clone(),
+                fill,
+                streams,
+                credentials,
+            )
+            .with_availability(availability),
+        );
         let relay = Rc::new(
             Relay::new(paths, forwarding.clone(), requester, admission.clone())
                 .with_network(network.clone()),
@@ -784,13 +784,6 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
-            retiring: false,
-            retirement_registered: false,
-            retirement_native_started: false,
-            retirement_scope: None,
-            retirement_native: None,
-            retirement_resume: None,
-            retirement_checkpoint: None,
         })
     }
 
@@ -814,7 +807,6 @@ impl WorkerApplication {
             )?;
             self.store.recovery.configure_geometry(geometry)?;
             self.store.checkpoint.configure_geometry(geometry)?;
-            self.recover_node(geometry, startup).await?;
             self.endpoint = Some(
                 self.directory
                     .install(self.worker, self.coordinator.clone())?,
@@ -877,6 +869,8 @@ impl WorkerApplication {
                 }
             })
             .await?;
+            // Recovery must consult the accepted cache UID set, not only secrets.
+            self.recover_node(geometry, startup).await?;
             self.refresh_snapshot(startup).await?;
             self.activate_native(startup).await?;
             std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
@@ -958,13 +952,24 @@ impl WorkerApplication {
             }
         };
         image.index.entries.retain(|(page, entry)| {
-            self.keys
-                .lease(
-                    Some(&page.version.object.cache),
-                    entry.key_id,
-                    KeyPurpose::Page,
-                )
-                .is_ok()
+            self.caches
+                .iter()
+                .any(|c| c.id == page.version.object.cache)
+                && self
+                    .keys
+                    .lease(
+                        Some(&page.version.object.cache),
+                        entry.key_id,
+                        KeyPurpose::Page,
+                    )
+                    .is_ok()
+        });
+        image.index.metadata.retain(|m| {
+            self.caches.iter().any(|c| c.id == m.version.object.cache)
+                && self
+                    .keys
+                    .active(&m.version.object.cache, KeyPurpose::Page)
+                    .is_ok()
         });
         node.checkpoint
             .lock()
@@ -1019,17 +1024,6 @@ impl WorkerApplication {
         self.http.poll_waiters(budget);
         self.metadata
             .poll_deadlines(crate::runtime::environment::now(), budget);
-        if self.stopping {
-            for task in [&mut self.retirement_native, &mut self.retirement_checkpoint] {
-                if let Some(result) = poll_task(task, cx) {
-                    result?;
-                }
-            }
-        }
-        if !self.stopping && self.poll_retirement(cx)? {
-            self.observe_health()?;
-            return Ok(());
-        }
         if !self.stopping {
             self.poll_cache_preparation(cx)?;
         }
@@ -1191,7 +1185,6 @@ impl WorkerService for WorkerApplication {
         self.stopping = true;
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
-        self.retirement_resume.take();
         if self.telemetry.health.state()? != crate::telemetry::health::State::Stopped {
             self.telemetry
                 .health
@@ -1261,8 +1254,6 @@ impl WorkerService for WorkerApplication {
                     && self.peer_task.is_none()
                     && self.writer_task.is_none()
                     && self.store.writer.is_idle()
-                    && self.retirement_native.is_none()
-                    && self.retirement_checkpoint.is_none()
                 {
                     Poll::Ready(())
                 } else {
@@ -1317,6 +1308,10 @@ mod dst;
 #[cfg(test)]
 #[path = "app_integration_tests.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+#[path = "app_lifetime_tests.rs"]
+mod lifetime_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

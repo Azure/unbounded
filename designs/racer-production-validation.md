@@ -78,23 +78,28 @@ No additional unresolved production failure was established by these six tests.
 `src/app_integration_tests.rs` includes real TLS enrollment and authenticated
 publication polling. The latest assertions cover:
 
-- Two worker objects: pending late driver blocks removal; rejected publication
+- Two worker objects: pending late driver survives removal; rejected publication
   preserves state; committed removal rejects late memory and disk fills. The test
   drives stage/publication directly and substitutes a pending control future
-  (`55-132`). It does not test a populated-cache update delivered by the server.
+  (the direct stage/rollback fixture). The separate controller-loss fixture tests
+  a populated-cache update delivered by the server.
 - Separate worker threads: real control startup and one complete two-shard shutdown
   checkpoint (`135-161`).
-- Real two-pair WorkerGroup: held-key retirement/resume, joined worker threads, and
+- Real two-pair WorkerGroup: held-key lifetime drain without a node pause, joined
+  worker threads, and
   exact checkpoint shard IDs `[0, 1]` (`173-216`). The TLS fixture publishes empty
   caches and the test installs key bundles directly.
-- One worker: accepted crypto completion must precede checkpoint invalidation;
-  the last key lease must precede destruction/resume; final reactor and crypto
-  counts are zero (`454-590`).
+- One worker: accepted crypto retains its key across rotation, historical
+  checkpoints remain, and final reactor and crypto counts are zero.
+- A populated cache removal delivered over TLS finishes after the controller exits,
+  including its new membership. An unrelated cache serves a real UDS pinned HEAD.
+- Recovery filters removed UIDs and unavailable keys, including standalone metadata,
+  from old checkpoint images before installation.
 
-Retirement uses a conservative full-node pause, including diagnostics. Its retained
-checkpoint invalidation future is reactor-backed and must finish before the key
-retirement loop (`src/app_retirement.rs:369-394`). This is narrower than claiming
-all filesystem work is nonblocking: checkpoint publication still uses synchronous
+Item 4 replaces the former full-node pause with current cache/key admission and
+resource-owned drain. Peer listeners, diagnostics, control, and unrelated cache
+service keep polling. No retirement checkpoint invalidation is required.
+This does not make all filesystem work nonblocking: checkpoint publication uses synchronous
 filesystem operations and explicitly omits fsync durability
 (`src/store/checkpoint.rs:1-4`, `142-200`); prepared listener setup also performs
 synchronous filesystem operations (`src/client/transition.rs:110-223`).

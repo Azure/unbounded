@@ -44,6 +44,7 @@ pub struct Coordinator {
     fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
     credentials: Rc<CredentialCrypto>,
+    availability: Option<Rc<crate::control::availability::Availability>>,
 }
 // Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 // acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -85,7 +86,15 @@ impl Coordinator {
             fill,
             streams,
             credentials,
+            availability: None,
         }
+    }
+    pub fn with_availability(
+        mut self,
+        availability: Rc<crate::control::availability::Availability>,
+    ) -> Self {
+        self.availability = Some(availability);
+        self
     }
     pub(crate) fn resolve_metadata<'a>(
         &'a self,
@@ -161,7 +170,19 @@ impl Coordinator {
     ) -> Operation<'a, ReadResponse> {
         Box::pin(async move {
             scope.check()?;
-            let membership = self.snapshots.current()?.membership.clone();
+            let snapshot = self.snapshots.current()?;
+            if !snapshot
+                .caches
+                .iter()
+                .any(|c| c.id == request.origin.object.cache)
+                || self
+                    .availability
+                    .as_ref()
+                    .is_some_and(|a| !a.metadata(&request.origin.object.cache))
+            {
+                return Err(Error::Unavailable);
+            }
+            let membership = snapshot.membership.clone();
             let directory = self.streams.directory();
             let ClientRequest { kind, origin } = request;
             match kind {
@@ -313,6 +334,19 @@ impl LocalPageService for Coordinator {
             };
             if object != &request.origin.object {
                 return Err(Error::InvalidRequest);
+            }
+            if !self
+                .snapshots
+                .current()?
+                .caches
+                .iter()
+                .any(|c| c.id == object.cache)
+                || self
+                    .availability
+                    .as_ref()
+                    .is_some_and(|a| !a.metadata(&object.cache))
+            {
+                return Ok(PeerResponse::Miss);
             }
             let mut effective = scope.clone();
             effective.deadline.0 = effective.deadline.0.min(request.route.deadline.0);

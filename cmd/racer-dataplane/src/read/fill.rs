@@ -703,7 +703,7 @@ impl Fill {
             }
         }
         match self.dependencies.memory.publish(result.clone()) {
-            Ok(()) | Err(Error::Overloaded) => {}
+            Ok(()) | Err(Error::Overloaded | Error::Unavailable | Error::MissingKey) => {}
             Err(error) => return Err(error),
         }
         // A descriptor catalog is an optimization. Every retained page owns its

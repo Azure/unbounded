@@ -3,7 +3,6 @@ use super::{
     page::{CiphertextCopy, PageResult},
     pool::BufferPool,
 };
-use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::{
@@ -17,17 +16,30 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 pub struct MemoryCache {
     pool: Rc<BufferPool>,
     entries: RefCell<VecDeque<PageResult>>,
-    retired: RefCell<HashSet<(CacheId, KeyId)>>,
-    removed: RefCell<HashSet<CacheId>>,
+    availability: Option<Rc<crate::control::availability::Availability>>,
 }
 impl MemoryCache {
     pub fn new(pool: Rc<BufferPool>) -> Self {
         Self {
             pool,
             entries: RefCell::new(VecDeque::new()),
-            retired: RefCell::new(HashSet::default()),
-            removed: RefCell::new(HashSet::default()),
+            availability: None,
         }
+    }
+    pub fn with_availability(
+        mut self,
+        availability: Rc<crate::control::availability::Availability>,
+    ) -> Self {
+        self.availability = Some(availability);
+        self
+    }
+    fn available(&self, page: &PageResult) -> bool {
+        self.availability.as_ref().is_none_or(|a| {
+            a.page(
+                &page.metadata.version.object.cache,
+                page.ciphertext.envelope().key_id,
+            )
+        })
     }
     pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
         let mut entries = self.entries.borrow_mut();
@@ -38,6 +50,9 @@ impl MemoryCache {
             return Ok(None);
         };
         let entry = entries.remove(index).expect("located entry");
+        if !self.available(&entry) {
+            return Ok(None);
+        }
         let result = entry.clone();
         entries.push_back(entry);
         Ok(Some(result))
@@ -49,15 +64,14 @@ impl MemoryCache {
     pub fn publish(&self, page: PageResult) -> Result<()> {
         self.pool.validate_page(&page)?;
         let id = page.plaintext.page();
-        let cache = &id.version.object.cache;
-        if self.removed.borrow().contains(cache) {
+        if self
+            .availability
+            .as_ref()
+            .is_some_and(|a| !a.cache(&id.version.object.cache))
+        {
             return Err(Error::Unavailable);
         }
-        if self
-            .retired
-            .borrow()
-            .contains(&(cache.clone(), page.ciphertext.envelope().key_id))
-        {
+        if !self.available(&page) {
             return Err(Error::MissingKey);
         }
         let mut entries = self.entries.borrow_mut();
@@ -89,7 +103,7 @@ impl MemoryCache {
             .entries
             .borrow()
             .iter()
-            .find(|entry| &entry.metadata.version == version)
+            .find(|entry| &entry.metadata.version == version && self.available(entry))
             .map(|entry| entry.metadata.immutable()))
     }
     /// Return released admission bytes, including any reserved final-page slack.
@@ -145,18 +159,9 @@ impl MemoryCache {
         });
         released
     }
-    /// Stop late publications and remove lookup visibility. Existing owners keep
+    /// Evict lookup references. Existing owners keep
     /// their charges until their completion fences release them.
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
-        let mut retired = self.retired.borrow_mut();
-        let id = (cache.clone(), key);
-        if !retired.contains(&id) {
-            if retired.len() >= self.pool.entry_limit() {
-                return Err(Error::Overloaded);
-            }
-            retired.try_reserve(1).map_err(|_| Error::Overloaded)?;
-            retired.insert(id);
-        }
         let mut entries = self.entries.borrow_mut();
         let before = entries.len();
         entries.retain(|entry| {
@@ -166,18 +171,9 @@ impl MemoryCache {
         Ok(before - entries.len())
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
-        let mut removed = self.removed.borrow_mut();
-        if !removed.contains(cache) {
-            if removed.len() >= self.pool.entry_limit() {
-                return Err(Error::Overloaded);
-            }
-            removed.try_reserve(1).map_err(|_| Error::Overloaded)?;
-            removed.insert(cache.clone());
-        }
         self.entries
             .borrow_mut()
             .retain(|entry| &entry.metadata.version.object.cache != cache);
-        self.retired.borrow_mut().retain(|(id, _)| id != cache);
         Ok(())
     }
 }
@@ -307,7 +303,7 @@ mod tests {
         assert_eq!(cache.entries.borrow().len(), 1);
     }
     #[test]
-    fn retirement_is_cache_scoped_blocks_late_fills_and_preserves_live_leases() {
+    fn eviction_is_cache_scoped_and_preserves_live_leases() {
         let admission = admission(8);
         let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
         let page = bundle(&admission, "v1");
@@ -324,7 +320,6 @@ mod tests {
         );
         assert!(cache.get(&id).unwrap().is_none());
         assert!(cache.get(&other_id).unwrap().is_some());
-        assert_eq!(cache.publish(page.clone()), Err(Error::MissingKey));
         assert_eq!(page.plaintext.bytes(), &[1; 3]);
         assert_eq!(admission.used(ResourceClass::Plaintext), 6);
         drop(page);
@@ -332,30 +327,23 @@ mod tests {
         let lease = cache.ciphertext(&other_id).unwrap().unwrap();
         cache.remove_cache(&other_id.version.object.cache).unwrap();
         assert!(cache.get(&other_id).unwrap().is_none());
-        assert_eq!(
-            cache.publish(bundle_for(&admission, other_descriptor)),
-            Err(Error::Unavailable)
-        );
         assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
         drop(lease);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
     #[test]
-    fn retirement_tombstones_are_bounded_and_idempotent() {
+    fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
         let admission = admission(1);
         let cache = MemoryCache::new(Rc::new(BufferPool::new(admission)));
         let id = CacheId("cache".into());
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
-        assert_eq!(
-            cache.retire_key(&id, KeyId([2; 16])),
-            Err(Error::Overloaded)
-        );
+        assert_eq!(cache.retire_key(&id, KeyId([2; 16])), Ok(0));
         assert_eq!(cache.remove_cache(&id), Ok(()));
         assert_eq!(cache.remove_cache(&id), Ok(()));
-        assert_eq!(
-            cache.remove_cache(&CacheId("other".into())),
-            Err(Error::Overloaded)
-        );
+        assert_eq!(cache.remove_cache(&CacheId("other".into())), Ok(()));
+        for n in 0..10_000 {
+            cache.remove_cache(&CacheId(n.to_string())).unwrap();
+        }
     }
 }

@@ -123,6 +123,20 @@ impl SnapshotStore {
         publication: Publication,
         transition: Option<Box<dyn super::caches::CacheTransition>>,
     ) -> Result<SnapshotLease> {
+        self.validate_or_publish(publication, transition, true)
+    }
+    /// Validate the entire downloaded publication before local resource staging.
+    /// Capacity can change while leases drain, so installation rechecks it.
+    pub fn validate(&self, publication: Publication) -> Result<()> {
+        self.validate_or_publish(publication, None, false)
+            .map(|_| ())
+    }
+    fn validate_or_publish(
+        &self,
+        publication: Publication,
+        transition: Option<Box<dyn super::caches::CacheTransition>>,
+        install: bool,
+    ) -> Result<SnapshotLease> {
         if publication.cluster != self.cluster {
             return Err(Error::Unauthorized);
         }
@@ -173,7 +187,7 @@ impl SnapshotStore {
             let replaceable = state.current.as_ref().is_some_and(|s| {
                 Arc::strong_count(s) == 1 && Arc::strong_count(&s.membership) == 1
             });
-            if state.memberships.len() - usize::from(replaceable) > self.retained_limit {
+            if install && state.memberships.len() - usize::from(replaceable) > self.retained_limit {
                 return Err(Error::Overloaded);
             }
             Arc::new(Membership::validate(
@@ -187,6 +201,9 @@ impl SnapshotStore {
             membership,
             caches: publication.caches,
         });
+        if !install {
+            return Ok(next);
+        }
         if let Some(transition) = transition {
             transition.commit();
         }

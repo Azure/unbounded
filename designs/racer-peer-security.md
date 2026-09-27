@@ -218,9 +218,10 @@ fences. Native transfer-scoped DMA fences remain independent and mandatory.
   buffers by bypassing reservations or expose unauthenticated plaintext.
 - Peer transport uses public canonical security encoders and signed envelopes;
   only security verification can mint `VerifiedRequest`/`VerifiedResponse`.
-- Key retirement stops new lease acquisition, waits for registered storage,
-  checkpoint and transport barriers, then waits for all existing key leases before
-  erasing material. Missing barrier integration must fail closed, not report success.
+- Retiring or omitted keys stop new lease acquisition. The registry drops its
+  secret owner; accepted crypto jobs/completions retain `Arc<Secret>` until their
+  last lease drops and zeroizes it. No node-wide storage/checkpoint/transport
+  barrier is required. Historical keyless ciphertext may remain on disk.
 
 Implementation-specific public APIs and vectors are documented alongside their
 exported functions. No caller should duplicate canonicalization in peer code.
@@ -308,9 +309,12 @@ encrypted bytes.
 Keyring validation review: equal-generation identical content is idempotent; lower
 generation or changed equal-generation content fails. Generation zero fails. Exactly
 one active key per represented cache/purpose is required, while a removed scope can
-be absent. A removed key must stop new leases immediately, then await registered
-retirement fences and existing leases. Reappearing retired IDs cannot resurrect old
-material. Retirement is retryable and must retain material if barriers are absent.
+be absent. Retiring and omitted keys stop new leases immediately. Existing leases
+remain valid until their owners complete. Registry storage is bounded by the current
+bundle, without cumulative tombstones. A newer bundle can reintroduce an omitted
+ID; the controller must use immutable cache/key identities. AEAD rejects historical
+ciphertext if the reintroduced material does not match. Equal-generation replay
+does not reinstall keys or change admission.
 
 ## Component verification
 
@@ -330,11 +334,10 @@ or deployment test.
 - `Keyring::{install,install_identity,install_signing_identity,signing_identity}`
   stage/activate shared material and independently rotate local signing identities.
   Identity installation is atomic with respect to current peer-trust publication.
-- `KeyLease::reference()` exposes the cache/key/purpose identity for fences without
-  exposing material. `Keyring::{register_retirement_barriers,pending_retirements,retire}`
-  connect application-wide local eviction/fencing to key erasure. Retire returns
-  unavailable while a barrier or lease is outstanding; the control owner retries
-  with bounded scheduling. No controller acknowledgment is involved.
+- `KeyLease::reference()` exposes the cache/key/purpose identity without exposing
+  material. `Keyring::install` replaces new-admission ownership synchronously;
+  accepted operations retain their own secret leases. The former retirement
+  barrier registration and polling APIs are removed.
 - `PageCryptoEngine::process` consumes an owned runtime job into an owned completion;
   the `CryptoService` implementation drives the real bounded runtime handoff.
 - `CredentialCrypto::{seal,open,open_charged}` retains charged context ownership.
@@ -353,9 +356,8 @@ and ten peer integration tests passed through Cargo; all-feature library check
 passed. The component runner also passed 43 security tests while application tests
 were transiently uncompilable.
 
-Remaining application integration at handoff: no production registration of
-`RetirementBarriers` or retirement-driver call was present, so omitted-key material
-is retained fail-closed after stopping new leases. The peer decoder still needed
+Historical application integration at handoff (superseded by lifetime-based
+retirement above): barrier registration was once required. The peer decoder still needed
 the cache-scoped context reservation fix described above. These are not silently
 treated as successful retirement or successful credential opening. Full deployment
 bootstrap, cluster rotation, storage/NIC retirement and load testing remain broader

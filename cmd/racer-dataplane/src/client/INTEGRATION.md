@@ -77,8 +77,8 @@ compatible as prepare + commit + immediate cleanup.
 generations; it retains completion owners. `drain_cache` stops admission and polls
 until those connection futures finish, canceling them on its deadline. Continue
 driving the shared reactor while draining. This is a client-future drain, **not a
-kernel completion fence**: application retirement must subsequently await the
-runtime's accepted-operation fence before releasing other cache resources. Other
+kernel completion fence**: submitted operations retain their own buffers and leases
+until runtime/native completion fences release them, even beyond deadlines. Other
 cache UIDs remain serving. Global shutdown cannot be reversed by a prepared commit.
 
 `ClientListeners::new` is side-effect-free. The worker calls

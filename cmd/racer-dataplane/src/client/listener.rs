@@ -209,6 +209,10 @@ impl ClientListeners {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_root(&mut self, root: PathBuf) {
+        self.root = root;
+    }
+    #[cfg(test)]
     pub(crate) fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -2341,6 +2345,41 @@ mod tests {
                 .unwrap()
                 .any(|entry| entry.unwrap().metadata().unwrap().ino() == inode)
         );
+    }
+
+    #[test]
+    fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keepalive() {
+        let mut fixture = Fixture::new();
+        let gated = Rc::new(GatedRead {
+            inner: fixture.reads.clone(),
+            scopes: RefCell::new(vec![]),
+            release: Cell::new(false),
+        });
+        fixture.listeners.reads = gated.clone();
+        fixture.reconcile(&[definition()]).unwrap();
+        let mut socket = fixture.connect();
+        socket.write_all(&request("HEAD", "")).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        assert_eq!(gated.scopes.borrow().len(), 1);
+        let operation_scope = gated.scopes.borrow()[0].clone();
+        fixture.reconcile(&[]).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        assert!(operation_scope.check().is_ok());
+        assert_eq!(fixture.listeners.active_connections(), 1);
+        fixture.reconcile(&[definition()]).unwrap();
+        gated.release.set(true);
+        let response = fixture.receive(&mut socket, true);
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        let mut new = fixture.connect();
+        new.write_all(&request("HEAD", "Connection: close\r\n"))
+            .unwrap();
+        assert!(fixture.receive(&mut new, true).starts_with(b"HTTP/1.1 200"));
+        assert_eq!(fixture.reads.calls.get(), 2);
     }
 
     #[test]

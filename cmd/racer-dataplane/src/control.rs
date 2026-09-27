@@ -1,5 +1,6 @@
 //! Control publications and node-local credential lifecycle; no Kubernetes watches.
 pub(crate) mod async_files;
+pub mod availability;
 pub mod caches;
 pub mod client;
 mod dns;

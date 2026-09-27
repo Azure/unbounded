@@ -26,15 +26,22 @@ cache-only replacement, delayed workers, bounded admission, and capacity reuse;
 the actual requester across publication while a TCP read is pending. Historical
 ownership notes below describe the superseded implementation.
 
-Current application fixtures include separate-thread startup, a real two-pair
-WorkerGroup retirement/checkpoint cut, late-driver removal/rollback, and accepted
-crypto completion before checkpoint invalidation
-(`cmd/racer-dataplane/src/app_integration_tests.rs:55-216`, `454-590`). Earlier
-single-worker-only coverage notes below are superseded. The config loader signature
-handoff and retained reactor-backed retirement checkpoint operation are implemented
-(`cmd/racer-dataplane/src/main.rs:15-21`,
-`cmd/racer-dataplane/src/app_retirement.rs:369-394`); their earlier compiler-blocker
-notes are also historical.
+**Approved item 4: scoped admission and lifetime drain.** The whole-node retirement
+state machine is removed. Control retains one complete validated pending publication
+through local preparation/install, independent of another controller poll. Listener
+commit closes only changed/removed generations; active responses keep their deadlines.
+Current positive UID/key availability gates cache lookup and late publication, with
+no cumulative cache/key tombstones. Retiring/omitted key registry owners are dropped;
+accepted jobs/completions own zeroizing secrets until their final lease release.
+Recovery waits for an accepted cache publication and filters unavailable UIDs, exact
+page keys, and standalone metadata before any shard is installed. All workers finish
+startup recovery before listener polling. Historical keyless ciphertext/checkpoints
+may remain. Transfer-specific native DMA fencing and shutdown fencing are preserved.
+
+Application fixtures cover controller loss after a removal snapshot, an unrelated
+cache's real UDS read, live peer/diagnostic tasks, delayed drivers, held crypto keys,
+two-worker startup/shutdown cuts, and restart filtering. All retirement/pause/erasure
+claims in the historical coordination log below describe the superseded contract.
 
 Subsequent integration context: the original `racer-v2` branch at `c1c33a95`
 implements TokenReview authentication and enrollment

@@ -773,9 +773,6 @@ impl Harness {
         app.telemetry
             .attach_io(runtime.reactor.clone(), runtime.admission.clone())
             .unwrap();
-        app.keys
-            .register_retirement_barriers(node.retirement.clone())
-            .unwrap();
         // The harness supplies accepted control inputs; startup/recovery and every
         // datapath dependency remain the production application implementation.
         let control = app.control.take();
@@ -1399,18 +1396,9 @@ impl Harness {
             node.app.keys.install(bundle).unwrap();
             node.app.control = node.control.clone();
         }
-        let mut finished = false;
-        for _ in 0..MAX_TURNS {
-            self.tick();
-            if self.nodes.iter().all(|n| {
-                n.app.keys.pending_retirements().unwrap().is_empty()
-                    && n.workers.iter().all(|w| !w.app.retiring)
-            }) {
-                finished = true;
-                break;
-            }
-        }
-        assert!(finished, "key retirement stalled");
+        // Key admission changes synchronously; existing native/crypto owners
+        // continue through their own completion protocol during normal ticks.
+        self.tick();
         for node in &mut self.nodes {
             node.app.control = None;
             node.app.control_task.take();
@@ -1455,12 +1443,7 @@ impl Harness {
                 }
             }
             self.tick();
-            if committed.iter().all(|v| *v)
-                && self
-                    .nodes
-                    .iter()
-                    .all(|n| n.workers.iter().all(|w| !w.app.retiring))
-            {
+            if committed.iter().all(|v| *v) {
                 break;
             }
         }

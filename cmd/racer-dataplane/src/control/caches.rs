@@ -1,4 +1,5 @@
-//! Cache definitions and lifecycle events. Removal drains sockets, keys, and I/O.
+//! Cache definitions and lifecycle events. Removal closes new admission while
+//! accepted socket, key, and I/O owners drain independently.
 //!
 //! Socket paths are fixed: /run/racer/<cache name>/client/socket and
 //! /run/racer/<cache name>/origin/socket. Separate endpoint directories let pods

@@ -1,13 +1,13 @@
-//! Immutable leased key epochs with explicit, fail-closed retirement fences.
+//! Immutable key leases. Closing admission drops the registry owner; the last
+//! operation/completion owner zeroizes the secret without a node-wide fence.
 use super::identity::SigningIdentity;
 use crate::{
     control::{enrollment::LocalSigningIdentity, wire::*},
-    error::{Error, Operation, Result},
+    error::{Error, Result},
     model::{
         envelope::KeyId,
         identity::{CacheId, ClusterId, NodeId},
     },
-    runtime::deadline::RequestScope,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -22,11 +22,9 @@ struct State {
     cluster: Option<ClusterId>,
     generation: Option<BundleGeneration>,
     fingerprint: Option<[u8; 32]>,
-    retired: Vec<CacheKeyRef>,
     roots: Arc<Vec<Vec<u8>>>,
     entries: Vec<Entry>,
     identity: Option<Arc<SigningIdentity>>,
-    barriers: Option<Arc<dyn RetirementBarriers>>,
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -123,7 +121,7 @@ pub(crate) mod tests {
         assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
     }
     #[test]
-    fn retirement_requires_barriers_and_last_lease() {
+    fn retirement_closes_admission_and_last_lease_owns_secret() {
         let keys = keys();
         let cache = CacheId(CACHE.into());
         let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
@@ -141,10 +139,9 @@ pub(crate) mod tests {
             material: [7; 32],
         });
         keys.install(next.clone()).unwrap();
-        assert!(keys.pending_retirements().unwrap().is_empty());
         assert!(
             keys.lease(Some(&cache), reference.id, KeyPurpose::Page)
-                .is_ok()
+                .is_err()
         );
         assert_eq!(
             keys.active(&cache, KeyPurpose::Page).unwrap().id(),
@@ -153,54 +150,41 @@ pub(crate) mod tests {
         next.generation = BundleGeneration(3);
         next.cache_keys.pop();
         keys.install(next).unwrap();
-        assert_eq!(keys.pending_retirements().unwrap(), vec![reference.clone()]);
         assert!(
             keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
                 .is_err()
         );
-        let scope = RequestScope::new(
-            crate::model::identity::RequestId([1; 16]),
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
-        )
-        .unwrap();
-        assert!(futures::executor::block_on(keys.retire(&reference, &scope)).is_err());
         assert!(
             keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
                 .is_err()
         );
-        struct Fence;
-        impl RetirementBarriers for Fence {
-            fn fence(&self, _: &CacheKeyRef) -> Result<bool> {
-                Ok(true)
-            }
-        }
-        keys.register_retirement_barriers(Arc::new(Fence)).unwrap();
-        assert!(futures::executor::block_on(keys.retire(&reference, &scope)).is_err());
+        let secret = Arc::downgrade(&lease.secret);
+        assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
+        assert_eq!(secret.strong_count(), 1);
         drop(lease);
-        futures::executor::block_on(keys.retire(&reference, &scope)).unwrap();
+        assert!(secret.upgrade().is_none());
+        // A later generation may reintroduce the immutable UID/key identity.
+        // No process-lifetime tombstones accumulate across projection churn.
         assert!(
             keys.install(bundle(
                 4,
                 (*keys.peer_trust_roots().unwrap()).clone(),
                 CacheKeyState::Active
             ))
-            .is_err()
+            .is_ok()
         );
         assert!(
             keys.lease(Some(&cache), reference.id, KeyPurpose::Page)
-                .is_err()
+                .is_ok()
         );
     }
     #[test]
-    fn explicit_retirement_blocks_published_keys_before_fences_complete() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct Fence(AtomicBool);
-        impl RetirementBarriers for Fence {
-            fn fence(&self, _: &CacheKeyRef) -> Result<bool> {
-                Ok(self.0.load(Ordering::Acquire))
-            }
-        }
+    fn explicit_retirement_blocks_published_keys_without_external_fences() {
         let keys = keys();
+        let held = keys
+            .active(&CacheId(CACHE.into()), KeyPurpose::Page)
+            .unwrap();
+        let secret = Arc::downgrade(&held.secret);
         let roots = (*keys.peer_trust_roots().unwrap()).clone();
         let mut rotated = bundle(2, roots, CacheKeyState::Active);
         let old = rotated.cache_keys[0].key.clone();
@@ -214,15 +198,8 @@ pub(crate) mod tests {
             material: [10; 32],
         });
         keys.install(rotated.clone()).unwrap();
-        let fence = Arc::new(Fence(AtomicBool::new(false)));
-        keys.register_retirement_barriers(fence.clone()).unwrap();
-        let scope = RequestScope::new(
-            crate::model::identity::RequestId([1; 16]),
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
-        )
-        .unwrap();
-        assert!(futures::executor::block_on(keys.retire(&old, &scope)).is_err());
-        assert_eq!(keys.pending_retirements().unwrap(), vec![old.clone()]);
+        assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
+        assert_eq!(secret.strong_count(), 1);
         assert!(
             keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
                 .is_err()
@@ -232,18 +209,104 @@ pub(crate) mod tests {
             keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
                 .is_err()
         );
-        fence.0.store(true, Ordering::Release);
-        futures::executor::block_on(keys.retire(&old, &scope)).unwrap();
         // A replay acknowledges already installed configuration without resurrecting it.
         keys.install(rotated.clone()).unwrap();
-        assert!(keys.pending_retirements().unwrap().is_empty());
         assert!(
             keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
                 .is_err()
         );
         rotated.generation = BundleGeneration(3);
-        assert!(keys.install(rotated).is_err());
+        keys.install(rotated).unwrap();
+        drop(held);
+        assert!(secret.upgrade().is_none());
     }
+    #[test]
+    fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease() {
+        use crate::{
+            memory::pool::BufferPool,
+            model::{identity::*, limits::ResourceClass},
+            runtime::{
+                crypto::{self, CryptoClient, CryptoInput, CryptoOutput},
+                deadline::RequestScope,
+                worker::{CryptoRuntime, CryptoService},
+            },
+            security::aead::PageCryptoEngine,
+        };
+        let keys = keys();
+        let cache = CacheId(CACHE.into());
+        use crate::runtime::reactor::IoBuffer;
+        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let pool = BufferPool::new(admission.clone());
+        let (io, engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());
+        let client = CryptoClient::new(io);
+        let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
+        let mut plaintext = pool
+            .plaintext(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Plaintext, 3)
+                    .unwrap(),
+                3,
+            )
+            .unwrap();
+        plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
+        let page = PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache.clone(),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("held"),
+            },
+            number: PageNumber(0),
+        };
+        let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let secret = Arc::downgrade(&lease.secret);
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut operation = client.execute(
+            CryptoInput::Encrypt {
+                page,
+                plaintext,
+                ciphertext: admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                    .unwrap(),
+            },
+            lease,
+            &scope,
+        );
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        let mut next = bundle(
+            2,
+            (*keys.peer_trust_roots().unwrap()).clone(),
+            CacheKeyState::Active,
+        );
+        next.cache_keys[0].key.id = KeyId([4; 16]);
+        next.cache_keys[0].material = [10; 32];
+        keys.install(next).unwrap();
+        assert!(
+            keys.lease(Some(&cache), KeyId([1; 16]), KeyPurpose::Page)
+                .is_err()
+        );
+        assert!(secret.upgrade().is_some());
+        engine.poll_budgeted(8).unwrap();
+        client.poll_budgeted(8).unwrap();
+        let std::task::Poll::Ready(Ok(CryptoOutput::Encrypted(verified, ciphertext))) =
+            operation.as_mut().poll(&mut cx)
+        else {
+            panic!("held operation did not complete");
+        };
+        assert_eq!(verified.bytes(), b"abc");
+        assert_eq!(ciphertext.envelope().key_id, KeyId([1; 16]));
+        drop(operation);
+        assert!(secret.upgrade().is_none());
+    }
+
     #[test]
     fn identity_installation_and_leases_follow_current_trust() {
         use super::super::identity::tests::{CLUSTER, NODE};
@@ -283,15 +346,9 @@ pub(crate) mod tests {
 struct Entry {
     reference: CacheKeyRef,
     state: CacheKeyState,
-    blocked: bool,
     secret: Arc<Secret>,
 }
 struct Secret(Zeroizing<[u8; 32]>);
-/// Implementations must fence storage, checkpoints, memory, transport, and late
-/// writes for this exact epoch. `true` is an irrevocable fence, not a snapshot.
-pub trait RetirementBarriers: Send + Sync {
-    fn fence(&self, key: &CacheKeyRef) -> Result<bool>;
-}
 pub struct Keyring {
     cluster: ClusterId,
     node: NodeId,
@@ -324,7 +381,7 @@ impl KeyLease {
     pub fn cache(&self) -> &CacheId {
         &self.reference.cache
     }
-    /// Exact immutable epoch identity for storage/transport retirement fences.
+    /// Exact immutable epoch identity, independent of current admission.
     pub fn reference(&self) -> &CacheKeyRef {
         &self.reference
     }
@@ -428,15 +485,8 @@ impl Keyring {
             if state.generation == Some(bundle.generation) {
                 continue;
             }
-            if state.retired.contains(&candidate.key) {
-                return Err(Error::InvalidConfiguration);
-            }
             if let Some(old) = state.entries.iter().find(|e| e.reference == candidate.key) {
-                if *old.secret.0 != candidate.material
-                    || (old.blocked && candidate.state != CacheKeyState::Retiring)
-                    || (old.state == CacheKeyState::Retiring
-                        && candidate.state != CacheKeyState::Retiring)
-                {
+                if *old.secret.0 != candidate.material {
                     return Err(Error::InvalidConfiguration);
                 }
             }
@@ -455,34 +505,28 @@ impl Keyring {
                 Err(Error::InvalidConfiguration)
             };
         }
-        if state
-            .entries
-            .len()
-            .checked_add(
-                bundle
-                    .cache_keys
-                    .iter()
-                    .filter(|k| !state.entries.iter().any(|e| e.reference == k.key))
-                    .count(),
-            )
-            .is_none_or(|n| n > 8192)
-        {
-            return Err(Error::Overloaded);
-        }
+        // Removed entries need no tombstone or polling state. Accepted jobs own
+        // their Arc independently, including jobs whose caller has timed out.
+        state.entries.retain(|entry| {
+            bundle
+                .cache_keys
+                .iter()
+                .any(|k| k.key == entry.reference && k.state != CacheKeyState::Retiring)
+        });
         for entry in &mut state.entries {
             entry.state = bundle
                 .cache_keys
                 .iter()
                 .find(|k| k.key == entry.reference)
                 .map_or(CacheKeyState::Retiring, |k| k.state);
-            entry.blocked |= !bundle.cache_keys.iter().any(|k| k.key == entry.reference);
         }
         for candidate in &bundle.cache_keys {
-            if !state.entries.iter().any(|e| e.reference == candidate.key) {
+            if candidate.state != CacheKeyState::Retiring
+                && !state.entries.iter().any(|e| e.reference == candidate.key)
+            {
                 state.entries.push(Entry {
                     reference: candidate.key.clone(),
                     state: candidate.state,
-                    blocked: false,
                     secret: Arc::new(Secret(Zeroizing::new(candidate.material))),
                 });
             }
@@ -497,18 +541,6 @@ impl Keyring {
     pub fn install_identity(&self, identity: LocalSigningIdentity) -> Result<()> {
         let roots = self.peer_trust_roots()?;
         self.install_signing_identity(identity.signing_identity(&roots)?)
-    }
-    pub fn pending_retirements(&self) -> Result<Vec<CacheKeyRef>> {
-        let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.cluster.as_ref() != Some(&self.cluster) {
-            return Err(Error::MissingKey);
-        }
-        Ok(state
-            .entries
-            .iter()
-            .filter(|e| e.blocked)
-            .map(|e| e.reference.clone())
-            .collect())
     }
     pub fn install_signing_identity(&self, identity: Arc<SigningIdentity>) -> Result<()> {
         if identity.node() != &self.node || identity.cluster() != &self.cluster {
@@ -559,7 +591,7 @@ impl Keyring {
         let entry = state
             .entries
             .iter()
-            .find(|e| e.reference == reference && !e.blocked)
+            .find(|e| e.reference == reference)
             .ok_or(Error::MissingKey)?;
         Ok(KeyLease {
             reference,
@@ -579,67 +611,11 @@ impl Keyring {
                 &e.reference.cache == cache
                     && e.reference.purpose == purpose
                     && e.state == CacheKeyState::Active
-                    && !e.blocked
             })
             .ok_or(Error::MissingKey)?;
         Ok(KeyLease {
             reference: entry.reference.clone(),
             secret: entry.secret.clone(),
-        })
-    }
-    pub fn register_retirement_barriers(
-        &self,
-        barriers: Arc<dyn RetirementBarriers>,
-    ) -> Result<()> {
-        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.barriers.is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        state.barriers = Some(barriers);
-        Ok(())
-    }
-    pub fn retire<'a>(
-        &'a self,
-        key: &'a CacheKeyRef,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            scope.check()?;
-            let barriers = {
-                let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-                if state.cluster.as_ref() != Some(&self.cluster) {
-                    return Err(Error::MissingKey);
-                }
-                let entry = state
-                    .entries
-                    .iter_mut()
-                    .find(|e| &e.reference == key)
-                    .ok_or(Error::MissingKey)?;
-                if entry.state != CacheKeyState::Retiring {
-                    return Err(Error::InvalidRequest);
-                }
-                entry.blocked = true;
-                state.barriers.clone().ok_or(Error::Unavailable)?
-            };
-            if !barriers.fence(key)? {
-                return Err(Error::Unavailable);
-            }
-            scope.check()?;
-            let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let index = state
-                .entries
-                .iter()
-                .position(|e| &e.reference == key)
-                .ok_or(Error::MissingKey)?;
-            if Arc::strong_count(&state.entries[index].secret) != 1 {
-                return Err(Error::Unavailable);
-            }
-            if state.retired.len() >= 8192 {
-                return Err(Error::Overloaded);
-            }
-            state.retired.push(key.clone());
-            state.entries.remove(index);
-            Ok(())
         })
     }
 }

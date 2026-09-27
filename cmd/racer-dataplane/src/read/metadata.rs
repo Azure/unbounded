@@ -397,7 +397,7 @@ impl MetadataService {
         }
     }
     /// Wake actual ingress children, including those parked in FuturesUnordered.
-    /// The worker tick calls this during normal polling, retirement, and drain.
+    /// The worker tick calls this during normal polling and shutdown drain.
     pub(crate) fn poll_deadlines(&self, now: Instant, budget: usize) -> usize {
         self.deadlines.poll(now, budget)
     }

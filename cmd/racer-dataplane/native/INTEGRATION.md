@@ -87,8 +87,9 @@ local_member.alignment_enabled)`. False requests revocation and removes readines
 replace the closed lifecycle pair before reactivation. Never continue advertising
 a fabric mapping after publication changes.
 
-For live cache/key retirement, pause the affected read/peer producers, capture
-`rdma_transfer.fence_cut()` and await it before acknowledging the retirement.
-This snapshots current sessions, requests cancellation on all of them before
-awaiting any fence, and leaves admission for future unrelated sessions open.
+Live cache/key retirement closes new application admission without canceling native
+sessions. Existing transfers retain their own registered-buffer/slot leases and
+mandatory terminal fences; deadlines never permit recycling DMA-visible memory.
+`rdma_transfer.fence_cut()` remains an explicit maintenance utility that cancels
+captured sessions; cache/key publication does not call it.
 `drain()` is terminal and is reserved for worker shutdown.

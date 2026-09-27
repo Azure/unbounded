@@ -102,9 +102,11 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   page/metadata ownership against its stable WorkerMap, distributes each shard,
   and awaits recovery.install_shard_with_keys before opening listeners. The
   available-key list must come from the accepted keyring, never from disk.
-  For cache-scoped keyrings, Recovery::filter_available_keys(&mut image, predicate)
-  takes `(cache UID, key ID)` and must run before distribution/install. The legacy
-  key-ID-only slice hooks assume globally unique key IDs.
+  Production calls Recovery::filter_available before distribution/install, using
+  both the accepted cache UID set and available page keys. Standalone metadata
+  requires a current UID and an active page key; entries require their exact key.
+  The low-level key-ID-only slice hooks assume globally unique IDs and are not
+  sufficient for production cache-UID admission.
 - Drive writer.progress(budget, scope) with a worker maintenance scope, polling
   concurrently with reactor.poll_budgeted. Keep a pending future alive between
   polls. Do not borrow a request credential context or create an extra executor.
@@ -114,12 +116,13 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   configuration/corruption errors remain errors. Exactly one progress driver is allowed.
 - Fill can call reader.read_with_token and reader.invalidate(token) after AEAD
   failure; conditional invalidation cannot remove a replacement mapping.
-- Retirement first serializes against checkpoint publication, calls
-  writer.retire_key(cache,key) or remove_cache(cache), drains/fences outstanding
-  I/O, and awaits checkpoint.invalidate_persisted_async to remove both recoverable
-  generations before key release. This sacrifices unrelated cache recovery
-  instead of requiring payload scans. The security owner
-  additionally drains memory/crypto/peer leases. Tombstone bounds fail closed.
+- Removal closes admission using the current positive cache/key set. Lookup and
+  late publication consult that set; eviction drops only cache references. A
+  submitted writer also checks its original dirty ticket before publishing, so
+  removal/reinsertion cannot let an older completion replace a newer write.
+  Submitted buffers and segment leases stay owned until actual I/O completion.
+  Checkpoint invalidation is not part of retirement: historical keyless ciphertext
+  can remain, and recovery filters both slots before installing any shard.
 - Stopping Admission does not prevent previously accepted fills from handing over
   their dirty reservations. Enqueue uses Admission::reserve_completion for padded
   staging, with the same hard ciphertext limit, and must follow Store::open.
@@ -134,9 +137,9 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   is_idle includes slab write fences even after the progress future is dropped.
   pending_count includes active copies, queued_count only unsubmitted copies,
   writes_in_flight counts submitted/unconsumed fenced write owners, and
-  discarded_count is a saturating persistence-loss counter. Key retirement may
-  empty the index/queue before writes_in_flight reaches zero; key release must wait
-  for that fence plus the independent memory/crypto/transport barriers.
+  discarded_count is a saturating persistence-loss counter. Eviction may empty the
+  index/queue before writes_in_flight reaches zero; I/O resource owners still await
+  their own fences. Ciphertext persistence does not need a secret-key lease.
 
 Staging headroom is reserved per accepted dirty copy rather than borrowed later
 from holders that may wait for that same dirty copy. If there is no padded staging
@@ -166,6 +169,5 @@ synchronously within the checkpoint/recovery futures. Payload slab reads/writes
 use the reactor. Application scheduling must treat checkpoint publication as a
 maintenance operation; it is not a nonblocking reactor metadata-I/O adapter.
 
-Serving-loop retirement uses `invalidate_persisted_async`: directory opening and
-both generation unlinks are completion-owned reactor filesystem operations.
-Missing files are already invalidated; other errors leave retirement fenced.
+`invalidate_persisted_async` is an explicit reset utility, not a serving-loop key
+or cache retirement requirement. Its filesystem operations retain completion owners.

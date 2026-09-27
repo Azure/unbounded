@@ -92,7 +92,7 @@ impl WorkerApplication {
         node.observations.record(
             self.worker,
             Resources {
-                workers_usable: self.started && !self.stopping && !self.retiring,
+                workers_usable: self.started && !self.stopping,
                 storage_usable: self.store.writer.slabs().alignment().is_ok(),
                 listeners_usable: self.started
                     && (self.control.is_none()

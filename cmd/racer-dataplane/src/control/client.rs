@@ -49,6 +49,7 @@ pub struct ControlClient {
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
     binding_check: Cell<bool>,
     restart_required: Cell<bool>,
+    pending: RefCell<Option<wire::Publication>>,
 }
 struct Busy<'a>(&'a Cell<bool>);
 struct ActiveTurn<'a>(&'a RefCell<Option<RequestScope>>);
@@ -109,6 +110,7 @@ impl ControlClient {
             startup_bundle: RefCell::new(None),
             binding_check: Cell::new(false),
             restart_required: Cell::new(false),
+            pending: RefCell::new(None),
         }
     }
     /// Reads the projected token at submission; retries reuse the same request ID.
@@ -357,6 +359,10 @@ impl ControlClient {
             if self.restart_required.get() {
                 return Err(Error::NodeIdentityChanged);
             }
+            if self.pending.borrow().is_some() {
+                self.install_pending()?;
+                return self.state();
+            }
             if self
                 .next
                 .get()
@@ -455,20 +461,35 @@ impl ControlClient {
         match polled? {
             SnapshotResponse::Updated(publication) => {
                 scope.check()?;
-                // Validate before acceptance; event delivery is infallible after this.
-                super::caches::validate_definitions(&publication.caches)?;
-                let transition = self
-                    .lifecycle
-                    .borrow()
-                    .as_ref()
-                    .map(|l| l.stage(&publication.caches))
-                    .transpose()?;
-                let snapshot = self.snapshots.publish_staged(publication, transition)?;
-                let events = self.caches.reconcile(&snapshot.caches)?;
-                self.events.borrow_mut().extend(events);
+                self.snapshots.validate(publication.clone())?;
+                *self.pending.borrow_mut() = Some(publication);
+                self.install_pending()?;
             }
             SnapshotResponse::Unchanged => (),
         }
+        Ok(())
+    }
+    /// Retry local preparation/installation without projection, renewal, or HTTP.
+    /// One bounded full publication survives transient failures and expired turns.
+    fn install_pending(&self) -> Result<()> {
+        let publication = self
+            .pending
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or(Error::Internal)?;
+        let transition = self
+            .lifecycle
+            .borrow()
+            .as_ref()
+            .map(|l| l.stage(&publication.caches))
+            .transpose()?;
+        let snapshot = self.snapshots.publish_staged(publication, transition)?;
+        self.events
+            .borrow_mut()
+            .extend(self.caches.reconcile(&snapshot.caches)?);
+        self.pending.borrow_mut().take();
+        self.next.set(Some(crate::runtime::environment::now()));
         Ok(())
     }
     async fn renew(&self, scope: &RequestScope) -> Result<()> {

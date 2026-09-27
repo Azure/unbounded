@@ -20,7 +20,8 @@ The [control API](CONTROL_API.md) provisions caches and credentials separately.
   `/run/racer/<cache name>/origin/socket`. The directory selects the cache; no cache
   header or URL parameter exists. Canonical socket paths and cache-definition
   validation are implemented in `src/control/caches.rs:55-99`; application cache
-  transitions and retirement are wired in `src/app_caches.rs` and `src/app_retirement.rs`.
+  transitions are wired in `src/app_caches.rs`; scoped new-admission checks use
+  `src/control/availability.rs`, while accepted operations drain under their leases.
 - Exactly `HEAD` and `GET` on `/v1/objects/<key>`, where `<key>` is exactly 64
   lowercase hexadecimal characters encoding the 32-byte key. Require this exact
   origin-form request target: no query (even empty), fragment, percent encoding,

@@ -32,10 +32,11 @@ pub struct Recovery {
 }
 
 impl Recovery {
-    /// Cache-scoped filtering for production keyrings. Invoke before installation;
-    /// descriptors remain available for pins, but unavailable payloads do not.
-    pub fn filter_available_keys(
+    /// Filter disposable checkpoint state before installation. Standalone metadata
+    /// has no key ID, so it requires both a current cache UID and an active page key.
+    pub fn filter_available(
         image: &mut CheckpointImage,
+        mut metadata_available: impl FnMut(&crate::model::identity::CacheId) -> bool,
         mut available: impl FnMut(&crate::model::identity::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
@@ -43,6 +44,10 @@ impl Recovery {
                 .index
                 .entries
                 .retain(|(page, entry)| available(&page.version.object.cache, entry.key_id));
+            shard
+                .index
+                .metadata
+                .retain(|m| metadata_available(&m.version.object.cache));
         }
     }
     pub fn new(directory: PathBuf, index: Rc<Index>, segments: Rc<Segments>) -> Self {

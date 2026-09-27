@@ -426,11 +426,15 @@ in the implementation test environment.
   certificates; subsequent snapshot polls use mTLS, not control HTTP signatures.
   One selected worker owns control enrollment; worker handles share node-wide
    snapshot and key-epoch roots. Bounded dispatch routes work to page owners.
-- Live key retirement and cache removal use a node-wide quiescent cut. Admission
-  pauses while accepted read, write, crypto, kernel, and native operations finish;
-  recoverable checkpoints are invalidated before omitted keys are destroyed.
-  The control worker alone restores client, peer, and diagnostic listeners.
-  This conservative path temporarily interrupts unrelated caches and diagnostics.
+- Live retirement closes new admission for the affected cache/key. Accepted work
+  drains under its original deadlines and resource leases; key material is zeroized
+  when its final secret lease drops. Peer listeners, diagnostics, control, and
+  unrelated caches continue polling. Control retains the entire validated pending
+  publication through local staging/install without downloading it again.
+  Historical keyless ciphertext/checkpoints may remain: recovery filters current
+  cache UIDs and available keys, including standalone metadata, before installation.
+  Reintroducing a UID means the same immutable namespace, while reused socket paths
+  get new listener generations. No process-lifetime removal tombstones accumulate.
 - `test_support` is test-only. Inline test sections identify the owning contracts;
   implement behavioral tests with each feature, rather than tests of placeholders.
 

@@ -85,9 +85,9 @@ impl Checkpointer {
         }
     }
 
-    /// Coordinator-only: invalidate both recoverable generations before releasing
-    /// a retired key. Serialize with all snapshot publication, including snapshots
-    /// already transferred from other workers. Payload files stay intact.
+    /// Explicit cache reset, serialized with checkpoint publication. Key/cache
+    /// removal does not require this: recovery filters current UID/key availability.
+    /// Payload files stay intact.
     pub fn invalidate_persisted(&self) -> Result<()> {
         if self.frozen.get() {
             return Err(Error::Overloaded);
@@ -102,7 +102,7 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// Serving-loop variant. Paths and directory ownership stay with accepted
+    /// Asynchronous reset variant. Paths and directory ownership stay with accepted
     /// filesystem submissions until completion, including on cancellation.
     pub fn invalidate_persisted_async(
         &self,

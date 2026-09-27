@@ -201,10 +201,12 @@ are consumed by both Go and Rust tests. Bundle keys there are synthetic all-zero
 or repeated-byte test values, and the certificate/CSR contain only public data.
 
 Stage replacements before activation, targeting daily rotation without waiting
-for acknowledgments. Missing previously installed keys initiate local retirement:
-stop new use, evict dependent ciphertext/checkpoint references, drain leases, fence
-late writes, then release material. Projection removal cannot bypass that ordering.
-On restart discard records whose keys are unavailable. Lagging nodes fail operations
+for acknowledgments. Retiring or missing keys stop new leases. Accepted operations
+retain zeroizing secret leases until completion, independently of ciphertext I/O
+and native DMA resource fences. Historical keyless ciphertext/checkpoints may remain.
+On restart discard unavailable cache UIDs and keys before installation, including
+standalone metadata when its UID or active page key is unavailable. Lagging nodes
+fail operations
 requiring missing keys; uninterrupted interoperability during rotation is not
 guaranteed. Snapshot and bundle generations advance independently; admit cache
 operations only when both configuration and required credentials are usable.

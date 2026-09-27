@@ -360,7 +360,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        caches: vec![],
+        caches: vec![crate::control::caches::CacheDefinition {
+            id: CacheId(CACHE.into()),
+            name: "remote".into(),
+            client_socket: "/run/racer/remote/client/socket".into(),
+            origin_socket: "/run/racer/remote/origin/socket".into(),
+        }],
         members: (0..4)
             .map(|i| Member {
                 node: node(i),
@@ -951,7 +956,12 @@ fn metadata_coordinator_with_newer_publication(
         sequence: PublicationSequence(1),
         membership_version: membership.version,
         members: membership.members().to_vec(),
-        caches: vec![],
+        caches: vec![crate::control::caches::CacheDefinition {
+            id: CacheId(CACHE.into()),
+            name: "remote".into(),
+            client_socket: "/run/racer/remote/client/socket".into(),
+            origin_socket: "/run/racer/remote/origin/socket".into(),
+        }],
     };
     snapshots.publish(publication.clone()).unwrap();
     if newer_publication {

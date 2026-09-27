@@ -130,7 +130,7 @@ fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
 }
 
 #[test]
-fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill() {
+fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill() {
     use crate::control::caches::CacheLifecycle;
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
@@ -156,6 +156,24 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
         .snapshots
         .publish(publication(&config, 1, vec![definition()]))
         .unwrap();
+    first
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: 1,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(2),
+            peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
+            cache_keys: vec![wire::CacheEncryptionKey {
+                key: wire::CacheKeyRef {
+                    cache: definition().id,
+                    id: crate::model::envelope::KeyId([7; 16]),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                state: wire::CacheKeyState::Active,
+                material: [19; 32],
+            }],
+        })
+        .unwrap();
     let late0 = page(&first);
     let late1 = page(&second);
     first.memory.publish(late0.clone()).unwrap();
@@ -167,39 +185,34 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
     };
     assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    first.poll_retirement(&mut cx).unwrap();
-    assert!(
-        !node.retirement.quiescent().unwrap(),
-        "worker zero cannot acknowledge worker one"
-    );
+    first.poll_cache_preparation(&mut cx).unwrap();
     let (release, receive) = futures::channel::oneshot::channel::<()>();
     let memory = second.memory.clone();
     let late = late1.clone();
     let owner = second.drivers.enter();
     crate::read::drivers::spawn(Box::pin(async move {
         receive.await.map_err(|_| Error::Cancelled)?;
-        memory.publish(late)
+        assert_eq!(memory.publish(late), Err(Error::Unavailable));
+        Ok(())
     }))
     .unwrap();
     drop(owner);
     for _ in 0..4 {
-        first.poll_retirement(&mut cx).unwrap();
-        second.poll_retirement(&mut cx).unwrap();
+        first.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
     }
-    assert!(!node.retirement.quiescent().unwrap());
+    assert_eq!(second.drivers.pending(), 1);
     assert_eq!(
         first.snapshots.cursor().unwrap(),
         Some(wire::PublicationSequence(1))
     );
     assert!(first.memory.get(late0.plaintext.page()).unwrap().is_some());
-    release.send(()).unwrap();
     // Avoid a real control poll here: drive the exact stage/acceptance handoff.
     first.control_task = Some(Box::pin(std::future::pending()));
     for _ in 0..8 {
-        first.poll_retirement(&mut cx).unwrap();
-        second.poll_retirement(&mut cx).unwrap();
+        first.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
     }
-    assert!(node.retirement.quiescent().unwrap());
     let rejected = adapter.stage(&[]).unwrap();
     let mut invalid = publication(&config, 2, vec![]);
     invalid.members[0].peer_endpoint = "127.0.0.1:7444".into();
@@ -213,8 +226,8 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
     );
     assert!(first.memory.get(late0.plaintext.page()).unwrap().is_some());
     for _ in 0..4 {
-        first.poll_retirement(&mut cx).unwrap();
-        second.poll_retirement(&mut cx).unwrap();
+        first.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
     }
     first
         .snapshots
@@ -223,19 +236,15 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
             Some(adapter.stage(&[]).unwrap()),
         )
         .unwrap();
-    first.poll_retirement(&mut cx).unwrap();
-    assert!(first.retiring && second.retiring);
-    assert!(second.memory.get(late1.plaintext.page()).unwrap().is_some());
-    let until = Instant::now() + Duration::from_secs(5);
-    while node.retirement.active().unwrap() {
-        rt0.reactor.poll_budgeted(64).unwrap();
-        rt1.reactor.poll_budgeted(64).unwrap();
-        first.poll_retirement(&mut cx).unwrap();
-        second.poll_retirement(&mut cx).unwrap();
-        rt0.reactor.wait(Duration::from_millis(1)).unwrap();
-        assert!(Instant::now() < until, "cache removal did not finish");
-    }
-    assert!(!node.retirement.active().unwrap());
+    assert_eq!(
+        second.drivers.pending(),
+        1,
+        "removal cannot cancel an accepted driver"
+    );
+    assert!(second.memory.get(late1.plaintext.page()).unwrap().is_none());
+    release.send(()).unwrap();
+    second.drivers.poll(&mut cx, 64);
+    assert_eq!(second.drivers.pending(), 0);
     for (app, late) in [(&first, late0), (&second, late1)] {
         assert!(app.memory.get(late.plaintext.page()).unwrap().is_none());
         assert_eq!(app.memory.publish(late.clone()), Err(Error::Unavailable));
@@ -254,7 +263,7 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
         ));
     }
     assert!(second.peer_task.is_none() && second.diagnostic_task.is_none());
-    // A removed UID cannot silently resurrect its tombstoned worker state.
+    // UID reuse is staged normally and consumes no cumulative tombstones.
     assert!(matches!(
         adapter.stage(&[definition()]),
         Err(Error::Unavailable)
@@ -341,6 +350,7 @@ struct Fixture {
     bootstrap_status: Arc<AtomicUsize>,
     poll_status: Arc<AtomicUsize>,
     certificate_age: Arc<AtomicUsize>,
+    publication: Arc<Mutex<Option<wire::Publication>>>,
     bootstrap_requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
     poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -410,6 +420,9 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     )
     .unwrap();
     assert!(node.observations.health.ready());
+    // Retained-publication startup completes staging without another HTTP turn.
+    // Establish a successful control turn before measuring renewal-only backoff.
+    turn(&mut worker, &runtime, &mut engine);
     let control = worker.control.clone().unwrap();
     let old = control.identity().unwrap();
     assert!(old.renewal_due() && old.valid_now());
@@ -594,6 +607,176 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
 }
 
 #[test]
+fn removal_publication_finishes_locally_after_controller_disappears() {
+    use crate::model::{envelope::KeyId, identity::*, metadata::VersionMetadata};
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config.diagnostics_listen = diagnostic_address.local_addr().unwrap();
+    drop(diagnostic_address);
+    let keep = crate::control::caches::CacheDefinition {
+        id: CacheId("44444444-4444-4444-8444-444444444444".into()),
+        name: "keep".into(),
+        client_socket: "/run/racer/keep/client/socket".into(),
+        origin_socket: "/run/racer/keep/origin/socket".into(),
+    };
+    *fixture.publication.lock().unwrap() =
+        Some(publication(&config, 1, vec![definition(), keep.clone()]));
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    Rc::get_mut(&mut worker.clients)
+        .unwrap()
+        .set_root(fixture.directory.join("sockets"));
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: 1,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(2),
+            peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
+            cache_keys: vec![wire::CacheEncryptionKey {
+                key: wire::CacheKeyRef {
+                    cache: keep.id.clone(),
+                    id: KeyId([9; 16]),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                state: wire::CacheKeyState::Active,
+                material: [29; 32],
+            }],
+        })
+        .unwrap();
+    let metadata = VersionMetadata {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: keep.id.clone(),
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::test_value("kept"),
+        },
+        length: 0,
+    };
+    worker
+        .store
+        .writer
+        .index()
+        .publish_version(metadata.clone())
+        .unwrap();
+    // A full removal snapshot also carries a new topology; retain both locally.
+    let mut next = publication(&config, 2, vec![keep.clone()]);
+    next.membership_version = MembershipVersion(2);
+    next.members[0].peer_endpoint = "127.0.0.1:7555".into();
+    *fixture.publication.lock().unwrap() = Some(next);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let until = Instant::now() + Duration::from_secs(10);
+    while node.cache_cut.lock().unwrap().definitions.len() != 1 {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        worker.poll_control(&mut cx).unwrap();
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+        assert!(Instant::now() < until);
+    }
+    assert_eq!(
+        worker.snapshots.cursor().unwrap(),
+        Some(wire::PublicationSequence(1))
+    );
+    fixture.stop.store(true, Ordering::Release);
+    fixture.server.take().unwrap().join().unwrap();
+    let polls = fixture.polls.load(Ordering::Acquire);
+    while worker.snapshots.cursor().unwrap() != Some(wire::PublicationSequence(2)) {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
+        assert!(
+            Instant::now() < until,
+            "accepted publication depended on a second HTTP poll"
+        );
+    }
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls);
+    let current = worker.snapshots.current().unwrap();
+    assert_eq!(current.membership.version, MembershipVersion(2));
+    assert_eq!(
+        current
+            .membership
+            .member(&config.node)
+            .unwrap()
+            .peer_endpoint,
+        "127.0.0.1:7555"
+    );
+    assert!(worker.peer_task.is_some() && worker.diagnostic_task.is_some());
+    assert!(worker.listener_scope.as_ref().unwrap().check().is_ok());
+    assert!(worker.diagnostic_scope.as_ref().unwrap().check().is_ok());
+    assert_eq!(
+        worker
+            .store
+            .writer
+            .index()
+            .version(&metadata.version)
+            .unwrap(),
+        Some(metadata.clone())
+    );
+    // An unrelated cache still serves a pinned HEAD over its real owned UDS.
+    let directory = std::fs::File::open(fixture.directory.join("sockets/keep/client")).unwrap();
+    use std::os::fd::AsRawFd;
+    let mut client = std::os::unix::net::UnixStream::connect(format!(
+        "/proc/self/fd/{}/socket",
+        directory.as_raw_fd()
+    ))
+    .unwrap();
+    client.set_nonblocking(true).unwrap();
+    client.write_all(format!("HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: \"kept\"\r\nConnection: close\r\n\r\n", "0".repeat(64)).as_bytes()).unwrap();
+    let mut response = Vec::new();
+    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
+        let mut bytes = [0; 1024];
+        match client.read(&mut bytes) {
+            Ok(n) => response.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+            Err(e) => panic!("{e}"),
+        }
+        assert!(Instant::now() < until, "unrelated cache stopped serving");
+    }
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let mut diagnostic = std::net::TcpStream::connect(config.diagnostics_listen).unwrap();
+    diagnostic.set_nonblocking(true).unwrap();
+    diagnostic
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: racer\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
+        let mut bytes = [0; 1024];
+        match diagnostic.read(&mut bytes) {
+            Ok(n) => response.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+            Err(e) => panic!("{e}"),
+        }
+        assert!(Instant::now() < until, "diagnostics stopped during removal");
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let shutdown = scope(Duration::from_secs(5)).unwrap();
+    drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
+    drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
+    drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
+}
+
+#[test]
 fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let mut fixture = Fixture::new();
     let config = fixture.config.take().unwrap();
@@ -746,7 +929,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 }
 
 #[test]
-fn two_worker_real_control_retirement_and_checkpoint_cut() {
+fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     use crate::{
         runtime::affinity::{EffectiveTopology, WorkerPair},
         store::checkpoint_format::CheckpointCodec,
@@ -820,23 +1003,18 @@ fn two_worker_real_control_retirement_and_checkpoint_cut() {
     })
     .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
-    while !node.retirement.quiescent().unwrap() {
-        assert!(
-            Instant::now() < until,
-            "both worker retirement fences did not arrive"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(keys.pending_retirements().unwrap(), vec![key]);
+    assert!(keys.lease(Some(&cache), key.id, KeyPurpose::Page).is_err());
+    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[21; 32]);
+    assert!(node.observations.health.ready());
     drop(lease);
-    while node.retirement.active().unwrap() || !node.observations.health.ready() {
+    while !node.observations.health.ready() {
         assert!(
             Instant::now() < until,
-            "two-worker retirement did not resume"
+            "two-worker readiness did not progress"
         );
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(keys.pending_retirements().unwrap().is_empty());
+    assert!(keys.active(&cache, KeyPurpose::Page).is_err());
     let shutdown = scope(Duration::from_secs(10)).unwrap();
     group.drain(&shutdown).unwrap();
     group.shutdown(&shutdown).unwrap();
@@ -955,6 +1133,8 @@ impl Fixture {
         let requests = bootstrap_requests.clone();
         let poll_certificates = Arc::new(Mutex::new(Vec::new()));
         let certificates = poll_certificates.clone();
+        let published = Arc::new(Mutex::new(None::<wire::Publication>));
+        let external_publication = published.clone();
         let server = thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 let (socket, _) = match listener.accept() {
@@ -1002,6 +1182,9 @@ impl Fixture {
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
                 let node = current_binding.lock().unwrap().clone();
+                if let Some(next) = external_publication.lock().unwrap().clone() {
+                    publication = next;
+                }
                 publication.members[0].node = node.clone();
                 let requested_status = if head.starts_with("POST ") {
                     assert!(head.contains("Authorization: Bearer fixture.token"));
@@ -1064,7 +1247,12 @@ impl Fixture {
                         .unwrap()
                         .push(stream.conn.peer_certificates().unwrap()[0].to_vec());
                     polled.fetch_add(1, Ordering::Release);
-                    if head.lines().next().unwrap().contains("?after=1") {
+                    if head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains(&format!("?after={} ", publication.sequence.0))
+                    {
                         (204, Vec::new())
                     } else {
                         (200, wire::encode_publication(&publication).unwrap())
@@ -1093,6 +1281,7 @@ impl Fixture {
             certificate_age,
             bootstrap_requests,
             poll_certificates,
+            publication: published,
         }
     }
 }
@@ -1155,9 +1344,10 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let startup = scope(Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready());
-    assert!(
-        fixture.polls.load(Ordering::Acquire) >= 2,
-        "first publication waits for prepared resource retry"
+    assert_eq!(
+        fixture.polls.load(Ordering::Acquire),
+        1,
+        "prepared resources install the retained publication without another poll"
     );
     assert_eq!(
         fixture.enrollments.load(Ordering::Acquire),
@@ -1173,8 +1363,8 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
             )
             .unwrap();
     }
-    // Retire an omitted epoch through the actual serving loop. A held key lease
-    // must keep material alive even after all worker/kernel/checkpoint barriers.
+    // Retire an omitted epoch through the actual serving loop. Accepted crypto
+    // retains its key and buffers, without pausing listeners or deleting checkpoints.
     let cache = crate::model::identity::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
@@ -1284,10 +1474,19 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     }
     assert!(
         fixture.directory.join("slabs/checkpoint.0").is_file(),
-        "accepted crypto completion must precede checkpoint invalidation"
+        "historical checkpoints remain disposable cache"
     );
     assert_eq!(runtime.crypto.outstanding(), 1);
-    while worker.retirement_checkpoint.is_none() {
+    assert!(worker.peer_task.is_some());
+    assert!(worker.diagnostic_task.is_some());
+    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[19; 32]);
+    assert!(
+        worker
+            .keys
+            .lease(Some(&cache), reference.id, KeyPurpose::Page)
+            .is_err()
+    );
+    while runtime.crypto.outstanding() != 0 {
         engine.poll_budgeted(64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         runtime.reactor.poll_budgeted(64).unwrap();
@@ -1297,14 +1496,9 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
                 64,
             )
             .unwrap();
-        assert!(
-            Instant::now() < until,
-            "checkpoint invalidation was not submitted"
-        );
+        assert!(Instant::now() < until, "accepted crypto completion stalled");
     }
-    // Application polling alone cannot acknowledge an unconsumed filesystem CQE.
-    let in_flight = runtime.reactor.in_flight();
-    assert!(in_flight > 0);
+    // Continued serving does not need an invalidation CQE or final key release.
     for _ in 0..4 {
         worker
             .poll_budgeted(
@@ -1312,43 +1506,14 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
                 64,
             )
             .unwrap();
-        assert!(worker.retirement_checkpoint.is_some());
-        assert_eq!(runtime.reactor.in_flight(), in_flight);
-        assert!(
-            !crate::security::keyring::RetirementBarriers::fence(&*node.retirement, &reference)
-                .unwrap()
-        );
-        assert_eq!(
-            worker.keys.pending_retirements().unwrap(),
-            vec![reference.clone()]
-        );
+        assert!(worker.peer_task.is_some());
+        assert!(worker.diagnostic_task.is_some());
     }
-    while !crate::security::keyring::RetirementBarriers::fence(&*node.retirement, &reference)
-        .unwrap()
-    {
-        engine.poll_budgeted(64).unwrap();
-        runtime.crypto.poll_budgeted(64).unwrap();
-        runtime.reactor.poll_budgeted(64).unwrap();
-        worker
-            .poll_budgeted(
-                &mut Context::from_waker(futures::task::noop_waker_ref()),
-                64,
-            )
-            .unwrap();
-        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
-        assert!(
-            Instant::now() < until,
-            "retirement checkpoint fence stalled"
-        );
-    }
-    assert!(!fixture.directory.join("slabs/checkpoint.0").exists());
-    assert!(!fixture.directory.join("slabs/checkpoint.1").exists());
-    assert_eq!(
-        worker.keys.pending_retirements().unwrap(),
-        vec![reference.clone()]
-    );
+    assert!(fixture.directory.join("slabs/checkpoint.0").exists());
+    assert!(fixture.directory.join("slabs/checkpoint.1").exists());
+    assert!(worker.keys.active(&cache, KeyPurpose::Page).is_err());
     let late = self::page(&worker);
-    assert_eq!(worker.memory.publish(late.clone()), Err(Error::MissingKey));
+    assert!(worker.memory.publish(late.clone()).is_err());
     let dirty = runtime
         .admission
         .reserve(
@@ -1362,22 +1527,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         Err(Error::MissingKey)
     ));
     assert_eq!(runtime.crypto.outstanding(), 0);
-    assert!(worker.retiring);
     drop(lease);
-    while !worker.keys.pending_retirements().unwrap().is_empty() || worker.retiring {
-        runtime.reactor.poll_budgeted(64).unwrap();
-        worker
-            .poll_budgeted(
-                &mut Context::from_waker(futures::task::noop_waker_ref()),
-                64,
-            )
-            .unwrap();
-        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
-        assert!(
-            Instant::now() < until,
-            "retirement key destruction/resume stalled"
-        );
-    }
     runtime.reactor.poll_budgeted(64).unwrap();
     worker
         .poll_budgeted(

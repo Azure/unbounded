@@ -85,8 +85,10 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
   connection ownership. `finish_to_socket` handles owned unframed sockets. Copied
   pipe data can be spliced without retaining userspace page pointers; readiness
   and asynchronous fallback operations retain all required connection/page leases.
-- `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` block late
-  publication. `evict_idle(bytes)` releases idle bundles and reports combined
+- `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` evict references.
+  Production lookups and late publication consult the current positive cache/key
+  availability set, without removal tombstones. `evict_idle(bytes)` releases idle
+  bundles and reports combined
   plaintext/ciphertext charges; it is not a class-specific admission budget.
   Read-owner pressure uses `reclaim_idle` with the exhausted class and its exact
   deficit. Fair-share pressure reclaims only the requesting cache; global pressure

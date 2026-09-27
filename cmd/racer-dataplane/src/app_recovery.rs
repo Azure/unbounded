@@ -9,6 +9,7 @@ pub(super) struct RecoveryCut {
     selected: bool,
     shards: HashMap<WorkerId, ShardImage>,
     failure: Option<Error>,
+    installed: HashSet<WorkerId>,
 }
 
 impl WorkerApplication {
@@ -51,6 +52,7 @@ impl WorkerApplication {
                         &node.workers,
                         self.runtime.admission.limits().metadata_entries.get(),
                         &self.keys,
+                        &self.snapshots.current()?.caches,
                     );
                     cut.shards = selected.map_or_else(HashMap::default, |image| {
                         image.shards.into_iter().map(|s| (s.worker, s)).collect()
@@ -84,6 +86,25 @@ impl WorkerApplication {
                 .failure = Some(error);
             return Err(error);
         }
+        node.recovery
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .installed
+            .insert(self.worker);
+        std::future::poll_fn(|cx| {
+            startup.check()?;
+            let cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
+            if let Some(error) = cut.failure {
+                return Poll::Ready(Err(error));
+            }
+            if cut.installed.len() == node.count {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await?;
         Ok(())
     }
 }
@@ -94,6 +115,7 @@ fn select(
     workers: &WorkerDirectory,
     capacity: usize,
     keys: &Keyring,
+    caches: &[crate::control::caches::CacheDefinition],
 ) -> Option<CheckpointImage> {
     candidates.sort_by_key(|image| std::cmp::Reverse(image.sequence));
     candidates.into_iter().find_map(|mut image| {
@@ -101,9 +123,13 @@ fn select(
         if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
             return None;
         }
-        Recovery::filter_available_keys(&mut image, |cache, id| {
-            keys.lease(Some(cache), id, KeyPurpose::Page).is_ok()
-        });
+        let available =
+            |cache: &crate::model::identity::CacheId| caches.iter().any(|c| &c.id == cache);
+        Recovery::filter_available(
+            &mut image,
+            |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
+            |cache, id| available(cache) && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok(),
+        );
         for shard in &image.shards {
             if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
                 return None;
@@ -141,6 +167,11 @@ mod tests {
             DirectAlignment::validate(4096, 4096, 4096).unwrap(),
         )
         .unwrap()
+    }
+    fn caches() -> Vec<crate::control::caches::CacheDefinition> {
+        let mut cache = super::super::integration_tests::definition();
+        cache.id = crate::model::identity::CacheId(crate::security::identity::tests::CACHE.into());
+        vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
         CheckpointImage {
@@ -185,7 +216,7 @@ mod tests {
             image(4, &[WorkerId(0), WorkerId(2)]),
         ];
         assert_eq!(
-            select(candidates, &geometry, &node.workers, 4, &keys)
+            select(candidates, &geometry, &node.workers, 4, &keys, &caches())
                 .unwrap()
                 .sequence,
             1
@@ -219,7 +250,8 @@ mod tests {
                 &geometry,
                 &node.workers,
                 4,
-                &keys
+                &keys,
+                &caches()
             )
             .unwrap()
             .sequence,
@@ -231,11 +263,143 @@ mod tests {
                 &geometry,
                 &node.workers,
                 4,
-                &keys
+                &keys,
+                &caches()
             )
             .is_none()
         );
     }
+    #[test]
+    fn old_checkpoints_filter_removed_uids_unavailable_keys_and_standalone_metadata_before_install()
+    {
+        use crate::model::{identity::*, metadata::VersionMetadata};
+        use crate::store::{
+            checkpoint_format::CheckpointCodec,
+            index::{IndexedPage, RecordLocation},
+            segment::Segments,
+        };
+        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let keys = crate::security::keyring::tests::keys();
+        let caches = caches();
+        let cache = caches[0].id.clone();
+        let g = geometry();
+        let geometry = [(WorkerId(0), g)].into_iter().collect();
+        let mut old = image(8, &[WorkerId(0)]);
+        let segments = Segments::new(WorkerId(0), g.segment_bytes);
+        segments
+            .configure(
+                g.slab_bytes,
+                g.segment_count as usize,
+                g.alignment().unwrap(),
+            )
+            .unwrap();
+        let append = segments.append(4096).unwrap();
+        let metadata = VersionMetadata {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache.clone(),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("old"),
+            },
+            length: 3,
+        };
+        let page = PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        };
+        old.shards[0].index.entries.push((
+            page.clone(),
+            IndexedPage {
+                location: RecordLocation {
+                    segment: append.segment.id(),
+                    generation: append.segment.generation(),
+                    location: append.location,
+                },
+                metadata: metadata.clone(),
+                key_id: crate::model::envelope::KeyId([1; 16]),
+            },
+        ));
+        drop(append);
+        old.shards[0].segments = segments.snapshot().unwrap();
+        let mut standalone = metadata.clone();
+        standalone.version.etag = StrongEtag::test_value("head-only");
+        standalone.length = 0;
+        old.shards[0].index.metadata.push(standalone.clone());
+        // Both historical slots survive. Decode their exact bytes, as restart does.
+        let bytes = CheckpointCodec.encode(&old).unwrap();
+        let decoded = || CheckpointCodec.decode(&bytes).unwrap();
+        let removed = select(
+            vec![decoded(), decoded()],
+            &geometry,
+            &node.workers,
+            16,
+            &keys,
+            &[],
+        )
+        .unwrap();
+        assert!(removed.shards[0].index.entries.is_empty());
+        assert!(removed.shards[0].index.metadata.is_empty());
+        let retained = select(
+            vec![decoded()],
+            &geometry,
+            &node.workers,
+            16,
+            &keys,
+            &caches,
+        )
+        .unwrap();
+        assert_eq!(retained.shards[0].index.entries.len(), 1);
+        assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
+        let mut missing_page = decoded();
+        missing_page.shards[0].index.entries[0].1.key_id = crate::model::envelope::KeyId([99; 16]);
+        let filtered = select(
+            vec![missing_page],
+            &geometry,
+            &node.workers,
+            16,
+            &keys,
+            &caches,
+        )
+        .unwrap();
+        assert!(filtered.shards[0].index.entries.is_empty());
+        assert_eq!(filtered.shards[0].index.metadata.len(), 1);
+        keys.install(crate::control::wire::KeyringBundle {
+            schema_version: 1,
+            cluster: keys.cluster().clone(),
+            generation: crate::control::wire::BundleGeneration(2),
+            peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
+            cache_keys: vec![],
+        })
+        .unwrap();
+        let keyless = select(
+            vec![decoded()],
+            &geometry,
+            &node.workers,
+            16,
+            &keys,
+            &caches,
+        )
+        .unwrap();
+        assert!(keyless.shards[0].index.entries.is_empty());
+        assert!(keyless.shards[0].index.metadata.is_empty());
+        let index = Rc::new(Index::new(WorkerId(0), 16));
+        let segments = Rc::new(Segments::new(WorkerId(0), g.segment_bytes));
+        segments
+            .configure(
+                g.slab_bytes,
+                g.segment_count as usize,
+                g.alignment().unwrap(),
+            )
+            .unwrap();
+        let recovery = Recovery::new(std::path::PathBuf::new(), index.clone(), segments);
+        recovery.configure_geometry(g).unwrap();
+        futures::executor::block_on(recovery.install_shard(keyless.shards.into_iter().next()))
+            .unwrap();
+        assert!(index.lookup(&page).unwrap().is_none());
+        assert!(index.version(&metadata.version).unwrap().is_none());
+    }
+
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
         use crate::model::{
@@ -273,7 +437,8 @@ mod tests {
                 &geometry,
                 &node.workers,
                 4,
-                &keys
+                &keys,
+                &caches()
             )
             .unwrap()
             .sequence,

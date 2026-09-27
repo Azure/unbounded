@@ -29,6 +29,7 @@ pub struct Index {
     metadata_capacity: usize,
     page_capacity: Cell<usize>,
     state: RefCell<State>,
+    availability: Option<std::rc::Rc<crate::control::availability::Availability>>,
 }
 #[derive(Default)]
 struct State {
@@ -83,7 +84,18 @@ impl Index {
             metadata_capacity,
             page_capacity: Cell::new(65536),
             state: RefCell::new(State::default()),
+            availability: None,
         }
+    }
+    pub fn with_availability(
+        mut self,
+        availability: std::rc::Rc<crate::control::availability::Availability>,
+    ) -> Self {
+        self.availability = Some(availability);
+        self
+    }
+    fn available(&self, cache: &crate::model::identity::CacheId) -> bool {
+        self.availability.as_ref().is_none_or(|a| a.metadata(cache))
     }
     pub fn worker(&self) -> WorkerId {
         self.worker
@@ -99,7 +111,17 @@ impl Index {
         Ok(())
     }
     pub fn lookup(&self, page: &PageId) -> Result<Option<IndexedPage>> {
-        Ok(self.state.borrow().pages.get(page).cloned())
+        Ok(self
+            .state
+            .borrow()
+            .pages
+            .get(page)
+            .filter(|e| {
+                self.availability
+                    .as_ref()
+                    .is_none_or(|a| a.page(&page.version.object.cache, e.key_id))
+            })
+            .cloned())
     }
     /// Allocation-free capacity preflight, not a slot reservation. Replacements
     /// remain admissible at capacity; new pages require an existing free slot.
@@ -114,6 +136,13 @@ impl Index {
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        if self
+            .availability
+            .as_ref()
+            .is_some_and(|a| !a.page(&page.version.object.cache, entry.key_id))
+        {
+            return Ok(());
+        }
         Self::validate_descriptor(&entry.metadata)?;
         entry.metadata.page_length(&page)?;
         let mut state = self.state.borrow_mut();
@@ -138,6 +167,9 @@ impl Index {
     /// Look in both the standalone catalog and retained page entries for this exact
     /// version. This operation does not consult TTL or substitute another ETag.
     pub fn version(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
+        if !self.available(&version.object.cache) {
+            return Ok(None);
+        }
         let s = self.state.borrow();
         Ok(s.metadata.get(version).cloned().or_else(|| {
             s.versions.get(version).map(|(length, _)| VersionMetadata {
@@ -149,6 +181,9 @@ impl Index {
     /// Page-zero owner only. Supports metadata-only objects without a dirty page,
     /// slab allocation, encryption record, or ciphertext reservation.
     pub fn publish_version(&self, metadata: VersionMetadata) -> Result<()> {
+        if !self.available(&metadata.version.object.cache) {
+            return Ok(());
+        }
         Self::validate_descriptor(&metadata)?;
         let mut s = self.state.borrow_mut();
         Self::check_length(&s, &metadata)?;
@@ -165,6 +200,9 @@ impl Index {
         Ok(())
     }
     pub fn current(&self, object: &ObjectId) -> Result<Option<CurrentVersion>> {
+        if !self.available(&object.cache) {
+            return Ok(None);
+        }
         Ok(self
             .state
             .borrow()
@@ -177,6 +215,9 @@ impl Index {
     /// immutable descriptor and advance the volatile pointer; reject length conflicts.
     /// A zero-TTL observation is returned to its waiters without a reusable hit.
     pub fn publish_current(&self, metadata: ObjectMetadata) -> Result<()> {
+        if !self.available(&metadata.version.object.cache) {
+            return Ok(());
+        }
         self.publish_version(metadata.immutable())?;
         let mut s = self.state.borrow_mut();
         s.current.remove(&metadata.version.object);

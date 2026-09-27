@@ -6,7 +6,7 @@ use super::{
     segment::Segments,
     slab::Slabs,
 };
-use crate::runtime::collections::{HashMap, HashSet};
+use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
@@ -44,8 +44,7 @@ pub struct StoreWriter {
     capacity: Cell<usize>,
     busy: Cell<bool>,
     active_scope: RefCell<Option<RequestScope>>,
-    retired: RefCell<HashSet<(CacheId, KeyId)>>,
-    removed: RefCell<HashSet<CacheId>>,
+    availability: Option<Rc<crate::control::availability::Availability>>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
 }
@@ -71,14 +70,20 @@ impl StoreWriter {
             capacity: Cell::new(64),
             busy: Cell::new(false),
             active_scope: RefCell::new(None),
-            retired: RefCell::new(HashSet::default()),
-            removed: RefCell::new(HashSet::default()),
+            availability: None,
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }
     }
     pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+    pub fn with_availability(
+        mut self,
+        availability: Rc<crate::control::availability::Availability>,
+    ) -> Self {
+        self.availability = Some(availability);
         self
     }
     pub fn configure(
@@ -127,11 +132,9 @@ impl StoreWriter {
     }
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
-        !self
-            .retired
-            .borrow()
-            .contains(&(e.page.version.object.cache.clone(), e.key_id))
-            && !self.removed.borrow().contains(&e.page.version.object.cache)
+        self.availability
+            .as_ref()
+            .is_none_or(|a| a.page(&e.page.version.object.cache, e.key_id))
     }
     pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<DirtyTicket> {
         if self.closed.get() {
@@ -385,12 +388,13 @@ impl StoreWriter {
         let disk_bytes = alignment
             .extent(0, RecordCodec.logical_length(page)?)?
             .length();
-        let (staging, dirty) = {
+        let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
             (
                 entry.staging.take().ok_or(Error::InvalidConfiguration)?,
                 entry._reservation.clone(),
+                entry.ticket,
             )
         };
         let mut buffer = alignment.allocate(disk_bytes, staging)?;
@@ -421,7 +425,14 @@ impl StoreWriter {
         self.slabs
             .write(append.location, encoded.buffer, append.segment, scope)
             .await?;
-        if self.allowed(page) && self.segments.validate_location(&location).is_ok() {
+        if self.allowed(page)
+            && self
+                .pending
+                .borrow()
+                .get(id)
+                .is_some_and(|d| d.ticket == ticket)
+            && self.segments.validate_location(&location).is_ok()
+        {
             self.index.publish(
                 id.clone(),
                 IndexedPage {
@@ -462,15 +473,9 @@ impl StoreWriter {
             self.slabs.fence_writes().await
         })
     }
-    /// Stops new/late publication immediately. Call drain/fence before releasing keys.
+    /// Evict disposable references without canceling submitted I/O. Completion
+    /// owners retain their buffers and segment leases regardless of visibility.
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
-        // Bounded tombstones fail closed. Epoch compaction is an explicit startup operation.
-        if self.retired.borrow().len() >= 65536
-            && !self.retired.borrow().contains(&(cache.clone(), key))
-        {
-            return Err(Error::Overloaded);
-        }
-        self.retired.borrow_mut().insert((cache.clone(), key));
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
         pending.retain(|_, d| {
@@ -482,10 +487,6 @@ impl StoreWriter {
         Ok(self.index.retire_key(cache, key))
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
-        if self.removed.borrow().len() >= 65536 && !self.removed.borrow().contains(cache) {
-            return Err(Error::Overloaded);
-        }
-        self.removed.borrow_mut().insert(cache.clone());
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
         pending.retain(|p, _| &p.version.object.cache != cache);
