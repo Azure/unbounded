@@ -248,6 +248,82 @@ fn incoming_idle_preserves_partial_heads_and_fences_cancel_races() {
 }
 
 #[test]
+fn incoming_keepalive_retention_preserves_ready_heads_and_completion_charges() {
+    use crate::http::{codec::Codec, io::HttpIo};
+    use std::io::Write;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.client_connections = NonZeroUsize::new(4).unwrap();
+    let admission = Rc::new(Admission::new(limits));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);
+    let io = HttpIo::with_admission(reactor.clone(), Codec::new(32768, 1024), admission.clone());
+    let scope =
+        RequestScope::new(RequestId([84; 16]), Instant::now() + Duration::from_secs(3)).unwrap();
+    let mut peers = Vec::new();
+    let mut work = Vec::new();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for index in 0..4 {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = pool.accept(socket.into()).unwrap();
+        connection.rx_remaining = Some(0);
+        connection.tx_remaining = Some(0);
+        connection.finish_exchange().unwrap();
+        if index == 0 {
+            peer.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        }
+        let mut receive = io.receive_peer_head(connection, &pool, &scope);
+        assert!(receive.as_mut().poll(&mut cx).is_pending());
+        peers.push(peer);
+        work.push(receive);
+    }
+    assert_eq!(pool.incoming_reclaims.get(), 2);
+    assert_eq!(
+        admission.used(ResourceClass::Connection),
+        4,
+        "cancellation is not a release fence"
+    );
+    let mut ended = [false; 4];
+    while !ended[1] || !ended[2] {
+        reactor.poll_budgeted(64).unwrap();
+        for i in 1..3 {
+            if !ended[i]
+                && let Poll::Ready(result) = work[i].as_mut().poll(&mut cx)
+            {
+                assert!(matches!(result, Err(Error::Cancelled)));
+                ended[i] = true;
+            }
+        }
+        scope.check().unwrap();
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 2);
+    assert!(
+        work[0].as_mut().poll(&mut cx).is_pending(),
+        "partial head was reclaimed"
+    );
+    peers[0].write_all(b"content-length: 0\r\n\r\n").unwrap();
+    loop {
+        reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = work[0].as_mut().poll(&mut cx) {
+            assert_eq!(result.unwrap().connection.remaining_body(), Some(0));
+            break;
+        }
+        scope.check().unwrap();
+    }
+    drop(work);
+    let mut drain = reactor.drain();
+    while drain.as_mut().poll(&mut cx).is_pending() {
+        reactor.poll_budgeted(64).unwrap();
+        scope.check().unwrap();
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    drop(drain);
+    drop(io);
+    drop(pool);
+    drop(reactor);
+    assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+}
+
+#[test]
 fn peer_slot_wait_is_bounded_cancelable_and_completion_owned() {
     for outcome in ["release", "cancel", "drop", "close"] {
         let mut limits = crate::test_support::cluster::config(false).limits;

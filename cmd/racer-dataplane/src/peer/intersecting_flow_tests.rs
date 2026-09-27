@@ -139,6 +139,46 @@ fn cut_through_transit_unwinds_relay_and_connection_pressure() {
     }
 }
 
+#[test]
+#[ignore = "sustained signed transit and incoming keepalive arrivals: run with --release"]
+fn streaming_load_reclaims_incoming_keepalives() {
+    for bytes in [4096, P] {
+        intersecting_with_pressure(2, bytes, true, false, true, "idle-churn");
+    }
+}
+
+fn incoming_keepalive<'a>(
+    node: &'a Node,
+    source: &NodeId,
+    destination: &NodeId,
+    scope: &'a RequestScope,
+    work: &mut FuturesUnordered<FutureResult<'a, ()>>,
+    peers: &mut Vec<std::net::TcpStream>,
+) {
+    use std::io::Write;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    let probe = crate::security::session::ChallengeProbe::new(source.clone(), destination.clone())
+        .unwrap()
+        .request_bytes();
+    let body = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, probe);
+    peer.write_all(format!("POST /racer/peer/v1/challenge HTTP/1.1\r\ncontent-length: 0\r\nracer-probe: {body}\r\n\r\n").as_bytes()).unwrap();
+    if let Ok(mut connection) = node.pool.accept(socket.into()) {
+        work.push(Box::pin(async move {
+            loop {
+                connection = node.server.serve_connection(connection, scope).await?;
+                if !connection.is_reusable() {
+                    return Ok(());
+                }
+            }
+        }));
+    }
+    peers.push(peer);
+}
+
 fn intersecting_with_pressure(
     slots: usize,
     bytes: usize,
@@ -349,7 +389,7 @@ fn intersecting_with_pressure(
     }
     let scope = RequestScope::new(
         RequestId([93; 16]),
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + Duration::from_secs(if pressure == "idle-churn" { 30 } else { 10 }),
     )
     .unwrap();
     let mut endpoints: Vec<_> = nodes
@@ -408,7 +448,33 @@ fn intersecting_with_pressure(
         .collect();
     let calls = data.calls.borrow().clone();
     let paths = Paths::new(Rc::new(LinkHealth), 128, 150000);
+    let churn = pressure == "idle-churn";
+    let mut idle_peers = Vec::new();
+    let mut idle_work: FuturesUnordered<FutureResult<'_, ()>> = FuturesUnordered::new();
+    if churn {
+        // Real completed challenge exchanges, then non-consuming peer idle waits.
+        // Keep sending new arrivals after streams start, not just one batch.
+        for _ in 0..58 {
+            for i in [1, 2] {
+                incoming_keepalive(
+                    &nodes[i],
+                    signers[0].node(),
+                    signers[i].node(),
+                    &scope,
+                    &mut idle_work,
+                    &mut idle_peers,
+                );
+            }
+        }
+    }
+    if churn {
+        for _ in 0..64 {
+            while let Poll::Ready(Some(_)) = idle_work.poll_next_unpin(&mut cx) {}
+            tick(&mut cx);
+        }
+    }
     let mut requests = FuturesUnordered::new();
+    let rounds = if churn { 12 } else { 1 };
     for (side, (source, first, destination)) in [(0, 1, 3), (4, 2, 5)].into_iter().enumerate() {
         for index in 0..slots {
             let node = &nodes[source];
@@ -451,18 +517,48 @@ fn intersecting_with_pressure(
                 expected.map(|i| NodeId(names[i].clone())).to_vec()
             );
             let source_auth = Forwarding::new(signers[source].clone());
-            let (signed, binding) = source_auth
-                .sign_request_to(request, signers[first].node())
-                .unwrap();
             let endpoint = Endpoint::Peer(listeners[first].local_addr().unwrap().to_string());
+            let first = signers[first].node().clone();
+            let copies = &copies;
+            let key = keys[side];
             requests.push(async move {
-                let response = node
-                    .transfers
-                    .exchange(endpoint, signed, &request_scope)
-                    .await?;
-                source_auth
-                    .verify_response(response, &binding)
-                    .map(|verified| verified.into_signed())
+                for round in 0..rounds {
+                    // Fresh signed attempts under one unchanged scope; these are
+                    // independent arrivals, not retries of failed transmissions.
+                    let attempt = AttemptId([round as u8 + 32 * index as u8; 16]);
+                    let mut route = request.route.clone();
+                    route.attempt = attempt;
+                    let request = PeerRequest {
+                        operation: Operation::Page {
+                            page: page(key, 0),
+                            mode: FetchMode::CopyOnly,
+                        },
+                        route,
+                        origin: node
+                            .credentials
+                            .seal(&context(key), attempt, &request_scope)?,
+                    };
+                    let (signed, binding) = source_auth.sign_request_to(request, &first)?;
+                    let response = node
+                        .transfers
+                        .exchange(endpoint.clone(), signed, &request_scope)
+                        .await?;
+                    let response = source_auth
+                        .verify_response(response, &binding)?
+                        .into_signed();
+                    if round + 1 == rounds {
+                        return Ok(response);
+                    }
+                    let PeerResponse::Page { ciphertext, .. } = response.response else {
+                        panic!("sustained stream failed at round {round}");
+                    };
+                    let expected = copies
+                        .iter()
+                        .find(|copy| copy.ciphertext.envelope().page == ciphertext.envelope().page)
+                        .unwrap();
+                    assert_eq!(ciphertext.bytes(), expected.ciphertext.bytes());
+                }
+                unreachable!()
             });
         }
     }
@@ -531,14 +627,34 @@ fn intersecting_with_pressure(
             );
         }
     } else if deferred {
-        let end = Instant::now() + Duration::from_secs(3);
+        let end = Instant::now() + Duration::from_secs(if churn { 25 } else { 3 });
+        let started = Instant::now();
+        let mut arrivals = 0;
         let mut complete = 0;
         let mut failed = 0;
         while complete < 2 * slots {
+            if churn {
+                // 200 completed-keepalive arrivals/s per relay throughout the
+                // run, while four clients issue successive pages.
+                if started.elapsed() >= Duration::from_millis(arrivals * 5) {
+                    for i in [1, 2] {
+                        incoming_keepalive(
+                            &nodes[i],
+                            signers[0].node(),
+                            signers[i].node(),
+                            &scope,
+                            &mut idle_work,
+                            &mut idle_peers,
+                        );
+                    }
+                    arrivals += 1;
+                }
+                while let Poll::Ready(Some(_)) = idle_work.poll_next_unpin(&mut cx) {}
+            }
             while let Poll::Ready(Some(result)) = requests.poll_next_unpin(&mut cx) {
                 let response = match result {
                     Ok(response) => response,
-                    Err(error) if pressure != "none" => {
+                    Err(error) if pressure != "none" && !churn => {
                         assert!(
                             matches!(error, Error::Io | Error::Overloaded | Error::Unavailable),
                             "{error:?}"
@@ -551,6 +667,7 @@ fn intersecting_with_pressure(
                 };
                 let PeerResponse::Page { ciphertext, .. } = response.response else {
                     if pressure != "none"
+                        && !churn
                         && matches!(
                             response.response,
                             PeerResponse::Overloaded | PeerResponse::Unavailable
@@ -575,7 +692,16 @@ fn intersecting_with_pressure(
             assert!(Instant::now() < end, "response-ready receive stalled");
         }
         assert_eq!(*data.calls.borrow(), calls);
-        if pressure != "none" {
+        if churn {
+            assert!(arrivals >= 12, "sustained arrivals were not exercised");
+            eprintln!(
+                "sustained arrivals={} rounds={} elapsed={:?}",
+                arrivals,
+                rounds,
+                started.elapsed()
+            );
+        }
+        if pressure != "none" && !churn {
             assert!(failed > 0, "pressure was not exercised");
         }
         eprintln!(
@@ -642,6 +768,8 @@ fn intersecting_with_pressure(
     scope.cancel().unwrap();
     drop(servers);
     drop(requests);
+    drop(idle_work);
+    drop(idle_peers);
     drop(copies);
     for node in &nodes {
         node.pool.close();

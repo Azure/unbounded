@@ -232,7 +232,29 @@ impl HttpPool {
             )?,
         });
         state.incoming_idle.push(Rc::downgrade(&idle));
+        drop(state);
+        self.trim_incoming_idle()?;
         Ok(idle)
+    }
+    /// Completed incoming keepalives must leave room for transit's outbound half.
+    /// Only quiet idle waits are canceled; readiness/partial heads and completion
+    /// owners remain fenced. No forwarding request waits for active work here.
+    fn trim_incoming_idle(&self) -> Result<()> {
+        let retained = self
+            .state
+            .borrow()
+            .incoming_idle
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|idle| !idle.scope.cancellation.is_cancelled())
+            .count();
+        let limit = (self.admission.limit(ResourceClass::Connection) / 2).max(1);
+        for _ in limit..retained {
+            if !self.reclaim_incoming_idle()? {
+                break;
+            }
+        }
+        Ok(())
     }
     fn reclaim_incoming_idle(&self) -> Result<bool> {
         let candidates: Vec<_> = self

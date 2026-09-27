@@ -51,6 +51,13 @@ is fenced before releasing its connection charge. First exchanges, partial heads
 and active responses do not enter this idle registry. Deadlines remain upper
 bounds, not promises that keepalives remain open.
 
+Incoming keepalive retention also targets at most half the worker connection
+quota (at least one). Each new idle registration cancels excess quiet idle waits
+through the same peek and completion fences. Queued heads remain protected, so
+the target is not a hard active-connection ceiling. This prevents completed
+accepted sockets from occupying all outbound forwarding capacity under sustained
+arrivals; transit still uses nonwaiting admission and the unchanged total quota.
+
 After the head, authenticated requests retain the existing signed request deadline
 policy, bounded by the listener deadline, for dispatch and response transfer. The
 header cap does not bound the whole response or reset the signed request budget.
