@@ -31,7 +31,7 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("controllers, issuance, and serving must share trust")
 	}
 
-	if a.Keyring.CatalogMu == nil || a.Topology.CatalogMu != a.Keyring.CatalogMu || issuer.CatalogMu != a.Keyring.CatalogMu {
+	if a.Keyring.CatalogGate == nil || a.Topology.CatalogGate != a.Keyring.CatalogGate || issuer.CatalogGate != a.Keyring.CatalogGate {
 		t.Fatal("controllers and issuance must share the catalog gate")
 	}
 

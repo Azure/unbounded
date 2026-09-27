@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -271,8 +272,10 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 
 func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Keyring.CatalogMu.Lock()
-	defer f.a.Keyring.CatalogMu.Unlock()
+	if err := f.a.Keyring.CatalogGate.Acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer f.a.Keyring.CatalogGate.Release()
 
 	ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
 	defer cancel()
@@ -287,13 +290,110 @@ func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("lock wait ignored deadline: %v", err)
+			t.Fatalf("gate wait ignored deadline: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("lock wait held enrollment admission past deadline")
+		t.Fatal("gate wait held enrollment admission past deadline")
 	}
 
 	if _, err := f.a.Server.Trust.pool(); err != nil {
-		t.Fatalf("canceled lock wait invalidated accepted trust: %v", err)
+		t.Fatalf("canceled gate wait invalidated accepted trust: %v", err)
+	}
+}
+
+func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
+	for _, operation := range []string{"topology", "keyring", "issuance"} {
+		for _, held := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/held=%t", operation, held), func(t *testing.T) {
+				f := newServingFixture(t)
+
+				roots, err := f.a.Server.Trust.pool()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				publication, err := f.a.Server.Publications.Current()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var reads atomic.Int64
+
+				reader := interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
+					Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+						reads.Add(1)
+						return wire.Unavailable
+					},
+				})
+				f.a.Topology.APIReader = reader
+				f.a.Keyring.APIReader = reader
+				f.a.Server.Bootstrap.Issuer.APIReader = reader
+
+				gate := f.a.Keyring.CatalogGate
+				if held {
+					if err := gate.Acquire(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					defer gate.Release()
+				}
+
+				ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
+				defer cancel()
+
+				want := context.DeadlineExceeded
+
+				if !held {
+					cancel()
+
+					want = context.Canceled
+				}
+
+				done := make(chan error, 1)
+
+				go func() {
+					var err error
+
+					switch operation {
+					case "topology":
+						_, err = f.a.Topology.Reconcile(ctx, ctrl.Request{})
+					case "keyring":
+						_, err = f.a.Keyring.Reconcile(ctx, ctrl.Request{})
+					case "issuance":
+						_, err = f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
+					}
+
+					done <- err
+				}()
+
+				select {
+				case err := <-done:
+					if !errors.Is(err, want) {
+						t.Fatalf("gate wait cancellation: %v", err)
+					}
+
+					if operation != "issuance" && !errors.Is(err, reconcile.TerminalError(nil)) {
+						t.Fatalf("canceled reconcile can retry: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("gate wait ignored cancellation")
+				}
+
+				if reads.Load() != 0 {
+					t.Fatalf("canceled admission read authority: %d", reads.Load())
+				}
+
+				if current, err := f.a.Server.Trust.pool(); err != nil || current != roots {
+					t.Fatalf("canceled admission changed accepted trust: %v", err)
+				}
+
+				if current, err := f.a.Server.Publications.Current(); err != nil || current != publication {
+					t.Fatalf("canceled admission changed publication: %v", err)
+				}
+
+				if err := f.a.Server.Ready(nil); err != nil {
+					t.Fatalf("canceled admission withdrew readiness: %v", err)
+				}
+			})
+		}
 	}
 }

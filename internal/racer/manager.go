@@ -8,7 +8,6 @@ package racer
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,12 +40,12 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 	// Serialize credential admission/pruning with topology's authoritative read
 	// and publication commit. Informer ordering alone cannot provide this gate.
-	catalogMu := &sync.Mutex{}
-	issuer.CatalogMu = catalogMu
+	catalogGate := newCatalogGate()
+	issuer.CatalogGate = catalogGate
 
 	return &Application{
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogMu: catalogMu, Trust: trust},
-		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Lifecycle: lifecycle, CatalogMu: catalogMu, Trust: trust},
+		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogGate: catalogGate, Trust: trust},
+		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Lifecycle: lifecycle, CatalogGate: catalogGate, Trust: trust},
 		Server:    &Server{Config: cfg, Trust: trust, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
 		Lifecycle: lifecycle,
 	}

@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,11 +34,11 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 // Issuer accesses a controller-only Secret. Its private key is never projected
 // into dataplane Pods or included in a response or diagnostic.
 type Issuer struct {
-	APIReader client.Reader
-	Config    Config
-	Trust     *Trust
-	CatalogMu *sync.Mutex
-	Now       func() time.Time
+	APIReader   client.Reader
+	Config      Config
+	Trust       *Trust
+	CatalogGate *CatalogGate
+	Now         func() time.Time
 }
 
 type signingMaterial struct {
@@ -198,20 +197,13 @@ func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
 func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
 	// Serialize observations with controller installation so an in-flight valid
 	// read cannot restore trust after another operation observes invalidity.
-	if i.CatalogMu != nil {
-		// Controller API work can stall. Waiting for its lock must still honor
+	if i.CatalogGate != nil {
+		// Controller API work can stall. Waiting for its gate must still honor
 		// the enrollment deadline and release bounded authentication admission.
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for !i.CatalogMu.TryLock() {
-			select {
-			case <-ctx.Done():
-				return signingState{}, ctx.Err()
-			case <-ticker.C:
-			}
+		if err := i.CatalogGate.Acquire(ctx); err != nil {
+			return signingState{}, err
 		}
-		defer i.CatalogMu.Unlock()
+		defer i.CatalogGate.Release()
 	}
 
 	state, err := loadSigning(ctx, i.APIReader, i.Config, now)

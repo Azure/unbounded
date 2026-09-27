@@ -408,8 +408,9 @@ func TestKeyringConflictCancellationAndAuthoritativeReads(t *testing.T) {
 				t.Fatal("write after cancellation")
 			}
 
-			if r.Lifecycle.issuer {
-				t.Fatal("failed operation left readiness set")
+			// Cancellation before admission observes no authority failure.
+			if r.Lifecycle.issuer != (cancelAt == "before") {
+				t.Fatal("readiness did not reflect whether admission observed a failure")
 			}
 
 			r.Client = base

@@ -24,7 +24,7 @@ import (
 )
 
 func testIssuer(r *KeyringReconciler) *Issuer {
-	return &Issuer{APIReader: r.APIReader, Config: r.Config, Trust: r.Trust, CatalogMu: r.CatalogMu, Now: r.Now}
+	return &Issuer{APIReader: r.APIReader, Config: r.Config, Trust: r.Trust, CatalogGate: r.CatalogGate, Now: r.Now}
 }
 
 func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {

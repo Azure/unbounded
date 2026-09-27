@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"errors"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,7 +27,7 @@ type TopologyReconciler struct {
 	Config       Config
 	Publications *Publications
 	Accepted     AcceptedMembers
-	CatalogMu    *sync.Mutex
+	CatalogGate  *CatalogGate
 	Trust        *Trust
 }
 
@@ -36,9 +35,11 @@ type TopologyReconciler struct {
 // authoritatively, commits counters/hashes with CAS, then installs the result.
 // Conflicts requeue from fresh inputs; missing established counters fail closed.
 func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if r.CatalogMu != nil {
-		r.CatalogMu.Lock()
-		defer r.CatalogMu.Unlock()
+	if r.CatalogGate != nil {
+		if err := r.CatalogGate.Acquire(ctx); err != nil {
+			return ctrl.Result{}, reconcile.TerminalError(err)
+		}
+		defer r.CatalogGate.Release()
 	}
 
 	if err := ctx.Err(); err != nil {

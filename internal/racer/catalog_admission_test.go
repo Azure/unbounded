@@ -351,8 +351,12 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 
 	<-read
 	// The keyring must be excluded for the entire read/commit/install window.
-	if a.Keyring.CatalogMu.TryLock() {
-		a.Keyring.CatalogMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	err := a.Keyring.CatalogGate.Acquire(ctx)
+	if err == nil {
+		a.Keyring.CatalogGate.Release()
 		close(proceed)
 		<-done
 		t.Fatal("keyring can prune an in-progress topology candidate")
@@ -364,10 +368,18 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !a.Keyring.CatalogMu.TryLock() {
-		t.Fatal("publication did not release admission gate")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unexpected gate wait error: %v", err)
 	}
-	a.Keyring.CatalogMu.Unlock()
+
+	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	if err := a.Keyring.CatalogGate.Acquire(ctx); err != nil {
+		t.Fatalf("publication did not release admission gate: %v", err)
+	}
+
+	a.Keyring.CatalogGate.Release()
 }
 
 func integrationCatalogCapacity(t *testing.T, c client.Client) {
