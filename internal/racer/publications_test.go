@@ -211,6 +211,10 @@ func TestPollValidationAndCancellation(t *testing.T) {
 			t.Fatalf("wait cancellation: %v", err)
 		}
 
+		if got, err := r.Publications.Wait(ctx, identity, nil); got != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled immediate poll: %p, %v", got, err)
+		}
+
 		if got, err := r.Publications.Wait(context.Background(), identity, nil); err != nil || got != current {
 			t.Fatalf("immediate shared snapshot: %p, %v", got, err)
 		}
@@ -255,24 +259,83 @@ func TestPollValidationAndCancellation(t *testing.T) {
 			t.Fatalf("old leadership still serves: %v", err)
 		}
 
+		if got, err := r.Publications.Wait(context.Background(), identity, nil); got != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("immediate poll after leadership loss: %p, %v", got, err)
+		}
+
 		if _, err := current.WriteTo(io.Discard); !errors.Is(err, context.Canceled) {
 			t.Fatalf("write after leadership: %v", err)
 		}
 	})
 }
 
-func TestPollCertificateExpiration(t *testing.T) {
+func TestPollImmediateReturnsWithoutAllocations(t *testing.T) {
 	r := initializedTopology(t)
-	p := reconcileTopology(t, r, context.Background())
+	ctx := context.Background()
+	previous := reconcileTopology(t, r, ctx).Version().Sequence
+	cache := catalogCache("cache", testNodeUID)
+
+	if err := r.Create(ctx, &cache); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
+
+	current := reconcileTopology(t, r, ctx)
 	identity := pollIdentity(r.Config, testNodeUID)
-	identity.expires = time.Now().Add(20 * time.Millisecond)
-	sequence := p.Version().Sequence
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	for _, tc := range []struct {
+		name  string
+		after *wire.Sequence
+	}{
+		{name: "absent cursor"},
+		{name: "older cursor", after: &previous},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				got *CommittedPublication
+				err error
+			)
 
-	if _, err := r.Publications.Wait(ctx, identity, &sequence); !errors.Is(err, wire.Unauthenticated) {
-		t.Fatalf("expiration: %v", err)
+			allocations := testing.AllocsPerRun(100, func() {
+				got, err = r.Publications.Wait(ctx, identity, tc.after)
+			})
+
+			if err != nil || got != current {
+				t.Fatalf("immediate shared publication: %p, %v", got, err)
+			}
+
+			if allocations != 0 {
+				t.Fatalf("immediate poll allocated: %v allocations per call", allocations)
+			}
+		})
+	}
+}
+
+func TestPollCertificateExpiration(t *testing.T) {
+	for _, name := range []string{"with context deadline", "without context deadline"} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := initializedTopology(t)
+				p := reconcileTopology(t, r, context.Background())
+				identity := pollIdentity(r.Config, testNodeUID)
+				identity.expires = time.Now().Add(time.Second)
+				sequence := p.Version().Sequence
+				ctx := context.Background()
+
+				if name == "with context deadline" {
+					var cancel context.CancelFunc
+
+					ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+				}
+
+				got, err := r.Publications.Wait(ctx, identity, &sequence)
+				if got != nil || !errors.Is(err, wire.Unauthenticated) || !time.Now().Equal(identity.expires) {
+					t.Fatalf("expiration: %p, %v, time %v, expires %v", got, err, time.Now(), identity.expires)
+				}
+			})
+		})
 	}
 }
 
