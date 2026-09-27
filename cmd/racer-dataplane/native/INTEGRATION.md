@@ -76,6 +76,10 @@ Dropping a pending consuming setup or claimed grant requests cancellation withou
 submitting another command. A published terminal fence can precede the native
 role's mailbox unlock; readback must still await mailbox access. Terminal fencing
 itself remains mandatory even after the request is canceled or expired.
+Request-facing terminal waits after a successful write or invalidation CQE honor
+cancellation and deadlines. Termination returns no completion or readback buffer;
+the native service retains quarantined resources and quota until fencing succeeds.
+Peer fallback still awaits the actual terminal fence under the live parent scope.
 
 The runtime's bounded crypto/lifecycle timer tick drives pending CQ work and
 retries failed fences. The service does not spin or spawn timer threads. Failed

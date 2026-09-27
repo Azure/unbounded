@@ -1396,3 +1396,318 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     request.route.membership = membership.version;
     assert_eq!(super::check_membership(&request, &membership), Ok(()));
 }
+
+mod established_sessions {
+    use super::*;
+    use crate::{
+        http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+        runtime::{reactor::IoBuffer, reactor::Reactor},
+        security::{connection, protocol as p},
+        topology::{
+            health::LinkHealth,
+            membership::{Member, Membership},
+            paths::Paths,
+        },
+    };
+    use std::{
+        cell::Cell,
+        future::Future,
+        os::unix::net::UnixStream,
+        task::{Context, Poll},
+    };
+
+    struct CountedService(Rc<Cell<usize>>);
+    impl server::LocalPageService for CountedService {
+        fn serve_peer<'a>(
+            &'a self,
+            _: wire::VerifiedRequest,
+            _: crate::topology::membership::MembershipLease,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, PeerResponse> {
+            Box::pin(async {
+                self.0.set(self.0.get() + 1);
+                Ok(PeerResponse::Miss)
+            })
+        }
+    }
+    impl requester::PeerTransport for CountedService {
+        fn exchange<'a>(
+            &'a self,
+            _: wire::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+            Box::pin(async { panic!("direct request must not relay") })
+        }
+    }
+    struct Fixture {
+        admission: Rc<Admission>,
+        reactor: Rc<Reactor>,
+        io: Rc<HttpIo>,
+        server: server::PeerServer,
+        signers: Vec<Rc<Signatures>>,
+        calls: Rc<Cell<usize>>,
+        scope: RequestScope,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            reactor.init().unwrap();
+            let io = Rc::new(HttpIo::with_admission(
+                reactor.clone(),
+                Codec::new(
+                    wire::MAX_ENVELOPE_HEAD,
+                    crate::model::range::PAGE_BYTES + 16,
+                ),
+                admission.clone(),
+            ));
+            let signers = signers();
+            let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
+            let calls = Rc::new(Cell::new(0));
+            let service = Rc::new(CountedService(calls.clone()));
+            let membership = Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    [A, C]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| Member {
+                            node: NodeId((*n).into()),
+                            shares: std::num::NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                            rails: vec![],
+                            alignment_enabled: false,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let network = Rc::new(
+                PeerNetwork::new(
+                    NodeId(C.into()),
+                    crate::control::snapshot::PublishedState::for_membership(membership),
+                )
+                .unwrap(),
+            );
+            let relay = Rc::new(
+                relay::Relay::new(
+                    Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                    forwarding.clone(),
+                    service.clone(),
+                    admission.clone(),
+                )
+                .with_network(network.clone()),
+            );
+            let server =
+                server::PeerServer::new(io.clone(), forwarding, admission.clone(), service, relay)
+                    .with_network(network)
+                    .with_wire(Rc::new(codec(&admission)))
+                    .with_handshake(Rc::new(handshake::Handshake::new(signers[2].clone(), None)));
+            Self {
+                admission,
+                reactor,
+                io,
+                server,
+                signers,
+                calls,
+                scope: RequestScope::new(
+                    RequestId([7; 16]),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap(),
+            }
+        }
+        fn drive<T>(&self, work: impl Future<Output = T>) -> T {
+            let mut work = std::pin::pin!(work);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            loop {
+                if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                    return result;
+                }
+                self.scope.check().unwrap();
+                self.reactor.poll_budgeted(128).unwrap();
+                self.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+        }
+        fn sockets(&self) -> (ConnectionLease, ConnectionLease) {
+            let (a, b) = UnixStream::pair().unwrap();
+            (
+                ConnectionLease::from_accepted(a.into(), &self.admission).unwrap(),
+                ConnectionLease::from_accepted(b.into(), &self.admission).unwrap(),
+            )
+        }
+        fn frame(&self, large: bool) -> crate::http::codec::MessageHead {
+            let mut request = request(&self.admission, 1);
+            if large {
+                request.origin.metadata = Some(
+                    crate::model::context::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap(),
+                );
+                request.origin.authorization.as_mut().unwrap().ciphertext = vec![5; 8208];
+            }
+            let (signed, _) = Forwarding::new(self.signers[0].clone())
+                .sign_request(request)
+                .unwrap();
+            WireCodec::encode(&signed.authentication, false, 0).unwrap()
+        }
+        // First successful dispatch uses the production server's accept path.
+        fn first(&self) -> (ConnectionLease, ConnectionLease) {
+            let (a, b) = self.sockets();
+            self.drive(async {
+                let client = async {
+                    let a = connection::connect(
+                        &self.io,
+                        a,
+                        self.signers[0].clone(),
+                        self.signers[2].node(),
+                        &self.scope,
+                    )
+                    .await?;
+                    let response = self
+                        .io
+                        .exchange_head(a, self.frame(false), &self.scope)
+                        .await?;
+                    let mut a = response.connection;
+                    a.finish_exchange()?;
+                    Ok::<_, Error>(a)
+                };
+                futures::try_join!(client, self.server.serve_connection(b, &self.scope))
+            })
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn established_server_rejects_duplicate_wrong_direction_session_and_corruption_before_dispatch()
+    {
+        for attack in ["duplicate", "direction", "session", "signature"] {
+            let f = Fixture::new();
+            let baseline = f.admission.used(ResourceClass::RequestContext);
+            let (mut a, b) = f.first();
+            assert_eq!(f.calls.get(), 1);
+            let mut head = a.session.as_mut().unwrap().sign(f.frame(false)).unwrap();
+            // Re-sign incorrect bindings with the real peer key. Rejection must
+            // test ordering/session/direction rather than signature corruption.
+            if attack != "signature" {
+                let (name, value) = match attack {
+                    "duplicate" => ("racer-sequence", "1".to_owned()),
+                    "direction" => ("racer-direction", "1".to_owned()),
+                    _ => ("racer-session", p::binary(&[0; 32])),
+                };
+                head.headers
+                    .iter_mut()
+                    .find(|h| h.name == name)
+                    .unwrap()
+                    .value = value.into_bytes();
+                head.headers.retain(|h| {
+                    !matches!(
+                        h.name.as_str(),
+                        "signature"
+                            | "signature-input"
+                            | "racer-profile"
+                            | "racer-cluster"
+                            | "racer-signer"
+                            | "racer-certificates"
+                            | "racer-timestamp"
+                    )
+                });
+                head = f.signers[0].sign_fields(head).unwrap().head;
+            } else {
+                let signature = &mut head
+                    .headers
+                    .iter_mut()
+                    .find(|h| h.name == "signature")
+                    .unwrap()
+                    .value;
+                signature[8] = if signature[8] == b'A' { b'B' } else { b'A' };
+            }
+            let bytes = Codec::new(wire::MAX_ENVELOPE_HEAD, 0)
+                .encode_head(&head)
+                .unwrap();
+            let mut buffer = f.io.buffer(bytes.len()).unwrap();
+            buffer.bytes_mut().unwrap().copy_from_slice(&bytes);
+            let (sent, received) = f.drive(async {
+                futures::join!(
+                    f.reactor.send(a.socket(), buffer, a, &f.scope),
+                    f.server.serve_connection(b, &f.scope)
+                )
+            });
+            assert!(sent.is_ok());
+            assert!(
+                matches!(received, Err(Error::Replay | Error::Unauthorized)),
+                "{attack}"
+            );
+            assert_eq!(f.calls.get(), 1, "{attack} reached service");
+            drop(sent);
+            f.drive(f.reactor.drain()).unwrap();
+            assert_eq!(f.admission.used(ResourceClass::Connection), 0);
+            assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+        }
+    }
+
+    #[test]
+    fn partial_signed_head_cancel_closes_socket_and_fresh_handshake_dispatches() {
+        use std::os::fd::AsRawFd;
+        let f = Fixture::new();
+        let baseline = f.admission.used(ResourceClass::RequestContext);
+        let (a, b) = f.first();
+        let socket = a.socket();
+        let size: libc::c_int = 1024;
+        // SAFETY: setsockopt synchronously reads this correctly sized integer.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as _,
+                )
+            },
+            0
+        );
+        drop(socket);
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let mut sending = f.io.send_head(a, f.frame(true), &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(sending.as_mut().poll(&mut cx).is_pending());
+        let mut prefix = vec![0; 65536];
+        let count = loop {
+            f.reactor.poll_budgeted(128).unwrap();
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            // SAFETY: recv writes within prefix; PEEK leaves partial bytes for
+            // the production server to consume after cancellation closes sender.
+            let n = unsafe {
+                libc::recv(
+                    b.socket().as_raw_fd(),
+                    prefix.as_mut_ptr().cast(),
+                    prefix.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if n > 0 {
+                break n as usize;
+            }
+            f.scope.check().unwrap();
+        };
+        assert!(prefix[..count].starts_with(b"POST "));
+        assert!(!prefix[..count].windows(4).any(|w| w == b"\r\n\r\n"));
+        scope.cancel().unwrap();
+        assert!(matches!(f.drive(sending), Err(Error::Cancelled)));
+        assert!(matches!(
+            f.drive(f.server.serve_connection(b, &f.scope)),
+            Err(Error::Io)
+        ));
+        assert_eq!(f.calls.get(), 1);
+        assert_eq!(f.reactor.in_flight(), 0);
+        assert_eq!(f.admission.used(ResourceClass::Connection), 0);
+        assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+        // A newly handshaken socket starts at sequence one and dispatches normally.
+        drop(f.first());
+        assert_eq!(f.calls.get(), 2);
+        assert_eq!(f.admission.used(ResourceClass::Connection), 0);
+        assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+    }
+}

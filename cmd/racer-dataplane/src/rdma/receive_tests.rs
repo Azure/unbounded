@@ -53,6 +53,17 @@ fn receive_completion_does_not_retry_ciphertext_quota_exhaustion() {
 }
 
 fn receive_contended(readback: bool, terminal: Option<Error>) {
+    receive_case(readback, terminal, false);
+}
+
+#[test]
+fn successful_invalidation_cancel_and_expiry_leave_failed_terminal_fence_quarantined() {
+    for error in [Error::Cancelled, Error::DeadlineExceeded] {
+        receive_case(true, Some(error), true);
+    }
+}
+
+fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     let (io, port) = pair(1).unwrap();
     let io = Rc::new(io);
     let mut native = NativeService::new(port);
@@ -148,8 +159,11 @@ fn receive_contended(readback: bool, terminal: Option<Error>) {
         native.poll_budgeted(1).unwrap();
         assert!(finish.as_mut().poll(&mut cx).is_pending());
         assert!(!qp.stopped());
+        if failed_fence {
+            backend::lifetime_tests::fail_stop(true);
+        }
         native.poll_budgeted(1).unwrap();
-        assert!(qp.stopped());
+        assert_eq!(qp.stopped(), !failed_fence);
     }
     // Hold the same mutex as the native role at invalidation submission or
     // immediately after it publishes the fence, before it releases the mailbox.
@@ -193,6 +207,35 @@ fn receive_contended(readback: bool, terminal: Option<Error>) {
     drop(finish);
     drop(quota);
     assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    if failed_fence {
+        assert!(!qp.stopped());
+        assert_eq!(charged.get(), 1);
+        assert!(
+            native.resources[0]
+                .as_ref()
+                .unwrap()
+                .region
+                .copy_to()
+                .is_err()
+        );
+        // Even the final I/O owner can disappear before fencing. The native
+        // allocation and quota remain quarantined and the slot cannot be claimed.
+        drop(session);
+        drop(qp);
+        native.resources[0].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(charged.get(), 1);
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), OWNED);
+        backend::lifetime_tests::fail_stop(false);
+        native.resources[0].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+        native.close();
+        native.poll_budgeted(1).unwrap();
+        assert!(native.drained());
+        assert_eq!(charged.get(), 0);
+        return;
+    }
     native.poll_budgeted(1).unwrap();
     assert!(qp.stopped());
     assert_eq!(charged.get(), 1);

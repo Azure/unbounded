@@ -239,7 +239,17 @@ impl Grant {
                 invalidated.as_ref().unwrap().poll(cx)
             })
             .await?;
-            futures::future::poll_fn(|cx| self.qp.poll_stopped(cx)).await?;
+            // Cancellation/expiry returns no buffer. Grant Drop requests stop;
+            // the native service retains DMA ownership until the real fence.
+            poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                if crate::runtime::environment::now() >= self.deadline.0 {
+                    return Poll::Ready(Err(Error::DeadlineExceeded));
+                }
+                self.qp.poll_stopped(cx)
+            })
+            .await?;
             self.buffer.take().ok_or(Error::InvalidRequest)
         })
     }

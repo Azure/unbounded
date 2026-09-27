@@ -122,7 +122,9 @@ impl RdmaTransfer {
             .await?;
             // Source buffer is safe after its write CQE. Stop this single-use QP
             // before returning a control completion or admitting a fallback.
-            futures::future::poll_fn(|cx| session.qp.poll_stopped(cx)).await?;
+            // Request termination abandons this wait, not the native owner's
+            // quarantine. Only a successful terminal fence permits completion.
+            super::verbs::wait(scope, |cx| session.qp.poll_stopped(cx)).await?;
             Ok(SendCompletion {
                 binding: session.binding(),
                 transfer: descriptor.descriptor.transfer,

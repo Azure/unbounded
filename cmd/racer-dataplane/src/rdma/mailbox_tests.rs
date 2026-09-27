@@ -151,12 +151,23 @@ fn envelope() -> PageEnvelope {
 
 #[test]
 fn receive_preparation_and_sender_wait_at_every_buffer_and_command_boundary() {
+    sender_case(None);
+}
+
+#[test]
+fn successful_write_cancel_and_expiry_leave_failed_terminal_fence_quarantined() {
+    for error in [Error::Cancelled, Error::DeadlineExceeded] {
+        sender_case(Some(error));
+    }
+}
+
+fn sender_case(terminal: Option<Error>) {
     let signers = network(2);
     let (io, port) = pair(2).unwrap();
     let io = Rc::new(io);
     let mut native = NativeService::new(port);
     provision_test(&mut native, 0);
-    provision_test(&mut native, 1);
+    let charged = provision_test(&mut native, 1);
     let receiver = claim(&io);
     let sender = claim(&io);
     mark_connected(&receiver, &mut native);
@@ -173,7 +184,10 @@ fn receive_preparation_and_sender_wait_at_every_buffer_and_command_boundary() {
         buffers.clone(),
         Rc::new(Permissions),
     );
-    let scope = scope();
+    let mut scope = scope();
+    if terminal == Some(Error::DeadlineExceeded) {
+        scope.deadline.0 = Instant::now() + Duration::from_secs(1);
+    }
     let envelope = envelope();
     let id = TransferId([9; 16]);
     let mut prepare = transfer.prepare_receive(&receive, &envelope, id, &scope);
@@ -214,6 +228,36 @@ fn receive_preparation_and_sender_wait_at_every_buffer_and_command_boundary() {
     backend::lifetime_tests::complete(1, 0, 1);
     native.poll_budgeted(2).unwrap();
     assert!(poll(&mut sending).is_pending());
+    if let Some(error) = terminal {
+        backend::lifetime_tests::fail_stop(true);
+        native.poll_budgeted(2).unwrap();
+        assert!(!sender.stopped());
+        assert!(poll(&mut sending).is_pending());
+        if error == Error::Cancelled {
+            scope.cancel().unwrap();
+        } else {
+            std::thread::sleep(scope.deadline.0.saturating_duration_since(Instant::now()));
+        }
+        assert!(matches!(poll(&mut sending), Poll::Ready(Err(e)) if e == error));
+        drop(sending);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        drop((send, sender));
+        native.resources[1].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(2).unwrap();
+        assert_eq!(charged.get(), 1);
+        assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), OWNED);
+        assert!(!io.shared.slots[1].fenced.load(Ordering::Acquire));
+        backend::lifetime_tests::fail_stop(false);
+        native.resources[1].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(2).unwrap();
+        assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), READY);
+        drop((grant, receive, receiver));
+        native.close();
+        native.poll_budgeted(2).unwrap();
+        assert!(native.drained());
+        assert_eq!(charged.get(), 0);
+        return;
+    }
     native.poll_budgeted(2).unwrap();
     done(&mut sending);
     drop(sending);
