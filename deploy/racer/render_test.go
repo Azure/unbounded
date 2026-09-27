@@ -58,9 +58,14 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				}
 			}
 
-			var config, trust corev1.ConfigMap
+			var config, trust, dataplaneConfig corev1.ConfigMap
 			decode("config.yaml", &config)
 			decode("bootstrap-trust.yaml", &trust)
+			decode("dataplane-config.yaml", &dataplaneConfig)
+
+			if dataplaneConfig.Namespace != namespace || dataplaneConfig.Name != "racer-dataplane-config" || dataplaneConfig.Data["RACER_REQUEST_CONTEXT_BYTES"] != "67108864" {
+				t.Fatal("dataplane defaults must fund the Rust peer relay progress floor at four workers")
+			}
 
 			for key, value := range config.Data {
 				t.Setenv(key, value)

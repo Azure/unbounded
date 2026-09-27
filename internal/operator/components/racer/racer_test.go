@@ -456,7 +456,10 @@ func TestConfigEditsPersistAndRollWorkloads(t *testing.T) {
 
 		cm.BinaryData = map[string][]byte{"admin.bin": {1, 2, 3}}
 		if test.config == dataplaneConfigName {
+			require.Equal(t, "67108864", cm.Data["RACER_REQUEST_CONTEXT_BYTES"])
 			cm.Data["RACER_MAX_THREADS"] = "2"
+			// Existing tuning, including the old default, remains administrator-owned.
+			cm.Data["RACER_REQUEST_CONTEXT_BYTES"] = "16777216"
 		}
 
 		require.NoError(t, env.Client.Update(t.Context(), cm))
@@ -479,6 +482,11 @@ func TestConfigEditsPersistAndRollWorkloads(t *testing.T) {
 			annotations = obj.Spec.Template.Annotations
 			container := obj.Spec.Template.Spec.Containers[0]
 			require.Equal(t, dataplaneConfigName, container.EnvFrom[0].ConfigMapRef.Name)
+
+			for _, variable := range container.Env {
+				require.NotEqual(t, "RACER_REQUEST_CONTEXT_BYTES", variable.Name, "explicit env must not shadow the ConfigMap budget")
+			}
+
 			require.Equal(t, "1Gi", container.Resources.Requests.Memory().String())
 			require.Empty(t, container.Resources.Limits)
 		}
