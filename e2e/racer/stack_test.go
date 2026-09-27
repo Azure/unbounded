@@ -125,7 +125,13 @@ func TestOperatorImagePull(t *testing.T) {
 
 	peers := h.peerNodes()
 	peerFixture := h.newPeerFixture(peers)
+	lifecycle := newLifecycleOrigin(t)
 	origin := h.serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/fixture/lifecycle/") {
+			lifecycle.ServeHTTP(w, r)
+			return
+		}
+
 		if strings.HasPrefix(r.URL.Path, "/v2/fixture/peers/") {
 			peerFixture.ServeHTTP(w, r)
 			return
@@ -186,6 +192,7 @@ func TestOperatorImagePull(t *testing.T) {
 	h.waitHTTP(racerURL + "/readyz")
 	t.Logf("containerd pulled and unpacked %s/fixture/image@%s through operator-installed Racer and Gantry (%d objects)", registry, fixture.manifest, len(fixture.blobs))
 	h.verifyPeerCache(peers, peerFixture)
+	h.verifyCacheRecreation(peers, lifecycle)
 }
 
 type harness struct {

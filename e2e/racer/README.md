@@ -76,6 +76,36 @@ systemd/kubelet processes. `Failed to create control group inotify object: Too m
 open files` during kind startup indicates host inotify exhaustion, before Racer is
 deployed.
 
+## Populated cache deletion and recreation
+
+The final phase deletes `ClusterCache/gantry` through Kubernetes while an origin
+fill is outstanding, then recreates the same name with a different API-assigned
+UID. The real controller and Rust HTTPS control poll perform every transition.
+The test:
+
+1. Warms an immutable object on both nodes and verifies repeated pinned reads
+   reuse it without additional origin GETs.
+2. Starts a cold read whose origin sends a prefix and holds the remaining body.
+   Deletion must cancel it before the ordinary request timeout and remove both
+   client sockets. The held client cannot complete successfully.
+3. Recreates the cache and polls pinned HEAD requests for replacement socket
+   readiness. Hard links retained to the old sockets must reject promptly, and
+   the replacement sockets must have different inodes.
+4. Releases the old origin handler only after replacement readiness, attempting
+   its late body write. With origin data GETs denied but HEAD still available,
+   reads of both the warmed and held objects must fail on both nodes and must
+   attempt origin. Old cached bytes cannot satisfy the replacement UID.
+5. Enables origin data again, checks exact bytes, ETag, and Content-Range, and
+   verifies the replacement pages become reusable without additional GETs.
+
+Pod UIDs and restart counts must remain unchanged throughout this phase, so a
+restart cannot substitute for live cache retirement. The fixture keeps immutable
+digest identities; origin request accounting distinguishes a genuine fresh fill
+from old byte reuse even though the correct object bytes are identical. No
+metrics thresholds or fixed sleeps are used. Release is idempotent and the held
+handler also exits on test cancellation. The existing `make e2e-racer` target
+includes this phase without additional tools or images.
+
 ## Iteration and diagnostics
 
 ### CI coverage
