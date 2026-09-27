@@ -23,6 +23,10 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
+func testIssuer(r *KeyringReconciler) *Issuer {
+	return &Issuer{APIReader: r.APIReader, Config: r.Config, Trust: r.Trust, CatalogMu: r.CatalogMu, Now: r.Now}
+}
+
 func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {
 	t.Helper()
 
@@ -41,10 +45,11 @@ func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.Boo
 
 func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 	r, now := testKeyring(t)
+	issuer := testIssuer(r)
 	runKeys(t, r)
 	identity, request, pub := issuanceRequest(t, r)
 
-	response, err := r.Issuer.Issue(context.Background(), identity, request)
+	response, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +67,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 		t.Fatal("certificate identity or policy")
 	}
 
-	roots, err := r.Issuer.TrustRoots(context.Background())
+	roots, err := issuer.TrustRoots(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +87,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 
 	identity.expires = now.Add(time.Hour)
 
-	staged, err := r.Issuer.Issue(context.Background(), identity, request)
+	staged, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +103,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 
 	identity.expires = now.Add(time.Hour)
 
-	active, err := r.Issuer.Issue(context.Background(), identity, request)
+	active, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +112,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 		t.Fatal("new issuer not activated")
 	}
 
-	roots, err = r.Issuer.TrustRoots(context.Background())
+	roots, err = issuer.TrustRoots(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +129,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 	*now = now.Add(r.Config.Rotation.RetainFor)
 	runKeys(t, r)
 
-	roots, err = r.Issuer.TrustRoots(context.Background())
+	roots, err = issuer.TrustRoots(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +141,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 
 func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 	r, _ := testKeyring(t)
+	issuer := testIssuer(r)
 	runKeys(t, r)
 
 	identity, request, _ := issuanceRequest(t, r)
@@ -174,7 +180,7 @@ func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 				cancel()
 			}
 
-			response, err := r.Issuer.Issue(ctx, id, req)
+			response, err := issuer.Issue(ctx, id, req)
 			if err == nil || len(response.CertificateChain) != 0 {
 				t.Fatal("untrusted issuance accepted")
 			}
@@ -186,11 +192,11 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 	r, now := testKeyring(t)
 	r.Config.CertificateLifetime = 2 * time.Minute
 	r.Config.Rotation = RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}
-	r.Issuer.Config = r.Config
+	issuer := testIssuer(r)
 	runKeys(t, r)
 	identity, request, _ := issuanceRequest(t, r)
 
-	response, err := r.Issuer.Issue(context.Background(), identity, request)
+	response, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +215,7 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 
 	runKeys(t, r)
 
-	renewed, err := r.Issuer.Issue(context.Background(), identity, request)
+	renewed, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil || bytes.Equal(response.CertificateChain[1], renewed.CertificateChain[1]) {
 		t.Fatalf("short rotation issuer activation: %v", err)
 	}
@@ -226,6 +232,7 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 
 func TestIssuerConcurrentIssuanceAndReconciliation(t *testing.T) {
 	r, _ := testKeyring(t)
+	issuer := testIssuer(r)
 	runKeys(t, r)
 	identity, request, _ := issuanceRequest(t, r)
 
@@ -233,11 +240,11 @@ func TestIssuerConcurrentIssuanceAndReconciliation(t *testing.T) {
 	for range 16 {
 		wg.Go(func() {
 			for range 4 {
-				if _, err := r.Issuer.Issue(context.Background(), identity, request); err != nil {
+				if _, err := issuer.Issue(context.Background(), identity, request); err != nil {
 					t.Error(err)
 				}
 
-				if _, err := r.Issuer.TrustRoots(context.Background()); err != nil {
+				if _, err := issuer.TrustRoots(context.Background()); err != nil {
 					t.Error(err)
 				}
 			}
@@ -255,6 +262,7 @@ func TestKeyringExpiredPreparationRecovery(t *testing.T) {
 	for _, prepared := range []bool{false, true} {
 		t.Run(fmtBool(prepared), func(t *testing.T) {
 			r, now := testKeyring(t)
+			issuer := testIssuer(r)
 			runKeys(t, r)
 
 			_, _, initial, _ := keyState(t, r)
@@ -267,7 +275,7 @@ func TestKeyringExpiredPreparationRecovery(t *testing.T) {
 			*now = now.Add(30 * 24 * time.Hour)
 			// An expired active issuer cannot sign, but rotation can recover by
 			// staging fresh trust and waiting the complete preparation interval.
-			if _, err := r.Issuer.TrustRoots(context.Background()); !errors.Is(err, wire.Unavailable) {
+			if _, err := issuer.TrustRoots(context.Background()); !errors.Is(err, wire.Unavailable) {
 				t.Fatalf("expired issuer accepted: %v", err)
 			}
 
@@ -284,7 +292,7 @@ func TestKeyringExpiredPreparationRecovery(t *testing.T) {
 
 			runKeys(t, r)
 
-			if _, err := r.Issuer.TrustRoots(context.Background()); err != nil {
+			if _, err := issuer.TrustRoots(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 		})

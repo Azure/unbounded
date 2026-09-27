@@ -42,7 +42,6 @@ type KeyringReconciler struct {
 	client.Client
 	APIReader client.Reader
 	Config    Config
-	Issuer    *Issuer
 	Trust     *Trust
 	Lifecycle *Lifecycle
 	Now       func() time.Time

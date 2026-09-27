@@ -73,7 +73,7 @@ func newServingFixture(t *testing.T) *servingFixture {
 	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}
 	identity := NodeIdentity{cluster: request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}
 
-	response, err := a.Keyring.Issuer.Issue(ctx, identity, request)
+	response, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 		t.Fatal("new TLS connection accepted retired root")
 	}
 	// A fresh identity reconnects successfully but cannot resume an old session.
-	responseChain, err := f.a.Keyring.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+	responseChain, err := f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
 	if err != nil {
 		t.Fatal(err)
 	}

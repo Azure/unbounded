@@ -132,7 +132,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 			case "keyring":
 				_, err = f.a.Keyring.Reconcile(f.ctx, ctrl.Request{})
 			case "issuance":
-				_, err = f.a.Keyring.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+				_, err = f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
 			default:
 				_, err = f.a.Topology.Reconcile(f.ctx, ctrl.Request{})
 			}
@@ -280,7 +280,7 @@ func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := f.a.Keyring.Issuer.TrustRoots(ctx)
+		_, err := f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
 		done <- err
 	}()
 

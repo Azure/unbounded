@@ -36,7 +36,6 @@ func testKeyring(t *testing.T) (*KeyringReconciler, *time.Time) {
 	a := Assemble(topology.Config, topology.Client, topology.APIReader)
 	now := time.Now().UTC().Truncate(time.Second)
 	a.Keyring.Now = func() time.Time { return now }
-	a.Keyring.Issuer.Now = a.Keyring.Now
 
 	return a.Keyring, &now
 }
@@ -320,6 +319,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 	for _, lost := range []string{"issuer", "bundle", "both", "version", "marker"} {
 		t.Run("lost "+lost, func(t *testing.T) {
 			r, _ := testKeyring(t)
+			issuer := testIssuer(r)
 			runKeys(t, r)
 
 			for _, name := range []string{r.Config.IssuerSecretName, r.Config.KeyringSecretName} {
@@ -349,7 +349,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 				t.Fatal("lost state accepted")
 			}
 
-			if _, err := r.Issuer.TrustRoots(context.Background()); err == nil {
+			if _, err := issuer.TrustRoots(context.Background()); err == nil {
 				t.Fatal("lost state still trusted")
 			}
 		})
@@ -641,7 +641,6 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 		t.Run(fmt.Sprintf("response-lost=%t", afterWrite), func(t *testing.T) {
 			r, now := testKeyring(t)
 			r.Config.Rotation.Interval = 7 * 24 * time.Hour
-			r.Issuer.Config = r.Config
 			runKeys(t, r)
 			_, _, initial, _ := keyState(t, r)
 			*now = initial.NextRotation
