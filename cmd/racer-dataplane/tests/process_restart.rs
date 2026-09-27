@@ -4,6 +4,10 @@
 
 #[path = "process/control.rs"]
 mod control;
+#[path = "process/measurement.rs"]
+mod measurement;
+#[path = "process/throughput.rs"]
+mod throughput;
 
 use racer_dataplane::{model::range::PAGE_BYTES, store::checkpoint_format::CheckpointCodec};
 use std::{
@@ -69,19 +73,48 @@ struct Process {
     log: PathBuf,
     diagnostics: SocketAddr,
     socket_directory: fs::File,
+    cache_directories: Vec<fs::File>,
 }
 impl Process {
     fn start(scratch: &Scratch, control: &control::Control, incarnation: usize) -> (Self, Origin) {
+        let (process, mut origins) = Self::start_profile(scratch, control, incarnation, None);
+        (process, origins.remove(0))
+    }
+    fn start_profile(
+        scratch: &Scratch,
+        control: &control::Control,
+        incarnation: usize,
+        profile: Option<&throughput::Profile>,
+    ) -> (Self, Vec<Origin>) {
         // This fixture gives each process fresh runtime sockets and shares identity/
         // and slabs/. It does not cover stale sockets on deployment's hostPath.
         let run = scratch.0.join(format!("run-{incarnation}"));
-        let cache = run.join("racer").join(NAME);
-        fs::create_dir_all(cache.join("origin")).unwrap();
-        fs::create_dir_all(cache.join("client")).unwrap();
-        let socket_directory = fs::File::open(&cache).unwrap();
-        let alias = PathBuf::from(format!("/proc/self/fd/{}", socket_directory.as_raw_fd()));
-        let origin = Origin::start(&alias.join("origin/socket"));
-        let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+        let names = profile.map_or_else(
+            || vec![NAME.to_owned()],
+            |p| p.caches.iter().map(|(_, name)| name.clone()).collect(),
+        );
+        let mut cache_directories = Vec::new();
+        let mut origins = Vec::new();
+        for name in names {
+            let cache = run.join("racer").join(name);
+            fs::create_dir_all(cache.join("origin")).unwrap();
+            fs::create_dir_all(cache.join("client")).unwrap();
+            let directory = fs::File::open(&cache).unwrap();
+            let alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+            origins.push(Origin::start_with(
+                &alias.join("origin/socket"),
+                profile.map_or(LENGTH, |p| p.length),
+                profile.is_some(),
+            ));
+            cache_directories.push(directory);
+        }
+        let socket_directory = cache_directories[0].try_clone().unwrap();
+        let peer = TcpListener::bind(
+            profile
+                .and_then(|p| p.peer)
+                .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+        )
+        .unwrap();
         let diagnostic = TcpListener::bind("127.0.0.1:0").unwrap();
         let diagnostics = diagnostic.local_addr().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_racer-dataplane"));
@@ -105,28 +138,33 @@ impl Process {
         ] {
             command.env(name, scratch.0.join(path));
         }
-        command.envs([
-            ("RACER_MAX_THREADS", "2"),
-            ("RACER_ENABLE_RDMA", "false"),
-            ("RACER_PLAINTEXT_BYTES", "67108864"),
-            ("RACER_CIPHERTEXT_BYTES", "167772160"),
-            ("RACER_DIRTY_BYTES", "67108864"),
-            ("RACER_REGISTERED_BYTES", "1"),
-            ("RACER_REQUEST_CONTEXT_BYTES", "1048576"),
-            ("RACER_SLAB_BYTES", "268435456"),
-            ("RACER_SEGMENT_BYTES", "67108864"),
-            ("RACER_FREE_SEGMENT_RESERVE", "1"),
-            ("RACER_QUEUE_ENTRIES", "16"),
-            ("RACER_CLIENT_CONNECTIONS", "8"),
-            ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "2"),
-            ("RACER_METADATA_ENTRIES", "32"),
-            ("RACER_FLIGHTS", "8"),
-            ("RACER_PIPES", "2"),
-            ("RACER_RANGE_WINDOW_PAGES", "1"),
-            ("RACER_REQUEST_TIMEOUT_MS", "20000"),
-            ("RACER_READER_STALL_TIMEOUT_MS", "10000"),
-            ("RACER_SHUTDOWN_TIMEOUT_MS", "10000"),
-        ]);
+        if let Some(profile) = profile {
+            command.env("RACER_MAX_THREADS", (profile.pairs * 2).to_string());
+        } else {
+            command.envs([
+                ("RACER_MAX_THREADS", "2"),
+                ("RACER_ENABLE_RDMA", "false"),
+                ("RACER_PLAINTEXT_BYTES", "67108864"),
+                ("RACER_CIPHERTEXT_BYTES", "167772160"),
+                ("RACER_DIRTY_BYTES", "67108864"),
+                ("RACER_REGISTERED_BYTES", "1"),
+                // Current signed-peer envelope progress floor exceeds 1 MiB.
+                ("RACER_REQUEST_CONTEXT_BYTES", "16777216"),
+                ("RACER_SLAB_BYTES", "268435456"),
+                ("RACER_SEGMENT_BYTES", "67108864"),
+                ("RACER_FREE_SEGMENT_RESERVE", "1"),
+                ("RACER_QUEUE_ENTRIES", "16"),
+                ("RACER_CLIENT_CONNECTIONS", "8"),
+                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "2"),
+                ("RACER_METADATA_ENTRIES", "32"),
+                ("RACER_FLIGHTS", "8"),
+                ("RACER_PIPES", "2"),
+                ("RACER_RANGE_WINDOW_PAGES", "1"),
+                ("RACER_REQUEST_TIMEOUT_MS", "20000"),
+                ("RACER_READER_STALL_TIMEOUT_MS", "10000"),
+                ("RACER_SHUTDOWN_TIMEOUT_MS", "10000"),
+            ]);
+        }
         let source = CString::new(run.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: the child performs only async-signal-safe syscalls before exec.
         // Make propagation private before mounting worktree-local storage over /run.
@@ -169,6 +207,7 @@ impl Process {
             log,
             diagnostics,
             socket_directory,
+            cache_directories,
         };
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -186,7 +225,29 @@ impl Process {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        (process, origin)
+        if let Some(profile) = profile {
+            let names: Vec<_> = fs::read_dir(format!("/proc/{}/task", process.child.id()))
+                .unwrap()
+                .map(|task| fs::read_to_string(task.unwrap().path().join("comm")).unwrap())
+                .collect();
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.starts_with("racer-crypto-"))
+                    .count(),
+                profile.pairs,
+                "host CPU/quota or progress floors reduced requested pairs: {names:?}"
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.starts_with("racer-io-"))
+                    .count(),
+                profile.pairs - 1,
+                "caller owns worker zero: {names:?}"
+            );
+        }
+        (process, origins)
     }
     fn logs(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
@@ -375,7 +436,7 @@ struct Origin {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Origin {
-    fn start(path: &Path) -> Self {
+    fn start_with(path: &Path, length: u64, distinct: bool) -> Self {
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -413,7 +474,11 @@ impl Origin {
                                 };
                                 let fields = fields(&head);
                                 let method = head.split_whitespace().next().unwrap();
-                                assert_eq!(head.split_whitespace().nth(1).unwrap(), format!("/v1/objects/{}", "ab".repeat(32)));
+                                let target = head.split_whitespace().nth(1).unwrap();
+                                let key = target.strip_prefix("/v1/objects/").unwrap();
+                                assert_eq!(key.len(), 64);
+                                assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+                                if !distinct { assert_eq!(key, "ab".repeat(32)); }
                                 assert_eq!(fields["authorization"], "fixture-credential");
                                 assert_eq!(fields["racer-metadata"], "fixture-metadata");
                                 calls.lock().unwrap().push(Call { method: method.into(), pin: fields.get("if-match").cloned(), range: fields.get("range").cloned() });
@@ -423,7 +488,7 @@ impl Origin {
                                 }
                                 assert!(fields.get("if-match").is_none_or(|pin| pin == "\"restart-v1\""));
                                 if method == "HEAD" {
-                                    if write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {LENGTH}\r\nContent-Type: application/octet-stream\r\nETag: \"restart-v1\"\r\nRacer-Expires-At: 0\r\n\r\n").is_err() { return; }
+                                    if write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nETag: \"restart-v1\"\r\nRacer-Expires-At: 0\r\n\r\n").is_err() { return; }
                                     continue;
                                 }
                                 assert_eq!(method, "GET");
@@ -432,13 +497,13 @@ impl Origin {
                                 let last: u64 = last.parse().unwrap();
                                 assert_eq!(first % P, 0);
                                 assert_eq!(last, first + P - 1);
-                                let end = (last + 1).min(LENGTH);
-                                if write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {first}-{}/{LENGTH}\r\nETag: \"restart-v1\"\r\nRacer-Expires-At: 0\r\n\r\n", end - first, end - 1).is_err() { return; }
+                                let end = (last + 1).min(length);
+                                if write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {first}-{}/{length}\r\nETag: \"restart-v1\"\r\nRacer-Expires-At: 0\r\n\r\n", end - first, end - 1).is_err() { return; }
                                 let mut offset = first;
                                 let mut chunk = [0; 65536];
                                 while offset < end {
                                     let n = chunk.len().min((end - offset) as usize);
-                                    for (i, b) in chunk[..n].iter_mut().enumerate() { *b = byte(offset + i as u64); }
+                                    for (i, b) in chunk[..n].iter_mut().enumerate() { *b = if distinct { throughput::object_byte(u64::from_str_radix(&key[48..], 16).unwrap(), offset + i as u64) } else { byte(offset + i as u64) }; }
                                     if socket.write_all(&chunk[..n]).is_err() { return; }
                                     offset += n as u64;
                                     if pause.load(Ordering::Acquire) {

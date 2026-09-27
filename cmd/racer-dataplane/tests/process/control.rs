@@ -14,11 +14,17 @@ use std::{num::NonZeroU32, os::unix::fs::symlink, time::SystemTime};
 pub struct Control {
     pub endpoint: String,
     pub enrollments: Arc<AtomicUsize>,
+    pub polls: Arc<AtomicUsize>,
+    pub blocked: Arc<AtomicBool>,
+    pub publication: Arc<Mutex<wire::Publication>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Control {
     pub fn start(root: &Path) -> Self {
+        Self::start_with(root, vec![(CACHE.into(), NAME.into())])
+    }
+    pub fn start_with(root: &Path, caches: Vec<(String, String)>) -> Self {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -56,11 +62,11 @@ impl Control {
         fs::write(root.join("token"), "fixture.token").unwrap();
         fs::create_dir_all(root.join("secrets/epoch")).unwrap();
         // Runtime-generated test material, distinct for the two encryption purposes.
-        let keys: Vec<_> = [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(|(purpose, id)| {
+        let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
             let mut material = [0; 32];
             getrandom::getrandom(&mut material).unwrap();
-            serde_json::json!({"cache": CACHE, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
-        }).collect();
+            serde_json::json!({"cache": cache, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
+        })).collect();
         let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
         fs::write(
             root.join("secrets/epoch/bundle.json"),
@@ -68,8 +74,7 @@ impl Control {
         )
         .unwrap();
         symlink("epoch", root.join("secrets/..data")).unwrap();
-        let (client_socket, origin_socket) = canonical_socket_paths(NAME).unwrap();
-        let publication = wire::encode_publication(&wire::Publication {
+        let publication = Arc::new(Mutex::new(wire::Publication {
             schema_version: 1,
             cluster: ClusterId(CLUSTER.into()),
             sequence: wire::PublicationSequence(1),
@@ -81,19 +86,28 @@ impl Control {
                 rails: vec![],
                 alignment_enabled: false,
             }],
-            caches: vec![CacheDefinition {
-                id: CacheId(CACHE.into()),
-                name: NAME.into(),
-                client_socket,
-                origin_socket,
-            }],
-        })
-        .unwrap();
+            caches: caches
+                .into_iter()
+                .map(|(id, name)| {
+                    let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
+                    CacheDefinition {
+                        id: CacheId(id),
+                        name,
+                        client_socket,
+                        origin_socket,
+                    }
+                })
+                .collect(),
+        }));
+        let published = publication.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let enrollments = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let (observed, paused) = (polls.clone(), blocked.clone());
         let (stopping, issued) = (stop.clone(), enrollments.clone());
         let thread = thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
@@ -128,7 +142,22 @@ impl Control {
                     continue;
                 }
                 let (status, body) = if head.starts_with("POST /v1/bootstrap ") {
-                    assert_eq!(fields["authorization"], "Bearer fixture.token");
+                    let binding = fields["authorization"]
+                        .strip_prefix("Bearer fixture.token")
+                        .unwrap();
+                    let node = if binding.is_empty() {
+                        NODE
+                    } else {
+                        binding.strip_prefix('.').unwrap()
+                    };
+                    assert!(
+                        published
+                            .lock()
+                            .unwrap()
+                            .members
+                            .iter()
+                            .any(|member| member.node.0 == node)
+                    );
                     assert!(stream.conn.peer_certificates().is_none());
                     let request = wire::decode_enrollment_request(&body).unwrap();
                     assert_eq!(request.cluster.0, CLUSTER);
@@ -138,7 +167,7 @@ impl Control {
                     csr.params.not_before = (SystemTime::now() - Duration::from_secs(1)).into();
                     csr.params.not_after = (SystemTime::now() + Duration::from_secs(86399)).into();
                     csr.params.subject_alt_names = vec![rcgen::SanType::URI(
-                        format!("spiffe://{CLUSTER}/node/{NODE}")
+                        format!("spiffe://{CLUSTER}/node/{node}")
                             .try_into()
                             .unwrap(),
                     )];
@@ -152,7 +181,7 @@ impl Control {
                         wire::encode_enrollment_response(&wire::EnrollmentResponse {
                             schema_version: 1,
                             cluster: request.cluster,
-                            node: NodeId(NODE.into()),
+                            node: NodeId(node.into()),
                             enrollment: request.enrollment,
                             certificate_chain: vec![certificate.der().to_vec()],
                         })
@@ -161,11 +190,21 @@ impl Control {
                 } else {
                     assert!(head.starts_with("GET /v1/snapshot"));
                     assert!(stream.conn.peer_certificates().is_some());
-                    if head.lines().next().unwrap().contains("?after=1") {
+                    observed.fetch_add(1, Ordering::Release);
+                    while paused.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    let publication = published.lock().unwrap();
+                    if head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains(&format!("?after={} ", publication.sequence.0))
+                    {
                         thread::sleep(Duration::from_millis(20));
                         (204, Vec::new())
                     } else {
-                        (200, publication.clone())
+                        (200, wire::encode_publication(&publication).unwrap())
                     }
                 };
                 let response = format!(
@@ -181,6 +220,9 @@ impl Control {
         Self {
             endpoint,
             enrollments,
+            polls,
+            blocked,
+            publication,
             stop,
             thread: Some(thread),
         }
