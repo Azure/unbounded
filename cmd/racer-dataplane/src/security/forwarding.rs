@@ -11,7 +11,7 @@
 //!     peer::{server::LocalPageService, wire::{PeerRequest, VerifiedResponse}},
 //!     runtime::deadline::RequestScope,
 //!     security::forwarding::Forwarding,
-//!     topology::paths::RouteBudget,
+//!     topology::{membership::MembershipLease, paths::RouteBudget},
 //! };
 //!
 //! async fn round_trip(
@@ -23,6 +23,7 @@
 //!     next: &NodeId,
 //!     previous: &NodeId,
 //!     budget: RouteBudget,
+//!     membership: MembershipLease,
 //!     scope: &RequestScope,
 //! ) -> Result<VerifiedResponse> {
 //!     let (outbound, outstanding) = requester.sign_request(request)?;
@@ -31,7 +32,7 @@
 //!     let forwarded = relay.append_request(ingress, next, budget)?;
 //!     let admitted = destination.verify_request(forwarded)?;
 //!     let reply_binding = admitted.binding().clone();
-//!     let unsigned = local.serve_peer(admitted, scope).await?;
+//!     let unsigned = local.serve_peer(admitted, membership, scope).await?;
 //!     let response = destination.sign_response(&reply_binding, unsigned)?;
 //!     let verified = relay.verify_response(response, &reverse_binding)?;
 //!     let reverse = relay.append_response(verified, previous)?;

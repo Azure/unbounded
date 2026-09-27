@@ -124,7 +124,7 @@ impl Handshake {
     pub fn negotiate_at<'a>(
         &'a self,
         peer: &'a NodeId,
-        membership: crate::model::identity::MembershipVersion,
+        membership: &'a crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, Capabilities> {
         Box::pin(async move {
@@ -160,7 +160,7 @@ impl Handshake {
             p::push(&mut head, "content-length", 0);
             p::push(&mut head, "racer-kind", "handshake");
             p::push(&mut head, "racer-wire-version", super::wire::VERSION);
-            p::push(&mut head, "racer-membership", membership.0);
+            p::push(&mut head, "racer-membership", membership.version.0);
             p::push(&mut head, "racer-receiver", &peer.0);
             p::push_binary(
                 &mut head,
@@ -178,7 +178,7 @@ impl Handshake {
                 || !matches!(head.start, StartLine::Response { status: 200 })
                 || p::field(head, "racer-kind")? != "handshake-response"
                 || p::field(head, "racer-wire-version")? != super::wire::VERSION
-                || p::number(head, "racer-membership")? != membership.0
+                || p::number(head, "racer-membership")? != membership.version.0
                 || p::decode_binary(p::field(head, "racer-request-binding")?.as_bytes())? != binding
             {
                 return Err(Error::Unauthorized);
@@ -211,10 +211,15 @@ impl Handshake {
         })
     }
 
+    /// Return the ingress lease with the signed reply so the connection owner
+    /// retains the generation through response I/O completion.
     pub fn respond(
         &self,
         signed: crate::security::signing::SignedHead,
-    ) -> Result<crate::security::signing::SignedHead> {
+    ) -> Result<(
+        crate::security::signing::SignedHead,
+        crate::topology::membership::MembershipLease,
+    )> {
         use crate::http::codec::{MessageHead, StartLine};
         use crate::security::{protocol as p, signing::signed_digest};
         let binding = signed_digest(&signed)?;
@@ -229,7 +234,8 @@ impl Handshake {
         let membership =
             crate::model::identity::MembershipVersion(p::number(head, "racer-membership")?);
         let (network, _) = self.http.as_ref().ok_or(Error::InvalidConfiguration)?;
-        network.endpoint(membership, verified.peer.node())?;
+        let membership = network.membership(membership)?;
+        network.endpoint(&membership, verified.peer.node())?;
         let challenge = p::decode_binary(p::field(head, "racer-session-challenge")?.as_bytes())?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?;
@@ -242,7 +248,7 @@ impl Handshake {
         p::push(&mut response, "content-length", 0);
         p::push(&mut response, "racer-kind", "handshake-response");
         p::push(&mut response, "racer-wire-version", super::wire::VERSION);
-        p::push(&mut response, "racer-membership", membership.0);
+        p::push(&mut response, "racer-membership", membership.version.0);
         p::push(&mut response, "racer-receiver", &verified.peer.node().0);
         p::push_binary(&mut response, "racer-request-binding", &binding);
         p::push_binary(
@@ -251,16 +257,9 @@ impl Handshake {
             &self.signatures.challenge()?,
         );
         let native_ready = self.rdma.as_ref().is_some_and(|sessions| {
-            network
-                .membership(membership)
+            membership
+                .member(&network.local)
                 .ok()
-                .and_then(|members| {
-                    members
-                        .members()
-                        .iter()
-                        .find(|m| m.node == network.local)
-                        .cloned()
-                })
                 .is_some_and(|member| {
                     member.alignment_enabled
                         && member.rails.iter().any(|rail| sessions.ready(rail.rail))
@@ -268,7 +267,7 @@ impl Handshake {
         });
         p::push(&mut response, "racer-rdma", u8::from(native_ready));
         p::push(&mut response, "racer-scoped-grants", u8::from(native_ready));
-        self.signatures.sign(response)
+        Ok((self.signatures.sign(response)?, membership))
     }
     pub fn with_exchange(
         mut self,

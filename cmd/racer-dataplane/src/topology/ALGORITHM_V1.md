@@ -25,9 +25,12 @@ connectivity failures belong to transport health rather than membership
 validation. These rules match `internal/racer/wire/validate.go` (`validRail`
 and `validatePublication`) and `CONTROL_API.md`'s codec contract.
 
-Members are immutable through their `Arc<Membership>` lease. Existing leases
-keep old snapshots usable; retention/admission of those leases is the control
-snapshot owner's responsibility. Topology caches hold only weak snapshot
+Members are immutable through one canonical `Arc<Membership>` per published version.
+Cache-only publications reuse that allocation. Existing operation leases keep old
+generations usable; the control publication owner admits at most the configured
+old-generation limit plus the current generation. Its sole incoming-version registry
+holds weak references; outgoing routes and endpoints use operation leases directly.
+Topology caches hold only weak snapshot
 references. A cache identity includes the immutable allocation, preventing
 accidental reuse across different snapshots with the same version counter.
 

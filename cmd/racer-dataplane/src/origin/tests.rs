@@ -194,6 +194,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         fn request<'a>(
             &'a self,
             _: PeerRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             panic!("rank-zero origin candidate must not probe peers")
@@ -624,6 +625,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         fn request<'a>(
             &'a self,
             _: PeerRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             panic!("rank zero must not probe peers")

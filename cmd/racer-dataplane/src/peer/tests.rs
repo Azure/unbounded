@@ -490,6 +490,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, wire::SignedResponse> {
             Box::pin(async { panic!("local service must not relay") })
@@ -500,6 +501,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         fn serve_peer<'a>(
             &'a self,
             request: wire::VerifiedRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -521,26 +523,30 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(false).limits,
     ));
-    let network = Rc::new(PeerNetwork::new(NodeId(C.into()), 2).unwrap());
-    network
-        .install(Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                [A, B, C]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| Member {
-                        node: NodeId((*n).into()),
-                        shares: NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
-                        rails: vec![],
-                        alignment_enabled: false,
-                    })
-                    .collect(),
-            )
-            .unwrap(),
-        ))
-        .unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, B, C]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Member {
+                    node: NodeId((*n).into()),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(C.into()),
+            crate::control::snapshot::PublishedState::for_membership(membership),
+        )
+        .unwrap(),
+    );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000));
     let relay = Rc::new(
         relay::Relay::new(
@@ -613,26 +619,31 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         io,
         None,
     ));
-    let network = Rc::new(PeerNetwork::new(NodeId(C.into()), 2).unwrap());
-    network
-        .install(Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                [A, C]
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| Member {
-                        node: NodeId((*name).into()),
-                        shares: std::num::NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
-                        rails: vec![],
-                        alignment_enabled: false,
-                    })
-                    .collect(),
-            )
-            .unwrap(),
-        ))
-        .unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, C]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Member {
+                    node: NodeId((*name).into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let weak = Arc::downgrade(&membership);
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(C.into()),
+            crate::control::snapshot::PublishedState::for_membership(membership),
+        )
+        .unwrap(),
+    );
     let handshake =
         handshake::Handshake::new(signers[2].clone(), None).with_http(network, transfers);
     let mut head = MessageHead {
@@ -654,7 +665,12 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     );
     let signed = signers[0].sign(head).unwrap();
     let binding = signed_digest(&signed).unwrap();
-    let reply = handshake.respond(signed).unwrap();
+    let (reply, response_lease) = handshake.respond(signed).unwrap();
+    drop(handshake);
+    assert!(
+        weak.upgrade().is_some(),
+        "pending reply retains ingress lease"
+    );
     assert_eq!(
         p::decode_binary(
             p::field(&reply.head, "racer-request-binding")
@@ -675,6 +691,11 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         .unwrap()
         .value = b"1".to_vec();
     assert!(signers[0].verify(tampered).is_err());
+    drop(response_lease);
+    assert!(
+        weak.upgrade().is_none(),
+        "completed reply releases ingress lease"
+    );
 }
 
 #[test]
@@ -692,6 +713,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         fn exchange<'a>(
             &'a self,
             request: wire::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, wire::SignedResponse> {
             Box::pin(async move {
@@ -723,26 +745,30 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let network = Rc::new(PeerNetwork::new(NodeId(B.into()), 1).unwrap());
-        network
-            .install(Arc::new(
-                Membership::validate(
-                    MembershipVersion(1),
-                    [A, B, C]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, n)| Member {
-                            node: NodeId((*n).into()),
-                            shares: std::num::NonZeroU32::new(1).unwrap(),
-                            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
-                            rails: vec![],
-                            alignment_enabled: false,
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                [A, B, C]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| Member {
+                        node: NodeId((*n).into()),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                        rails: vec![],
+                        alignment_enabled: false,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let network = Rc::new(
+            PeerNetwork::new(
+                NodeId(B.into()),
+                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+            )
+            .unwrap(),
+        );
         let relay = relay::Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 1, 1000)),
             forwarding.clone(),
@@ -757,7 +783,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let scope = local.origin.scope().clone();
         let (signed, binding) = origin.sign_request_to(local, signers[1].node()).unwrap();
         let ingress = forwarding.verify_request(signed).unwrap();
-        let result = futures::executor::block_on(relay.forward(ingress, &scope));
+        let result = futures::executor::block_on(relay.forward(ingress, membership, &scope));
         if fail {
             assert!(matches!(result, Err(Error::Io)));
         } else {
@@ -801,6 +827,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, wire::SignedResponse> {
             Box::pin(async { panic!("direct request must not relay") })
@@ -811,6 +838,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         fn serve_peer<'a>(
             &'a self,
             request: wire::VerifiedRequest,
+            _: crate::topology::membership::MembershipLease,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -875,10 +903,20 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         )
         .unwrap(),
     );
-    let source_network = Rc::new(PeerNetwork::new(NodeId(A.into()), 1).unwrap());
-    let destination_network = Rc::new(PeerNetwork::new(NodeId(C.into()), 1).unwrap());
-    source_network.install(membership.clone()).unwrap();
-    destination_network.install(membership).unwrap();
+    let source_network = Rc::new(
+        PeerNetwork::new(
+            NodeId(A.into()),
+            crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+        )
+        .unwrap(),
+    );
+    let destination_network = Rc::new(
+        PeerNetwork::new(
+            NodeId(C.into()),
+            crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+        )
+        .unwrap(),
+    );
     let source_handshake = Rc::new(
         handshake::Handshake::new(signers[0].clone(), None)
             .with_http(source_network.clone(), transfers.clone())
@@ -947,7 +985,8 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         server.serve_connection(connection, &listener_scope).await?;
         Ok::<(), Error>(())
     };
-    let exchange = async { futures::try_join!(requester.request(local, &scope), server_work) };
+    let exchange =
+        async { futures::try_join!(requester.request(local, membership, &scope), server_work) };
     let mut exchange = std::pin::pin!(exchange);
     let mut context = Context::from_waker(futures::task::noop_waker_ref());
     let (response, ()) = loop {
@@ -979,6 +1018,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, wire::SignedResponse> {
             Box::pin(async { panic!("incomplete headers must not relay") })
@@ -988,6 +1028,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         fn serve_peer<'a>(
             &'a self,
             _: wire::VerifiedRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async { panic!("incomplete headers must not dispatch") })
@@ -1337,4 +1378,59 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         ),
         crate::topology::rails::TransportPlan::Http
     ));
+}
+#[test]
+fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
+    use crate::topology::{
+        graph::Graph,
+        membership::{Member, Membership},
+    };
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(7),
+            (0..64)
+                .map(|index| Member {
+                    node: NodeId(format!("node-{index:02}")),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8000 + index),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let local = membership.members()[0].node.clone();
+    let network = PeerNetwork::new(
+        local.clone(),
+        Arc::new(crate::control::snapshot::PublishedState::default()),
+    )
+    .unwrap();
+    assert!(matches!(
+        network.membership(membership.version),
+        Err(Error::IncompatibleMembership)
+    ));
+    let neighbors = Graph::new(membership.clone()).neighbors(&local).unwrap();
+    assert!(neighbors.len() < membership.members().len() - 1);
+    for member in membership.members() {
+        let endpoint = network.endpoint(&membership, &member.node);
+        if neighbors.contains(&member.node) {
+            assert_eq!(
+                endpoint.unwrap(),
+                crate::http::pool::Endpoint::Peer(member.peer_endpoint.clone())
+            );
+        } else {
+            assert!(matches!(endpoint, Err(Error::InvalidRequest)));
+        }
+    }
+    let admission = crate::runtime::admission::Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    );
+    let mut request = request(&admission, 1);
+    assert_eq!(
+        super::check_membership(&request, &membership),
+        Err(Error::IncompatibleMembership)
+    );
+    request.route.membership = membership.version;
+    assert_eq!(super::check_membership(&request, &membership), Ok(()));
 }

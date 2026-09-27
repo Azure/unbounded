@@ -424,6 +424,7 @@ impl PeerClient for NoTransport {
     fn request<'a>(
         &'a self,
         _: PeerRequest,
+        _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async { panic!("bootstrap fixture must not use a peer") })

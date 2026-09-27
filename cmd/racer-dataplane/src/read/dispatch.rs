@@ -70,7 +70,7 @@ enum Work {
     Acquire(PageId, MembershipLease, PeerOriginContext),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
-    Peer(VerifiedRequest),
+    Peer(VerifiedRequest, MembershipLease),
 }
 enum Value {
     Metadata(ObjectMetadata),
@@ -569,6 +569,7 @@ impl WorkerDirectory {
     fn peer<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -579,10 +580,10 @@ impl WorkerDirectory {
                 }
             };
             if self.is_local(owner) {
-                return self.local()?.serve_peer(request, scope).await;
+                return self.local()?.serve_peer(request, membership, scope).await;
             }
             match self
-                .submit(owner, Work::Peer(request), scope, None)?
+                .submit(owner, Work::Peer(request, membership), scope, None)?
                 .await?
                 .value?
             {
@@ -821,7 +822,10 @@ async fn execute(
             .retained_metadata(&version, scope)
             .await
             .map(Value::Retained),
-        Work::Peer(request) => local.serve_peer(request, scope).await.map(Value::Peer),
+        Work::Peer(request, membership) => local
+            .serve_peer(request, membership, scope)
+            .await
+            .map(Value::Peer),
     }
 }
 
@@ -855,9 +859,10 @@ impl LocalPageService for Dispatcher {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
-        self.directory.peer(request, scope)
+        self.directory.peer(request, membership, scope)
     }
 }
 

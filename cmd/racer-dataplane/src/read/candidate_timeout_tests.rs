@@ -70,6 +70,7 @@ impl PeerClient for Peers {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
+        membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         assert_eq!(scope.deadline.0, request.route.deadline.0);
@@ -89,6 +90,7 @@ impl PeerClient for Peers {
             links: request.route.remaining_links,
         });
         Box::pin(async move {
+            let _membership = membership;
             if stalled {
                 // A successful result computed before timeout is still inadmissible
                 // if its transport completion fence arrives after the attempt ends.
@@ -366,6 +368,7 @@ fn all_stalled_candidates_stop_at_original_deadline_without_refunding_credits() 
 fn parent_cancellation_cancels_child_but_waits_for_fence_without_fallback() {
     let mut f = Fixture::new(None, 1, false);
     f.peers.fenced.set(false);
+    let membership = std::sync::Arc::downgrade(&f.candidates.membership);
     let operation = f.operation();
     let mut resolve = Box::pin(f.policy.resolve_with_budget(
         f.candidates,
@@ -378,11 +381,20 @@ fn parent_cancellation_cancels_child_but_waits_for_fence_without_fallback() {
     f.scope.cancel().unwrap();
     assert!(poll(resolve.as_mut()).is_pending());
     assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+    assert!(
+        membership.upgrade().is_some(),
+        "cancellation is not a membership completion fence"
+    );
     f.peers.fenced.set(true);
     assert!(matches!(
         poll(resolve.as_mut()),
         Poll::Ready(Err(Error::Cancelled))
     ));
+    drop(resolve);
+    assert!(
+        membership.upgrade().is_none(),
+        "completion releases the operation lease"
+    );
     assert_eq!(f.peers.calls.borrow().len(), 1);
 }
 

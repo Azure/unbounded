@@ -358,7 +358,9 @@ impl CandidatePolicy {
             },
         };
         let registration = scope.cancellation.subscribe()?;
-        let mut exchange = self.peers.request(request, &attempt_scope);
+        let mut exchange = self
+            .peers
+            .request(request, membership.clone(), &attempt_scope);
         let mut stopped = None;
         let response = std::future::poll_fn(|cx| {
             registration.register(cx.waker());
@@ -538,6 +540,7 @@ mod tests {
             fn request<'a>(
                 &'a self,
                 request: PeerRequest,
+                _: MembershipLease,
                 _: &'a RequestScope,
             ) -> Operation<'a, VerifiedResponse> {
                 self.0.borrow_mut().push((
@@ -599,6 +602,7 @@ mod tests {
         fn request<'a>(
             &'a self,
             request: PeerRequest,
+            _: MembershipLease,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             let copy = matches!(
@@ -859,6 +863,7 @@ mod tests {
         fn request<'a>(
             &'a self,
             request: PeerRequest,
+            _: MembershipLease,
             _scope: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             Box::pin(async move {

@@ -146,11 +146,15 @@ also passed all three application composition/membership tests.
 The required scoped `make fmt` attempt ran gofumpt, but golangci-lint failed because
 its Go 1.26 build cannot analyze a Go 1.27 dependency. No Go changes resulted.
 
-The membership-retirement audit finding is resolved by per-object structural
-reference accounting in `update_memberships` (`src/app.rs:1139-1171`). Its two-worker
-regression covers a retained request lease, churn beyond routing-table capacity,
-and workers skipping an intermediate publication. This is component-level churn
-coverage, not a deployed control-server churn test.
+The approved membership simplification replaces per-worker structural-reference
+accounting with canonical operation leases and one node-wide weak registry
+(`src/control/snapshot.rs`, `src/peer.rs`). Publication bounds distinct live
+generations; cache-only changes reuse the same membership allocation. The preserved
+two-worker regression covers retained leases, skipped publications, and capacity
+reuse. Snapshot tests also exercise a delayed thread and bounded weak-registry
+size. `read::remote_tests::live_read_routes_after_cache_only_publication_and_membership_update`
+exercises a pending TCP read with the actual requester across publication. These
+are component-level churn tests, not a deployed control-server churn test.
 
 1. Exercise deployed Go SDK reads through the binary's actual client listeners,
    populated-cache control-driven publication/removal, and restart with persisted

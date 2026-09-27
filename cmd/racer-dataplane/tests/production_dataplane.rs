@@ -497,9 +497,10 @@ impl Rig {
         }
         keys.install(wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
             .unwrap();
+        let published = Arc::new(PublishedState::default());
         let snapshots = Rc::new(SnapshotStore::new(
             ClusterId(CLUSTER.into()),
-            Arc::new(PublishedState::default()),
+            published.clone(),
             4,
         ));
         let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
@@ -524,8 +525,7 @@ impl Rig {
                 }],
             })
             .unwrap();
-        let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), 4).unwrap());
-        network.install(snapshot.membership.clone()).unwrap();
+        let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published).unwrap());
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(
             keys.clone(),

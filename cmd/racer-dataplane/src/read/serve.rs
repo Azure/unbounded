@@ -294,11 +294,13 @@ impl LocalPageService for Coordinator {
     fn serve_peer<'a>(
         &'a self,
         verified: VerifiedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             scope.check()?;
             let request = verified.into_signed().request;
+            crate::peer::check_membership(&request, &membership)?;
             if request.route.request != scope.request
                 || request.origin.request != request.route.request
                 || request.origin.attempt != request.route.attempt
@@ -316,7 +318,7 @@ impl LocalPageService for Coordinator {
             effective.deadline.0 = effective.deadline.0.min(request.route.deadline.0);
             effective.check()?;
             // Copy-only never opens credentials and never invokes acquisition.
-            // It does not need a live membership snapshot to serve retained bytes.
+            // The ingress lease is still retained while serving those bytes.
             let result = match request.operation {
                 PeerOperation::Page {
                     page,
@@ -360,10 +362,6 @@ impl LocalPageService for Coordinator {
                         })
                 }
                 operation => {
-                    let membership = self.snapshots.current()?.membership.clone();
-                    if membership.version != request.route.membership {
-                        return Err(Error::IncompatibleMembership);
-                    }
                     let mut budget = inherited_budget(&request.route, &effective)?;
                     let context = self.open_context(request.origin)?;
                     match operation {

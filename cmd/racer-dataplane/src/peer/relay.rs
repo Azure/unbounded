@@ -11,7 +11,7 @@ use crate::{
     model::limits::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
-    topology::paths::Paths,
+    topology::{membership::MembershipLease, paths::Paths},
 };
 use std::rc::Rc;
 pub struct Relay {
@@ -52,35 +52,35 @@ impl Relay {
     ///
     /// ```compile_fail
     /// use racer_dataplane::{peer::{relay::Relay, wire::SignedRequest},
-    ///     runtime::deadline::RequestScope};
-    /// fn unverified(relay: &Relay, request: SignedRequest, scope: &RequestScope) {
-    ///     relay.forward(request, scope);
+    ///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
+    /// fn unverified(relay: &Relay, request: SignedRequest,
+    ///     membership: MembershipLease, scope: &RequestScope) {
+    ///     relay.forward(request, membership, scope);
     /// }
     /// ```
     pub fn forward<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(request.request(), scope)?;
+            super::check_membership(request.request(), &membership)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let budget = &request.request().route;
             if budget.destination == network.local || budget.visited.contains(&network.local) {
                 return Err(Error::InvalidRequest);
             }
             let _reservation = self.admission.reserve(None, ResourceClass::Relay, 1)?;
-            let membership = network.membership(budget.membership)?;
             let search_budget = super::search_budget(budget, &network.local)?;
             let route = self
                 .paths
-                .shortest_async(membership, &network.local, &search_budget)
+                .shortest_async(membership.clone(), &network.local, &search_budget)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             if let Some(handshake) = &self.handshake {
-                handshake
-                    .negotiate_at(next, budget.membership, &scope)
-                    .await?;
+                handshake.negotiate_at(next, &membership, &scope).await?;
             }
             let previous = request
                 .forwarders()
@@ -108,7 +108,10 @@ impl Relay {
             let outbound = self
                 .forwarding
                 .append_request(request, next, outbound_budget)?;
-            let response = self.transport.exchange(outbound, &scope).await?;
+            let response = self
+                .transport
+                .exchange(outbound, membership, &scope)
+                .await?;
             scope.check()?;
             let response = self.forwarding.verify_response(response, &binding)?;
             // The caller owns the ingress connection. Return on that connection;

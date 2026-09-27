@@ -8,13 +8,16 @@ use crate::{
     error::{Error, Operation},
     runtime::deadline::RequestScope,
     security::forwarding::Forwarding,
-    topology::{paths::Paths, rails::Rails},
+    topology::{membership::MembershipLease, paths::Paths, rails::Rails},
 };
 use std::rc::Rc;
 pub trait PeerClient {
+    /// Carry the originating operation's lease through routing and completion.
+    /// Cancellation does not release accepted transport work before its fence.
     fn request<'a>(
         &'a self,
         request: PeerRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse>;
 }
@@ -26,28 +29,31 @@ pub trait PeerClient {
 /// use racer_dataplane::{error::Result, peer::{requester::{PeerClient, PeerTransport},
 ///     relay::Relay, server::PeerServer,
 ///     wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
-///     runtime::deadline::RequestScope, security::forwarding::Forwarding};
+///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
+///     topology::membership::MembershipLease};
 /// async fn interfaces(
 ///     client: &dyn PeerClient, transport: &dyn PeerTransport,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
-///     inbound: SignedRequest, scope: &RequestScope,
+///     inbound: SignedRequest, membership: MembershipLease, scope: &RequestScope,
 /// ) -> Result<()> {
-///     let verified: VerifiedResponse = client.request(local, scope).await?;
+///     let verified: VerifiedResponse = client.request(local, membership.clone(), scope).await?;
 ///     let _wire_response: SignedResponse = verified.into_signed();
 ///     let admitted = auth.verify_request(wire)?;
-///     let reply = relay.forward(admitted, scope).await?;
+///     let reply = relay.forward(admitted, membership.clone(), scope).await?;
 ///     let _retained_chain = reply.authentication;
 ///     // Both network boundaries preserve envelopes in each direction.
-///     let _exchange: SignedResponse = transport.exchange(outbound, scope).await?;
+///     let _exchange: SignedResponse = transport.exchange(outbound, membership, scope).await?;
 ///     let _dispatch: SignedResponse = server.dispatch(inbound, scope).await?;
 ///     Ok(())
 /// }
 /// ```
 pub trait PeerTransport {
+    /// Use this exact lease for the signed route; never resolve its version again.
     fn exchange<'a>(
         &'a self,
         request: SignedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse>;
 }
@@ -87,27 +93,25 @@ impl PeerClient for Requester {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request, scope)?;
+            super::check_membership(&request, &membership)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let search_budget = super::search_budget(&request.route, &network.local)?;
             let route = self
                 .paths
-                .shortest_async(
-                    network.membership(request.route.membership)?,
-                    &network.local,
-                    &search_budget,
-                )
+                .shortest_async(membership.clone(), &network.local, &search_budget)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let _capabilities = self
                 .handshake
-                .negotiate_at(next, request.route.membership, &scope)
+                .negotiate_at(next, &membership, &scope)
                 .await?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
-            let response = self.exchange(signed, &scope).await?;
+            let response = self.exchange(signed, membership, &scope).await?;
             scope.check()?;
             self.forwarding.verify_response(response, &binding)
         })
@@ -117,10 +121,12 @@ impl PeerTransport for Requester {
     fn exchange<'a>(
         &'a self,
         request: SignedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request.request, scope)?;
+            super::check_membership(&request.request, &membership)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let budget = &request.request.route;
             let signed_head = request
@@ -131,17 +137,13 @@ impl PeerTransport for Requester {
             let next = crate::security::signing::receiver(&signed_head.head)?;
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
-            let endpoint = network.endpoint(budget.membership, &next)?;
+            let endpoint = network.endpoint(&membership, &next)?;
             let mut plan =
                 if let super::wire::Operation::Page { page, .. } = &request.request.operation {
                     let search = super::search_budget(budget, &network.local)?;
                     let route = self
                         .paths
-                        .shortest_async(
-                            network.membership(budget.membership)?,
-                            &network.local,
-                            &search,
-                        )
+                        .shortest_async(membership.clone(), &network.local, &search)
                         .await?;
                     if route.nodes.get(1) != Some(&next) {
                         return Err(Error::Unavailable);
@@ -156,9 +158,12 @@ impl PeerTransport for Requester {
                     plan = crate::topology::rails::TransportPlan::Http;
                 }
             }
-            self.transfers
+            let response = self
+                .transfers
                 .exchange_planned(endpoint, request, plan, &scope)
-                .await
+                .await;
+            drop(membership);
+            response
         })
     }
 }

@@ -26,6 +26,7 @@ impl PeerClient for ScriptedPeers {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
+        _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {

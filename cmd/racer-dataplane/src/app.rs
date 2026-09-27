@@ -31,7 +31,7 @@ use crate::{
     },
     origin::client::{Origin, OriginClient},
     peer::{
-        PeerNetwork, handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
+        handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
         transfer::Transfers,
     },
     rdma::{
@@ -82,9 +82,8 @@ use crate::{
     topology::{health::LinkHealth, paths::Paths, placement::Placement, rails::Rails},
 };
 #[cfg(test)]
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 use std::{
-    collections::VecDeque,
     num::NonZeroUsize,
     rc::Rc,
     sync::{
@@ -130,7 +129,6 @@ pub struct NodeState {
     native: native::NativePairs,
     cache_cut: Mutex<caches::CacheCut>,
     retirement: Arc<retirement::Retirement>,
-    membership_owners: Mutex<crate::runtime::collections::HashMap<usize, usize>>,
 }
 #[derive(Default)]
 struct CheckpointCut {
@@ -162,7 +160,6 @@ impl NodeState {
             native: native::NativePairs::default(),
             cache_cut: Mutex::new(caches::CacheCut::default()),
             retirement: Arc::new(retirement::Retirement::new(count)),
-            membership_owners: Mutex::new(crate::runtime::collections::HashMap::default()),
         })
     }
 }
@@ -460,7 +457,6 @@ pub struct WorkerApplication {
     started: bool,
     stopping: bool,
     snapshot_sequence: Option<crate::control::wire::PublicationSequence>,
-    memberships: VecDeque<crate::topology::membership::MembershipLease>,
     memory: Rc<MemoryCache>,
     caches: Vec<crate::control::caches::CacheDefinition>,
     slab_directory: std::path::PathBuf,
@@ -641,14 +637,7 @@ impl WorkerApplication {
         let placement = Rc::new(Placement::new(limits.cached_rankings.get()));
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
-            // SnapshotStore bounds old generations separately from the current
-            // publication. Every accepted generation must fit the routing table.
-            config
-                .limits
-                .retained_snapshots
-                .get()
-                .checked_add(1)
-                .ok_or(Error::InvalidConfiguration)?,
+            node.publications.clone(),
         )?);
         let wire = Rc::new(crate::peer::wire::SecurityCodec::new(
             admission.clone(),
@@ -808,7 +797,6 @@ impl WorkerApplication {
             started: false,
             stopping: false,
             snapshot_sequence: None,
-            memberships: VecDeque::new(),
             memory,
             caches: Vec::new(),
             slab_directory: config.slab_directory.clone(),
@@ -962,13 +950,6 @@ impl WorkerApplication {
                 self.actual_rails.clear();
             }
         }
-        let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
-        update_memberships(
-            &self.network,
-            &mut self.memberships,
-            &node.membership_owners,
-            &snapshot.membership,
-        )?;
         if self.snapshot_sequence == Some(snapshot.sequence) {
             return Ok(());
         }
@@ -1168,19 +1149,6 @@ impl WorkerApplication {
             }
             self.endpoint.take();
             self.store.checkpoint.finish_snapshot();
-            if let Some(node) = &self.node {
-                let mut owners = node
-                    .membership_owners
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?;
-                for membership in self.memberships.drain(..) {
-                    self.network.retire(membership.version);
-                    if let Some(count) = owners.get_mut(&(Arc::as_ptr(&membership) as usize)) {
-                        *count -= 1;
-                    }
-                }
-                owners.retain(|_, count| *count != 0);
-            }
             self.started = false;
             self.telemetry
                 .health
@@ -1188,40 +1156,6 @@ impl WorkerApplication {
             Ok(())
         })))
     }
-}
-
-fn update_memberships(
-    network: &PeerNetwork,
-    memberships: &mut VecDeque<crate::topology::membership::MembershipLease>,
-    owners: &Mutex<crate::runtime::collections::HashMap<usize, usize>>,
-    current: &crate::topology::membership::MembershipLease,
-) -> Result<()> {
-    // Each installed worker owns exactly two structural references: its queue and
-    // its network. Serialize their accounting across workers; all other references
-    // are publication or request leases and prevent retirement.
-    let mut owners = owners.lock().map_err(|_| Error::Unavailable)?;
-    memberships.retain(|membership| {
-        let count = owners
-            .get_mut(&(Arc::as_ptr(membership) as usize))
-            .expect("installed membership owner");
-        if membership.version != current.version && Arc::strong_count(membership) == 2 * *count {
-            network.retire(membership.version);
-            *count -= 1;
-            false
-        } else {
-            true
-        }
-    });
-    owners.retain(|_, count| *count != 0);
-    if !memberships
-        .iter()
-        .any(|membership| membership.version == current.version)
-    {
-        network.install(current.clone())?;
-        memberships.push_back(current.clone());
-        *owners.entry(Arc::as_ptr(current) as usize).or_default() += 1;
-    }
-    Ok(())
 }
 
 fn poll_task(
@@ -1589,31 +1523,31 @@ pub(crate) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
             assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
-            // Hold every old generation at the configured limit while installing
-            // the current generation on both actual application networks.
-            for network in [&worker.network, &second.network] {
-                let mut requests = Vec::new();
-                for version in 0..=config.limits.retained_snapshots.get() {
-                    let membership = Arc::new(
-                        crate::topology::membership::Membership::validate(
-                            crate::model::identity::MembershipVersion(version as u64 + 1),
-                            vec![],
-                        )
-                        .unwrap(),
-                    );
-                    network.install(membership.clone()).unwrap();
-                    requests.push(membership);
+            // Admission bounds generations once for both actual worker networks.
+            let mut publication = crate::control::wire::decode_publication(include_bytes!(
+                "control/testdata/publication.json"
+            ))
+            .unwrap();
+            publication.cluster = config.cluster.clone();
+            let mut requests = Vec::new();
+            for version in 1..=config.limits.retained_snapshots.get() + 1 {
+                publication.sequence.0 = version as u64;
+                publication.membership_version.0 = version as u64;
+                let snapshot = worker.snapshots.publish(publication.clone()).unwrap();
+                for network in [&worker.network, &second.network] {
+                    assert!(Arc::ptr_eq(
+                        &snapshot.membership,
+                        &network.membership(snapshot.membership.version).unwrap()
+                    ));
                 }
-                assert_eq!(requests.len(), config.limits.retained_snapshots.get() + 1);
-                let extra = Arc::new(
-                    crate::topology::membership::Membership::validate(
-                        crate::model::identity::MembershipVersion(requests.len() as u64 + 1),
-                        vec![],
-                    )
-                    .unwrap(),
-                );
-                assert_eq!(network.install(extra), Err(Error::Overloaded));
+                requests.push(snapshot.membership.clone());
             }
+            publication.sequence.0 += 1;
+            publication.membership_version.0 += 1;
+            assert!(matches!(
+                worker.snapshots.publish(publication),
+                Err(Error::Overloaded)
+            ));
         }
     }
 
@@ -1626,58 +1560,75 @@ pub(crate) mod tests {
 
     #[test]
     fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
-        use crate::{model::identity::MembershipVersion, topology::membership::Membership};
-        let owners = Mutex::new(crate::runtime::collections::HashMap::default());
-        let publication = crate::control::wire::decode_publication(include_bytes!(
+        use crate::{model::identity::MembershipVersion, peer::PeerNetwork};
+        let mut publication = crate::control::wire::decode_publication(include_bytes!(
             "control/testdata/publication.json"
         ))
         .unwrap();
         let local = publication.members[0].node.clone();
+        let neighbor = publication.members[1].node.clone();
+        let published = Arc::new(PublishedState::default());
+        let store = SnapshotStore::new(publication.cluster.clone(), published.clone(), 1);
         let networks = [
-            PeerNetwork::new(local.clone(), 2).unwrap(),
-            PeerNetwork::new(local, 2).unwrap(),
+            PeerNetwork::new(local.clone(), published.clone()).unwrap(),
+            PeerNetwork::new(local, published).unwrap(),
         ];
-        let mut queues = [VecDeque::new(), VecDeque::new()];
-        let membership = |version| {
-            Arc::new(
-                Membership::validate(MembershipVersion(version), publication.members.clone())
-                    .unwrap(),
-            )
+        let mut publish = |sequence, version| {
+            publication.sequence.0 = sequence;
+            publication.membership_version.0 = version;
+            store.publish(publication.clone())
         };
-        let first = membership(1);
-        for worker in 0..2 {
-            update_memberships(&networks[worker], &mut queues[worker], &owners, &first).unwrap();
+        let first = publish(1, 1).unwrap();
+        // A delayed worker holds a publication, while a read starts from the
+        // cache-only replacement. Both must own the same canonical generation.
+        let cache_only = publish(2, 1).unwrap();
+        assert!(Arc::ptr_eq(&first.membership, &cache_only.membership));
+        let request = cache_only.membership.clone();
+        let weak = Arc::downgrade(&request);
+        drop(cache_only);
+        let current = publish(3, 2).unwrap();
+        for network in &networks {
+            assert!(Arc::ptr_eq(
+                &request,
+                &network.membership(MembershipVersion(1)).unwrap()
+            ));
+            assert!(network.endpoint(&request, &neighbor).is_ok());
         }
-        let request = first.clone();
-        drop(first);
-        let mut current = membership(2);
-        for worker in 0..2 {
-            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
-            assert!(networks[worker].membership(MembershipVersion(1)).is_ok());
+        assert!(matches!(publish(4, 3), Err(Error::Overloaded)));
+        // Even at capacity, arbitrarily many cache-only publications fit.
+        for sequence in 4..30 {
+            publish(sequence, 2).unwrap();
         }
+        drop(current);
         drop(request);
-        for worker in 0..2 {
-            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
-            assert!(networks[worker].membership(MembershipVersion(1)).is_err());
+        assert!(
+            weak.upgrade().is_some(),
+            "delayed worker still holds the generation"
+        );
+        drop(first);
+        assert!(weak.upgrade().is_none());
+        for network in &networks {
+            assert!(network.membership(MembershipVersion(1)).is_err());
         }
         for version in 3..20 {
-            current = membership(version);
-            for worker in 0..2 {
-                update_memberships(&networks[worker], &mut queues[worker], &owners, &current)
-                    .unwrap();
-                assert_eq!(queues[worker].len(), 1);
+            let current = publish(version + 30, version).unwrap();
+            for network in &networks {
+                assert!(Arc::ptr_eq(
+                    &current.membership,
+                    &network.membership(MembershipVersion(version)).unwrap()
+                ));
             }
-            assert_eq!(owners.lock().unwrap().len(), 1);
         }
-        // Only one worker installs an intermediate publication. Ownership is
-        // counted per installed object, never inferred from the worker total.
-        current = membership(20);
-        update_memberships(&networks[0], &mut queues[0], &owners, &current).unwrap();
-        current = membership(21);
+        // Only one worker observes an intermediate publication. Neither requires
+        // an installation/retirement poll to resolve the next accepted version.
+        publish(50, 20).unwrap();
+        let delayed = networks[0].membership(MembershipVersion(20)).unwrap();
+        publish(51, 21).unwrap();
         for worker in [1, 0] {
-            update_memberships(&networks[worker], &mut queues[worker], &owners, &current).unwrap();
-            assert_eq!(queues[worker].len(), 1);
+            assert!(networks[worker].membership(MembershipVersion(21)).is_ok());
         }
-        assert_eq!(owners.lock().unwrap().len(), 1);
+        drop(delayed);
+        publish(52, 22).unwrap();
+        assert!(networks[0].membership(MembershipVersion(20)).is_err());
     }
 }

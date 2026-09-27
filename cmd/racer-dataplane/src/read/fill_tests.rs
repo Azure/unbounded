@@ -37,6 +37,7 @@ impl PeerClient for NoPeer {
     fn request<'a>(
         &'a self,
         _: crate::peer::wire::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> Operation<'a, crate::peer::wire::VerifiedResponse> {
         Box::pin(async { panic!("single-node fill must never contact a peer") })

@@ -13,14 +13,18 @@ acceptance checklist. Test totals in that log are attributed owner observations;
 the documentation auditor did not rerun the suites. See
 `designs/racer-production-validation.md` for the inspected coverage and limits.
 
-**Resolved: multiworker membership retirement.** The audit found that a fixed
-global reference count could not retire memberships installed on several workers.
-`update_memberships` now serializes per-object structural-reference accounting
-across workers, including workers that skip publications. Publication and request
-leases still prevent retirement (`cmd/racer-dataplane/src/app.rs:1139-1171`). The
-regression `multiworker_memberships_retire_after_request_leases_and_reuse_capacity`
-holds an old request lease, then advances beyond the two-entry table capacity and
-exercises a publication installed on only one worker.
+**Approved simplification: canonical membership leases.** Publication owns one
+immutable membership allocation per version and reuses it for cache-only changes
+(`cmd/racer-dataplane/src/control/snapshot.rs`). Its single weak registry resolves
+incoming wire versions and admission bounds distinct live generations, including
+leases held by delayed workers. Outbound requests, relays, handshakes, and native
+response routing receive operation leases directly. Per-worker membership tables
+and structural-reference accounting are removed. The preserved regression
+`multiworker_memberships_retire_after_request_leases_and_reuse_capacity` covers
+cache-only replacement, delayed workers, bounded admission, and capacity reuse;
+`live_read_routes_after_cache_only_publication_and_membership_update` exercises
+the actual requester across publication while a TCP read is pending. Historical
+ownership notes below describe the superseded implementation.
 
 Current application fixtures include separate-thread startup, a real two-pair
 WorkerGroup retirement/checkpoint cut, late-driver removal/rollback, and accepted

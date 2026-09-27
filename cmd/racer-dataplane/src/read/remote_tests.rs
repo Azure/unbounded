@@ -132,6 +132,7 @@ impl PeerTransport for NeverRelay {
     fn exchange<'a>(
         &'a self,
         _: SignedRequest,
+        _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async { panic!("direct candidate must not relay") })
@@ -149,6 +150,7 @@ impl LocalPageService for CandidateService {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -176,7 +178,7 @@ impl LocalPageService for CandidateService {
             );
             self.calls.set(self.calls.get() + 1);
             if let Some(local) = &self.local {
-                return local.serve_peer(request, scope).await;
+                return local.serve_peer(request, membership, scope).await;
             }
             if self.version_unavailable {
                 return Err(Error::VersionUnavailable);
@@ -216,6 +218,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         fn request<'a>(
             &'a self,
             _: wire::PeerRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> Operation<'a, wire::VerifiedResponse> {
             Box::pin(async { panic!("single candidate must not probe peers") })
@@ -249,7 +252,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         crate::test_support::cluster::config(false).limits,
     ));
     let calls = Rc::new(Cell::new(0));
-    let (coordinator, _endpoint) = metadata_coordinator(
+    let (coordinator, _endpoint) = metadata_coordinator_with_newer_publication(
         &node(1),
         &membership,
         ids[1].keys.clone(),
@@ -257,6 +260,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         Rc::new(Reactor::new(admission.clone())),
         Rc::new(NoPeers),
         calls.clone(),
+        true,
     );
     let sender = Forwarding::new(ids[0].signatures.clone());
     let receiver = Forwarding::new(ids[1].signatures.clone());
@@ -316,7 +320,12 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         let (signed, binding) = sender.sign_request(request).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         let response_binding = admitted.binding().clone();
-        let result = futures::executor::block_on(coordinator.serve_peer(admitted, &scope)).unwrap();
+        let result = futures::executor::block_on(coordinator.serve_peer(
+            admitted,
+            membership.clone(),
+            &scope,
+        ))
+        .unwrap();
         assert!(match index {
             0 | 1 => matches!(result, PeerResponse::Miss),
             2 => matches!(result, PeerResponse::NotFound),
@@ -341,6 +350,19 @@ enum Absence {
 }
 
 fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
+    remote_candidate_with_churn(absence, forbidden, false);
+}
+
+#[test]
+fn live_read_routes_after_cache_only_publication_and_membership_update() {
+    remote_candidate_with_churn(None, false, true);
+}
+
+fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
+    use crate::control::{
+        snapshot::{PublishedState, SnapshotStore},
+        wire::{Publication, PublicationSequence},
+    };
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -348,21 +370,33 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let membership = Arc::new(
-        Membership::validate(
-            MembershipVersion(1),
-            (0..4)
-                .map(|i| Member {
-                    node: node(i),
-                    shares: std::num::NonZeroU32::new(4).unwrap(),
-                    peer_endpoint: address.clone(),
-                    rails: vec![],
-                    alignment_enabled: false,
-                })
-                .collect(),
-        )
-        .unwrap(),
-    );
+    let source_publications = Arc::new(PublishedState::default());
+    let source_store =
+        SnapshotStore::new(ClusterId(CLUSTER.into()), source_publications.clone(), 1);
+    let mut publication = Publication {
+        schema_version: 1,
+        cluster: ClusterId(CLUSTER.into()),
+        sequence: PublicationSequence(1),
+        membership_version: MembershipVersion(1),
+        caches: vec![],
+        members: (0..4)
+            .map(|i| Member {
+                node: node(i),
+                shares: std::num::NonZeroU32::new(4).unwrap(),
+                peer_endpoint: address.clone(),
+                rails: vec![],
+                alignment_enabled: false,
+            })
+            .collect(),
+    };
+    let first = source_store.publish(publication.clone()).unwrap();
+    publication.sequence.0 = 2;
+    let cache_only = source_store.publish(publication.clone()).unwrap();
+    assert!(Arc::ptr_eq(&first.membership, &cache_only.membership));
+    let membership = cache_only.membership.clone();
+    let retired = Arc::downgrade(&membership);
+    drop(first);
+    drop(cache_only);
     let placement = Rc::new(Placement::new(16));
     let ranked = placement
         .rank(membership.clone(), &object, PageNumber(0))
@@ -424,10 +458,16 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
         )
         .with_wire(admission.clone(), codec.clone()),
     );
-    let source_network = Rc::new(PeerNetwork::new(source.clone(), 1).unwrap());
-    let destination_network = Rc::new(PeerNetwork::new(destination.clone(), 1).unwrap());
-    source_network.install(membership.clone()).unwrap();
-    destination_network.install(membership.clone()).unwrap();
+    let source_network = Rc::new(PeerNetwork::new(source.clone(), source_publications).unwrap());
+    let destination_membership =
+        Arc::new(Membership::validate(membership.version, membership.members().to_vec()).unwrap());
+    let destination_network = Rc::new(
+        PeerNetwork::new(
+            destination.clone(),
+            PublishedState::for_membership(destination_membership),
+        )
+        .unwrap(),
+    );
     let handshake = |id: &Identity, network: Rc<PeerNetwork>| {
         Rc::new(
             Handshake::new(id.signatures.clone(), None)
@@ -588,6 +628,9 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
         Ok::<(), Error>(())
     };
     let result = {
+        // From here the candidate read itself owns the source lease. Network and
+        // topology caches must not contribute hidden structural strong owners.
+        drop(membership);
         let read = async {
             if let Some((coordinator, _endpoint)) = &ingress {
                 use crate::client::request::{ClientRequest, ReadKind};
@@ -619,6 +662,7 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
         let mut exchange = std::pin::pin!(exchange);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let watchdog = Instant::now() + Duration::from_secs(10);
+        let mut updated = false;
         loop {
             if let Poll::Ready((result, served)) =
                 std::future::Future::poll(exchange.as_mut(), &mut cx)
@@ -626,11 +670,44 @@ fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
                 served.unwrap();
                 break result;
             }
+            if churn && !updated {
+                publication.sequence.0 = 3;
+                let cache_only = source_store.publish(publication.clone()).unwrap();
+                assert!(Arc::ptr_eq(
+                    &retired.upgrade().unwrap(),
+                    &cache_only.membership
+                ));
+                drop(cache_only);
+                publication.sequence.0 = 4;
+                publication.membership_version.0 = 2;
+                for member in &mut publication.members {
+                    member.peer_endpoint = "127.0.0.1:1".into();
+                }
+                source_store.publish(publication.clone()).unwrap();
+                assert!(
+                    retired.upgrade().is_some(),
+                    "pending read must retain old routing"
+                );
+                updated = true;
+            }
             assert!(Instant::now() < watchdog, "peer absence exchange stalled");
             reactor.poll_budgeted(128).unwrap();
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
     };
+    if churn {
+        assert_eq!(
+            source_store.current().unwrap().membership.version,
+            MembershipVersion(2)
+        );
+        assert!(
+            retired.upgrade().is_none(),
+            "finished read must release old routing"
+        );
+        publication.sequence.0 = 5;
+        publication.membership_version.0 = 3;
+        source_store.publish(publication).unwrap();
+    }
     if ingress.is_none() {
         assert_eq!(
             budget.remaining_attempts(),
@@ -735,6 +812,7 @@ impl crate::peer::requester::PeerClient for PinnedFallback {
     fn request<'a>(
         &'a self,
         request: wire::PeerRequest,
+        membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, wire::VerifiedResponse> {
         Box::pin(async move {
@@ -742,6 +820,7 @@ impl crate::peer::requester::PeerClient for PinnedFallback {
                 return crate::peer::requester::PeerClient::request(
                     self.requester.as_ref(),
                     request,
+                    membership,
                     scope,
                 )
                 .await;
@@ -765,9 +844,10 @@ impl LocalPageService for OwnedCoordinator {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
-        self.coordinator.serve_peer(request, scope)
+        self.coordinator.serve_peer(request, membership, scope)
     }
 }
 
@@ -820,6 +900,7 @@ impl crate::peer::requester::PeerClient for CachedCopies {
     fn request<'a>(
         &'a self,
         request: wire::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> Operation<'a, wire::VerifiedResponse> {
         Box::pin(async move {
@@ -869,6 +950,24 @@ fn metadata_coordinator(
     Rc<super::serve::Coordinator>,
     super::dispatch::WorkerEndpoint,
 ) {
+    metadata_coordinator_with_newer_publication(
+        node, membership, keys, admission, reactor, peers, calls, false,
+    )
+}
+
+fn metadata_coordinator_with_newer_publication(
+    node: &NodeId,
+    membership: &Arc<Membership>,
+    keys: Rc<Keyring>,
+    admission: Rc<Admission>,
+    reactor: Rc<Reactor>,
+    peers: Rc<dyn crate::peer::requester::PeerClient>,
+    calls: Rc<Cell<usize>>,
+    newer_publication: bool,
+) -> (
+    Rc<super::serve::Coordinator>,
+    super::dispatch::WorkerEndpoint,
+) {
     use crate::{
         control::{
             snapshot::{PublishedState, SnapshotStore},
@@ -890,16 +989,23 @@ fn metadata_coordinator(
         Arc::new(PublishedState::default()),
         4,
     ));
-    snapshots
-        .publish(Publication {
-            schema_version: SCHEMA_VERSION,
-            cluster: ClusterId(CLUSTER.into()),
-            sequence: PublicationSequence(1),
-            membership_version: membership.version,
-            members: membership.members().to_vec(),
-            caches: vec![],
-        })
-        .unwrap();
+    let mut publication = Publication {
+        schema_version: SCHEMA_VERSION,
+        cluster: ClusterId(CLUSTER.into()),
+        sequence: PublicationSequence(1),
+        membership_version: membership.version,
+        members: membership.members().to_vec(),
+        caches: vec![],
+    };
+    snapshots.publish(publication.clone()).unwrap();
+    if newer_publication {
+        publication.sequence.0 += 1;
+        publication.membership_version.0 += 1;
+        publication.members.clear();
+        snapshots.publish(publication).unwrap();
+        // Peer acquisition must use the ingress lease, even when current
+        // membership has advanced and no longer includes this candidate.
+    }
     let buffers = Rc::new(BufferPool::new(admission.clone()));
     let index = Rc::new(Index::new(WorkerId(0), 16));
     let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));

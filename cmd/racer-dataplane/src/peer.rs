@@ -16,62 +16,35 @@ use crate::{
     model::identity::{MembershipVersion, NodeId},
     topology::membership::MembershipLease,
 };
-use std::{cell::RefCell, collections::BTreeMap};
+use std::sync::Arc;
 
-/// Worker-local routing inputs. A request always uses its exact retained snapshot.
-/// The controller installs snapshots; readiness must not rewrite their contents.
+/// Worker-local identity and a handle to the sole node-wide incoming registry.
+/// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    snapshots: RefCell<BTreeMap<u64, MembershipLease>>,
-    capacity: usize,
+    published: Arc<crate::control::snapshot::PublishedState>,
 }
 
 impl PeerNetwork {
-    pub fn new(local: NodeId, capacity: usize) -> Result<Self> {
-        if local.0.is_empty() || capacity == 0 {
+    pub fn new(
+        local: NodeId,
+        published: Arc<crate::control::snapshot::PublishedState>,
+    ) -> Result<Self> {
+        if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self {
-            local,
-            snapshots: RefCell::new(BTreeMap::new()),
-            capacity,
-        })
-    }
-
-    pub fn install(&self, membership: MembershipLease) -> Result<()> {
-        let mut snapshots = self.snapshots.borrow_mut();
-        if let Some(existing) = snapshots.get(&membership.version.0) {
-            return if std::sync::Arc::ptr_eq(existing, &membership) {
-                Ok(())
-            } else {
-                Err(Error::IncompatibleMembership)
-            };
-        }
-        if snapshots.len() == self.capacity {
-            return Err(Error::Overloaded);
-        }
-        snapshots.insert(membership.version.0, membership);
-        Ok(())
-    }
-
-    pub fn retire(&self, version: MembershipVersion) {
-        self.snapshots.borrow_mut().remove(&version.0);
+        Ok(Self { local, published })
     }
 
     pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
-        self.snapshots
-            .borrow()
-            .get(&version.0)
-            .cloned()
-            .ok_or(Error::IncompatibleMembership)
+        self.published.membership(version)
     }
 
     pub fn endpoint(
         &self,
-        version: MembershipVersion,
+        membership: &MembershipLease,
         node: &NodeId,
     ) -> Result<crate::http::pool::Endpoint> {
-        let membership = self.membership(version)?;
         if !crate::topology::graph::Graph::new(membership.clone())
             .neighbors(&self.local)?
             .contains(node)
@@ -110,6 +83,16 @@ pub(crate) fn request_scope(
         .min(request.origin.scope().deadline.0);
     narrowed.check()?;
     Ok(narrowed)
+}
+
+pub(crate) fn check_membership(
+    request: &wire::PeerRequest,
+    membership: &MembershipLease,
+) -> Result<()> {
+    if request.route.membership != membership.version {
+        return Err(Error::IncompatibleMembership);
+    }
+    Ok(())
 }
 
 pub(crate) fn search_budget(

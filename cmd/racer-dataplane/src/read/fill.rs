@@ -829,6 +829,7 @@ mod tests {
         fn request<'a>(
             &'a self,
             _: crate::peer::wire::PeerRequest,
+            _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> Operation<'a, crate::peer::wire::VerifiedResponse> {
             Box::pin(async { panic!("local owner must not contact a peer") })

@@ -8,6 +8,7 @@ use crate::{
     model::limits::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
+    topology::membership::MembershipLease,
 };
 use std::{
     rc::Rc,
@@ -19,15 +20,17 @@ use std::{
 ///
 /// ```compile_fail
 /// use racer_dataplane::{peer::{server::LocalPageService, wire::PeerRequest},
-///     runtime::deadline::RequestScope};
-/// fn unverified(service: &dyn LocalPageService, request: PeerRequest, scope: &RequestScope) {
-///     service.serve_peer(request, scope);
+///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
+/// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
+///     membership: MembershipLease, scope: &RequestScope) {
+///     service.serve_peer(request, membership, scope);
 /// }
 /// ```
 pub trait LocalPageService {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
+        membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse>;
 }
@@ -216,7 +219,7 @@ impl PeerServer {
                 }
                 let signed = std::sync::Arc::try_unwrap(authentication.original)
                     .map_err(|_| Error::InvalidRequest)?;
-                let response = self
+                let (response, membership) = self
                     .handshake
                     .as_ref()
                     .ok_or(Error::InvalidConfiguration)?
@@ -235,6 +238,7 @@ impl PeerServer {
                     .await?;
                 let mut connection = sent.connection;
                 connection.finish_exchange()?;
+                drop(membership);
                 return Ok(connection);
             }
             let request = codec.request(authentication, scope)?;
@@ -252,17 +256,19 @@ impl PeerServer {
                 }
                 _ => None,
             };
-            let response = self.dispatch(request, &request_scope).await?;
+            let request = self.forwarding.verify_request(request)?;
+            let membership = self
+                .network
+                .as_ref()
+                .ok_or(Error::InvalidConfiguration)?
+                .membership(request.request().route.membership)?;
+            let response = self
+                .dispatch_verified(request, membership.clone(), &request_scope)
+                .await?;
             let mut connection = received.connection;
             if let (Some(admitted), Some(transfers)) = (admitted, &self.transfers) {
                 let (returned, sent) = transfers
-                    .send_native(
-                        connection,
-                        &response,
-                        admitted,
-                        self.network.as_ref().ok_or(Error::InvalidConfiguration)?,
-                        &request_scope,
-                    )
+                    .send_native(connection, &response, admitted, &membership, &request_scope)
                     .await?;
                 connection = returned;
                 if sent {
@@ -290,6 +296,7 @@ impl PeerServer {
                 connection = sent.lease;
             }
             connection.finish_exchange()?;
+            drop(membership);
             Ok(connection)
         })
     }
@@ -304,18 +311,33 @@ impl PeerServer {
         Box::pin(async move {
             scope.check()?;
             let request = self.forwarding.verify_request(request)?;
+            let membership = self
+                .network
+                .as_ref()
+                .ok_or(Error::InvalidConfiguration)?
+                .membership(request.request().route.membership)?;
+            self.dispatch_verified(request, membership, scope).await
+        })
+    }
+
+    fn dispatch_verified<'a>(
+        &'a self,
+        request: VerifiedRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, SignedResponse> {
+        Box::pin(async move {
             let scope = super::request_scope(request.request(), scope)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
-            let _membership = network.membership(request.request().route.membership)?;
             let previous = request
                 .forwarders()
                 .last()
                 .unwrap_or(request.origin())
                 .node();
-            network.endpoint(request.request().route.membership, previous)?;
+            network.endpoint(&membership, previous)?;
             if request.request().route.destination != network.local {
                 let binding = request.binding().clone();
-                return match self.relay.forward(request, &scope).await {
+                return match self.relay.forward(request, membership, &scope).await {
                     Ok(response) => Ok(response),
                     Err(Error::Overloaded) => self
                         .forwarding
@@ -344,7 +366,7 @@ impl PeerServer {
                 }
                 Err(error) => return Err(error),
             };
-            let response = match self.local.serve_peer(request, &scope).await {
+            let response = match self.local.serve_peer(request, membership, &scope).await {
                 Ok(response) => response,
                 Err(Error::NotFound) => PeerResponse::NotFound,
                 Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,

@@ -207,7 +207,12 @@ rotation. Long-poll contexts are bounded by certificate expiration.
 Waiters hold references, not copied 64 MiB buffers. Bound poll admission, concurrent
 writes, headers, bootstrap concurrency, and write/shutdown deadlines. Coalesce
 input bursts. Publication full-replacement semantics allow reconnects to skip
-intermediate states. Rust retains bounded old membership leases for in-flight work.
+intermediate states. Rust publishes one canonical immutable membership allocation
+per version; cache-only changes reuse it. Publication admission bounds distinct live
+membership generations to the old-generation limit plus the current generation.
+Operations retain leases through their actual lifetime and pass them directly to
+outbound routing. One node-wide weak registry resolves incoming versions, prunes
+dead entries at publication, and never owns old generations on behalf of workers.
 
 Wire counters are decimal strings; bytes use padded standard base64; CSRs/certs
 use DER. Reject duplicate fields/identities, invalid values, unknown versions and

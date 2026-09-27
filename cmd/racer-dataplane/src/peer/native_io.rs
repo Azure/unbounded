@@ -551,25 +551,22 @@ mod tests {
             )
             .unwrap();
         let accept_wire = super::super::wire::encode_signed(&accept).unwrap();
-        let network = super::super::PeerNetwork::new(signers[2].node().clone(), 1).unwrap();
-        network
-            .install(Arc::new(
-                Membership::validate(
-                    MembershipVersion(1),
-                    [0, 2]
-                        .into_iter()
-                        .map(|i| Member {
-                            node: signers[i].node().clone(),
-                            shares: std::num::NonZeroU32::new(1).unwrap(),
-                            peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
-                            rails: mappings.clone(),
-                            alignment_enabled: true,
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                [0, 2]
+                    .into_iter()
+                    .map(|i| Member {
+                        node: signers[i].node().clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                        rails: mappings.clone(),
+                        alignment_enabled: true,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
         let (a, b) = UnixStream::pair().unwrap();
         let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
         let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
@@ -614,7 +611,7 @@ mod tests {
                     received.connection,
                     &response,
                     (binding.clone(), verified),
-                    &network,
+                    &membership,
                     &scope,
                 )
                 .await?;
@@ -662,7 +659,7 @@ impl Transfers {
         mut connection: ConnectionLease,
         response: &SignedResponse,
         admitted: (Binding, VerifiedHead),
-        network: &super::PeerNetwork,
+        membership: &crate::topology::membership::MembershipLease,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
         let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -673,6 +670,9 @@ impl Transfers {
             return Ok((connection, false));
         };
         let (mut binding, accept) = admitted;
+        if binding.membership != membership.version.0 {
+            return Err(Error::IncompatibleMembership);
+        }
         let mut bounded_scope = scope.clone();
         bounded_scope.deadline.0 = bounded_scope
             .deadline
@@ -689,9 +689,7 @@ impl Transfers {
             .as_bytes(),
         )?;
         let route = crate::topology::paths::Route {
-            membership: network.membership(crate::model::identity::MembershipVersion(
-                binding.membership,
-            ))?,
+            membership: membership.clone(),
             nodes: path,
         };
         if crate::topology::rails::Rails.select(&route, &ciphertext.envelope().page)?

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    model::identity::ClusterId,
+    model::identity::{ClusterId, MembershipVersion},
     topology::membership::{Membership, MembershipLease},
 };
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ pub struct PublishedState {
 }
 struct State {
     current: Option<SnapshotLease>,
-    old: Vec<(Weak<Snapshot>, Weak<Membership>)>,
+    memberships: Vec<(MembershipVersion, Weak<Membership>)>,
     content_hash: [u8; 32],
     membership_hash: [u8; 32],
 }
@@ -32,7 +32,7 @@ struct State {
 pub const PublishedState: PublishedState = PublishedState {
     state: Mutex::new(State {
         current: None,
-        old: Vec::new(),
+        memberships: Vec::new(),
         content_hash: [0; 32],
         membership_hash: [0; 32],
     }),
@@ -43,6 +43,37 @@ impl Default for PublishedState {
     }
 }
 impl PublishedState {
+    /// Incoming wire versions resolve here once, then travel as operation leases.
+    /// Weak entries never prolong a generation's lifetime and publication prunes
+    /// dead entries before admission, bounding the registry as well as live state.
+    pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
+        self.state
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .memberships
+            .iter()
+            .find(|(v, _)| *v == version)
+            .and_then(|(_, membership)| membership.upgrade())
+            .ok_or(Error::IncompatibleMembership)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_membership(membership: MembershipLease) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State {
+                memberships: vec![(membership.version, Arc::downgrade(&membership))],
+                current: Some(Arc::new(Snapshot {
+                    cluster: ClusterId("test".into()),
+                    sequence: PublicationSequence(1),
+                    membership,
+                    caches: vec![],
+                })),
+                content_hash: [0; 32],
+                membership_hash: [0; 32],
+            }),
+        })
+    }
+
     pub fn current(&self) -> Result<SnapshotLease> {
         self.state
             .lock()
@@ -55,6 +86,7 @@ impl PublishedState {
 pub struct SnapshotStore {
     cluster: ClusterId,
     published: Arc<PublishedState>,
+    /// Maximum old live membership generations, in addition to the current one.
     retained_limit: usize,
 }
 impl SnapshotStore {
@@ -126,34 +158,49 @@ impl SnapshotStore {
                 return Err(Error::IncompatibleMembership);
             }
         }
-        state
-            .old
-            .retain(|(s, m)| s.strong_count() != 0 || m.strong_count() != 0);
-        let retain_current = state
+        state.memberships.retain(|(_, m)| m.strong_count() != 0);
+        let same_membership = state
             .current
             .as_ref()
-            .is_some_and(|s| Arc::strong_count(s) > 1 || Arc::strong_count(&s.membership) > 1);
-        if state.old.len() + usize::from(retain_current) > self.retained_limit {
-            return Err(Error::Overloaded);
-        }
+            .filter(|s| s.membership.version == publication.membership_version);
+        let membership = if let Some(current) = same_membership {
+            current.membership.clone()
+        } else {
+            // Only the current publication's sole structural lease can disappear
+            // on replacement. External snapshot and membership leases both count.
+            // Resolution and admission share this lock, so an incoming request
+            // cannot acquire that lease between this check and replacement.
+            let replaceable = state.current.as_ref().is_some_and(|s| {
+                Arc::strong_count(s) == 1 && Arc::strong_count(&s.membership) == 1
+            });
+            if state.memberships.len() - usize::from(replaceable) > self.retained_limit {
+                return Err(Error::Overloaded);
+            }
+            Arc::new(Membership::validate(
+                publication.membership_version,
+                publication.members,
+            )?)
+        };
         let next = Arc::new(Snapshot {
             cluster: publication.cluster,
             sequence: publication.sequence,
-            membership: Arc::new(Membership::validate(
-                publication.membership_version,
-                publication.members,
-            )?),
+            membership,
             caches: publication.caches,
         });
-        if retain_current {
-            let old = state.current.as_ref().unwrap();
-            let weak = (Arc::downgrade(old), Arc::downgrade(&old.membership));
-            state.old.push(weak);
-        }
         if let Some(transition) = transition {
             transition.commit();
         }
         state.current = Some(next.clone());
+        state.memberships.retain(|(_, m)| m.strong_count() != 0);
+        if !state
+            .memberships
+            .iter()
+            .any(|(v, _)| *v == next.membership.version)
+        {
+            state
+                .memberships
+                .push((next.membership.version, Arc::downgrade(&next.membership)));
+        }
         state.content_hash = content_hash;
         state.membership_hash = membership_hash;
         Ok(next)
@@ -162,6 +209,73 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
+        let published = Arc::new(PublishedState::default());
+        let store = SnapshotStore::new(publication(1).cluster, published.clone(), 0);
+        let first = store.publish(publication(1)).unwrap();
+        let mut history = vec![first.clone()];
+        for sequence in 2..40 {
+            let mut next = publication(sequence);
+            next.caches.clear();
+            let snapshot = store.publish(next).unwrap();
+            assert!(Arc::ptr_eq(&first.membership, &snapshot.membership));
+            history.push(snapshot);
+            assert_eq!(published.state.lock().unwrap().memberships.len(), 1);
+        }
+        let mut next = publication(40);
+        next.membership_version.0 = 2;
+        assert!(matches!(
+            store.publish(next.clone()),
+            Err(Error::Overloaded)
+        ));
+        let weak = Arc::downgrade(&first.membership);
+        drop(first);
+        drop(history);
+        store.publish(next).unwrap();
+        assert!(weak.upgrade().is_none());
+        for version in 3..100 {
+            let mut next = publication(version + 40);
+            next.membership_version.0 = version;
+            store.publish(next).unwrap();
+            assert_eq!(published.state.lock().unwrap().memberships.len(), 1);
+            assert!(matches!(
+                published.membership(MembershipVersion(version - 1)),
+                Err(Error::IncompatibleMembership)
+            ));
+        }
+    }
+
+    #[test]
+    fn delayed_thread_lease_blocks_admission_until_release() {
+        let published = Arc::new(PublishedState::default());
+        let store = SnapshotStore::new(publication(1).cluster, published.clone(), 1);
+        store.publish(publication(1)).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let snapshot = published.current().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let incoming = published.membership(MembershipVersion(1)).unwrap();
+            assert!(Arc::ptr_eq(&snapshot.membership, &incoming));
+        });
+        ready_rx.recv().unwrap();
+        let mut next = publication(2);
+        next.membership_version.0 = 2;
+        let current = store.publish(next.clone()).unwrap();
+        next.sequence.0 = 3;
+        next.membership_version.0 = 3;
+        assert!(matches!(
+            store.publish(next.clone()),
+            Err(Error::Overloaded)
+        ));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        store.publish(next).unwrap();
+        assert_eq!(current.membership.version, MembershipVersion(2));
+    }
+
     fn publication(sequence: u64) -> Publication {
         let mut p =
             crate::control::wire::decode_publication(include_bytes!("testdata/publication.json"))
@@ -186,17 +300,22 @@ mod tests {
         changed.caches[0].id =
             crate::model::identity::CacheId("66666666-6666-4666-8666-666666666666".into());
         assert!(matches!(store.publish(changed), Err(Error::Replay)));
-        let second = store.publish(publication(2)).unwrap();
+        let mut next = publication(2);
+        next.membership_version.0 = 2;
+        let second = store.publish(next.clone()).unwrap();
         assert!(matches!(store.publish(publication(1)), Err(Error::Replay)));
+        next.sequence.0 = 3;
+        next.membership_version.0 = 3;
         assert!(matches!(
-            store.publish(publication(3)),
+            store.publish(next.clone()),
             Err(Error::Overloaded)
         ));
         assert_eq!(store.cursor().unwrap(), Some(PublicationSequence(2)));
         drop(first);
-        assert!(store.publish(publication(3)).is_ok());
+        assert!(store.publish(next).is_ok());
         drop(second);
         let mut changed = publication(4);
+        changed.membership_version.0 = 3;
         changed.members[0].peer_endpoint = "192.0.2.7:7443".into();
         assert!(matches!(
             store.publish(changed.clone()),
@@ -222,20 +341,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(committed.get(), 1);
+        let mut next = publication(2);
+        next.membership_version.0 = 2;
         assert!(matches!(
-            store.publish_staged(
-                publication(2),
-                Some(Box::new(Transition(committed.clone())))
-            ),
+            store.publish_staged(next.clone(), Some(Box::new(Transition(committed.clone())))),
             Err(Error::Overloaded)
         ));
         assert_eq!(committed.get(), 1);
         drop(first);
         store
-            .publish_staged(
-                publication(2),
-                Some(Box::new(Transition(committed.clone()))),
-            )
+            .publish_staged(next, Some(Box::new(Transition(committed.clone()))))
             .unwrap();
         assert_eq!(committed.get(), 2);
     }

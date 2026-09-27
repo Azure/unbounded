@@ -21,6 +21,8 @@ pub struct Limits {
     pub route_search_work: NonZeroUsize,
     pub cached_rankings: NonZeroUsize,
     pub cached_paths: NonZeroUsize,
+    /// Old live membership generations in addition to current; cache-only
+    /// publications reuse a generation and do not consume another slot.
     pub retained_snapshots: NonZeroUsize,
     pub metadata_entries: NonZeroUsize,
     pub relay_transfers: NonZeroUsize,

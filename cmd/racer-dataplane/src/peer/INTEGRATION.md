@@ -1,11 +1,10 @@
 # Peer integration
 
-All constructors remain side-effect-free. Existing constructors are retained;
+All constructors remain side-effect-free;
 missing required operational inputs fail with `InvalidConfiguration`.
 
 ```rust,ignore
-let network = Rc::new(PeerNetwork::new(local_node, retained_snapshot_limit)?);
-network.install(membership.clone())?;
+let network = Rc::new(PeerNetwork::new(local_node, published_state.clone())?);
 let codec = Rc::new(SecurityCodec::new(admission.clone(), buffers.clone()));
 let peer_io = Rc::new(HttpIo::with_admission(
     reactor.clone(),
@@ -50,10 +49,20 @@ Errors close that connection and do not stop other connections.
 The listener retains one outstanding accept across connection task completions,
 including when its accepted socket is ready but has not yet been consumed.
 
-Install exact immutable membership snapshots on every worker and retire old entries
-only after acquisition policy stops issuing requests for those versions. Replacing
-a version with a different allocation is rejected. Retiring a map entry does not
-invalidate an already acquired membership lease.
+Share the node's `PublishedState` with every worker network. Publication admission
+creates one immutable `Arc<Membership>` per version and cache-only publications
+reuse it. It bounds distinct live generations to `retained_snapshots + 1`, counting
+the current generation; cache-only history consumes no additional membership slots.
+The single incoming-version registry holds weak references and prunes dead entries
+at publication. Workers do not install or retire membership tables.
+
+Reads pass their lease to `PeerClient::request`; relays pass it to
+`PeerTransport::exchange`. Routing, endpoint lookup, and outbound handshakes receive
+that lease directly. Authenticated ingress resolves its wire version once, then
+passes the lease through local worker dispatch or relay and retains it through
+HTTP/native response completion. Delayed workers and cancellation keep actual
+operation leases alive until completion; no worker reference-count bookkeeping is
+required. Neighbor validation still uses the leased bounded graph.
 
 `SecurityCodec` decodes the security owner's canonical headers and checks exact
 agreement by re-encoding through `security::protocol`. It does not authenticate.
