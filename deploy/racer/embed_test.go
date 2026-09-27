@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -67,14 +68,31 @@ func TestEmbeddedManifestContract(t *testing.T) {
 }
 
 func TestIgnoredRenderedTreesCannotShadowManifests(t *testing.T) {
-	// Keep the fixture inside this module so it uses the real dependencies and
-	// version package without downloading or maintaining a separate go.mod.
+	// Scratch directories can contain unrelated modules. Reproduce one at the
+	// subprocess's TMPDIR and give the fixture an explicit nested module so Go
+	// never discovers that unrelated go.mod (or a developer's go.work).
 	root, err := filepath.Abs("../..")
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "tmp"), 0o755))
-	fixture, err := os.MkdirTemp(filepath.Join(root, "tmp"), "racer-embed-")
+	scratch, err := os.MkdirTemp(filepath.Join(root, "tmp"), "racer-embed-")
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(fixture)) })
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(scratch)) })
+
+	unrelatedModule := []byte("module example.invalid/unrelated-scratch\n\ngo 1.26.6\n")
+	require.NoError(t, os.WriteFile(filepath.Join(scratch, "go.mod"), unrelatedModule, 0o600))
+	fixture := filepath.Join(scratch, "fixture")
+	require.NoError(t, os.Mkdir(fixture, 0o755))
+	// Reuse the repository's dependency versions and checksums. The nested
+	// module path retains access to internal packages through a local replace.
+	module, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	require.NoError(t, err)
+
+	moduleText := strings.Replace(string(module), "module github.com/Azure/unbounded", "module github.com/Azure/unbounded/embedfixture", 1)
+	moduleText += "\nrequire github.com/Azure/unbounded v0.0.0\nreplace github.com/Azure/unbounded => " + strconv.Quote(root) + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(fixture, "go.mod"), []byte(moduleText), 0o600))
+	checksums, err := os.ReadFile(filepath.Join(root, "go.sum"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(fixture, "go.sum"), checksums, 0o600))
 
 	sources, err := filepath.Glob("*.yaml.tmpl")
 	require.NoError(t, err)
@@ -109,10 +127,15 @@ func TestIgnoredRenderedTreesCannotShadowManifests(t *testing.T) {
 				}
 			}
 
-			cmd := exec.CommandContext(t.Context(), "go", "test", "-count=1", "-run=^TestEmbeddedManifestContract$", ".")
+			cmd := exec.CommandContext(t.Context(), "go", "test", "-mod=readonly", "-count=1", "-run=^TestEmbeddedManifestContract$", ".")
 			cmd.Dir = fixture
+			cmd.Env = append(cmd.Environ(), "GOWORK=off", "TMPDIR="+scratch)
 			output, err := cmd.CombinedOutput()
 			require.NoError(t, err, "%s", output)
 		})
 	}
+
+	remaining, err := os.ReadFile(filepath.Join(scratch, "go.mod"))
+	require.NoError(t, err)
+	require.Equal(t, unrelatedModule, remaining)
 }
