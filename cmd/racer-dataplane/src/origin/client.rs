@@ -218,7 +218,10 @@ impl OriginClient {
             .iter()
             .find(|cache| cache.id == context.object.cache)
             .ok_or(Error::Unavailable)?;
-        Ok(Endpoint::Unix(resolve_socket(&self.socket_root, cache)?))
+        Ok(Endpoint::Origin {
+            cache: cache.id.clone(),
+            path: resolve_socket(&self.socket_root, cache)?,
+        })
     }
 
     async fn metadata_at(

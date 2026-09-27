@@ -234,7 +234,6 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	defer cancel()
 
 	result := make(chan lifecycleResponse, 1)
-	readStarted := time.Now()
 
 	go func() { result <- h.lifecycleRead(ctx, nodes[0], lifecycleSocket, fixture.cold, http.MethodGet) }()
 
@@ -250,21 +249,9 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 
 	fixture.allow(false)
 
-	retireBy := time.NewTimer(20 * time.Second)
-	defer retireBy.Stop()
+	retirementStarted := time.Now()
 
 	h.kubectl("delete", "clustercache", "gantry", "--wait=true", "--timeout=15s")
-	// Racer's ordinary request timeout is 30 seconds. Cancellation must beat it
-	// so a timed-out fill cannot masquerade as controller-driven retirement.
-	select {
-	case <-fixture.canceled:
-	case <-retireBy.C:
-		h.t.Fatal("cache deletion did not cancel the held fill before the ordinary request timeout")
-	case <-h.ctx.Done():
-		h.t.Fatal(h.ctx.Err())
-	}
-
-	require.Less(h.t, time.Since(readStarted), 25*time.Second, "ordinary 30-second request expiry must not satisfy cancellation")
 	// Observe the empty catalog on both Rust dataplanes before recreating. This
 	// cannot be satisfied by Kubernetes deletion alone or a manually staged cut.
 	for _, node := range nodes {
@@ -273,17 +260,17 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 			defer stop()
 
 			return exec.CommandContext(probe, "docker", "exec", node.name, "test", "!", "-S", lifecycleSocket).Run() == nil
-		}, 45*time.Second, 200*time.Millisecond, "controller removal never retired %s socket", node.name)
+		}, 20*time.Second, 200*time.Millisecond, "controller removal never retired %s socket", node.name)
+		probe, stop := context.WithTimeout(h.ctx, 2*time.Second)
+		r := h.lifecycleRead(probe, node, oldSocket, fixture.warm, http.MethodGet)
+		probeErr := probe.Err()
+
+		stop()
+		require.NoError(h.t, probeErr, "retired listener must reject new admission promptly")
+		require.Error(h.t, r.err, "retired listener accepted new work")
 	}
 
-	select {
-	case r := <-result:
-		require.True(h.t, r.err != nil || r.status >= 400, "removed UID completed a held read successfully")
-	case <-ctx.Done():
-		h.t.Fatal("old read did not retire before its deadline")
-	}
-
-	require.NoError(h.t, ctx.Err(), "client timeout must not masquerade as retirement")
+	require.Less(h.t, time.Since(retirementStarted), 25*time.Second, "new admission must close independently of the held operation's 30-second timeout")
 	h.apply("apiVersion: racer.unbounded-cloud.io/v1alpha1\nkind: ClusterCache\nmetadata:\n  name: gantry\n")
 	newUID := strings.TrimSpace(h.kubectl("get", "clustercache", "gantry", "-o", "jsonpath={.metadata.uid}"))
 	require.NotEmpty(h.t, newUID)
@@ -313,6 +300,19 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 
 	fixture.unblock()
 	h.awaitLifecycle(fixture.finished, "late origin handler did not finish")
+	// Accepted work may drain under its original deadline. Explicitly releasing
+	// the old origin, rather than deletion, ends the held operation.
+	select {
+	case r := <-result:
+		if r.err == nil && r.status < 400 {
+			require.Equal(h.t, http.StatusPartialContent, r.status)
+			require.Equal(h.t, fixture.blobs[fixture.cold], r.body)
+		}
+	case <-ctx.Done():
+		h.t.Fatal("released old read did not finish before its deadline")
+	}
+
+	cancel()
 	// With metadata still available but all data GETs denied, neither warmed old
 	// pages nor the released late fill may satisfy either replacement node.
 	for _, node := range nodes {
@@ -347,7 +347,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	}
 
 	require.Equal(h.t, beforePods, podState(), "live deletion/recreation must not rely on dataplane restart")
-	h.t.Logf("cache lifecycle: %s -> %s, old listeners rejected, held fill canceled, replacement cold and reusable on both nodes", oldUID, newUID)
+	h.t.Logf("cache lifecycle: %s -> %s, old listeners rejected, held fill released, replacement cold and reusable on both nodes", oldUID, newUID)
 }
 
 func TestLifecycleOriginHoldRelease(t *testing.T) {

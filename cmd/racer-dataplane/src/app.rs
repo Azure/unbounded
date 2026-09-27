@@ -667,7 +667,8 @@ impl WorkerApplication {
             )
             .with_buffers(admission.clone(), buffers.clone()),
         );
-        let flights = Rc::new(Flights::new(admission.clone()));
+        let flights =
+            Rc::new(Flights::new(admission.clone()).with_availability(availability.clone()));
         let fill = Rc::new(
             Fill::new(FillDependencies {
                 memory: memory.clone(),

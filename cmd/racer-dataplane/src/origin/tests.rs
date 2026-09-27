@@ -109,13 +109,19 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
     context.object.cache = snapshot.caches[0].id.clone();
     assert_eq!(
         client.endpoint(&context).unwrap(),
-        Endpoint::Unix("/run/racer/cache-a/origin/socket".into())
+        Endpoint::Origin {
+            cache: context.object.cache.clone(),
+            path: "/run/racer/cache-a/origin/socket".into(),
+        }
     );
     let root = PathBuf::from("/nonexistent-racer-fixture-root");
     let client = client.with_socket_root(root.clone()).unwrap();
     assert_eq!(
         client.endpoint(&context).unwrap(),
-        Endpoint::Unix(root.join("cache-a/origin/socket"))
+        Endpoint::Origin {
+            cache: context.object.cache.clone(),
+            path: root.join("cache-a/origin/socket"),
+        }
     );
     assert_eq!(
         snapshot.caches[0].origin_socket,
@@ -301,6 +307,110 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
         reactor.poll_budgeted(128).unwrap();
         reactor.wait(Duration::from_millis(1)).unwrap();
     }
+}
+
+#[test]
+fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
+    use std::os::fd::AsRawFd;
+    let directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("origin-replacement-{}", std::process::id()));
+    std::fs::create_dir_all(directory_path.join("cache-a/origin")).unwrap();
+    let directory = std::fs::File::open(&directory_path).unwrap();
+    let root = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    let socket = root.join("cache-a/origin/socket");
+    let old_listener = UnixListener::bind(&socket).unwrap();
+    old_listener.set_nonblocking(true).unwrap();
+    let (mut client, admission, reactor) = self::client();
+    let mut publication = crate::control::wire::decode_publication(include_bytes!(
+        "../control/testdata/publication.json"
+    ))
+    .unwrap();
+    publication.sequence.0 = 1;
+    client.snapshots = Rc::new(SnapshotStore::new(
+        publication.cluster.clone(),
+        Arc::new(PublishedState::default()),
+        2,
+    ));
+    let snapshot = client.snapshots.publish(publication.clone()).unwrap();
+    let client = client.with_socket_root(root).unwrap();
+    let mut old_context = context();
+    old_context.object.cache = snapshot.caches[0].id.clone();
+    let old_endpoint = client.endpoint(&old_context).unwrap();
+    let scope = scope();
+    let (release, held) = std::sync::mpsc::channel();
+    let old_server = thread::spawn(move || {
+        // All three exchanges must use this one accepted socket, including the
+        // delayed old operation after the replacement starts serving.
+        let mut stream = accept(&old_listener);
+        for _ in 0..2 {
+            check_request(&receive(&mut stream), "HEAD", None, None, true);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        }
+        held.recv_timeout(Duration::from_secs(5)).unwrap();
+        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+    });
+    for _ in 0..2 {
+        let result = drive(
+            &reactor,
+            client.metadata_at(&old_endpoint, &old_context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(
+            result.metadata.version.etag,
+            StrongEtag::parse(b"\"old\"").unwrap()
+        );
+    }
+    assert_eq!(admission.used(ResourceClass::Connection), 1);
+    let delayed = client.metadata_at(&old_endpoint, &old_context, MetadataSelector::Fresh, &scope);
+    std::fs::remove_file(&socket).unwrap();
+    let replacement_listener = UnixListener::bind(&socket).unwrap();
+    replacement_listener.set_nonblocking(true).unwrap();
+    publication.sequence.0 += 2; // The worker can skip the intervening removal.
+    publication.caches[0].id = CacheId("55555555-5555-4555-8555-555555555555".into());
+    let mut new_context = context();
+    new_context.object.cache = publication.caches[0].id.clone();
+    new_context.authorization =
+        Some(Authorization::from_header(b"replacement-credential").unwrap());
+    client.snapshots.publish(publication).unwrap();
+    let new_endpoint = client.endpoint(&new_context).unwrap();
+    assert_ne!(old_endpoint, new_endpoint);
+    let replacement = thread::spawn(move || {
+        let mut stream = accept(&replacement_listener);
+        for _ in 0..2 {
+            assert_eq!(
+                receive(&mut stream).unique("Authorization").unwrap(),
+                Some(b"replacement-credential".as_slice())
+            );
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"new\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        }
+    });
+    for _ in 0..2 {
+        let result = drive(
+            &reactor,
+            client.metadata_at(&new_endpoint, &new_context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(
+            result.metadata.version.etag,
+            StrongEtag::parse(b"\"new\"").unwrap()
+        );
+    }
+    release.send(()).unwrap();
+    assert_eq!(
+        drive(&reactor, delayed).unwrap().metadata.version.etag,
+        StrongEtag::parse(b"\"old\"").unwrap()
+    );
+    old_server.join().unwrap();
+    replacement.join().unwrap();
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    std::fs::remove_dir_all(directory_path).unwrap();
 }
 
 struct SocketPath(PathBuf);

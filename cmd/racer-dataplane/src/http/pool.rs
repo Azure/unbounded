@@ -25,6 +25,11 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Endpoint {
     Unix(PathBuf),
+    /// Cache incarnation is pool identity; the name-derived path is only a dial address.
+    Origin {
+        cache: crate::model::identity::CacheId,
+        path: PathBuf,
+    },
     /// Numeric IP:port only. DNS resolution is deliberately not performed on an
     /// I/O worker. Control-plane DNS must supply an already-resolved endpoint.
     Peer(String),
@@ -326,6 +331,9 @@ impl HttpPool {
                             + std::mem::size_of::<WaitingEntry>()
                             + match endpoint {
                                 Endpoint::Unix(path) => path.as_os_str().len(),
+                                Endpoint::Origin { cache, path } => {
+                                    cache.0.len() + path.as_os_str().len()
+                                }
                                 Endpoint::Peer(address) => address.len(),
                             }
                             + 128,
@@ -408,7 +416,7 @@ impl HttpPool {
             }
             let entry = state.entries.get_mut(endpoint).ok_or(Error::Unavailable)?;
             let limit = match endpoint {
-                Endpoint::Unix(_) => self.per_origin,
+                Endpoint::Unix(_) | Endpoint::Origin { .. } => self.per_origin,
                 Endpoint::Peer(_) => self.per_endpoint,
             };
             if entry.active >= limit {
@@ -545,7 +553,9 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
                 SocketAddress::Inet(address),
             )
         }
-        Endpoint::Unix(path) => (libc::AF_UNIX, SocketAddress::Unix(path.clone())),
+        Endpoint::Unix(path) | Endpoint::Origin { path, .. } => {
+            (libc::AF_UNIX, SocketAddress::Unix(path.clone()))
+        }
     };
     Ok((OwnedFd::socket(domain)?, address))
 }
@@ -845,9 +855,41 @@ mod tests {
     }
 
     #[test]
+    fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
+        let (admission, _, mut pool) = setup();
+        pool.max_endpoints = 1;
+        let origin = |uid: usize| Endpoint::Origin {
+            cache: crate::model::identity::CacheId(format!("cache-{uid}")),
+            path: "/unused/origin".into(),
+        };
+        let (first, _peer) = held(&pool, &origin(0));
+        assert!(matches!(
+            pool.prepare_connection(&origin(1)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(pool.state.borrow().entries.len(), 1);
+        drop(first);
+        for uid in 1..32 {
+            let (mut connection, address) = pool.prepare_connection(&origin(uid)).unwrap();
+            assert!(address.is_some(), "new UID must dial rather than reuse");
+            assert_eq!(pool.state.borrow().entries.len(), 1);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            connection.rx_remaining = Some(0);
+            connection.tx_remaining = Some(0);
+            connection.finish_exchange().unwrap();
+            drop(connection);
+        }
+        pool.close();
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+
+    #[test]
     fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
         let (admission, _, pool) = setup();
-        let origin = Endpoint::Unix("/unused/origin".into());
+        let origin = Endpoint::Origin {
+            cache: crate::model::identity::CacheId("cache".into()),
+            path: "/unused/origin".into(),
+        };
         let (first, _a) = held(&pool, &origin);
         let (second, _b) = held(&pool, &origin);
         drop(second);

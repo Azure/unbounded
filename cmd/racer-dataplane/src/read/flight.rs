@@ -38,6 +38,7 @@ use std::{
 
 pub struct Flights {
     admission: Rc<Admission>,
+    availability: Option<Rc<crate::control::availability::Availability>>,
     owner: Rc<()>,
     limits: FlightLimits,
     table: RefCell<Table>,
@@ -559,6 +560,7 @@ impl Flights {
         };
         Self {
             admission,
+            availability: None,
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
@@ -575,10 +577,45 @@ impl Flights {
         }
         Ok(Self {
             admission,
+            availability: None,
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
         })
+    }
+
+    pub fn with_availability(
+        mut self,
+        availability: Rc<crate::control::availability::Availability>,
+    ) -> Self {
+        self.availability = Some(availability);
+        self
+    }
+
+    // Only new registrations consult current admission. Existing waiters and
+    // completion owners retain their result, even after its key is retired.
+    fn admit_join(&self, page: &PageId, entry: Option<&Entry>) -> Result<()> {
+        let Some(availability) = &self.availability else {
+            return Ok(());
+        };
+        if !availability.cache(&page.version.object.cache) {
+            return Err(Error::Unavailable);
+        }
+        let result = entry.and_then(|entry| {
+            entry.result.as_ref().or(match &entry.outcome {
+                Some(Outcome::Published(result)) => Some(result),
+                _ => None,
+            })
+        });
+        if result.is_some_and(|result| {
+            !availability.page(
+                &page.version.object.cache,
+                result.ciphertext.envelope().key_id,
+            )
+        }) {
+            return Err(Error::MissingKey);
+        }
+        Ok(())
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
@@ -608,6 +645,7 @@ impl Flights {
             if table.stopping {
                 return Err(Error::Cancelled);
             }
+            self.admit_join(&page, table.entries.get(&page))?;
             if let Some(entry) = table.entries.get_mut(&page) {
                 refresh(entry, wakes);
                 if let Some(result) = &entry.result {
@@ -707,6 +745,9 @@ impl Flights {
             let Some(entry) = table.entries.get_mut(page) else {
                 return Ok(JoinedCopy::Miss);
             };
+            if self.admit_join(page, Some(entry)).is_err() {
+                return Ok(JoinedCopy::Miss);
+            }
             refresh(entry, wakes);
             if let Some(result) = &entry.result {
                 return Ok(JoinedCopy::Complete(result.clone()));

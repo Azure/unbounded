@@ -86,15 +86,18 @@ The test:
 1. Warms an immutable object on both nodes and verifies repeated pinned reads
    reuse it without additional origin GETs.
 2. Starts a cold read whose origin sends a prefix and holds the remaining body.
-   Deletion must cancel it before the ordinary request timeout and remove both
-   client sockets. The held client cannot complete successfully.
+   Deletion must promptly remove both client sockets and reject new admission
+   through retained old socket links. Already accepted work may drain under its
+   original deadline.
 3. Recreates the cache and polls pinned HEAD requests for replacement socket
    readiness. Hard links retained to the old sockets must reject promptly, and
    the replacement sockets must have different inodes.
 4. Releases the old origin handler only after replacement readiness, attempting
-   its late body write. With origin data GETs denied but HEAD still available,
-   reads of both the warmed and held objects must fail on both nodes and must
-   attempt origin. Old cached bytes cannot satisfy the replacement UID.
+   its late body write, and waits for the old client to finish. Successful old
+   responses must contain the exact expected bytes. With origin data GETs denied
+   but HEAD still available, reads of both the warmed and held objects must fail
+   on both nodes and must attempt origin. Old cached bytes cannot satisfy the
+   replacement UID.
 5. Enables origin data again, checks exact bytes, ETag, and Content-Range, and
    verifies the replacement pages become reusable without additional GETs.
 

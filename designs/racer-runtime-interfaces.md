@@ -87,7 +87,14 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
   and asynchronous fallback operations retain all required connection/page leases.
 - `MemoryCache::retire_key(cache, key)` and `remove_cache(cache)` evict references.
   Production lookups and late publication consult the current positive cache/key
-  availability set, without removal tombstones. `evict_idle(bytes)` releases idle
+  availability set, without removal tombstones. New flight joins check that same
+  set before sharing completed results or published results awaiting completion
+  fences. Retired results remain owned by previously admitted waiters; new
+  acquisition callers receive `MissingKey` and copy-only callers miss until those
+  registrations drain. Origin pools include cache UID in endpoint identity, while
+  the name-derived Unix path remains the dial address. Skipping a removal snapshot
+  cannot make a replacement UID reuse the old adapter's keepalive connection.
+  `evict_idle(bytes)` releases idle
   bundles and reports combined
   plaintext/ciphertext charges; it is not a class-specific admission budget.
   Read-owner pressure uses `reclaim_idle` with the exhausted class and its exact

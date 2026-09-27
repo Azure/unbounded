@@ -115,6 +115,7 @@ impl Origin for TestOrigin {
 
 struct Fixture {
     fill: Fill,
+    keys: Rc<crate::security::keyring::Keyring>,
     origin: Rc<TestOrigin>,
     crypto: Rc<CryptoClient>,
     engine: PageCryptoEngine,
@@ -133,16 +134,38 @@ fn fixture() -> Fixture {
     fixture_with(3, None)
 }
 fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fixture {
+    fixture_with_availability(length, limits, false)
+}
+fn fixture_with_availability(
+    length: u64,
+    limits: Option<crate::model::limits::Limits>,
+    check_availability: bool,
+) -> Fixture {
     let mut config = crate::test_support::cluster::config(false);
     if let Some(limits) = limits {
         config.limits = limits;
     }
     let worker = WorkerId(0);
     let admission = Rc::new(Admission::new(config.limits.clone()));
+    let keys = Rc::new(crate::security::keyring::tests::keys());
+    let availability = crate::control::availability::for_caches(
+        keys.clone(),
+        vec![CacheId(crate::security::identity::tests::CACHE.into())],
+    );
     let buffers = Rc::new(BufferPool::new(admission.clone()));
-    let memory = Rc::new(MemoryCache::new(buffers.clone()));
+    let memory = MemoryCache::new(buffers.clone());
+    let memory = Rc::new(if check_availability {
+        memory.with_availability(availability.clone())
+    } else {
+        memory
+    });
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let index = Rc::new(Index::new(worker, 16));
+    let index = Index::new(worker, 16);
+    let index = Rc::new(if check_availability {
+        index.with_availability(availability.clone())
+    } else {
+        index
+    });
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -171,8 +194,12 @@ fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fi
         slabs.clone(),
         buffers.clone(),
     ));
-    let writer = Rc::new(StoreWriter::new(index, segments, slabs));
-    let keys = Rc::new(crate::security::keyring::tests::keys());
+    let writer = StoreWriter::new(index, segments, slabs);
+    let writer = Rc::new(if check_availability {
+        writer.with_availability(availability.clone())
+    } else {
+        writer
+    });
     let context = OriginContext {
         object: ObjectId {
             cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -233,6 +260,12 @@ fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fi
         )
         .unwrap(),
     );
+    let flights = Flights::new(admission.clone());
+    let flights = Rc::new(if check_availability {
+        flights.with_availability(availability)
+    } else {
+        flights
+    });
     let fill = Fill::new(FillDependencies {
         memory,
         buffers,
@@ -241,13 +274,14 @@ fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fi
         peers,
         origin: origin.clone(),
         candidates,
-        flights: Rc::new(Flights::new(admission.clone())),
-        crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+        flights,
+        crypto: Rc::new(PageCrypto::new(keys.clone(), crypto.clone())),
         credentials,
         admission,
         metadata_owner,
     });
     Fixture {
+        keys,
         directory,
         fill,
         origin,
@@ -279,6 +313,296 @@ fn drive<T>(
         }
     }
     panic!("bounded test executor did not complete");
+}
+
+#[test]
+fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
+    use crate::security::keyring::{KeyPurpose, tests::rotation_bundle};
+    let mut f = fixture_with_availability(3, None, true);
+    let flights = f.fill.dependencies.flights.clone();
+    let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let JoinedFlight::Waiter(mut held) = flights
+        .join(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut held_budget,
+        )
+        .unwrap()
+    else {
+        panic!("expected registration")
+    };
+    let JoinedCopy::Waiter(mut old_copy) = flights.join_copy(&f.page, &f.scope).unwrap() else {
+        panic!("expected copy registration")
+    };
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let original = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let old_key = original.ciphertext.envelope().key_id;
+    // Exercise the completed fast paths before retirement, with registrations
+    // deliberately retaining the real encrypted fill after its driver finishes.
+    assert!(matches!(
+        flights.join_copy(&f.page, &f.scope).unwrap(),
+        JoinedCopy::Complete(_)
+    ));
+    assert!(matches!(
+        flights
+            .join(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget
+            )
+            .unwrap(),
+        JoinedFlight::Complete(_)
+    ));
+    let roots = (*f.keys.peer_trust_roots().unwrap()).clone();
+    f.keys.install(rotation_bundle(2, roots)).unwrap();
+    let current_key = f
+        .keys
+        .active(&f.context.object.cache, KeyPurpose::Page)
+        .unwrap()
+        .id();
+    assert_ne!(current_key, old_key);
+    assert!(
+        f.keys
+            .lease(Some(&f.context.object.cache), old_key, KeyPurpose::Page)
+            .is_err()
+    );
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        flights.join(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget
+        ),
+        Err(Error::MissingKey)
+    ));
+    assert!(matches!(
+        flights.join_copy(&f.page, &f.scope).unwrap(),
+        JoinedCopy::Miss
+    ));
+    assert!(matches!(
+        drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget
+            ),
+            &mut f.engine,
+            &f.crypto,
+        ),
+        Err(Error::MissingKey)
+    ));
+    assert!(
+        drive(
+            f.fill.copy_only(&f.page, &f.scope),
+            &mut f.engine,
+            &f.crypto
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(f.origin.calls.get(), 1);
+    // The public pinned coordinator may still know the immutable descriptor.
+    // Its range body must nevertheless miss the retired completed page flight.
+    {
+        use crate::{
+            client::request::{ClientRequest, ReadKind},
+            control::{
+                caches::CacheDefinition,
+                snapshot::{PublishedState, SnapshotStore},
+                wire::*,
+            },
+            memory::{delivery::Delivery, pipe::PipePool},
+            model::range::ByteRange,
+            read::{
+                metadata::{MetadataDependencies, MetadataService},
+                range_stream::RangeStreams,
+                serve::{Coordinator, ReadService},
+            },
+        };
+        let snapshots = Rc::new(SnapshotStore::new(
+            f.keys.cluster().clone(),
+            Arc::new(PublishedState::default()),
+            2,
+        ));
+        let (client_socket, origin_socket) =
+            crate::control::caches::canonical_socket_paths("rotation").unwrap();
+        snapshots
+            .publish(Publication {
+                schema_version: SCHEMA_VERSION,
+                cluster: f.keys.cluster().clone(),
+                sequence: PublicationSequence(1),
+                membership_version: f.membership.version,
+                members: f.membership.members().to_vec(),
+                caches: vec![CacheDefinition {
+                    id: f.context.object.cache.clone(),
+                    name: "rotation".into(),
+                    client_socket,
+                    origin_socket,
+                }],
+            })
+            .unwrap();
+        let fill = Rc::new(Fill::new(f.fill.dependencies.clone()));
+        let owners = fill.dependencies.metadata_owner.clone();
+        let metadata = Rc::new(MetadataService::new(
+            fill.dependencies.candidates.clone(),
+            f.origin.clone(),
+            fill.dependencies.peers.clone(),
+            fill.dependencies.credentials.clone(),
+            16,
+            MetadataDependencies {
+                index: Rc::new(Index::new(WorkerId(0), 16)),
+                owners: owners.clone(),
+                fill: fill.clone(),
+            },
+        ));
+        metadata
+            .publish_version(original.metadata.immutable())
+            .unwrap();
+        let admission = fill.dependencies.admission.clone();
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let delivery = Rc::new(Delivery::new(
+            Rc::new(PipePool::new(admission, reactor)),
+            Duration::from_secs(10),
+        ));
+        let streams = Rc::new(RangeStreams::new(fill.clone(), owners.clone(), delivery, 1));
+        let coordinator = Rc::new(Coordinator::new(
+            snapshots,
+            metadata,
+            fill.clone(),
+            streams,
+            fill.dependencies.credentials.clone(),
+        ));
+        let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
+        let mut response = drive(
+            coordinator.read(
+                ClientRequest {
+                    kind: ReadKind::Pinned {
+                        etag: f.page.version.etag.clone(),
+                        range: ByteRange::Closed { first: 0, last: 2 },
+                    },
+                    origin: OriginContext {
+                        object: f.context.object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                },
+                &f.scope,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        let mut slice = response.body.as_mut().unwrap().next_slice();
+        assert!(matches!(
+            drive(
+                std::future::poll_fn(|cx| {
+                    endpoint.poll(cx, 64).unwrap();
+                    slice.as_mut().poll(cx)
+                }),
+                &mut f.engine,
+                &f.crypto
+            ),
+            Err(Error::MissingKey)
+        ));
+    }
+    let AcquisitionEvent::Complete(admitted) = futures::executor::block_on(held.wait()).unwrap()
+    else {
+        panic!("original waiter must finish")
+    };
+    let admitted_copy = futures::executor::block_on(old_copy.wait()).unwrap();
+    assert_eq!(admitted.plaintext.bytes(), b"abc");
+    assert_eq!(
+        admitted_copy.ciphertext.bytes(),
+        original.ciphertext.bytes()
+    );
+    assert_eq!(admitted.ciphertext.envelope().key_id, old_key);
+    drop((held, old_copy));
+    let replacement = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(replacement.ciphertext.envelope().key_id, current_key);
+    assert_eq!(replacement.plaintext.bytes(), b"abc");
+    assert_eq!(f.origin.calls.get(), 2);
+    assert_eq!(original.plaintext.bytes(), b"abc");
+
+    // Publication can also retain a completed bundle behind an outstanding
+    // completion fence. New joins must not sneak into that draining cohort.
+    let JoinedFlight::Waiter(mut draining) = flights
+        .join(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut held_budget,
+        )
+        .unwrap()
+    else {
+        panic!("expected new flight")
+    };
+    let AcquisitionEvent::Lead(leader) = futures::executor::block_on(draining.wait()).unwrap()
+    else {
+        panic!("expected election")
+    };
+    let operation = flights.retain_operation(&leader, ()).unwrap();
+    flights.publish(leader, replacement.clone()).unwrap();
+    let roots = (*f.keys.peer_trust_roots().unwrap()).clone();
+    f.keys.install(rotation_bundle(3, roots)).unwrap();
+    assert!(matches!(
+        flights.join(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget
+        ),
+        Err(Error::MissingKey)
+    ));
+    assert!(matches!(
+        flights.join_copy(&f.page, &f.scope).unwrap(),
+        JoinedCopy::Miss
+    ));
+    operation.complete().unwrap();
+    let AcquisitionEvent::Complete(result) = futures::executor::block_on(draining.wait()).unwrap()
+    else {
+        panic!("admitted draining waiter must finish")
+    };
+    assert_eq!(result.ciphertext.envelope().key_id, current_key);
 }
 
 struct GatedMetadataOrigin {

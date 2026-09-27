@@ -247,6 +247,8 @@ impl Fill {
                 budget,
             )? {
                 JoinedFlight::Complete(result) => {
+                    // join checks current UID/key admission before sharing a
+                    // completed bundle; registered waiters retain their own rights.
                     result.validate_for(&page)?;
                     return Ok(result);
                 }
