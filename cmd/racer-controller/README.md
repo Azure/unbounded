@@ -27,6 +27,12 @@ both the test-only reference codec and the existing Rust runtime codec.
 - `internal/operator/components/racer`: the sole controller Deployment and dataplane
   DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet` builder.
 
+Topology lists Pods in the installation namespace using the assigned-node index
+and passes those grouped lists directly to the pure `ReconcileMembers` helper.
+Endpoint selection verifies node assignment and the current DaemonSet owner UID.
+Membership diagnostics follow Node UID order; candidate history owns its nested
+state and is installed only after the publication commits.
+
 There is no Kubernetes abstraction, custom queue/leader-election framework,
 per-node Secret, enrollment ledger, or goal-state checkpoint store. Only the
 version ConfigMap (including its one-way credential initialization claim), shared

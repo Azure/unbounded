@@ -120,7 +120,7 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	}
 	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
 	// Node. Ownership is still verified against the current DaemonSet UID.
-	var pods []corev1.Pod
+	podsByNode := make(map[string][]corev1.Pod, len(nodes.Items))
 
 	for _, node := range nodes.Items {
 		if err := ctx.Err(); err != nil {
@@ -132,10 +132,10 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 			return err
 		}
 
-		pods = append(pods, list.Items...)
+		podsByNode[node.Name] = list.Items
 	}
 
-	candidate, diagnostics, err := ReconcileMembers(nodes.Items, pods, ds.UID, r.Accepted, r.Config.PeerPort)
+	candidate, diagnostics, err := ReconcileMembers(nodes.Items, podsByNode, ds.UID, r.Accepted, r.Config.PeerPort)
 	if err != nil {
 		return err
 	}
