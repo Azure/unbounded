@@ -119,7 +119,8 @@ impl PeerServer {
             request_timeout: Duration::from_secs(30),
         }
     }
-    /// Bound the entire incoming head, including idle time between exchanges.
+    /// Bound incoming heads and the complete connection handshake, including writes.
+    /// Authenticated page dispatch and transfer retain their signed request deadline.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -157,9 +158,9 @@ impl PeerServer {
             use crate::runtime::reactor::IoBuffer;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
-            // One fixed budget per exchange, never renewed by partial headers.
-            // Clone the listener cancellation, but keep this cap out of dispatch
-            // and response I/O, which use the signed request deadline below.
+            // One fixed budget for handshake reads, verification, signing, writes,
+            // and the incoming application head. Partial progress never renews it.
+            // Only application dispatch/response I/O use the signed deadline below.
             let header_scope = header_scope(
                 scope,
                 self.request_timeout,
@@ -172,11 +173,23 @@ impl PeerServer {
                 .signatures
                 .clone();
             let connection = if connection.session.is_none() {
-                let _permit = self
-                    .admission
-                    .reserve(None, ResourceClass::ControlProgress, 1)?;
-                crate::security::connection::accept(&self.io, connection, signatures, &header_scope)
-                    .await?
+                let mut connection = connection;
+                connection.control_reservation = Some(self.admission.reserve(
+                    None,
+                    ResourceClass::ControlProgress,
+                    1,
+                )?);
+                let mut connection = crate::security::connection::accept(
+                    &self.io,
+                    connection,
+                    signatures,
+                    &header_scope,
+                )
+                .await?;
+                // Successful accept has fenced every control operation. On error
+                // or abandonment the reactor-owned connection retains this charge.
+                connection.control_reservation.take();
+                connection
             } else {
                 connection
             };
@@ -430,7 +443,7 @@ mod tests {
             self.counts.dropped.set(self.counts.dropped.get() + 1);
         }
     }
-    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    fn poll<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
     fn listener_scope() -> RequestScope {
@@ -705,5 +718,269 @@ mod tests {
             header_scope(&listener, Duration::MAX, clock.now()),
             Err(Error::InvalidConfiguration)
         ));
+    }
+
+    #[test]
+    fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
+        use crate::{
+            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            memory::pool::BufferPool,
+            peer::{handshake::Handshake, requester::PeerTransport, wire::SecurityCodec},
+            runtime::{environment::SimulationClock, reactor::Reactor},
+            security::connection::tests::{finish, hello},
+            topology::{health::LinkHealth, paths::Paths},
+        };
+
+        struct Never;
+        impl LocalPageService for Never {
+            fn serve_peer<'a>(
+                &'a self,
+                _: VerifiedRequest,
+                _: MembershipLease,
+                _: &'a RequestScope,
+            ) -> Operation<'a, PeerResponse> {
+                Box::pin(async { panic!("handshake must not dispatch") })
+            }
+        }
+        impl PeerTransport for Never {
+            fn exchange<'a>(
+                &'a self,
+                _: SignedRequest,
+                _: MembershipLease,
+                _: &'a RequestScope,
+            ) -> Operation<'a, SignedResponse> {
+                Box::pin(async { panic!("handshake must not relay") })
+            }
+        }
+        fn fill(socket: &mut UnixStream) -> usize {
+            socket.set_nonblocking(true).unwrap();
+            let mut total = 0;
+            loop {
+                match socket.write(&[0x55; 4096]) {
+                    Ok(n) => {
+                        assert!(n > 0);
+                        total += n;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("fill: {error}"),
+                }
+            }
+            assert!(total > 0);
+            total
+        }
+        fn response(
+            reactor: &Reactor,
+            work: &mut Operation<'_, ConnectionLease>,
+            peer: &mut UnixStream,
+            codec: &Codec,
+        ) -> crate::http::codec::MessageHead {
+            let mut bytes = Vec::new();
+            drive(
+                reactor,
+                futures::future::poll_fn(|_| {
+                    assert!(poll(work.as_mut()).is_pending());
+                    let mut buffer = [0; 8192];
+                    match peer.read(&mut buffer) {
+                        Ok(n) => {
+                            assert!(n > 0);
+                            bytes.extend_from_slice(&buffer[..n]);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                        Err(error) => panic!("response: {error}"),
+                    }
+                    match codec.decode_head(&bytes).unwrap() {
+                        Some((head, end)) => {
+                            assert_eq!(end, bytes.len());
+                            Poll::Ready(head)
+                        }
+                        None => Poll::Pending,
+                    }
+                }),
+            )
+        }
+
+        for phase in ["challenge", "ready"] {
+            for end in ["expiry", "handshake-cap", "cancel", "drop", "resume"] {
+                // Only the clock is virtual: socket buffers and CQEs are real.
+                let clock =
+                    SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
+                let environment = clock.environment(0);
+                let _guard = environment.enter();
+                let signers = crate::security::signing::tests::network(2);
+                let mut limits = crate::test_support::cluster::config(false).limits;
+                limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
+                let admission = Rc::new(Admission::new(limits));
+                let reactor = Rc::new(Reactor::new(admission.clone()));
+                reactor.init().unwrap();
+                let baseline = admission.used(ResourceClass::RequestContext);
+                let io = Rc::new(HttpIo::with_admission(
+                    reactor.clone(),
+                    Codec::new(super::super::wire::MAX_ENVELOPE_HEAD, 0),
+                    admission.clone(),
+                ));
+                let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
+                let relay = Rc::new(Relay::new(
+                    Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                    forwarding.clone(),
+                    Rc::new(Never),
+                    admission.clone(),
+                ));
+                let server =
+                    PeerServer::new(io, forwarding, admission.clone(), Rc::new(Never), relay)
+                        .with_wire(Rc::new(SecurityCodec::new(
+                            admission.clone(),
+                            Rc::new(BufferPool::new(admission.clone())),
+                        )))
+                        .with_handshake(Rc::new(Handshake::new(signers[1].clone(), None)))
+                        .with_request_timeout(Duration::from_secs(if end == "handshake-cap" {
+                            60
+                        } else {
+                            4
+                        }));
+                let scope = RequestScope::new(
+                    RequestId([5; 16]),
+                    crate::runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
+                )
+                .unwrap();
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let mut writer = socket.try_clone().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let mut work = server.serve_connection(connection, &scope);
+                assert!(poll(work.as_mut()).is_pending());
+                let codec = Codec::new(65536, 0);
+                let hello = codec
+                    .encode_head(&hello(&signers[0], signers[1].node()))
+                    .unwrap();
+                let request = if phase == "ready" {
+                    peer.write_all(&hello).unwrap();
+                    let challenge = response(&reactor, &mut work, &mut peer, &codec);
+                    // Let the server enter its finish read before sending it.
+                    reactor.poll_budgeted(128).unwrap();
+                    assert!(poll(work.as_mut()).is_pending());
+                    codec
+                        .encode_head(&finish(&signers[0], signers[1].node(), challenge))
+                        .unwrap()
+                } else {
+                    // Consume a partial hello before advancing time. Completing
+                    // its head must not restart the response-write budget.
+                    peer.write_all(&hello[..10]).unwrap();
+                    drive(
+                        &reactor,
+                        futures::future::poll_fn(|_| {
+                            if reactor.in_flight() == 0 {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        }),
+                    );
+                    assert!(poll(work.as_mut()).is_pending());
+                    hello[10..].to_vec()
+                };
+                clock.advance(Duration::from_secs(3));
+                let filled = fill(&mut writer);
+                drop(writer);
+                peer.write_all(&request).unwrap();
+                // Reap only the incoming head, then submit the response write.
+                drive(
+                    &reactor,
+                    futures::future::poll_fn(|_| {
+                        if reactor.in_flight() == 0 {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                );
+                assert!(poll(work.as_mut()).is_pending());
+                reactor.poll_budgeted(128).unwrap();
+                assert!(poll(work.as_mut()).is_pending());
+                assert_eq!(reactor.in_flight(), 1);
+                assert_eq!(admission.used(ResourceClass::Connection), 1);
+                assert_eq!(admission.used(ResourceClass::ControlProgress), 1);
+                assert!(admission.used(ResourceClass::RequestContext) > baseline);
+                assert!(matches!(
+                    admission.reserve(None, ResourceClass::Connection, 1),
+                    Err(Error::Overloaded)
+                ));
+
+                if end == "resume" {
+                    let mut filler = vec![0; filled];
+                    peer.read_exact(&mut filler).unwrap();
+                    assert!(filler.iter().all(|b| *b == 0x55));
+                    let mut reply = response(&reactor, &mut work, &mut peer, &codec);
+                    if phase == "challenge" {
+                        let finish = finish(&signers[0], signers[1].node(), reply);
+                        peer.write_all(&codec.encode_head(&finish).unwrap())
+                            .unwrap();
+                        reply = response(&reactor, &mut work, &mut peer, &codec);
+                    }
+                    assert_eq!(
+                        reply.unique("racer-handshake").unwrap(),
+                        Some(b"ready".as_slice())
+                    );
+                    // The server has completed control I/O and now awaits the
+                    // application head under the same initial four-second cap.
+                    drive(
+                        &reactor,
+                        futures::future::poll_fn(|_| {
+                            assert!(poll(work.as_mut()).is_pending());
+                            if admission.used(ResourceClass::ControlProgress) == 0 {
+                                Poll::Ready(())
+                            } else {
+                                Poll::Pending
+                            }
+                        }),
+                    );
+                    scope.cancel().unwrap();
+                } else if matches!(end, "expiry" | "handshake-cap") {
+                    clock.advance(Duration::from_secs(if end == "handshake-cap" {
+                        2
+                    } else {
+                        1
+                    }));
+                    assert_eq!(scope.check(), Ok(()));
+                } else if end == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                if matches!(end, "expiry" | "handshake-cap" | "cancel") {
+                    // Deadline/cancellation alone cannot release kernel owners.
+                    assert_eq!(reactor.in_flight(), 1);
+                    assert_eq!(admission.used(ResourceClass::Connection), 1);
+                    assert_eq!(admission.used(ResourceClass::ControlProgress), 1);
+                    assert!(admission.used(ResourceClass::RequestContext) > baseline);
+                }
+                if end != "drop" {
+                    let result = drive(&reactor, work.as_mut());
+                    let expected = if matches!(end, "expiry" | "handshake-cap") {
+                        Error::DeadlineExceeded
+                    } else {
+                        Error::Cancelled
+                    };
+                    assert!(
+                        matches!(result, Err(error) if error == expected),
+                        "{phase}/{end}"
+                    );
+                }
+                drop(work);
+                if end == "drop" {
+                    // No CQE has been driven since abandonment: all three charges
+                    // must remain, even though the waiting future is gone.
+                    assert_eq!(reactor.in_flight(), 1);
+                    assert_eq!(admission.used(ResourceClass::Connection), 1);
+                    assert_eq!(admission.used(ResourceClass::ControlProgress), 1);
+                    assert!(admission.used(ResourceClass::RequestContext) > baseline);
+                }
+                drive(&reactor, reactor.drain()).unwrap();
+                assert_eq!(reactor.in_flight(), 0);
+                assert_eq!(admission.used(ResourceClass::Connection), 0);
+                assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
+                assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+                let (next, _peer) = UnixStream::pair().unwrap();
+                let admitted = ConnectionLease::from_accepted(next.into(), &admission).unwrap();
+                drop(admitted);
+            }
+        }
     }
 }

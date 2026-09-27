@@ -50,15 +50,21 @@ connections and ciphertext retain quota through I/O completion. The listener sco
 bounds connection lifetime. At the start of every exchange, including the first
 and each reused keepalive exchange, header reception gets a fixed deadline of
 `min(listener deadline, now + request_timeout)` with the listener's cancellation.
-This covers idle waiting and the entire head; partial/trickled bytes never renew
-the budget. Application assembly supplies `Config.request_timeout`; the constructor
+This covers idle waiting, the complete connection handshake (reads, verification,
+signing, and both response writes), and the entire application head. Partial reads,
+writes, and handshake rounds never renew the budget.
+Application assembly supplies `Config.request_timeout`; the constructor
 default is 30 seconds. Expiry closes the connection, retaining I/O resources and
 admission charges until completion is fenced.
 
 After the head, authenticated requests retain the existing signed request deadline
 policy, bounded by the listener deadline, for dispatch and response transfer. The
 header cap does not bound the whole response or reset the signed request budget.
-Connection handshakes have a five-second cap within the listener scope. The listener uses
+Connection handshakes also have a fixed five-second cap within that initial header
+scope. Their control admission travels with the connection through I/O fences,
+including when the waiting future is dropped, and is released after successful
+handshake completion. There is no unauthenticated public challenge response in v2;
+the first response requires a verified signed hello. The listener uses
 bounded concurrent connection tasks. Each task serves sequential pooled exchanges.
 Errors close that connection and do not stop other connections.
 The listener retains one outstanding accept across connection task completions,
@@ -131,6 +137,9 @@ failure replies, capability tampering, and real TCP partial ciphertext bodies wi
 pool reuse and truncated-body rejection. Header timeout tests cover silent/partial
 peers, idle keepalive, healthy reuse, dispatch deadline preservation, shorter listener
 deadlines, cancellation, and admission retention through completion fences.
+Real socket backpressure tests pre-fill the server send buffer and cover both
+signed handshake responses, fixed deadlines across rounds, cancellation,
+abandonment, and admission recovery after CQEs.
 Accept-loop tests exercise the production selection helper across pending and ready
 accepts, concurrent connection completions, cancellation, and abandonment.
 They are under `peer::tests`, `peer::server::tests`, and
