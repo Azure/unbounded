@@ -779,7 +779,7 @@ fn intersecting_with_pressure(
         };
         assert!(matches!(
             auth.verify_response(response, &binding).unwrap().response(),
-            PeerResponse::Overloaded
+            PeerResponse::NotForwarded
         ));
         remote_release = Some(Instant::now() + Duration::from_millis(150));
     }
@@ -866,7 +866,9 @@ fn intersecting_with_pressure(
                         && !hotspot
                         && matches!(
                             response.response,
-                            PeerResponse::Overloaded | PeerResponse::Unavailable
+                            PeerResponse::Overloaded
+                                | PeerResponse::NotForwarded
+                                | PeerResponse::Unavailable
                         )
                     {
                         complete += 1;

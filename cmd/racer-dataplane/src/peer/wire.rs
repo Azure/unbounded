@@ -54,6 +54,9 @@ pub enum PeerResponse {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// Transit rejected this attempt before submitting its downstream exchange.
+    /// The signed response path proves which reserved links were never used.
+    NotForwarded,
     OriginRejected,
     OriginForbidden,
 }

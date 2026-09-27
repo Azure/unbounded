@@ -159,8 +159,10 @@ impl VerifiedResponseHead {
     /// Only the authenticated responder can report its own admission pressure.
     /// A forwarded overload does not establish congestion at the adjacent peer.
     pub(crate) fn overloaded_at(&self, peer: &NodeId) -> bool {
-        matches!(self.descriptor, protocol::ResponseDescriptor::Overloaded)
-            && self.origin.node() == peer
+        matches!(
+            self.descriptor,
+            protocol::ResponseDescriptor::Overloaded | protocol::ResponseDescriptor::NotForwarded
+        ) && self.origin.node() == peer
     }
 
     pub fn length(&self) -> usize {
@@ -171,6 +173,34 @@ impl VerifiedResponseHead {
     }
 }
 impl VerifiedResponse {
+    /// A verified pre-forward rejection is a receipt for unused delegation, not
+    /// a refund of the attempted request or the links to its rejecting relay.
+    /// Only original requesters reconcile it; destination failures are ambiguous.
+    pub(crate) fn unused_delegation(&self) -> Result<Option<(u32, u8)>> {
+        if !matches!(self.response(), PeerResponse::NotForwarded) {
+            return Ok(None);
+        }
+        let route = RouteState::from_head(&self.binding.original.head)?;
+        if self.binding.path.len() != 1 || route.visited.len() != 1 {
+            return Ok(None);
+        }
+        let path = protocol::decode_nodes(
+            field(
+                &self.signed.authentication.original.head,
+                "racer-response-path",
+            )?
+            .as_bytes(),
+        )?;
+        let used = path.len().checked_sub(1).ok_or(Error::Unauthorized)?;
+        let unused = route
+            .links
+            .checked_sub(used as u64)
+            .ok_or(Error::Unauthorized)?;
+        Ok(Some((
+            route.attempts,
+            unused.try_into().map_err(|_| Error::Unauthorized)?,
+        )))
+    }
     pub fn response(&self) -> &PeerResponse {
         &self.signed.response
     }
@@ -686,6 +716,13 @@ fn response_authority(
     request: &MessageHead,
     signer: &NodeId,
 ) -> Result<()> {
+    if field(response, "racer-outcome")? == "not-forwarded" {
+        let destination = node_field(request, "racer-route-destination")?;
+        let path = protocol::decode_nodes(field(response, "racer-response-path")?.as_bytes())?;
+        if signer == &destination || path.contains(&destination) {
+            return Err(Error::Unauthorized);
+        }
+    }
     if matches!(
         field(response, "racer-outcome")?.as_str(),
         "page" | "metadata"
@@ -1302,6 +1339,94 @@ mod tests {
             assert_eq!(verified.overloaded_at(&node(2)), overload);
             assert!(!verified.overloaded_at(&node(1)));
         }
+    }
+
+    #[test]
+    fn non_submission_receipt_is_bound_replay_protected_and_transit_only() {
+        let signatures = network(4);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let mut logical = request(7);
+        if let Operation::Metadata { mode, .. } = &mut logical.operation {
+            *mode = FetchMode::Acquire;
+        }
+        logical.route.destination = node(3);
+        logical.route.remaining_attempts = 3;
+        logical.route.remaining_links = 4;
+        let (signed, binding) = f[0].sign_request_to(logical, &node(1)).unwrap();
+        let admitted = f[1].verify_request(signed).unwrap();
+        let mut route = admitted.request().route.clone();
+        route.visited.push(node(1));
+        route.remaining_links -= 1;
+        let forwarded = f[1].append_request(admitted, &node(2), route).unwrap();
+        let admitted = f[2].verify_request(forwarded).unwrap();
+        let response = f[2]
+            .sign_response(admitted.binding(), PeerResponse::NotForwarded)
+            .unwrap();
+        let b_binding = RequestBinding {
+            original: binding.original.clone(),
+            path: vec![node(0), node(1)],
+            deadline: binding.deadline,
+        };
+        let verified = f[1].verify_response(response, &b_binding).unwrap();
+        assert_eq!(
+            verified.unused_delegation().unwrap(),
+            None,
+            "relay cannot refund ingress delegation"
+        );
+        let response = f[1].append_response(verified, &node(0)).unwrap();
+        let duplicate = || SignedResponse {
+            authentication: ForwardedHead {
+                original: Arc::new(clone_head(&response.authentication.original)),
+                hops: response
+                    .authentication
+                    .hops
+                    .iter()
+                    .map(clone_head)
+                    .collect(),
+            },
+            response: PeerResponse::NotForwarded,
+        };
+        let mut corrupt = duplicate();
+        Arc::get_mut(&mut corrupt.authentication.original)
+            .unwrap()
+            .signature[0] ^= 1;
+        assert!(f[0].verify_response(corrupt, &binding).is_err());
+        let (_, other) = f[0].sign_request(request(8)).unwrap();
+        assert!(f[0].verify_response(duplicate(), &other).is_err());
+        let mut expired = binding.clone();
+        expired.deadline = 0;
+        assert!(matches!(
+            f[0].verify_response(duplicate(), &expired),
+            Err(Error::DeadlineExceeded)
+        ));
+        let verified = f[0].verify_response(duplicate(), &binding).unwrap();
+        assert_eq!(verified.unused_delegation().unwrap(), Some((3, 2)));
+        assert!(matches!(
+            f[0].verify_response(duplicate(), &binding),
+            Err(Error::Replay)
+        ));
+
+        let mut logical = request(9);
+        logical.route.destination = node(3);
+        let (signed, binding) = f[0].sign_request_to(logical, &node(3)).unwrap();
+        let admitted = f[3].verify_request(signed).unwrap();
+        assert!(matches!(
+            f[3].sign_response(admitted.binding(), PeerResponse::NotForwarded),
+            Err(Error::Unauthorized)
+        ));
+        let response = f[3]
+            .sign_response(admitted.binding(), PeerResponse::Overloaded)
+            .unwrap();
+        assert_eq!(
+            f[0].verify_response(response, &binding)
+                .unwrap()
+                .unused_delegation()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ func TestProductionStreamFixture(t *testing.T) {
 					n, err := io.CopyN(hash, value, int64(PageSize))
 					ready.Done()
 					ready.Wait()
-					if directory := os.Getenv("RACER_STREAM_BARRIER"); directory != "" && start == 0 {
+					if directory := os.Getenv("RACER_STREAM_BARRIER"); directory != "" && (start == 0 || os.Getenv("RACER_STREAM_REPEATED_PRESSURE") != "") {
 						barrier.Do(func() {
 							if err := os.WriteFile(filepath.Join(directory, "sdk-ready"), []byte("ready"), 0o600); err != nil {
 								t.Error(err)
@@ -138,6 +138,21 @@ func TestProductionStreamFixture(t *testing.T) {
 				}()
 			}
 			done.Wait()
+			if directory := os.Getenv("RACER_STREAM_BARRIER"); directory != "" && os.Getenv("RACER_STREAM_REPEATED_PRESSURE") != "" {
+				if err := os.Remove(filepath.Join(directory, "sdk-ready")); err != nil {
+					t.Fatal(err)
+				}
+				for {
+					if _, err := os.Stat(filepath.Join(directory, "sdk-release")); os.IsNotExist(err) {
+						break
+					}
+					select {
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					case <-time.After(time.Millisecond):
+					}
+				}
+			}
 		}
 	}
 }

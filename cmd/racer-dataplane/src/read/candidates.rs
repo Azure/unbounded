@@ -206,58 +206,80 @@ impl CandidatePolicy {
             let mut saw_transient = false;
             let mut saw_version = false;
             let count = rank.unwrap_or(candidates.ordered.len());
-            for (index, destination) in candidates.ordered[..count].iter().enumerate() {
-                let mode = if rank.is_some() {
-                    FetchMode::CopyOnly
-                } else {
-                    FetchMode::Acquire
-                };
-                match self
-                    .request(
-                        &candidates.membership,
-                        destination,
-                        context,
-                        &operation,
-                        mode,
-                        scope,
-                        budget,
-                        (count - index) as u32,
-                        output,
-                    )
-                    .await
-                {
-                    Ok(response) => match classify(response.response(), &operation)? {
-                        None => return Ok(CandidateResolution::Copy(response)),
-                        Some(outcome) => {
-                            if outcome == ProbeOutcome::Overloaded && index + 1 < count {
+            loop {
+                // Only a candidate's one predecessor pass can mint authority.
+                // Noncandidate retries retain no unbounded history of outcomes.
+                evidence.clear();
+                let mut retry = false;
+                for (index, destination) in candidates.ordered[..count].iter().enumerate() {
+                    let mode = if rank.is_some() {
+                        FetchMode::CopyOnly
+                    } else {
+                        FetchMode::Acquire
+                    };
+                    match self
+                        .request(
+                            &candidates.membership,
+                            destination,
+                            context,
+                            &operation,
+                            mode,
+                            scope,
+                            budget,
+                            (count - index) as u32,
+                            output,
+                        )
+                        .await
+                    {
+                        Ok(response) => {
+                            retry |= matches!(response.response(), PeerResponse::NotForwarded);
+                            match classify(response.response(), &operation)? {
+                                None => return Ok(CandidateResolution::Copy(response)),
+                                Some(outcome) => {
+                                    if outcome == ProbeOutcome::Overloaded && index + 1 < count {
+                                        self.overload_backoff(scope, budget, output).await?;
+                                    }
+                                    saw_version |= outcome == ProbeOutcome::VersionUnavailable;
+                                    saw_transient |= matches!(
+                                        outcome,
+                                        ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                                    );
+                                    evidence.push(outcome);
+                                    if saw_transient {
+                                        budget.note_route_failure();
+                                    }
+                                }
+                            }
+                        }
+                        Err(Error::Unavailable | Error::Io) => {
+                            evidence.push(ProbeOutcome::Unreachable);
+                            saw_transient = true;
+                            budget.note_route_failure();
+                        }
+                        Err(Error::Overloaded) => {
+                            if index + 1 < count {
                                 self.overload_backoff(scope, budget, output).await?;
                             }
-                            saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                            saw_transient |= matches!(
-                                outcome,
-                                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
-                            );
-                            evidence.push(outcome);
-                            if saw_transient {
-                                budget.note_route_failure();
-                            }
+                            evidence.push(ProbeOutcome::Overloaded);
+                            saw_transient = true;
+                            budget.note_route_failure();
                         }
-                    },
-                    Err(Error::Unavailable | Error::Io) => {
-                        evidence.push(ProbeOutcome::Unreachable);
-                        saw_transient = true;
-                        budget.note_route_failure();
+                        Err(error) => return Err(error),
                     }
-                    Err(Error::Overloaded) => {
-                        if index + 1 < count {
-                            self.overload_backoff(scope, budget, output).await?;
-                        }
-                        evidence.push(ProbeOutcome::Overloaded);
-                        saw_transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(error) => return Err(error),
                 }
+                // Only explicit non-submission receipts justify revisiting ranked
+                // candidates. Each new send still spends one original attempt and
+                // actual forward links; no timeout, lost response or ordinary error
+                // restores credits. Park in the existing acquisition owner.
+                if rank.is_none()
+                    && retry
+                    && budget.remaining_attempts() > 0
+                    && budget.remaining_links() > 0
+                {
+                    self.overload_backoff(scope, budget, output).await?;
+                    continue;
+                }
+                break;
             }
             if rank.is_some() {
                 scope.check()?;
@@ -358,23 +380,27 @@ impl CandidatePolicy {
         output: &mut Option<crate::runtime::admission::Reservation>,
     ) -> Result<VerifiedResponse> {
         scope.check()?;
-        // Reserve the complete permitted route before sending. Lost responses cannot
-        // refund an unknown number of forwarded links. No retry gets fresh credits.
+        // Reserve the complete permitted route before sending. Only an explicit,
+        // verified non-submission receipt can reconcile unused delegation. Lost
+        // responses and ordinary errors retain the full debit.
         let links = budget.route_links();
         if links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
         let deadline = budget.begin_peer_attempt(Instant::now(), scope.deadline.0, links)?;
-        let attempts = if matches!(mode, FetchMode::Acquire) {
+        let delegation = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
-            // Without a signed response receipt unused remote credits stay spent.
+            // Without a verified non-submission receipt these credits stay spent.
             let credits = budget
                 .remaining_attempts()
                 .div_ceil(remaining_candidates.max(1));
-            budget.partition(credits, 0)?.remaining_attempts()
+            Some(budget.partition(credits, 0)?)
         } else {
-            0
+            None
         };
+        let attempts = delegation
+            .as_ref()
+            .map_or(0, AcquisitionBudget::remaining_attempts);
         let mut bytes = [0; 16];
         getrandom::getrandom(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
@@ -396,6 +422,15 @@ impl CandidatePolicy {
         };
         let response = self.peers.request_reserved(request, scope, output).await?;
         scope.check()?;
+        if let Some((unused_attempts, unused_links)) = response.unused_delegation()? {
+            if unused_attempts != attempts || unused_links >= links {
+                return Err(Error::Unauthorized);
+            }
+            if let Some(delegation) = delegation {
+                budget.reunite(delegation)?;
+            }
+            budget.refund_links(unused_links)?;
+        }
         Ok(response)
     }
 
@@ -460,7 +495,7 @@ fn classify(response: &PeerResponse, operation: &PeerOperation) -> Result<Option
         PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
         PeerResponse::VersionUnavailable => Ok(Some(ProbeOutcome::VersionUnavailable)),
         PeerResponse::Unavailable => Ok(Some(ProbeOutcome::Unreachable)),
-        PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
+        PeerResponse::Overloaded | PeerResponse::NotForwarded => Ok(Some(ProbeOutcome::Overloaded)),
         PeerResponse::OriginRejected => Err(Error::OriginRejected),
         PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
         PeerResponse::Page {
@@ -494,6 +529,240 @@ fn classify(response: &PeerResponse, operation: &PeerOperation) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acquisition_owner_retries_only_receipted_work_with_original_credits() {
+        use crate::{
+            memory::{cache::MemoryCache, pool::BufferPool},
+            model::identity::MembershipVersion,
+            runtime::admission::Admission,
+            security::{
+                forwarding::Forwarding,
+                signing::tests::{network, node},
+            },
+            topology::membership::{Member, Membership},
+        };
+        use std::{
+            cell::Cell,
+            task::{Context, Poll},
+            time::Duration,
+        };
+        struct Receipts {
+            auth: Vec<Forwarding>,
+            calls: RefCell<Vec<(u32, u8)>>,
+            fail: usize,
+            ordinary: bool,
+            corrupt: bool,
+            lost: bool,
+        }
+        impl PeerClient for Receipts {
+            fn request<'a>(
+                &'a self,
+                request: PeerRequest,
+                _: &'a RequestScope,
+            ) -> Operation<'a, VerifiedResponse> {
+                Box::pin(async move {
+                    self.calls.borrow_mut().push((
+                        request.route.remaining_attempts,
+                        request.route.remaining_links,
+                    ));
+                    if self.lost {
+                        return Err(Error::Io);
+                    }
+                    let destination = request.route.destination.clone();
+                    let object = request.origin.object.clone();
+                    let (signed, binding) = self.auth[0].sign_request_to(request, &node(1))?;
+                    let admitted = self.auth[1].verify_request(signed)?;
+                    let response = if self.calls.borrow().len() <= self.fail {
+                        let mut response = self.auth[1].sign_response(
+                            admitted.binding(),
+                            if self.ordinary {
+                                PeerResponse::Overloaded
+                            } else {
+                                PeerResponse::NotForwarded
+                            },
+                        )?;
+                        if self.corrupt {
+                            std::sync::Arc::get_mut(&mut response.authentication.original)
+                                .unwrap()
+                                .signature[0] ^= 1;
+                        }
+                        response
+                    } else {
+                        let reverse = admitted.binding().clone();
+                        let mut route = admitted.request().route.clone();
+                        route.visited.push(node(1));
+                        route.remaining_links -= 1;
+                        let forwarded =
+                            self.auth[1].append_request(admitted, &destination, route)?;
+                        let dest = (2..5).find(|i| node(*i) == destination).unwrap();
+                        let admitted = self.auth[dest].verify_request(forwarded)?;
+                        let response = self.auth[dest].sign_response(
+                            admitted.binding(),
+                            PeerResponse::Metadata(ObjectMetadata {
+                                version: ObjectVersion {
+                                    object,
+                                    etag: StrongEtag::test_value("v1"),
+                                },
+                                length: 7,
+                                expires_at: ExpiresAt(std::time::SystemTime::now()),
+                            }),
+                        )?;
+                        let verified = self.auth[1].verify_response(response, &reverse)?;
+                        self.auth[1].append_response(verified, &node(0))?
+                    };
+                    self.auth[0].verify_response(response, &binding)
+                })
+            }
+        }
+        for case in [
+            "success",
+            "exhausted",
+            "links",
+            "ordinary",
+            "lost",
+            "corrupt",
+            "cancel",
+            "deadline",
+            "drop",
+        ] {
+            let signatures = network(5);
+            let peers = Rc::new(Receipts {
+                auth: signatures.into_iter().map(Forwarding::new).collect(),
+                calls: RefCell::new(Vec::new()),
+                fail: if case == "success" { 3 } else { usize::MAX },
+                ordinary: case == "ordinary",
+                corrupt: case == "corrupt",
+                lost: case == "lost",
+            });
+            let membership = std::sync::Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    (2..5)
+                        .map(|i| Member {
+                            node: node(i),
+                            shares: std::num::NonZeroU32::new(1).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                            rails: vec![],
+                            alignment_enabled: false,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let (_, placement, context, scope, credentials) = fixture();
+            let policy = CandidatePolicy::new(node(0), placement, peers.clone());
+            policy.set_credentials(credentials);
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            policy.set_retry_resources(
+                admission.clone(),
+                Rc::new(MemoryCache::new(Rc::new(BufferPool::new(
+                    admission.clone(),
+                )))),
+            );
+            let deadline = if case == "deadline" {
+                Instant::now() + Duration::from_millis(10)
+            } else {
+                scope.deadline.0
+            };
+            let mut budget =
+                AcquisitionBudget::new(deadline, 8, if case == "links" { 3 } else { 16 });
+            let candidates = policy
+                .candidates(membership, &context.object, PageNumber(0))
+                .unwrap();
+            let mut output = Some(
+                admission
+                    .reserve(
+                        Some(&context.object.cache),
+                        crate::model::limits::ResourceClass::Ciphertext,
+                        4096,
+                    )
+                    .unwrap(),
+            );
+            let mut work = policy.resolve_reserved(
+                candidates,
+                &context,
+                PeerOperation::Metadata {
+                    object: context.object.clone(),
+                    selector: MetadataSelector::Fresh,
+                    mode: FetchMode::Acquire,
+                },
+                &scope,
+                &mut budget,
+                &mut output,
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let cancelled = Cell::new(false);
+            let end = Instant::now() + Duration::from_secs(4);
+            let result = loop {
+                if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                    break Some(result);
+                }
+                if case == "drop" {
+                    break None;
+                }
+                if case == "cancel" && !cancelled.replace(true) {
+                    scope.cancel().unwrap();
+                }
+                assert!(Instant::now() < end, "{case}");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            drop(work);
+            let calls = peers.calls.borrow();
+            match case {
+                "success" => {
+                    assert!(matches!(result, Some(Ok(CandidateResolution::Copy(_)))));
+                    assert_eq!(calls.len(), 4);
+                    assert_eq!(budget.remaining_attempts(), 2);
+                    assert_eq!(budget.remaining_links(), 5);
+                }
+                "exhausted" => {
+                    assert!(matches!(result, Some(Err(Error::Unavailable))));
+                    assert_eq!(calls.len(), 8);
+                    assert_eq!(budget.remaining_attempts(), 0);
+                    assert_eq!(budget.remaining_links(), 8);
+                }
+                "links" => {
+                    assert!(matches!(result, Some(Err(Error::Unavailable))));
+                    assert_eq!(calls.len(), 3);
+                    assert_eq!(budget.remaining_links(), 0);
+                }
+                "ordinary" | "lost" => {
+                    assert!(matches!(result, Some(Err(Error::Unavailable))));
+                    assert_eq!(calls.len(), 3);
+                    assert_eq!(budget.remaining_attempts(), 0);
+                    assert_eq!(budget.remaining_links(), 0);
+                }
+                "corrupt" => {
+                    assert!(matches!(result, Some(Err(Error::Unauthorized))));
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(budget.remaining_attempts(), 4);
+                    assert_eq!(budget.remaining_links(), 12);
+                }
+                "cancel" => {
+                    assert!(matches!(result, Some(Err(Error::Cancelled))));
+                    assert_eq!(calls.len(), 1);
+                }
+                "deadline" => {
+                    assert!(matches!(result, Some(Err(Error::DeadlineExceeded))));
+                    assert_eq!(calls.len(), 1);
+                }
+                "drop" => {
+                    assert!(result.is_none());
+                    assert_eq!(calls.len(), 1);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(budget.deadline(), deadline);
+            drop(output);
+            assert_eq!(
+                admission.used(crate::model::limits::ResourceClass::Ciphertext),
+                0,
+                "{case}"
+            );
+        }
+    }
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);

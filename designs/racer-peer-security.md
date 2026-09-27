@@ -95,11 +95,41 @@ credits are inferred for older heads that lack this field.
 CopyOnly carries zero acquisition credits. Acquire may carry zero (existing-copy
 lookup is still possible), but zero authorizes no origin acquisition. Read reserves
 and debits a child allowance before submission; destination inherits that allowance
-verbatim. Relays preserve it unless deliberately consuming credits. Neither response
-handling nor native fallback refunds credits: no signed credit receipt exists.
+verbatim. Relays preserve it unless deliberately consuming credits. Ordinary response
+handling and native fallback do not refund credits. The explicit pre-forward
+rejection receipt below is the sole exception for proven unused delegation.
 The exact original signature digest already binds the response to its original
 attempt ceiling. A new request ID/signature alone is not permission for read policy
 to allocate additional credits.
+
+### Pre-forward rejection receipt
+
+`racer-outcome: not-forwarded` is a zero-body signed application status 200 outcome.
+It asserts that the responding transit node rejected the request before submitting
+any downstream exchange for that request. Production cut-through sets its submission
+flag before polling the downstream header send, so partial writes and all later
+errors cannot produce this receipt. The ordinary `overloaded` outcome makes no such
+assertion. The buffered relay API continues to use ordinary failures.
+
+The verifier rejects a receipt signed by the destination or whose response path
+contains the destination. It verifies the exact original request binding, responder
+certificate/signature, complete reverse chain, deadline, and replay admission as
+for other outcomes. Only the original requester may reconcile the receipt. It
+returns the owned child acquisition allowance and refunds reserved links minus
+the signed path's actual forward edges. The attempted request and every edge to
+the rejecting relay remain spent. No lost response, ordinary error, destination
+overload, corrupt signature, or expired response authorizes a refund.
+
+The acquisition owner may revisit ranked candidates after such receipts while
+its original attempt and link balances remain positive, with the existing
+200-250 ms jittered backoff and original deadline. Each retry has a new attempt
+and signature. Relays never replay an envelope, and receipt processing never
+increases the original call's total work allowance.
+
+This extends the closed v1 outcome vocabulary. Older decoders reject the unknown
+outcome and receive no refund, preserving fail-closed security during mixed-version
+operation. They cannot benefit from this recovery until upgraded. No unsigned
+compatibility fallback reinterprets ordinary overload as non-submission.
 
 `PeerResponse::OriginForbidden` serializes `racer-outcome: origin-forbidden` with
 signed application `@status` 403. `OriginRejected` serializes `origin-rejected` with

@@ -67,6 +67,12 @@ fn sdk_sustained_full_images_avoid_remote_relay_congestion() {
     sdk_fixture(true, true, true, true, true, false);
 }
 
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_sustained_full_images_retry_proven_unspent_acquisition() {
+    sdk_fixture_inner(true, false, true, false, true, false, true);
+}
+
 /// Select an explicit first hop so this small graph exercises a relay, as the
 /// fleet does. Everything after signing uses production transport and Fill.
 pub(super) struct ViaRelay {
@@ -119,6 +125,7 @@ struct SdkScenario {
     incoming_pressure: bool,
     relay_pressure: bool,
     expired_fill: bool,
+    acquisition_progress: bool,
 }
 
 fn sdk_fixture(
@@ -128,6 +135,26 @@ fn sdk_fixture(
     incoming_pressure: bool,
     relay_pressure: bool,
     expired_fill: bool,
+) {
+    sdk_fixture_inner(
+        busy_peers,
+        idle_pressure,
+        uniform_memory,
+        incoming_pressure,
+        relay_pressure,
+        expired_fill,
+        false,
+    );
+}
+
+fn sdk_fixture_inner(
+    busy_peers: bool,
+    idle_pressure: bool,
+    uniform_memory: bool,
+    incoming_pressure: bool,
+    relay_pressure: bool,
+    expired_fill: bool,
+    acquisition_progress: bool,
 ) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -165,6 +192,7 @@ fn sdk_fixture(
                 incoming_pressure,
                 relay_pressure,
                 expired_fill,
+                acquisition_progress,
             },
         );
     }
@@ -178,6 +206,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         incoming_pressure,
         relay_pressure,
         expired_fill,
+        acquisition_progress,
     } = scenario;
     let hotspot = incoming_pressure && relay_pressure;
     let remote_hotspot = hotspot && idle_pressure;
@@ -423,6 +452,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let ready_path = output.join("sdk-ready");
     let release_path = output.join("sdk-release");
     let mut pressure_seeded = false;
+    let mut pressure_rounds = 0;
     let mut relay_charges = Vec::new();
     let mut relay_release = None;
     let mut seed_incoming = async || {
@@ -555,7 +585,18 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
             ])
             .env("RACER_STREAM_SOCKET", socket)
             .env("RACER_STREAM_LAYERS", fixture)
-            .env("RACER_STREAM_ROUNDS", if hotspot { "3" } else { "1" })
+            .env(
+                "RACER_STREAM_ROUNDS",
+                if hotspot || acquisition_progress {
+                    "3"
+                } else {
+                    "1"
+                },
+            )
+            .env(
+                "RACER_STREAM_REPEATED_PRESSURE",
+                if acquisition_progress { "1" } else { "" },
+            )
             .env(
                 "RACER_STREAM_BARRIER",
                 if !hotspot && (incoming_pressure || relay_pressure || expired_fill) {
@@ -657,7 +698,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                 .unwrap();
             assert!(matches!(
                 auth.verify_response(response, &binding).unwrap().response(),
-                PeerResponse::Overloaded
+                PeerResponse::NotForwarded
             ));
             relay_release = Some(Instant::now() + Duration::from_millis(150));
             pressure_seeded = true;
@@ -749,6 +790,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                 fs::write(&release_path, b"release").unwrap();
             }
             if relay_pressure && !pressure_seeded && ready_path.exists() {
+                pressure_rounds += 1;
                 // Match the observed 8/8 live boundary with finite competing
                 // owners. The SDK continues on already established connections.
                 for node in nodes.iter().skip(1) {
@@ -761,12 +803,25 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                     }
                 }
                 pressure_seeded = true;
-                relay_release = Some(Instant::now() + Duration::from_millis(150));
+                relay_release = Some(
+                    Instant::now()
+                        + Duration::from_millis(if acquisition_progress { 650 } else { 150 }),
+                );
                 fs::write(&release_path, b"release").unwrap();
             }
             if relay_release.is_some_and(|at| Instant::now() >= at) {
                 relay_charges.clear();
                 relay_release = None;
+            }
+            if acquisition_progress
+                && pressure_seeded
+                && !ready_path.exists()
+                && relay_release.is_none()
+            {
+                pressure_seeded = false;
+                if release_path.exists() {
+                    fs::remove_file(&release_path).unwrap();
+                }
             }
             if incoming_pressure && !pressure_seeded && ready_path.exists() {
                 seed_incoming().await;
@@ -870,6 +925,12 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     }
     if expired_fill {
         assert!(pressure_seeded, "SDK must cross the expired-Fill barrier");
+    }
+    if acquisition_progress {
+        assert_eq!(
+            pressure_rounds, 6,
+            "every four-layer batch must cross transient pressure"
+        );
     }
     if relay_pressure && !hotspot {
         assert!(

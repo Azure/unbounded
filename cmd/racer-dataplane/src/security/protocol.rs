@@ -336,6 +336,7 @@ pub enum ResponseDescriptor {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    NotForwarded,
     OriginRejected,
     OriginForbidden,
 }
@@ -357,6 +358,7 @@ impl ResponseDescriptor {
             PeerResponse::VersionUnavailable => Ok(Self::VersionUnavailable),
             PeerResponse::Unavailable => Ok(Self::Unavailable),
             PeerResponse::Overloaded => Ok(Self::Overloaded),
+            PeerResponse::NotForwarded => Ok(Self::NotForwarded),
             PeerResponse::OriginRejected => Ok(Self::OriginRejected),
             PeerResponse::OriginForbidden => Ok(Self::OriginForbidden),
         }
@@ -412,6 +414,7 @@ pub(crate) fn response_descriptor_head(
         ResponseDescriptor::VersionUnavailable => ("version-unavailable", 0),
         ResponseDescriptor::Unavailable => ("unavailable", 0),
         ResponseDescriptor::Overloaded => ("overloaded", 0),
+        ResponseDescriptor::NotForwarded => ("not-forwarded", 0),
         ResponseDescriptor::OriginRejected => ("origin-rejected", 0),
         ResponseDescriptor::OriginForbidden => ("origin-forbidden", 0),
     };

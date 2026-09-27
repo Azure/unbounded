@@ -36,7 +36,10 @@ impl PeerClient for CrossingIngress {
                 .await?;
             let response = self.auth.verify_response(response, &binding)?;
             assert!(
-                !matches!(response.response(), PeerResponse::Overloaded),
+                !matches!(
+                    response.response(),
+                    PeerResponse::Overloaded | PeerResponse::NotForwarded
+                ),
                 "request={:?}: opposite ingress relay rejected a retained page while local Fills hold its receive capacity",
                 scope.request,
             );

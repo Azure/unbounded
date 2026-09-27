@@ -65,6 +65,7 @@ impl Relay {
     ) -> crate::error::Result<crate::http::pool::ConnectionLease> {
         let scope = super::request_scope(request.request(), scope)?;
         let binding = request.binding().clone();
+        let mut submitted = false;
         let prepare = async {
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let budget = &request.request().route;
@@ -137,6 +138,7 @@ impl Relay {
                 &binding,
                 &previous,
                 next,
+                &mut submitted,
             )
             .await
             .inspect_err(|error| {
@@ -164,7 +166,11 @@ impl Relay {
                     Error::Overloaded => {
                         #[cfg(test)]
                         self.overloads.set(self.overloads.get() + 1);
-                        super::wire::PeerResponse::Overloaded
+                        if submitted {
+                            super::wire::PeerResponse::Overloaded
+                        } else {
+                            super::wire::PeerResponse::NotForwarded
+                        }
                     }
                     Error::Unavailable
                     | Error::Io

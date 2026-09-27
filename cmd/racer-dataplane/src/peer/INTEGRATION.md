@@ -111,7 +111,13 @@ After overload, the acquisition owner may back off 200-250 ms before the next
 existing candidate attempt. It drops its ciphertext output during that wait, uses
 the original deadline/credits, and reacquires output before submitting again.
 There is no relay retry, fresh credit, or deadline extension. Worker driver ticks
-and cancellation subscriptions drive this bounded wait.
+and cancellation subscriptions drive this bounded wait. A signed `not-forwarded`
+receipt additionally permits the acquisition owner to return its unused delegated
+allowance, reconcile unused route links, and revisit candidates within those same
+original balances. The attempted send and actual forward links remain charged.
+Only a pre-submission transit rejection produces this outcome; an ordinary overload
+or ambiguous downstream failure cannot refund anything. See the receipt contract
+and mixed-version behavior in `designs/racer-peer-security.md`.
 
 The worker must continue calling `server.poll_admission_deadlines()` for local
 peer-pool waiters and buffered-interface waits. Production already does so.
