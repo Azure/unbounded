@@ -479,6 +479,11 @@ deployment integration check and is not exercised by envtest.
   readiness, and bounds shutdown by `Limits.ShutdownTimeout`. Connection context
   tracks the raw transport so write deadlines/cancellation also close TCP directly;
   TLS close-notify cannot extend a blocked write past its admission deadline.
+  Listener failure and leadership cancellation share one force-close teardown:
+  withdraw readiness, cancel serving, close raw transports, and call HTTP `Close`.
+  The shutdown deadline bounds waiting for both `Close` and the serve loop, without
+  a graceful `Shutdown` pass. Newly accepted connections check cancellation after
+  registration so a concurrent accept cannot escape the transport sweep.
 
 Phase 5 tests include real TLS enrollment/snapshots, strict errors/routes/bounds,
 live UID/ownership/audience attacks, pooled trust retirement and expiry, disabled
