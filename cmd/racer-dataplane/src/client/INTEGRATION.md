@@ -40,6 +40,32 @@ Rollback never overwrites an externally substituted inode; if external code
 replaces a prepared pathname, the last-good descriptor remains owned but pathname
 restoration cannot be guaranteed without overwriting that foreign entry.
 
+Each real endpoint holds a persistent `.racer-client.lock` with nonblocking
+exclusive `flock`. The lock is opened no-follow and must be an effective-user-owned
+regular file with a single link and no group/world permissions. Its pathname
+identity is checked after acquisition and before generation reuse. Endpoint
+directories must be owned by the effective user and not group/world writable;
+ancestors and all directory writers must be trusted. The lock is never removed
+or truncated. Listener generations share its owner until deferred cleanup finishes.
+
+Each generation binds `.racer-owned-<temporary name>` first and hard-links that
+socket inode to its temporary name before publication. Witnesses pin inode identity
+through process death, including crashes during preparation, exchange or rollback.
+On initial lock acquisition, recovery validates canonical and temporary sockets
+against the witnesses and requires a nonblocking probe of every witness to return
+`ECONNREFUSED`. Only then are stale owned paths removed. Live owners, unwitnessed
+sockets, symlinks, files and ambiguous probe failures are preserved and refused.
+Cleanup removes only matching inodes, retaining the witness if pathname removal
+fails. A crash before hard-link publication leaves a recoverable witness alone.
+Simulation keeps its existing in-memory lifecycle; process-level crash tests use
+the real filesystem and `SIGKILL`.
+
+This requires a local Linux filesystem supporting socket hard links and `flock`.
+It covers process death rather than power-loss durability. Old-release sockets
+without witnesses require explicit operator cleanup after verifying the old owner
+is stopped. Persistent lock files intentionally survive cache removal; do not
+delete them while any process can own or acquire the endpoint.
+
 Commit swaps listener maps and retires old generations entirely in memory.
 Worker `poll_budgeted` subsequently cleans up old owned socket names. Unchanged
 definitions preserve descriptors. UID/name reuse creates a new listener generation.

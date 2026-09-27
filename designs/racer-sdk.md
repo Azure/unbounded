@@ -153,12 +153,34 @@ when intending to read through EOF, including when io.Copy's destination fails.
 
 ServeOrigin binds only the canonical origin socket derived from CacheName. It
 requires a precreated endpoint directory and never creates/chmods parent paths.
-Validate the entire path and reject symlink traversal before bind. Existing paths,
+Validate the entire path and reject symlink traversal before bind. By default existing paths,
 including stale sockets and symlinks, fail; do not unlink first. Disable automatic
 UnixListener unlink and remove only the socket inode this invocation created,
 checking identity on cleanup so a replacement is preserved. Endpoint directories
 must not be writable by untrusted peers; stdlib pathname checks do not promise
 race-free traversal against an adversary changing parent directories.
+
+`OriginConfig.RecoverStaleSocket` (default false) opts into Linux crash recovery;
+Gantry enables it for its persistent hostPath endpoint. This mode pins each path
+component with no-follow directory opens and requires an endpoint directory owned
+by the effective user, without group/world write permission. Ancestors must still
+be trusted against replacement. A persistent `0600` `.racer-origin.lock` regular
+file is opened no-follow, checked for owner, permissions, single link and pathname
+identity, then held with nonblocking exclusive `flock` through socket cleanup.
+The lock is never unlinked or truncated, including after clean shutdown.
+
+Bind `.racer-origin.socket` first, then hard-link that socket inode to `socket`
+without replacement. The witness pins inode identity and closes the bind-to-record
+crash window. Restart under the lock recovers only a canonical socket matching the
+witness (or a witness left before publication), and only after a bounded connection
+probe reports `ECONNREFUSED`. A live listener, other probe errors, foreign sockets,
+files and symlinks fail closed. Cleanup checks inode identity and retains the
+witness if removing the canonical socket fails. The SDK default still refuses all
+existing endpoints; sockets left by older releases without a witness require
+operator cleanup after independently establishing that the owner is stopped.
+This protocol assumes a local Linux filesystem with Unix socket hard links and
+`flock`, and trusted directory writers. It handles process death, not power-loss
+durability or hostile same-user directory mutation.
 
 Invoke Origin once per accepted operation, including HEAD. No callback retry.
 Callback metadata and body must describe the same immutable version; the SDK
@@ -186,6 +208,7 @@ No root/socket override, custom transport, or global singleton:
 | `OriginConfig.WriteTimeout` | 30 seconds of blocked write; reset before each bounded chunk, bounded by request deadline |
 | `OriginConfig.IdleTimeout` | 30 seconds waiting for the next request |
 | `OriginConfig.SocketMode` | 0600; allow only permission bits, apply to the newly created socket, fail and clean up on chmod failure |
+| `OriginConfig.RecoverStaleSocket` | false; opt into exclusive ownership and recovery of witnessed sockets; enabled by Gantry |
 
 Wire header limits are fixed constants, not configurable. Copy scratch space is
 32 KiB per active origin stream; use a hard-bounded pool or bounded active

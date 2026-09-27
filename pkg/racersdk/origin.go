@@ -47,6 +47,10 @@ type OriginConfig struct {
 	IdleTimeout time.Duration
 	// SocketMode contains only permission bits and defaults to 0600.
 	SocketMode os.FileMode
+	// RecoverStaleSocket opts into exclusive endpoint ownership using persistent
+	// lock and socket witness files. Only sockets created in this mode are recovered.
+	// The directory must be owned by this user and not group/world writable.
+	RecoverStaleSocket bool
 }
 
 func (c OriginConfig) defaults() (OriginConfig, error) {
@@ -90,7 +94,8 @@ func (c OriginConfig) defaults() (OriginConfig, error) {
 }
 
 // ServeOrigin binds /run/racer/<cache>/origin/socket and serves until cancellation
-// or a listener failure. Existing paths (including stale sockets) are refused.
+// or a listener failure. Existing paths (including stale sockets) are refused
+// unless RecoverStaleSocket explicitly enables recovery of an owned endpoint.
 // Cleanup removes only this invocation's socket inode, preserving replacements.
 // Cancellation closes connections and bodies and returns ctx.Err() without waiting
 // for noncooperative callbacks; a late-returned body is still closed. Callbacks
@@ -115,7 +120,12 @@ func serveOrigin(ctx context.Context, config OriginConfig, origin Origin, path s
 		return err
 	}
 
-	l, cleanup, err := listenOrigin(path, config.SocketMode)
+	listen := listenOrigin
+	if config.RecoverStaleSocket {
+		listen = listenOwnedOrigin
+	}
+
+	l, cleanup, err := listen(path, config.SocketMode)
 	if err != nil {
 		return err
 	}

@@ -155,6 +155,11 @@ pub(super) fn prepare<'a>(
                 if !owns(current, "socket") {
                     return Err(Error::Io);
                 }
+                if let (Some(owner), Directory::Real(directory)) =
+                    (&current.owner, &current.directory)
+                {
+                    owner.validate(directory)?;
+                }
                 prepared.next.insert(definition.id.clone(), current.clone());
                 continue;
             }
@@ -162,11 +167,16 @@ pub(super) fn prepare<'a>(
             crate::runtime::environment::fill_random(&mut random)
                 .map_err(|_| Error::Unavailable)?;
             let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
-            let next = Rc::new(bind(&owner.root, definition.clone(), &temporary)?);
             let previous = old
                 .values()
                 .find(|current| current.definition.name == definition.name)
                 .cloned();
+            let next = Rc::new(bind(
+                &owner.root,
+                definition.clone(),
+                &temporary,
+                previous.as_deref(),
+            )?);
             if let Some(previous) = &previous {
                 if !owns(previous, "socket")
                     || !same_directory(&previous.directory, &next.directory)?
