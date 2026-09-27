@@ -131,7 +131,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 // serve owns the listener and every accepted connection. Close, rather than a
 // grace period for active traffic, is required as soon as leadership is lost.
-func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) (result error) {
+func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	server := &http.Server{
 		Handler:           s.Handler(),
 		TLSConfig:         config,
@@ -149,18 +152,44 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 	server.ConnState = func(conn net.Conn, state http.ConnState) {
 		if state == http.StateNew {
 			connections.Store(conn, struct{}{})
+			// Accept may race teardown's connection sweep. Every new connection
+			// must also check cancellation after registering itself.
+			if ctx.Err() != nil {
+				closeTransport(conn)
+			}
 		}
 
 		if state == http.StateClosed {
 			connections.Delete(conn)
 		}
-
-		if ctx.Err() != nil {
-			closeTransport(conn)
-		}
 	}
 
-	closeAll := func() {
+	done := make(chan error, 1)
+
+	go func(done chan<- error) { done <- server.Serve(tls.NewListener(listener, config)) }(done)
+
+	s.Lifecycle.SetServingReady(true)
+
+	var result error
+
+	select {
+	case err := <-done:
+		result = err
+		done = nil
+	case <-ctx.Done():
+	}
+
+	s.Lifecycle.SetServingReady(false)
+	cancel()
+
+	shutdown, stop := context.WithTimeout(context.Background(), s.Config.Limits.ShutdownTimeout)
+	defer stop()
+
+	closed := make(chan error, 1)
+
+	go func(closed chan<- error) {
+		// Force-close TCP before net/http closes TLS connections: close-notify
+		// can otherwise block on a slow reader. No graceful drain is allowed.
 		connections.Range(func(key, _ any) bool {
 			if conn, ok := key.(net.Conn); ok {
 				closeTransport(conn)
@@ -168,43 +197,29 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 
 			return true
 		})
-	}
 
-	stop := context.AfterFunc(ctx, closeAll)
-	defer stop()
-	defer s.Lifecycle.SetServingReady(false)
-	defer func() { result = errors.Join(result, server.Close()) }()
+		closed <- server.Close()
+	}(closed)
 
-	done := make(chan error, 1)
+	var closeErr error
 
-	go func() { done <- server.Serve(tls.NewListener(listener, config)) }()
-
-	s.Lifecycle.SetServingReady(true)
-
-	select {
-	case err := <-done:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-
-		return err
-	case <-ctx.Done():
-		s.Lifecycle.SetServingReady(false)
-		closeAll()
-
-		closeErr := server.Close()
-
-		shutdown, cancel := context.WithTimeout(context.Background(), s.Config.Limits.ShutdownTimeout)
-		defer cancel()
-
-		shutdownErr := server.Shutdown(shutdown)
+	for done != nil || closed != nil {
 		select {
-		case <-done:
-			return errors.Join(closeErr, shutdownErr)
+		case result = <-done:
+			done = nil
+		case closeErr = <-closed:
+			closed = nil
 		case <-shutdown.Done():
-			return errors.Join(closeErr, shutdownErr, shutdown.Err())
+			closeErr = errors.Join(closeErr, shutdown.Err())
+			done, closed = nil, nil
 		}
 	}
+
+	if errors.Is(result, http.ErrServerClosed) {
+		result = nil
+	}
+
+	return errors.Join(result, closeErr)
 }
 
 func (s *Server) initializeAdmission() {
