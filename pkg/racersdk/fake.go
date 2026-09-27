@@ -22,11 +22,11 @@ import (
 // production endpoint overrides. Client and origin resource defaults apply.
 //
 // The fake forwards request metadata and authorization unchanged. Each Get opens
-// a fresh bootstrap; its lazy pinned continuation is split into whole-page origin
-// requests, streamed sequentially without object-sized buffering. Origin callback
-// errors before response headers retain their HTTP classification; later errors
-// abort the stream. Origin must obey the same cancellation/body ownership contract
-// as ServeOrigin.
+// a fresh bootstrap; its lazy pinned continuations are forwarded as whole-page
+// origin requests, streamed sequentially without object-sized buffering. Origin
+// callback errors before response headers retain their HTTP classification;
+// later errors abort the stream. Origin must obey the same cancellation/body
+// ownership contract as ServeOrigin.
 //
 // Always call the returned, concurrent-safe, idempotent cleanup function (for
 // example with t.Cleanup). It closes the Client, cancels origin work, and closes

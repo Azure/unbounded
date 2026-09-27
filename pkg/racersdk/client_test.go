@@ -95,6 +95,11 @@ func (b repeatedByte) Read(p []byte) (int, error) {
 }
 
 func streamResponse(w http.ResponseWriter, first, length, size int64, tag string) {
+	streamResponseHead(w, first, length, size, tag)
+	_, _ = io.CopyN(w, repeatedByte('x'), length)
+}
+
+func streamResponseHead(w http.ResponseWriter, first, length, size int64, tag string) {
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", tag)
@@ -104,12 +109,10 @@ func streamResponse(w http.ResponseWriter, first, length, size int64, tag string
 		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10)+"/"+strconv.FormatInt(size, 10))
 		w.WriteHeader(206)
 	}
-
-	_, _ = io.CopyN(w, repeatedByte('x'), length)
 }
 
 func TestClientStreamingTranscript(t *testing.T) {
-	for _, size := range []int64{0, 1, 4096, int64(PageSize), 3*int64(PageSize) + 1} {
+	for _, size := range []int64{0, 1, 4096, int64(PageSize), 2 * int64(PageSize), 3*int64(PageSize) + 1} {
 		t.Run(strconv.FormatInt(size, 10), func(t *testing.T) {
 			var calls atomic.Int32
 
@@ -127,13 +130,16 @@ func TestClientStreamingTranscript(t *testing.T) {
 						t.Error("bootstrap")
 					}
 				} else {
-					first, length = int64(PageSize), size-int64(PageSize)
-					if call != 2 || r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes=16777216-"+strconv.FormatInt(size-1, 10) {
+					first = int64(call-1) * int64(PageSize)
+
+					length = min(int64(PageSize), size-first)
+					if r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes="+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10) {
 						t.Error("continuation")
 					}
 				}
 
-				streamResponse(w, first, length, size, `"v"`)
+				streamResponseHead(w, first, length, size, `"v"`)
+				_, _ = io.CopyN(w, &offsetStream{offset: first}, length)
 			}))
 			c := testClient(t, path, 1)
 
@@ -146,7 +152,7 @@ func TestClientStreamingTranscript(t *testing.T) {
 				t.Fatal("metadata or eager continuation")
 			}
 
-			n, err := io.Copy(io.Discard, v)
+			n, err := io.Copy(&offsetSink{}, v)
 			if err != nil || n != size {
 				t.Fatalf("stream: %d %v", n, err)
 			}
@@ -159,13 +165,14 @@ func TestClientStreamingTranscript(t *testing.T) {
 				t.Fatal("EOF lost", err)
 			}
 
-			want := int32(1)
-			if size > int64(PageSize) {
-				want = 2
-			}
+			want := int32(max(1, (size+int64(PageSize)-1)/int64(PageSize)))
 
 			if calls.Load() != want {
 				t.Fatal("request count", calls.Load())
+			}
+
+			if len(c.slots) != 0 {
+				t.Fatal("EOF retained capacity")
 			}
 		})
 	}
@@ -371,63 +378,95 @@ func TestClientGetCloseRace(t *testing.T) {
 }
 
 func TestClientContinuationFailures(t *testing.T) {
-	for _, mode := range []string{"pin", "size", "412", "503", "short"} {
-		t.Run(mode, func(t *testing.T) {
-			var calls atomic.Int32
+	for _, prefixPages := range []int64{1, 2} {
+		t.Run(strconv.FormatInt(prefixPages, 10), func(t *testing.T) {
+			for _, mode := range []string{"pin", "size", "range", "length", "412", "503", "short", "empty"} {
+				t.Run(mode, func(t *testing.T) {
+					var calls atomic.Int32
 
-			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if calls.Add(1) == 1 {
-					streamResponse(w, 0, int64(PageSize), int64(PageSize)+2, `"v"`)
-					return
-				}
+					first := prefixPages * int64(PageSize)
+					size := first + 2
 
-				switch mode {
-				case "pin":
-					streamResponse(w, int64(PageSize), 2, int64(PageSize)+2, `"other"`)
-				case "size":
-					streamResponse(w, int64(PageSize), 2, int64(PageSize)+3, `"v"`)
-				case "412", "503":
-					status, _ := strconv.Atoi(mode)
+					path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						call := calls.Add(1)
+						if int64(call) <= prefixPages {
+							streamResponse(w, int64(call-1)*int64(PageSize), int64(PageSize), size, `"v"`)
+							return
+						}
 
-					w.Header().Set("Content-Length", "0")
-					w.WriteHeader(status)
-				case "short":
-					w.Header().Set("Content-Length", "2")
-					w.Header().Set("Content-Range", "bytes 16777216-16777217/16777218")
-					w.Header().Set("Content-Type", "application/octet-stream")
-					w.Header().Set("ETag", `"v"`)
-					w.Header().Set("Racer-Expires-At", "1")
-					w.WriteHeader(206)
-					_, _ = w.Write([]byte("x"))
-				}
-			}))
-			c := testClient(t, path, 1)
+						switch mode {
+						case "pin":
+							streamResponse(w, first, 2, size, `"other"`)
+						case "size":
+							streamResponse(w, first, 2, size+1, `"v"`)
+						case "range":
+							streamResponse(w, first-1, 2, size, `"v"`)
+						case "length":
+							w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(size-1, 10)+"/"+strconv.FormatInt(size, 10))
+							w.Header().Set("Content-Length", "1")
+							w.Header().Set("Content-Type", "application/octet-stream")
+							w.Header().Set("ETag", `"v"`)
+							w.Header().Set("Racer-Expires-At", "0")
+							w.WriteHeader(206)
+							_, _ = w.Write([]byte("x"))
+						case "412", "503":
+							status, _ := strconv.Atoi(mode)
 
-			v, err := c.Get(context.Background(), Request{})
-			if err != nil {
-				t.Fatal(err)
-			}
+							w.Header().Set("Content-Length", "0")
+							w.WriteHeader(status)
+						case "short", "empty":
+							streamResponseHead(w, first, 2, size, `"v"`)
 
-			n, err := io.Copy(io.Discard, v)
-			if err == nil || n < int64(PageSize) || calls.Load() != 2 {
-				t.Fatalf("failure %d %v", n, err)
-			}
+							if mode == "short" {
+								_, _ = w.Write([]byte("x"))
+							}
+						}
+					}))
+					c := testClient(t, path, 1)
 
-			switch mode {
-			case "pin", "size":
-				assertKind(t, err, ErrorProtocol)
-			case "412":
-				assertKind(t, err, ErrorVersionUnavailable)
-			case "503":
-				assertKind(t, err, ErrorUnavailable)
-			case "short":
-				if n != int64(PageSize)+1 || !errors.Is(err, io.ErrUnexpectedEOF) {
-					t.Fatal("truncation", n, err)
-				}
-			}
+					v, err := c.Get(context.Background(), Request{})
+					if err != nil {
+						t.Fatal(err)
+					}
 
-			if v.Metadata().ExpiresAt.UnixMilli() != 0 {
-				t.Fatal("snapshot changed")
+					n, err := io.Copy(io.Discard, v)
+					if err == nil || n < first || int64(calls.Load()) != prefixPages+1 {
+						t.Fatalf("failure %d %v", n, err)
+					}
+
+					switch mode {
+					case "pin", "size", "range", "length":
+						assertKind(t, err, ErrorProtocol)
+					case "412":
+						assertKind(t, err, ErrorVersionUnavailable)
+					case "503":
+						assertKind(t, err, ErrorUnavailable)
+					case "short":
+						if n != first+1 || !errors.Is(err, io.ErrUnexpectedEOF) {
+							t.Fatal("truncation", n, err)
+						}
+					case "empty":
+						if !errors.Is(err, io.ErrUnexpectedEOF) {
+							t.Fatal("missing body", err)
+						}
+					}
+
+					if mode != "short" && n != first {
+						t.Fatal("invalid response bytes exposed", n)
+					}
+
+					if next, terminal := v.Read(make([]byte, 1)); next != 0 || terminal != err || int64(calls.Load()) != prefixPages+1 {
+						t.Fatal("failure was not terminal", next, terminal)
+					}
+
+					if len(c.slots) != 0 {
+						t.Fatal("failure retained capacity")
+					}
+
+					if v.Metadata().ExpiresAt.UnixMilli() != 0 {
+						t.Fatal("snapshot changed")
+					}
+				})
 			}
 		})
 	}
