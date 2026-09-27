@@ -10,7 +10,8 @@ This document describes intended behavior. Phase 1 bounded codecs, canonical
 hashing, and shared Go/Rust contract vectors, Phase 2 pure membership/catalog
 reconciliation, Phase 3 initialization/publication lifecycle, Phase 4 issuer
 and shared-key rotation, Phase 5 token bootstrap/authenticated HTTPS serving,
-and Phase 6 server-side managed workload reconciliation are implemented. Phase 7
+and Phase 6 deployment wiring are implemented. Workload ownership was subsequently
+moved exclusively to unbounded-operator (architecture simplification item 6). Phase 7
 server integration and bounded publication/reconciliation measurements are complete.
 The initialize-only command and leader-scoped HTTPS service are operational;
 deployment must provide serving TLS files, bootstrap server trust, and a compatible
@@ -38,10 +39,24 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
   persistent jobs. Stage roots/keys before activation, retain retiring material,
   and reserve the 512 KiB bundle bound before admitting catalog growth, including
   active, prepared, and all retiring generations. No acknowledgments.
-- `WorkloadReconciler` manages the DaemonSet. Its desired spec includes a projected
-  racer-control token, common keyring and bootstrap trust, node-private identity
-  storage, slabs, client/origin socket mounts, and exclusion-label affinity.
-  Missing DaemonSets must be reconciled on startup, not only on watch events.
+- The operator Racer component owns the Deployment and DaemonSet, configuration,
+  and deployment wiring. The pure `DesiredDaemonSet` builder retains projected
+  racer-control tokens, common keyring/bootstrap trust, private identity storage,
+  slabs, sockets, and exclusion affinity. No workload reconciler is registered by
+  the Racer manager; startup does not build a DaemonSet. ClusterCache activates
+  provisioning independently of Sites; zero caches retain the installation.
+- Administrator configuration is preserved with the operator's create-if-absent
+  and optimistic merge-patch pipeline. The generic overrides pipeline handles both
+  workloads, including device/resource/env/mount and scheduling customization.
+  Config payload hashes trigger rollouts. Runtime defaults and the memory-limit
+  policy are documented in `cmd/racer-controller/README.md` and checked against
+  actual Rust worker sizing/admission, not a presumed RSS budget.
+- Controller writes are limited to runtime installation/version ConfigMaps and
+  issuer/keyring Secrets. Named RBAC restricts updates; fail-closed admission
+  restricts creates. Policy and binding are explicit prerequisites of workload
+  enablement. Enrollment retains live Node/Pod/SA/DaemonSet reads; snapshot
+  authentication uses local validated trust. Existing selectors are retained for
+  in-place adoption, despite the legacy managed-by label.
 
 The server is a leader-election runnable. Readiness requires synchronized inputs,
 usable issuer/trust, and an installed publication. Followers are live but unready.
@@ -436,18 +451,18 @@ Scaffold composition tests remain; Phase 6 owns server-side workload wiring and
 Phase 7 verifies the real API-server/election and measures capacity constraints.
 Projection requires a kubelet and remains deployment verification.
 
-## Phase 6 server-only workload and deployment handoff
+## Phase 6 workload and deployment handoff (updated by item 6)
 
-- `WorkloadReconciler` validates deployment configuration and creates the managed
-  DaemonSet from the startup singleton enqueue, including when no objects exist.
-  Normal `Run` validates workload configuration before constructing the manager;
-  initialize-only operation still does not require a dataplane image or endpoint.
-- Reconciliation uses authoritative reads and optimistic resource-version patches.
-  Conflicts and create races requeue for a fresh read; canceled leadership stops
-  writes. Foreign management labels or incompatible immutable selectors fail
-  closed. Terminating workloads are allowed to finish deletion before recreation.
-  The controller repairs the pod spec, including added privileges or volumes,
-  while preserving DaemonSet metadata and pod-template rollout annotations.
+- The operator validates deployment configuration and applies both workloads
+  through its normal SSA executor and generic override pipeline. Normal Racer
+  `Run` and initialize-only operation do not construct a workload or require a
+  dataplane image or endpoint. A first ClusterCache triggers operator provisioning.
+- The operator preserves existing ConfigMap payloads, repairs only installation
+  wiring under optimistic concurrency, and hashes configuration for rollouts.
+  SSA removes fields introduced by overrides when those overrides are removed;
+  invalid overrides withhold affected workloads. The immutable legacy selector is
+  preserved, permitting adoption without DaemonSet recreation. Racer has no
+  workload write path or mutation grant.
 - The managed service account has no API RBAC binding and automatic token mounting
   is disabled. A dedicated projected token has audience `racer-control`, one-hour
   requested lifetime, and mode 0400. The common Secret exposes only `bundle.json`
@@ -491,13 +506,13 @@ Projection requires a kubelet and remains deployment verification.
   ConfigMap environment changes and serving certificate replacement require a
   controller rollout; bootstrap trust remains a live projected directory.
 
-Phase 6 tests cover workload creation from startup enqueue, drift repair/no-op,
-ownership rejection, conflict/create-race recovery, cancellation after reads,
-credential/storage/affinity contracts, and rendered deployment/RBAC consistency.
-These are fake-client and render tests, not a claim of a working Rust client or
-end-to-end dataplane deployment. Phase 7 now verifies real API-server
-defaulting/admission and election. Kubelet projected-token rotation and node
-filesystem integration remain deployment checks; the client runtime is out of scope.
+Phase 6 retains named builder/projection/storage/affinity and optimistic executor
+tests. Operator tests cover provisioning without Sites, retention, config edits,
+policy-before-workload ordering, real SSA override removal, and RBAC/admission
+denial of administrator-object writes. Real manager tests verify Racer does not
+create or mutate the operator workload. Rust tests parse the deployed runtime
+profile and exercise actual worker sizing and admission progress floors. Kubelet
+projection and host-filesystem behavior remain deployment checks.
 
 ## Phase 7 server verification and measurements
 
@@ -525,11 +540,12 @@ the generated ClusterCache CRD. Assertions cover:
   bundle generation, deadlines, cache-key overlap, and trust-before-private pruning
   survive these boundaries. The broader before/after-write matrix remains in the
   existing unit/race tests.
-- Two real managers use production options and all three reconcilers. Only election
+- Two real managers use production options and both reconcilers. Only election
   durations and bound addresses are shortened/isolated for the test; release-on-cancel
   remains false. Readiness probes distinguish leader/follower. Empty input startup
-  creates the DaemonSet, real admission defaults do not cause a write loop, and a
-  watched privilege mutation is repaired.
+  does not create a DaemonSet. After independent workload provisioning, a watched
+  pod-spec mutation remains untouched by Racer. Operator envtest covers workload
+  adoption, overrides, and actual SSA removal.
 - Real Pod-bound TokenRequest credentials pass real TokenReview over HTTPS;
   wrong-audience tokens fail. The returned identity uses the API-assigned Node UID.
   The managed Pod becomes published through the informer, and mTLS snapshot serving

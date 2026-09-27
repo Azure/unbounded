@@ -1,0 +1,20 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-dataplane-config
+  namespace: {{ .Namespace | default "unbounded-system" }}
+data:
+  # Defaults match the Rust runtime. Existing administrator data is preserved.
+  RACER_ENABLE_RDMA: "false"
+  RACER_MAX_THREADS: "8"
+  RACER_PLAINTEXT_BYTES: "268435456"
+  RACER_CIPHERTEXT_BYTES: "268435456"
+  RACER_DIRTY_BYTES: "134217728"
+  RACER_REGISTERED_BYTES: "134217728"
+  RACER_REQUEST_CONTEXT_BYTES: "16777216"
+  # Storage geometry is per worker; byte admission budgets above are node-wide.
+  RACER_SLAB_BYTES: "1073741824"
+  RACER_SEGMENT_BYTES: "67108864"
+  RACER_FREE_SEGMENT_RESERVE: "2"

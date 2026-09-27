@@ -73,7 +73,7 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ds, err := (&racer.WorkloadReconciler{Config: cfg}).DesiredDaemonSet()
+			ds, err := racer.DesiredDaemonSet(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,9 +155,15 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 				return false
 			}
-			for _, verb := range []string{"get", "list", "watch", "create", "patch"} {
+			for _, verb := range []string{"get", "list", "watch"} {
 				if !grants(role.Rules, "apps", "daemonsets", verb) {
 					t.Fatalf("missing workload permission %s", verb)
+				}
+			}
+
+			for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+				if grants(role.Rules, "apps", "daemonsets", verb) {
+					t.Fatalf("controller may not mutate workloads: %s", verb)
 				}
 			}
 

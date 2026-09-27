@@ -3,7 +3,7 @@
 Phases 1-7 implement and verify the server: configuration, bounded codecs, membership/catalog calculation,
 one-shot initialization, durable publication CAS, issuer/shared-key rotation, and
 certificate issuance, TokenReview bootstrap, and operational leader-scoped HTTPS/mTLS
-serving, and managed DaemonSet reconciliation. Phase 7 exercises real Kubernetes
+serving. The operator owns both Racer workloads. Phase 7 exercises real Kubernetes
 API-server persistence, manager election/failover, TLS enrollment, and publication scale.
 The `initialize` command performs Kubernetes writes; normal startup validates
 existing durable state. Constructors only wire dependencies; they open no files
@@ -20,11 +20,12 @@ both the test-only reference codec and the existing Rust runtime codec.
 ## Structure
 
 - `api/racer/v1alpha1`: cluster-scoped ClusterCache resource and generated CRD.
-- `internal/racer`: three ordinary controller-runtime reconcilers, manager,
+- `internal/racer`: two ordinary controller-runtime reconcilers, manager,
   publication state, token bootstrap, certificate issuance, and mTLS server.
 - `internal/racer/wire`: shared contract declarations and bounded codec boundaries.
-- `deploy/racer`: controller/RBAC/config templates. Workload reconciliation owns
-  the dataplane DaemonSet; supply a compatible image.
+- `deploy/racer`: controller/RBAC/config/admission templates.
+- `internal/operator/components/racer`: the sole controller Deployment and dataplane
+  DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet` builder.
 
 There is no Kubernetes abstraction, custom queue/leader-election framework,
 per-node Secret, enrollment ledger, or goal-state checkpoint store. Only the
@@ -82,8 +83,9 @@ Installing unbounded-operator bootstraps the ClusterCache CRD. Creating a
 `ClusterCache` activates Racer without requiring a Site. The operator provisions
 the controller RBAC, configuration, serving TLS/trust, and initialize-only Job,
 then deploys the controller after validating the consumed marker and bound
-version counters. The controller provisions node credentials and its dataplane
-DaemonSet. Both images use the operator's registry prefix and release tag.
+version counters. The operator deploys the dataplane DaemonSet; the controller
+provisions node credentials. Both images use the operator's registry prefix and
+release tag. Controller startup neither constructs nor reconciles a DaemonSet.
 
 The operator reserves a random UUID in `racer-operator-installation`, consumes
 that claim under an optimistic lock, and attempts to create `racer-installation`.
@@ -100,8 +102,14 @@ a genuinely new namespace.
 
 Existing standalone resources are not automatically adopted. Do not mix the
 standalone installation procedure with operator provisioning in one namespace.
-The operator owns `racer-config`; use the operator workload override mechanism
-for controller Deployment customization. The dataplane remains controller-owned.
+The operator creates `racer-config` and `racer-dataplane-config` defaults only when
+absent and preserves administrator data. Only installation wiring in `racer-config`
+(cluster identity, endpoint/image, trust and runtime object names) is repaired with
+an optimistic merge patch. Config payload hashes roll the consuming workload.
+Use the existing `unbounded-component-overrides` ConfigMap with `component: racer` and
+`kind: Deployment` or `kind: DaemonSet` for resources, environment, devices,
+scheduling, mounts, and RDMA. Invalid overrides withhold affected workload writes;
+removing valid overrides returns those fields to defaults through SSA.
 Deleting the last ClusterCache retains resources and pauses operator reconciliation
 for Racer. Administrators may remove workloads deliberately; a later cache resumes
 provisioning with the retained identity and counters.
@@ -113,7 +121,45 @@ node issuer. Missing established serving credentials fail closed. Reconciliation
 checks renewal hourly while a cache exists. Controller updates use the Recreate
 and leader-only readiness contract described below.
 
+### Runtime profile and resource policy
+
+`racer-dataplane-config` exposes the Rust environment settings, including thread,
+byte-budget, and slab tuning. Defaults use HTTP (`RACER_ENABLE_RDMA=false`), eight
+threads maximum (four I/O/crypto pairs), 256 MiB plaintext, 256 MiB ciphertext,
+128 MiB dirty bytes, 16 MiB request contexts, and a 1 GiB hostPath slab per worker
+(up to 4 GiB at four workers), split into 64 MiB segments with two free segments
+reserved per slab. The 128 MiB registered budget is
+unused in HTTP mode. Runtime affinity and progress checks can reduce worker pairs.
+The deployed profile is parsed by a Rust test that exercises actual worker sizing
+and admission. See [configuration](../racer-dataplane/CONFIGURATION.md).
+
+The dataplane requests 1 CPU and 1 GiB memory. These are scheduling reservations,
+not throughput guarantees or a proven RSS ceiling. No default CPU or memory limit
+is imposed: TLS, metadata, stacks, allocator overhead, and filesystem cache are
+outside the byte-budget sum. Set limits through generic overrides after profiling
+the selected concurrency, cluster size, and RDMA configuration. The hostPath slab
+is host filesystem capacity, not a Kubernetes ephemeral-storage quota. Increasing
+slab capacity does not increase a pod ephemeral-storage request or limit.
+
+The controller retains read access to Nodes, Pods, ServiceAccounts, and DaemonSets
+for enrollment. Snapshot authentication uses locally validated trust. It has no
+DaemonSet mutation permission. ConfigMap/Secret update and patch grants name only
+`racer-installation`, `racer-version`, `racer-issuer`, and `racer-keyring`; create is
+restricted to the same kind/name pairs by a fail-closed ValidatingAdmissionPolicy.
+The operator installs the policy and binding before enabling the RoleBinding,
+initializer, or workloads. Kubernetes must support `admissionregistration.k8s.io/v1`
+ValidatingAdmissionPolicy. Racer cannot write either admin config map, serving TLS,
+or the generic overrides map.
+
+Upgrades retain the legacy DaemonSet selector, including its
+`app.kubernetes.io/managed-by: racer-controller` label. That immutable compatibility
+label does not confer write ownership; `unbounded-operator` is the SSA field manager.
+
 ## Standalone first installation
+
+These templates support control-plane-only development and recovery. They no longer
+install a dataplane automatically. Use operator installation for a complete Racer
+deployment; do not run a second workload reconciler beside the operator.
 
 1. Choose a **new permanent cluster UUID**, namespace, controller image, and
    compatible dataplane image. Provision the namespace and deployment TLS/trust
@@ -123,7 +169,8 @@ and leader-only readiness contract described below.
 2. Render with `make racer-manifests RACER_CLUSTER_ID=<uuid>
    RACER_NAMESPACE=<namespace> RACER_CONTROLLER_IMAGE=<image>
    RACER_DATAPLANE_IMAGE=<image> RACER_INITIALIZATION_STATE=fresh`.
-   Apply `rendered/crd/`, `rendered/rbac.yaml`, `rendered/config.yaml`, and
+   Apply `rendered/create-restriction.yaml` before RBAC or Jobs. Then apply
+   `rendered/crd/`, `rendered/rbac.yaml`, `rendered/config.yaml`, and
    `rendered/installation.yaml` from `deploy/racer`. Do not start the Deployment yet.
 3. Run the following initialize-only Job, substituting the namespace and controller
    image. It consumes the marker once, then creates counters 1/1. No serving TLS
@@ -159,8 +206,8 @@ spec:
    (`state: consumed`, `immutable: true`) and bound `racer-version` ConfigMap.
    Rerender with the same settings and `RACER_INITIALIZATION_STATE=consumed`.
    Keep that consumed marker in deployment configuration/backups, then apply
-   `deploy/racer/rendered/controller.yaml`. The leader creates credentials and the
-   managed DaemonSet. Only the leader becomes ready; followers remain live.
+   `deploy/racer/rendered/controller.yaml`. The leader creates credentials.
+   Only the leader becomes ready; followers remain live.
 
 Never rerun initialization to repair an established cluster. If the Job fails
 after consuming the marker, inspect durable state: valid bound counters permit

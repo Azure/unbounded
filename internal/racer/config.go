@@ -48,8 +48,13 @@ type Limits struct {
 // LoadConfig reads deployment configuration. Initialization state is deliberately
 // not an environment setting: it is read authoritatively on every recovery.
 func LoadConfig() (Config, error) {
+	return ConfigFromLookup(os.LookupEnv)
+}
+
+// ConfigFromLookup parses the controller configuration without process-global state.
+func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 	env := func(key, fallback string) string {
-		if value, ok := os.LookupEnv(key); ok {
+		if value, ok := lookup(key); ok {
 			return value
 		}
 

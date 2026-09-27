@@ -13,6 +13,15 @@ most 4096 bytes, with no control characters.
 
 ## Deployment and identity
 
+The operator is the sole owner of the deployed DaemonSet. Edit the preserved
+`racer-dataplane-config` ConfigMap for runtime tuning; its payload hash rolls the
+DaemonSet. Explicit wiring environment variables in the pod take precedence over
+`envFrom`. The existing generic operator overrides support resources, device
+requests, scheduling, environment, and mounts, including optional RDMA settings.
+Default requests are 1 CPU and 1 GiB memory with no default memory limit; runtime
+budgets are not a whole-process RSS bound. Each worker's 1 GiB hostPath slab
+consumes host disk capacity and is not accounted as a pod ephemeral-storage quota.
+
 | Environment variable | Default | Contract |
 | --- | --- | --- |
 | `RACER_CLUSTER_ID` | Required | Persistent non-nil, canonical lowercase hyphenated UUID |

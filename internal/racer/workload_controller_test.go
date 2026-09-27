@@ -17,6 +17,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -28,17 +29,95 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-func workloadFixture(t *testing.T) *WorkloadReconciler {
+// workloadDriver retains the builder and optimistic executor contracts of the
+// old workload tests. Production ownership and SSA are tested in internal/operator.
+// It is deliberately test-only: no Racer manager can register a workload writer.
+type workloadDriver struct {
+	client.Client
+	APIReader client.Reader
+	Config    Config
+}
+
+func (r *workloadDriver) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
+	return DesiredDaemonSet(r.Config)
+}
+
+func (r *workloadDriver) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	desired, err := r.DesiredDaemonSet()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	current := &appsv1.DaemonSet{}
+
+	err = r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current)
+	if ctx.Err() != nil {
+		return ctrl.Result{}, ctx.Err()
+	}
+
+	op := component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(desired), Component: "racer"}
+	if err == nil {
+		if current.Labels["app.kubernetes.io/managed-by"] != "racer-controller" || !apiequality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) {
+			return ctrl.Result{}, wire.Conflict
+		}
+
+		if !current.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
+		}
+
+		current.TypeMeta = desired.TypeMeta
+		before := current.DeepCopy()
+		desired.Spec.Template.Annotations = current.Spec.Template.Annotations
+		current.Spec.Template = desired.Spec.Template
+		current.Spec.UpdateStrategy = desired.Spec.UpdateStrategy
+
+		current.Spec.MinReadySeconds = desired.Spec.MinReadySeconds
+		if apiequality.Semantic.DeepEqual(before.Spec, current.Spec) {
+			return ctrl.Result{}, nil
+		}
+
+		op.Kind, op.Object, op.Base = component.OpMergePatch, component.ToUnstructured(current), component.ToUnstructured(before)
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	plan := component.NewPlan()
+	plan.Add(op)
+
+	env := &component.Env{Client: r.Client}
+
+	result, err := env.Execute(ctx, plan)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if len(result.Deferred) != 0 || len(result.Stale) != 0 {
+		return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
+	}
+
+	return ctrl.Result{}, result.Err()
+}
+
+func workloadFixture(t *testing.T) *workloadDriver {
 	t.Helper()
 	topology := initializedTopology(t)
 	cfg := topology.Config
 	cfg.ControlURL = "https://racer-controller.racer.svc:8443"
 	cfg.DataplaneImage = "racer:test"
 
-	return &WorkloadReconciler{Client: topology.Client, APIReader: topology.APIReader, Config: cfg}
+	return &workloadDriver{Client: topology.Client, APIReader: topology.APIReader, Config: cfg}
 }
 
 func TestWorkloadProjectionAndStorage(t *testing.T) {
@@ -578,7 +657,9 @@ func TestWorkloadInvalidEndpointFailsBeforeManagerStartup(t *testing.T) {
 		r := workloadFixture(t)
 
 		r.Config.ControlURL = endpoint
-		if err := Run(context.Background(), r.Config); !errors.Is(err, wire.InvalidRequest) {
+		// Workload validation belongs to operator planning, before either workload
+		// is enabled. Controller startup no longer constructs a DaemonSet.
+		if _, err := DesiredDaemonSet(r.Config); !errors.Is(err, wire.InvalidRequest) {
 			t.Fatalf("endpoint %q: %v", endpoint, err)
 		}
 	}

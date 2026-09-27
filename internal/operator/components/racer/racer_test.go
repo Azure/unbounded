@@ -137,7 +137,7 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	cfg := initialize(t, env)
 	plan := planPass(t, env)
 	require.Contains(t, plan.Summary(), "Deployment/custom-system/racer-controller [overridable]")
-	require.NotContains(t, plan.Summary(), "DaemonSet/")
+	require.Contains(t, plan.Summary(), "DaemonSet/custom-system/racer-dataplane [overridable]")
 	persist(t, env, plan)
 
 	deployment := &appsv1.Deployment{}
@@ -181,8 +181,6 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	// Use the production controller with precisely the operator's configuration.
 	app := racercore.Assemble(cfg, env.Client, env.APIReader)
 	_, err = app.Keyring.Reconcile(t.Context(), ctrl.Request{})
-	require.NoError(t, err)
-	_, err = app.Workload.Reconcile(t.Context(), ctrl.Request{})
 	require.NoError(t, err)
 
 	ds := &appsv1.DaemonSet{}
@@ -436,6 +434,91 @@ func TestTLSRejectsInvalidCredentials(t *testing.T) {
 			_, err = planTLS(t.Context(), env, plan, true)
 			require.Error(t, err)
 			require.Zero(t, plan.Len())
+		})
+	}
+}
+
+func TestConfigEditsPersistAndRollWorkloads(t *testing.T) {
+	env := testEnv(t, cache("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	for _, test := range []struct {
+		config, workload string
+		object           client.Object
+	}{
+		{configName, controllerName, &appsv1.Deployment{}},
+		{dataplaneConfigName, dataplaneName, &appsv1.DaemonSet{}},
+	} {
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.config), cm))
+		cm.Data["ADMIN_SETTING"] = "preserved"
+
+		cm.BinaryData = map[string][]byte{"admin.bin": {1, 2, 3}}
+		if test.config == dataplaneConfigName {
+			cm.Data["RACER_MAX_THREADS"] = "2"
+		}
+
+		require.NoError(t, env.Client.Update(t.Context(), cm))
+		want := component.ConfigMapPayloadHash(cm)
+
+		for range 2 {
+			persist(t, env, planPass(t, env))
+		}
+
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.config), cm))
+		require.Equal(t, want, component.ConfigMapPayloadHash(cm))
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, test.workload), test.object))
+
+		var annotations map[string]string
+
+		switch obj := test.object.(type) {
+		case *appsv1.Deployment:
+			annotations = obj.Spec.Template.Annotations
+		case *appsv1.DaemonSet:
+			annotations = obj.Spec.Template.Annotations
+			container := obj.Spec.Template.Spec.Containers[0]
+			require.Equal(t, dataplaneConfigName, container.EnvFrom[0].ConfigMapRef.Name)
+			require.Equal(t, "1Gi", container.Resources.Requests.Memory().String())
+			require.Empty(t, container.Resources.Limits)
+		}
+
+		require.Equal(t, want, annotations["unbounded-cloud.io/racer-config-hash"])
+	}
+}
+
+func TestAdmissionFailureGatesBindingAndWorkloads(t *testing.T) {
+	for _, target := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		t.Run(target, func(t *testing.T) {
+			env := testEnv(t, cache("cache"))
+			initialize(t, env)
+
+			policy := &unstructured.Unstructured{}
+			policy.SetAPIVersion("admissionregistration.k8s.io/v1")
+			policy.SetKind(target)
+			policy.SetName("racer-runtime-write-restriction")
+			require.NoError(t, env.Client.Delete(t.Context(), policy))
+			plan := planPass(t, env)
+			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+					data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
+					require.NoError(t, err)
+
+					if data["kind"] == target {
+						return errors.New("policy unavailable")
+					}
+
+					return c.Apply(ctx, cfg, opts...)
+				},
+			})
+			result, err := env.Execute(t.Context(), plan)
+			require.NoError(t, err)
+
+			for _, op := range result.Results {
+				if op.Ref.GVK.Kind == "Deployment" || op.Ref.GVK.Kind == "DaemonSet" || op.Ref.GVK.Kind == "RoleBinding" {
+					require.Equal(t, component.OpSkipped, op.Status, "%s", op.Ref)
+				}
+			}
 		})
 	}
 }

@@ -4,104 +4,25 @@
 package racer
 
 import (
-	"context"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-type WorkloadReconciler struct {
-	client.Client
-	APIReader client.Reader
-	Config    Config
-}
-
-func (r *WorkloadReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	desired, err := r.DesiredDaemonSet()
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := ctx.Err(); err != nil {
-		return ctrl.Result{}, err
-	}
-	// Use authoritative reads on every retry, never refresh an old leader's write.
-	current := &appsv1.DaemonSet{}
-
-	err = r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current)
-	if ctx.Err() != nil {
-		return ctrl.Result{}, ctx.Err()
-	}
-
-	if apierrors.IsNotFound(err) {
-		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		err = r.Create(ctx, desired)
-	} else if err == nil {
-		if current.Labels["app.kubernetes.io/managed-by"] != "racer-controller" || !apiequality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) {
-			return ctrl.Result{}, fmt.Errorf("unmanaged or incompatible DaemonSet: %w", wire.Conflict)
-		}
-
-		if !current.DeletionTimestamp.IsZero() {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-
-		// Own the pod spec, including absence of extra mounts, tokens, or privileges.
-		// Set API defaults explicitly in desired state so equality is stable after
-		// admission. Preserve unrelated object metadata and rollout annotations.
-		before := current.DeepCopy()
-		desired.Spec.Template.Annotations = current.Spec.Template.Annotations
-		current.Spec.Template = desired.Spec.Template
-
-		current.Spec.UpdateStrategy = desired.Spec.UpdateStrategy
-
-		current.Spec.MinReadySeconds = desired.Spec.MinReadySeconds
-		if apiequality.Semantic.DeepEqual(before.Spec, current.Spec) {
-			return ctrl.Result{}, nil
-		}
-
-		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		err = r.Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
-	}
-
-	if ctx.Err() != nil {
-		return ctrl.Result{}, ctx.Err()
-	}
-
-	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
-	}
-
-	return ctrl.Result{}, err
-}
-
 // DesiredDaemonSet declares the token audience, common keyring/trust projection,
 // node-private identity and slab storage, socket mounts, and exclusion affinity.
 // It must never introduce a per-node Secret or trust a node-name as a Node UID.
-func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
-	c := r.Config
+// This pure builder is consumed by the operator, never by controller startup.
+func DesiredDaemonSet(c Config) (*appsv1.DaemonSet, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -118,6 +39,8 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 		}
 	}
 
+	// The legacy managed-by label is part of the immutable selector. Preserve it
+	// for in-place adoption; SSA's field manager records the actual workload owner.
 	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/managed-by": "racer-controller"}
 	// Keep diagnostics separate even when the configured peer port is 9090.
 	diagnosticsPort := int32(9090)
@@ -125,7 +48,7 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 		diagnosticsPort++
 	}
 
-	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels}, Spec: appsv1.DaemonSetSpec{
+	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels}, Spec: appsv1.DaemonSetSpec{
 		Selector:       &metav1.LabelSelector{MatchLabels: labels},
 		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: ptr.To(intstr.FromInt32(1)), MaxSurge: ptr.To(intstr.FromInt32(0))}},
 		// Require sustained readiness across probe periods before advancing a rollout.
@@ -178,14 +101,4 @@ func (r *WorkloadReconciler) DesiredDaemonSet() (*appsv1.DaemonSet, error) {
 	}
 
 	return ds, nil
-}
-
-func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("racer-workload").
-		WatchesRawSource(initialEnqueue()).
-		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.DaemonSetName))).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.BootstrapTrustConfigMap))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
 }

@@ -4,9 +4,17 @@ Run build commands from the repository root. This packages the Rust dataplane;
 the existing `racer-controller-build`, `racer-test`, `racer-generate`, and
 `racer-manifests` targets remain available. The Go controller implements bootstrap
 authentication, enrollment, and publication serving. Follow the
-[controller installation procedure](../racer-controller/README.md#first-installation)
+[operator installation procedure](../racer-controller/README.md#operator-installation)
 to initialize durable state and provision serving TLS and bootstrap trust before
 starting the dataplane. The shared protocol is [CONTROL_API.md](CONTROL_API.md).
+
+The operator exclusively owns the controller Deployment and dataplane DaemonSet.
+It preserves `racer-dataplane-config` edits and hashes that payload for rollouts.
+Use `unbounded-component-overrides` for workload resources, devices, environment,
+mounts, and scheduling. Racer itself has read-only workload access for enrollment.
+Default dataplane requests are 1 CPU and 1 GiB memory; there is no default memory
+limit because the runtime budgets below do not bound whole-process RSS. HostPath
+slabs are host capacity, not a Kubernetes ephemeral-storage quota.
 
 ## Release artifacts
 

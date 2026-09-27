@@ -134,6 +134,62 @@ mod tests {
         .0
     }
 
+    #[test]
+    fn operator_profile_reaches_runtime_admission_and_progress_floors() {
+        // Parse the actual deployed ConfigMap defaults, not a second test profile.
+        let manifest = include_str!("../../../deploy/racer/dataplane-config.yaml.tmpl");
+        let values: std::collections::HashMap<_, _> = manifest
+            .lines()
+            .filter_map(|line| line.trim().split_once(": \""))
+            .filter(|(key, _)| key.starts_with("RACER_"))
+            .map(|(key, value)| (key, value.trim_end_matches('"')))
+            .collect();
+        assert_eq!(values.len(), 10);
+        let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+            Ok(values
+                .get(name)
+                .map(|v| (*v).to_owned())
+                .or_else(|| match name {
+                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                    _ => None,
+                }))
+        })
+        .unwrap();
+        assert!(!config.enable_rdma);
+        assert_eq!(config.max_threads, 8);
+        assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
+        let mut plan = four_pair_plan(&config);
+        let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
+        assert_eq!(plan.pairs.len(), 4);
+        let admission = Admission::new(limits.clone());
+        let page = crate::model::range::PAGE_BYTES as usize;
+        for (class, floor) in [
+            (ResourceClass::Plaintext, 3 * page),
+            (
+                ResourceClass::Ciphertext,
+                3 * (page + 16) + crate::store::format::MAX_HEADER_BYTES,
+            ),
+            (ResourceClass::DirtyCiphertext, page + 16),
+            (ResourceClass::RequestContext, 128 * 1024),
+        ] {
+            let reservation = admission.reserve(None, class, floor).unwrap();
+            assert_eq!(admission.used(class), floor);
+            drop(reservation);
+            assert_eq!(admission.used(class), 0);
+        }
+        assert_eq!(limits.plaintext_bytes.get(), 64 * 1024 * 1024);
+        assert_eq!(limits.ciphertext_bytes.get(), 64 * 1024 * 1024);
+        assert_eq!(limits.dirty_bytes.get(), 32 * 1024 * 1024);
+        assert_eq!(limits.request_context_bytes.get(), 4 * 1024 * 1024);
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        // Reducing thread cap or quotas keeps whole pairs and re-partitions the
+        // node budget. An impossible byte floor must fail rather than deadlock.
+        let mut too_small = config.limits.clone();
+        too_small.plaintext_bytes = NonZeroUsize::new(3 * page - 1).unwrap();
+        assert!(size_workers(&too_small, &mut plan, false).is_err());
+    }
+
     fn four_pair_plan(config: &Config) -> AffinityPlan {
         use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
         let plan = AffinityPlan::from_topology(

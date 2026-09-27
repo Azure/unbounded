@@ -1,0 +1,33 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-runtime-write-restriction
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["configmaps", "secrets"]
+  matchConditions:
+    - name: racer-controller
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Namespace | default "unbounded-system" }}:racer-controller'
+  validations:
+    - expression: >-
+        request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':racer-controller' &&
+        ((request.resource.resource == 'configmaps' && object.metadata.name in ['racer-installation', 'racer-version']) ||
+         (request.resource.resource == 'secrets' && object.metadata.name in ['racer-issuer', 'racer-keyring']))
+      message: Racer may only write its runtime installation/version and issuer/keyring objects
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-runtime-write-restriction
+spec:
+  policyName: racer-runtime-write-restriction
+  validationActions: [Deny]

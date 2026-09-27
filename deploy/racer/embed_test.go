@@ -24,6 +24,8 @@ var manifestNames = []string{
 	"config.yaml",
 	"controller.yaml",
 	"crd/racer.unbounded-cloud.io_clustercaches.yaml",
+	"create-restriction.yaml",
+	"dataplane-config.yaml",
 	"installation.yaml",
 	"rbac.yaml",
 }

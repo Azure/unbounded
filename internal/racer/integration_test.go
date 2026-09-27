@@ -87,7 +87,7 @@ func TestEnvtestServer(t *testing.T) {
 
 func integrationWorkloadReadiness(t *testing.T, c client.Client) {
 	a := integrationInstallation(t, c, "workload-readiness")
-	r := &WorkloadReconciler{Client: c, APIReader: c, Config: a.Topology.Config}
+	r := &workloadDriver{Client: c, APIReader: c, Config: a.Topology.Config}
 	ctx := t.Context()
 	key := client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName}
 	ds := &appsv1.DaemonSet{}
@@ -603,27 +603,24 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 			t.Fatalf("manager %d readiness: %d", i, response.StatusCode)
 		}
 	}
-	// No Nodes/Pods/DaemonSets existed at startup. Verify actual admission/defaults
-	// and no repeated workload patches after the controller's own watch event.
+	// No Nodes/Pods/DaemonSets existed at startup. The ready Racer manager must
+	// not provision workloads; simulate the operator's independent installation.
 	ds := &appsv1.DaemonSet{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.DaemonSetName}, ds); !apierrors.IsNotFound(err) {
+		t.Fatalf("Racer manager created a workload: %v", err)
+	}
 
-	eventually(t, "empty-start workload creation", func() bool {
-		return c.Get(t.Context(), client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.DaemonSetName}, ds) == nil
-	})
-	time.Sleep(300 * time.Millisecond)
-
-	if err := c.Get(t.Context(), client.ObjectKeyFromObject(ds), ds); err != nil {
+	workload, err := DesiredDaemonSet(apps[leader].Topology.Config)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	rv := ds.ResourceVersion
-
-	if _, err := apps[leader].Workload.Reconcile(t.Context(), ctrl.Request{}); err != nil {
+	if err := c.Create(t.Context(), workload); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := c.Get(t.Context(), client.ObjectKeyFromObject(ds), ds); err != nil || ds.ResourceVersion != rv {
-		t.Fatalf("API defaulting caused workload write loop: %v", err)
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(workload), ds); err != nil {
+		t.Fatal(err)
 	}
 
 	ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged = ptr.To(true)
@@ -633,9 +630,13 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal(err)
 	}
 
-	eventually(t, "workload watch repairs admitted privilege drift", func() bool {
-		return c.Get(t.Context(), client.ObjectKeyFromObject(ds), ds) == nil && ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged == nil
-	})
+	rv := ds.ResourceVersion
+
+	time.Sleep(300 * time.Millisecond)
+
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(ds), ds); err != nil || ds.ResourceVersion != rv {
+		t.Fatalf("Racer manager mutated an operator-owned workload: %v", err)
+	}
 
 	peer := integrationEnrollment(t, rc, c, apps[leader], ds, roots)
 	endpoint := "https://" + apps[leader].Server.Config.ControlAddress

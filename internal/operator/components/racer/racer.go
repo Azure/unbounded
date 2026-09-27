@@ -14,6 +14,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
@@ -35,6 +36,8 @@ const (
 	markerName             = "racer-installation"
 	versionName            = "racer-version"
 	configName             = "racer-config"
+	dataplaneConfigName    = "racer-dataplane-config"
+	dataplaneName          = "racer-dataplane"
 	jobName                = "racer-initialize"
 	tlsName                = "racer-controller-tls"
 	trustName              = "racer-bootstrap-trust"
@@ -43,7 +46,7 @@ const (
 	installationAnnotation = "racer.unbounded-cloud.io/installation-uid"
 )
 
-// Component owns provisioning, while the Racer controller owns the dataplane.
+// Component is the sole owner of Racer workloads and deployment configuration.
 type Component struct{}
 
 func New() component.ClusterComponent   { return Component{} }
@@ -118,7 +121,7 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 		return plan, pending(), nil
 	}
 
-	if err := runtimePlan(env, plan, marker.Data["cluster"], secret, consumed); err != nil {
+	if err := runtimePlan(ctx, env, plan, marker.Data["cluster"], secret, consumed); err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -147,13 +150,17 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 	return plan, component.ReconciledAfter("Racer installation reconciled", time.Hour), nil
 }
 
-func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret, ready bool) error {
-	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"rbac.yaml", "config.yaml", "controller.yaml"}, nil)
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret, ready bool) error {
+	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "rbac.yaml", "config.yaml", "controller.yaml"}, nil)
 	if err != nil {
 		return err
 	}
 
-	var configHash string
+	var (
+		configHash    string
+		cfg           racercore.Config
+		prerequisites []component.ObjectRef
+	)
 
 	for _, obj := range objects {
 		switch obj.GetKind() {
@@ -166,6 +173,10 @@ func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secre
 				"RACER_BOOTSTRAP_TRUST_CONFIGMAP":   trustName,
 				"RACER_INSTALLATION_CONFIGMAP_NAME": markerName,
 				"RACER_VERSION_CONFIGMAP_NAME":      versionName,
+				"RACER_ISSUER_SECRET_NAME":          "racer-issuer",
+				"RACER_KEYRING_SECRET_NAME":         "racer-keyring",
+				"RACER_DAEMONSET_NAME":              dataplaneName,
+				"RACER_DATAPLANE_SERVICE_ACCOUNT":   dataplaneName,
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
@@ -178,7 +189,29 @@ func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secre
 				return err
 			}
 
+			cm, err = preservedConfig(ctx, env, plan, cm, values)
+			if err != nil {
+				return err
+			}
+
 			configHash = component.ConfigMapPayloadHash(cm)
+
+			cfg, err = racercore.ConfigFromLookup(func(key string) (string, bool) {
+				if key == "POD_NAMESPACE" {
+					return env.Namespace, true
+				}
+
+				value, ok := cm.Data[key]
+
+				return value, ok
+			})
+			if err != nil {
+				return err
+			}
+
+			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
+
+			continue
 		case "Deployment":
 			if !ready {
 				continue
@@ -197,7 +230,14 @@ func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secre
 			}
 		}
 
-		plan.Add(component.Operation{Kind: component.OpApply, Object: obj, Component: name, Overridable: obj.GetKind() == "Deployment"})
+		op := component.Operation{Kind: component.OpApply, Object: obj, Component: name, Overridable: obj.GetKind() == "Deployment"}
+		if obj.GetKind() == "ValidatingAdmissionPolicy" || obj.GetKind() == "ValidatingAdmissionPolicyBinding" {
+			prerequisites = append(prerequisites, op.Ref())
+		} else if obj.GetKind() == "RoleBinding" || obj.GetKind() == "Deployment" {
+			op.DependsOn = append(op.DependsOn, prerequisites...)
+		}
+
+		plan.Add(op)
 	}
 
 	add(plan, component.OpApply, &corev1.ConfigMap{
@@ -206,13 +246,47 @@ func runtimePlan(env *component.Env, plan *component.Plan, cluster string, secre
 		Data:       map[string]string{"ca.crt": string(secret.Data["ca.crt"])},
 	})
 
+	defaults, err := env.DefaultConfigMap(manifests.Manifests, dataplaneConfigName, name)
+	if err != nil {
+		return err
+	}
+
+	tuning, err := preservedConfig(ctx, env, plan, defaults, nil)
+	if err != nil {
+		return err
+	}
+
+	if ready {
+		ds, err := racercore.DesiredDaemonSet(cfg)
+		if err != nil {
+			return err
+		}
+
+		ds.Spec.Template.Annotations = map[string]string{"unbounded-cloud.io/racer-config-hash": component.ConfigMapPayloadHash(tuning)}
+		container := &ds.Spec.Template.Spec.Containers[0]
+		container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
+		// Scheduling reservation, not a claim that admission budgets bound RSS.
+		// TLS, metadata, allocator overhead and filesystem cache are additional.
+		container.Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
+
+		op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: true}
+		for _, dependency := range plan.Operations {
+			if dependency.Object.GetKind() != "Deployment" {
+				op.DependsOn = append(op.DependsOn, dependency.Ref())
+			}
+		}
+
+		plan.Add(op)
+	}
+
 	return nil
 }
 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, trustName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, dataplaneConfigName, trustName))))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
 	b.Watches(&batchv1.Job{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(jobName))))
 }
