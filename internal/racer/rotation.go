@@ -285,9 +285,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 	}
 
 	now := r.now()
-	if err := credentials.discardStalePreparation(r.Config, now); err != nil {
-		return ctrl.Result{}, err
-	}
+	credentials.discardStalePreparation(r.Config, now)
 
 	issuerChanged, err := credentials.prepareIssuer(r.Config, now)
 	if err != nil {
@@ -317,15 +315,12 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 	return ctrl.Result{RequeueAfter: max(time.Second, credentials.rotation.NextTransition.Sub(now))}, nil
 }
 
-func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) error {
-	b, s, material := &c.bundle, &c.rotation, c.material
+func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) {
+	b, s := &c.bundle, &c.rotation
 	// Downtime may exhaust a staged root's useful lifetime. Cancel that unused
 	// preparation and stage a fresh replacement with a full new preparation delay.
 	if s.PreparedIssuer != "" {
-		cert, _, err := parseSigning(material.Keys[s.PreparedIssuer])
-		if err != nil {
-			return err
-		}
+		cert := c.signing[s.PreparedIssuer].certificate
 
 		if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
 			roots := b.PeerTrustRoots[:0]
@@ -348,8 +343,6 @@ func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) err
 			s.PreparedIssuer, s.ActivateAt, s.NextRotation = "", time.Time{}, now
 		}
 	}
-
-	return nil
 }
 
 func (c *credentialState) prepareIssuer(cfg Config, now time.Time) (bool, error) {
@@ -361,10 +354,7 @@ func (c *credentialState) prepareIssuer(cfg Config, now time.Time) (bool, error)
 		// it after ambiguous writes instead of generating a different replacement.
 		pending := material.Pending
 		if pending != "" && !containsRoot(*b, pending) {
-			cert, _, err := parseSigning(material.Keys[pending])
-			if err != nil {
-				return false, err
-			}
+			cert := c.signing[pending].certificate
 
 			if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
 				pending = ""
@@ -584,6 +574,8 @@ type credentialState struct {
 	bundle   wire.KeyringBundle
 	rotation RotationState
 	material issuerMaterial
+	// Parsed once per authoritative read, never used to install candidate trust.
+	signing map[string]parsedSigning
 }
 
 func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (credentialState, error) {
@@ -622,16 +614,32 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 		return credentialState{}, wire.Unavailable
 	}
 
-	if err := validateRotation(b, s, material); err != nil {
+	credentials := credentialState{issuer: &issuer, shared: &shared, bundle: b, rotation: s, material: material}
+	if err := credentials.validateRotation(); err != nil {
 		return credentialState{}, err
 	}
 
-	return credentialState{issuer: &issuer, shared: &shared, bundle: b, rotation: s, material: material}, nil
+	return credentials, nil
 }
 
-func validateRotation(b wire.KeyringBundle, s RotationState, m issuerMaterial) error {
+func (c *credentialState) validateRotation() error {
+	b, s, m := c.bundle, c.rotation, c.material
 	if s.NextRotation.IsZero() || s.NextTransition.IsZero() || s.Retiring == nil || !containsRoot(b, s.ActiveIssuer) || (s.PreparedIssuer == "") != s.ActivateAt.IsZero() {
 		return wire.Unavailable
+	}
+
+	c.signing = make(map[string]parsedSigning, len(m.Keys))
+	for id, material := range m.Keys {
+		if rootID(material.Certificate) != id {
+			return wire.Unavailable
+		}
+
+		cert, key, err := parseSigning(material)
+		if err != nil {
+			return err
+		}
+
+		c.signing[id] = parsedSigning{certificate: cert, key: key}
 	}
 
 	expected := map[string]time.Time{}
@@ -648,13 +656,9 @@ func validateRotation(b wire.KeyringBundle, s RotationState, m issuerMaterial) e
 	for _, root := range b.PeerTrustRoots {
 		id := rootID(root)
 
-		key, ok := m.Keys[id]
-		if !ok || !bytes.Equal(key.Certificate, root) {
+		key, ok := c.signing[id]
+		if !ok || !bytes.Equal(key.certificate.Raw, root) {
 			return wire.Unavailable
-		}
-
-		if _, _, err := parseSigning(key); err != nil {
-			return err
 		}
 
 		if id != s.ActiveIssuer && id != s.PreparedIssuer {
@@ -700,16 +704,6 @@ func validateRotation(b wire.KeyringBundle, s RotationState, m issuerMaterial) e
 	if m.Pending != "" {
 		if _, ok := m.Keys[m.Pending]; !ok {
 			return wire.Unavailable
-		}
-	}
-
-	for id, key := range m.Keys {
-		if rootID(key.Certificate) != id {
-			return wire.Unavailable
-		}
-
-		if _, _, err := parseSigning(key); err != nil {
-			return err
 		}
 	}
 

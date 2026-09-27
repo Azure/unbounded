@@ -15,6 +15,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -204,6 +205,81 @@ func TestTrustReadOutageAtEachAuthorityRead(t *testing.T) {
 				t.Fatalf("read outage withdrew local state: %v", err)
 			}
 		})
+	}
+}
+
+func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
+	for _, resource := range []string{"racer-installation", "racer-version", "racer-issuer", "racer-keyring"} {
+		for _, failure := range []string{"outage", "deleted", "malformed"} {
+			t.Run(resource+"/"+failure, func(t *testing.T) {
+				r, now := testKeyring(t)
+				runKeys(t, r)
+				_, _, initial, _ := keyState(t, r)
+				*now = initial.NextRotation
+
+				accepted, err := r.Trust.pool()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				reads := 0
+				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == resource {
+						reads++
+						if reads == 2 {
+							switch failure {
+							case "outage":
+								return errors.New("post-reconcile API outage")
+							case "deleted":
+								return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
+							case "malformed":
+								if err := c.Get(ctx, key, obj, opts...); err != nil {
+									return err
+								}
+
+								switch value := obj.(type) {
+								case *corev1.Secret:
+									value.Data = nil
+								case *corev1.ConfigMap:
+									value.Data = nil
+								}
+
+								return nil
+							}
+						}
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				}})
+
+				if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil || reads != 2 {
+					t.Fatalf("post-reconcile failure bypassed: %v, reads=%d", err, reads)
+				}
+
+				current, err := r.Trust.pool()
+				if failure == "outage" {
+					if err != nil || current != accepted || !r.Lifecycle.issuer {
+						t.Fatalf("read outage replaced accepted trust with candidate roots: %v", err)
+					}
+				} else if err == nil || r.Lifecycle.issuer {
+					t.Fatal("observed invalid authority retained or installed trust")
+				}
+
+				r.APIReader = r.Client
+
+				_, staged, _, _ := keyState(t, r)
+				if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
+					t.Fatal("failure preceded successful rotation publication")
+				}
+
+				runKeys(t, r)
+
+				current, err = r.Trust.pool()
+				if err != nil || current.Equal(accepted) {
+					t.Fatalf("fresh successful reconciliation did not install staged trust: %v", err)
+				}
+			})
+		}
 	}
 }
 

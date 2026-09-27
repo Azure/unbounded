@@ -113,6 +113,11 @@ func parseSigning(m signingMaterial) (*x509.Certificate, ed25519.PrivateKey, err
 	return cert, key, nil
 }
 
+type parsedSigning struct {
+	certificate *x509.Certificate
+	key         ed25519.PrivateKey
+}
+
 type signingState struct {
 	certificate *x509.Certificate
 	key         ed25519.PrivateKey
@@ -143,10 +148,8 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, err
 	}
 
-	cert, key, err := parseSigning(credentials.material.Keys[credentials.rotation.ActiveIssuer])
-	if err != nil {
-		return signingState{}, err
-	}
+	active := credentials.signing[credentials.rotation.ActiveIssuer]
+	cert, key := active.certificate, active.key
 
 	if now.Before(cert.NotBefore) || now.Add(cfg.certificateLifetime()).After(cert.NotAfter) {
 		return signingState{}, wire.Unavailable
@@ -155,10 +158,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 	roots := x509.NewCertPool()
 
 	for _, der := range credentials.bundle.PeerTrustRoots {
-		root, err := x509.ParseCertificate(der)
-		if err != nil {
-			return signingState{}, wire.Unavailable
-		}
+		root := credentials.signing[rootID(der)].certificate
 
 		if !now.Before(root.NotBefore) && now.Before(root.NotAfter) {
 			roots.AddCert(root)
