@@ -103,6 +103,14 @@ links. Successful routes are bounded FIFO entries; failures are not cached.
 Concurrent cold searches are limited to `clamp(cache_capacity, 1, 8)` to bound
 aggregate scratch memory; dropping an operation releases that admission.
 
+Cut-through transit also excludes locally saturated outbound endpoint slots from
+the source's incident edges before signing the next hop. These temporary admission
+hints share the bounded route-cache key's unavailable-edge set; they do not mark
+nodes failed or modify link-health circuits. An available detour uses the same
+shortest-path ordering, work allowance, visited exclusions, and remaining signed
+link budget. Checkout still enforces admission if capacity changes during search.
+Transit does not wait for busy connections or retry an already sent envelope.
+
 Normal admission chooses 4 links; failure-tolerant admission may choose 8.
 An already admitted attempt never increases its budget. `visited` contains
 prior senders and excludes the current recipient. A forward appends the

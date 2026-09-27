@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -81,53 +82,62 @@ func TestProductionStreamFixture(t *testing.T) {
 	if err = json.Unmarshal(small(manifest.Config), &config); err != nil || config.Architecture != "amd64" {
 		t.Fatal("invalid config", err)
 	}
-	for start := 0; start < len(manifest.Layers); start += 4 {
-		var ready, done sync.WaitGroup
-		var barrier sync.Once
-		ready.Add(4)
-		done.Add(4)
-		for _, layer := range manifest.Layers[start : start+4] {
-			go func() {
-				defer done.Done()
-				value := get(layer)
-				if value == nil {
+	rounds, err := strconv.Atoi(os.Getenv("RACER_STREAM_ROUNDS"))
+	if err != nil || rounds < 1 {
+		rounds = 1
+	}
+	for round := 0; round < rounds; round++ {
+		for start := 0; start < len(manifest.Layers); start += 4 {
+			var ready, done sync.WaitGroup
+			var barrier sync.Once
+			ready.Add(4)
+			done.Add(4)
+			for _, layer := range manifest.Layers[start : start+4] {
+				go func() {
+					defer done.Done()
+					if rounds > 1 {
+						time.Sleep(time.Duration(layer.RawKey[0]%20) * time.Millisecond)
+					}
+					value := get(layer)
+					if value == nil {
+						ready.Done()
+						return
+					}
+					defer value.Close()
+					hash := sha256.New()
+					n, err := io.CopyN(hash, value, int64(PageSize))
 					ready.Done()
-					return
-				}
-				defer value.Close()
-				hash := sha256.New()
-				n, err := io.CopyN(hash, value, int64(PageSize))
-				ready.Done()
-				ready.Wait()
-				if directory := os.Getenv("RACER_STREAM_BARRIER"); directory != "" && start == 0 {
-					barrier.Do(func() {
-						if err := os.WriteFile(filepath.Join(directory, "sdk-ready"), []byte("ready"), 0o600); err != nil {
-							t.Error(err)
-							return
-						}
-						for {
-							if _, err := os.Stat(filepath.Join(directory, "sdk-release")); err == nil {
-								break
-							}
-							select {
-							case <-ctx.Done():
-								t.Error(ctx.Err())
+					ready.Wait()
+					if directory := os.Getenv("RACER_STREAM_BARRIER"); directory != "" && start == 0 {
+						barrier.Do(func() {
+							if err := os.WriteFile(filepath.Join(directory, "sdk-ready"), []byte("ready"), 0o600); err != nil {
+								t.Error(err)
 								return
-							case <-time.After(time.Millisecond):
 							}
-						}
-					})
-				}
-				if err == nil {
-					var rest int64
-					rest, err = io.Copy(hash, value)
-					n += rest
-				}
-				if err != nil || n != layer.Size || fmt.Sprintf("sha256:%x", hash.Sum(nil)) != layer.Digest {
-					t.Errorf("layer bytes=%d want=%d err=%v", n, layer.Size, err)
-				}
-			}()
+							for {
+								if _, err := os.Stat(filepath.Join(directory, "sdk-release")); err == nil {
+									break
+								}
+								select {
+								case <-ctx.Done():
+									t.Error(ctx.Err())
+									return
+								case <-time.After(time.Millisecond):
+								}
+							}
+						})
+					}
+					if err == nil {
+						var rest int64
+						rest, err = io.Copy(hash, value)
+						n += rest
+					}
+					if err != nil || n != layer.Size || fmt.Sprintf("sha256:%x", hash.Sum(nil)) != layer.Digest {
+						t.Errorf("layer bytes=%d want=%d err=%v", n, layer.Size, err)
+					}
+				}()
+			}
+			done.Wait()
 		}
-		done.Wait()
 	}
 }

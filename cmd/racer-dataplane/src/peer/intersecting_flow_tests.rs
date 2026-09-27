@@ -147,6 +147,55 @@ fn streaming_load_reclaims_incoming_keepalives() {
     }
 }
 
+#[test]
+#[ignore = "sustained same-page hotspot on fleet routes: run with --release"]
+fn sustained_hotspot_uses_available_transit_edges() {
+    intersecting_with_pressure(2, P, true, false, true, "hotspot");
+}
+
+#[test]
+#[ignore = "sustained production Fill on fleet hotspot routes: run with --release"]
+fn sustained_fills_use_available_transit_edges() {
+    intersecting_with_pressure(2, P, true, false, true, "hotspot-fill");
+}
+
+struct HotspotIngress {
+    next: NodeId,
+    endpoint: Endpoint,
+    auth: Rc<Forwarding>,
+    transfers: Rc<transfer::Transfers>,
+}
+impl requester::PeerClient for HotspotIngress {
+    fn request<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+    ) -> FutureResult<'a, wire::VerifiedResponse> {
+        Box::pin(async move { self.request_reserved(request, scope, &mut None).await })
+    }
+    fn request_reserved<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<Reservation>,
+    ) -> FutureResult<'a, wire::VerifiedResponse> {
+        Box::pin(async move {
+            let (signed, binding) = self.auth.sign_request_to(request, &self.next)?;
+            let response = self
+                .transfers
+                .exchange_reserved(
+                    self.endpoint.clone(),
+                    signed,
+                    crate::topology::rails::TransportPlan::Http,
+                    scope,
+                    output,
+                )
+                .await?;
+            self.auth.verify_response(response, &binding)
+        })
+    }
+}
+
 fn incoming_keepalive<'a>(
     node: &'a Node,
     source: &NodeId,
@@ -187,13 +236,20 @@ fn intersecting_with_pressure(
     cut_through: bool,
     pressure: &str,
 ) {
+    let hotspot = pressure.starts_with("hotspot");
     // Actual 1500-member radix-18 graph: both middle edges occur in production
-    // shortest paths. Only the six participating peers need active sockets.
-    const POSITIONS: [usize; 6] = [3, 0, 1, 18, 19, 2];
+    // shortest paths. Hotspot cases activate one additional detour peer.
+    const BASE_POSITIONS: [usize; 6] = [3, 0, 1, 18, 19, 2];
+    const HOTSPOT_POSITIONS: [usize; 7] = [3, 0, 1, 18, 19, 2, 333];
+    let positions: &[usize] = if hotspot {
+        &HOTSPOT_POSITIONS
+    } else {
+        &BASE_POSITIONS
+    };
     let names: Vec<_> = (0..1500)
         .map(|i| format!("{:08x}-1111-4111-8111-111111111111", i + 1))
         .collect();
-    let active_names: Vec<_> = POSITIONS.iter().map(|&i| names[i].as_str()).collect();
+    let active_names: Vec<_> = positions.iter().map(|&i| names[i].as_str()).collect();
     let (signers, discovery) = named_identities(&active_names, 8192);
     for signer in &signers {
         for peer in &signers {
@@ -238,7 +294,7 @@ fn intersecting_with_pressure(
         )
         .unwrap();
     }
-    let listeners: Vec<_> = POSITIONS
+    let listeners: Vec<_> = positions
         .iter()
         .map(|_| {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -255,7 +311,7 @@ fn intersecting_with_pressure(
                 .map(|(i, name)| Member {
                     node: NodeId(name.clone()),
                     shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: POSITIONS.iter().position(|&p| p == i).map_or_else(
+                    peer_endpoint: positions.iter().position(|&p| p == i).map_or_else(
                         || "127.0.0.1:9".into(),
                         |j| listeners[j].local_addr().unwrap().to_string(),
                     ),
@@ -293,7 +349,7 @@ fn intersecting_with_pressure(
             .collect(),
         calls: RefCell::new(HashMap::new()),
     });
-    let mut nodes: Vec<_> = (0..6)
+    let mut nodes: Vec<_> = (0..positions.len())
         .map(|i| {
             build_node_with_limits_adjustment(
                 i,
@@ -389,7 +445,12 @@ fn intersecting_with_pressure(
     }
     let scope = RequestScope::new(
         RequestId([93; 16]),
-        Instant::now() + Duration::from_secs(if pressure == "idle-churn" { 30 } else { 10 }),
+        Instant::now()
+            + Duration::from_secs(if pressure == "idle-churn" || hotspot {
+                30
+            } else {
+                10
+            }),
     )
     .unwrap();
     let mut endpoints: Vec<_> = nodes
@@ -435,6 +496,25 @@ fn intersecting_with_pressure(
         tick(&mut cx);
     }
     drop(seed);
+    let mut hot_connections = Vec::new();
+    if hotspot {
+        // Keep exactly the existing two slots on the canonical middle edge busy.
+        // Other graph edges remain available; no quota is increased for detours.
+        let endpoint = Endpoint::Peer(listeners[2].local_addr().unwrap().to_string());
+        for _ in 0..2 {
+            let mut checkout = nodes[1].pool.checkout(&endpoint, &scope);
+            loop {
+                match checkout.as_mut().poll(&mut cx) {
+                    Poll::Ready(connection) => {
+                        hot_connections.push(connection.unwrap());
+                        break;
+                    }
+                    Poll::Pending => tick(&mut cx),
+                }
+                scope.check().unwrap();
+            }
+        }
+    }
     let copies: Vec<_> = [3, 5]
         .iter()
         .enumerate()
@@ -474,7 +554,7 @@ fn intersecting_with_pressure(
         }
     }
     let mut requests = FuturesUnordered::new();
-    let rounds = if churn { 12 } else { 1 };
+    let rounds = if churn || hotspot { 12 } else { 1 };
     for (side, (source, first, destination)) in [(0, 1, 3), (4, 2, 5)].into_iter().enumerate() {
         for index in 0..slots {
             let node = &nodes[source];
@@ -521,8 +601,52 @@ fn intersecting_with_pressure(
             let first = signers[first].node().clone();
             let copies = &copies;
             let key = keys[side];
+            let signer = signers[source].clone();
+            let membership = membership.clone();
             requests.push(async move {
+                let mut dependencies = node.fill.dependencies_for_test();
+                let peers = Rc::new(HotspotIngress {
+                    next: first.clone(),
+                    endpoint: endpoint.clone(),
+                    auth: Rc::new(Forwarding::new(signer.clone())),
+                    transfers: node.transfers.clone(),
+                });
+                dependencies.peers = peers.clone();
+                dependencies.candidates = Rc::new(CandidatePolicy::new(
+                    signer.node().clone(),
+                    Rc::new(Placement::new(128)),
+                    peers,
+                ));
+                let fill = Fill::new(dependencies);
                 for round in 0..rounds {
+                    if hotspot {
+                        let arrival = Instant::now() + Duration::from_millis(20);
+                        std::future::poll_fn(|cx| {
+                            if Instant::now() >= arrival {
+                                Poll::Ready(())
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                    if pressure == "hotspot-fill" {
+                        let mut budget = AcquisitionBudget::new(request_scope.deadline.0, 8, 16);
+                        let result = fill
+                            .acquire(
+                                page(key, 0),
+                                membership.clone(),
+                                &context(key),
+                                &request_scope,
+                                &mut budget,
+                            )
+                            .await?;
+                        assert_eq!(result.plaintext.bytes(), vec![key.0[0]; bytes]);
+                        drop(result);
+                        node.writer.discard_unsubmitted();
+                        node.memory.evict_idle(usize::MAX).unwrap();
+                    }
                     // Fresh signed attempts under one unchanged scope; these are
                     // independent arrivals, not retries of failed transmissions.
                     let attempt = AttemptId([round as u8 + 32 * index as u8; 16]);
@@ -627,7 +751,7 @@ fn intersecting_with_pressure(
             );
         }
     } else if deferred {
-        let end = Instant::now() + Duration::from_secs(if churn { 25 } else { 3 });
+        let end = Instant::now() + Duration::from_secs(if churn || hotspot { 25 } else { 3 });
         let started = Instant::now();
         let mut arrivals = 0;
         let mut complete = 0;
@@ -654,7 +778,7 @@ fn intersecting_with_pressure(
             while let Poll::Ready(Some(result)) = requests.poll_next_unpin(&mut cx) {
                 let response = match result {
                     Ok(response) => response,
-                    Err(error) if pressure != "none" && !churn => {
+                    Err(error) if pressure != "none" && !churn && !hotspot => {
                         assert!(
                             matches!(error, Error::Io | Error::Overloaded | Error::Unavailable),
                             "{error:?}"
@@ -668,6 +792,7 @@ fn intersecting_with_pressure(
                 let PeerResponse::Page { ciphertext, .. } = response.response else {
                     if pressure != "none"
                         && !churn
+                        && !hotspot
                         && matches!(
                             response.response,
                             PeerResponse::Overloaded | PeerResponse::Unavailable
@@ -701,7 +826,7 @@ fn intersecting_with_pressure(
                 started.elapsed()
             );
         }
-        if pressure != "none" && !churn {
+        if pressure != "none" && !churn && !hotspot {
             assert!(failed > 0, "pressure was not exercised");
         }
         eprintln!(
@@ -768,6 +893,7 @@ fn intersecting_with_pressure(
     scope.cancel().unwrap();
     drop(servers);
     drop(requests);
+    drop(hot_connections);
     drop(idle_work);
     drop(idle_peers);
     drop(copies);

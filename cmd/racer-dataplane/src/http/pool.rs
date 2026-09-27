@@ -450,6 +450,15 @@ impl HttpPool {
     ) -> Operation<'a, ConnectionLease> {
         self.checkout_inner(endpoint, scope, false)
     }
+    /// Routing hint only; checkout still owns and enforces admission. A full
+    /// endpoint must not hide other currently available incident graph edges.
+    pub(crate) fn endpoint_saturated(&self, endpoint: &Endpoint) -> bool {
+        self.state
+            .borrow()
+            .entries
+            .get(endpoint)
+            .is_some_and(|entry| entry.active >= self.per_endpoint)
+    }
     fn checkout_inner<'a>(
         &'a self,
         endpoint: &'a Endpoint,

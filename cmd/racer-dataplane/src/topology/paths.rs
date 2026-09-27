@@ -162,8 +162,21 @@ impl Paths {
         from: &'a NodeId,
         budget: &'a RouteBudget,
     ) -> Operation<'a, Route> {
+        self.shortest_available_async(membership, from, budget, &[])
+    }
+
+    /// Exclude only the source's temporarily saturated incident edges. This is
+    /// a local admission snapshot, not a failed node or a change in placement.
+    /// The same shortest-path tie rules, work limit and signed hop ceiling apply.
+    pub(crate) fn shortest_available_async<'a>(
+        &'a self,
+        membership: MembershipLease,
+        from: &'a NodeId,
+        budget: &'a RouteBudget,
+        saturated: &'a [NodeId],
+    ) -> Operation<'a, Route> {
         Box::pin(async move {
-            let key = self.key(&membership, from, budget)?;
+            let key = self.available_key(&membership, from, budget, saturated)?;
             if let Some(route) = self.cached(&membership, &key) {
                 return Ok(route);
             }
@@ -180,12 +193,33 @@ impl Paths {
             .await?;
             let nodes = search.finish()?;
             // Health may have changed while yielded: retry under the same budget.
-            if self.key(&membership, from, budget)? != key {
+            if self.available_key(&membership, from, budget, saturated)? != key {
                 return Err(Error::Unavailable);
             }
             self.store(&membership, key, &nodes);
             Ok(route(membership, &nodes))
         })
+    }
+
+    fn available_key(
+        &self,
+        membership: &MembershipLease,
+        from: &NodeId,
+        budget: &RouteBudget,
+        saturated: &[NodeId],
+    ) -> Result<PathKey> {
+        let mut key = self.key(membership, from, budget)?;
+        let neighbors = neighbor_positions(membership.members().len(), key.from);
+        for node in saturated {
+            let position = membership.position(node)?;
+            if neighbors.binary_search(&position).is_err() {
+                return Err(Error::InvalidRequest);
+            }
+            key.failed.push(position);
+        }
+        key.failed.sort_unstable();
+        key.failed.dedup();
+        Ok(key)
     }
 
     fn admit_search(&self) -> Result<SearchAdmission<'_>> {
@@ -520,6 +554,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn saturated_edges_are_local_bounded_and_do_not_poison_healthy_routes() {
+        let members = membership(1500);
+        let paths = Paths::new(Rc::new(LinkHealth), 4, 150_000);
+        let from = &members.members()[0].node;
+        let busy = vec![members.members()[1].node.clone()];
+        for links in [1, 2, 3, 4] {
+            for destination in [1, 18, 333, 1499] {
+                let mut request = budget(&members, destination, links);
+                request.visited = vec![members.members()[3].node.clone()];
+                let expected = oracle(1500, 0, destination, links, &[3], &[1]);
+                let result = futures::executor::block_on(paths.shortest_available_async(
+                    members.clone(),
+                    from,
+                    &request,
+                    &busy,
+                ));
+                match expected {
+                    Some(expected) => assert_eq!(
+                        result.unwrap().nodes,
+                        expected
+                            .into_iter()
+                            .map(|i| members.members()[i].node.clone())
+                            .collect::<Vec<_>>()
+                    ),
+                    None => assert_eq!(result.unwrap_err(), Error::Unavailable),
+                }
+                assert_eq!(request.remaining_links, links);
+                assert_eq!(request.remaining_attempts, 0);
+            }
+        }
+        let request = budget(&members, 1, 4);
+        assert_eq!(
+            paths
+                .shortest(members.clone(), from, &request)
+                .unwrap()
+                .nodes
+                .len(),
+            2
+        );
+        let all: Vec<_> = neighbor_positions(1500, 0)
+            .into_iter()
+            .map(|i| members.members()[i].node.clone())
+            .collect();
+        assert_eq!(
+            futures::executor::block_on(paths.shortest_available_async(
+                members.clone(),
+                from,
+                &request,
+                &all
+            ))
+            .unwrap_err(),
+            Error::Unavailable
+        );
+        assert_eq!(
+            futures::executor::block_on(paths.shortest_available_async(
+                members.clone(),
+                from,
+                &request,
+                &[members.members()[18].node.clone()]
+            ))
+            .unwrap_err(),
+            Error::InvalidRequest
+        );
+        let mut expired = request.clone();
+        expired.deadline = Deadline(Instant::now());
+        assert_eq!(
+            futures::executor::block_on(paths.shortest_available_async(
+                members.clone(),
+                from,
+                &expired,
+                &busy
+            ))
+            .unwrap_err(),
+            Error::DeadlineExceeded
+        );
+        assert_eq!(
+            paths
+                .shortest(members.clone(), from, &request)
+                .unwrap()
+                .nodes
+                .len(),
+            2
+        );
+        assert!(paths.cached_paths() <= 4);
     }
 
     #[test]

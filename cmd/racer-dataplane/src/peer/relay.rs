@@ -63,14 +63,34 @@ impl Relay {
             let budget = &request.request().route;
             let previous = budget.visited.last().ok_or(Error::InvalidRequest)?.clone();
             network.endpoint(budget.membership, &previous)?;
+            let membership = network.membership(budget.membership)?;
+            let saturated = crate::topology::graph::Graph::new(membership.clone())
+                .neighbors(&network.local)?
+                .into_iter()
+                .filter(|node| {
+                    network
+                        .endpoint(budget.membership, node)
+                        .is_ok_and(|endpoint| transfers.http.endpoint_saturated(&endpoint))
+                })
+                .collect::<Vec<_>>();
             let route = self
                 .paths
-                .shortest_async(
-                    network.membership(budget.membership)?,
+                .shortest_available_async(
+                    membership,
                     &network.local,
                     &super::search_budget(budget, &network.local)?,
+                    &saturated,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    // If the available subgraph has no route, preserve overload
+                    // backoff at the acquisition owner rather than imply a miss.
+                    if error == Error::Unavailable && !saturated.is_empty() {
+                        Error::Overloaded
+                    } else {
+                        error
+                    }
+                })?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             // No wait for another exchange's scarce resources, including the
             // discovery handshake. A failure unwinds before a page head is sent.

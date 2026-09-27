@@ -53,6 +53,14 @@ fn sdk_full_image_survives_expired_peer_fill() {
     sdk_fixture(true, false, true, false, false, true);
 }
 
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_sustained_full_images_avoid_hot_transit_edge() {
+    // This combination selects ongoing hotspot pressure instead of the existing
+    // one-time relay-quota scenario. All SDK connections and layer sizes match it.
+    sdk_fixture(true, false, true, true, true, false);
+}
+
 /// Select an explicit first hop so this small graph exercises a relay, as the
 /// fleet does. Everything after signing uses production transport and Fill.
 pub(super) struct ViaRelay {
@@ -165,6 +173,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         relay_pressure,
         expired_fill,
     } = scenario;
+    let hotspot = incoming_pressure && relay_pressure;
     let (signers, discovery) =
         named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
     for signer in &signers {
@@ -506,6 +515,15 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     } else {
         socket
     };
+    let mut hot_connections = Vec::new();
+    if hotspot {
+        drive(Box::pin(async {
+            let endpoint = Endpoint::Peer(listeners[2].local_addr().unwrap().to_string());
+            for _ in 0..2 {
+                hot_connections.push(nodes[1].pool.checkout(&endpoint, &scope).await.unwrap());
+            }
+        }));
+    }
     let fixture = output.join("manifest.json");
     fs::write(&fixture, serde_json::to_vec(&manifest_descriptor).unwrap()).unwrap();
     let mut child = Process(
@@ -517,9 +535,10 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
             ])
             .env("RACER_STREAM_SOCKET", socket)
             .env("RACER_STREAM_LAYERS", fixture)
+            .env("RACER_STREAM_ROUNDS", if hotspot { "3" } else { "1" })
             .env(
                 "RACER_STREAM_BARRIER",
-                if incoming_pressure || relay_pressure || expired_fill {
+                if !hotspot && (incoming_pressure || relay_pressure || expired_fill) {
                     output.as_os_str()
                 } else {
                     std::ffi::OsStr::new("")
@@ -771,7 +790,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
             }
         })));
     }
-    if incoming_pressure {
+    if incoming_pressure && !hotspot {
         assert!(
             nodes[0].pool.incoming_reclaims.get() > 0,
             "SDK must exercise accepted-peer reclamation"
@@ -780,7 +799,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     if expired_fill {
         assert!(pressure_seeded, "SDK must cross the expired-Fill barrier");
     }
-    if relay_pressure {
+    if relay_pressure && !hotspot {
         assert!(
             nodes
                 .iter()
@@ -790,6 +809,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
             "SDK continuations must exercise relay admission"
         );
     }
+    drop(hot_connections);
     for node in &nodes {
         node.pool.close();
         node.writer.discard_unsubmitted();
