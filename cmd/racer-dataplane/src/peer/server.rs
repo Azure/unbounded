@@ -204,8 +204,7 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::pool::ConnectionLease> {
         Box::pin(async move {
-            use super::{transfer::WireBuffer, wire::WireCodec};
-            use crate::runtime::reactor::IoBuffer;
+            use super::wire::WireCodec;
             scope.check()?;
             let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
             // One fixed budget for handshake reads, verification, signing, writes,
@@ -305,11 +304,12 @@ impl PeerServer {
             let sent = self.io.send_head(connection, head, &request_scope).await?;
             let mut connection = sent.connection;
             if !body.is_empty() {
-                let mut buffer = WireBuffer::new(&self.admission, body.len())?;
-                buffer.bytes_mut()?.copy_from_slice(body);
+                let PeerResponse::Page { ciphertext, .. } = &response.response else {
+                    return Err(Error::InvalidRequest);
+                };
                 let sent = self
                     .io
-                    .write_body(connection, buffer, &request_scope)
+                    .write_body(connection, ciphertext.clone(), &request_scope)
                     .await?;
                 if sent.bytes != body.len() {
                     return Err(Error::Io);

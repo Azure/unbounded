@@ -1438,13 +1438,21 @@ impl Op {
                     check_direct(flags, *offset, *ptr, *len)?;
                 }
                 let len = (*len).min(limit).min(i32::MAX as usize);
-                // SAFETY: Entry owns the exclusive IoBuffer until both completions.
-                let bytes = unsafe { std::slice::from_raw_parts_mut(*ptr, len) };
                 let n = match operation {
-                    BufferOperation::Read(offset) => fd.file_read(*offset, bytes),
-                    BufferOperation::Write(offset) => fd.file_write(*offset, bytes),
-                    BufferOperation::Recv => fd.recv(bytes),
-                    BufferOperation::Send => fd.send(bytes),
+                    // SAFETY: receive/read entries own exclusive IoBuffers through
+                    // both fences; immutable sends may have shared aliases.
+                    BufferOperation::Read(offset) => fd.file_read(*offset, unsafe {
+                        std::slice::from_raw_parts_mut(*ptr, len)
+                    }),
+                    BufferOperation::Recv => {
+                        fd.recv(unsafe { std::slice::from_raw_parts_mut(*ptr, len) })
+                    }
+                    BufferOperation::Write(offset) => {
+                        fd.file_write(*offset, unsafe { std::slice::from_raw_parts(*ptr, len) })
+                    }
+                    BufferOperation::Send => {
+                        fd.send(unsafe { std::slice::from_raw_parts(*ptr, len) })
+                    }
                 }?;
                 Ok(KernelResult::Value(n as i32))
             }

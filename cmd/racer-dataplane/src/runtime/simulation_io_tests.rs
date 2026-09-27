@@ -11,6 +11,70 @@ impl Drop for Probe {
 }
 
 #[test]
+fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences() {
+    use crate::model::{
+        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
+        metadata::VersionMetadata,
+    };
+    for cancel_first in [false, true] {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let r = reactor();
+        let scope = scope();
+        let bundle = crate::memory::pool::tests::bundle_for(
+            &r.admission,
+            VersionMetadata {
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: CacheId("cache".into()),
+                        key: CacheKey([0; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 3,
+            },
+        );
+        let page = bundle.ciphertext.clone();
+        drop(bundle);
+        let weak = std::sync::Arc::downgrade(&page.inner);
+        let pointer = page.bytes().as_ptr();
+        let (fd, peer) = sim.socket_pair();
+        let fd = Rc::new(fd);
+        sim.set_max_chunk(3);
+        let completed = drive(&r, r.send(fd.clone(), page.clone(), (), &scope)).unwrap();
+        assert_eq!(completed.bytes, 3);
+        assert_eq!(completed.buffer.bytes().as_ptr(), pointer);
+        assert_eq!(page.bytes(), &[2; 19]);
+        assert_eq!(r.admission.used(ResourceClass::Ciphertext), 19);
+        let mut received = [0; 3];
+        assert_eq!(peer.try_recv(&mut received).unwrap(), 3);
+        assert_eq!(received, [2; 3]);
+        drop(completed);
+        sim.inject("send", Fault::Delay(20));
+        let mut send = r.send(fd, page, (), &scope);
+        assert!(poll(&mut send).is_pending());
+        drop(send);
+        assert_eq!(r.poll_budgeted(1), Ok(0));
+        if !cancel_first {
+            r.state
+                .borrow_mut()
+                .simulation
+                .as_mut()
+                .unwrap()
+                .completed
+                .borrow_mut()
+                .swap(0, 1);
+        }
+        assert_eq!(r.poll_budgeted(1), Ok(1));
+        assert!(weak.upgrade().is_some());
+        assert_eq!(r.admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(r.poll_budgeted(1), Ok(1));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(r.admission.used(ResourceClass::Ciphertext), 0);
+    }
+}
+
+#[test]
 fn abandoned_resources_wait_for_both_fences_in_either_order() {
     for cancel_first in [false, true] {
         let sim = Simulation::new();

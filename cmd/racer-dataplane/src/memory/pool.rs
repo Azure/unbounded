@@ -156,6 +156,12 @@ impl CiphertextPage {
         &self.inner.bytes
     }
 }
+impl crate::runtime::reactor::sealed::Sealed for CiphertextPage {}
+impl crate::runtime::reactor::SendBuffer for CiphertextPage {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(self.bytes())
+    }
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

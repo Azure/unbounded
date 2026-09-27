@@ -12,7 +12,7 @@ use crate::{
         permission::{AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER},
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SetupParameters},
     },
-    runtime::{deadline::RequestScope, reactor::IoBuffer},
+    runtime::deadline::RequestScope,
     security::{
         forwarding::ForwardedHead,
         signing::{SignedHead, VerifiedHead, signed_digest},
@@ -910,10 +910,10 @@ impl Transfers {
         let mut head = WireCodec::encode(&response.authentication, true, ciphertext.bytes().len())?;
         native::attach(&mut head, &finish)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
-        let (admission, _) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let mut buffer = WireBuffer::new(admission, ciphertext.bytes().len())?;
-        buffer.bytes_mut()?.copy_from_slice(ciphertext.bytes());
-        let written = self.io.write_body(connection, buffer, scope).await?;
+        let written = self
+            .io
+            .write_body(connection, ciphertext.clone(), scope)
+            .await?;
         Ok((written.lease, true))
     }
     pub(super) fn accept_native(

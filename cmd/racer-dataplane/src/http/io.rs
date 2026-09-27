@@ -14,7 +14,7 @@ use crate::{
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
-        reactor::{Completion, IoBuffer, Reactor},
+        reactor::{Completion, IoBuffer, Reactor, SendBuffer},
     },
 };
 use std::{ops::Range, rc::Rc};
@@ -89,6 +89,18 @@ pub struct HttpIo {
     codec: super::codec::Codec,
     send_body_limit: u64,
     admission: Option<Rc<Admission>>,
+}
+
+/// Immutable subrange owner; cannot be submitted to a receive operation.
+struct SendRange<B: SendBuffer> {
+    buffer: B,
+    range: Range<usize>,
+}
+impl<B: SendBuffer> crate::runtime::reactor::sealed::Sealed for SendRange<B> {}
+impl<B: SendBuffer> SendBuffer for SendRange<B> {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(&self.buffer.send_bytes()?[self.range.clone()])
+    }
 }
 /// A completed head operation, including the still-exclusively-owned connection.
 ///
@@ -434,7 +446,7 @@ impl HttpIo {
                 .await
         })
     }
-    /// Stage borrowed/shared page slices in an owned buffer before calling.
+    /// Transfer an admitted mutable or immutable owner, never a borrowed slice.
     /// ```compile_fail
     /// use racer_dataplane::{http::{io::HttpIo, pool::ConnectionLease},
     ///     runtime::deadline::RequestScope};
@@ -443,14 +455,14 @@ impl HttpIo {
     ///     let _future = io.write_body(connection, &bytes[..], scope);
     /// }
     /// ```
-    pub fn write_body<'a, B: IoBuffer>(
+    pub fn write_body<'a, B: SendBuffer>(
         &'a self,
         connection: ConnectionLease,
         buffer: B,
         scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, ConnectionLease>> {
         Box::pin(async move {
-            let length = buffer.bytes()?.len();
+            let length = buffer.send_bytes()?.len();
             self.write_body_range(connection, buffer, 0..length, scope)
                 .await
         })
@@ -522,7 +534,7 @@ impl HttpIo {
     }
     /// Writes exactly this initialized subrange through partial sends. The full
     /// buffer allocation and connection remain completion-owned at every send.
-    pub fn write_body_range<'a, B: IoBuffer>(
+    pub fn write_body_range<'a, B: SendBuffer>(
         &'a self,
         mut connection: ConnectionLease,
         mut buffer: B,
@@ -532,7 +544,7 @@ impl HttpIo {
         Box::pin(async move {
             scope.check()?;
             connection.begin_io();
-            if range.start > range.end || range.end > buffer.bytes()?.len() {
+            if range.start > range.end || range.end > buffer.send_bytes()?.len() {
                 return Err(Error::InvalidRequest);
             }
             let remaining = connection.tx_remaining.ok_or(Error::InvalidRequest)?;
@@ -545,7 +557,10 @@ impl HttpIo {
                     .reactor
                     .send(
                         connection.fd.clone(),
-                        BufferRange::new(buffer, offset..range.end)?,
+                        SendRange {
+                            buffer,
+                            range: offset..range.end,
+                        },
                         connection,
                         scope,
                     )
@@ -554,7 +569,7 @@ impl HttpIo {
                     return Err(Error::Io);
                 }
                 offset += completion.bytes;
-                buffer = completion.buffer.into_inner();
+                buffer = completion.buffer.buffer;
                 connection = completion.lease;
             }
             connection.tx_remaining = Some(remaining - range.len() as u64);

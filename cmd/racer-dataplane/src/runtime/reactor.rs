@@ -339,6 +339,27 @@ pub trait IoBuffer: sealed::Sealed + 'static {
     fn bytes_mut(&mut self) -> Result<&mut [u8]>;
 }
 
+/// Completion-owned immutable send storage. Shared aliases are permitted only
+/// when none can mutate or relocate the initialized bytes. The owner retains
+/// allocation admission through the final original/cancel completion fence.
+/// This trait deliberately grants no receive or mutable-buffer capability.
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use racer_dataplane::{memory::pool::CiphertextPage,
+///     runtime::{reactor::{Reactor, Descriptor}, deadline::RequestScope}};
+/// fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
+///     let _ = r.recv(fd, page, (), scope);
+/// }
+/// ```
+pub trait SendBuffer: sealed::Sealed + 'static {
+    fn send_bytes(&self) -> Result<&[u8]>;
+}
+impl<B: IoBuffer> SendBuffer for B {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        self.bytes()
+    }
+}
+
 /// Reactor-owned submission state. `L` retains connection/segment/other leases.
 /// Stored before the kernel can see any pointer, including across partial I/O.
 struct InFlight<B: IoBuffer, L: 'static> {
@@ -349,7 +370,7 @@ struct InFlight<B: IoBuffer, L: 'static> {
 
 /// Resources return to the caller only after all applicable completion fences.
 /// On error or an abandoned future, the reactor releases them after those fences.
-pub struct Completion<B: IoBuffer, L: 'static = ()> {
+pub struct Completion<B: 'static, L: 'static = ()> {
     pub buffer: B,
     pub bytes: usize,
     pub lease: L,
@@ -667,14 +688,40 @@ impl Reactor {
         self.buffer_io(fd, buffer, lease, scope, BufferOperation::Recv)
     }
 
-    pub fn send<'a, B: IoBuffer, L: 'static>(
+    pub fn send<'a, B: SendBuffer, L: 'static>(
         &'a self,
         fd: Rc<OwnedFd>,
         buffer: B,
         lease: L,
         scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Send)
+        Box::pin(async move {
+            scope.check()?;
+            let bytes = buffer.send_bytes()?;
+            let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRequest)?;
+            let sqe = submission!(
+                self,
+                simulation::Op::Buffer {
+                    fd: fd.clone(),
+                    operation: BufferOperation::Send,
+                    // Simulation creates a shared slice for Send, never a mutable one.
+                    ptr: bytes.as_ptr().cast_mut(),
+                    len: len as usize,
+                },
+                opcode::Send::new(types::Fd(fd.as_raw_fd()), bytes.as_ptr(), len)
+                    .flags(libc::MSG_NOSIGNAL)
+                    .build()
+            );
+            self.submit(sqe, scope, false, move |result| {
+                drop(fd);
+                Ok(Completion {
+                    buffer,
+                    bytes: result?.value()? as usize,
+                    lease,
+                })
+            })?
+            .await
+        })
     }
 
     pub fn readiness<'a>(
