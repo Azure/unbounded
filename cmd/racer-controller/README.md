@@ -68,7 +68,7 @@ Run `make fmt` before committing. Generated deepcopy/CRD files are regenerated,
 never hand-edited. Behavioral and interoperability tests accompany implementation
 of each boundary; scaffold tests verify actual composition and fail-closed entry.
 
-Deployment must supply the namespace, `racer-controller-tls` serving Secret, and
+Standalone deployment must supply the namespace, `racer-controller-tls` serving Secret, and
 `racer-bootstrap-trust` ConfigMap with `ca.crt`. The serving certificate must cover
 the configured service DNS name. These public trust/server TLS inputs are separate
 from the controller-managed node issuer. No sample private keys are shipped.
@@ -76,7 +76,44 @@ The serving files are loaded at startup, so replacing deployment TLS certificate
 requires a controller restart. Rotating node issuer roots are read live. Bootstrap
 recovery must omit expired client certificates; snapshot always requires mTLS.
 
-## First installation
+## Operator installation
+
+Installing unbounded-operator bootstraps the ClusterCache CRD. Creating a
+`ClusterCache` activates Racer without requiring a Site. The operator provisions
+the controller RBAC, configuration, serving TLS/trust, and initialize-only Job,
+then deploys the controller after validating the consumed marker and bound
+version counters. The controller provisions node credentials and its dataplane
+DaemonSet. Both images use the operator's registry prefix and release tag.
+
+The operator reserves a random UUID in `racer-operator-installation`, consumes
+that claim under an optimistic lock, and attempts to create `racer-installation`.
+Both objects are permanent. The consumed operator claim is immutable, binds the
+marker to its UID, and never authorizes marker recreation. A crash after claim
+consumption but before marker creation fails closed. The controller's own
+initialize command separately consumes the marker before its single counter
+Create. An interrupted initialization with valid bound counters can proceed;
+missing or corrupt counters require consistent recovery or an explicit new
+installation with a new UUID, preferably in a new namespace. Never delete or
+reset claims to retry initialization. Back up all permanent and durable objects
+together; deleting every trace of an installation cannot be distinguished from
+a genuinely new namespace.
+
+Existing standalone resources are not automatically adopted. Do not mix the
+standalone installation procedure with operator provisioning in one namespace.
+The operator owns `racer-config`; use the operator workload override mechanism
+for controller Deployment customization. The dataplane remains controller-owned.
+Deleting the last ClusterCache retains resources and pauses operator reconciliation
+for Racer. Administrators may remove workloads deliberately; a later cache resumes
+provisioning with the retained identity and counters.
+
+The operator renews serving certificates with the same CA key, republishes public
+trust, and stamps the controller pod template to restart after certificate changes.
+The serving CA key stays in `racer-controller-tls`, separate from the controller's
+node issuer. Missing established serving credentials fail closed. Reconciliation
+checks renewal hourly while a cache exists. Controller updates use the Recreate
+and leader-only readiness contract described below.
+
+## Standalone first installation
 
 1. Choose a **new permanent cluster UUID**, namespace, controller image, and
    compatible dataplane image. Provision the namespace and deployment TLS/trust
