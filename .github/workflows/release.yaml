@@ -853,6 +853,14 @@ jobs:
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: racer-controller
+            file: images/racer-controller/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64

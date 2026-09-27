@@ -31,6 +31,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
@@ -269,6 +270,7 @@ func run(ctx context.Context, cfg config) error {
 
 func runtimeScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
+	utilruntime.Must(racerv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))

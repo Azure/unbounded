@@ -57,6 +57,11 @@ spec:
         - name: tls
           secret:
             secretName: {{ .ServingTLSSecret | default "racer-controller-tls" | quote }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
 ---
 apiVersion: v1
 kind: Service

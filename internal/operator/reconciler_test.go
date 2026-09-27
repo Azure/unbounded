@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -125,6 +126,7 @@ func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
 		"apps/v1":     appsv1.AddToScheme,
 		"core/v1":     corev1.AddToScheme,
 		"machina API": unboundedv1alpha3.AddToScheme,
+		"racer API":   racerv1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add %s to scheme: %v", name, err)
@@ -445,7 +447,7 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		t.Fatalf("DefaultRegistry is invalid: %v", err)
 	}
 
-	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false}
+	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "RacerReady": false}
 
 	for _, c := range reg.Cluster {
 		wantConditions[c.ConditionType()] = true

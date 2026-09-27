@@ -46,9 +46,9 @@ func TestBootstrapCRDsTimeoutCancelsBlockedApply(t *testing.T) {
 }
 
 // TestBootstrapCRDsAppliesEmbeddedCRDs exercises the real startup CRD bootstrap
-// against the embedded machina + net manifests (rendered by `make test`). A fake
+// against the embedded machina, net, and racer manifests (rendered by `make test`). A fake
 // client records the applied CRDs and reports them Established so the wait
-// completes. It guards that the operator installs every machina and net CRD
+// completes. It guards that the operator installs every component CRD
 // itself, which is what lets a cluster be maintained by applying the operator
 // manifests alone.
 func TestBootstrapCRDsAppliesEmbeddedCRDs(t *testing.T) {
@@ -227,6 +227,7 @@ func TestRequiredCRDNames(t *testing.T) {
 		"sitegatewaypoolassignments.net.unbounded-cloud.io",
 		"sitepeerings.net.unbounded-cloud.io",
 		"gatewaypoolpeerings.net.unbounded-cloud.io",
+		"clustercaches.racer.unbounded-cloud.io",
 	}
 
 	if RequiredCRDNames != want {

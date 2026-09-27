@@ -180,6 +180,25 @@ func TestOperatorClusterRoleAllowsGantryPriorityClass(t *testing.T) {
 	}
 }
 
+func TestOperatorClusterRoleAllowsRacerProvisioning(t *testing.T) {
+	cr := loadOperatorClusterRole(t)
+	for _, verb := range []string{"get", "list", "watch"} {
+		if !clusterRoleGrants(cr, "racer.unbounded-cloud.io", "clustercaches", verb) {
+			t.Fatalf("operator must grant %s on ClusterCaches", verb)
+		}
+	}
+
+	if !clusterRoleGrants(cr, "batch", "jobs", "create") {
+		t.Fatal("operator cannot create the initialization Job")
+	}
+
+	for _, verb := range []string{"update", "patch", "delete"} {
+		if clusterRoleGrants(cr, "batch", "jobs", verb) {
+			t.Fatalf("initialization only requires create, not %s", verb)
+		}
+	}
+}
+
 func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 	resources := []struct {
