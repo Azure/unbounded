@@ -480,6 +480,115 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 	}
 }
 
+func TestPlanRotationOwnsOutput(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	runKeys(t, r)
+	_, _, prepared, _ := keyState(t, r)
+	*now = prepared.ActivateAt
+
+	runKeys(t, r)
+	_, original, state, _ := keyState(t, r)
+	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
+	// The old codec round trip preserves order, even when it is not sorted.
+	original.PeerTrustRoots[0], original.PeerTrustRoots[1] = original.PeerTrustRoots[1], original.PeerTrustRoots[0]
+	original.CacheKeys[0], original.CacheKeys[1] = original.CacheKeys[1], original.CacheKeys[0]
+
+	before, err := wire.EncodeBundle(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeState, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := wire.DecodeBundle(bytes.NewReader(before))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, nextState, err := r.PlanRotation(original, state, catalog, *now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(next, want) || !reflect.DeepEqual(nextState, state) {
+		t.Fatal("idle planner changed bundle representation or rotation state")
+	}
+
+	// Exercise both outer collections and nested bytes, plus the retirement map.
+	next.PeerTrustRoots[0][0] ^= 0xff
+	next.PeerTrustRoots[1] = nil
+	next.CacheKeys[0].Key.ID[0] ^= 0xff
+	next.CacheKeys[1].State = wire.PreparedKey
+
+	for id := range nextState.Retiring {
+		delete(nextState.Retiring, id)
+	}
+
+	after, err := wire.EncodeBundle(original)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("output aliases input bundle: %v", err)
+	}
+
+	afterState, err := json.Marshal(state)
+	if err != nil || !bytes.Equal(beforeState, afterState) {
+		t.Fatalf("output aliases input retirement map: %v", err)
+	}
+}
+
+func TestPlanRotationInputValidation(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+
+	_, original, state, _ := keyState(t, r)
+	for _, tc := range []struct {
+		name string
+		edit func(*wire.KeyringBundle)
+		want error
+	}{
+		{"schema", func(b *wire.KeyringBundle) { b.SchemaVersion++ }, wire.UnsupportedVersion},
+		{"generation", func(b *wire.KeyringBundle) { b.Generation = 0 }, wire.InvalidRequest},
+		{"duplicate root", func(b *wire.KeyringBundle) { b.PeerTrustRoots = append(b.PeerTrustRoots, b.PeerTrustRoots[0]) }, wire.InvalidRequest},
+		{"invalid key", func(b *wire.KeyringBundle) {
+			b.CacheKeys = append([]wire.CacheKey(nil), b.CacheKeys...)
+			b.CacheKeys[0].Key.ID = nil
+		}, wire.InvalidRequest},
+		{"encoded size", func(b *wire.KeyringBundle) {
+			key := b.CacheKeys[0]
+
+			b.CacheKeys = make([]wire.CacheKey, 4000)
+			for i := range b.CacheKeys {
+				b.CacheKeys[i] = key
+				b.CacheKeys[i].Key.Cache = wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i+1))
+			}
+		}, wire.TooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := original
+			tc.edit(&b)
+			// An empty catalog would discard all keys; invalid/oversized input
+			// must still fail before the planner can shrink it into a valid output.
+			if _, _, err := r.PlanRotation(b, state, nil, *now); !errors.Is(err, tc.want) {
+				t.Fatalf("input validation: got %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	original.CacheKeys = nil
+	state.Retiring = nil
+
+	next, nextState, err := r.PlanRotation(original, state, nil, *now)
+	if err != nil || next.CacheKeys == nil || nextState.Retiring == nil {
+		t.Fatalf("empty collection normalization: %v", err)
+	}
+}
+
 func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 	for _, corrupt := range []string{"timestamp", "active issuer", "bundle", "private key", "generation", "binding"} {
 		t.Run(corrupt, func(t *testing.T) {

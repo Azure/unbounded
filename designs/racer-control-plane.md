@@ -357,6 +357,13 @@ establishes 100,000-node HTTPS capacity.
   configured overlap after actual activation, at least the 24-hour leaf lifetime.
   Pruning removes common trust first, private material second. Failures between
   these writes leave recoverable extra private material, not dangling trust.
+  After authoritative loading and catalog admission, `reconcileKeys` sequences
+  `discardStalePreparation`, `prepareIssuer`, `PlanRotation`, `encodeRotation`,
+  `publishRotation`, and `pruneIssuerMaterial`. Encoding finishes before writes;
+  publication persists private write-ahead material before the common Secret,
+  and private pruning runs only after successful publication or a no-op plan.
+  The planner deep-copies roots, cache-key IDs, and retirement deadlines while
+  retaining wire validation and encoded-size checks at both boundaries.
 - Deadlines are not reset on replay/restart and missed rotations are not replayed
   in a loop. Long downtime that exhausts a prepared root cancels that unused
   preparation and stages fresh material with a full preparation delay. Expired

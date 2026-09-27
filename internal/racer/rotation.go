@@ -73,17 +73,28 @@ func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyStat
 
 // PlanRotation owns its output. Deadlines are measured from actual transitions,
 // never advanced through missed intervals after downtime. Issuer staging is done
-// by reconcileKeys before this planner, with private material persisted first.
+// by reconcileKeys before this planner; publication persists private material first.
 func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time) (wire.KeyringBundle, RotationState, error) {
-	encoded, err := wire.EncodeBundle(b)
-	if err != nil {
+	// Keep wire validation and the encoded size bound at the input boundary.
+	// Ownership does not require decoding the just-validated representation.
+	if _, err := wire.EncodeBundle(b); err != nil {
 		return wire.KeyringBundle{}, RotationState{}, err
 	}
 
-	b, err = wire.DecodeBundle(bytes.NewReader(encoded))
-	if err != nil {
-		return wire.KeyringBundle{}, RotationState{}, err
+	rootsCopy := make([][]byte, len(b.PeerTrustRoots))
+	for i, root := range b.PeerTrustRoots {
+		rootsCopy[i] = bytes.Clone(root)
 	}
+
+	b.PeerTrustRoots = rootsCopy
+	// Like DecodeBundle, normalize an empty key collection to a non-nil slice.
+	keysCopy := make([]wire.CacheKey, len(b.CacheKeys))
+	for i, key := range b.CacheKeys {
+		keysCopy[i] = key // Includes the value-owned [32]byte material.
+		keysCopy[i].Key.ID = bytes.Clone(key.Key.ID)
+	}
+
+	b.CacheKeys = keysCopy
 
 	retiring := make(map[string]time.Time, len(s.Retiring))
 	for id, deadline := range s.Retiring {
@@ -257,24 +268,55 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return ctrl.Result{}, err
 	}
 
-	issuer, shared := credentials.issuer, credentials.shared
-	b, s, material := credentials.bundle, credentials.rotation, credentials.material
-
-	catalog, err = admitCatalog(ctx, r.Config, catalog, b)
+	catalog, err = admitCatalog(ctx, r.Config, catalog, credentials.bundle)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	now := r.now()
+	if err := credentials.discardStalePreparation(r.Config, now); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	issuerChanged, err := credentials.prepareIssuer(r.Config, now)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	credentials.bundle, credentials.rotation, err = r.PlanRotation(credentials.bundle, credentials.rotation, catalog, now)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	bundleChanged, err := credentials.encodeRotation(issuerChanged)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if bundleChanged {
+		if err := r.publishRotation(ctx, &credentials, issuerChanged); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if err := r.pruneIssuerMaterial(ctx, &credentials); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: max(time.Second, credentials.rotation.NextTransition.Sub(now))}, nil
+}
+
+func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) error {
+	b, s, material := &c.bundle, &c.rotation, c.material
 	// Downtime may exhaust a staged root's useful lifetime. Cancel that unused
 	// preparation and stage a fresh replacement with a full new preparation delay.
 	if s.PreparedIssuer != "" {
 		cert, _, err := parseSigning(material.Keys[s.PreparedIssuer])
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 
-		if now.Add(r.Config.Rotation.PrepareFor + r.Config.certificateLifetime()).After(cert.NotAfter) {
+		if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
 			roots := b.PeerTrustRoots[:0]
 			for _, root := range b.PeerTrustRoots {
 				if rootID(root) != s.PreparedIssuer {
@@ -296,27 +338,32 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		}
 	}
 
+	return nil
+}
+
+func (c *credentialState) prepareIssuer(cfg Config, now time.Time) (bool, error) {
+	b, s, material := &c.bundle, &c.rotation, &c.material
 	issuerChanged := false
 
 	if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
 		// An unreferenced pending root is a recoverable write-ahead record. Reuse
 		// it after ambiguous writes instead of generating a different replacement.
 		pending := material.Pending
-		if pending != "" && !containsRoot(b, pending) {
+		if pending != "" && !containsRoot(*b, pending) {
 			cert, _, err := parseSigning(material.Keys[pending])
 			if err != nil {
-				return ctrl.Result{}, err
+				return false, err
 			}
 
-			if now.Add(r.Config.Rotation.PrepareFor + r.Config.certificateLifetime()).After(cert.NotAfter) {
+			if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
 				pending = ""
 			}
 		}
 
-		if pending == "" || containsRoot(b, pending) {
-			cert, key, err := generateIssuer(now, r.Config)
+		if pending == "" || containsRoot(*b, pending) {
+			cert, key, err := generateIssuer(now, cfg)
 			if err != nil {
-				return ctrl.Result{}, err
+				return false, err
 			}
 
 			pending = rootID(cert)
@@ -326,13 +373,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 				next.Keys[id] = key
 			}
 
-			material = next
-
-			issuer.Data["issuer.json"], err = json.Marshal(material)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-
+			*material = next
 			issuerChanged = true
 		}
 
@@ -340,55 +381,72 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		s.PreparedIssuer = pending
 	}
 
-	next, state, err := r.PlanRotation(b, s, catalog, now)
+	return issuerChanged, nil
+}
+
+// encodeRotation validates the complete candidate, including its publication
+// generation, before either Secret can be written.
+func (c *credentialState) encodeRotation(issuerChanged bool) (bool, error) {
+	encoded, err := wire.EncodeBundle(c.bundle)
 	if err != nil {
-		return ctrl.Result{}, err
+		return false, err
 	}
 
-	encoded, err := wire.EncodeBundle(next)
+	stateBytes, err := json.Marshal(c.rotation)
 	if err != nil {
-		return ctrl.Result{}, err
+		return false, err
 	}
 
-	stateBytes, err := json.Marshal(state)
-	if err != nil {
-		return ctrl.Result{}, err
+	if bytes.Equal(encoded, c.shared.Data["bundle.json"]) && bytes.Equal(stateBytes, c.shared.Data["rotation.json"]) {
+		return false, nil
 	}
 
-	if !bytes.Equal(encoded, shared.Data["bundle.json"]) || !bytes.Equal(stateBytes, shared.Data["rotation.json"]) {
-		if next.Generation == math.MaxUint64 {
-			return ctrl.Result{}, wire.Unavailable
-		}
+	if c.bundle.Generation == math.MaxUint64 {
+		return false, wire.Unavailable
+	}
 
-		next.Generation++
+	c.bundle.Generation++
 
-		shared.Data["bundle.json"], err = wire.EncodeBundle(next)
+	c.shared.Data["bundle.json"], err = wire.EncodeBundle(c.bundle)
+	if err != nil {
+		return false, err
+	}
+
+	c.shared.Data["rotation.json"] = stateBytes
+
+	if issuerChanged {
+		c.issuer.Data["issuer.json"], err = json.Marshal(c.material)
 		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		shared.Data["rotation.json"] = stateBytes
-
-		if issuerChanged {
-			if err := ctx.Err(); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			if err := r.Update(ctx, issuer); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-
-		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Update(ctx, shared); err != nil {
-			return ctrl.Result{}, err
+			return false, err
 		}
 	}
+
+	return true, nil
+}
+
+func (r *KeyringReconciler) publishRotation(ctx context.Context, c *credentialState, issuerChanged bool) error {
+	// Private write-ahead material must be durable before publishing its root.
+	if issuerChanged {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if err := r.Update(ctx, c.issuer); err != nil {
+			return err
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	return r.Update(ctx, c.shared)
+}
+
+func (r *KeyringReconciler) pruneIssuerMaterial(ctx context.Context, c *credentialState) error {
 	// Remove private material only after the common bundle no longer references
 	// it. A crash here leaves harmless extra private keys, never dangling trust.
+	next, material, issuer := c.bundle, c.material, c.issuer
 	clean := issuerMaterial{Pending: material.Pending, Keys: map[string]signingMaterial{}}
 
 	for _, root := range next.PeerTrustRoots {
@@ -401,21 +459,23 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 	}
 
 	if !reflect.DeepEqual(clean, material) {
+		var err error
+
 		issuer.Data["issuer.json"], err = json.Marshal(clean)
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 
 		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 
 		if err := r.Update(ctx, issuer); err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 	}
 
-	return ctrl.Result{RequeueAfter: max(time.Second, state.NextTransition.Sub(now))}, nil
+	return nil
 }
 
 func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.ConfigMap, catalog []wire.CacheDefinition) (ctrl.Result, error) {
