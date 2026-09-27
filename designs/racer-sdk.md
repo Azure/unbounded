@@ -61,6 +61,8 @@ func (c *Client) Get(ctx context.Context, request Request) (*Value, error)
 func (c *Client) Close() error
 func (v *Value) Metadata() Metadata
 func (v *Value) Read(p []byte) (int, error)
+func (v *Value) WriteTo(w io.Writer) (int64, error)
+func (v *Value) ServeHTTP(w http.ResponseWriter, r *http.Request)
 func (v *Value) Close() error
 
 type Origin func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error)
@@ -142,8 +144,15 @@ classification, even after earlier pages succeeded. Truncated bodies remain I/O
 errors with partial counts. Both are terminal for the Value.
 The client holds at most PageWindow response bodies per Value, and no SDK-owned page buffer.
 `Read` reads directly into `p`; small stdlib framing buffers still exist.
-Use standard `io.Copy` or `io.CopyBuffer` for copying; all reads retain the SDK's
-boundary checks. Do not allocate arrays of page descriptors proportional to object size.
+Use standard `io.Copy` or `io.CopyBuffer` for copying; WriteTo retains the SDK's
+boundary checks. `NewFDSink` explicitly permits direct delivery to a TCP or Unix
+stream. Linux uses actual splice after draining both parsers' body read-ahead;
+other platforms use bounded copying. TLS and ordinary ResponseWriters use copying.
+Spliced source connections are closed through Transport rather than returned to
+its pool with an inaccurate private body counter. `Value.ServeHTTP` supports a
+plain HTTP/1 loopback server through explicit Hijack, fixed-length framing,
+header flush and connection closure; other responses retain ResponseWriter I/O.
+Do not allocate arrays of page descriptors proportional to object size.
 
 Client is safe for concurrent Get and Close. Value has one consuming goroutine
 (Read, directly or through io.Copy); Close may run concurrently and

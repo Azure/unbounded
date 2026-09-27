@@ -263,6 +263,9 @@ func (v *Value) fetch(r OriginRequest, snapshot *Metadata) (_ Metadata, _ int64,
 	}
 
 	state := &responseState{request: r, snapshot: snapshot}
+
+	var responseSocket *responseConn
+
 	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
 		conn, ok := info.Conn.(*responseConn)
 		if !ok {
@@ -272,6 +275,7 @@ func (v *Value) fetch(r OriginRequest, snapshot *Metadata) (_ Metadata, _ int64,
 		conn.mu.Lock()
 		conn.state = state
 		conn.mu.Unlock()
+		responseSocket = conn
 	}}
 	ctx := httptrace.WithClientTrace(v.ctx, trace)
 
@@ -314,13 +318,14 @@ func (v *Value) fetch(r OriginRequest, snapshot *Metadata) (_ Metadata, _ int64,
 		return Metadata{}, 0, nil, wireErr
 	}
 
-	return result.metadata, result.length, &pageBody{ReadCloser: res.Body, permits: v.client.pages}, nil
+	return result.metadata, result.length, &pageBody{ReadCloser: res.Body, permits: v.client.pages, socket: responseSocket}, nil
 }
 
 type pageBody struct {
 	io.ReadCloser
 	once    sync.Once
 	permits chan struct{}
+	socket  *responseConn
 }
 
 func (b *pageBody) Close() error {

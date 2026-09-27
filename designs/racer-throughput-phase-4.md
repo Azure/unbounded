@@ -146,12 +146,25 @@ Implementation results will be recorded below as each tested increment lands.
   IoBuffer ownership. Simulation never creates mutable aliases for sends. New
   tests check backing-pointer identity, short sends, retained charges and both
   cancellation-completion orders; a compile-fail test rejects ciphertext receives.
-- SDK window increment: ClientConfig.PageWindow defaults to four, capped by the
+- `ac5adc7c`: ClientConfig.PageWindow defaults to four, capped by the
   pool. Connection permits precede worker creation, speculative pages never wait
   for permits, and pending response storage is bounded by the window. Read consumes
   in order; Close cancels and joins every worker. Bootstrap remains header-only
   until consumption and continuations start after page zero. Updated SDK prose
   and fake-origin assertions for concurrent page arrival with exact ordered bytes.
+- `5dc0c999`: actual worker-local pipe descriptor recycling after completion fences.
+  Empty pipes retain admission while idle; partially drained pipes close. Lease
+  ownership uses weak pool links, avoiding a reactor cycle. Updated cleanup tests
+  distinguish idle capacity from active delivery; descriptor-identity tests prove
+  actual reuse. Production cancellation initially waited for idle charges to reach
+  zero and hit its internal bounded stall assertion; it now checks zero active
+  leases and verifies full original cancellation, bytes, and resource contracts.
+- FD delivery increment: WriteTo uses Linux splice for parsed fixed-length bodies
+  and portable bounded copying otherwise. FDSink counts actual spliced bytes;
+  loopback ServeHTTP uses explicit net/http Hijack/flush/close ownership. Spliced
+  source bodies close through Transport; its private counters are never bypassed
+  for pooled reuse. Tests check multi-page ordered bytes, framing, cancellation,
+  subsequent requests, and loopback HTTP responses.
 
 Commands executed from the crate for Rust and worktree root for Go; all tests
 used the mandatory external `timeout --signal=TERM --kill-after=10s 300s` prefix:
@@ -166,7 +179,13 @@ used the mandatory external `timeout --signal=TERM --kill-after=10s 300s` prefix
 | `env GOTOOLCHAIN=go1.26.6 make fmt GO_PACKAGE_DIRS=./pkg/racersdk GO_PACKAGE_PATTERNS=./pkg/racersdk/...` | Passed, zero lint issues. |
 | `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m ./pkg/racersdk -run 'TestValueWindow\|TestClient' -count=1` | Passed, 5.214 s after creating missing worktree-local tmp fixture directory. |
 | `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk -count=1` | Passed, 19.710 s after correcting the two arrival-order assumptions described above. |
+| `cargo test --locked --all-features --lib memory:: -j 2 -- --test-threads=2 --quiet` | 43 passed after retained-pipe accounting updates. |
+| `cargo test --locked --all-features --lib client::listener:: -j 2 -- --test-threads=2 --quiet` | 28 passed. |
+| `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet` | After pipe recycling: 741 passed, seven explicit ignores, 65.60 s. |
+| `cargo test --locked --all-features --test production_dataplane -j 2 -- --test-threads=2 --quiet` | 13 passed, two explicit ignores, 5.90 s. |
+| `cargo test --locked --all-features --test production_dataplane --test client_origin_conformance -j 2 -- --test-threads=2 --quiet` | Conformance 19 passed/one ignore; production initially found the idle-charge stall described above. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk -count=1` | After FD delivery: passed, 20.754 s. |
 
 No external timeout fired in these increments. These results do not yet establish
-the full Phase 4 exit gates; FD-aware splice, acquisition/bootstrap, recycling,
+the full Phase 4 exit gates; acquisition/bootstrap, disk/page-buffer recycling,
 CRC64 and rotating request MAC remain to be delivered.
