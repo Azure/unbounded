@@ -119,15 +119,24 @@ For a fresh full-object Get:
    a page to obtain metadata. Empty bootstrap returns a valid immediately-EOF Value.
 2. Read page zero directly from its HTTP body into the caller's buffer. Pin its
    ETag and total size in Value. Expose no later version, even after expiry.
-3. After page zero is consumed, if more bytes remain, lazily issue exactly one
-   `Range: bytes=16777216-<size-1>` GET with that If-Match and identical context.
-   Validate 206, ETag, unchanged total size, and exact boundaries before reading.
-   The remainder may span any number of pages. Racer schedules them within its
-   own bounded window. Retain the initial Metadata snapshot if expiry is refreshed.
+3. After each page is consumed, if more bytes remain, lazily issue a pinned GET
+   for `Range: bytes=<offset>-<min(offset+16777216,size)-1>` with the bootstrap
+   If-Match and identical context. Each continuation covers at most one 16 MiB
+   page; the final range ends exactly at size-1. Validate 206, ETag, unchanged
+   total size, and exact boundaries before reading each body. Retain the initial
+   Metadata snapshot if expiry is refreshed. Racer schedules underlying fetches.
 4. End with EOF only after the full expected count. Do not open a continuation
    for a one-page object. Closing before page zero ends never fetches the remainder.
 
 Continuation pin errors never fall back to a fresh version.
+The dataplane's absolute request deadline (30 seconds by default) covers reading
+and delivering each response, and good progress does not renew it. Page-bounded
+requests allow the full stream to exceed that deadline as long as each page fits
+its own budget. A slow page can still time out; the SDK does not retry it or relax
+the dataplane deadline. Get's context can separately bound the full stream.
+Errors received before any continuation's body starts retain their HTTP error
+classification, even after earlier pages succeeded. Truncated bodies remain I/O
+errors with partial counts. Both are terminal for the Value.
 The client holds at most one response body per Value, and no SDK-owned page buffer.
 `Read` reads directly into `p`; small stdlib framing buffers still exist.
 Use standard `io.Copy` or `io.CopyBuffer` for copying; all reads retain the SDK's
@@ -142,7 +151,8 @@ Client.Close rejects new work, cancels pending Get calls and all active Values,
 closes active bodies, then closes idle transport connections. Handle the race
 between registration, successful headers, and Close without leaking a response.
 
-EOF, terminal errors, and Close all release capacity and request-scoped context.
+One live-Value capacity slot is retained across every page boundary. EOF, terminal
+errors, and Close all release capacity and request-scoped context.
 Close is idempotent; never drain an unread object to keep a socket alive. Aborted
 bodies are not reused. After explicit Close, consumption returns a typed closed
 error; an already observed clean EOF remains EOF. Preserve partial byte counts on

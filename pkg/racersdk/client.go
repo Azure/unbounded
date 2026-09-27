@@ -111,7 +111,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 
 // Get admits a fresh object using a bootstrap GET and returns as soon as validated
 // headers arrive, without buffering page zero. ctx governs the returned Value's
-// entire lifetime, including capacity waits and its lazy pinned continuation.
+// entire lifetime, including capacity waits and its lazy pinned continuations.
 // The caller owns the Value and should defer Close.
 func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
 	if ctx == nil {

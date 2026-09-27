@@ -27,7 +27,7 @@ type Value struct {
 	metadata  Metadata
 	request   OriginRequest
 	remaining int64
-	continued bool
+	offset    int64
 }
 
 // Metadata returns the initial total-size/tag/expiry snapshot, never a remaining
@@ -94,7 +94,7 @@ func (v *Value) finish(err error) {
 }
 
 // Read copies directly from the current HTTP body into p. Once bootstrap is
-// consumed, it lazily opens one pinned range covering all remaining pages.
+// consumed, it lazily opens pinned ranges of at most one page each.
 // A terminal error preserves partial byte counts and never restarts the version.
 func (v *Value) Read(p []byte) (int, error) {
 	if err := v.err(); err != nil {
@@ -121,17 +121,17 @@ func (v *Value) Read(p []byte) (int, error) {
 		v.mu.Unlock()
 		closeBody(body)
 
-		if v.continued || v.metadata.Size <= PageSize {
+		if v.offset == int64(v.metadata.Size) {
 			v.finish(io.EOF)
 			return 0, v.err()
 		}
 
-		v.continued = true
 		v.mu.Lock()
 		r := v.request
 		v.mu.Unlock()
 		r.operation, r.pin = OperationPinned, v.metadata.ETag
-		r.byteRange = Range{present: true, first: uint64(PageSize), last: uint64(v.metadata.Size) - 1}
+		length := min(int64(PageSize), int64(v.metadata.Size)-v.offset)
+		r.byteRange = Range{present: true, first: uint64(v.offset), last: uint64(v.offset + length - 1)}
 
 		_, length, err := v.open(r, &v.metadata)
 		if err != nil {
@@ -157,6 +157,8 @@ func (v *Value) Read(p []byte) (int, error) {
 	n, err := body.Read(p)
 
 	v.remaining -= int64(n)
+
+	v.offset += int64(n)
 	if err == io.EOF {
 		if v.remaining != 0 {
 			err = io.ErrUnexpectedEOF

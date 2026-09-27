@@ -16,8 +16,9 @@
 // Avoid io.ReadAll for large objects: it introduces caller-side object buffering.
 //
 // Get opens a fresh full-object stream with a page-zero bootstrap. After consuming
-// the first 16 MiB, reading lazily opens one pinned continuation for all remaining
-// bytes. Racer, rather than this SDK, schedules its whole-page origin fetches.
+// the first 16 MiB, reading lazily opens pinned continuations of at most 16 MiB
+// each, shortening the last range at EOF. Every request uses the original ETag,
+// total size, and fetch context. Racer schedules the underlying origin fetches.
 // There is no HEAD preflight, client page cache, or object-sized SDK buffer.
 // Value.Metadata is the initial total size, strong ETag, and expiry snapshot;
 // it is not a remaining length and does not change if continuation expiry changes.
@@ -59,7 +60,10 @@
 // lifetime. Keep it alive until consumption ends; use a deadline when completion
 // must be bounded. Client defaults are 16 connections/live Values, a 5-second dial
 // timeout, a 10-second response-header timeout, and a 90-second idle timeout.
-// There is no total client stream timeout. Zero numeric config fields select
+// There is no total client stream timeout. Page-bounded continuations let the
+// total stream outlive the dataplane's absolute per-request deadline (30 seconds
+// by default). Each page must still complete within that budget; progress does
+// not renew it, and a failed page is terminal. Zero numeric config fields select
 // defaults, not unlimited operation; negative values are invalid. Bound caller
 // concurrency too: pending Get callers still consume application resources.
 // Read uses the caller's buffer; each active origin stream uses a 32 KiB
@@ -123,16 +127,17 @@
 // NewFakeClient(origin) returns (*Client, func(), error). Register its cleanup with
 // t.Cleanup or defer it in examples. The returned Client and its Values use the real
 // SDK transport and validation path. Private loopback servers run the real origin
-// request, metadata, pin, body-length, EOF, and cancellation checks, plus a fake
-// sequential page scheduler for continuations larger than 16 MiB. No /run directory,
-// Racer process, endpoint configuration, or testing-package dependency is required.
+// request, metadata, pin, body-length, EOF, and cancellation checks, plus fake
+// sequential page forwarding. No /run directory, Racer process, endpoint
+// configuration, or testing-package dependency is required.
 //
 // Each Get fetches a fresh bootstrap. The fake forwards FetchContext on every page,
 // keeps bounded streaming buffers, and never caches objects. It does not model
 // Racer caching, distributed scheduling, retries, or performance, and passing fake
 // tests does not establish real Racer compatibility. Callback failures before a
-// response starts preserve their HTTP classification; failures on later pages of
-// an already-started continuation abort the stream and leave a partial byte count.
+// page response starts preserve their HTTP classification, including later
+// continuations; failures within a started body abort it. Both leave a partial
+// full-object byte count and a terminal Value.
 //
 // Cleanup is idempotent and safe concurrently. It closes the Client and both
 // servers, cancels active work, and releases listeners and connections. Calling

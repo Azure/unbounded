@@ -203,11 +203,7 @@ func TestFakeClientContinuationErrors(t *testing.T) {
 				t.Fatal("incorrect partial byte count", n)
 			}
 
-			if failPage == 1 {
-				assertKind(t, err, ErrorVersionUnavailable)
-			} else if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatal("late failure did not abort", err)
-			}
+			assertKind(t, err, ErrorVersionUnavailable)
 		})
 	}
 }
@@ -357,8 +353,14 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 			}
 
 			n, err := io.Copy(io.Discard, v)
-			if n != 2*int64(PageSize) || !errors.Is(err, io.ErrUnexpectedEOF) {
+			if n != 2*int64(PageSize) {
 				t.Fatal("changed immutable version was accepted", n, err)
+			}
+
+			if change == "pin" {
+				assertKind(t, err, ErrorBadGateway)
+			} else {
+				assertKind(t, err, ErrorProtocol)
 			}
 		})
 	}
