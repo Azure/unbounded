@@ -15,11 +15,17 @@ import (
 )
 
 func serveGantryRacerOrigin(ctx context.Context, config racersdk.OriginConfig, origin racersdk.Origin) error {
-	if err := prepareRacerOriginDirectory("/run/racer"); err != nil {
+	return serveGantryRacerOriginAt(ctx, config, origin, "/run/racer", racersdk.ServeOrigin)
+}
+
+func serveGantryRacerOriginAt(ctx context.Context, config racersdk.OriginConfig, origin racersdk.Origin, root string, serve func(context.Context, racersdk.OriginConfig, racersdk.Origin) error) error {
+	if err := prepareRacerOriginDirectory(root); err != nil {
 		return fmt.Errorf("prepare origin directory: %w", err)
 	}
 
-	return racersdk.ServeOrigin(ctx, config, origin)
+	config.RecoverStaleSocket = true
+
+	return serve(ctx, config, origin)
 }
 
 // Gantry owns the origin endpoint; Racer creates only the client endpoint. The

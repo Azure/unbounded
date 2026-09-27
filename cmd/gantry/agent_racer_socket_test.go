@@ -4,11 +4,39 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
+
+func TestGantryOriginEnablesOwnedRecoveryAfterDirectoryPreparation(t *testing.T) {
+	root := t.TempDir()
+	want := errors.New("serve result")
+	called := false
+
+	err := serveGantryRacerOriginAt(t.Context(), racersdk.OriginConfig{}, nil, root,
+		func(_ context.Context, config racersdk.OriginConfig, _ racersdk.Origin) error {
+			called = true
+
+			if !config.RecoverStaleSocket {
+				t.Fatal("Gantry did not opt into crash recovery")
+			}
+
+			if info, err := os.Stat(filepath.Join(root, "gantry", "origin")); err != nil || !info.IsDir() {
+				t.Fatalf("directory not ready: %v", err)
+			}
+
+			return want
+		})
+	if !called || !errors.Is(err, want) {
+		t.Fatalf("serve result: called=%v err=%v", called, err)
+	}
+}
 
 func TestPrepareRacerOriginDirectory(t *testing.T) {
 	for _, clientExists := range []bool{false, true} {
