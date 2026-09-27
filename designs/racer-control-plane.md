@@ -374,8 +374,18 @@ deployment integration check and is not exercised by envtest.
   request. It checks current chain validity, Ed25519/digital-signature/client-auth
   usage, one exact cluster/Node URI, live Node UID/exclusion, and a live authorized
   Pod of the current managed DaemonSet and ServiceAccount. Node certificates bind
-  Node UIDs rather than Pod UIDs, so replacement authorized Pods on the same Node
-  can continue using a locally persisted valid identity. UID-only certificates
+  Node UIDs rather than Pod UIDs, so the server can authorize replacement managed
+  Pods on the same Node with an existing valid certificate. The Rust client now
+  reauthenticates its projected token on every startup before constructing or
+  activating node-bound runtime state. Retained identity hostPaths therefore
+  converge after Node delete/recreate: a verified same-cluster enrollment may
+  replace the old UID, including when the disk certificate has expired. During
+  renewal, a changed UID triggers a terminal `NodeIdentityChanged`, worker-wide
+  drain/fencing, and container restart rather than rebinding a live graph. Snapshot
+  503s also schedule token reauthentication with backoff to escape stale-UID
+  discovery loops. Cross-cluster identity adoption remains forbidden. See
+  `cmd/racer-dataplane/src/control/INTEGRATION.md` for persistence and restart details.
+  UID-only certificates
   use an informer Node UID index and a namespace-scoped managed-Pod-by-Node index
   solely to discover names. Live GETs validate Node UID/exclusion, Pod UID and
   assignment/state/owner, current DaemonSet UID, and ServiceAccount existence/state.

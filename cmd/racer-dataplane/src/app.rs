@@ -861,7 +861,7 @@ impl WorkerApplication {
             if let Some(control) = self.control.clone() {
                 let identity = control.start(startup).await?;
                 if identity.node() != self.keys.node() {
-                    return Err(Error::Unauthorized);
+                    return Err(Error::NodeIdentityChanged);
                 }
                 control.activate_identity()?;
                 // Accept a complete compatible first snapshot before any listener.

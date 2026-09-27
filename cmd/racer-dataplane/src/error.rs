@@ -27,6 +27,8 @@ pub enum Error {
     Cancelled,
     StaleFlight,
     Unauthorized,
+    /// Authenticated Node binding changed; drain the entire graph and restart.
+    NodeIdentityChanged,
     /// The origin rejected only the credentials of the supplying caller.
     OriginRejected,
     /// The origin forbids this caller; this is not evidence of page absence.

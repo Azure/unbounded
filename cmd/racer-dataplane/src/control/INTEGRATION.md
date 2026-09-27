@@ -38,9 +38,12 @@ staged by async startup. These APIs preserve authenticated NodeId resolution.
 
 ## Identity and lifecycle
 
-1. `ControlClient::start(scope)` reads the coherent projected trust bundle, loads
-   a verified local identity or performs server-authenticated token enrollment,
-   and returns `LocalSigningIdentity`. It does not use an environment Node UID.
+1. `ControlClient::start(scope)` reads the coherent projected trust bundle, recovers
+   interrupted identity persistence, and always performs server-authenticated token
+   enrollment before returning `LocalSigningIdentity`. A valid disk certificate
+   does not prove the current Kubernetes Node binding. Startup requires the control
+   endpoint and current projected token, including after a process or Pod restart.
+   It does not use an environment Node UID.
    Retry transient failures at `next_attempt()`. The persisted pending CSR/key and
    enrollment ID survive restarts; the projected token is read per submission.
 2. Construct node-dependent worker state from the returned `identity.node()`.
@@ -55,6 +58,37 @@ staged by async startup. These APIs preserve authenticated NodeId resolution.
    cache lifecycle adapter; it does not create an executor.
 4. Call `shutdown()`, drop the owner future, and drain/fence the reactor. Cancellation
    of readiness retains its duplicated FD until the runtime's completion fences.
+
+### Kubernetes Node replacement
+
+An authenticated enrollment response may replace the persisted Node UID within the
+same pinned cluster. Acceptance still verifies request correlation, issuer chain,
+validity, exact cluster/Node SAN, and local private-key pairing. Neither a CSR nor
+host configuration selects the Node UID. An existing identity from another cluster
+is rejected, even if the new configuration and projected roots have changed.
+
+The pre-worker bootstrap constructs the graph using the newly authenticated UID.
+Worker zero also authenticates on startup; a binding change between these two
+steps fails startup with `NodeIdentityChanged`. During serving, renewal detecting
+a changed UID latches this terminal error before persistence, so an abandoned
+future or failed durability fence cannot resume the old control loop. The new
+identity is never installed into the old graph. The application propagates the
+error to the whole worker group, stops admission, drains clients/flights/RDMA and
+crypto, checkpoints cache data, fences kernel work, and exits. Kubernetes must
+restart the container (or a standalone supervisor must restart the process).
+
+Snapshot 503 responses schedule token reauthentication on the next backoff-bounded
+turn, covering a deleted UID absent from controller discovery without waiting for
+certificate renewal. Ordinary token renewal still uses the 16-hour deadline. A
+403 remains terminal. Failure to authenticate never falls back to a disk identity.
+
+Restart recreates node-bound signing views, replay windows, sessions, membership,
+publication cursor, and worker state. Cache slabs/checkpoints contain cache-keyed
+content rather than Node identity; they retain the existing geometry, ownership,
+and available-key recovery checks. Identity persistence remains an atomic
+old-or-complete-new replacement. Crashes before rename retain the old identity and
+pending request; crashes after rename recover the new identity and finish pending
+cleanup. Both paths authenticate the current binding again before serving.
 
 `LocalSigningIdentity::signing_identity(roots)` returns security's verified
 `Arc<SigningIdentity>`. Its crate-private PKCS#8 accessor supports TLS without

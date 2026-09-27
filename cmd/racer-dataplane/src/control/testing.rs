@@ -111,9 +111,10 @@ pub(super) fn issue(
     let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
     let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
     csr.params.not_before =
-        (std::time::SystemTime::now() - std::time::Duration::from_secs(1)).into();
-    csr.params.not_after =
-        (std::time::SystemTime::now() + std::time::Duration::from_secs(86400 - 1)).into();
+        (crate::runtime::environment::wall_now() - std::time::Duration::from_secs(1)).into();
+    csr.params.not_after = (crate::runtime::environment::wall_now()
+        + std::time::Duration::from_secs(86400 - 1))
+    .into();
     csr.params.subject_alt_names = vec![rcgen::SanType::URI(
         format!("spiffe://{}/node/{node}", request.cluster.0)
             .try_into()

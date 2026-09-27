@@ -203,7 +203,7 @@ impl Enrollment {
                             .decode(&old.response)
                             .map_err(|_| Error::CorruptRecord)?,
                     )?;
-                    if old.cluster != response.cluster || old.node != response.node {
+                    if old.cluster != response.cluster {
                         return Err(Error::Unauthorized);
                     }
                 }
@@ -398,6 +398,8 @@ impl Enrollment {
     }
     /// Verify server-authenticated response correlation, chain/SAN/validity, and
     /// local key pairing, then persist the node identity. Never trust CSR SANs.
+    /// A token-authenticated response may replace a Node UID within the pinned
+    /// cluster. Callers with a live node-bound graph must restart before activation.
     pub fn accept_response(&self, response: EnrollmentResponse) -> Result<LocalSigningIdentity> {
         if self.reactor.borrow().is_some() {
             return Err(Error::InvalidConfiguration);
@@ -416,7 +418,7 @@ impl Enrollment {
                         .decode(&old.response)
                         .map_err(|_| Error::CorruptRecord)?,
                 )?;
-                if old.cluster != response.cluster || old.node != response.node {
+                if old.cluster != response.cluster {
                     return Err(Error::Unauthorized);
                 }
             }
@@ -620,6 +622,167 @@ impl LocalSigningIdentity {
 mod tests {
     use super::*;
     use crate::control::testing;
+    const OLD_NODE: &str = "22222222-2222-4222-8222-222222222222";
+    const NEW_NODE: &str = "33333333-3333-4333-8333-333333333333";
+
+    #[test]
+    fn authenticated_replacement_preserves_cluster_key_and_correlation_checks() {
+        let Some(r) = testing::reactor() else { return };
+        for expired in [false, true] {
+            let d = testing::Directory::new();
+            let e = Enrollment::new(
+                ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                d.0.join("token"),
+                d.0.join("identity"),
+            );
+            e.attach_reactor(r.clone());
+            let (ca, key) = testing::ca();
+            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+            let scope = testing::scope();
+            let request = testing::drive(&r, e.prepare(&scope)).unwrap();
+            testing::drive(
+                &r,
+                e.accept_response_async(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
+            )
+            .unwrap();
+            let clock = crate::runtime::environment::SimulationClock::new_at(
+                31,
+                std::time::Instant::now(),
+                SystemTime::now() + Duration::from_secs(172800),
+            );
+            let _time = expired.then(|| clock.environment(1).enter());
+            if expired {
+                assert!(
+                    testing::drive(&r, e.load_identity_async(&scope))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let old = std::fs::read(d.0.join("identity/identity.json")).unwrap();
+            let request = testing::drive(&r, e.prepare(&scope)).unwrap();
+            let response = testing::issue(&request, &ca, &key, NEW_NODE);
+            let mut wrong_san = response.clone();
+            wrong_san.node = NodeId(OLD_NODE.into());
+            let mut wrong_id = response.clone();
+            wrong_id.enrollment = EnrollmentId(OLD_NODE.into());
+            let mut foreign_request = request.clone();
+            foreign_request.cluster = ClusterId("44444444-4444-4444-8444-444444444444".into());
+            let foreign = testing::issue(&foreign_request, &ca, &key, NEW_NODE);
+            let (rogue_ca, rogue_key) = testing::ca();
+            let rogue = testing::issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
+            let other = Enrollment::new(e.cluster.clone(), d.0.join("token"), d.0.join("other"));
+            let mut other_request = other.prepare_now().unwrap();
+            other_request.enrollment = request.enrollment.clone();
+            let wrong_key = testing::issue(&other_request, &ca, &key, NEW_NODE);
+            for bad in [wrong_san, wrong_id, foreign, rogue, wrong_key] {
+                assert!(matches!(
+                    testing::drive(&r, e.accept_response_async(bad, &scope)),
+                    Err(Error::Unauthorized)
+                ));
+                assert_eq!(
+                    std::fs::read(d.0.join("identity/identity.json")).unwrap(),
+                    old
+                );
+                assert!(d.0.join("identity/pending.json").exists());
+            }
+            let identity = testing::drive(&r, e.accept_response_async(response, &scope)).unwrap();
+            assert_eq!(identity.node().0, NEW_NODE);
+            assert_eq!(
+                testing::drive(&r, e.load_identity_async(&scope))
+                    .unwrap()
+                    .unwrap()
+                    .node()
+                    .0,
+                NEW_NODE
+            );
+            assert!(!d.0.join("identity/pending.json").exists());
+
+            // Even with new configuration, roots, and a fresh pending request,
+            // a hostPath pinned by an existing identity cannot adopt a cluster.
+            let foreign = Enrollment::new(
+                foreign_request.cluster,
+                d.0.join("token"),
+                d.0.join("identity"),
+            );
+            foreign
+                .set_peer_trust_roots(vec![ca.der().to_vec()])
+                .unwrap();
+            let request = foreign.prepare_now().unwrap();
+            assert!(matches!(
+                foreign.accept_response(testing::issue(&request, &ca, &key, NEW_NODE)),
+                Err(Error::Unauthorized)
+            ));
+        }
+    }
+
+    #[test]
+    fn replacement_crash_at_each_completion_recovers_and_reauthenticates() {
+        let Some(r) = testing::reactor() else { return };
+        let (ca, key) = testing::ca();
+        let mut saw_old = false;
+        let mut saw_new = false;
+        let mut saw_committed_pending = false;
+        for boundary in 0..45 {
+            let d = testing::Directory::new();
+            let enrollment = || {
+                let e = Enrollment::new(
+                    ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                    d.0.join("token"),
+                    d.0.join("identity"),
+                );
+                e.attach_reactor(r.clone());
+                e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+                e
+            };
+            let e = enrollment();
+            let scope = testing::scope();
+            let request = testing::drive(&r, e.prepare(&scope)).unwrap();
+            testing::drive(
+                &r,
+                e.accept_response_async(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
+            )
+            .unwrap();
+            let request = testing::drive(&r, e.prepare(&scope)).unwrap();
+            let mut accept =
+                e.accept_response_async(testing::issue(&request, &ca, &key, NEW_NODE), &scope);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..boundary {
+                if accept.as_mut().poll(&mut cx).is_ready() {
+                    break;
+                }
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while r.in_flight() != 0 {
+                    assert!(std::time::Instant::now() < until);
+                    r.poll_budgeted(1).unwrap();
+                    r.wait(Duration::from_millis(1)).unwrap();
+                }
+            }
+            drop(accept);
+            testing::drive(&r, r.file_fence(e.previous.get().unwrap())).unwrap();
+            let pending_exists = d.0.join("identity/pending.json").exists();
+            let restarted = enrollment();
+            let recovered = testing::drive(&r, restarted.load_identity_async(&scope))
+                .unwrap()
+                .unwrap();
+            saw_old |= recovered.node().0 == OLD_NODE;
+            saw_new |= recovered.node().0 == NEW_NODE;
+            saw_committed_pending |= recovered.node().0 == NEW_NODE && pending_exists;
+            assert!([OLD_NODE, NEW_NODE].contains(&recovered.node().0.as_str()));
+            // Startup must submit a request again, regardless of what survived.
+            let request = testing::drive(&r, restarted.prepare(&scope)).unwrap();
+            let current = testing::drive(
+                &r,
+                restarted
+                    .accept_response_async(testing::issue(&request, &ca, &key, NEW_NODE), &scope),
+            )
+            .unwrap();
+            assert_eq!(current.node().0, NEW_NODE);
+            assert!(!d.0.join("identity/pending.json").exists());
+        }
+        assert!(saw_old && saw_new && saw_committed_pending);
+        assert_eq!(r.in_flight(), 0);
+    }
+
     #[test]
     fn durable_retry_key_pairing_identity_and_rotation() {
         let directory = testing::Directory::new();
