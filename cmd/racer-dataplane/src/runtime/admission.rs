@@ -47,6 +47,34 @@ pub struct Reservation {
     local: Option<Arc<Counters>>,
 }
 impl Reservation {
+    /// Release unused capacity only while the allocation owner is exclusive.
+    /// Callers must retain at least the capacity of every live backing allocation.
+    pub fn shrink(&mut self, amount: usize) -> Result<()> {
+        if amount == 0 || amount > self.amount {
+            return Err(Error::InvalidConfiguration);
+        }
+        let released = self.amount - amount;
+        self.amount = amount;
+        self.totals.used[index(self.class)].fetch_sub(released, Ordering::AcqRel);
+        if let Some(local) = &self.local {
+            local.used[index(self.class)].fetch_sub(released, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+    /// Divide an already admitted working set without changing its total charge.
+    pub fn split(&mut self, amount: usize) -> Result<Self> {
+        if amount == 0 || amount >= self.amount {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.amount -= amount;
+        Ok(Self {
+            class: self.class,
+            amount,
+            cache: self.cache.clone(),
+            totals: self.totals.clone(),
+            local: self.local.clone(),
+        })
+    }
     pub fn amount(&self) -> usize {
         self.amount
     }
@@ -124,9 +152,12 @@ impl Admission {
         let limit = self.limit(class);
         let progress = match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
-            ResourceClass::Ciphertext
-            | ResourceClass::DirtyCiphertext
-            | ResourceClass::Registered => PAGE_BYTES as usize + 16,
+            // A disk read owns padded staging and decoded ciphertext together.
+            // Global admission still bounds aggregate concurrent working sets.
+            ResourceClass::Ciphertext => {
+                2 * (PAGE_BYTES as usize + 16) + crate::store::format::MAX_HEADER_BYTES + 4096
+            }
+            ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
         };
         (limit / active.max(1)).max(progress).min(limit)
@@ -260,6 +291,25 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_and_shrink_preserve_live_ownership_and_reject_growth() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let cache = CacheId("cache".into());
+        let mut bundle = admission
+            .reserve(Some(&cache), ResourceClass::Ciphertext, 100)
+            .unwrap();
+        assert!(bundle.split(100).is_err());
+        assert!(bundle.shrink(101).is_err());
+        assert!(bundle.shrink(0).is_err());
+        let staging = bundle.split(60).unwrap();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 100);
+        bundle.shrink(19).unwrap();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 79);
+        std::thread::spawn(move || drop(staging)).join().unwrap();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        drop(bundle);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
     #[test]
     fn rollback_and_cross_thread_release() {
         let mut limits = crate::test_support::cluster::config(false).limits;

@@ -660,7 +660,7 @@ fn production_blocked_listener_publication() {
 }
 
 #[test]
-#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity; expected multicache disk admission deficit"]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity"]
 fn production_multicache_disk_baseline() {
     let scratch = Scratch::new();
     let profile = Profile::new(4, P + 113, 2);
@@ -707,16 +707,15 @@ fn production_multicache_disk_baseline() {
         "BASELINE {}",
         json!({"diagnostic": "multicache-full-page-disk", "pairs": 4, "caches": 2, "ciphertext_bytes_per_worker": 64 << 20, "measurement": measured, "before": before, "after": after})
     );
-    if std::env::var_os("RACER_THROUGHPUT_STRICT_BASELINE").is_some() {
-        assert!(measured.accept(1), "strict later-phase gate: {measured:?}");
-    } else {
-        assert_eq!(
-            measured.failures.get("Http(503)"),
-            Some(&1),
-            "expected precise baseline overload: {measured:?}"
-        );
-        assert!(after["racer_overloads_total"] > before["racer_overloads_total"]);
-    }
+    assert!(measured.accept(1), "multicache disk progress: {measured:?}");
+    assert_eq!(
+        after["racer_overloads_total"],
+        before["racer_overloads_total"]
+    );
+    assert_eq!(
+        after["racer_disk_hits_total"],
+        before["racer_disk_hits_total"] + 1
+    );
     assert_eq!(
         after["racer_origin_fills_total"],
         before["racer_origin_fills_total"]

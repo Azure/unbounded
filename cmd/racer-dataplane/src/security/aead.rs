@@ -262,9 +262,12 @@ impl PageCryptoEngine {
                 CryptoInput::Encrypt {
                     page,
                     plaintext,
-                    ciphertext,
+                    mut ciphertext,
                 } => {
                     let (plain, reservation) = plaintext.into_parts();
+                    ciphertext
+                        .shrink(bytes.capacity())
+                        .expect("validated crypto capacity");
                     let plain = VerifiedPage {
                         inner: Arc::new(VerifiedBytes {
                             page,
@@ -283,8 +286,11 @@ impl PageCryptoEngine {
                 }
                 CryptoInput::Decrypt {
                     ciphertext,
-                    plaintext,
+                    mut plaintext,
                 } => {
+                    plaintext
+                        .shrink(bytes.capacity())
+                        .expect("validated crypto capacity");
                     let page = VerifiedPage {
                         inner: Arc::new(VerifiedBytes {
                             page: envelope.page,

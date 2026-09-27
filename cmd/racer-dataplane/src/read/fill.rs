@@ -484,9 +484,9 @@ impl Fill {
             .candidates_async(membership, &page.version.object, page.number)
             .await?;
         let persist = self.dependencies.candidates.is_candidate(&candidates);
-        // Reserve progress before touching transport, optionally including dirty
-        // capacity on candidates. Retrying a bad local copy releases this batch.
-        let mut reservation = self.reserve_progress(&context.object.cache, persist)?;
+        // Pending copies already own ciphertext. Disk owns a separate complete
+        // staging/decoded bundle; neither source needs speculative network bytes.
+        let plaintext = self.reserve_bootstrap(&context.object.cache)?;
         let local = self.dependencies.writer.copy_only(page)?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
@@ -510,7 +510,7 @@ impl Fill {
             },
         };
         if let Some(copy) = local {
-            match self.decrypt(page, copy, reservation.plaintext, scope).await {
+            match self.decrypt(page, copy, plaintext, scope).await {
                 Ok(result) => {
                     self.publish(result.clone(), None, scope).await?;
                     self.metrics.record(
@@ -530,13 +530,13 @@ impl Fill {
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
                     }
-                    drop(reservation.ciphertext);
-                    drop(reservation.dirty);
-                    reservation = self.reserve_progress(&context.object.cache, persist)?;
                 }
                 Err(error) => return Err(error),
             }
+        } else {
+            drop(plaintext);
         }
+        let reservation = self.reserve_progress(&context.object.cache, persist)?;
         let operation = PeerOperation::Page {
             page: page.clone(),
             mode: FetchMode::Acquire,

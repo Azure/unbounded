@@ -60,7 +60,11 @@ impl BufferPool {
     pub fn new(admission: Rc<Admission>) -> Self {
         Self { admission }
     }
-    pub fn plaintext(&self, reservation: Reservation, length: usize) -> Result<PlaintextBuffer> {
+    pub fn plaintext(
+        &self,
+        mut reservation: Reservation,
+        length: usize,
+    ) -> Result<PlaintextBuffer> {
         if length == 0 || length > PAGE_BYTES as usize {
             return Err(Error::InvalidConfiguration);
         }
@@ -75,14 +79,13 @@ impl BufferPool {
             .try_reserve_exact(length)
             .map_err(|_| Error::Overloaded)?;
         bytes.resize(length, 0);
-        Ok(PlaintextBuffer {
-            bytes: bytes.into_boxed_slice(),
-            reservation,
-        })
+        let bytes = bytes.into_boxed_slice();
+        reservation.shrink(bytes.len())?;
+        Ok(PlaintextBuffer { bytes, reservation })
     }
     pub fn ciphertext(
         &self,
-        reservation: Reservation,
+        mut reservation: Reservation,
         envelope: PageEnvelope,
         bytes: Vec<u8>,
     ) -> Result<CiphertextPage> {
@@ -96,6 +99,7 @@ impl BufferPool {
             bytes.capacity(),
             Some(&envelope.page.version.object.cache),
         )?;
+        reservation.shrink(bytes.capacity())?;
         Ok(CiphertextPage {
             inner: Arc::new(CiphertextBytes {
                 envelope,
@@ -242,8 +246,8 @@ pub(crate) mod tests {
         let (bytes, reservation) = buffer.into_parts();
         assert_eq!(bytes.as_ptr(), pointer);
         assert_eq!(&*bytes, b"abc");
-        assert_eq!(reservation.amount(), 8);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 8);
+        assert_eq!(reservation.amount(), 3);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
         drop((bytes, reservation));
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }

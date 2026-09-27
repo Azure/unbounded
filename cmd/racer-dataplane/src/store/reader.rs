@@ -74,8 +74,7 @@ impl StoreReader {
             )
         })
     }
-    /// The read owner may reclaim for each exact ciphertext allocation separately:
-    /// padded disk staging, then decoded ciphertext while staging is still owned.
+    /// Admit staging and decoded ciphertext together before submitting disk I/O.
     pub(crate) fn read_with_token_reclaim<'a>(
         &'a self,
         page: &'a PageId,
@@ -108,7 +107,14 @@ impl StoreReader {
                 }
             };
             let length = entry.location.location.extent.length();
-            let buffer = self.slabs.alignment()?.allocate(length, reserve(length)?)?;
+            let decoded_length = entry.metadata.page_length(page)? as usize + 16;
+            let mut decoded_reservation = reserve(
+                length
+                    .checked_add(decoded_length)
+                    .ok_or(Error::Overloaded)?,
+            )?;
+            let staging = decoded_reservation.split(length)?;
+            let buffer = self.slabs.alignment()?.allocate(length, staging)?;
             let buffer = match self
                 .slabs
                 .read(entry.location.location, buffer, lease, scope)
@@ -147,9 +153,8 @@ impl StoreReader {
             }) {
                 return Ok(None);
             }
-            let reservation = reserve(decoded.ciphertext.len())?;
             let ciphertext = self.buffers.ciphertext(
-                reservation,
+                decoded_reservation,
                 decoded.header.envelope,
                 buffer.bytes()?[decoded.ciphertext].to_vec(),
             )?;
