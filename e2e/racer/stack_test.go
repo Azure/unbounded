@@ -57,11 +57,17 @@ func TestOperatorImagePull(t *testing.T) {
 	t.Logf("artifacts: %s", artifacts)
 
 	images := []string{"unbounded-operator", "racer-controller", "racer-dataplane", "gantry"}
-	for _, component := range images {
-		h.run("docker", "image", "inspect", "docker.io/library/"+component+":e2e")
+
+	imageRegistry := os.Getenv("RACER_E2E_IMAGE_REGISTRY")
+	if imageRegistry == "" {
+		imageRegistry = "docker.io/library"
 	}
 
-	h.write("kind.yaml", "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n")
+	for _, component := range images {
+		h.run("docker", "image", "inspect", imageRegistry+"/"+component+":e2e")
+	}
+
+	h.write("kind.yaml", "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n")
 	t.Cleanup(func() {
 		h.diagnostics()
 
@@ -72,10 +78,10 @@ func TestOperatorImagePull(t *testing.T) {
 	h.run("kind", "create", "cluster", "--name", h.cluster, "--image", "kindest/node:v1.33.1", "--config", filepath.Join(artifacts, "kind.yaml"), "--kubeconfig", h.kubeconfig, "--wait", "120s")
 
 	for _, component := range images {
-		h.run("kind", "load", "docker-image", "--name", h.cluster, "docker.io/library/"+component+":e2e")
+		h.run("kind", "load", "docker-image", "--name", h.cluster, imageRegistry+"/"+component+":e2e")
 	}
 
-	h.run("make", "unbounded-operator-manifests", "UNBOUNDED_OPERATOR_IMAGE=docker.io/library/unbounded-operator:e2e", "UNBOUNDED_OPERATOR_IMAGE_REGISTRY=docker.io/library", "UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES=false")
+	h.run("make", "unbounded-operator-manifests", "UNBOUNDED_OPERATOR_IMAGE="+imageRegistry+"/unbounded-operator:e2e", "UNBOUNDED_OPERATOR_IMAGE_REGISTRY="+imageRegistry, "UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES=false")
 
 	manifests, err := filepath.Glob(filepath.Join(root, "deploy/unbounded-operator/rendered/*.yaml"))
 	require.NoError(t, err)
@@ -117,9 +123,18 @@ func TestOperatorImagePull(t *testing.T) {
 
 	require.NotEmpty(t, gateway, "kind requires an IPv4 gateway to the fixture")
 
-	origin := h.serve(fixture.handler())
+	peers := h.peerNodes()
+	peerFixture := h.newPeerFixture(peers)
+	origin := h.serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/fixture/peers/") {
+			peerFixture.ServeHTTP(w, r)
+			return
+		}
+
+		fixture.handler().ServeHTTP(w, r)
+	}))
 	originURL := "http://" + net.JoinHostPort(gateway, origin)
-	h.apply(fmt.Sprintf(gantryManifest, originURL))
+	h.apply(strings.ReplaceAll(fmt.Sprintf(gantryManifest, originURL), "docker.io/library/gantry:e2e", imageRegistry+"/gantry:e2e"))
 	h.kubectl("rollout", "status", "daemonset/gantry-racer-e2e", "-n", namespace, "--timeout=90s")
 
 	racerPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "-o", "jsonpath={.items[0].metadata.name}"))
@@ -170,6 +185,7 @@ func TestOperatorImagePull(t *testing.T) {
 
 	h.waitHTTP(racerURL + "/readyz")
 	t.Logf("containerd pulled and unpacked %s/fixture/image@%s through operator-installed Racer and Gantry (%d objects)", registry, fixture.manifest, len(fixture.blobs))
+	h.verifyPeerCache(peers, peerFixture)
 }
 
 type harness struct {
@@ -237,6 +253,7 @@ func (h *harness) serve(handler http.Handler) string {
 	require.NoError(h.t, err)
 
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+
 	go func() { _ = server.Serve(listener) }()
 
 	h.t.Cleanup(func() { server.Close() })
@@ -253,9 +270,11 @@ func (h *harness) forward(pod, port, readyPath string) string {
 	ctx, cancel := context.WithTimeout(h.ctx, time.Minute)
 	defer cancel()
 
+	h.sequence++
+
 	address, stop, err := forwardHTTP(ctx, func() *exec.Cmd {
 		return exec.Command("kubectl", "--kubeconfig", h.kubeconfig, "-n", namespace, "port-forward", "pod/"+pod, ":"+port)
-	}, filepath.Join(h.artifacts, "forward-"+port), readyPath)
+	}, filepath.Join(h.artifacts, fmt.Sprintf("forward-%s-%s-%d", pod, port, h.sequence)), readyPath)
 	require.NoError(h.t, err, "pod %s port %s not ready", pod, port)
 	h.t.Cleanup(stop)
 
