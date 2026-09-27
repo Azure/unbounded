@@ -61,6 +61,12 @@ fn sdk_sustained_full_images_avoid_hot_transit_edge() {
     sdk_fixture(true, false, true, true, true, false);
 }
 
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_sustained_full_images_avoid_remote_relay_congestion() {
+    sdk_fixture(true, true, true, true, true, false);
+}
+
 /// Select an explicit first hop so this small graph exercises a relay, as the
 /// fleet does. Everything after signing uses production transport and Fill.
 pub(super) struct ViaRelay {
@@ -174,8 +180,17 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         expired_fill,
     } = scenario;
     let hotspot = incoming_pressure && relay_pressure;
-    let (signers, discovery) =
-        named_identities(&[A, B, C, "00000004-1111-4111-8111-111111111111"], 8192);
+    let remote_hotspot = hotspot && idle_pressure;
+    let idle_pressure = idle_pressure && !remote_hotspot;
+    let names = [
+        A,
+        B,
+        C,
+        "00000004-1111-4111-8111-111111111111",
+        "00000005-1111-4111-8111-111111111111",
+    ];
+    let count = if remote_hotspot { 5 } else { 4 };
+    let (signers, discovery) = named_identities(&names[..count], 8192);
     for signer in &signers {
         for peer in &signers {
             signer
@@ -219,7 +234,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         )
         .unwrap();
     }
-    let listeners: Vec<_> = (0..4)
+    let listeners: Vec<_> = (0..count)
         .map(|_| {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.set_nonblocking(true).unwrap();
@@ -294,7 +309,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     });
     // Seven full-page charges fit inside the fleet's 128 MiB worker quota.
     // Four two-page windows must make progress without an eighth full-page charge.
-    let nodes: Vec<_> = (0..4)
+    let nodes: Vec<_> = (0..count)
         .map(|i| {
             build_node_with_relay_pressure(
                 i,
@@ -518,7 +533,12 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let mut hot_connections = Vec::new();
     if hotspot {
         drive(Box::pin(async {
-            let endpoint = Endpoint::Peer(listeners[2].local_addr().unwrap().to_string());
+            let endpoint = Endpoint::Peer(
+                listeners[if remote_hotspot { 3 } else { 2 }]
+                    .local_addr()
+                    .unwrap()
+                    .to_string(),
+            );
             for _ in 0..2 {
                 hot_connections.push(nodes[1].pool.checkout(&endpoint, &scope).await.unwrap());
             }
@@ -590,6 +610,58 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let client_server = async {
         let node = &nodes[0];
         let mut active = FuturesUnordered::new();
+        if remote_hotspot {
+            for _ in 0..8 {
+                relay_charges.push(
+                    nodes[2]
+                        .admission
+                        .reserve(None, ResourceClass::Relay, 1)
+                        .unwrap(),
+                );
+            }
+            // Prime the real failure feedback before independent SDK arrivals.
+            // Local 1->3 slots are busy; 1->2->3 returns signed overload, while
+            // 1->4->3 remains available under precisely the same limits.
+            let request_scope = RequestScope::new(RequestId(rand_id()), scope.deadline.0).unwrap();
+            let attempt = AttemptId(rand_id());
+            let request = PeerRequest {
+                operation: Operation::Page {
+                    page: page(layer_keys[0], 1),
+                    mode: FetchMode::CopyOnly,
+                },
+                origin: nodes[0]
+                    .credentials
+                    .seal(&context(layer_keys[0]), attempt, &request_scope)
+                    .unwrap(),
+                route: RouteBudget {
+                    membership: membership.version,
+                    request: request_scope.request,
+                    attempt,
+                    destination: signers[3].node().clone(),
+                    visited: vec![signers[0].node().clone()],
+                    remaining_links: 4,
+                    remaining_attempts: 0,
+                    deadline: request_scope.deadline,
+                },
+            };
+            let auth = Forwarding::new(signers[0].clone());
+            let (signed, binding) = auth.sign_request_to(request, signers[1].node()).unwrap();
+            let response = nodes[0]
+                .transfers
+                .exchange(
+                    Endpoint::Peer(listeners[1].local_addr().unwrap().to_string()),
+                    signed,
+                    &request_scope,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                auth.verify_response(response, &binding).unwrap().response(),
+                PeerResponse::Overloaded
+            ));
+            relay_release = Some(Instant::now() + Duration::from_millis(150));
+            pressure_seeded = true;
+        }
         loop {
             if expired_fill && !pressure_seeded && ready_path.exists() {
                 // A separate signed acquisition expires while its elected Fill

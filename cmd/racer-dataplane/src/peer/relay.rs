@@ -12,7 +12,12 @@ use crate::{
     security::forwarding::Forwarding,
     topology::paths::Paths,
 };
-use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 #[path = "relay_admission.rs"]
 mod admission;
 pub struct Relay {
@@ -21,6 +26,7 @@ pub struct Relay {
     transport: Rc<dyn PeerTransport>,
     admission: admission::RelayAdmission,
     resources: Rc<Admission>,
+    congested: RefCell<NeighborCongestion>,
     #[cfg(test)]
     overloads: std::cell::Cell<usize>,
     network: Option<Rc<super::PeerNetwork>>,
@@ -39,6 +45,7 @@ impl Relay {
             transport,
             admission: admission::RelayAdmission::new(admission.clone()),
             resources: admission,
+            congested: RefCell::new(NeighborCongestion::default()),
             #[cfg(test)]
             overloads: std::cell::Cell::new(0),
             network: None,
@@ -64,13 +71,18 @@ impl Relay {
             let previous = budget.visited.last().ok_or(Error::InvalidRequest)?.clone();
             network.endpoint(budget.membership, &previous)?;
             let membership = network.membership(budget.membership)?;
-            let saturated = crate::topology::graph::Graph::new(membership.clone())
-                .neighbors(&network.local)?
+            let neighbors =
+                crate::topology::graph::Graph::new(membership.clone()).neighbors(&network.local)?;
+            self.congested
+                .borrow_mut()
+                .retain(budget.membership, &neighbors, Instant::now());
+            let saturated = neighbors
                 .into_iter()
                 .filter(|node| {
-                    network
-                        .endpoint(budget.membership, node)
-                        .is_ok_and(|endpoint| transfers.http.endpoint_saturated(&endpoint))
+                    self.congested.borrow().entries.contains_key(node)
+                        || network
+                            .endpoint(budget.membership, node)
+                            .is_ok_and(|endpoint| transfers.http.endpoint_saturated(&endpoint))
                 })
                 .collect::<Vec<_>>();
             let route = self
@@ -107,13 +119,14 @@ impl Relay {
             // The signed security profile permits visited+links == MAX_HOPS+1;
             // preserve the same effective-budget transition as buffered relay.
             let mut outbound = budget.clone();
+            let version = budget.membership;
             outbound.visited.push(network.local.clone());
             outbound.remaining_links = outbound
                 .remaining_links
                 .checked_sub(1)
                 .ok_or(Error::HopBudgetExhausted)?;
             let signed = self.forwarding.append_request(request, next, outbound)?;
-            super::stream::TransitBody::open(
+            let result = super::stream::TransitBody::open(
                 transfers,
                 &endpoint,
                 signed,
@@ -123,6 +136,7 @@ impl Relay {
                 &self.forwarding,
                 &binding,
                 &previous,
+                next,
             )
             .await
             .inspect_err(|error| {
@@ -131,11 +145,20 @@ impl Relay {
                 {
                     handshake.invalidate(next);
                 }
-            })
+            });
+            if let Ok((_, _, true)) = &result {
+                // Remember only an authenticated immediate neighbor's overload.
+                // Future independent arrivals can use another incident edge; the
+                // failed envelope is returned unchanged and is never replayed.
+                self.congested
+                    .borrow_mut()
+                    .observe(next.clone(), version, Instant::now());
+            }
+            result
         }
         .await;
         match prepare {
-            Ok((head, body)) => body.send(transfers, upstream, head, &scope).await,
+            Ok((head, body, _)) => body.send(transfers, upstream, head, &scope).await,
             Err(error) => {
                 let outcome = match error {
                     Error::Overloaded => {
@@ -245,6 +268,85 @@ impl Relay {
             // never choose a new route for a reverse-link failure.
             self.forwarding.append_response(response, &previous)
         })
+    }
+}
+
+#[derive(Default)]
+struct NeighborCongestion {
+    entries: BTreeMap<
+        crate::model::identity::NodeId,
+        (crate::model::identity::MembershipVersion, Instant),
+    >,
+}
+
+impl NeighborCongestion {
+    fn retain(
+        &mut self,
+        membership: crate::model::identity::MembershipVersion,
+        neighbors: &[crate::model::identity::NodeId],
+        now: Instant,
+    ) {
+        self.entries.retain(|node, (version, until)| {
+            *version == membership && *until > now && neighbors.contains(node)
+        });
+    }
+
+    fn observe(
+        &mut self,
+        node: crate::model::identity::NodeId,
+        membership: crate::model::identity::MembershipVersion,
+        now: Instant,
+    ) {
+        // Bound even completions from different retained memberships. This is a
+        // brief routing hint, not a failed-node circuit or an acquisition retry.
+        if self.entries.len() == 2 * crate::topology::graph::RADIX
+            && !self.entries.contains_key(&node)
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(node, _)| node.clone())
+                .unwrap();
+            self.entries.remove(&oldest);
+        }
+        self.entries
+            .insert(node, (membership, now + Duration::from_millis(250)));
+    }
+}
+
+#[cfg(test)]
+mod congestion_tests {
+    use super::*;
+    use crate::model::identity::{MembershipVersion, NodeId};
+
+    #[test]
+    fn congestion_expires_and_stays_bounded_across_membership_changes() {
+        let mut congestion = NeighborCongestion::default();
+        let now = Instant::now();
+        let nodes: Vec<_> = (0..40).map(|i| NodeId(i.to_string())).collect();
+        for node in &nodes {
+            congestion.observe(node.clone(), MembershipVersion(1), now);
+        }
+        assert_eq!(congestion.entries.len(), 36);
+        congestion.retain(
+            MembershipVersion(1),
+            &nodes,
+            now + Duration::from_millis(249),
+        );
+        assert_eq!(congestion.entries.len(), 36);
+        congestion.retain(
+            MembershipVersion(1),
+            &nodes,
+            now + Duration::from_millis(250),
+        );
+        assert!(congestion.entries.is_empty());
+        congestion.observe(nodes[0].clone(), MembershipVersion(1), now);
+        congestion.retain(MembershipVersion(2), &nodes, now);
+        assert!(congestion.entries.is_empty());
+        congestion.observe(nodes[0].clone(), MembershipVersion(2), now);
+        congestion.retain(MembershipVersion(2), &nodes[1..], now);
+        assert!(congestion.entries.is_empty());
     }
 }
 #[cfg(test)]

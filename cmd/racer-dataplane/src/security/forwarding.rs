@@ -156,6 +156,13 @@ pub struct VerifiedResponseHead {
     forwarders: Vec<VerifiedPeer>,
 }
 impl VerifiedResponseHead {
+    /// Only the authenticated responder can report its own admission pressure.
+    /// A forwarded overload does not establish congestion at the adjacent peer.
+    pub(crate) fn overloaded_at(&self, peer: &NodeId) -> bool {
+        matches!(self.descriptor, protocol::ResponseDescriptor::Overloaded)
+            && self.origin.node() == peer
+    }
+
     pub fn length(&self) -> usize {
         match &self.descriptor {
             protocol::ResponseDescriptor::Page(_, envelope) => envelope.ciphertext_length as usize,
@@ -1271,6 +1278,32 @@ mod tests {
         }
         a.verify_response(response, &binding).unwrap();
     }
+    #[test]
+    fn overload_feedback_identifies_only_the_authenticated_responder() {
+        for overload in [false, true] {
+            let signatures = network(3);
+            let a = Forwarding::new(signatures[0].clone());
+            let b = Forwarding::new(signatures[2].clone());
+            let (signed, binding) = a.sign_request(request(3)).unwrap();
+            let admitted = b.verify_request(signed).unwrap();
+            let response = b
+                .sign_response(
+                    admitted.binding(),
+                    if overload {
+                        PeerResponse::Overloaded
+                    } else {
+                        PeerResponse::Miss
+                    },
+                )
+                .unwrap();
+            let verified = a
+                .verify_response_head(response.authentication, 0, &binding)
+                .unwrap();
+            assert_eq!(verified.overloaded_at(&node(2)), overload);
+            assert!(!verified.overloaded_at(&node(1)));
+        }
+    }
+
     #[test]
     fn streamed_descriptor_rejects_lengths_binding_signature_and_replay_without_body() {
         use crate::model::{

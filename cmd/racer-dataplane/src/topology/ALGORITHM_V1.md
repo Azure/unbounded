@@ -111,6 +111,15 @@ shortest-path ordering, work allowance, visited exclusions, and remaining signed
 link budget. Checkout still enforces admission if capacity changes during search.
 Transit does not wait for busy connections or retry an already sent envelope.
 
+A verified Overloaded response originating at the immediate downstream neighbor
+also excludes that incident edge for 250 ms for subsequent independent requests.
+Only the authenticated responder's own overload supplies this hint; an overload
+forwarded from a more distant node does not implicate the adjacent peer. The hint
+is scoped to the membership, expires without renewal by readers, and is bounded
+to 36 entries across retained memberships. It feeds the same unavailable-edge
+set above. It does not add attempts, replay the failed envelope, extend deadlines,
+or increase admission quotas. The original signed failure still returns upstream.
+
 Normal admission chooses 4 links; failure-tolerant admission may choose 8.
 An already admitted attempt never increases its budget. `visited` contains
 prior senders and excludes the current recipient. A forward appends the

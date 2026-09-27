@@ -159,6 +159,12 @@ fn sustained_fills_use_available_transit_edges() {
     intersecting_with_pressure(2, P, true, false, true, "hotspot-fill");
 }
 
+#[test]
+#[ignore = "sustained production Fill with remote relay congestion: run with --release"]
+fn sustained_fills_avoid_repeated_remote_relay_overload() {
+    intersecting_with_pressure(2, P, true, false, true, "hotspot-remote-fill");
+}
+
 struct HotspotIngress {
     next: NodeId,
     endpoint: Endpoint,
@@ -237,6 +243,7 @@ fn intersecting_with_pressure(
     pressure: &str,
 ) {
     let hotspot = pressure.starts_with("hotspot");
+    let remote_hotspot = pressure == "hotspot-remote-fill";
     // Actual 1500-member radix-18 graph: both middle edges occur in production
     // shortest paths. Hotspot cases activate one additional detour peer.
     const BASE_POSITIONS: [usize; 6] = [3, 0, 1, 18, 19, 2];
@@ -366,6 +373,9 @@ fn intersecting_with_pressure(
                 128,
                 false,
                 |limits| {
+                    if remote_hotspot {
+                        limits.relay_transfers = NonZeroUsize::new(8).unwrap();
+                    }
                     if reverse_pressure && cut_through && [1, 2].contains(&i) {
                         limits.ciphertext_bytes = NonZeroUsize::new(P + 16 + 8 * 16384).unwrap();
                     }
@@ -497,7 +507,7 @@ fn intersecting_with_pressure(
     }
     drop(seed);
     let mut hot_connections = Vec::new();
-    if hotspot {
+    if hotspot && !remote_hotspot {
         // Keep exactly the existing two slots on the canonical middle edge busy.
         // Other graph edges remain available; no quota is increased for detours.
         let endpoint = Endpoint::Peer(listeners[2].local_addr().unwrap().to_string());
@@ -556,6 +566,9 @@ fn intersecting_with_pressure(
     let mut requests = FuturesUnordered::new();
     let rounds = if churn || hotspot { 12 } else { 1 };
     for (side, (source, first, destination)) in [(0, 1, 3), (4, 2, 5)].into_iter().enumerate() {
+        if remote_hotspot && side == 1 {
+            continue;
+        }
         for index in 0..slots {
             let node = &nodes[source];
             let request_scope = RequestScope::new(
@@ -631,7 +644,7 @@ fn intersecting_with_pressure(
                         })
                         .await;
                     }
-                    if pressure == "hotspot-fill" {
+                    if pressure == "hotspot-fill" || remote_hotspot {
                         let mut budget = AcquisitionBudget::new(request_scope.deadline.0, 8, 16);
                         let result = fill
                             .acquire(
@@ -716,6 +729,60 @@ fn intersecting_with_pressure(
         all.next().await.unwrap()
     };
     let mut servers = Box::pin(servers);
+    let mut remote_pressure = Vec::new();
+    let mut remote_release = None;
+    if remote_hotspot {
+        // Downstream is at the fleet's eight-relay worker ceiling. The first
+        // upstream edge is free: local slot exclusion cannot detect this load.
+        for _ in 0..nodes[2].admission.limit(ResourceClass::Relay) {
+            remote_pressure.push(
+                nodes[2]
+                    .admission
+                    .reserve(None, ResourceClass::Relay, 1)
+                    .unwrap(),
+            );
+        }
+        let source = &nodes[0];
+        let probe_scope = RequestScope::new(RequestId([222; 16]), scope.deadline.0).unwrap();
+        let attempt = AttemptId([222; 16]);
+        let request = PeerRequest {
+            operation: Operation::Page {
+                page: page(keys[0], 0),
+                mode: FetchMode::CopyOnly,
+            },
+            origin: source
+                .credentials
+                .seal(&context(keys[0]), attempt, &probe_scope)
+                .unwrap(),
+            route: RouteBudget {
+                membership: membership.version,
+                request: probe_scope.request,
+                attempt,
+                destination: signers[3].node().clone(),
+                visited: vec![signers[0].node().clone()],
+                remaining_links: 4,
+                remaining_attempts: 0,
+                deadline: probe_scope.deadline,
+            },
+        };
+        let auth = Forwarding::new(signers[0].clone());
+        let (signed, binding) = auth.sign_request_to(request, signers[1].node()).unwrap();
+        let endpoint = Endpoint::Peer(listeners[1].local_addr().unwrap().to_string());
+        let mut probe = source.transfers.exchange(endpoint, signed, &probe_scope);
+        let response = loop {
+            if let Poll::Ready(response) = probe.as_mut().poll(&mut cx) {
+                break response.unwrap();
+            }
+            assert!(servers.as_mut().poll(&mut cx).is_pending());
+            tick(&mut cx);
+            scope.check().unwrap();
+        };
+        assert!(matches!(
+            auth.verify_response(response, &binding).unwrap().response(),
+            PeerResponse::Overloaded
+        ));
+        remote_release = Some(Instant::now() + Duration::from_millis(150));
+    }
     if reverse_pressure && !cut_through {
         let end = Instant::now() + Duration::from_secs(3);
         loop {
@@ -756,7 +823,11 @@ fn intersecting_with_pressure(
         let mut arrivals = 0;
         let mut complete = 0;
         let mut failed = 0;
-        while complete < 2 * slots {
+        while complete < if remote_hotspot { slots } else { 2 * slots } {
+            if remote_release.is_some_and(|at| Instant::now() >= at) {
+                remote_pressure.clear();
+                remote_release = None;
+            }
             if churn {
                 // 200 completed-keepalive arrivals/s per relay throughout the
                 // run, while four clients issue successive pages.
@@ -831,7 +902,7 @@ fn intersecting_with_pressure(
         }
         eprintln!(
             "response-ready complete: cut_through={cut_through} pressure={pressure} failures={failed} bytes={bytes} concurrent={}",
-            2 * slots
+            if remote_hotspot { slots } else { 2 * slots }
         );
     } else {
         let end = Instant::now() + Duration::from_secs(3);
@@ -894,6 +965,7 @@ fn intersecting_with_pressure(
     drop(servers);
     drop(requests);
     drop(hot_connections);
+    drop(remote_pressure);
     drop(idle_work);
     drop(idle_peers);
     drop(copies);

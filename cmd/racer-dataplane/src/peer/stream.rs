@@ -211,7 +211,8 @@ impl TransitBody {
         forwarding: &Forwarding,
         binding: &RequestBinding,
         previous: &crate::model::identity::NodeId,
-    ) -> Result<(ForwardedHead, Self)> {
+        next: &crate::model::identity::NodeId,
+    ) -> Result<(ForwardedHead, Self, bool)> {
         let chunk = WireBuffer::transit(chunk, permit)?;
         let connection = transfers.http.checkout(endpoint, scope).await?;
         // No native accept is attached. Downstream uses the existing HTTP fallback
@@ -248,6 +249,7 @@ impl TransitBody {
             )?;
         let (authentication, length) = WireCodec::decode(received.value, true)?;
         let verified = forwarding.verify_response_head(authentication, length, binding)?;
+        let overloaded = verified.overloaded_at(next);
         let authentication = forwarding.append_response_head(verified, previous)?;
         Ok((
             authentication,
@@ -256,6 +258,7 @@ impl TransitBody {
                 chunk,
                 remaining: length,
             },
+            overloaded,
         ))
     }
 
