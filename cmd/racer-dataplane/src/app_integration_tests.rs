@@ -341,6 +341,256 @@ struct Fixture {
     bootstrap_status: Arc<AtomicUsize>,
     poll_status: Arc<AtomicUsize>,
     certificate_age: Arc<AtomicUsize>,
+    bootstrap_requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
+    poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[test]
+fn same_node_renewal_backs_off_expires_closed_and_recovers() {
+    use crate::runtime::environment::{SimulationClock, now, wall_now};
+    use crate::telemetry::health::State;
+
+    // Complete each real control turn through the application's error handling.
+    // Leave the next turn unsubmitted so the test controls all retry boundaries.
+    fn turn(
+        worker: &mut WorkerApplication,
+        runtime: &WorkerRuntime,
+        engine: &mut PageCryptoEngine,
+    ) {
+        let done = Rc::new(std::cell::Cell::new(false));
+        let completed = done.clone();
+        let control = worker.control.clone().unwrap();
+        let request_scope = scope(Duration::from_secs(40)).unwrap();
+        assert!(worker.control_task.is_none());
+        worker.control_task = Some(Box::pin(async move {
+            let result = control.progress(&request_scope).await;
+            completed.set(true);
+            result.map(|_| ())
+        }));
+        drive(
+            runtime,
+            engine,
+            Box::pin(std::future::poll_fn(|cx| {
+                worker.poll_control(cx)?;
+                if done.get() {
+                    worker.control_task.take();
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })),
+        )
+        .unwrap();
+        worker.observe_health().unwrap();
+        assert!(worker.started && !worker.stopping);
+        assert!(!runtime.admission.is_stopped());
+    }
+
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    // An already renewal-due, still valid certificate avoids advancing the TLS
+    // server's host clock. A fresh 24-hour certificate covers the later virtual
+    // expiry of this old certificate, and is also valid for real TLS handshakes.
+    fixture
+        .certificate_age
+        .store(16 * 3600 + 60, Ordering::Release);
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    assert!(node.observations.health.ready());
+    let control = worker.control.clone().unwrap();
+    let old = control.identity().unwrap();
+    assert!(old.renewal_due() && old.valid_now());
+    let old_signing = worker.keys.signing_identity().unwrap();
+    let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
+    let baseline = fixture.bootstrap_requests.lock().unwrap().len();
+    let polls = fixture.polls.load(Ordering::Acquire);
+
+    let clock = SimulationClock::new_at(3, Instant::now(), std::time::SystemTime::now());
+    let environment = clock.environment(0);
+    let _clock = environment.enter();
+    fixture.bootstrap_status.store(503, Ordering::Release);
+    turn(&mut worker, &runtime, &mut engine);
+    assert_eq!(control.renewal_error(), Some(Error::Unavailable));
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 1
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls + 1);
+    let pending = std::fs::read(config.identity_directory.join("pending.json")).unwrap();
+
+    // Even many successful 204 polls must neither reset renewal backoff nor
+    // replace the accepted certificate. Check both sides of the 1-second retry.
+    clock.advance(Duration::from_millis(999));
+    for _ in 0..16 {
+        turn(&mut worker, &runtime, &mut engine);
+        assert!(node.observations.health.ready());
+        assert!(old.valid_now());
+        assert!(Arc::ptr_eq(
+            &old_signing,
+            &worker.keys.signing_identity().unwrap()
+        ));
+        assert_eq!(
+            control.identity().unwrap().certificate_chain(),
+            old.certificate_chain()
+        );
+        assert_eq!(control.renewal_error(), Some(Error::Unavailable));
+    }
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 1
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls + 17);
+    clock.advance(Duration::from_millis(1));
+    turn(&mut worker, &runtime, &mut engine);
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 2
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls + 18);
+    // This seed selects a second jittered delay greater than one second.
+    // Successful polls must retain the failure count so retries grow rather
+    // than restarting at the first-failure delay on every turn.
+    clock.advance(Duration::from_secs(1));
+    turn(&mut worker, &runtime, &mut engine);
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 2
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls + 19);
+    for cert in &fixture.poll_certificates.lock().unwrap()[polls..] {
+        assert_eq!(cert, &old.certificate_chain()[0]);
+    }
+    assert_eq!(
+        std::fs::read(config.identity_directory.join("identity.json")).unwrap(),
+        committed
+    );
+    assert_eq!(
+        std::fs::read(config.identity_directory.join("pending.json")).unwrap(),
+        pending
+    );
+
+    // Refresh the observation just before expiry: readiness must fail because of
+    // credentials, not because its independent 2-second observation lease aged.
+    clock.advance(old.expires_at().duration_since(wall_now()).unwrap() - Duration::from_millis(1));
+    worker.observe_health().unwrap();
+    assert!(node.observations.health.ready());
+    clock.advance(Duration::from_millis(1));
+    assert!(!old.valid_now());
+    assert!(!node.observations.health.ready());
+    worker.observe_health().unwrap();
+    assert_eq!(node.observations.health.state(), Ok(State::Degraded));
+    let polls_at_expiry = fixture.polls.load(Ordering::Acquire);
+    assert!(matches!(
+        drive(
+            &runtime,
+            &mut engine,
+            control.poll(
+                wire::SnapshotRequest { after: None },
+                &scope(Duration::from_secs(10)).unwrap()
+            )
+        ),
+        Err(Error::Unauthorized)
+    ));
+    turn(&mut worker, &runtime, &mut engine);
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 3
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls_at_expiry);
+    assert_eq!(control.renewal_error(), Some(Error::Unavailable));
+    let retry = control.next_attempt().unwrap();
+    assert!(
+        (Duration::from_secs(1)..=Duration::from_secs(30)).contains(&retry.duration_since(now()))
+    );
+    clock.advance(retry.duration_since(now()) - Duration::from_millis(1));
+    for _ in 0..16 {
+        turn(&mut worker, &runtime, &mut engine);
+        assert!(!node.observations.health.ready());
+    }
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 3
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls_at_expiry);
+    assert_eq!(
+        std::fs::read(config.identity_directory.join("identity.json")).unwrap(),
+        committed
+    );
+
+    fixture.certificate_age.store(1, Ordering::Release);
+    fixture.bootstrap_status.store(200, Ordering::Release);
+    clock.advance(Duration::from_millis(1));
+    turn(&mut worker, &runtime, &mut engine);
+    let fresh = control.identity().unwrap();
+    assert_eq!(fresh.node(), old.node());
+    assert!(fresh.valid_now() && !fresh.renewal_due());
+    assert_ne!(fresh.certificate_chain(), old.certificate_chain());
+    assert_ne!(fresh.private_key_der(), old.private_key_der());
+    assert_eq!(
+        worker.keys.signing_identity().unwrap().certificate_chain(),
+        fresh.certificate_chain()
+    );
+    assert_eq!(control.renewal_error(), None);
+    assert_eq!(control.next_attempt(), Some(now()));
+    assert!(node.observations.health.ready());
+    assert!(!config.identity_directory.join("pending.json").exists());
+    assert_ne!(
+        std::fs::read(config.identity_directory.join("identity.json")).unwrap(),
+        committed
+    );
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 4
+    );
+    let requests = fixture.bootstrap_requests.lock().unwrap();
+    for request in &requests[baseline..] {
+        assert_eq!(request.enrollment, requests[baseline].enrollment);
+        assert_eq!(request.csr_der, requests[baseline].csr_der);
+    }
+    assert_ne!(requests[baseline].csr_der, requests[baseline - 1].csr_der);
+    drop(requests);
+    turn(&mut worker, &runtime, &mut engine);
+    assert_eq!(
+        fixture.bootstrap_requests.lock().unwrap().len(),
+        baseline + 4
+    );
+    assert_eq!(fixture.polls.load(Ordering::Acquire), polls_at_expiry + 2);
+    for cert in &fixture.poll_certificates.lock().unwrap()[polls_at_expiry..] {
+        assert_eq!(cert, &fresh.certificate_chain()[0]);
+    }
+    assert!(node.observations.health.ready());
+    assert_eq!(
+        worker.snapshots.cursor().unwrap(),
+        Some(wire::PublicationSequence(1))
+    );
+
+    drop(_clock);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
+    drive(
+        &runtime,
+        &mut engine,
+        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -701,6 +951,10 @@ impl Fixture {
         let issued = enrollments.clone();
         let polls = Arc::new(AtomicUsize::new(0));
         let polled = polls.clone();
+        let bootstrap_requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = bootstrap_requests.clone();
+        let poll_certificates = Arc::new(Mutex::new(Vec::new()));
+        let certificates = poll_certificates.clone();
         let server = thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 let (socket, _) = match listener.accept() {
@@ -750,6 +1004,12 @@ impl Fixture {
                 let node = current_binding.lock().unwrap().clone();
                 publication.members[0].node = node.clone();
                 let requested_status = if head.starts_with("POST ") {
+                    assert!(head.contains("Authorization: Bearer fixture.token"));
+                    assert!(stream.conn.peer_certificates().is_none());
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(wire::decode_enrollment_request(&body).unwrap());
                     enrollment_status.load(Ordering::Acquire)
                 } else {
                     snapshot_status.load(Ordering::Acquire)
@@ -799,6 +1059,10 @@ impl Fixture {
                     )
                 } else {
                     assert!(stream.conn.peer_certificates().is_some());
+                    certificates
+                        .lock()
+                        .unwrap()
+                        .push(stream.conn.peer_certificates().unwrap()[0].to_vec());
                     polled.fetch_add(1, Ordering::Release);
                     if head.lines().next().unwrap().contains("?after=1") {
                         (204, Vec::new())
@@ -827,6 +1091,8 @@ impl Fixture {
             bootstrap_status,
             poll_status,
             certificate_age,
+            bootstrap_requests,
+            poll_certificates,
         }
     }
 }
