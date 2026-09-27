@@ -79,6 +79,12 @@ fn sdk_sustained_full_images_route_around_rejecting_first_hops() {
     sdk_fixture_inner(true, false, true, false, true, false, true, true);
 }
 
+#[test]
+#[ignore = "production SDK continuation on sustained 1500-member crossing routes: run with --release"]
+fn sdk_sustained_full_images_continue_with_original_stream_credits() {
+    sdk_fixture_inner(true, true, true, false, true, false, true, false);
+}
+
 /// Remove only direct edges in this small graph to require transit. Route choice,
 /// signed receiver, transport and receipt handling remain production Requester.
 pub(super) struct RoutedIngress {
@@ -168,7 +174,7 @@ impl requester::PeerClient for ViaRelay {
                 .membership
                 .members()
                 .iter()
-                .skip(1)
+                .skip(usize::from(self.membership.members().len() < 100))
                 .find(|m| m.node != request.route.destination)
                 .unwrap();
             let (signed, binding) = self.auth.sign_request_to(request, &next.node)?;
@@ -273,6 +279,7 @@ fn sdk_fixture_inner(
     fs::remove_dir_all(output).unwrap();
 }
 fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
+    crate::read::range_stream::CONTINUATIONS.with(|count| count.set(0));
     let SdkScenario {
         busy_peers,
         idle_pressure,
@@ -284,21 +291,36 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         ingress_routes,
     } = scenario;
     let hotspot = incoming_pressure && relay_pressure;
+    let continuation = acquisition_progress && idle_pressure && !incoming_pressure;
     let remote_hotspot = hotspot && idle_pressure;
-    let idle_pressure = idle_pressure && !remote_hotspot;
-    let names = [
+    let idle_pressure = idle_pressure && !remote_hotspot && !continuation;
+    let small_names = [
         A,
         B,
         C,
         "00000004-1111-4111-8111-111111111111",
         "00000005-1111-4111-8111-111111111111",
     ];
-    let count = if remote_hotspot || ingress_routes {
+    let fleet_names: Vec<_> = (0..1500)
+        .map(|i| format!("{:08x}-1111-4111-8111-111111111111", i + 1))
+        .collect();
+    // Active vertices of real intersecting radix-18 paths: 3->0->1->18
+    // and 19->1->0->2. All remaining members participate in ranking/routing.
+    let positions = [3, 0, 1, 18, 19, 2];
+    let active_names: Vec<_> = positions.iter().map(|&i| fleet_names[i].as_str()).collect();
+    let count = if continuation {
+        6
+    } else if remote_hotspot || ingress_routes {
         5
     } else {
         4
     };
-    let (signers, discovery) = named_identities(&names[..count], 8192);
+    let names = if continuation {
+        &active_names[..]
+    } else {
+        &small_names[..count]
+    };
+    let (signers, discovery) = named_identities(names, 8192);
     for signer in &signers {
         for peer in &signers {
             signer
@@ -352,15 +374,36 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
-            signers
-                .iter()
-                .zip(&listeners)
-                .map(|(s, l)| Member {
-                    node: s.node().clone(),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: l.local_addr().unwrap().to_string(),
-                    rails: vec![],
-                    alignment_enabled: false,
+            (0..if continuation { 1500 } else { count })
+                .map(|index| {
+                    let active = if continuation {
+                        positions.iter().position(|&p| p == index)
+                    } else {
+                        Some(index)
+                    };
+                    Member {
+                        node: if continuation {
+                            NodeId(fleet_names[index].clone())
+                        } else {
+                            signers[index].node().clone()
+                        },
+                        // Weighted placement keeps all three candidates in the active
+                        // subgraph; no mocked ranking or origin authority.
+                        shares: NonZeroU32::new(
+                            if continuation && active.is_some_and(|i| i >= 3) {
+                                1_000_000
+                            } else {
+                                1
+                            },
+                        )
+                        .unwrap(),
+                        peer_endpoint: active.map_or_else(
+                            || "127.0.0.1:9".into(),
+                            |i| listeners[i].local_addr().unwrap().to_string(),
+                        ),
+                        rails: vec![],
+                        alignment_enabled: false,
+                    }
                 })
                 .collect(),
         )
@@ -385,11 +428,15 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                 let key = CacheKey(key);
                 (0..length.div_ceil(P))
                     .all(|number| {
-                        !placement
+                        let ranked = placement
                             .rank(membership.clone(), &object(key), PageNumber(number as u64))
-                            .unwrap()
-                            .ordered
-                            .contains(signers[0].node())
+                            .unwrap();
+                        !ranked.ordered.contains(signers[0].node())
+                            && (!continuation
+                                || ranked
+                                    .ordered
+                                    .iter()
+                                    .all(|n| signers[3..].iter().any(|s| s.node() == n)))
                     })
                     .then_some(key)
             })
@@ -398,6 +445,24 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         descriptors.push(serde_json::json!({"raw_key":key.0.to_vec(), "size":length,"digest":format!("sha256:{:x}",Sha256::digest(&body))}));
         bytes.insert(key, body);
         layer_keys.push(key);
+    }
+    let crossing_key = continuation.then(|| {
+        (0..100_000u32)
+            .find_map(|n| {
+                let mut key = [0xf0; 32];
+                key[..4].copy_from_slice(&n.to_le_bytes());
+                let key = CacheKey(key);
+                (placement
+                    .rank(membership.clone(), &object(key), PageNumber(0))
+                    .unwrap()
+                    .ordered[0]
+                    == *signers[5].node())
+                .then_some(key)
+            })
+            .unwrap()
+    });
+    if let Some(key) = crossing_key {
+        bytes.insert(key, vec![0xa5; P]);
     }
     let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
     let config_key = CacheKey(Sha256::digest(&config).into());
@@ -533,6 +598,8 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let ready_path = output.join("sdk-ready");
     let release_path = output.join("sdk-release");
     let mut pressure_seeded = false;
+    let crossing_completed = Cell::new(0usize);
+    let crossing_started = Cell::new(false);
     let mut pressure_rounds = 0;
     let mut relay_charges = Vec::new();
     let mut relay_release = None;
@@ -700,7 +767,12 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     let servers = async {
         let mut all = FuturesUnordered::new();
         for (index, node) in nodes.iter().enumerate() {
-            let address = membership.members()[index].peer_endpoint.parse().unwrap();
+            let address = membership
+                .member(signers[index].node())
+                .unwrap()
+                .peer_endpoint
+                .parse()
+                .unwrap();
             let fd = (!expired_fill)
                 .then(|| Rc::new(OwnedFd::from(listeners[index].try_clone().unwrap())));
             let scope = &scope;
@@ -879,7 +951,12 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                     .skip(1)
                     .take(if ingress_routes { 2 } else { count - 1 })
                 {
-                    for _ in 0..8 {
+                    let occupied = if continuation {
+                        node.admission.used(ResourceClass::Relay)
+                    } else {
+                        0
+                    };
+                    for _ in occupied..8 {
                         relay_charges.push(
                             node.admission
                                 .reserve(None, ResourceClass::Relay, 1)
@@ -888,9 +965,12 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                     }
                 }
                 pressure_seeded = true;
+                crossing_started.set(true);
                 relay_release = Some(
                     Instant::now()
-                        + Duration::from_millis(if ingress_routes {
+                        + Duration::from_millis(if continuation {
+                            2200
+                        } else if ingress_routes {
                             2500
                         } else if acquisition_progress {
                             650
@@ -995,13 +1075,78 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
             .await;
         }
     };
+    let crossing = async {
+        let Some(key) = crossing_key else {
+            return std::future::pending::<()>().await;
+        };
+        std::future::poll_fn(|_| {
+            if crossing_started.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        loop {
+            let ctx = context(key);
+            let crossing_scope = RequestScope::new(RequestId(rand_id()), scope.deadline.0).unwrap();
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 32, 96);
+            let result = nodes[4]
+                .fill
+                .acquire(
+                    page(key, 0),
+                    membership.clone(),
+                    &ctx,
+                    &crossing_scope,
+                    &mut budget,
+                )
+                .await;
+            if let Ok(result) = result {
+                assert!(result.plaintext.bytes().iter().all(|&b| b == 0xa5));
+                crossing_completed.set(crossing_completed.get() + 1);
+            }
+            nodes[4].writer.discard_unsubmitted();
+            nodes[4].memory.evict_idle(usize::MAX).unwrap();
+            // Continuous active crossing transfers, including after every SDK
+            // pressure interval. Yield to the same production reactor/Fill owners.
+            let until = Instant::now() + Duration::from_millis(100);
+            std::future::poll_fn(|_| {
+                if Instant::now() >= until {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    };
     drive(Box::pin(async {
         futures::pin_mut!(servers, client_server);
-        match futures::future::select(client_server, servers).await {
-            futures::future::Either::Left(_) => {}
-            futures::future::Either::Right((result, _)) => panic!("peer server: {result:?}"),
-        }
+        let foreground = async {
+            match futures::future::select(client_server, servers).await {
+                futures::future::Either::Left(_) => {}
+                futures::future::Either::Right((result, _)) => panic!("peer server: {result:?}"),
+            }
+        };
+        futures::pin_mut!(foreground, crossing);
+        let _ = futures::future::select(foreground, crossing).await;
     }));
+    if continuation {
+        assert!(
+            crossing_completed.get() >= 6,
+            "sustained crossing Fill transfers must complete"
+        );
+        eprintln!(
+            "1500-member crossing transfers completed: {}",
+            crossing_completed.get()
+        );
+        let continued = crate::read::range_stream::CONTINUATIONS.with(Cell::get);
+        assert!(
+            continued >= 6,
+            "SDK must exercise completed transient page failures"
+        );
+        eprintln!("SDK page continuations using original credits: {continued}");
+    }
     if idle_pressure {
         client_listeners
             .cancel_cache(&CacheId(CACHE.into()))

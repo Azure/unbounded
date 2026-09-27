@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -87,6 +88,7 @@ func TestProductionStreamFixture(t *testing.T) {
 		rounds = 1
 	}
 	for round := 0; round < rounds; round++ {
+		var passed, failed atomic.Int32
 		for start := 0; start < len(manifest.Layers); start += 4 {
 			var ready, done sync.WaitGroup
 			var barrier sync.Once
@@ -100,6 +102,7 @@ func TestProductionStreamFixture(t *testing.T) {
 					}
 					value := get(layer)
 					if value == nil {
+						failed.Add(1)
 						ready.Done()
 						return
 					}
@@ -133,7 +136,10 @@ func TestProductionStreamFixture(t *testing.T) {
 						n += rest
 					}
 					if err != nil || n != layer.Size || fmt.Sprintf("sha256:%x", hash.Sum(nil)) != layer.Digest {
+						failed.Add(1)
 						t.Errorf("layer bytes=%d want=%d err=%v", n, layer.Size, err)
+					} else {
+						passed.Add(1)
 					}
 				}()
 			}
@@ -154,5 +160,6 @@ func TestProductionStreamFixture(t *testing.T) {
 				}
 			}
 		}
+		t.Logf("full-image round=%d verified_layers=%d failed_layers=%d", round, passed.Load(), failed.Load())
 	}
 }

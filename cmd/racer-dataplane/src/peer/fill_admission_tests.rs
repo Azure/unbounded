@@ -401,7 +401,15 @@ fn build_node_with_ingress_routes(
                 discovery.2.clone(),
             ),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 128, 4096));
+    let paths = Rc::new(Paths::new(
+        Rc::new(LinkHealth),
+        128,
+        if membership.members().len() > 100 {
+            150_000
+        } else {
+            4096
+        },
+    ));
     let peers = Rc::new(
         requester::Requester::new(
             paths.clone(),

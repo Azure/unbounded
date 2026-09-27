@@ -100,6 +100,23 @@ No runtime owner edits Cargo, app, config, error, HTTP, security, or storage fil
 
 ## Verification
 
+### Continuation after a completed page failure
+
+`RangeStream` partitions one original ingress acquisition budget across its sliding
+window. A completed `Unavailable`, `HopBudgetExhausted`, `Overloaded`, or `Io` page
+failure may continue at the same pinned page using credits still owned by that
+stream. Each continuation spends one original attempt before partitioning another
+child. Neither lost remote work nor a failed child restores spent credits. The
+original deadline, context, membership and version remain fixed; authentication,
+integrity, origin rejection, version, cancellation and deadline errors terminate.
+
+Failed pages take priority over extending the speculative window. Pending sibling
+pages remain owned and completed pages remain available for ordered delivery.
+Continuation futures live in the window, so dropping `next_slice` cannot restart
+them. There is no object-sized retry plan or new admission class. See
+`racer-continuation-convergence-validation.md` for the live terminal trace and the
+production SDK exact-base comparison.
+
 Runtime tests cover real io_uring TCP/Unix connections, positional file I/O,
 partial I/O, cancellation CQE ordering, abandonment, quota release, driver wakes,
 affinity, one-CPU paired startup/drain and rollback. Memory tests cover real

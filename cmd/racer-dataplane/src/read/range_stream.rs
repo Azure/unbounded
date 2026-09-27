@@ -1,6 +1,6 @@
 //! Bounded sliding whole-page window with ordered, independently leased slices.
-//! A stream pins its version and length once. A late error terminates that stream;
-//! it cannot replace headers or reopen against a newer version.
+//! A stream pins its version and length once. Completed transient page failures
+//! can continue using unspent ingress credits, never a new version or budget.
 use super::{
     dispatch::WorkerDirectory,
     fill::{Fill, PageResult},
@@ -29,6 +29,11 @@ use std::{
 enum WindowPage {
     Waiting(Operation<'static, (Result<PageResult>, AcquisitionBudget)>),
     Ready(Result<PageResult>),
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CONTINUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub struct RangeStreams {
@@ -171,7 +176,12 @@ impl RangeStream {
                 self.ready.clear();
                 return Err(error);
             }
-            while self.ready.len() < self.window_pages {
+            while self.ready.len() < self.window_pages
+                && !self
+                    .ready
+                    .iter()
+                    .any(|(_, entry)| matches!(entry, WindowPage::Ready(Err(_))))
+            {
                 let Some(number) = self.next_page else {
                     break;
                 };
@@ -200,19 +210,70 @@ impl RangeStream {
                     &self.scope,
                     child,
                 );
-                let failed = result.is_err();
                 let entry = match result {
                     Ok(future) => WindowPage::Waiting(future),
                     Err(error) => WindowPage::Ready(Err(error)),
                 };
-                if failed {
-                    self.next_page = None;
-                } else {
-                    self.advance(number);
-                }
+                // The failed page stays in the window. If it later continues,
+                // preserve the remainder of the range rather than ending early.
+                self.advance(number);
                 self.ready.push_back((number, entry));
             }
-            poll_fn(|cx| poll_window(&mut self.ready, &mut self.budget, cx)).await;
+            poll_fn(|cx| {
+                loop {
+                    if poll_window(&mut self.ready, &mut self.budget, cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    let Some((number, WindowPage::Ready(Err(error)))) = self.ready.front() else {
+                        return Poll::Ready(());
+                    };
+                    if !continuable(error, &self.budget) {
+                        return Poll::Ready(());
+                    }
+                    // A completed child has returned only its unused credits.
+                    // Spend one original attempt for every continuation, including
+                    // local admission failures that did no network work. This
+                    // bounds retries even when a child returns all its credits.
+                    if let Err(error) = self.scope.check().and_then(|()| {
+                        self.budget
+                            .begin_attempt(std::time::Instant::now(), self.scope.deadline.0)
+                            .map(|_| ())
+                    }) {
+                        self.ready.front_mut().unwrap().1 = WindowPage::Ready(Err(error));
+                        return Poll::Ready(());
+                    }
+                    let number = *number;
+                    #[cfg(test)]
+                    CONTINUATIONS.with(|count| count.set(count.get() + 1));
+                    let child = match self.budget.partition(
+                        self.budget.remaining_attempts().min(8),
+                        self.budget.remaining_links().min(16),
+                    ) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            self.ready.front_mut().unwrap().1 = WindowPage::Ready(Err(error));
+                            return Poll::Ready(());
+                        }
+                    };
+                    self.ready.front_mut().unwrap().1 = match self.directory.start_page(
+                        PageId {
+                            version: self.metadata.version.clone(),
+                            number,
+                        },
+                        self.membership.clone(),
+                        &self.context,
+                        &self.scope,
+                        child,
+                    ) {
+                        Ok(future) => WindowPage::Waiting(future),
+                        Err(error) => WindowPage::Ready(Err(error)),
+                    };
+                    // Keep the replacement in the window across next_slice drop.
+                    // Later completed pages and leases are neither redownloaded
+                    // nor discarded while the ordered front makes progress.
+                }
+            })
+            .await;
             if let Err(error) = self.scope.check() {
                 self.terminated = true;
                 self.ready.clear();
@@ -252,6 +313,13 @@ impl RangeStream {
     pub fn buffered_pages(&self) -> usize {
         self.ready.len()
     }
+}
+fn continuable(error: &Error, budget: &AcquisitionBudget) -> bool {
+    matches!(
+        error,
+        Error::Unavailable | Error::HopBudgetExhausted | Error::Overloaded | Error::Io
+    ) && budget.remaining_attempts() > 1
+        && budget.remaining_links() > 0
 }
 fn poll_window(
     window: &mut VecDeque<(PageNumber, WindowPage)>,
@@ -320,6 +388,167 @@ mod tests {
             length: PAGE_BYTES + 7,
             expires_at: ExpiresAt(std::time::UNIX_EPOCH),
         }
+    }
+    #[test]
+    fn completed_page_failure_continuation_is_bounded_and_cancelable() {
+        use crate::{
+            memory::pipe::PipePool,
+            model::identity::{MembershipVersion, RequestId, WorkerId},
+            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+            topology::membership::Membership,
+        };
+        use std::time::{Duration, Instant};
+        for (error, cancel, expired) in [
+            (Error::Unavailable, false, false),
+            (Error::CorruptRecord, false, false),
+            (Error::VersionUnavailable, false, false),
+            (Error::Unavailable, true, false),
+            (Error::Unavailable, false, true),
+        ] {
+            let admission = Rc::new(Admission::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let delivery = Rc::new(Delivery::new(
+                Rc::new(PipePool::new(admission, reactor)),
+                Duration::from_secs(1),
+            ));
+            // An unavailable owner is a completed local failure. It cannot mint
+            // new acquisition credits or spin indefinitely without network I/O.
+            let directory = Arc::new(
+                WorkerDirectory::new(
+                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                    vec![WorkerId(0)],
+                    8,
+                )
+                .unwrap(),
+            );
+            let metadata = metadata();
+            let scope =
+                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(10))
+                    .unwrap();
+            let budget = AcquisitionBudget::new(
+                if expired {
+                    Instant::now()
+                } else {
+                    scope.deadline.0
+                },
+                32,
+                96,
+            );
+            let mut stream = RangeStreams::from_directory(directory, delivery, 2)
+                .open_with_budget(
+                    metadata.clone(),
+                    ByteRange::From(0).resolve(metadata.length).unwrap(),
+                    OriginContext {
+                        object: metadata.version.object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                    Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
+                    scope.clone(),
+                    budget,
+                    None,
+                )
+                .unwrap();
+            stream
+                .ready
+                .push_back((PageNumber(0), WindowPage::Ready(Err(error))));
+            stream.next_page = Some(PageNumber(1));
+            if cancel {
+                scope.cancel().unwrap();
+            }
+            CONTINUATIONS.with(|count| count.set(0));
+            let result = futures::executor::block_on(stream.next_slice());
+            let expected = if cancel {
+                Error::Cancelled
+            } else if expired {
+                Error::DeadlineExceeded
+            } else {
+                error
+            };
+            assert!(matches!(result, Err(actual) if actual == expected));
+            assert!(stream.terminated);
+            assert!(stream.ready.is_empty());
+            assert!(
+                futures::executor::block_on(stream.next_slice())
+                    .unwrap()
+                    .is_none()
+            );
+            let count = CONTINUATIONS.with(std::cell::Cell::get);
+            if error == Error::Unavailable && !cancel && !expired {
+                assert!(count > 0 && count <= 31);
+                assert!(stream.budget.remaining_attempts() < 32);
+            } else {
+                assert_eq!(count, 0);
+                assert_eq!(stream.budget.remaining_attempts(), 32);
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_requires_original_credits_and_never_retries_security_or_pin_errors() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for error in [
+            Error::Unavailable,
+            Error::HopBudgetExhausted,
+            Error::Overloaded,
+            Error::Io,
+        ] {
+            assert!(continuable(&error, &AcquisitionBudget::new(deadline, 2, 1)));
+            for (attempts, links) in [(0, 96), (1, 96), (32, 0)] {
+                assert!(!continuable(
+                    &error,
+                    &AcquisitionBudget::new(deadline, attempts, links)
+                ));
+            }
+        }
+        for error in [
+            Error::Unauthorized,
+            Error::Replay,
+            Error::CorruptRecord,
+            Error::MissingKey,
+            Error::OriginRejected,
+            Error::OriginForbidden,
+            Error::VersionUnavailable,
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::InvalidRequest,
+            Error::InvalidRange,
+        ] {
+            assert!(
+                !continuable(&error, &AcquisitionBudget::new(deadline, 32, 96)),
+                "{error:?}"
+            );
+        }
+        let mut original = AcquisitionBudget::new(deadline, 32, 96);
+        let mut retries = 0;
+        // An admission failure can return every child credit without doing I/O.
+        // The continuation itself still consumes one original attempt.
+        while continuable(&Error::Overloaded, &original) {
+            original.begin_attempt(Instant::now(), deadline).unwrap();
+            let child = original
+                .partition(original.remaining_attempts().min(8), 16)
+                .unwrap();
+            original.reunite(child).unwrap();
+            retries += 1;
+        }
+        assert_eq!(retries, 31);
+        assert_eq!(
+            (original.remaining_attempts(), original.remaining_links()),
+            (1, 96)
+        );
+        assert_eq!(original.deadline(), deadline);
+        let mut expired = AcquisitionBudget::new(Instant::now(), 32, 96);
+        assert_eq!(
+            expired.begin_attempt(Instant::now(), deadline),
+            Err(Error::DeadlineExceeded)
+        );
+        assert_eq!(
+            (expired.remaining_attempts(), expired.remaining_links()),
+            (32, 96)
+        );
     }
     #[test]
     fn out_of_order_completion_waits_for_front_and_returns_only_unused_credits() {
