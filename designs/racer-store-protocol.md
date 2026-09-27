@@ -123,6 +123,9 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   Submitted buffers and segment leases stay owned until actual I/O completion.
   Checkpoint invalidation is not part of retirement: historical keyless ciphertext
   can remain, and recovery filters both slots before installing any shard.
+  Production writers use `with_availability` for the bounded positive cache/key
+  checks, so rotations do not accumulate writer tombstones. Generation-bound
+  key IDs prevent newer bundles from reopening admission for erased epochs.
 - Stopping Admission does not prevent previously accepted fills from handing over
   their dirty reservations. Enqueue uses Admission::reserve_completion for padded
   staging, with the same hard ciphertext limit, and must follow Store::open.

@@ -6,6 +6,7 @@ package racer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +83,10 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		if k.State != wire.ActiveKey {
 			t.Fatal("initial key not active")
 		}
+
+		if string(k.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(k.Key.ID[4:12]) != 1 {
+			t.Fatal("initial key must bind the first publication generation")
+		}
 	}
 	// Repeated reconciliation must neither write nor consume a generation.
 	runKeys(t, r)
@@ -97,6 +102,17 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	_, staged, prepared, _ := keyState(t, r)
 	if staged.Generation != 2 || len(staged.CacheKeys) != 4 || len(staged.PeerTrustRoots) != 2 || prepared.ActiveIssuer != state.ActiveIssuer || prepared.PreparedIssuer == "" || result.RequeueAfter != r.Config.Rotation.PrepareFor {
 		t.Fatal("replacement not staged")
+	}
+
+	for _, k := range staged.CacheKeys {
+		want := uint64(1)
+		if k.State == wire.PreparedKey {
+			want = 2
+		}
+
+		if string(k.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(k.Key.ID[4:12]) != want {
+			t.Fatal("rotation changed an existing epoch or failed to bind the next generation")
+		}
 	}
 	// A fresh process resumes the persisted deadline, not a new delay.
 	restarted := Assemble(r.Config, r.Client, r.APIReader).Keyring
@@ -147,6 +163,23 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(r.Config.Limits), Accepted: make(AcceptedMembers)}
 	reconcileTopology(t, topology, context.Background())
 	keyState(t, r)
+}
+
+func TestGenerationBoundCacheKey(t *testing.T) {
+	if _, err := newCacheKey(wire.CacheID(testNodeUID), wire.PageKey, wire.ActiveKey, 0); err == nil {
+		t.Fatal("zero or wrapped generation accepted")
+	}
+
+	for _, generation := range []wire.Generation{1, 256, math.MaxUint64} {
+		key, err := newCacheKey(wire.CacheID(testNodeUID), wire.PageKey, wire.PreparedKey, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(key.Key.ID) != 16 || string(key.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(generation) {
+			t.Fatalf("creation generation not preserved: %x", key.Key.ID)
+		}
+	}
 }
 
 func TestKeyringRotationCrashRecovery(t *testing.T) {

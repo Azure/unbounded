@@ -153,7 +153,7 @@ impl CiphertextPage {
     }
 }
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         model::{
@@ -188,7 +188,7 @@ pub(super) mod tests {
             },
         )
     }
-    pub(in crate::memory) fn bundle_for(
+    pub(crate) fn bundle_for(
         admission: &Rc<Admission>,
         metadata: VersionMetadata,
     ) -> super::super::page::PageResult {

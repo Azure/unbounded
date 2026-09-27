@@ -346,4 +346,47 @@ mod tests {
             cache.remove_cache(&CacheId(n.to_string())).unwrap();
         }
     }
+    #[test]
+    fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
+        use crate::{
+            control::{availability::for_caches, wire::CacheKeyPurpose},
+            security::keyring::tests::rotation_bundle,
+        };
+        let admission = admission(1024);
+        let keys = Rc::new(crate::security::keyring::tests::keys());
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        let caches: Vec<_> = (0..356)
+            .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
+            .collect();
+        let memory = MemoryCache::new(Rc::new(BufferPool::new(admission)))
+            .with_availability(for_caches(keys.clone(), caches.clone()));
+        let mut previous: Vec<crate::control::wire::CacheKeyRef> = Vec::new();
+        for generation in 2u64..=6 {
+            let mut next = rotation_bundle(generation, roots.clone());
+            let templates = std::mem::take(&mut next.cache_keys);
+            for cache in 0u64..356 {
+                for template in &templates {
+                    let mut key = template.clone();
+                    key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
+                    key.material[8..16].copy_from_slice(&cache.to_be_bytes());
+                    next.cache_keys.push(key);
+                }
+            }
+            keys.install(next.clone()).unwrap();
+            for key in previous {
+                if key.purpose == CacheKeyPurpose::Page {
+                    assert_eq!(memory.retire_key(&key.cache, key.id), Ok(0));
+                    assert!(
+                        !memory
+                            .availability
+                            .as_ref()
+                            .unwrap()
+                            .page(&key.cache, key.id)
+                    );
+                }
+            }
+            previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();
+        }
+        assert!(memory.entries.borrow().is_empty());
+    }
 }

@@ -124,7 +124,7 @@ copy is introduced here.
   worker memory/writer tombstones, asynchronously invalidate both checkpoint slots,
   and resume only after all removal acknowledgments. Capacity rejection precedes
   the pause; superseding an uncommitted removal can retain the old cache. Retired
-  UIDs remain fenced for the process lifetime. Key retirement additionally waits
+  cache UIDs remain fenced for the process lifetime. Key retirement additionally waits
   for retained read drivers, crypto/kernel/native completions and the last key
   lease. Only the control worker prepares and binds listeners on resume. Startup
   continuously drives prepared listeners during control retries. Shutdown waits
@@ -135,11 +135,30 @@ copy is introduced here.
   central recovery/cut, late fills, failed publication rollback, nonempty-cache
   non-listener resume, and multiworker membership churn with retained leases.
   Remaining limitations: retirement pauses unrelated caches and diagnostics;
-  tombstone exhaustion requires restart; allocation failure after cache acceptance
-  retains the pause and retries. Recovery/checkpoint publication filesystem work
+  removed-cache UID tombstone exhaustion requires restart; allocation failure after
+  cache acceptance retains the pause and retries. Recovery/checkpoint publication filesystem work
   remains synchronous. Actual Go-controller interoperability and provider-backed
   RDMA retirement are not established by these application fixtures. Strict Clippy
   is blocked by warnings in other component paths; owned app warnings are fixed.
+
+- Reviewed key-rotation lifetime fix (2026-09-27): production memory and writer
+  publication use the scoped refactor's `Availability`, requiring a current cache
+  UID and live page epoch, including the writer's post-I/O check. Its original
+  dirty ticket additionally fences removed/reinserted writes. Retiring and omitted
+  epochs immediately lose their registry owner; accepted key leases and kernel,
+  crypto, and native completion owners independently retain their resources.
+  No node retirement barrier, checkpoint invalidation, or cumulative tombstone is
+  reintroduced by the merge with the scoped lifetime refactor.
+  Controller-issued IDs encode their creation bundle generation (`RKG1`, big-endian
+  u64, four random suffix bytes). An unknown epoch must be newer than the node's
+  accepted bundle high-water mark to admit leases and no newer than its containing
+  bundle. Retiring declarations may persist through later overlap bundles without
+  secrets or admission; erased epochs cannot become active/prepared again.
+  Legacy opaque IDs retain the refactor's immutable-identity reintroduction behavior.
+  Deploy both controller and dataplane for generation-bound anti-resurrection.
+  Regression coverage includes 65,538 rotations through memory, writer, and both
+  key purposes, held pages/keys and in-flight write completion, late publication,
+  resurrection rejection, and four retirements across 356 empty stable caches.
 
 - Final integrator additional membership review: SnapshotStore retained_limit is
   an OLD-generation count (`control/snapshot.rs:136`), but PeerNetwork is constructed

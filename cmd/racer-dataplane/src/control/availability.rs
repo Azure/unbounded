@@ -28,3 +28,40 @@ impl Availability {
         self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
     }
 }
+
+#[cfg(test)]
+pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availability> {
+    use super::{caches::CacheDefinition, snapshot::SnapshotStore, wire::*};
+    let publications = Arc::new(PublishedState::default());
+    SnapshotStore::new(keys.cluster().clone(), publications.clone(), 1)
+        .publish(Publication {
+            schema_version: SCHEMA_VERSION,
+            cluster: keys.cluster().clone(),
+            sequence: PublicationSequence(1),
+            membership_version: crate::model::identity::MembershipVersion(1),
+            members: vec![crate::topology::membership::Member {
+                node: keys.node().clone(),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:7443".into(),
+                rails: vec![],
+                alignment_enabled: false,
+            }],
+            caches: caches
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let name = format!("rotation-{i}");
+                    let (client_socket, origin_socket) =
+                        super::caches::canonical_socket_paths(&name).unwrap();
+                    CacheDefinition {
+                        id,
+                        name,
+                        client_socket,
+                        origin_socket,
+                    }
+                })
+                .collect(),
+        })
+        .unwrap();
+    Rc::new(Availability::new(publications, keys))
+}

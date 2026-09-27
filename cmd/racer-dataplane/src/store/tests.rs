@@ -570,6 +570,111 @@ fn retirement_during_write_fences_late_publication() {
 }
 
 #[test]
+fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completions() {
+    use crate::{
+        control::availability::for_caches,
+        memory::{cache::MemoryCache, pool::tests::bundle_for},
+        security::keyring::{
+            KeyPurpose,
+            tests::{keys, rotation_bundle},
+        },
+    };
+    use std::sync::Arc;
+    let mut f = Fixture::new();
+    let keys = Rc::new(keys());
+    let roots = (*keys.peer_trust_roots().unwrap()).clone();
+    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let availability = for_caches(keys.clone(), vec![cache.clone()]);
+    f.store.writer = Rc::new(
+        Rc::try_unwrap(f.store.writer)
+            .ok()
+            .unwrap()
+            .with_availability(availability.clone()),
+    );
+    let memory = MemoryCache::new(f.pool.clone()).with_availability(availability);
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut descriptor = f.copy(1, 3).metadata.immutable();
+    descriptor.version.object.cache = cache.clone();
+    let late = bundle_for(&f.admission, descriptor.clone());
+    memory.publish(late.clone()).unwrap();
+    let request = RequestScope::new(
+        RequestId([0; 16]),
+        Instant::now() + Duration::from_secs(300),
+    )
+    .unwrap();
+    // More than the former writer limit, and twice as many keyring retirements.
+    // Both populated and empty caches follow the real keyring/memory/writer path.
+    for generation in 2..=65539 {
+        let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let old = lease.reference().clone();
+        let mut page = bundle_for(&f.admission, descriptor.clone());
+        Arc::get_mut(&mut page.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .key_id = old.id;
+        memory.publish(page.clone()).unwrap();
+        f.enqueue(page.copy()).unwrap();
+        let mut write = if generation == 2 {
+            let mut operation = f.store.writer.progress(1, &request);
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_pending()
+            );
+            Some(operation)
+        } else {
+            None
+        };
+        keys.install(rotation_bundle(generation, roots.clone()))
+            .unwrap();
+        assert_eq!(memory.retire_key(&cache, old.id), Ok(1));
+        f.store.writer.retire_key(&cache, old.id).unwrap();
+        assert!(memory.get(page.plaintext.page()).unwrap().is_none());
+        assert_eq!(memory.publish(page.clone()), Err(Error::MissingKey));
+        assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
+        assert!(keys.lease(Some(&cache), old.id, KeyPurpose::Page).is_err());
+        assert_eq!(lease.id(), old.id);
+        assert!(lease.material(KeyPurpose::Page).is_ok());
+        assert_eq!(page.plaintext.bytes(), &[1; 3]);
+        if let Some(operation) = write.take() {
+            assert!(f.store.writer.writes_in_flight() > 0);
+            assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
+            drive(&f.reactor, operation).unwrap();
+            assert!(
+                f.store
+                    .writer
+                    .index()
+                    .lookup(page.plaintext.page())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(lease);
+    }
+    assert_eq!(memory.publish(late.clone()), Err(Error::MissingKey));
+    assert!(matches!(f.enqueue(late.copy()), Err(Error::MissingKey)));
+    // Current keys still publish after all old limits have been exceeded.
+    let mut page = bundle_for(&f.admission, descriptor);
+    Arc::get_mut(&mut page.ciphertext.inner)
+        .unwrap()
+        .envelope
+        .key_id = keys.active(&cache, KeyPurpose::Page).unwrap().id();
+    memory.publish(page.clone()).unwrap();
+    f.enqueue(page.copy()).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+    assert!(
+        f.store
+            .writer
+            .index()
+            .lookup(page.plaintext.page())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();

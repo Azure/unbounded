@@ -312,9 +312,25 @@ one active key per represented cache/purpose is required, while a removed scope 
 be absent. Retiring and omitted keys stop new leases immediately. Existing leases
 remain valid until their owners complete. Registry storage is bounded by the current
 bundle, without cumulative tombstones. A newer bundle can reintroduce an omitted
-ID; the controller must use immutable cache/key identities. AEAD rejects historical
-ciphertext if the reintroduced material does not match. Equal-generation replay
+legacy opaque ID; the controller must use immutable cache/key identities. AEAD
+rejects historical ciphertext if the reintroduced material does not match. Equal-generation replay
 does not reinstall keys or change admission.
+
+New controller-issued cache-key IDs use `RKG1 || creation_generation_be_u64 ||
+random_4_bytes` within the existing 16-byte wire field. Generation zero and future
+creation generations fail closed. After initial installation, an unknown ID must
+have a creation generation strictly greater than the last accepted bundle to admit
+new leases; known IDs may persist through any number of bundles. The accepted bundle high-water mark
+therefore fences erased epochs without retaining their IDs. Equal-generation exact
+replay acknowledges configuration but never restores an explicitly retired key.
+Retiring declarations may remain in later overlap bundles without retaining a
+secret or reopening admission. Changing such an erased epoch back to active or
+prepared is rejected. Legacy opaque IDs follow the scoped-admission compatibility
+behavior above, with no cumulative history. Both controller and dataplane must be
+updated for generation-bound anti-resurrection protection. The versioned ID
+namespace is reserved; a legacy random ID coinciding with it fails closed if its
+embedded generation is invalid. The new format does not change AEAD material,
+nonces, key-reference scoping, wire lengths, or disk formats.
 
 ## Component verification
 

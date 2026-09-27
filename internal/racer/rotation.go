@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -43,7 +44,11 @@ func (r *KeyringReconciler) now() time.Time {
 	return time.Now().UTC().Truncate(time.Second)
 }
 
-func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyState) (wire.CacheKey, error) {
+func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyState, generation wire.Generation) (wire.CacheKey, error) {
+	if generation == 0 {
+		return wire.CacheKey{}, wire.Unavailable
+	}
+
 	var material [32]byte
 	if _, err := rand.Read(material[:]); err != nil {
 		return wire.CacheKey{}, err
@@ -53,6 +58,11 @@ func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyStat
 	if _, err := rand.Read(id); err != nil {
 		return wire.CacheKey{}, err
 	}
+	// Reserve a versioned namespace in the otherwise opaque wire ID. A node can
+	// reject reintroduced epochs using its bundle high-water mark, without keeping
+	// every retired ID. The suffix distinguishes keys minted in competing CAS attempts.
+	copy(id, "RKG1")
+	binary.BigEndian.PutUint64(id[4:12], uint64(generation))
 
 	return wire.NewCacheKey(wire.CacheKeyRef{Cache: cache, Purpose: purpose, ID: id}, state, material)
 }
@@ -121,7 +131,7 @@ func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, 
 	for _, cache := range catalog {
 		for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
 			if !present[string(cache.ID)+"/"+string(purpose)] {
-				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey)
+				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, b.Generation+1)
 				if err != nil {
 					return b, s, err
 				}
@@ -171,7 +181,7 @@ func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, 
 				continue
 			}
 
-			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey)
+			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, b.Generation+1)
 			if err != nil {
 				return b, s, err
 			}
@@ -434,6 +444,11 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 	b, s, err = r.PlanRotation(b, s, catalog, now)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	// PlanRotation normally plans the next CAS generation. Initial publication
+	// has no previous bundle and is generation one.
+	for i := range b.CacheKeys {
+		binary.BigEndian.PutUint64(b.CacheKeys[i].Key.ID[4:12], uint64(b.Generation))
 	}
 
 	encoded, err := wire.EncodeBundle(b)

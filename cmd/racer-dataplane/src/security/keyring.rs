@@ -41,6 +41,76 @@ pub(crate) mod tests {
             .unwrap();
         keys
     }
+    pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
+        let mut next = bundle(generation, roots, CacheKeyState::Active);
+        for (i, key) in next.cache_keys.iter_mut().enumerate() {
+            key.key.id.0[..4].copy_from_slice(b"RKG1");
+            key.key.id.0[4..12].copy_from_slice(&generation.to_be_bytes());
+            key.key.id.0[12..].copy_from_slice(&(i as u32).to_be_bytes());
+            key.material[..8].copy_from_slice(&generation.to_be_bytes());
+        }
+        next
+    }
+    #[test]
+    fn generation_bound_ids_reject_resurrection_skips_future_and_zero_epochs() {
+        let keys = keys();
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        let first = rotation_bundle(2, roots.clone());
+        keys.install(first.clone()).unwrap();
+        let lease = keys
+            .active(&CacheId(CACHE.into()), KeyPurpose::Page)
+            .unwrap();
+        let secret = Arc::downgrade(&lease.secret);
+        // Skipped bundle generations are normal after projected-secret delays.
+        let next = rotation_bundle(100, roots.clone());
+        keys.install(next.clone()).unwrap();
+        let held = first.cache_keys[0].key.clone();
+        assert_eq!(secret.strong_count(), 1);
+        drop(lease);
+        assert!(secret.upgrade().is_none());
+        assert!(
+            keys.lease(Some(&held.cache), held.id, KeyPurpose::Page)
+                .is_err()
+        );
+        for generation in [0, 2, 99, 100, 102] {
+            let mut bad = rotation_bundle(generation, roots.clone());
+            bad.generation = BundleGeneration(101);
+            bad.cache_keys[0].key.id.0[15] ^= 128;
+            assert_eq!(keys.install(bad), Err(Error::InvalidConfiguration));
+        }
+        let mut resurrected = first.clone();
+        resurrected.generation = BundleGeneration(101);
+        assert_eq!(keys.install(resurrected), Err(Error::InvalidConfiguration));
+        assert_eq!(keys.install(first), Err(Error::InvalidConfiguration));
+        assert_eq!(keys.install(next), Ok(BundleGeneration(100)));
+        assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
+        let mut overlap = rotation_bundle(101, roots.clone());
+        let mut retiring = rotation_bundle(100, roots).cache_keys;
+        for key in &mut retiring {
+            key.state = CacheKeyState::Retiring;
+        }
+        overlap.cache_keys.extend(retiring);
+        keys.install(overlap.clone()).unwrap();
+        let old = &overlap.cache_keys[2].key;
+        assert_eq!(keys.install(overlap.clone()), Ok(BundleGeneration(101)));
+        assert!(
+            keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
+                .is_err()
+        );
+        // Controller overlap keeps declaring retired epochs after secrets are gone.
+        overlap.generation = BundleGeneration(102);
+        assert_eq!(keys.install(overlap.clone()), Ok(BundleGeneration(102)));
+        for admission in [CacheKeyState::Active, CacheKeyState::Prepared] {
+            let mut resurrected = overlap.clone();
+            resurrected.generation = BundleGeneration(103);
+            resurrected.cache_keys[2].state = admission;
+            if admission == CacheKeyState::Active {
+                resurrected.cache_keys[0].state = CacheKeyState::Retiring;
+            }
+            assert_eq!(keys.install(resurrected), Err(Error::InvalidConfiguration));
+        }
+        assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
+    }
     fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
         KeyringBundle {
             schema_version: SCHEMA_VERSION,
@@ -484,6 +554,18 @@ impl Keyring {
             }
             if state.generation == Some(bundle.generation) {
                 continue;
+            }
+            if let Some(generation) = candidate.key.id.generation() {
+                if generation == 0
+                    || generation > bundle.generation.0
+                    // Retiring declarations never admit leases or retain secrets.
+                    // They may persist across many controller overlap bundles.
+                    || (candidate.state != CacheKeyState::Retiring
+                        && state.generation.is_some_and(|g| generation <= g.0)
+                        && !state.entries.iter().any(|e| e.reference == candidate.key))
+                {
+                    return Err(Error::InvalidConfiguration);
+                }
             }
             if let Some(old) = state.entries.iter().find(|e| e.reference == candidate.key) {
                 if *old.secret.0 != candidate.material {
