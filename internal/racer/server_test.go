@@ -292,36 +292,37 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 	f := newServingFixture(t)
 
 	endpoint := f.start(t)
-	for name, mutate := range map[string]func(*x509.Certificate){
-		"expired":          func(c *x509.Certificate) { c.NotAfter = time.Now().Add(-time.Second) },
-		"future":           func(c *x509.Certificate) { c.NotBefore = time.Now().Add(time.Minute) },
-		"wrong usage":      func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} },
-		"wrong cluster":    func(c *x509.Certificate) { c.URIs[0].Host = testNodeUID },
-		"wrong uid":        func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID },
-		"ambiguous SAN":    func(c *x509.Certificate) { c.URIs = append(c.URIs, c.URIs[0]) },
-		"query SAN":        func(c *x509.Certificate) { c.URIs[0].RawQuery = "admin=true" },
-		"no signing usage": func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment },
+	for name, tc := range map[string]struct {
+		mutate            func(*x509.Certificate)
+		status            int
+		allowTLSRejection bool
+	}{
+		"expired":       {func(c *x509.Certificate) { c.NotAfter = time.Now().Add(-time.Second) }, http.StatusUnauthorized, true},
+		"future":        {func(c *x509.Certificate) { c.NotBefore = time.Now().Add(time.Minute) }, http.StatusUnauthorized, true},
+		"wrong usage":   {func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }, http.StatusUnauthorized, true},
+		"wrong cluster": {func(c *x509.Certificate) { c.URIs[0].Host = testNodeUID }, http.StatusForbidden, false},
+		// An unknown UID is discovery uncertainty, not a live identity rejection.
+		"wrong uid":        {func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID }, http.StatusServiceUnavailable, false},
+		"ambiguous SAN":    {func(c *x509.Certificate) { c.URIs = append(c.URIs, c.URIs[0]) }, http.StatusUnauthorized, false},
+		"query SAN":        {func(c *x509.Certificate) { c.URIs[0].RawQuery = "admin=true" }, http.StatusUnauthorized, false},
+		"no signing usage": {func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment }, http.StatusUnauthorized, false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			cert := f.signLeaf(t, mutate)
+			cert := f.signLeaf(t, tc.mutate)
 
 			response, err := f.client(t, &cert).Get(endpoint + wire.SnapshotPath)
-			if name == "wrong uid" {
-				// An unknown UID is discovery uncertainty, not a live identity rejection.
-				// Require the retryable wire error, with no snapshot bytes admitted.
-				if body := responseBody(t, response, err, http.StatusServiceUnavailable); string(body) != `{"code":"unavailable"}` {
-					t.Fatalf("unknown UID response: %s", body)
-				}
-
+			if err != nil && tc.allowTLSRejection && strings.Contains(err.Error(), "remote error: tls:") {
 				return
 			}
 
-			if err == nil {
-				defer response.Body.Close()
-
-				if response.StatusCode != 401 && response.StatusCode != 403 {
-					t.Fatalf("bad identity admitted: %d", response.StatusCode)
-				}
+			// Require only the expected wire error, with no snapshot bytes admitted.
+			want := map[int]string{
+				http.StatusUnauthorized:       `{"code":"unauthenticated"}`,
+				http.StatusForbidden:          `{"code":"forbidden"}`,
+				http.StatusServiceUnavailable: `{"code":"unavailable"}`,
+			}[tc.status]
+			if body := responseBody(t, response, err, tc.status); string(body) != want {
+				t.Fatalf("rejection response: %s, want %s", body, want)
 			}
 		})
 	}
@@ -339,7 +340,23 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+f.token)
 	response, err := f.client(t, nil).Do(req)
-	responseBody(t, response, err, 200)
+
+	enrollment, err := wire.DecodeBootstrapResponse(bytes.NewReader(responseBody(t, response, err, http.StatusOK)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if enrollment.Node != wire.NodeID(testNodeUID) {
+		t.Fatalf("recovered Node %s, want %s", enrollment.Node, testNodeUID)
+	}
+
+	cert := tls.Certificate{Certificate: enrollment.CertificateChain, PrivateKey: f.key}
+	response, err = f.client(t, &cert).Get(endpoint + wire.SnapshotPath)
+
+	publication, err := wire.DecodePublication(bytes.NewReader(responseBody(t, response, err, http.StatusOK)))
+	if err != nil || len(publication.Members) != 1 {
+		t.Fatalf("recovered snapshot: %v", err)
+	}
 }
 
 func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
