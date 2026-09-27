@@ -83,6 +83,7 @@ unbounded-kube is organized into several directories:
 
 ## Testing Standards
 
+- Every test command must use an external `timeout --signal=TERM --kill-after=10s 300s ...` (shorter bounds are allowed), with tool timeouts no greater than 320000 ms. Go tests must also use `-timeout=5m`. Split suites into bounded groups. A timeout is a failure to investigate, never a reason to retry unbounded. Ensure child process cleanup. This also applies to scripts, benchmarks, and `make fmt` if it invokes tests.
 - Add tests for new behavior. Cover success, failure, and edge cases.
 
 ## Sources of Truth

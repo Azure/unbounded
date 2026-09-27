@@ -1,5 +1,12 @@
 # Executable restart integration tests
 
+Mandatory for every agent: wrap every test, script, or benchmark command in
+`timeout --signal=TERM --kill-after=10s 300s` (shorter is allowed), use a tool
+timeout no greater than 320000 ms, and use `-timeout=5m` for Go tests. Split
+larger suites. Investigate timeouts as failures and clean up child processes;
+never retry unbounded. Historical commands in Phase 1 records are not current
+execution instructions.
+
 `process_restart.rs` executes Cargo's actual `racer-dataplane` binary, including
 environment parsing, CPU discovery, TLS enrollment, projected key loading,
 application startup, readiness, UDS listeners, encrypted O_DIRECT storage, signal
@@ -24,7 +31,7 @@ sudo systemd-run --wait --pipe --collect \
   --setenv="CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/bin/racer-cargo}" \
   --setenv='CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -n' \
   bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
-  cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+  timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
   --all-features --test process_restart -j 2 -- \
   --ignored --test-threads=1 --nocapture
 ```
@@ -90,9 +97,9 @@ small-slab restart profile above. No custom worker factory distributes clients.
 From `cmd/racer-dataplane`, run:
 
 ```sh
-cargo test --locked --test process_restart measurement::tests -j 2
+timeout --signal=TERM --kill-after=10s 300s cargo test --locked --test process_restart measurement::tests -j 2
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n' \
-  cargo test --locked --test process_restart -j 2 -- \
+  timeout --signal=TERM --kill-after=10s 300s cargo test --locked --test process_restart -j 2 -- \
   --ignored --test-threads=1
 ```
 
@@ -118,14 +125,15 @@ excluded from the exact userspace worker-pair count.
   while client traffic completes. `production_blocked_listener_publication`
   blocks a new socket with a regular file, verifies last-good-cache traffic,
   removes the obstacle, and verifies the newly published cache serves requests.
-- `production_multicache_disk_baseline` expects exactly one HTTP 503 and an
-  overload counter increase for a cold full page with two active caches at four
-  pairs. A small tail remains readable. Set `RACER_THROUGHPUT_STRICT_BASELINE=1`
-  in the **runner environment** to require full-page success instead.
-- `production_ingress_baseline` holds 32 partial client heads at four pairs,
+- `production_multicache_disk_baseline` now permanently requires a verified cold
+  full-page disk hit with two active caches at four pairs, no overload and no
+  origin refetch. A small tail remains readable. Phase 2 fixes the Phase 1 failure.
+- `production_ingress_baseline` holds 22 partial client heads at four pairs,
   observes acceptance via process socket FDs, proves excess ingress stalls,
   checks readiness, releases the clients, and verifies recovery. Its 200 ms
   probe timeout is a diagnostic bound, not a production timeout change.
+  The existing 32-connection worker budget reserves eight outbound and two control
+  slots. Phase 3 owns distribution of ingress across workers.
 - `production_churn_diagnostic` reads 512 distinct small objects across two
   caches with concurrency two at 1/2/4 pairs. It allows only HTTP 503 failures,
   records exact successes and failures, and checks server-counter consistency.
@@ -149,7 +157,7 @@ bytes, and ranking misses. No new production counters were added.
 
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_MODE=memory RACER_THROUGHPUT_PAIRS=4 RACER_THROUGHPUT_REQUESTS=128 RACER_THROUGHPUT_CONCURRENCY=4' \
-  cargo test --locked --release --test process_restart \
+  timeout --signal=TERM --kill-after=10s 300s cargo test --locked --release --test process_restart \
   production_configured_measurement -j 2 -- --ignored --test-threads=1 --nocapture
 ```
 
@@ -165,11 +173,11 @@ page's publication, then restarts to remove the memory cache. Long distinct
 disk preloads can still expose missing persistence; they are not silently
 refetched from origin.
 
-Strict expected-baseline example (currently exits nonzero):
+Strict disk acceptance example (passes after Phase 2):
 
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' \
-  cargo test --locked --test process_restart production_multicache_disk_baseline \
+  timeout --signal=TERM --kill-after=10s 300s cargo test --locked --test process_restart production_multicache_disk_baseline \
   -j 2 -- --ignored --test-threads=1 --nocapture
 ```
 
