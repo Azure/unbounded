@@ -23,13 +23,20 @@ and debug information. The first run compiles this profile; later runs reuse it.
 For the complete Rust suite, including integration tests and doctests:
 
 ```sh
-cargo fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-bash hack/scripts/memory-safe-run.sh -- cargo check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-targets --all-features
-bash hack/scripts/memory-safe-run.sh -- cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir bin/racer-cargo --all-features
+CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 \
+  bash hack/scripts/memory-safe-run.sh -- make racer-rust-test
 ```
 
 `bash hack/scripts/memory-safe-run.sh -- make racer-test` also runs the Go server
 checks before the complete Rust suite.
+
+Normal PR CI runs `racer-rust-test` on an Ubuntu 24.04 VM with Rust 1.96.0,
+io_uring enabled, native build dependencies, and the native adapter build.
+Compilation and tests share a verified 12 GiB cgroup limit with swap disabled;
+two compilation jobs and serial tests bound overlapping allocations. The target
+includes library, binary, integration, and documentation tests with all features.
+Explicitly ignored hardware, SDK, privileged benchmark, and release-only tests
+still require their documented opt-in commands.
 
 ## Metadata contention simulation
 

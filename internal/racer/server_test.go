@@ -306,6 +306,16 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 			cert := f.signLeaf(t, mutate)
 
 			response, err := f.client(t, &cert).Get(endpoint + wire.SnapshotPath)
+			if name == "wrong uid" {
+				// An unknown UID is discovery uncertainty, not a live identity rejection.
+				// Require the retryable wire error, with no snapshot bytes admitted.
+				if body := responseBody(t, response, err, http.StatusServiceUnavailable); string(body) != `{"code":"unavailable"}` {
+					t.Fatalf("unknown UID response: %s", body)
+				}
+
+				return
+			}
+
 			if err == nil {
 				defer response.Body.Close()
 

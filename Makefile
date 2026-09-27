@@ -16,6 +16,9 @@ RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
 RACER_TEST_ARGS ?=
 RACER_DST_FILTER ?= dst
 RACER_CONTENTION_BUILD_JOBS ?= 2
+ENVTEST_K8S_VERSION ?= 1.37.0
+SETUP_ENVTEST_VERSION ?= v0.25.2-0.20260923145615-d837464d41be
+SETUP_ENVTEST = $(CURDIR)/bin/setup-envtest-$(SETUP_ENVTEST_VERSION)
 RACER_NATIVE_RDMA ?= false
 RACER_NATIVE_LIB ?= bin/libracer_rdma.so.1
 RACER_PREFIX ?= /usr/local
@@ -575,7 +578,7 @@ e2e-racer: ## Run the operator-installed Racer e2e suite with prebuilt Docker im
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-scale racer-generate racer-manifests
+.PHONY: racer-controller racer-controller-build racer-test racer-rust-test racer-server-test racer-envtest racer-envtest-ci racer-scale racer-generate racer-manifests
 racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
 
 racer-controller-build: ## Build the Racer controller without lint/test
@@ -631,9 +634,24 @@ racer-server-test: ## Lint and race-test the Racer server and deployment contrac
 	$(GOTEST) -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
 
 racer-test: racer-server-test ## Check Racer server and committed Rust contracts
+	$(MAKE) racer-rust-test
+
+racer-rust-test: ## Check the complete Rust suite, including integration tests and doctests
+	@# Integration fixtures use this scratch root even with a separate Cargo target-dir.
+	@mkdir -p cmd/racer-dataplane/target
 	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
 	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-targets --all-features
-	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features -- $(RACER_TEST_ARGS)
+
+$(SETUP_ENVTEST):
+	@mkdir -p bin tmp/envtest-tools
+	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+	mv bin/setup-envtest "$(SETUP_ENVTEST)"
+
+racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require Racer envtest
+	@mkdir -p tmp/racer-envtest
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
 
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }

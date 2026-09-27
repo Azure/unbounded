@@ -49,18 +49,17 @@ race tests. `make racer-test` also checks the existing Rust contracts. Run the
 opt-in integration and scale checks explicitly:
 
 ```sh
-# Binaries may be reused from repository-local tooling. If absent, install
-# setup-envtest into ./bin and download assets into ./bin/envtest, not $HOME.
-mkdir -p bin tmp
-export TMPDIR="$PWD/tmp"
-GOBIN="$PWD/bin" go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
-export KUBEBUILDER_ASSETS="$(bin/setup-envtest use 1.37.0 --bin-dir "$PWD/bin/envtest" -p path)"
-make racer-envtest
+# Provision the pinned setup-envtest tool and Kubernetes assets under ./bin.
+make racer-envtest-ci
+# Or reuse existing assets explicitly:
+make racer-envtest KUBEBUILDER_ASSETS=<absolute-repository-path>
 make racer-scale
 ```
 
 The targets keep test temporary files under the project. Envtest uses real etcd,
 apiserver, CRD admission, TokenRequest/TokenReview, informer caches, and two managers.
+Normal PR CI runs `racer-envtest-ci`, requiring successful asset provisioning and
+the race-instrumented integration suite; missing assets cannot silently skip it.
 Scale uses real informer indexes/deep copies against synthetic list/watch input,
 real reconciliation/encoding, and fake durable CAS. It is not a Kubernetes or
 HTTPS capacity test. See the design's Phase 7 results for exact measurements.
