@@ -322,6 +322,44 @@ fn check(reply: &Reply, start: u64, end: u64) {
     }
 }
 
+fn enrolled_identity(
+    scratch: &Scratch,
+    control: &control::Control,
+    processes: usize,
+) -> racer_dataplane::control::enrollment::LocalSigningIdentity {
+    use racer_dataplane::{
+        control::{enrollment::Enrollment, wire},
+        model::identity::ClusterId,
+    };
+    assert_eq!(
+        control.enrollments.load(Ordering::Acquire),
+        2 * processes,
+        "each process authenticates at pre-worker bootstrap and control-worker startup"
+    );
+    assert!(
+        !scratch.0.join("identity/pending.json").exists(),
+        "readiness requires committed enrollment and completed pending cleanup"
+    );
+    let enrollment = Enrollment::new(
+        ClusterId(CLUSTER.into()),
+        scratch.0.join("token"),
+        scratch.0.join("identity"),
+    );
+    let bundle =
+        wire::decode_bundle(&fs::read(scratch.0.join("secrets/epoch/bundle.json")).unwrap())
+            .unwrap();
+    enrollment
+        .set_peer_trust_roots(bundle.peer_trust_roots)
+        .unwrap();
+    // Verify the persisted certificate's chain, SAN, validity, request correlation,
+    // and local key pairing rather than comparing opaque identity.json bytes.
+    let identity = enrollment.load_identity().unwrap().unwrap();
+    assert_eq!(identity.cluster().0, CLUSTER);
+    assert_eq!(identity.node().0, NODE);
+    assert!(identity.valid_now());
+    identity
+}
+
 #[derive(Clone, Debug)]
 struct Call {
     method: String,
@@ -467,7 +505,7 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
             assert_eq!(call.pin.as_deref(), Some("\"restart-v1\""));
         }
     }
-    let identity = fs::read(scratch.0.join("identity/identity.json")).unwrap();
+    let identity = enrolled_identity(&scratch, &control, 1);
     assert!(
         first.stop(libc::SIGTERM).success(),
         "graceful exit: {}",
@@ -496,14 +534,11 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
     let (mut second, origin) = Process::start(&scratch, &control, 1);
     origin.offline.store(true, Ordering::Release);
     assert_ne!(first.child.id(), second.child.id());
-    assert_eq!(
-        fs::read(scratch.0.join("identity/identity.json")).unwrap(),
-        identity
-    );
-    assert_eq!(
-        control.enrollments.load(Ordering::Acquire),
-        1,
-        "restart must reuse persisted identity"
+    let renewed = enrolled_identity(&scratch, &control, 2);
+    assert_ne!(
+        renewed.certificate_chain(),
+        identity.certificate_chain(),
+        "restart must persist fresh issuance for the authenticated Node binding"
     );
     assert_eq!(second.metric("racer_disk_hits_total"), 0);
     check(
@@ -531,6 +566,7 @@ fn interrupted_process_restart_refetches_safely_after_partial_origin_body() {
     let scratch = Scratch::new();
     let control = control::Control::start(&scratch.0);
     let (mut first, origin) = Process::start(&scratch, &control, 0);
+    let identity = enrolled_identity(&scratch, &control, 1);
     check(&first.request(None, 0, P), 0, P);
     let deadline = Instant::now() + TIMEOUT;
     while fs::metadata(scratch.0.join("slabs/worker-0-slab-0.dat"))
@@ -561,7 +597,12 @@ fn interrupted_process_restart_refetches_safely_after_partial_origin_body() {
     assert!(!scratch.0.join("slabs/checkpoint.1").exists());
     let (mut second, origin) = Process::start(&scratch, &control, 1);
     assert_ne!(first.child.id(), second.child.id());
-    assert_eq!(control.enrollments.load(Ordering::Acquire), 1);
+    let renewed = enrolled_identity(&scratch, &control, 2);
+    assert_ne!(
+        renewed.certificate_chain(),
+        identity.certificate_chain(),
+        "crash recovery must reauthenticate rather than reuse the disk certificate"
+    );
     check(
         &second.request(Some("\"restart-v1\""), 0, LENGTH),
         0,
