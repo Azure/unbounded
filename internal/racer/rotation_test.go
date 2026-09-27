@@ -170,6 +170,99 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	keyState(t, r)
 }
 
+func TestKeyringDerivedDeadlines(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval time.Duration
+		retain   time.Duration
+		steps    []struct{ at, next time.Duration }
+	}{
+		{
+			name:     "overlapping retirements",
+			interval: 24 * time.Hour,
+			retain:   48 * time.Hour,
+			steps: []struct{ at, next time.Duration }{
+				{0, 24 * time.Hour},
+				{24 * time.Hour, 25 * time.Hour},
+				{25 * time.Hour, 49 * time.Hour},
+				{49 * time.Hour, 50 * time.Hour},
+				{50 * time.Hour, 73 * time.Hour},
+				{73 * time.Hour, 74 * time.Hour},
+			},
+		},
+		{
+			name:     "retirement during preparation",
+			interval: 24 * time.Hour,
+			retain:   24*time.Hour + 30*time.Minute,
+			steps: []struct{ at, next time.Duration }{
+				{0, 24 * time.Hour},
+				{24 * time.Hour, 25 * time.Hour},
+				{25 * time.Hour, 49 * time.Hour},
+				{49 * time.Hour, 49*time.Hour + 30*time.Minute},
+				{49*time.Hour + 30*time.Minute, 50 * time.Hour},
+				{50 * time.Hour, 74 * time.Hour},
+			},
+		},
+		{
+			name:     "retirement before next rotation",
+			interval: 7 * 24 * time.Hour,
+			retain:   24 * time.Hour,
+			steps: []struct{ at, next time.Duration }{
+				{0, 168 * time.Hour},
+				{168 * time.Hour, 169 * time.Hour},
+				{169 * time.Hour, 193 * time.Hour},
+				{193 * time.Hour, 337 * time.Hour},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, now := testKeyring(t)
+			r.Config.Rotation = RotationPolicy{Interval: tc.interval, PrepareFor: time.Hour, RetainFor: tc.retain}
+			start := *now
+
+			for i, step := range tc.steps {
+				*now = start.Add(step.at)
+				result := runKeys(t, r)
+
+				shared, bundle, state, _ := keyState(t, r)
+				if want := start.Add(step.next); !state.nextTransition().Equal(want) || result.RequeueAfter != want.Sub(*now) {
+					t.Fatalf("step %d: deadline=%v requeue=%v, want %v", i, state.nextTransition(), result.RequeueAfter, want)
+				}
+
+				if bundle.Generation != wire.Generation(i+1) {
+					t.Fatalf("step %d did not publish exactly one transition: generation=%d", i, bundle.Generation)
+				}
+
+				var persisted map[string]json.RawMessage
+				if err := json.Unmarshal(shared.Data["rotation.json"], &persisted); err != nil {
+					t.Fatal(err)
+				}
+
+				if _, exists := persisted["next_transition"]; exists {
+					t.Fatal("derived deadline persisted")
+				}
+
+				// Every phase must resume from only primary state without rewriting
+				// credentials or extending a deadline when the process restarts.
+				restarted := Assemble(r.Config, r.Client, r.APIReader).Keyring
+				restarted.Now = r.Now
+
+				*now = now.Add(time.Second)
+				if got := runKeys(t, restarted).RequeueAfter; got != step.next-step.at-time.Second {
+					t.Fatalf("step %d: restart requeue=%v", i, got)
+				}
+
+				unchanged, _, _, _ := keyState(t, restarted)
+				if shared.ResourceVersion != unchanged.ResourceVersion || !reflect.DeepEqual(shared.Data, unchanged.Data) {
+					t.Fatalf("step %d: restart rewrote credentials", i)
+				}
+
+				r = restarted
+			}
+		})
+	}
+}
+
 func TestGenerationBoundCacheKey(t *testing.T) {
 	if _, err := newCacheKey(wire.CacheID(testNodeUID), wire.PageKey, wire.ActiveKey, 0); err == nil {
 		t.Fatal("zero or wrapped generation accepted")
@@ -622,31 +715,41 @@ func TestPlanRotationInputValidation(t *testing.T) {
 }
 
 func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
-	for _, corrupt := range []string{"timestamp", "transition mismatch", "zero root retirement", "zero key retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
+	for _, corrupt := range []string{"timestamp", "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
 		t.Run(corrupt, func(t *testing.T) {
 			r, now := testKeyring(t)
 			runKeys(t, r)
 
 			switch corrupt {
-			case "zero root retirement", "zero key retirement", "unknown retirement":
+			case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "unknown retirement":
 				_, _, initial, _ := keyState(t, r)
 				*now = initial.NextRotation
 
 				runKeys(t, r)
-				_, _, prepared, _ := keyState(t, r)
-				*now = prepared.ActivateAt
 
-				runKeys(t, r)
+				if corrupt == "zero root retirement" || corrupt == "zero key retirement" || corrupt == "unknown retirement" {
+					_, _, prepared, _ := keyState(t, r)
+					*now = prepared.ActivateAt
+
+					runKeys(t, r)
+				}
 			}
 
 			shared, b, s, _ := keyState(t, r)
 
 			switch corrupt {
 			case "timestamp":
-				s.NextTransition = time.Time{}
+				s.NextRotation = time.Time{}
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "transition mismatch":
-				s.NextTransition = s.NextTransition.Add(time.Second)
+				// Preparation must activate strictly after the rotation timestamp.
+				s.ActivateAt = s.NextRotation
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "missing activation":
+				s.ActivateAt = time.Time{}
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "missing prepared issuer":
+				s.PreparedIssuer = ""
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "zero root retirement":
 				for _, root := range b.PeerTrustRoots {
@@ -666,7 +769,7 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "unknown retirement":
-				s.Retiring["unknown"] = s.NextTransition.Add(time.Hour)
+				s.Retiring["unknown"] = s.NextRotation.Add(time.Hour)
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "active issuer":
 				s.ActiveIssuer = "missing"

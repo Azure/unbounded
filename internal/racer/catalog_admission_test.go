@@ -113,7 +113,7 @@ func TestCatalogAdmissionRotationCycles(t *testing.T) {
 
 			for range 30 {
 				_, before, previous, _ := keyState(t, r)
-				*now = previous.NextTransition
+				*now = previous.nextTransition()
 
 				runKeys(t, r)
 				_, after, state, _ := keyState(t, r)

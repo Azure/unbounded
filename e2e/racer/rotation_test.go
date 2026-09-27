@@ -262,10 +262,9 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.Equal(h.t, beforeWarm, gets, "pre-rotation cached bytes must be reusable")
 	h.verifyRotationDisk(nodes[0], urls[0], fixture, pressure, "before-rotation")
 
-	// Advance only the persisted scheduling deadline. The real Go reconciler
+	// Advance only the next rotation timestamp. The real Go reconciler
 	// generates, stages, activates and prunes every key/root; no bundle is forged.
 	initialState.NextRotation = time.Now().UTC().Truncate(time.Second)
-	initialState.NextTransition = initialState.NextRotation
 	stateBytes, err := json.Marshal(initialState)
 	require.NoError(h.t, err)
 	patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": secret.ResourceVersion}, "data": map[string][]byte{"rotation.json": stateBytes}})

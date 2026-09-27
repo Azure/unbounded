@@ -341,9 +341,12 @@ establishes 100,000-node HTTPS capacity.
   is included. Only `bundle.json` is a dataplane wire contract.
 - Rotation metadata persists the next rotation, preparation deadline, selected
   active/prepared issuer fingerprints, retirement deadlines for roots and scoped
-  cache-key IDs, and earliest next transition. `RotationState.nextTransition()`
-  supplies the same deadline calculation for planning and validation of persisted
-  `NextTransition`. Both cache-key purposes rotate.
+  cache-key IDs. `RotationState.nextTransition()` derives the earliest transition
+  for scheduling from those primary timestamps: activation while preparation is
+  pending, otherwise the next rotation, or any earlier retirement. No derived
+  deadline is persisted in `rotation.json`. Credential loading validates primary
+  timestamps, issuer/material bindings, and retirement coverage. Both cache-key
+  purposes rotate.
   Initial cache keys are active immediately; replacements are prepared before
   activation. Caches added during an existing preparation retain their initial
   active keys until the next cycle. Removed cache UIDs lose their key scopes;

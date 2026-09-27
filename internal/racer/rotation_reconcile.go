@@ -105,7 +105,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: max(time.Second, credentials.rotation.NextTransition.Sub(now))}, nil
+	return ctrl.Result{RequeueAfter: max(time.Second, credentials.rotation.nextTransition().Sub(now))}, nil
 }
 
 func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) {

@@ -79,7 +79,7 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 
 func (c *credentialState) validateRotation() error {
 	b, s, m := c.bundle, c.rotation, c.material
-	if s.NextRotation.IsZero() || s.NextTransition.IsZero() || s.Retiring == nil || !containsRoot(b, s.ActiveIssuer) || (s.PreparedIssuer == "") != s.ActivateAt.IsZero() {
+	if s.NextRotation.IsZero() || s.Retiring == nil || !containsRoot(b, s.ActiveIssuer) || (s.PreparedIssuer == "") != s.ActivateAt.IsZero() {
 		return wire.Unavailable
 	}
 
@@ -143,10 +143,6 @@ func (c *credentialState) validateRotation() error {
 		if at.IsZero() {
 			return wire.Unavailable
 		}
-	}
-
-	if !s.nextTransition().Equal(s.NextTransition) {
-		return wire.Unavailable
 	}
 
 	if m.Pending != "" {

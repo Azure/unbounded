@@ -21,10 +21,9 @@ type RotationPolicy struct {
 	RetainFor  time.Duration
 }
 
-// RotationState lives beside bundle.json in the shared Secret. It is sufficient
-// to resume transitions after restart; no rotation-job or acknowledgment objects.
+// RotationState is controller-only metadata beside bundle.json in the shared
+// Secret. Primary timestamps suffice to derive scheduling deadlines after restart.
 type RotationState struct {
-	NextTransition time.Time            `json:"next_transition"`
 	NextRotation   time.Time            `json:"next_rotation"`
 	ActivateAt     time.Time            `json:"activate_at"`
 	ActiveIssuer   string               `json:"active_issuer"`
@@ -225,8 +224,6 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 		b.CacheKeys = append(b.CacheKeys, prepared...)
 		s.ActivateAt = now.Add(policy.PrepareFor)
 	}
-
-	s.NextTransition = s.nextTransition()
 
 	if _, err := wire.EncodeBundle(b); err != nil {
 		return b, s, err

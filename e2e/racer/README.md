@@ -115,7 +115,7 @@ Between peer recovery and cache recreation, the same two live Rust dataplanes
 exercise Go-controller-driven rotation. A supported `racer` Deployment override
 sets a two-minute leaf TTL, one-minute preparation, and two-minute retention.
 The normal rotation interval stays at 24 hours so earlier accounting checks cannot
-race activation. The test advances only `rotation.json`'s scheduling deadline
+race activation. The test advances only `rotation.json`'s `next_rotation` timestamp
 with a resourceVersion precondition; the real Go reconciler generates and
 publishes all prepared, active, retiring, and pruned keys and issuer roots.
 No credential bundle is constructed by the test.

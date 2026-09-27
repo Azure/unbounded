@@ -96,7 +96,6 @@ func TestSigningRejectsCorruptPrivateEntries(t *testing.T) {
 					b.PeerTrustRoots = append(b.PeerTrustRoots, m.Keys[id].Certificate)
 					s.PreparedIssuer = id
 					s.ActivateAt = s.NextRotation.Add(r.Config.Rotation.PrepareFor)
-					s.NextTransition = s.ActivateAt
 				case "retiring":
 					b.PeerTrustRoots = append(b.PeerTrustRoots, m.Keys[id].Certificate)
 					s.Retiring[id] = s.NextRotation.Add(time.Hour)
