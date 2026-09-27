@@ -82,7 +82,7 @@ turn, covering a deleted UID absent from controller discovery without waiting fo
 certificate renewal. Ordinary token renewal still uses the 16-hour deadline. A
 403 remains terminal. Failure to authenticate never falls back to a disk identity.
 
-Restart recreates node-bound signing views, replay windows, sessions, membership,
+Restart recreates node-bound signing views, connection sessions, membership,
 publication cursor, and worker state. Cache slabs/checkpoints contain cache-keyed
 content rather than Node identity; they retain the existing geometry, ownership,
 and available-key recovery checks. Identity persistence remains an atomic

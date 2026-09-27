@@ -16,7 +16,6 @@ pub struct Limits {
     pub client_connections: NonZeroUsize,
     pub pipes: NonZeroUsize,
     pub range_window_pages: NonZeroUsize,
-    pub replay_entries: NonZeroUsize,
     pub header_bytes: NonZeroUsize,
     pub cached_rankings: NonZeroUsize,
     pub cached_paths: NonZeroUsize,

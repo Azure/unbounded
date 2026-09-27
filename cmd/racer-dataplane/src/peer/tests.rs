@@ -21,7 +21,6 @@ use crate::{
         forwarding::Forwarding,
         identity::PendingIdentity,
         keyring::{KeyEpochs, Keyring},
-        replay::{ReplayState, ReplayWindow},
         signing::Signatures,
     },
     topology::paths::RouteBudget,
@@ -37,7 +36,7 @@ const B: &str = "00000002-1111-4111-8111-111111111111";
 const C: &str = "00000003-1111-4111-8111-111111111111";
 const CACHE: &str = "cccccccc-1111-4111-8111-111111111111";
 const CLUSTER: &str = "dddddddd-1111-4111-8111-111111111111";
-type Discovery = (Rc<Keyring>, Rc<Certificates>, Rc<ReplayWindow>);
+type Discovery = (Rc<Keyring>, Rc<Certificates>);
 fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -89,24 +88,13 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
         .unwrap();
         keys.install_signing_identity(Arc::new(identity)).unwrap();
         let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-        let replay = Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 100));
-        discovery.push((keys.clone(), certificates.clone(), replay.clone()));
-        signers.push(Rc::new(Signatures::new(keys, certificates, replay)));
+        discovery.push((keys.clone(), certificates.clone()));
+        signers.push(Rc::new(Signatures::new(keys, certificates)));
     }
     (signers, discovery)
 }
 pub(super) fn signers() -> Vec<Rc<Signatures>> {
     let (signers, _) = identities();
-    for signer in &signers {
-        for peer in &signers {
-            signer
-                .configure_authenticated_peer_challenge(
-                    peer.node().clone(),
-                    peer.challenge().unwrap(),
-                )
-                .unwrap();
-        }
-    }
     signers
 }
 fn request(admission: &Admission, attempt: u8) -> PeerRequest {
@@ -443,10 +431,10 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     )
     .unwrap();
     receiver.verify_request(signed).unwrap();
-    assert!(matches!(
-        receiver.verify_request(codec.request(envelope, &scope).unwrap()),
-        Err(Error::Replay)
-    ));
+    receiver
+        .verify_request(codec.request(envelope, &scope).unwrap())
+        .unwrap();
+    crate::security::connection::tests::replay_and_binding_checks();
     let mut expired = request(&admission, 3);
     expired.route.deadline = Deadline(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
@@ -644,8 +632,10 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         )
         .unwrap(),
     );
-    let handshake =
-        handshake::Handshake::new(signers[2].clone(), None).with_http(network, transfers);
+    let handshake = handshake::Handshake::new(signers[2].clone(), None);
+    drop(transfers);
+    let response_lease = network.membership(MembershipVersion(1)).unwrap();
+    drop(network);
     let mut head = MessageHead {
         start: StartLine::Request {
             method: "POST".into(),
@@ -658,14 +648,20 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     p::push(&mut head, "racer-wire-version", wire::VERSION);
     p::push(&mut head, "racer-membership", 1);
     p::push(&mut head, "racer-receiver", C);
-    p::push_binary(
-        &mut head,
-        "racer-session-challenge",
-        &signers[0].challenge().unwrap(),
-    );
     let signed = signers[0].sign(head).unwrap();
     let binding = signed_digest(&signed).unwrap();
-    let (reply, response_lease) = handshake.respond(signed).unwrap();
+    // Capabilities are no longer discovered per request. Membership and native
+    // availability remain signed application/control data, inside a session head.
+    let mut reply = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: vec![],
+    };
+    p::push(&mut reply, "content-length", 0);
+    p::push(&mut reply, "racer-receiver", A);
+    p::push(&mut reply, "racer-membership", 1);
+    p::push(&mut reply, "racer-rdma", 0);
+    p::push_binary(&mut reply, "racer-request-binding", &binding);
+    let reply = signers[2].sign(reply).unwrap();
     drop(handshake);
     assert!(
         weak.upgrade().is_some(),
@@ -690,7 +686,8 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         .find(|h| h.name == "racer-rdma")
         .unwrap()
         .value = b"1".to_vec();
-    assert!(signers[0].verify(tampered).is_err());
+    assert!(signers[0].verify_proof(tampered).is_err());
+    crate::security::connection::tests::replay_and_binding_checks();
     drop(response_lease);
     assert!(
         weak.upgrade().is_none(),
@@ -860,7 +857,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
             })
         }
     }
-    let (signers, discovery) = identities();
+    let (signers, _) = identities();
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(false).limits,
     ));
@@ -917,24 +914,8 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         )
         .unwrap(),
     );
-    let source_handshake = Rc::new(
-        handshake::Handshake::new(signers[0].clone(), None)
-            .with_http(source_network.clone(), transfers.clone())
-            .with_discovery(
-                discovery[0].0.clone(),
-                discovery[0].1.clone(),
-                discovery[0].2.clone(),
-            ),
-    );
-    let destination_handshake = Rc::new(
-        handshake::Handshake::new(signers[2].clone(), None)
-            .with_http(destination_network.clone(), transfers.clone())
-            .with_discovery(
-                discovery[2].0.clone(),
-                discovery[2].1.clone(),
-                discovery[2].2.clone(),
-            ),
-    );
+    let source_handshake = Rc::new(handshake::Handshake::new(signers[0].clone(), None));
+    let destination_handshake = Rc::new(handshake::Handshake::new(signers[2].clone(), None));
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let relay = Rc::new(
@@ -980,8 +961,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
             )
             .await?;
         let connection = ConnectionLease::from_accepted(fd, &admission)?;
-        let connection = server.serve_connection(connection, &listener_scope).await?;
-        let connection = server.serve_connection(connection, &listener_scope).await?;
         server.serve_connection(connection, &listener_scope).await?;
         Ok::<(), Error>(())
     };
@@ -1068,7 +1047,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             ),
             admission.clone(),
         ));
-        let (signers, discovery) = identities();
+        let (signers, _) = identities();
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
         let relay = Rc::new(relay::Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
@@ -1076,23 +1055,22 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             Rc::new(Never),
             admission.clone(),
         ));
-        let mut server =
-            server::PeerServer::new(io, forwarding, admission.clone(), Rc::new(Never), relay)
-                .with_wire(Rc::new(codec(&admission)))
-                .with_request_timeout(if matches!(case, "listener" | "cancel" | "drop") {
-                    Duration::from_secs(60)
-                } else if case == "idle" {
-                    Duration::from_secs(5)
-                } else {
-                    Duration::from_millis(30)
-                })
-                .with_handshake(Rc::new(
-                    handshake::Handshake::new(signers[2].clone(), None).with_discovery(
-                        discovery[2].0.clone(),
-                        discovery[2].1.clone(),
-                        discovery[2].2.clone(),
-                    ),
-                ));
+        let mut server = server::PeerServer::new(
+            io.clone(),
+            forwarding,
+            admission.clone(),
+            Rc::new(Never),
+            relay,
+        )
+        .with_wire(Rc::new(codec(&admission)))
+        .with_request_timeout(if matches!(case, "listener" | "cancel" | "drop") {
+            Duration::from_secs(60)
+        } else if case == "idle" {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(30)
+        })
+        .with_handshake(Rc::new(handshake::Handshake::new(signers[2].clone(), None)));
         let scope = RequestScope::new(
             RequestId([7; 16]),
             Instant::now()
@@ -1108,51 +1086,29 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             .unwrap();
         let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
         if case == "idle" {
-            // Real successful challenge exchanges leave the same connection
-            // reusable, then an idle next exchange must time out too.
-            for _ in 0..2 {
-                use crate::{
-                    http::codec::{MessageHead, StartLine},
-                    security::protocol as p,
-                };
-                let probe = crate::security::session::ChallengeProbe::new(
-                    NodeId(A.into()),
-                    NodeId(C.into()),
-                )
-                .unwrap();
-                let mut head = MessageHead {
-                    start: StartLine::Request {
-                        method: "POST".into(),
-                        target: "/racer/peer/v1/challenge".into(),
-                    },
-                    headers: vec![],
-                };
-                p::push(&mut head, "content-length", 0);
-                p::push_binary(&mut head, "racer-probe", &probe.request_bytes());
-                let http = Codec::new(
-                    wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
-                );
-                peer.write_all(&http.encode_head(&head).unwrap()).unwrap();
-                connection = drive(&reactor, server.serve_connection(connection, &scope)).unwrap();
-                assert!(connection.is_reusable());
-                let mut bytes = Vec::new();
-                while !bytes.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    peer.read_exact(&mut byte).unwrap();
-                    bytes.push(byte[0]);
-                }
-                let (head, _) = http.decode_head(&bytes).unwrap().unwrap();
-                assert!(matches!(head.start, StartLine::Response { status: 200 }));
-                let mut body = vec![0; head.content_length().unwrap().unwrap() as usize];
-                peer.read_exact(&mut body).unwrap();
-                probe
-                    .verify(
-                        &discovery[0].1,
-                        crate::security::session::ChallengeReply::decode(&body).unwrap(),
-                    )
+            let client =
+                ConnectionLease::from_accepted(peer.try_clone().unwrap().into(), &admission)
                     .unwrap();
-            }
+            let (client, accepted) = drive(&reactor, async {
+                futures::try_join!(
+                    crate::security::connection::connect(
+                        &io,
+                        client,
+                        signers[0].clone(),
+                        signers[2].node(),
+                        &scope
+                    ),
+                    crate::security::connection::accept(
+                        &io,
+                        connection,
+                        signers[2].clone(),
+                        &scope
+                    )
+                )
+            })
+            .unwrap();
+            connection = accepted;
+            drop(client);
             server = server.with_request_timeout(Duration::from_millis(30));
         }
         if matches!(case, "partial" | "trickle") {
@@ -1232,10 +1188,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             metadata::{ExpiresAt, ObjectMetadata},
         },
         runtime::reactor::Reactor,
-        security::{forwarding::ForwardedHead, protocol, signing::SignedHead},
+        security::{forwarding::ForwardedHead, protocol},
     };
     use std::{
-        io::{Read, Write},
         net::TcpListener,
         task::{Context, Poll},
     };
@@ -1249,8 +1204,10 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
-    let transfers = transfer::Transfers::new(pool, io, None)
+    let signers = signers();
+    let transfers = transfer::Transfers::new(pool, io.clone(), None)
         .with_wire(admission.clone(), Rc::new(codec(&admission)));
+    transfers.set_signatures(signers[0].clone());
     let buffers = BufferPool::new(admission.clone());
     let version = ObjectVersion {
         object: ObjectId {
@@ -1291,80 +1248,85 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         },
         ciphertext: page,
     };
-    let head = protocol::response_head(&response, &[3; 32], &[NodeId(A.into()), NodeId(C.into())])
-        .unwrap();
-    // This test isolates transport framing. Cryptographic verification is tested
-    // above using real certificates; these bytes are deliberately unverified.
+    let mut head =
+        protocol::response_head(&response, &[3; 32], &[NodeId(A.into()), NodeId(C.into())])
+            .unwrap();
+    protocol::push(&mut head, "racer-receiver", A);
     let authentication = ForwardedHead {
-        original: Arc::new(SignedHead {
-            head,
-            signature: vec![1; 64],
-        }),
+        original: Arc::new(signers[2].sign(head).unwrap()),
         hops: vec![],
     };
-    let encoded = Codec::new(64 * 1024, crate::model::range::PAGE_BYTES + 16)
-        .encode_head(&WireCodec::encode(&authentication, true, body.len()).unwrap())
-        .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
     let expected = body.clone();
-    let thread = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+    let scope =
+        RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
+    let server = async {
+        use crate::{http::pool::ConnectionLease, runtime::reactor::IoBuffer};
+        let fd = reactor
+            .accept(
+                Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
+                &scope,
+            )
+            .await?;
+        let conn = ConnectionLease::from_accepted(fd, &admission)?;
+        let mut conn =
+            crate::security::connection::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            socket.write_all(&encoded).unwrap();
+            conn = io.receive_head(conn, &scope).await?.connection;
+            conn = io
+                .send_head(
+                    conn,
+                    WireCodec::encode(&authentication, true, body.len())?,
+                    &scope,
+                )
+                .await?
+                .connection;
             let bytes = if attempt == 2 { &body[..5] } else { &body[..] };
             for chunk in bytes.chunks(257) {
-                socket.write_all(chunk).unwrap();
+                let mut buffer = io.buffer(chunk.len())?;
+                buffer.bytes_mut()?.copy_from_slice(chunk);
+                conn = io.write_body(conn, buffer, &scope).await?.lease;
+            }
+            if attempt != 2 {
+                conn.finish_exchange()?;
             }
         }
-    });
-    let drive = |mut operation: crate::error::Operation<'_, wire::SignedResponse>| {
+        Ok::<_, Error>(())
+    };
+    let client = async {
+        for attempt in 0..3 {
+            let local = request(&admission, attempt);
+            let scope = local.origin.scope().clone();
+            let (signed, _) = Forwarding::new(signers[0].clone())
+                .sign_request(local)
+                .unwrap();
+            let result = transfers.exchange(endpoint.clone(), signed, &scope).await;
+            if attempt == 2 {
+                assert!(result.is_err());
+            } else {
+                match result.unwrap().response {
+                    PeerResponse::Page { ciphertext, .. } => {
+                        assert_eq!(ciphertext.bytes(), expected)
+                    }
+                    _ => panic!("wrong response"),
+                }
+            }
+        }
+        Ok::<_, Error>(())
+    };
+    {
+        let mut operation = std::pin::pin!(async { futures::try_join!(client, server) });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         loop {
-            if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-                break result;
+            if let Poll::Ready(result) = std::future::Future::poll(operation.as_mut(), &mut cx) {
+                result.unwrap();
+                break;
             }
             reactor.poll_budgeted(128).unwrap();
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
-    };
-    for attempt in 0..3 {
-        let local = request(&admission, attempt);
-        let scope = local.origin.scope().clone();
-        let authentication = ForwardedHead {
-            original: Arc::new(SignedHead {
-                head: protocol::request_head(&local).unwrap(),
-                signature: vec![2; 64],
-            }),
-            hops: vec![],
-        };
-        let result = drive(transfers.exchange(
-            endpoint.clone(),
-            wire::SignedRequest {
-                authentication,
-                request: local,
-            },
-            &scope,
-        ));
-        if attempt == 2 {
-            assert!(result.is_err());
-        } else {
-            match result.unwrap().response {
-                PeerResponse::Page { ciphertext, .. } => assert_eq!(ciphertext.bytes(), expected),
-                _ => panic!("wrong response"),
-            }
-        }
     }
-    thread.join().unwrap();
     assert!(matches!(
         transfers.select(
             crate::topology::rails::TransportPlan::Rdma {

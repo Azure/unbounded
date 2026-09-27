@@ -193,7 +193,7 @@ impl Binding {
         if crate::security::signing::node_field(&signed.head, "racer-signer")? != *from {
             return Err(Error::Unauthorized);
         }
-        Ok((signatures.verify(signed)?, phase))
+        Ok((signatures.verify_proof(signed)?, phase))
     }
     pub fn parse_accept(signed: &SignedHead) -> Result<Self> {
         fn a<const N: usize>(h: &MessageHead, n: &str) -> Result<[u8; N]> {
@@ -269,6 +269,70 @@ pub(crate) fn extension(name: &str, value: Vec<u8>) -> Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
+        use crate::security::connection::tests::{pair, signer};
+        let (mut sender, mut receiver) = pair();
+        let a = signer(&sender);
+        let b = signer(&receiver);
+        let scope = RequestScope::new(
+            crate::model::identity::RequestId([4; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let original = binding(&scope);
+        for phase in [
+            Phase::Accept,
+            Phase::Offer,
+            Phase::Setup,
+            Phase::Ready,
+            Phase::Grant,
+            Phase::Complete,
+            Phase::Done,
+            Phase::Finish,
+        ] {
+            let extensions = phase
+                .fields()
+                .iter()
+                .map(|name| extension(name, p::binary(&[1; 32]).into_bytes()))
+                .collect();
+            let control = original
+                .sign(&a, b.node(), phase, &[9; 32], 0, extensions)
+                .unwrap();
+            let signed = sender.sign(frame(control).unwrap()).unwrap();
+            let admitted = receiver.admit(signed).unwrap();
+            let control = unframe(admitted, phase.response()).unwrap();
+            let copy = || {
+                super::super::wire::decode_signed(
+                    &super::super::wire::encode_signed(&control).unwrap(),
+                )
+                .unwrap()
+            };
+            let mut wrong = original.clone();
+            wrong.transfer.0[0] ^= 1;
+            assert!(
+                wrong
+                    .verify(&b, a.node(), copy(), &[phase], &[9; 32], 0, &scope)
+                    .is_err()
+            );
+            assert!(
+                original
+                    .verify(
+                        &b,
+                        a.node(),
+                        copy(),
+                        &[Phase::Fallback],
+                        &[9; 32],
+                        0,
+                        &scope
+                    )
+                    .is_err()
+            );
+            original
+                .verify(&b, a.node(), control, &[phase], &[9; 32], 0, &scope)
+                .unwrap();
+        }
+    }
     fn binding(scope: &RequestScope) -> Binding {
         Binding {
             request: [1; 32],
@@ -366,18 +430,18 @@ mod tests {
                 &scope,
             )
             .unwrap();
-        assert!(matches!(
-            original.verify(
+        original
+            .verify(
                 &nodes[1],
                 nodes[0].node(),
                 copy,
                 &[Phase::Fallback],
                 &[9; 32],
                 0,
-                &scope
-            ),
-            Err(Error::Replay)
-        ));
+                &scope,
+            )
+            .unwrap();
+        crate::security::connection::tests::replay_and_binding_checks();
     }
     #[test]
     fn control_extension_and_fallback_length_schema_is_closed() {

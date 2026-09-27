@@ -61,7 +61,6 @@ mod test_support {
                     client_connections: n,
                     pipes: n,
                     range_window_pages: n,
-                    replay_entries: n,
                     header_bytes: NonZeroUsize::new(4096).unwrap(),
                     cached_rankings: n,
                     cached_paths: n,

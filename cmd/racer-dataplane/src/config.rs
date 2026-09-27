@@ -184,7 +184,6 @@ impl Config {
             client_connections: limit("RACER_CLIENT_CONNECTIONS", 128)?,
             pipes: limit("RACER_PIPES", 16)?,
             range_window_pages: limit("RACER_RANGE_WINDOW_PAGES", 2)?,
-            replay_entries: limit("RACER_REPLAY_ENTRIES", 4096)?,
             header_bytes: limit("RACER_HEADER_BYTES", 32 * 1024)?,
             cached_rankings: limit("RACER_CACHED_RANKINGS", 128)?,
             cached_paths: limit("RACER_CACHED_PATHS", 128)?,
@@ -310,7 +309,6 @@ impl Config {
             (limits.client_connections, 65_536),
             (limits.pipes, 65_536),
             (limits.range_window_pages, 64),
-            (limits.replay_entries, MAX_ENTRIES),
             (limits.header_bytes, 32 * 1024),
             (limits.cached_rankings, MAX_ENTRIES),
             (limits.cached_paths, MAX_ENTRIES),
@@ -1436,7 +1434,6 @@ mod tests {
             ("RACER_FLIGHTS", "0"),
             ("RACER_PIPES", "65537"),
             ("RACER_RANGE_WINDOW_PAGES", "16"),
-            ("RACER_REPLAY_ENTRIES", "1048577"),
             ("RACER_PLAINTEXT_BYTES", "18446744073709551615"),
             ("RACER_CONNECTIONS_PER_NEIGHBOR", "129"),
         ] {

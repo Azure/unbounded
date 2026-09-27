@@ -383,7 +383,6 @@ mod tests {
                 certificates::Certificates,
                 identity::tests::{CLUSTER, NODE, issued},
                 keyring::{KeyEpochs, Keyring},
-                replay::{ReplayState, ReplayWindow},
                 signing::{Signatures, SignedHead},
             },
         };
@@ -409,14 +408,7 @@ mod tests {
         .unwrap();
         keys.install_signing_identity(Arc::new(identity)).unwrap();
         let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-        let signatures = Signatures::new(
-            keys,
-            certificates,
-            Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 32)),
-        );
-        signatures
-            .configure_authenticated_peer_challenge(node, signatures.challenge().unwrap())
-            .unwrap();
+        let signatures = Signatures::new(keys, certificates);
         let setup = SetupParameters::new(
             RailId(9),
             Endpoint {
@@ -450,7 +442,9 @@ mod tests {
                 },
             ],
         };
-        let verified = signatures.verify(signatures.sign(head()).unwrap()).unwrap();
+        let verified = signatures
+            .verify_proof(signatures.sign(head()).unwrap())
+            .unwrap();
         assert_eq!(
             SetupParameters::from_verified(&verified, RailId(9))
                 .unwrap()
@@ -466,7 +460,8 @@ mod tests {
             head: verified.signed.head,
             signature: verified.signed.signature,
         };
-        assert!(matches!(signatures.verify(replay), Err(Error::Replay)));
+        signatures.verify_proof(replay).unwrap();
+        crate::security::connection::tests::replay_and_binding_checks();
         let mut tampered = signatures.sign(head()).unwrap();
         tampered
             .head
@@ -475,7 +470,7 @@ mod tests {
             .find(|h| h.name == SETUP_HEADER)
             .unwrap()
             .value[0] = b'A';
-        assert!(signatures.verify(tampered).is_err());
+        assert!(signatures.verify_proof(tampered).is_err());
     }
     #[test]
     fn setup_encoding_is_bounded_and_rail_bound() {

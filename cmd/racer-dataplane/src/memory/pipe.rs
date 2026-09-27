@@ -416,7 +416,6 @@ pub(super) mod tests {
             client_connections: small,
             pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
             range_window_pages: small,
-            replay_entries: small,
             header_bytes: small,
             cached_rankings: small,
             cached_paths: small,

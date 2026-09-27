@@ -51,7 +51,7 @@ fn verified(signers: &[Rc<Signatures>], headers: Vec<Header>) -> VerifiedHead {
         value: signers[1].node().0.as_bytes().to_vec(),
     });
     signers[1]
-        .verify(
+        .verify_proof(
             signers[0]
                 .sign(MessageHead {
                     start: StartLine::Request {

@@ -123,7 +123,7 @@ fn receive_contended(readback: bool, terminal: Option<Error>) {
             ],
         })
         .unwrap();
-    let completion = signers[1].verify(signed).unwrap();
+    let completion = signers[1].verify_proof(signed).unwrap();
     // Expire only the finish scope; the grant remains valid so admission/binding
     // cannot be mistaken for the receive-completion deadline check.
     if terminal == Some(Error::DeadlineExceeded) {

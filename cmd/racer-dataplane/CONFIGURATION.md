@@ -143,8 +143,8 @@ cancellation, including idle time on accepted and reused keepalive connections.
 Partial header bytes do not extend it. Expiry closes the connection; admission
 charges remain held until outstanding I/O is fenced. Once the head is received,
 authenticated peer dispatch and response transfer use the existing signed request
-deadline capped by the listener deadline, not the header cap. Challenge and
-handshake responses continue under the listener scope. This is a header-only
+deadline capped by the listener deadline, not the header cap. Connection handshake
+responses have a five-second cap within the listener/header scope. This is a header-only
 ingress limit; it does not renew or otherwise change the fixed read/range request
 budget.
 
@@ -160,7 +160,10 @@ All limits are strictly positive. Aggregate limits are node-wide ceilings, not
 promised concurrency or allocations made by configuration. Runtime partitions
 aggregate dimensions after affinity discovery; per-operation caps such as window,
 headers, waiters per flight, connections per neighbor/cache, and retained snapshots stay
-unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
+unchanged. Peer ordering uses constant storage per live pooled connection, bounded
+by connection admission; handshake work uses control-progress admission. Sessions
+expire after one monotonic hour and reconnect with fresh signed challenges. There
+is no replay-entry capacity setting. MiB means 1048576 bytes.
 
 | Environment variable | Default | Maximum |
 | --- | --- | --- |
@@ -177,7 +180,6 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_CLIENT_CONNECTIONS` | `128` | 65536 |
 | `RACER_PIPES` | `16` | 65536 |
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
-| `RACER_REPLAY_ENTRIES` | `4096` | 1048576 |
 | `RACER_HEADER_BYTES` | `32768` | 32768 |
 | `RACER_CACHED_RANKINGS` | `128` | 1048576 |
 | `RACER_CACHED_PATHS` | `128` | 1048576 |

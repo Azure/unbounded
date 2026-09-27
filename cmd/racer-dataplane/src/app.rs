@@ -63,7 +63,6 @@ use crate::{
         credentials::CredentialCrypto,
         forwarding::Forwarding,
         keyring::{KeyEpochs, KeyPurpose, Keyring},
-        replay::{ReplayState, ReplayWindow},
         signing::Signatures,
     },
     store::{
@@ -118,7 +117,6 @@ pub struct NodeState {
     metrics: crate::telemetry::metrics::Metrics,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
-    replay: Arc<ReplayState>,
     control_worker: WorkerId,
     workers: Arc<WorkerDirectory>,
     count: usize,
@@ -149,7 +147,6 @@ impl NodeState {
             publications: Arc::new(PublishedState::default()),
             metrics: crate::telemetry::metrics::Metrics::default(),
             keys: Arc::new(KeyEpochs::default()),
-            replay: Arc::new(ReplayState::default()),
             control_worker: WorkerId(0),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
             count,
@@ -500,15 +497,7 @@ impl WorkerApplication {
             node.keys.clone(),
         ));
         let certificates = Rc::new(Certificates::new(config.cluster.clone(), keys.clone()));
-        let replay = Rc::new(ReplayWindow::new(
-            node.replay.clone(),
-            config.limits.replay_entries.get(),
-        ));
-        let signatures = Rc::new(Signatures::new(
-            keys.clone(),
-            certificates.clone(),
-            replay.clone(),
-        ));
+        let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
@@ -645,11 +634,7 @@ impl WorkerApplication {
             Some(sessions) => transfers.with_native(signatures.clone(), sessions.clone()),
             None => transfers,
         });
-        let handshake = Rc::new(
-            Handshake::new(signatures.clone(), sessions)
-                .with_http(network.clone(), transfers.clone())
-                .with_discovery(keys.clone(), certificates, replay),
-        );
+        let handshake = Rc::new(Handshake::new(signatures.clone(), sessions));
         let requester = Rc::new(
             Requester::new(
                 paths.clone(),
@@ -714,8 +699,7 @@ impl WorkerApplication {
         ));
         let relay = Rc::new(
             Relay::new(paths, forwarding.clone(), requester, admission.clone())
-                .with_network(network.clone())
-                .with_handshake(handshake.clone()),
+                .with_network(network.clone()),
         );
         let dispatcher = Rc::new(Dispatcher::new(
             worker,

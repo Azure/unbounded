@@ -169,7 +169,9 @@ invalid or deleted durable authority. An API read outage may retain accepted loc
 state while leadership holds, but cannot restore previously withdrawn trust.
 Bootstrap can connect without a client certificate, including recovery from an
 expired identity. There are no control HTTP signatures or challenge endpoint.
-TLS authenticates responses. Peer HTTP retains its signature/replay machinery.
+TLS authenticates responses. Peer HTTP uses separate certificate-authenticated v2
+connection sessions with signed, strictly ordered immediate-hop heads. It adds no
+payload TLS encryption; see `designs/racer-peer-security.md`.
 
 ## Shared projected keyring
 

@@ -741,7 +741,6 @@ impl Harness {
         config.limits.client_connections = NonZeroUsize::new(64).unwrap();
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
         config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
-        config.limits.replay_entries = NonZeroUsize::new(8192).unwrap();
         config.limits.metadata_entries = NonZeroUsize::new(128).unwrap();
         config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
         config.limits.request_context_bytes = NonZeroUsize::new(4 * 1024 * 1024).unwrap();
@@ -1634,11 +1633,7 @@ impl Harness {
         use crate::{
             http::codec::{Codec, MessageHead, StartLine},
             peer::wire::WireCodec,
-            security::{
-                protocol as p,
-                replay::ReplayWindow,
-                session::{ChallengeProbe, ChallengeReply},
-            },
+            security::protocol as p,
         };
         let receiver = self.rng.pick(self.nodes.len());
         let sender = (receiver + 1) % self.nodes.len();
@@ -1647,31 +1642,8 @@ impl Harness {
             self.nodes[sender].config.cluster.clone(),
             keys.clone(),
         ));
-        let signatures = Signatures::new(
-            keys,
-            certificates.clone(),
-            Rc::new(ReplayWindow::new(
-                self.nodes[sender].app.node.as_ref().unwrap().replay.clone(),
-                8192,
-            )),
-        );
+        let signatures = Signatures::new(keys, certificates.clone());
         let peer = self.nodes[receiver].config.node.clone();
-        let probe =
-            ChallengeProbe::new(self.nodes[sender].config.node.clone(), peer.clone()).unwrap();
-        let body = probe.request_bytes();
-        let request = format!("POST /racer/peer/v1/challenge HTTP/1.1\r\nContent-Length: 0\r\nracer-probe: {}\r\n\r\n", p::binary(&body)).into_bytes();
-        let response = self.raw_peer(receiver, request);
-        let (_, _, end) = headers(&response);
-        signatures
-            .install_peer_challenge(
-                probe
-                    .verify(
-                        &certificates,
-                        ChallengeReply::decode(&response[end..]).unwrap(),
-                    )
-                    .unwrap(),
-            )
-            .unwrap();
         let mut head = MessageHead {
             start: StartLine::Request {
                 method: "POST".into(),
@@ -1684,11 +1656,6 @@ impl Harness {
         p::push(&mut head, "racer-wire-version", crate::peer::wire::VERSION);
         p::push(&mut head, "racer-membership", self.generation);
         p::push(&mut head, "racer-receiver", &peer.0);
-        p::push_binary(
-            &mut head,
-            "racer-session-challenge",
-            &signatures.challenge().unwrap(),
-        );
         let signed = signatures.sign(head).unwrap();
         let envelope = crate::security::forwarding::ForwardedHead {
             original: Arc::new(signed),
@@ -1701,10 +1668,12 @@ impl Harness {
         }
         let selected = self.rng.pick(self.security_faults.len());
         if self.security_faults.swap_remove(selected) {
+            // A retained signed proof on a new socket has no live session. Both
+            // attempts must fail, including after receiver restart.
             let valid = self.raw_peer(receiver, bytes.clone());
             assert!(
-                valid.starts_with(b"HTTP/1.1 200"),
-                "signed peer request did not succeed"
+                !valid.starts_with(b"HTTP/1.1 200"),
+                "sessionless signed proof accepted"
             );
             let replay = self.raw_peer(receiver, bytes);
             assert!(

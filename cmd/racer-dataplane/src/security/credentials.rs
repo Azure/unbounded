@@ -125,7 +125,7 @@ impl CredentialCrypto {
     ///
     /// Select KeyPurpose::OriginCredentials, never a page key. For every encryption
     /// generate a fresh CSPRNG XChaCha20 nonce internally, independent of attempt IDs,
-    /// page nonces, and HTTP replay nonces. Canonical, versioned credential-domain
+    /// page nonces, and connection challenges. Canonical, versioned credential-domain
     /// AAD binds key ID, object (cache UID + exact key), scope.request, attempt, and
     /// opaque metadata presence/length/bytes. Encrypt the exact Authorization bytes.
     /// A missing Authorization still requires an owned, charged peer context and

@@ -213,8 +213,8 @@ impl Forwarding {
             binding,
         ))
     }
-    /// Verify original and every hop, identity, replay, logical-field agreement,
-    /// and monotonic routing limits before returning service/relay admission.
+    /// Verify original and every historical hop, identity, logical-field agreement,
+    /// and monotonic routing limits. Socket admission must precede this call.
     pub fn verify_request(&self, request: SignedRequest) -> Result<VerifiedRequest> {
         let auth = &request.authentication;
         if auth.hops.len() >= protocol::MAX_HOPS {
@@ -255,8 +255,9 @@ impl Forwarding {
         if route.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
-        let last_peer = forwarders.last().unwrap_or(&origin);
-        self.signatures.admit(previous, last_peer)?;
+        if receiver(&previous.head)? != *self.signatures.node() {
+            return Err(Error::Unauthorized);
+        }
         let mut path = route.visited;
         path.push(self.signatures.node().clone());
         let binding = RequestBinding {
@@ -299,7 +300,7 @@ impl Forwarding {
             response,
         })
     }
-    /// Verify original and every hop, replay/identity and signed logical fields,
+    /// Verify original and every historical hop, identity and signed logical fields,
     /// then check response correlation against the supplied outstanding attempt.
     /// A request ID alone is not sufficient; the original signature binds identity,
     /// operation, membership, attempt, and freshness without hashing page bytes.
@@ -375,8 +376,9 @@ impl Forwarding {
         if index + 1 != request.path.len() || request.path.last() != Some(self.signatures.node()) {
             return Err(Error::Unauthorized);
         }
-        self.signatures
-            .admit(previous, forwarders.last().unwrap_or(&origin))?;
+        if receiver(&previous.head)? != *self.signatures.node() {
+            return Err(Error::Unauthorized);
+        }
         Ok(VerifiedResponse {
             signed: response,
             binding: request.clone(),
@@ -652,7 +654,6 @@ mod tests {
             client_connections: n,
             pipes: n,
             range_window_pages: n,
-            replay_entries: n,
             header_bytes: n,
             cached_rankings: n,
             cached_paths: n,
@@ -807,8 +808,9 @@ mod tests {
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
         let (signed, binding) = sender.sign_request(request(1)).unwrap();
-        // Same request/attempt IDs, but a distinct original signature and nonce.
-        let (_, other) = sender.sign_request(request(1)).unwrap();
+        // A distinct attempt has a distinct signed binding. Session ordering
+        // distinguishes repeated transport sends of an identical historical proof.
+        let (_, other) = sender.sign_request(request(2)).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         for outcome in [
             PeerResponse::Miss,
@@ -1073,12 +1075,10 @@ mod tests {
         );
         let replay = copy_response(&response);
         let verified = f[1].verify_response(response, &reverse).unwrap();
-        assert!(matches!(
-            f[1].verify_response(replay, &reverse),
-            Err(Error::Replay)
-        ));
+        f[1].verify_response(replay, &reverse).unwrap();
+        crate::security::connection::tests::replay_and_binding_checks();
         assert!(f[1].append_response(verified, &node(2)).is_err());
-        // Fresh response nonce allows a legitimate distinct signed outcome.
+        // Historical response proofs may be carried by fresh session heads.
         let response = f[2]
             .sign_response(destination.binding(), PeerResponse::Miss)
             .unwrap();
@@ -1350,7 +1350,7 @@ mod tests {
             assert!(f[1].append_request(admitted, &node(2), route).is_err());
         }
         let (first, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
-        let (second, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+        let (second, _) = f[0].sign_request_to(request(2), &node(1)).unwrap();
         let admitted = f[1].verify_request(first).unwrap();
         let route = budget(&admitted);
         let mut forwarded = f[1].append_request(admitted, &node(2), route).unwrap();

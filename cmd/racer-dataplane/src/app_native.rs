@@ -190,7 +190,6 @@ mod tests {
             assert!(partition.get() * plan.pairs.len() <= node.get());
         }
         assert_eq!(limits.range_window_pages, config.limits.range_window_pages);
-        assert_eq!(limits.replay_entries, config.limits.replay_entries);
         assert_eq!(
             limits.connections_per_neighbor,
             config.limits.connections_per_neighbor

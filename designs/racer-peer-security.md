@@ -1,4 +1,4 @@
-# Racer peer security v1
+# Racer peer security v2
 
 This document is owned by the security implementer. It defines the peer protocol,
 not the control HTTPS or SDK Unix-socket protocol. Implemented exported encoders
@@ -34,7 +34,7 @@ Use RFC 9421 signature-base construction and structured `Signature-Input` and
 `@status`. Cover every security/operation header in deterministic order. Reject
 duplicate fields, malformed structured fields, unsupported signature algorithms,
 unknown profile versions, and logical fields that disagree with the signed head.
-The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v1`.
+The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v2`.
 No body digest is used: the signed page envelope and AEAD tag protect page bytes.
 
 Signature components begin with request derived components in the order above (or
@@ -44,7 +44,7 @@ case-insensitively. Header values must be ASCII without leading/trailing whitesp
 The signature parameters have this exact canonical structured-field serialization:
 
 ```
-("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v1"
+("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v2"
 ```
 
 The base consists of RFC 9421 `"component": value` lines joined by LF, followed by
@@ -54,12 +54,13 @@ The base consists of RFC 9421 `"component": value` lines joined by LF, followed 
 Verification rejects alternate parameters, algorithms, labels, or coverage lists.
 
 Authentication headers are `racer-profile`, `racer-cluster`, `racer-signer`,
-`racer-receiver`, `racer-certificates`, `racer-nonce`, `racer-challenge`, and
-`racer-timestamp`. Cluster/signer/receiver are plain canonical UUID text. Certificates
+`racer-receiver`, `racer-certificates`, and `racer-timestamp`. Immediate-hop heads
+also require `racer-session`, `racer-direction`, and `racer-sequence`.
+Cluster/signer/receiver are plain canonical UUID text. Certificates
 are base64 of concatenated u32-big-endian-length-prefixed DER certificates. The
 timestamp is Unix milliseconds, and `created` must equal its integer seconds.
 
-The signed-head binding is SHA-256 of `racer-peer-v1/signed-head\0`, u64-BE base
+The signed-head binding is SHA-256 of `racer-peer-v2/signed-head\0`, u64-BE base
 length, exact base, u64-BE signature length, and exact signature. Forwarding heads
 include `racer-original` and `racer-previous` bindings. Canonical `protocol` encoders
 are authoritative for all application and route headers; no unsigned side channel
@@ -124,11 +125,8 @@ acquisition retain `version-unavailable`, including permitted alternate cached
 version probes before claiming version absence. A fresh authoritative absence is
 terminal at noncandidate ingress and maps to client 404.
 
-This is an additive outcome in the existing v1 envelope/profile/signature tag;
-existing outcomes and signature encodings are unchanged. There is no outcome
-capability negotiation. Older v1 requesters or relays reject the unknown outcome
-rather than treating it as a cache miss. Thus mixed-version paths do not guarantee
-client 404 until every requester/relay on the path understands `not-found`.
+The v2 upgrade is coordinated and breaking. There is no compatibility or capability
+negotiation. Every requester, relay, and destination must implement v2 sessions.
 
 ### Native setup/grant/completion security review
 
@@ -169,15 +167,43 @@ from this schema review; this document does not claim those hardware tests ran.
 
 ## Freshness and admission
 
-Replay protection is node-wide, atomic across reactors, and bounded. Freshness uses
-a random 24-byte nonce, Unix-millisecond timestamp, and a 32-byte receiver restart
-challenge. The acceptance window is 60 seconds old and 5 seconds into the future.
-Live entries are never evicted for capacity. Store a successfully verified envelope
-only once at its intended receiver; forwarding retains verifiable originals but
-does not readmit an original addressed to another hop. Restart changes challenges.
-Session challenges must be authenticated before use; a peer transport must not
-substitute an unauthenticated challenge. Signature verification precedes replay
-insertion so forged packets cannot consume another signer's nonce.
+Each exclusive pooled socket owns one mutually certificate-authenticated session.
+The client sends a signed `hello` with fresh 32-byte client randomness and the exact
+server identity to POST `/racer/peer/v2/session`. The server responds with signed
+`challenge`, echoing that randomness and adding fresh 32-byte server randomness.
+The client verifies the expected server certificate and signs `finish` over both
+challenges; the server verifies the client certificate and exact outstanding
+challenges before returning signed `ready`. Every message signs its phase, profile,
+cluster, signer, receiver, both challenges, and HTTP method/target or status.
+Hello uses an all-zero server challenge; all later phases require both fresh values.
+Handshake admission and a five-second monotonic deadline bound incomplete sessions.
+
+The session ID is SHA-256 of `racer-peer-v2/connection\0`, client UUID, server UUID,
+client challenge, and server challenge, in that order. The owning socket installs
+the non-cloneable session exactly once. It expires after one monotonic hour.
+Reconnect and process restart require a fresh handshake, never reset counters.
+
+Every application or native-control HTTP head is signed by that session's immediate
+sender after checkout. It covers the complete carried original, historical hop
+proofs, optional native control, framing, session ID, direction (0 client-to-server,
+1 server-to-client), and sequence (u64 starting at 1). Each direction accepts exactly
+the next sequence. Signature, certificate identity, receiver, session, and direction
+checks precede counter advancement. Forged high sequences cannot advance state.
+There is no sliding window, nonce set, expiry tree, node mutex, or peer registry.
+Memory is fixed per live/idle connection plus bounded handshake admissions.
+
+`HttpIo` verifies and admits the immediate-hop head on its owning socket before
+logical decoding or worker dispatch. Historical original/hop/control signatures
+are verified for provenance and exact logical agreement, never replay-admitted.
+They retain the 60-second timestamp validity and five-second future-skew bound;
+application deadlines remain authoritative. Destination-authoritative responses
+and reverse-path proofs survive relays verbatim. Ciphertext is never decrypted or
+re-encrypted by the relay; peer sessions add no TLS or payload encryption.
+
+Only a complete exchange can return to the pool. Intermediate handshake/native
+rounds reset framing without authorizing pool return. Partial I/O, cancellation,
+ambiguous failure, expiry, and counter overflow close the socket after its I/O
+fences. Native transfer-scoped DMA fences remain independent and mandatory.
 
 ## Ownership and integration
 
@@ -217,31 +243,20 @@ Model: provide `StrongEtag::as_bytes() -> &[u8]` returning the exact quoted stro
 ETag. This must not normalize or reinterpret the tag. Opaque context accessors
 likewise preserve bytes and presence.
 
-Replay API: `ReplayWindow::challenge()` returns the local receiver challenge;
-`Freshness::generate(challenge)` produces a fresh nonce and millisecond timestamp;
-`admit_verified(signer, verified_certificate_epoch, freshness)` is atomic and checks
-the local challenge. The challenge is not a sender-selected session identifier.
+Connection API: `security::connection::{connect,accept}` consumes and returns the
+exclusive `ConnectionLease`. `Signatures::{sign,verify_proof}` handles retained
+provenance; only the connection's immediate-hop admission advances ordering state.
 
 Cross-owner transient verification blocker observed: `src/topology/graph.rs:90`
 had an extra closing brace during a security test build. Security does not edit it.
 
-### Plain-HTTP authenticated challenge discovery
+### Plain-HTTP connection authentication
 
-`security::session::ChallengeProbe::new(local, remote)` creates a one-use random
-outstanding probe valid for five monotonic seconds. Send `request_bytes()` unchanged
-(or standard-base64 framed). Receiver calls `session::respond(keys, replay, bytes)`
-after bounded handshake admission and returns `ChallengeReply` fields. Requester
-consumes the probe with `verify(certificates, reply)`, obtaining an
-`AuthenticatedChallenge`. Install its peer/challenge with the signing facade.
-Verification binds both Node UUIDs, the fresh requester nonce, receiver challenge,
-and responder certificate. This avoids any circular dependency on established HTTP
-message-signature sessions or an unavailable peer TLS channel. Discover both
-directions before bidirectional signed traffic. Probe responses grant no application
-or RDMA permission and allocate no receiver-side session state.
-
-`ChallengeReply::encode/decode` provides the bounded canonical binary reply framing
-(64 KiB maximum, eight DER certificates, exactly one Ed25519 signature). Use these
-methods rather than duplicating a challenge-reply codec in peer transport.
+The session handshake above replaces per-request challenge discovery and capability
+negotiation. Handshake HTTP heads are capped at 64 KiB, with at most eight DER
+certificates and one 64-byte Ed25519 signature. Certificate identity authentication
+is sufficient; no Kubernetes revocation lookup is part of peer admission. Leased
+membership still enforces the bounded-degree neighbor graph at application routing.
 
 ### Security integration review requirements
 
@@ -258,19 +273,16 @@ Relays can return request-bound unavailable/error outcomes but cannot impersonat
 the destination by choosing a self-consistent shorter response path. Response
 verification checks the outstanding request deadline before admitting a result.
 
-Signature challenge discovery is implemented in `security/session.rs` by the
-parent. Add a typed `Signatures::install_peer_challenge(AuthenticatedChallenge)`
-adapter when convenient; the existing explicitly authenticated install method is
-the lower-level integration entry point. Peer owner must use fresh probe verification
-before installing challenges.
+Session authentication is implemented in `security/connection.rs`. No challenge
+installation map or unauthenticated application traffic is accepted on peer sockets.
 
 The signature profile maximum must agree with `peer::wire::MAX_SIGNED_HEAD` (64 KiB).
 Logical encoders validate bounded fields before allocation. Historical original
-signatures must also enforce freshness/deadline validity, while nonce insertion is
-only for the final receiver-addressed envelope. Immutable response descriptors must
+signatures must also enforce freshness/deadline validity, while sequence admission
+is only for the fresh immediate-hop HTTP head. Immutable response descriptors must
 match the requested object/version/page, not only a self-consistent signed response.
 The canonical application target is `/racer/peer/v1`; the transport envelope uses
-`/racer/peer/v1/exchange`, with the original signed application head carried intact.
+`/racer/peer/v2/exchange`, with the original signed application head carried intact.
 
 Current compiler integration requests:
 
@@ -333,8 +345,8 @@ or deployment test.
   and `signing::{signature_base,signed_digest}` are the peer encoding authority.
 - `Forwarding::{sign_request_to,verify_request,sign_response,verify_response,append_request,append_response}`
   preserve private verified wrappers, exact bindings, and full forwarding chains.
-- `ChallengeProbe`, `ChallengeReply::{encode,decode}`, `session::respond`, and
-  `Signatures::install_peer_challenge` establish authenticated restart challenges.
+- `connection::{connect,accept}` establishes mutually authenticated, socket-owned
+  ordering. `Signatures::new(keys, certificates)` has no replay-table dependency.
 
 Verification at security handoff: 43 security unit tests, nine security doctests,
 and ten peer integration tests passed through Cargo; all-feature library check

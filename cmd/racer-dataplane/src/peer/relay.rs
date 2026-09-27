@@ -20,7 +20,6 @@ pub struct Relay {
     transport: Rc<dyn PeerTransport>,
     admission: Rc<Admission>,
     network: Option<Rc<super::PeerNetwork>>,
-    handshake: Option<Rc<super::handshake::Handshake>>,
 }
 impl Relay {
     pub fn new(
@@ -35,15 +34,10 @@ impl Relay {
             transport,
             admission,
             network: None,
-            handshake: None,
         }
     }
     pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
         self.network = Some(network);
-        self
-    }
-    pub fn with_handshake(mut self, handshake: Rc<super::handshake::Handshake>) -> Self {
-        self.handshake = Some(handshake);
         self
     }
     /// Retain ingress binding and reverse path, append a signed request hop, and
@@ -79,9 +73,6 @@ impl Relay {
                 .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
-            if let Some(handshake) = &self.handshake {
-                handshake.negotiate_at(next, &membership, &scope).await?;
-            }
             let previous = request
                 .forwarders()
                 .last()

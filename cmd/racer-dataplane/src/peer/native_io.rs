@@ -231,6 +231,14 @@ mod tests {
         let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
         let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
+            let a = crate::security::connection::connect(
+                &receiver.io,
+                a,
+                signers[0].clone(),
+                signers[2].node(),
+                &scope,
+            )
+            .await?;
             let initial = MessageHead {
                 start: StartLine::Request {
                     method: "POST".into(),
@@ -305,6 +313,8 @@ mod tests {
                 .await
         };
         let send = async {
+            let b = crate::security::connection::accept(&sender.io, b, signers[2].clone(), &scope)
+                .await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let sent = sender
                 .io
@@ -571,6 +581,14 @@ mod tests {
         let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
         let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
+            let a = crate::security::connection::connect(
+                &receiver.io,
+                a,
+                signers[0].clone(),
+                signers[2].node(),
+                &scope,
+            )
+            .await?;
             let initial = MessageHead {
                 start: StartLine::Request {
                     method: "POST".into(),
@@ -596,6 +614,8 @@ mod tests {
                 .await
         };
         let send = async {
+            let b = crate::security::connection::accept(&sender.io, b, signers[2].clone(), &scope)
+                .await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let (verified, _) = binding.verify(
                 &signers[2],
@@ -717,7 +737,7 @@ impl Transfers {
         let mut head = WireCodec::encode(&response.authentication, true, 0)?;
         native::attach(&mut head, &offer)?;
         connection = self.io.send_head(connection, head, scope).await?.connection;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         let (conn, setup) = self.read_control(connection, false, scope).await?;
         connection = conn;
         let (setup, phase) = binding.verify(
@@ -759,7 +779,7 @@ impl Transfers {
         )?;
         previous = signed_digest(&ready)?;
         connection = self.write_control(connection, ready, scope).await?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         let (conn, grant) = self.read_control(connection, false, scope).await?;
         connection = conn;
         let (grant, phase) = binding.verify(
@@ -804,7 +824,7 @@ impl Transfers {
         )?;
         previous = signed_digest(&complete)?;
         connection = self.write_control(connection, complete, scope).await?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         let (conn, done) = self.read_control(connection, false, scope).await?;
         connection = conn;
         let (done, phase) = binding.verify(
@@ -842,7 +862,7 @@ impl Transfers {
         let failed = binding.sign(signatures, peer, Phase::Failed, &previous, 0, vec![])?;
         let previous = signed_digest(&failed)?;
         connection = self.write_control(connection, failed, scope).await?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         let (connection, fallback) = self.read_control(connection, false, scope).await?;
         let (fallback, _) = binding.verify(
             signatures,
@@ -1044,7 +1064,7 @@ impl Transfers {
         let (metadata, envelope) = super::decode::page_descriptor(&authentication.original.head)?;
         let remote = SetupParameters::from_verified(&offer, binding.rail)?;
         let mut previous = signed_digest(&offer.signed)?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         let prepared = match sessions.prepare(&offer.peer, binding.rail, scope).await {
             Ok(prepared) => prepared,
             Err(error) if recoverable(error) => {
@@ -1080,7 +1100,7 @@ impl Transfers {
             scope,
         )?;
         previous = signed_digest(&ready.signed)?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         if phase == Phase::Failed {
             drop(prepared);
             return self
@@ -1154,7 +1174,7 @@ impl Transfers {
             scope,
         )?;
         previous = signed_digest(&completed.signed)?;
-        connection.finish_exchange()?;
+        connection.next_round()?;
         if phase == Phase::Failed {
             fence(&session, scope).await?;
             drop(grant);
@@ -1199,7 +1219,6 @@ impl Transfers {
             0,
             scope,
         )?;
-        conn.finish_exchange()?;
         // The original envelope is verified by the requester/relay's outstanding
         // binding after this transport returns. No plaintext is published here.
         let response = PeerResponse::Page {
@@ -1220,6 +1239,7 @@ impl Transfers {
             &crate::security::protocol::response_head(&response, &request_digest, &path)?,
             false,
         )?;
+        conn.finish_exchange()?;
         Ok(SignedResponse {
             authentication,
             response,

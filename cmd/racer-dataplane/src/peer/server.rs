@@ -157,6 +157,21 @@ impl PeerServer {
                 self.request_timeout,
                 crate::runtime::environment::now(),
             )?;
+            let signatures = self
+                .handshake
+                .as_ref()
+                .ok_or(Error::InvalidConfiguration)?
+                .signatures
+                .clone();
+            let connection = if connection.session.is_none() {
+                let _permit = self
+                    .admission
+                    .reserve(None, ResourceClass::ControlProgress, 1)?;
+                crate::security::connection::accept(&self.io, connection, signatures, &header_scope)
+                    .await?
+            } else {
+                connection
+            };
             let mut received = self.io.receive_head(connection, &header_scope).await?;
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())
@@ -171,75 +186,10 @@ impl PeerServer {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            if matches!(&received.value.start, crate::http::codec::StartLine::Request { method, target } if method == "POST" && target == "/racer/peer/v1/challenge")
-            {
-                use crate::{
-                    http::codec::{MessageHead, StartLine},
-                    security::protocol as p,
-                };
-                if received.value.content_length()? != Some(0) {
-                    return Err(Error::InvalidRequest);
-                }
-                let value = p::field(&received.value, "racer-probe")?;
-                if value.len() > 512 {
-                    return Err(Error::InvalidRequest);
-                }
-                let _permit = self
-                    .admission
-                    .reserve(None, ResourceClass::ControlProgress, 1)?;
-                let probe = p::decode_binary(value.as_bytes())?;
-                let bytes = self
-                    .handshake
-                    .as_ref()
-                    .ok_or(Error::InvalidConfiguration)?
-                    .respond_probe(&probe)?;
-                let mut head = MessageHead {
-                    start: StartLine::Response { status: 200 },
-                    headers: Vec::new(),
-                };
-                p::push(&mut head, "content-length", bytes.len());
-                let mut buffer = self.io.buffer(bytes.len())?;
-                buffer.bytes_mut()?.copy_from_slice(&bytes);
-                let sent = self.io.send_head(received.connection, head, scope).await?;
-                let sent = self.io.write_body(sent.connection, buffer, scope).await?;
-                let mut connection = sent.lease;
-                connection.finish_exchange()?;
-                return Ok(connection);
-            }
             let native_control = super::native::detach(&mut received.value)?;
             let (authentication, length) = WireCodec::decode(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
-            }
-            if crate::security::protocol::field(&authentication.original.head, "racer-kind")?
-                == "handshake"
-            {
-                if !authentication.hops.is_empty() {
-                    return Err(Error::InvalidRequest);
-                }
-                let signed = std::sync::Arc::try_unwrap(authentication.original)
-                    .map_err(|_| Error::InvalidRequest)?;
-                let (response, membership) = self
-                    .handshake
-                    .as_ref()
-                    .ok_or(Error::InvalidConfiguration)?
-                    .respond(signed)?;
-                let envelope = crate::security::forwarding::ForwardedHead {
-                    original: std::sync::Arc::new(response),
-                    hops: Vec::new(),
-                };
-                let sent = self
-                    .io
-                    .send_head(
-                        received.connection,
-                        WireCodec::encode(&envelope, true, 0)?,
-                        scope,
-                    )
-                    .await?;
-                let mut connection = sent.connection;
-                connection.finish_exchange()?;
-                drop(membership);
-                return Ok(connection);
             }
             let request = codec.request(authentication, scope)?;
             // Listener scopes bound connection lifetime, while the signed request

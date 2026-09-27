@@ -17,13 +17,11 @@ if let Some(sessions) = &sessions {
     transfers = transfers.with_native(signatures.clone(), sessions.clone());
 }
 let transfers = Rc::new(transfers);
-let handshake = Rc::new(Handshake::new(signatures.clone(), sessions)
-    .with_http(network.clone(), transfers.clone())
-    .with_discovery(keys.clone(), certificates.clone(), replay.clone()));
+let handshake = Rc::new(Handshake::new(signatures.clone(), sessions));
 let requester = Rc::new(Requester::new(paths.clone(), rails, forwarding.clone(),
     handshake.clone(), transfers.clone()).with_network(network.clone()));
 let relay = Rc::new(Relay::new(paths, forwarding.clone(), requester.clone(), admission.clone())
-    .with_network(network.clone()).with_handshake(handshake.clone()));
+    .with_network(network.clone()));
 let server = PeerServer::new(peer_io, forwarding, admission, local_service, relay)
     .with_request_timeout(config.request_timeout)
     .with_network(network).with_wire(codec).with_handshake(handshake).with_reactor(reactor)
@@ -43,7 +41,7 @@ admission charges until completion is fenced.
 After the head, authenticated requests retain the existing signed request deadline
 policy, bounded by the listener deadline, for dispatch and response transfer. The
 header cap does not bound the whole response or reset the signed request budget.
-Challenge and handshake responses retain the listener scope. The listener uses
+Connection handshakes have a five-second cap within the listener scope. The listener uses
 bounded concurrent connection tasks. Each task serves sequential pooled exchanges.
 Errors close that connection and do not stop other connections.
 The listener retains one outstanding accept across connection task completions,
@@ -57,7 +55,7 @@ The single incoming-version registry holds weak references and prunes dead entri
 at publication. Workers do not install or retire membership tables.
 
 Reads pass their lease to `PeerClient::request`; relays pass it to
-`PeerTransport::exchange`. Routing, endpoint lookup, and outbound handshakes receive
+`PeerTransport::exchange`. Routing and endpoint lookup receive
 that lease directly. Authenticated ingress resolves its wire version once, then
 passes the lease through local worker dispatch or relay and retains it through
 HTTP/native response completion. Delayed workers and cancellation keep actual
@@ -66,9 +64,20 @@ required. Neighbor validation still uses the leased bounded graph.
 
 `SecurityCodec` decodes the security owner's canonical headers and checks exact
 agreement by re-encoding through `security::protocol`. It does not authenticate.
-Only `Forwarding` admits operations or responses. Challenge discovery uses
-`security::session::{ChallengeProbe, ChallengeReply, respond}` and installs the
-typed authenticated challenge. No unsigned capability or challenge grants service.
+`HttpIo` first admits the signed immediate-hop head using the session owned by its
+`ConnectionLease`. `Forwarding` then validates historical signatures, routing, and
+exact request/response provenance before dispatch. `Signatures::verify_proof` alone
+is not replay admission. `security::connection::{connect,accept}` establishes the
+session once per socket using reciprocal signed fresh challenges. No challenge map
+or per-request capability negotiation remains. The outer wire version is 2 and
+the exchange target is `/racer/peer/v2/exchange`; mixed v1/v2 paths fail closed.
+
+`Session` moves with the lease into reactor operations and idle pooling. Each
+direction has an exact-next u64 counter, never reset by `finish_exchange`.
+`next_round` resets intermediate native framing without permitting pool return.
+Only successful final completion permits reuse. Failed or abandoned exchanges close
+after their fences; reconnect authenticates fresh challenges. There is no payload
+TLS layer. Session storage is bounded by connection and handshake admissions.
 
 ## Current transport boundary
 

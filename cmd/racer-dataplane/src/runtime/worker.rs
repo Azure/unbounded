@@ -105,7 +105,6 @@ pub trait WorkerFactory: Sync {
             client_connections: n(128),
             pipes: n(16),
             range_window_pages: n(2),
-            replay_entries: n(1024),
             header_bytes: n(32768),
             cached_rankings: n(128),
             cached_paths: n(128),

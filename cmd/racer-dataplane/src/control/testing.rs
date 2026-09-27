@@ -68,7 +68,6 @@ pub(super) fn reactor() -> Option<std::rc::Rc<crate::runtime::reactor::Reactor>>
         client_connections: n,
         pipes: n,
         range_window_pages: n,
-        replay_entries: n,
         header_bytes: n,
         cached_rankings: n,
         cached_paths: n,

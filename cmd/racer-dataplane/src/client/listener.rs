@@ -860,7 +860,6 @@ mod tests {
             client_connections: n,
             pipes: n,
             range_window_pages: n,
-            replay_entries: n,
             header_bytes: NonZeroUsize::new(32768).unwrap(),
             cached_rankings: n,
             cached_paths: n,
@@ -1194,9 +1193,8 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         let directory = File::open(directory).unwrap();
-        let witness = anchored(&directory).join(
-            ".racer-owned-.racer-00000000000000000000000000000000",
-        );
+        let witness =
+            anchored(&directory).join(".racer-owned-.racer-00000000000000000000000000000000");
         drop(UnixListener::bind(&witness).unwrap());
         let socket = anchored(&directory).join("socket");
         drop(UnixListener::bind(&socket).unwrap());
@@ -1208,8 +1206,14 @@ mod tests {
         fixture.reconcile(&[definition()]).unwrap();
         assert!(!witness.exists());
         let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", "Connection: close\r\n")).unwrap();
-        assert!(fixture.receive(&mut socket, true).starts_with(b"HTTP/1.1 200"));
+        socket
+            .write_all(&request("HEAD", "Connection: close\r\n"))
+            .unwrap();
+        assert!(
+            fixture
+                .receive(&mut socket, true)
+                .starts_with(b"HTTP/1.1 200")
+        );
     }
 
     struct GatedRead {

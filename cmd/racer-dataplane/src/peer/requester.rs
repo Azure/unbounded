@@ -61,7 +61,6 @@ pub struct Requester {
     paths: Rc<Paths>,
     rails: Rc<Rails>,
     forwarding: Rc<Forwarding>,
-    handshake: Rc<Handshake>,
     transfers: Rc<Transfers>,
     network: Option<Rc<super::PeerNetwork>>,
 }
@@ -73,11 +72,11 @@ impl Requester {
         handshake: Rc<Handshake>,
         transfers: Rc<Transfers>,
     ) -> Self {
+        transfers.set_signatures(handshake.signatures.clone());
         Self {
             paths,
             rails,
             forwarding,
-            handshake,
             transfers,
             network: None,
         }
@@ -106,10 +105,6 @@ impl PeerClient for Requester {
                 .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
-            let _capabilities = self
-                .handshake
-                .negotiate_at(next, &membership, &scope)
-                .await?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
             let response = self.exchange(signed, membership, &scope).await?;
             scope.check()?;
@@ -138,26 +133,20 @@ impl PeerTransport for Requester {
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(&membership, &next)?;
-            let mut plan =
-                if let super::wire::Operation::Page { page, .. } = &request.request.operation {
-                    let search = super::search_budget(budget, &network.local)?;
-                    let route = self
-                        .paths
-                        .shortest_async(membership.clone(), &network.local, &search, &scope)
-                        .await?;
-                    if route.nodes.get(1) != Some(&next) {
-                        return Err(Error::Unavailable);
-                    }
-                    self.rails.select(&route, page)?
-                } else {
-                    crate::topology::rails::TransportPlan::Http
-                };
-            if matches!(plan, crate::topology::rails::TransportPlan::Rdma { .. }) {
-                let capabilities = self.handshake.negotiate(&next).await?;
-                if !capabilities.rdma || !capabilities.scoped_grants {
-                    plan = crate::topology::rails::TransportPlan::Http;
+            let plan = if let super::wire::Operation::Page { page, .. } = &request.request.operation
+            {
+                let search = super::search_budget(budget, &network.local)?;
+                let route = self
+                    .paths
+                    .shortest_async(membership.clone(), &network.local, &search, &scope)
+                    .await?;
+                if route.nodes.get(1) != Some(&next) {
+                    return Err(Error::Unavailable);
                 }
-            }
+                self.rails.select(&route, page)?
+            } else {
+                crate::topology::rails::TransportPlan::Http
+            };
             let response = self
                 .transfers
                 .exchange_planned(endpoint, request, plan, &scope)
@@ -168,5 +157,5 @@ impl PeerTransport for Requester {
     }
 }
 #[cfg(test)]
-mod tests { /* Late attempts, fresh replay nonce per send, retry budgets, cancellation. */
+mod tests { /* Late attempts, connection ordering, retry budgets, cancellation. */
 }

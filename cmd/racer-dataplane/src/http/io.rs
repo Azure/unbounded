@@ -261,6 +261,11 @@ impl HttpIo {
                     if used > end {
                         connection.read_ahead = Some((buffer, end..used));
                     }
+                    let head = if let Some(session) = connection.session.as_mut() {
+                        session.admit(head)?
+                    } else {
+                        head
+                    };
                     return Ok(HeadCompletion {
                         connection,
                         value: Ok(head),
@@ -299,6 +304,11 @@ impl HttpIo {
             connection.begin_io();
             let length =
                 Self::framing_with_limit(&head, connection.request_is_head, self.send_body_limit)?;
+            let head = if let Some(session) = connection.session.as_mut() {
+                session.sign(head)?
+            } else {
+                head
+            };
             connection.close |= head.closes_connection()?;
             if let StartLine::Request { method, .. } = &head.start {
                 connection.request_is_head = method == "HEAD";

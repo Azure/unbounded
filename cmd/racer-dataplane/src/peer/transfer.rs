@@ -46,6 +46,7 @@ impl IoBuffer for WireBuffer {
 }
 
 pub struct Transfers {
+    signatures: std::cell::RefCell<Option<Rc<crate::security::signing::Signatures>>>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -64,6 +65,7 @@ pub struct Transfers {
 impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
+            signatures: std::cell::RefCell::new(None),
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -82,6 +84,7 @@ impl Transfers {
         signatures: Rc<crate::security::signing::Signatures>,
         sessions: Rc<crate::rdma::session::Sessions>,
     ) -> Self {
+        self.set_signatures(signatures.clone());
         self.native = Some((signatures, sessions));
         self
     }
@@ -89,45 +92,8 @@ impl Transfers {
         self.wire = Some((admission, codec));
         self
     }
-    pub fn exchange_probe<'a>(
-        &'a self,
-        endpoint: crate::http::pool::Endpoint,
-        probe: Vec<u8>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, Vec<u8>> {
-        Box::pin(async move {
-            use crate::http::codec::{MessageHead, StartLine};
-            use crate::security::protocol as p;
-            if probe.len() > 256 {
-                return Err(Error::InvalidRequest);
-            }
-            let mut head = MessageHead {
-                start: StartLine::Request {
-                    method: "POST".into(),
-                    target: "/racer/peer/v1/challenge".into(),
-                },
-                headers: Vec::new(),
-            };
-            p::push(&mut head, "content-length", 0);
-            p::push_binary(&mut head, "racer-probe", &probe);
-            let connection = self.http.checkout(&endpoint, scope).await?;
-            let response = self.io.exchange_head(connection, head, scope).await?;
-            if !matches!(response.value.start, StartLine::Response { status: 200 }) {
-                return Err(Error::Unauthorized);
-            }
-            let body = self
-                .io
-                .collect_body(
-                    response.connection,
-                    crate::security::session::MAX_CHALLENGE_REPLY,
-                    scope,
-                )
-                .await?;
-            let bytes = body.buffer.bytes()?.to_vec();
-            let mut connection = body.lease;
-            connection.finish_exchange()?;
-            Ok(bytes)
-        })
+    pub(crate) fn set_signatures(&self, signatures: Rc<crate::security::signing::Signatures>) {
+        *self.signatures.borrow_mut() = Some(signatures);
     }
     /// Route selection alone never authorizes RDMA. A matching, live authenticated
     /// single-use session and transfer-scoped grant are both required.
@@ -208,31 +174,6 @@ impl Transfers {
                 .await
         })
     }
-    pub fn exchange_head<'a>(
-        &'a self,
-        endpoint: crate::http::pool::Endpoint,
-        head: crate::security::signing::SignedHead,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, crate::security::signing::SignedHead> {
-        Box::pin(async move {
-            scope.check()?;
-            let envelope = crate::security::forwarding::ForwardedHead {
-                original: std::sync::Arc::new(head),
-                hops: Vec::new(),
-            };
-            let head = WireCodec::encode(&envelope, false, 0)?;
-            let connection = self.http.checkout(&endpoint, scope).await?;
-            let sent = self.io.send_head(connection, head, scope).await?;
-            let received = self.io.receive_head(sent.connection, scope).await?;
-            let (response, length) = WireCodec::decode(received.value, true)?;
-            if length != 0 || !response.hops.is_empty() {
-                return Err(Error::InvalidRequest);
-            }
-            let mut connection = received.connection;
-            connection.finish_exchange()?;
-            std::sync::Arc::try_unwrap(response.original).map_err(|_| Error::InvalidRequest)
-        })
-    }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
     pub fn exchange<'a>(
@@ -270,11 +211,33 @@ impl Transfers {
                     .max(1),
             )?;
             let mut head = WireCodec::encode(&request.authentication, false, 0)?;
+            let signatures = self
+                .signatures
+                .borrow()
+                .clone()
+                .ok_or(Error::InvalidConfiguration)?;
+            let peer = crate::security::signing::receiver(
+                &request
+                    .authentication
+                    .hops
+                    .last()
+                    .unwrap_or(&request.authentication.original)
+                    .head,
+            )?;
+            let connection = self.http.checkout(&endpoint, scope).await?;
+            let connection = {
+                let _permit = connection
+                    .session
+                    .is_none()
+                    .then(|| admission.reserve(None, ResourceClass::ControlProgress, 1))
+                    .transpose()?;
+                crate::security::connection::connect(&self.io, connection, signatures, &peer, scope)
+                    .await?
+            };
             let native = self.accept_native(&request, plan, scope)?;
             if let Some((_, accept, _)) = &native {
                 super::native::attach(&mut head, accept)?;
             }
-            let connection = self.http.checkout(&endpoint, scope).await?;
             let sent = self.io.send_head(connection, head, scope).await?;
             let mut received = self.io.receive_head(sent.connection, scope).await?;
             let control = super::native::detach(&mut received.value)?;

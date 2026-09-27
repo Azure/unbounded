@@ -208,12 +208,12 @@ Nodes have one or two worker pairs and use production cross-worker mailboxes.
 Additional generated actions retire page/credential keys, remove a cache and
 recreate its name under a new UID, jump wall time, reject credentials with 401/403,
 malform origin ETags and framing, truncate bodies, malform client requests, replay
-signed peer handshakes, corrupt signatures, and corrupt stored record bytes.
+sessionless signed peer proofs, corrupt signatures, and corrupt stored record bytes.
 Native actions cover Bind/Write/Invalidate crossed with synchronous rejection,
 delayed completion, and failed completion.
 
 Workers use `WorkerApplication::assemble` and production startup/recovery, client
-listeners, dispatch, candidate selection, peer challenge/signature/replay checks,
+listeners, dispatch, candidate selection, peer connection/signature/ordering checks,
 credential encryption, origin HTTP, page crypto queues, encrypted storage,
 checkpointing, and shutdown. Client and origin fixtures exchange raw bytes over
 hostless `Descriptor::Sim` sockets. Canonical cache names differ per simulated
@@ -367,9 +367,11 @@ in the implementation test environment.
   `RequestBinding`, minted by request signing/verification, retains the exact
   original request head/signature and is required for response signing/verification.
   `PeerTransport` exchanges owned signed envelopes, including through relays.
-   Canonical field agreement, original/hop signatures, replay/identity checks,
-   response correlation, and route consumption are checked before verified types
-   can be constructed. The versioned profile is documented in
+    The owning socket admits the fresh signed immediate-hop head before dispatch.
+    Canonical field agreement, historical original/hop signatures, identity checks,
+    response correlation, and route consumption then construct verified types.
+    Session counters move with exclusive pool leases, with no node-wide replay
+    table. The coordinated v2 wire profile is documented in
    `designs/racer-peer-security.md` at the repository root.
 - `store` accepts only encrypted pages. Slabs require `O_DIRECT` with discovered
   address/offset/length alignment. Aligned padded record lengths differ from
@@ -405,7 +407,7 @@ in the implementation test environment.
   contain only peer trust and cache keys. Token-authenticated bootstrap also renews
   certificates; subsequent snapshot polls use mTLS, not control HTTP signatures.
   One selected worker owns control enrollment; worker handles share node-wide
-  snapshot, key-epoch, and replay roots. Bounded dispatch routes work to page owners.
+   snapshot and key-epoch roots. Bounded dispatch routes work to page owners.
 - Live key retirement and cache removal use a node-wide quiescent cut. Admission
   pauses while accepted read, write, crypto, kernel, and native operations finish;
   recoverable checkpoints are invalidated before omitted keys are destroyed.

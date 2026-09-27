@@ -78,8 +78,8 @@ pub struct SignedResponse {
     pub response: PeerResponse,
 }
 
-pub const VERSION: &str = "1";
-pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
+pub const VERSION: &str = "2";
+pub const REQUEST_TARGET: &str = "/racer/peer/v2/exchange";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_SIGNED_HEAD: usize = crate::security::protocol::MAX_HEAD;
 pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn rejects_versions_duplicates_holes_and_request_bodies() {
         let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
-        head.headers[0].value = b"2".to_vec();
+        head.headers[0].value = b"1".to_vec();
         assert!(WireCodec::decode(head, false).is_err());
         let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
         head.headers.push(Header {

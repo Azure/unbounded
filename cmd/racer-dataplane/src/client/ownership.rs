@@ -170,9 +170,7 @@ fn refused(path: &Path) -> Result<()> {
             std::mem::size_of_val(&address) as _,
         )
     };
-    if result == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED)
-    {
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
         Ok(())
     } else {
         Err(Error::Io)

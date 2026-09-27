@@ -49,7 +49,6 @@ use racer_dataplane::{
         credentials::CredentialCrypto,
         forwarding::Forwarding,
         keyring::{KeyEpochs, Keyring},
-        replay::{ReplayState, ReplayWindow},
         signing::Signatures,
     },
     store::{
@@ -115,7 +114,6 @@ fn limits(pages: usize) -> Limits {
         client_connections: n,
         pipes: nz(8),
         range_window_pages: nz(2),
-        replay_entries: n,
         header_bytes: nz(32768),
         cached_rankings: n,
         cached_paths: n,
@@ -526,15 +524,10 @@ impl Rig {
             .unwrap();
         let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published).unwrap());
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
-        let signatures = Rc::new(Signatures::new(
-            keys.clone(),
-            certificates,
-            Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 64)),
-        ));
+        let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let transfers = Rc::new(Transfers::new(http.clone(), io.clone(), None));
-        let handshake =
-            Rc::new(Handshake::new(signatures, None).with_http(network.clone(), transfers.clone()));
+        let handshake = Rc::new(Handshake::new(signatures, None));
         let peers = Rc::new(
             Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 64)),

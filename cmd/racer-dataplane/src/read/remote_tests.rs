@@ -31,7 +31,6 @@ use crate::{
         forwarding::Forwarding,
         identity::PendingIdentity,
         keyring::{KeyEpochs, Keyring},
-        replay::{ReplayState, ReplayWindow},
         signing::Signatures,
     },
     topology::{
@@ -59,7 +58,6 @@ fn node(n: usize) -> NodeId {
 struct Identity {
     keys: Rc<Keyring>,
     certificates: Rc<Certificates>,
-    replay: Rc<ReplayWindow>,
     signatures: Rc<Signatures>,
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
@@ -112,16 +110,10 @@ fn identities(nodes: &[NodeId]) -> Vec<Identity> {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-            let replay = Rc::new(ReplayWindow::new(Arc::new(ReplayState::default()), 128));
-            let signatures = Rc::new(Signatures::new(
-                keys.clone(),
-                certificates.clone(),
-                replay.clone(),
-            ));
+            let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
             Identity {
                 keys,
                 certificates,
-                replay,
                 signatures,
             }
         })
@@ -225,16 +217,6 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         }
     }
     let ids = identities(&[node(0), node(1)]);
-    for id in &ids {
-        for peer in &ids {
-            id.signatures
-                .configure_authenticated_peer_challenge(
-                    peer.signatures.node().clone(),
-                    peer.signatures.challenge().unwrap(),
-                )
-                .unwrap();
-        }
-    }
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -412,28 +394,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let mut nodes = vec![source.clone(), destination.clone()];
     nodes.extend(ranked.ordered.iter().skip(1).cloned());
     let identities = identities(&nodes);
-    // Remaining-copy fixtures have authenticated sessions. The actual TCP
-    // requester/destination pair still performs challenge discovery/handshake.
-    for id in identities.iter().skip(1) {
-        for peer in &identities {
-            id.signatures
-                .configure_authenticated_peer_challenge(
-                    peer.signatures.node().clone(),
-                    peer.signatures.challenge().unwrap(),
-                )
-                .unwrap();
-        }
-    }
     let a = &identities[0];
     let b = &identities[1];
-    for peer in identities.iter().skip(2) {
-        a.signatures
-            .configure_authenticated_peer_challenge(
-                peer.signatures.node().clone(),
-                peer.signatures.challenge().unwrap(),
-            )
-            .unwrap();
-    }
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(false).limits,
     ));
@@ -468,12 +430,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         )
         .unwrap(),
     );
-    let handshake = |id: &Identity, network: Rc<PeerNetwork>| {
-        Rc::new(
-            Handshake::new(id.signatures.clone(), None)
-                .with_http(network, transfers.clone())
-                .with_discovery(id.keys.clone(), id.certificates.clone(), id.replay.clone()),
-        )
+    let handshake = |id: &Identity, _network: Rc<PeerNetwork>| {
+        Rc::new(Handshake::new(id.signatures.clone(), None))
     };
     let source_handshake = handshake(a, source_network.clone());
     let destination_handshake = handshake(b, destination_network.clone());
@@ -622,8 +580,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             )
             .await?;
         let connection = ConnectionLease::from_accepted(fd, &admission)?;
-        let connection = server.serve_connection(connection, &scope).await?;
-        let connection = server.serve_connection(connection, &scope).await?;
         server.serve_connection(connection, &scope).await?;
         Ok::<(), Error>(())
     };

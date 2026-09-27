@@ -1,6 +1,6 @@
 # Native payload protocol v1
 
-This peer-owned extension uses `Signatures::sign/verify` without a separate signing
+This peer-owned extension uses `Signatures::sign/verify_proof` without a separate signing
 algorithm or signature-base encoder. `protocol::agrees` enforces exact application
 fields for each state. The security owner reviewed the live schema and typed
 consumers; see `designs/racer-peer-security.md`, "Native setup/grant/completion
@@ -25,6 +25,13 @@ Page bytes are never signed or hashed. Their existing AEAD descriptor and tag re
 authoritative. Controls neither grant origin access nor change logical routing.
 
 ## Connection state machine
+
+Every outer HTTP head, including accept/offer/setup/grant/completion and fallback,
+is signed and replay-admitted by the v2 connection session before control decoding.
+The carried signed control is retained provenance and is checked against the exact
+transfer, phase, predecessor, and DMA grant. It does not use a global replay table.
+Local framing resets between control rounds do not permit pool return; only final
+completion does. Session failure closes the socket without relaxing DMA fences.
 
 1. `accept` accompanies the original request in outer `racer-payload-control`.
 2. `offer` accompanies the unchanged signed response envelope, with outer length

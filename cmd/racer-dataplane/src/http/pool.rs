@@ -30,6 +30,7 @@ pub enum Endpoint {
     Peer(String),
 }
 struct Idle {
+    session: Option<crate::security::connection::Session>,
     fd: Rc<OwnedFd>,
     reservation: Reservation,
     since: Instant,
@@ -91,6 +92,7 @@ struct ReturnToPool {
 /// Exclusive connection ownership follows every submitted operation into the
 /// reactor. Drop is a pool return only after explicit successful finish_exchange.
 pub struct ConnectionLease {
+    pub(crate) session: Option<crate::security::connection::Session>,
     pub(crate) fd: Rc<OwnedFd>,
     reusable: bool,
     reservation: Option<Reservation>,
@@ -112,6 +114,7 @@ impl ConnectionLease {
     fn new(fd: Rc<OwnedFd>, reservation: Reservation, pool: Option<ReturnToPool>) -> Self {
         Self {
             fd,
+            session: None,
             reusable: false,
             reservation: Some(reservation),
             pool,
@@ -125,15 +128,33 @@ impl ConnectionLease {
     pub(crate) fn begin_io(&mut self) {
         self.reusable = false;
     }
+    pub(crate) fn install_session(
+        &mut self,
+        session: crate::security::connection::Session,
+    ) -> Result<()> {
+        if self.session.is_some() || self.close {
+            return Err(Error::Unauthorized);
+        }
+        self.session = Some(session);
+        self.reusable = false;
+        Ok(())
+    }
     /// Explicitly mark the complete request/response exchange reusable. This is
     /// valid for client or server use and resets framing for the next exchange.
     /// Unexpected pipelined/read-ahead data prevents pool return.
     pub fn finish_exchange(&mut self) -> Result<()> {
+        self.next_round()?;
+        self.reusable = !self.close;
+        Ok(())
+    }
+    /// Reset framing inside an unfinished handshake/native transaction. Errors
+    /// after this boundary still close the socket rather than returning it idle.
+    pub(crate) fn next_round(&mut self) -> Result<()> {
         if self.rx_remaining != Some(0) || self.tx_remaining != Some(0) || self.read_ahead.is_some()
         {
             return Err(Error::InvalidRequest);
         }
-        self.reusable = !self.close;
+        self.reusable = false;
         self.rx_remaining = None;
         self.tx_remaining = None;
         self.request_is_head = false;
@@ -174,6 +195,7 @@ impl Drop for ConnectionLease {
             {
                 if let Some(reservation) = self.reservation.take() {
                     entry.idle.push(Idle {
+                        session: self.session.take(),
                         fd: self.fd.clone(),
                         reservation,
                         since: crate::runtime::environment::now(),
@@ -402,10 +424,9 @@ impl HttpPool {
         let mut slot = ConnectingSlot(Some(target));
         if let Some(idle) = idle {
             if idle_healthy(&idle.fd) {
-                return Ok((
-                    ConnectionLease::new(idle.fd, idle.reservation, slot.0.take()),
-                    None,
-                ));
+                let mut connection = ConnectionLease::new(idle.fd, idle.reservation, slot.0.take());
+                connection.session = idle.session;
+                return Ok((connection, None));
             }
         }
         let reservation = match self.admission.reserve(None, ResourceClass::Connection, 1) {
