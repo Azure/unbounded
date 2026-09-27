@@ -75,6 +75,17 @@ func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyStat
 // never advanced through missed intervals after downtime. Issuer staging is done
 // by reconcileKeys before this planner; publication persists private material first.
 func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time) (wire.KeyringBundle, RotationState, error) {
+	var creationGeneration wire.Generation
+	if b.Generation < math.MaxUint64 {
+		creationGeneration = b.Generation + 1
+	}
+
+	return r.planRotation(b, s, catalog, now, creationGeneration)
+}
+
+// creationGeneration is the publication that will first contain new keys. Zero
+// forbids key creation when generations are exhausted, while allowing idle plans.
+func (r *KeyringReconciler) planRotation(b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time, creationGeneration wire.Generation) (wire.KeyringBundle, RotationState, error) {
 	// Keep wire validation and the encoded size bound at the input boundary.
 	// Ownership does not require decoding the just-validated representation.
 	if _, err := wire.EncodeBundle(b); err != nil {
@@ -146,7 +157,7 @@ func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, 
 	for _, cache := range catalog {
 		for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
 			if !present[string(cache.ID)+"/"+string(purpose)] {
-				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, b.Generation+1)
+				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, creationGeneration)
 				if err != nil {
 					return b, s, err
 				}
@@ -196,7 +207,7 @@ func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, 
 				continue
 			}
 
-			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, b.Generation+1)
+			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, creationGeneration)
 			if err != nil {
 				return b, s, err
 			}
@@ -506,14 +517,9 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		return ctrl.Result{}, err
 	}
 
-	b, s, err = r.PlanRotation(b, s, catalog, now)
+	b, s, err = r.planRotation(b, s, catalog, now, 1)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-	// PlanRotation normally plans the next CAS generation. Initial publication
-	// has no previous bundle and is generation one.
-	for i := range b.CacheKeys {
-		binary.BigEndian.PutUint64(b.CacheKeys[i].Key.ID[4:12], uint64(b.Generation))
 	}
 
 	encoded, err := wire.EncodeBundle(b)

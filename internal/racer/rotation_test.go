@@ -111,6 +111,10 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 			t.Fatal("rotation changed an existing epoch or failed to bind the next generation")
 		}
 	}
+
+	if !reflect.DeepEqual(staged.CacheKeys[:len(initial.CacheKeys)], initial.CacheKeys) {
+		t.Fatal("staging changed retained keys")
+	}
 	// A fresh process resumes the persisted deadline, not a new delay.
 	restarted := Assemble(r.Config, r.Client, r.APIReader).Keyring
 	restarted.Now = r.Now
@@ -129,9 +133,13 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("activation/overlap incorrect")
 	}
 
-	for _, k := range activated.CacheKeys {
+	for i, k := range activated.CacheKeys {
 		if k.State == wire.PreparedKey {
 			t.Fatal("prepared key not activated")
+		}
+
+		if !reflect.DeepEqual(k.Key, staged.CacheKeys[i].Key) || !k.EqualMaterial(staged.CacheKeys[i]) {
+			t.Fatal("activation changed key identity or material")
 		}
 	}
 	// Further cycles overlap without evicting an earlier retirement prematurely.
@@ -176,6 +184,29 @@ func TestGenerationBoundCacheKey(t *testing.T) {
 		if len(key.Key.ID) != 16 || string(key.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(generation) {
 			t.Fatalf("creation generation not preserved: %x", key.Key.ID)
 		}
+	}
+}
+
+func TestPlanRotationExhaustedKeyCreation(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, b, state, _ := keyState(t, r)
+	b.Generation = math.MaxUint64
+	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
+
+	next, nextState, err := r.PlanRotation(b, state, catalog, *now)
+	if err != nil || !reflect.DeepEqual(next, b) || !reflect.DeepEqual(nextState, state) {
+		t.Fatalf("exhausted idle plan: %v", err)
+	}
+
+	catalog = append(catalog, wire.CacheDefinition{ID: wire.CacheID(testOtherUID)})
+	if _, _, err := r.PlanRotation(b, state, catalog, *now); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("exhausted admission plan: %v", err)
+	}
+
+	state.PreparedIssuer = state.ActiveIssuer
+	if _, _, err := r.PlanRotation(b, state, catalog[:1], state.NextRotation); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("exhausted staging plan: %v", err)
 	}
 }
 
@@ -646,6 +677,119 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 	}
 }
 
+func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
+	for _, transition := range []string{"idle", "admission", "stage", "empty stage", "activate", "remove", "prune"} {
+		t.Run(transition, func(t *testing.T) {
+			r, now := testKeyring(t)
+
+			r.Config.Rotation.Interval = 7 * 24 * time.Hour
+			if transition == "empty stage" {
+				if err := r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			runKeys(t, r)
+
+			_, _, initial, _ := keyState(t, r)
+			if transition == "activate" || transition == "prune" {
+				*now = initial.NextRotation
+
+				runKeys(t, r)
+				_, _, staged, _ := keyState(t, r)
+				*now = staged.ActivateAt
+
+				if transition == "prune" {
+					runKeys(t, r)
+					_, _, active, _ := keyState(t, r)
+					*now = active.Retiring[initial.ActiveIssuer]
+				}
+			}
+
+			shared, b, _, _ := keyState(t, r)
+			b.Generation = math.MaxUint64
+
+			var err error
+
+			shared.Data["bundle.json"], err = wire.EncodeBundle(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.Update(t.Context(), shared); err != nil {
+				t.Fatal(err)
+			}
+
+			switch transition {
+			case "admission":
+				cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+				if err := r.Create(t.Context(), cache); err != nil {
+					t.Fatal(err)
+				}
+			case "stage", "empty stage":
+				*now = initial.NextRotation
+			case "remove":
+				if err := r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+				t.Fatal("exhausted generation wrote durable state")
+				return nil
+			}})
+			if transition == "idle" {
+				runKeys(t, r)
+			} else if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.Unavailable) {
+				t.Fatalf("exhausted generation transition: %v", err)
+			}
+
+			after, preserved, _, _ := keyState(t, r)
+			if after.ResourceVersion != shared.ResourceVersion || !reflect.DeepEqual(preserved, b) {
+				t.Fatal("exhausted generation changed the published bundle")
+			}
+		})
+	}
+}
+
+func TestKeyringAdmissionAtLastGeneration(t *testing.T) {
+	r, _ := testKeyring(t)
+	runKeys(t, r)
+	shared, b, _, _ := keyState(t, r)
+	b.Generation = math.MaxUint64 - 1
+
+	var err error
+
+	shared.Data["bundle.json"], err = wire.EncodeBundle(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Update(t.Context(), shared); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+	if err := r.Create(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, r)
+
+	_, admitted, _, _ := keyState(t, r)
+	if admitted.Generation != math.MaxUint64 || len(admitted.CacheKeys) != 4 || !reflect.DeepEqual(admitted.CacheKeys[:2], b.CacheKeys) {
+		t.Fatal("last generation admission lost existing keys or new scopes")
+	}
+
+	for _, key := range admitted.CacheKeys[2:] {
+		if key.Key.Cache != wire.CacheID(testOtherUID) || key.State != wire.ActiveKey || binary.BigEndian.Uint64(key.Key.ID[4:12]) != math.MaxUint64 {
+			t.Fatal("admitted key did not bind the last publication generation")
+		}
+	}
+
+	runKeys(t, r)
+}
+
 func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	r, now := testKeyring(t)
 	runKeys(t, r)
@@ -711,8 +855,8 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	runKeys(t, r)
 
 	_, b, s, _ := keyState(t, r)
-	if len(b.CacheKeys) != 0 {
-		t.Fatal("empty catalog has keys")
+	if b.Generation != 1 || len(b.CacheKeys) != 0 {
+		t.Fatal("empty catalog initialization has wrong generation or keys")
 	}
 
 	*now = s.NextRotation
@@ -728,8 +872,14 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	runKeys(t, r)
 
 	_, added, _, _ := keyState(t, r)
-	if len(added.CacheKeys) != 2 {
+	if added.Generation != 3 || len(added.CacheKeys) != 2 {
 		t.Fatal("new cache missing initial keys")
+	}
+
+	for _, key := range added.CacheKeys {
+		if binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(added.Generation) {
+			t.Fatal("new cache key did not bind its admission generation")
+		}
 	}
 
 	*now = staged.ActivateAt
@@ -738,7 +888,7 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 
 	_, activated, _, _ := keyState(t, r)
 	for n, key := range activated.CacheKeys {
-		if key.State != wire.ActiveKey || !key.EqualMaterial(added.CacheKeys[n]) {
+		if key.State != wire.ActiveKey || !reflect.DeepEqual(key.Key, added.CacheKeys[n].Key) || !key.EqualMaterial(added.CacheKeys[n]) {
 			t.Fatal("new cache key retired without replacement")
 		}
 	}
