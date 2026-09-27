@@ -303,7 +303,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 	}
 	// Model the older controller's active-only admission without removing the
 	// planner's independent final wire-size check.
-	b, state, err = r.PlanRotation(b, state, catalog, *now)
+	b, state, err = PlanRotation(r.Config.Rotation, b, state, catalog, *now)
 	if err != nil {
 		t.Fatal(err)
 	}

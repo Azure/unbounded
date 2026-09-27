@@ -20,23 +20,6 @@ import (
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 )
 
-type RotationPolicy struct {
-	Interval   time.Duration
-	PrepareFor time.Duration
-	RetainFor  time.Duration
-}
-
-// RotationState lives beside bundle.json in the shared Secret. It is sufficient
-// to resume transitions after restart; no rotation-job or acknowledgment objects.
-type RotationState struct {
-	NextTransition time.Time            `json:"next_transition"`
-	NextRotation   time.Time            `json:"next_rotation"`
-	ActivateAt     time.Time            `json:"activate_at"`
-	ActiveIssuer   string               `json:"active_issuer"`
-	PreparedIssuer string               `json:"prepared_issuer"`
-	Retiring       map[string]time.Time `json:"retiring"`
-}
-
 type KeyringReconciler struct {
 	client.Client
 	APIReader   client.Reader

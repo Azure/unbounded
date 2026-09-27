@@ -194,18 +194,18 @@ func TestPlanRotationExhaustedKeyCreation(t *testing.T) {
 	b.Generation = math.MaxUint64
 	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
 
-	next, nextState, err := r.PlanRotation(b, state, catalog, *now)
+	next, nextState, err := PlanRotation(r.Config.Rotation, b, state, catalog, *now)
 	if err != nil || !reflect.DeepEqual(next, b) || !reflect.DeepEqual(nextState, state) {
 		t.Fatalf("exhausted idle plan: %v", err)
 	}
 
 	catalog = append(catalog, wire.CacheDefinition{ID: wire.CacheID(testOtherUID)})
-	if _, _, err := r.PlanRotation(b, state, catalog, *now); !errors.Is(err, wire.Unavailable) {
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, *now); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("exhausted admission plan: %v", err)
 	}
 
 	state.PreparedIssuer = state.ActiveIssuer
-	if _, _, err := r.PlanRotation(b, state, catalog[:1], state.NextRotation); !errors.Is(err, wire.Unavailable) {
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog[:1], state.NextRotation); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("exhausted staging plan: %v", err)
 	}
 }
@@ -460,13 +460,13 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 		catalog = append(catalog, wire.CacheDefinition{ID: wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", n+1))})
 	}
 
-	b, state, err := r.PlanRotation(original, s, catalog, *now)
+	b, state, err := PlanRotation(r.Config.Rotation, original, s, catalog, *now)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	state.PreparedIssuer = state.ActiveIssuer
-	if _, _, err := r.PlanRotation(b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("overlap bound not enforced: %v", err)
 	}
 
@@ -544,7 +544,7 @@ func TestPlanRotationOwnsOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	next, nextState, err := r.PlanRotation(original, state, catalog, *now)
+	next, nextState, err := PlanRotation(r.Config.Rotation, original, state, catalog, *now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestPlanRotationInputValidation(t *testing.T) {
 			tc.edit(&b)
 			// An empty catalog would discard all keys; invalid/oversized input
 			// must still fail before the planner can shrink it into a valid output.
-			if _, _, err := r.PlanRotation(b, state, nil, *now); !errors.Is(err, tc.want) {
+			if _, _, err := PlanRotation(r.Config.Rotation, b, state, nil, *now); !errors.Is(err, tc.want) {
 				t.Fatalf("input validation: got %v, want %v", err, tc.want)
 			}
 		})
@@ -615,7 +615,7 @@ func TestPlanRotationInputValidation(t *testing.T) {
 	original.CacheKeys = nil
 	state.Retiring = nil
 
-	next, nextState, err := r.PlanRotation(original, state, nil, *now)
+	next, nextState, err := PlanRotation(r.Config.Rotation, original, state, nil, *now)
 	if err != nil || next.CacheKeys == nil || nextState.Retiring == nil {
 		t.Fatalf("empty collection normalization: %v", err)
 	}
