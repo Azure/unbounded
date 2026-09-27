@@ -102,6 +102,7 @@ fn persisted(process: &mut Process, count: u64) {
 struct Observation {
     rss_kib: u64,
     socket_fds: usize,
+    /// Linux schedstat execution nanoseconds, not scheduler wait/queue time.
     threads: BTreeMap<String, u64>,
 }
 fn observe(pid: u32) -> Observation {
@@ -127,10 +128,15 @@ fn observe(pid: u32) -> Observation {
         let stat = fs::read_to_string(task.path().join("stat")).unwrap();
         let end = stat.rfind(')').unwrap();
         let name = &stat[stat.find('(').unwrap() + 1..end];
-        let fields: Vec<_> = stat[end + 2..].split_whitespace().collect();
+        let schedstat = fs::read_to_string(task.path().join("schedstat")).unwrap();
         result.threads.insert(
             format!("{name}:{}", task.file_name().to_string_lossy()),
-            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap(),
+            schedstat
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap(),
         );
     }
     result
@@ -182,7 +188,6 @@ fn measure(
     });
     measured.finish(start.elapsed());
     let cpu_after = observe(process.child.id());
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     let utilization: BTreeMap<_, _> = cpu_after
         .threads
         .iter()
@@ -190,7 +195,7 @@ fn measure(
             (
                 name.clone(),
                 value.saturating_sub(*cpu_before.threads.get(name).unwrap_or(&0)) as f64
-                    / ticks
+                    / 1_000_000_000.
                     / measured.elapsed_seconds,
             )
         })
@@ -201,10 +206,16 @@ fn measure(
         .filter(|(name, _)| name.ends_with("_total"))
         .map(|(name, value)| (name.clone(), value - before[name]))
         .collect();
-    println!(
-        "THROUGHPUT {}",
-        json!({"mode": mode, "pairs": profile.pairs, "caches": profile.caches.len(), "object_bytes": profile.length, "range": [range.start, range.end], "concurrency": concurrency, "shared": shared, "slow_reader": slow, "budgets": "production-defaults", "measurement": measured, "thread_cpu_fraction": utilization, "before": cpu_before, "after": cpu_after, "counter_delta": deltas, "unavailable": ["per-worker reservation failures", "queue residence", "reactor lag", "allocation bytes", "copy bytes", "ranking misses", "exact RSS peak", "exact connection peak"]})
-    );
+    let report = json!({"mode": mode, "pairs": profile.pairs, "caches": profile.caches.len(), "object_bytes": profile.length, "range": [range.start, range.end], "concurrency": concurrency, "shared": shared, "slow_reader": slow, "budgets": "production-defaults", "measurement": measured, "thread_cpu_fraction": utilization, "thread_cpu_unit": "schedstat execution nanoseconds", "build": if cfg!(debug_assertions) { "test-optimized" } else { "release" }, "before": cpu_before, "after": cpu_after, "counter_delta": deltas, "unavailable": ["per-worker reservation failures", "queue residence", "reactor lag", "allocation bytes", "copy bytes", "ranking misses", "exact RSS peak", "exact connection peak"]});
+    println!("THROUGHPUT {report}");
+    // Persist nonsecret measurement evidence across fixture cleanup, including
+    // failed gates. Append one JSON object per line under the worktree only.
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/throughput-results.jsonl"))
+        .unwrap();
+    writeln!(output, "{report}").unwrap();
     (measured, deltas)
 }
 
@@ -218,11 +229,35 @@ fn case(
     slow: bool,
     short: bool,
 ) {
+    run_case(
+        pairs,
+        length,
+        caches,
+        mode,
+        shared,
+        concurrency,
+        slow,
+        short,
+        if shared { 8 } else { 4 },
+    );
+}
+
+fn run_case(
+    pairs: usize,
+    length: u64,
+    caches: usize,
+    mode: &str,
+    shared: bool,
+    concurrency: usize,
+    slow: bool,
+    short: bool,
+    count: usize,
+) {
+    assert!(count > 0 && count <= 4096 && concurrency > 0 && concurrency <= count);
     let scratch = Scratch::new();
     let profile = Profile::new(pairs, length, caches);
     let control = control::Control::start_with(&scratch.0, profile.caches.clone());
     let (mut process, mut origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
-    let count = if shared { 8 } else { 4 };
     let range = Expected {
         start: if short { 17 } else { 0 },
         end: if short { 97 } else { length },
@@ -230,7 +265,31 @@ fn case(
     };
     if mode != "origin" {
         let preload = if shared { caches } else { count };
+        let mut stored = 0;
         for i in 0..preload {
+            if mode == "disk" {
+                // Isolate preload from the measurement: persist each page before
+                // submitting the next, so dirty pressure cannot silently omit it.
+                for page in 0..if short { 1 } else { length.div_ceil(P) } {
+                    let page_range = Expected {
+                        start: page * P,
+                        end: ((page + 1) * P).min(length),
+                        length,
+                    };
+                    assert_eq!(
+                        request(
+                            &socket_path(&process, i % caches),
+                            if shared { 0 } else { i as u64 },
+                            &page_range,
+                            false
+                        ),
+                        Ok(page_range.end - page_range.start)
+                    );
+                    stored += 1;
+                    persisted(&mut process, stored);
+                }
+                continue;
+            }
             assert_eq!(
                 request(
                     &socket_path(&process, i % caches),
@@ -255,10 +314,15 @@ fn case(
         }
     }
     let calls_before: usize = origins.iter().map(|o| o.calls().len()).sum();
+    let label = if shared && mode != "memory" {
+        format!("{mode}-cold-to-warm")
+    } else {
+        mode.into()
+    };
     let (measured, deltas) = measure(
         &process,
         &profile,
-        mode,
+        &label,
         count,
         concurrency,
         shared,
@@ -275,6 +339,14 @@ fn case(
         deltas[event] > 0,
         "selected path was not exercised: {deltas:?}"
     );
+    let pages = if short { 1 } else { length.div_ceil(P) };
+    if !shared && mode != "memory" {
+        assert_eq!(
+            deltas[event],
+            count as u64 * pages,
+            "every distinct request must exercise selected cold path"
+        );
+    }
     if mode != "origin" {
         assert_eq!(deltas["racer_origin_fills_total"], 0);
         assert_eq!(
@@ -292,13 +364,25 @@ fn production_progress_matrix() {
     for pairs in [1, 2, 4] {
         for mode in ["origin", "memory", "disk"] {
             for length in [113, P, 2 * P + 113] {
-                case(pairs, length, 1, mode, true, 1, false, false);
+                // Long recovered values verify cold-to-warm streaming. Distinct
+                // full-page disk cases below require a disk hit for every read.
+                case(
+                    pairs,
+                    length,
+                    1,
+                    mode,
+                    mode == "memory" || mode == "disk" && length > P,
+                    1,
+                    false,
+                    false,
+                );
             }
         }
         case(pairs, 113, 2, "origin", false, 2, false, false);
         case(pairs, 113, 2, "memory", true, 2, false, false);
         case(pairs, P, 1, "memory", true, 2, true, false);
         case(pairs, 2 * P + 113, 1, "memory", true, 2, false, true);
+        case(pairs, P, 1, "origin", true, 2, false, false);
     }
 }
 
@@ -306,7 +390,83 @@ fn production_progress_matrix() {
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; focused one-pair baseline"]
 fn production_progress_smoke() {
     for mode in ["origin", "memory", "disk"] {
-        case(1, P, 1, mode, true, 1, false, false);
+        case(1, P, 1, mode, mode == "memory", 1, false, false);
+    }
+}
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and requested CPU capacity; configurable measurement"]
+fn production_configured_measurement() {
+    let number = |name: &str, default: usize| {
+        std::env::var(name).map_or(default, |value| {
+            value.parse().expect("unsigned throughput parameter")
+        })
+    };
+    let pairs = number("RACER_THROUGHPUT_PAIRS", 4);
+    let length = number("RACER_THROUGHPUT_BYTES", P as usize) as u64;
+    let caches = number("RACER_THROUGHPUT_CACHES", 1);
+    let count = number("RACER_THROUGHPUT_REQUESTS", 32);
+    let concurrency = number("RACER_THROUGHPUT_CONCURRENCY", 1);
+    let mode = std::env::var("RACER_THROUGHPUT_MODE").unwrap_or_else(|_| "origin".into());
+    assert!(["memory", "disk", "origin"].contains(&mode.as_str()));
+    assert!((1..=4).contains(&caches) && (113..=4 * P).contains(&length));
+    run_case(
+        pairs,
+        length,
+        caches,
+        &mode,
+        number("RACER_THROUGHPUT_SHARED", usize::from(mode == "memory")) != 0,
+        concurrency,
+        number("RACER_THROUGHPUT_SLOW", 0) != 0,
+        number("RACER_THROUGHPUT_SHORT", 0) != 0,
+        count,
+    );
+}
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity; churn diagnostic, strict mode may expose baseline overload"]
+fn production_churn_diagnostic() {
+    for pairs in [1, 2, 4] {
+        let scratch = Scratch::new();
+        let profile = Profile::new(pairs, 113, 2);
+        let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+        let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+        let range = Expected {
+            start: 0,
+            end: 113,
+            length: 113,
+        };
+        let (measured, deltas) = measure(
+            &process,
+            &profile,
+            "distinct-churn-diagnostic",
+            512,
+            2,
+            false,
+            &range,
+            false,
+        );
+        assert_eq!(measured.attempted, 512);
+        assert!(measured.completed > 0);
+        assert!(
+            measured
+                .failures
+                .keys()
+                .all(|failure| failure == "Http(503)"),
+            "unexpected failure: {measured:?}"
+        );
+        assert_eq!(
+            deltas["racer_origin_fills_total"],
+            measured.completed as u64
+        );
+        assert_eq!(
+            deltas["racer_request_errors_total"],
+            (512 - measured.completed) as u64
+        );
+        assert!(process.stop(libc::SIGTERM).success());
+        if std::env::var_os("RACER_THROUGHPUT_STRICT_BASELINE").is_some() {
+            assert!(measured.accept(512), "strict churn gate: {measured:?}");
+        }
     }
 }
 
@@ -346,7 +506,10 @@ fn production_ingress_baseline() {
     .unwrap();
     let mut byte = [0];
     let outcome = excess.read(&mut byte);
-    assert!(outcome.is_err(), "expected ingress stall: {outcome:?}");
+    assert!(
+        matches!(&outcome, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+        "expected ingress stall: {outcome:?}"
+    );
     assert_eq!(process.diagnostic("/readyz").unwrap().status, 200);
     println!(
         "BASELINE {}",
@@ -437,6 +600,63 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
                 == WorkerId(owner)
         })
         .unwrap()
+}
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; blocked listener publication and recovery"]
+fn production_blocked_listener_publication() {
+    use racer_dataplane::control::wire::PublicationSequence;
+    let scratch = Scratch::new();
+    let profile = Profile::new(2, 113, 2);
+    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    let added = control.publication.lock().unwrap().caches.pop().unwrap();
+    let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+    let blocked = scratch.0.join("run-0/racer/throughput-1/client/socket");
+    fs::write(&blocked, b"fixture blocks publication").unwrap();
+    let polls = control.polls.load(Ordering::Acquire);
+    {
+        let mut publication = control.publication.lock().unwrap();
+        publication.sequence = PublicationSequence(2);
+        publication.caches.push(added);
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    while control.polls.load(Ordering::Acquire) == polls {
+        assert!(Instant::now() < deadline);
+        process.assert_running();
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(100));
+    let range = Expected {
+        start: 0,
+        end: 113,
+        length: 113,
+    };
+    let mut old = profile.clone();
+    old.caches.truncate(1);
+    let (measured, _) = measure(
+        &process,
+        &old,
+        "blocked-listener-publication",
+        8,
+        1,
+        true,
+        &range,
+        false,
+    );
+    assert!(measured.accept(8));
+    assert_eq!(fs::read(&blocked).unwrap(), b"fixture blocks publication");
+    fs::remove_file(&blocked).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while !blocked.exists() {
+        assert!(Instant::now() < deadline, "publication did not recover");
+        process.assert_running();
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        request(&socket_path(&process, 1), 0, &range, false),
+        Ok(113)
+    );
+    assert!(process.stop(libc::SIGTERM).success());
 }
 
 #[test]
