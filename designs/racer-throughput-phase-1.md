@@ -95,7 +95,108 @@ Sampling maxima are labeled sampled, not exact peaks. Queue residence, reactor
 lag, reservation failures, allocation/copy bytes, connections, and ranking misses
 must be explicitly distinguished as implemented, approximated, or unavailable.
 
-## Validation and completion record
+## Delivered scope
 
-Pending implementation. This section will be replaced with actual commands,
-results, exact scope, and limitations before the final Phase 1 commit.
+Implementation commits: `628de6fa` (executable gates and oracle), `3c414650`
+(cold-path evidence, churn/configured workloads, and blocked publication).
+The plan was committed first as `ffc8fa21`. All work is confined to this
+worktree; the parent retains merge ownership.
+
+Files delivered:
+
+- `tests/process/measurement.rs`: bounded HTTP completion oracle and strict
+  acceptance accounting, including malformed, corrupt, truncated, empty, and
+  unsuccessful responses. No partial bytes count toward goodput.
+- `tests/process/throughput.rs`: production-profile workloads, JSON reporting,
+  process CPU/RSS/socket observations, actual peer processes, expected baseline
+  diagnostics, and configurable measurement parameters.
+- `tests/process/control.rs`: reusable multicache/controller publication fixture,
+  separate node enrollment bindings under one CA/key domain, and blocked polls.
+- `tests/process_restart.rs`: reusable actual executable startup profile and
+  variable-length/distinct-key origin. Production-profile budgets are defaults.
+  The preexisting restart-only 1 MiB request-context setting was stale against
+  `src/app.rs:245-246` and `src/peer/wire.rs:85-89`; it is now 16 MiB. Both
+  existing restart tests pass without removing assertions.
+- `tests/process/README.md`: exact commands, prerequisites, test semantics,
+  measurement limitations, and configurable later-phase gates.
+
+The acceptance matrix covers 1/2/4 pairs; memory, cold disk, origin, and peer
+paths; full pages, small objects, long values, short ranges, multicache traffic,
+fan-in, and slow readers. Separate diagnostics cover 512-key distinct churn,
+connection saturation, and full-page multicache disk failure. Real control
+response blocking and failed listener publication preserve last-good traffic
+and recover. Two actual Applications exercise authenticated TCP transfer and
+fallback after the preferred peer is killed without changing membership.
+
+## Commands and outcomes
+
+Run from `cmd/racer-dataplane/` unless specified otherwise. All commands below
+were actually executed on this Linux host, with working sudo/mount namespaces,
+io_uring, O_DIRECT, and CPU capacity for four pairs.
+
+| Command | Outcome |
+| --- | --- |
+| `cargo fmt` and `cargo fmt --check` | Passed. |
+| `cargo test --locked --test process_restart measurement -j 2` | Two oracle tests passed; the matching privileged configured-measurement test was explicitly ignored. |
+| `cargo test --locked --all-features --no-run -j 2` | All library, binary, and integration targets compiled. |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1` | Eleven selected privileged tests passed, zero ignored in this selected run, including existing restart tests and the final matrix. |
+| `cargo test --locked --all-features --lib app::caches::tests -j 2` | Two publication/rendezvous tests passed. |
+| `cargo test --locked --all-features --lib app::health::tests -j 2` | Readiness progress test passed. |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart production_multicache_disk_baseline -j 2 -- --ignored --test-threads=1` | Intentionally failed: zero complete responses, one HTTP 503, zero goodput, one server overload. Confirms strict gate rejects the baseline. |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n' cargo test --locked --release --test process_restart production_configured_measurement -j 2 -- --ignored --test-threads=1 --nocapture` | Passed: four pairs, 32 distinct full-page origin reads, 32/32 complete, 536870912 verified bytes, 44.55 MB/s, p50 376.21 ms, p99 404.07 ms. |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_MODE=memory' cargo test --locked --release --test process_restart production_configured_measurement -j 2 -- --ignored --test-threads=1 --nocapture` | Passed: four pairs, 32 shared full-page memory reads, 32/32 complete, 536870912 verified bytes, 301.36 MB/s, p50 54.98 ms, p99 61.49 ms; 32 memory hits, zero origin fills. |
+
+An initial cold build exceeded the tool's 120-second command timeout; the retry
+completed. Intermediate fixture failures were investigated rather than counted
+as passing: Linux includes kernel `iou-wrk-*` tasks in `/proc/PID/task`, so exact
+pair verification uses named userspace roles; stale restart context limits failed
+startup; long distinct disk preloads omitted persistence; and four-pair churn
+intermittently overloaded. The final selected suite above passed after separating
+diagnostics from the zero-failure acceptance matrix and tightening path evidence.
+
+## Baseline discoveries and exact limits
+
+1. Full-page multicache disk: four pairs give 64 MiB ciphertext per worker.
+   With a second cache's short tail retained on worker zero, a recovered full
+   page returns HTTP 503, one overload, zero disk hits, and zero origin fills.
+   The tail remains readable. This is a production Application reproduction of
+   the reserve/staging overlap identified in the inspected baseline above.
+2. Ingress: 32 partial heads occupy worker-zero acceptance at four pairs despite
+   the aggregate 128-connection budget. The excess request times out at the
+   diagnostic's 200 ms bound while readiness remains 200. Releasing held heads
+   restores successful reads. The diagnostic tests this baseline, not improved
+   ingress; later phases must update its expected contract when ownership changes.
+3. Churn: 512 distinct 113-byte objects across two caches and two clients passed
+   at some runs but produced four HTTP 503s at four pairs in another observed run
+   (508/512 complete). The diagnostic permits only categorized HTTP 503s, checks
+   server-counter consistency, and offers strict zero-failure mode. No claim of
+   reliable high-concurrency small-object progress is made.
+4. Persistence: even sequential successful long-value reads can omit dirty
+   publication. An observed four-pair preload had 12 origin fills but only ten
+   disk publications with no pending writes. Page-at-a-time preload also exposed
+   omission under accumulated residency. The ordinary long disk case therefore
+   explicitly measures one recovered long object transitioning to memory; cold
+   distinct single-page disk cases require a disk hit for every measured page.
+   Configurable larger distinct disk workloads retain the hard persistence gate.
+   The release origin run published eight pages by measurement end for 32 fills;
+   response goodput is not persistence throughput.
+5. Implemented counters are client completion/error/truncation/content evidence,
+   existing aggregate request/hit/overload/write counters, per-thread schedstat
+   execution nanoseconds, and before/after RSS/socket FD observations. No
+   per-worker reservation-failure, queue-residence, reactor-lag, allocation/copy,
+   or ranking-miss counters were added. These are explicitly unavailable in JSON.
+   Socket FDs include listeners/control/origin/peer sockets and are not categorized
+   connections or peaks. CPU snapshots include small measurement overhead.
+6. The bounded fixtures and byte oracle can limit measured goodput. No CPU
+   isolation, NUMA hardware scaling, NIC/RDMA throughput, multi-hop peer cluster,
+   exhaustive Cartesian workload matrix, or full 100k-node throughput was tested.
+   Peer coverage is full-page cold-to-warm transfer and failure fallback on two
+   local processes; it is not sustained cold-peer goodput. All production source
+   files and budgets remain unchanged. No migration, dependency, or test removal
+   was introduced.
+
+Reusable later-phase commands and environment knobs are in
+`tests/process/README.md`. Machine-readable measurements from the final runs are
+retained in the gitignored worktree-local
+`cmd/racer-dataplane/target/throughput-results.jsonl`; they contain no credentials.
+Ordinary test ignores are never represented as passed hardware measurements.
