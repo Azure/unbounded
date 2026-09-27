@@ -146,6 +146,13 @@ impl Coordinator {
     ) -> Result<PeerOriginContext> {
         self.credentials.seal(context, attempt, scope)
     }
+    pub(crate) fn local_context(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<ChargedOriginContext> {
+        self.credentials.local_context(context, scope)
+    }
     pub(crate) fn open_context(&self, envelope: PeerOriginContext) -> Result<ChargedOriginContext> {
         let request = envelope.request;
         let attempt = envelope.attempt;

@@ -5,6 +5,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -20,10 +24,48 @@ const MAX_DRIVERS: usize = 1024;
 
 #[derive(Default)]
 pub struct DriverQueue {
-    drivers: RefCell<VecDeque<Operation<'static, ()>>>,
+    drivers: RefCell<VecDeque<Driver>>,
     new: RefCell<Vec<Operation<'static, ()>>>,
     count: Cell<usize>,
     owner: RefCell<Option<Waker>>,
+}
+struct Driver {
+    operation: Operation<'static, ()>,
+    wake: Arc<Runnable>,
+}
+pub(crate) struct Runnable {
+    ready: AtomicBool,
+    owner: futures::task::AtomicWaker,
+}
+impl Runnable {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(true),
+            owner: futures::task::AtomicWaker::new(),
+        })
+    }
+    pub(crate) fn poll<T>(
+        self: &Arc<Self>,
+        future: std::pin::Pin<&mut impl std::future::Future<Output = T>>,
+        cx: &mut Context<'_>,
+        force: bool,
+    ) -> Poll<T> {
+        self.owner.register(cx.waker());
+        if !self.ready.swap(false, Ordering::AcqRel) && !force {
+            return Poll::Pending;
+        }
+        let waker = Waker::from(self.clone());
+        future.poll(&mut Context::from_waker(&waker))
+    }
+}
+impl std::task::Wake for Runnable {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ready.store(true, Ordering::Release);
+        self.owner.wake();
+    }
 }
 
 pub struct QueueGuard {
@@ -71,12 +113,28 @@ impl DriverQueue {
         let Ok(mut drivers) = self.drivers.try_borrow_mut() else {
             return;
         };
-        drivers.extend(self.new.borrow_mut().drain(..));
+        drivers.extend(self.new.borrow_mut().drain(..).map(|operation| Driver {
+            operation,
+            wake: Arc::new(Runnable {
+                ready: AtomicBool::new(true),
+                owner: futures::task::AtomicWaker::new(),
+            }),
+        }));
         for _ in 0..budget.min(drivers.len()) {
             let Some(mut driver) = drivers.pop_front() else {
                 break;
             };
-            match driver.as_mut().poll(cx) {
+            driver.wake.owner.register(cx.waker());
+            if !driver.wake.ready.swap(false, Ordering::AcqRel) {
+                drivers.push_back(driver);
+                continue;
+            }
+            let waker = Waker::from(driver.wake.clone());
+            match driver
+                .operation
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+            {
                 Poll::Ready(_) => self.count.set(self.count.get() - 1),
                 Poll::Pending => drivers.push_back(driver),
             }
@@ -169,6 +227,31 @@ mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
     use std::{cell::Cell, rc::Rc};
+    #[test]
+    fn blocked_driver_is_not_repolled_until_its_own_wake() {
+        let queue = Rc::new(DriverQueue::default());
+        let _owner = queue.enter();
+        let polls = Rc::new(Cell::new(0));
+        let observed = polls.clone();
+        let wake = Rc::new(RefCell::new(None::<Waker>));
+        let saved = wake.clone();
+        spawn(Box::pin(std::future::poll_fn(move |cx| {
+            observed.set(observed.get() + 1);
+            *saved.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        })))
+        .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..100 {
+            queue.poll(&mut cx, 64);
+        }
+        assert_eq!(polls.get(), 1);
+        wake.borrow().as_ref().unwrap().wake_by_ref();
+        queue.poll(&mut cx, 64);
+        assert_eq!(polls.get(), 2);
+        queue.simulation_crash();
+        assert_eq!(queue.pending(), 0);
+    }
     #[test]
     fn workers_isolate_permits_children_and_capacity_on_one_thread() {
         let a = Rc::new(DriverQueue::default());

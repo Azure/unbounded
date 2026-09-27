@@ -3,6 +3,7 @@ use super::{
     page::{CiphertextCopy, PageResult},
     pool::BufferPool,
 };
+use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
     model::{
@@ -12,17 +13,72 @@ use crate::{
         metadata::VersionMetadata,
     },
 };
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+#[derive(Default)]
+struct Entries {
+    pages: HashMap<PageId, (u64, PageResult)>,
+    lru: BTreeMap<u64, PageId>,
+    versions: HashMap<ObjectVersion, HashSet<PageId>>,
+    clock: u64,
+    reclaim_after: u64,
+}
+impl Entries {
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+    fn remove(&mut self, id: &PageId) -> Option<PageResult> {
+        let (tick, page) = self.pages.remove(id)?;
+        self.lru.remove(&tick);
+        if let Some(pages) = self.versions.get_mut(&id.version) {
+            pages.remove(id);
+            if pages.is_empty() {
+                self.versions.remove(&id.version);
+            }
+        }
+        Some(page)
+    }
+    fn insert(&mut self, page: PageResult) -> Result<()> {
+        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let id = page.plaintext.page().clone();
+        self.lru.insert(self.clock, id.clone());
+        self.versions
+            .entry(id.version.clone())
+            .or_default()
+            .insert(id.clone());
+        self.pages.insert(id, (self.clock, page));
+        Ok(())
+    }
+    fn candidates(&mut self) -> Vec<PageId> {
+        let selected: Vec<_> = self
+            .lru
+            .range((
+                std::ops::Bound::Excluded(self.reclaim_after),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(self.lru.range(..=self.reclaim_after))
+            .take(256)
+            .map(|(tick, id)| (*tick, id.clone()))
+            .collect();
+        if let Some((tick, _)) = selected.last() {
+            self.reclaim_after = *tick;
+        }
+        selected.into_iter().map(|(_, id)| id).collect()
+    }
+}
 pub struct MemoryCache {
     pool: Rc<BufferPool>,
-    entries: RefCell<VecDeque<PageResult>>,
+    entries: RefCell<Entries>,
     availability: Option<Rc<crate::control::availability::Availability>>,
 }
 impl MemoryCache {
     pub fn new(pool: Rc<BufferPool>) -> Self {
         Self {
             pool,
-            entries: RefCell::new(VecDeque::new()),
+            entries: RefCell::new(Entries::default()),
             availability: None,
         }
     }
@@ -43,18 +99,20 @@ impl MemoryCache {
     }
     pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
         let mut entries = self.entries.borrow_mut();
-        let Some(index) = entries
-            .iter()
-            .position(|entry| entry.plaintext.page() == page)
-        else {
+        let Some((tick, entry)) = entries.pages.get(page) else {
             return Ok(None);
         };
-        let entry = entries.remove(index).expect("located entry");
         if !self.available(&entry) {
+            entries.remove(page);
             return Ok(None);
         }
+        let old = *tick;
         let result = entry.clone();
-        entries.push_back(entry);
+        entries.clock = entries.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let tick = entries.clock;
+        entries.lru.remove(&old);
+        entries.lru.insert(tick, page.clone());
+        entries.pages.get_mut(page).unwrap().0 = tick;
         Ok(Some(result))
     }
     pub fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
@@ -75,50 +133,66 @@ impl MemoryCache {
             return Err(Error::MissingKey);
         }
         let mut entries = self.entries.borrow_mut();
-        for entry in entries.iter() {
-            if entry.metadata.version == page.metadata.version
-                && entry.metadata.length != page.metadata.length
-            {
+        if let Some(known) = entries
+            .versions
+            .get(&page.metadata.version)
+            .and_then(|pages| pages.iter().next())
+            .and_then(|id| entries.pages.get(id))
+        {
+            if known.1.metadata.length != page.metadata.length {
                 return Err(Error::CorruptRecord);
             }
-            if entry.plaintext.page() == id {
-                if entry.plaintext.bytes() != page.plaintext.bytes() {
-                    return Err(Error::CorruptRecord);
-                }
-                // A duplicate fill must not replace the original nonce/ciphertext
-                // or turn its historical deadline into renewed freshness.
-                return Ok(());
+        }
+        if let Some((_, entry)) = entries.pages.get(id) {
+            if entry.plaintext.bytes() != page.plaintext.bytes() {
+                return Err(Error::CorruptRecord);
             }
+            // A duplicate fill must not replace the original nonce/ciphertext
+            // or turn its historical deadline into renewed freshness.
+            return Ok(());
         }
         if entries.len() >= self.pool.entry_limit() {
-            let index = entries.iter().position(idle).ok_or(Error::Overloaded)?;
-            entries.remove(index);
+            let id = entries
+                .candidates()
+                .into_iter()
+                .find(|id| idle(&entries.pages[id].1))
+                .ok_or(Error::Overloaded)?;
+            entries.remove(&id);
         }
-        entries.try_reserve(1).map_err(|_| Error::Overloaded)?;
-        entries.push_back(page);
-        Ok(())
+        entries.insert(page)
     }
     pub fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
-        Ok(self
-            .entries
-            .borrow()
-            .iter()
-            .find(|entry| &entry.metadata.version == version && self.available(entry))
-            .map(|entry| entry.metadata.immutable()))
+        let entries = self.entries.borrow();
+        Ok(entries
+            .versions
+            .get(version)
+            .and_then(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|id| entries.pages.get(id))
+                    .find(|(_, entry)| self.available(entry))
+            })
+            .map(|(_, entry)| entry.metadata.immutable()))
     }
     /// Return released admission bytes, including any reserved final-page slack.
     /// Busy plaintext OR ciphertext protects the complete retained bundle.
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
         let mut released = 0usize;
-        self.entries.borrow_mut().retain(|entry| {
-            if released >= bytes || !idle(entry) {
-                return true;
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for id in candidates {
+            if released >= bytes {
+                break;
+            }
+            let entry = &entries.pages[&id].1;
+            if !idle(entry) {
+                continue;
             }
             released = released
                 .saturating_add(entry.plaintext.inner.reservation.amount())
                 .saturating_add(entry.ciphertext.inner.reservation.amount());
-            false
-        });
+            entries.remove(&id);
+        }
         Ok(released)
     }
     /// One bounded LRU pass, counting only the exhausted class. The callback may
@@ -134,29 +208,34 @@ impl MemoryCache {
             return 0;
         }
         let mut released = 0usize;
-        self.entries.borrow_mut().retain(|entry| {
-            if released >= bytes
-                || cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for id in candidates {
+            if released >= bytes {
+                break;
+            }
+            let entry = &entries.pages[&id].1;
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
                 || Arc::strong_count(&entry.plaintext.inner) != 1
             {
-                return true;
+                continue;
             }
             let staging = release_queued(entry);
             if matches!(class, ResourceClass::Ciphertext) {
                 released = released.saturating_add(staging);
             }
             if released >= bytes {
-                return true;
+                break;
             }
             if !idle(entry) {
-                return true;
+                continue;
             }
             released = released.saturating_add(match class {
                 ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
                 _ => entry.ciphertext.inner.reservation.amount(),
             });
-            false
-        });
+            entries.remove(&id);
+        }
         released
     }
     /// Evict lookup references. Existing owners keep
@@ -164,16 +243,31 @@ impl MemoryCache {
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
         let mut entries = self.entries.borrow_mut();
         let before = entries.len();
-        entries.retain(|entry| {
-            &entry.metadata.version.object.cache != cache
-                || entry.ciphertext.envelope().key_id != key
-        });
+        let removed: Vec<_> = entries
+            .pages
+            .iter()
+            .filter(|(_, (_, entry))| {
+                &entry.metadata.version.object.cache == cache
+                    && entry.ciphertext.envelope().key_id == key
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in removed {
+            entries.remove(&id);
+        }
         Ok(before - entries.len())
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
-        self.entries
-            .borrow_mut()
-            .retain(|entry| &entry.metadata.version.object.cache != cache);
+        let mut entries = self.entries.borrow_mut();
+        let removed: Vec<_> = entries
+            .pages
+            .keys()
+            .filter(|id| &id.version.object.cache == cache)
+            .cloned()
+            .collect();
+        for id in removed {
+            entries.remove(&id);
+        }
         Ok(())
     }
 }
@@ -188,6 +282,29 @@ mod tests {
         memory::pool::tests::{admission, bundle, bundle_for},
         model::{limits::ResourceClass, metadata::ExpiresAt},
     };
+    #[test]
+    fn bounded_reclamation_advances_past_a_busy_prefix() {
+        let admission = admission(300);
+        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let mut busy = Vec::new();
+        for n in 0..300 {
+            let page = bundle(&admission, &format!("v{n}"));
+            if n < 256 {
+                busy.push(page.clone());
+            }
+            cache.publish(page).unwrap();
+        }
+        assert_eq!(cache.evict_idle(1), Ok(0));
+        assert_eq!(cache.evict_idle(1), Ok(22));
+        assert_eq!(cache.entries.borrow().len(), 299);
+        drop(busy);
+        for _ in 0..3 {
+            cache.evict_idle(usize::MAX).unwrap();
+        }
+        assert!(cache.entries.borrow().is_empty());
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
 
     #[test]
     fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {

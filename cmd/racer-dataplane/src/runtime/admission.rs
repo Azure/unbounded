@@ -11,7 +11,7 @@ use crate::{
 use std::{
     cell::RefCell,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -21,14 +21,31 @@ fn index(class: ResourceClass) -> usize {
     class as usize
 }
 struct Counters {
+    active: Option<Arc<AtomicUsize>>,
+    retired: Option<(CacheId, Arc<Mutex<std::collections::VecDeque<CacheId>>>)>,
     used: [AtomicUsize; CLASSES],
     wake: futures::task::AtomicWaker,
 }
 impl Counters {
     fn new() -> Self {
         Self {
+            active: None,
+            retired: None,
             used: std::array::from_fn(|_| AtomicUsize::new(0)),
             wake: futures::task::AtomicWaker::new(),
+        }
+    }
+}
+impl Drop for Counters {
+    fn drop(&mut self) {
+        if let Some(active) = &self.active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Some((cache, queue)) = &self.retired {
+            queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(cache.clone());
         }
     }
 }
@@ -36,7 +53,9 @@ impl Counters {
 pub struct Admission {
     limits: Limits,
     totals: Arc<Counters>,
-    caches: RefCell<HashMap<CacheId, Arc<Counters>>>,
+    caches: RefCell<HashMap<CacheId, Weak<Counters>>>,
+    active_caches: Arc<AtomicUsize>,
+    retired_caches: Arc<Mutex<std::collections::VecDeque<CacheId>>>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -168,6 +187,9 @@ impl Admission {
     /// Partition the existing socket ceiling. Ingress cannot consume outbound or
     /// control progress slots; outbound traffic cannot consume control slots.
     pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
+        if matches!(role, ResourceClass::IngressConnection) {
+            return self.connection_admission().reserve();
+        }
         if !matches!(
             role,
             ResourceClass::IngressConnection
@@ -188,6 +210,8 @@ impl Admission {
             limits,
             totals: Arc::new(Counters::new()),
             caches: RefCell::new(HashMap::default()),
+            active_caches: Arc::new(AtomicUsize::new(0)),
+            retired_caches: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -258,13 +282,17 @@ impl Admission {
         amount: usize,
     ) -> Option<(Option<CacheId>, usize)> {
         let caches = self.caches.borrow();
-        let local = caches.get(cache)?;
-        let fair = self.fair_limit(class, caches.len());
+        let local = caches.get(cache).and_then(Weak::upgrade);
+        let fair = self.fair_limit(
+            class,
+            self.active_caches.load(Ordering::Acquire) + usize::from(local.is_none()),
+        );
         if amount > fair {
             return None;
         }
-        let local_deficit = local.used[index(class)]
-            .load(Ordering::Acquire)
+        let local_deficit = local
+            .as_ref()
+            .map_or(0, |local| local.used[index(class)].load(Ordering::Acquire))
             .saturating_sub(fair - amount);
         if local_deficit != 0 {
             return Some((Some(cache.clone()), local_deficit));
@@ -306,15 +334,39 @@ impl Admission {
         let limit = self.limit(class);
         let local = if let Some(cache) = cache {
             let mut caches = self.caches.borrow_mut();
-            caches.retain(|_, counts| counts.used.iter().any(|n| n.load(Ordering::Acquire) != 0));
+            // Completion-thread destructors enqueue only released cache records.
+            // Cleanup examines notifications, never every class of every cache.
+            let mut retired = self
+                .retired_caches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for _ in 0..256 {
+                let Some(id) = retired.pop_front() else {
+                    break;
+                };
+                if caches
+                    .get(&id)
+                    .is_some_and(|counts| counts.strong_count() == 0)
+                {
+                    caches.remove(&id);
+                }
+            }
+            drop(retired);
             if !caches.contains_key(cache) && caches.len() >= self.limits.metadata_entries.get() {
                 return Err(Error::Overloaded);
             }
             Some(
-                caches
-                    .entry(cache.clone())
-                    .or_insert_with(|| Arc::new(Counters::new()))
-                    .clone(),
+                if let Some(counts) = caches.get(cache).and_then(Weak::upgrade) {
+                    counts
+                } else {
+                    let mut counts = Counters::new();
+                    counts.active = Some(self.active_caches.clone());
+                    counts.retired = Some((cache.clone(), self.retired_caches.clone()));
+                    self.active_caches.fetch_add(1, Ordering::AcqRel);
+                    let counts = Arc::new(counts);
+                    caches.insert(cache.clone(), Arc::downgrade(&counts));
+                    counts
+                },
             )
         } else {
             None
@@ -324,7 +376,7 @@ impl Admission {
         // Existing leases are never revoked, so a newly active cache may have to
         // wait for their natural release/idle eviction before its first admission.
         if let Some(local) = local.as_ref().filter(|_| !completing) {
-            let active = self.caches.borrow().len().max(1);
+            let active = self.active_caches.load(Ordering::Acquire).max(1);
             let fair_limit = self.fair_limit(class, active);
             if local.used[index(class)]
                 .load(Ordering::Acquire)
@@ -505,7 +557,8 @@ mod tests {
         let third = admission
             .reserve(Some(&a), ResourceClass::RequestContext, 60)
             .unwrap();
-        assert_eq!(admission.caches.borrow().len(), 1);
+        assert_eq!(admission.active_caches.load(Ordering::Acquire), 1);
+        assert!(!admission.caches.borrow().contains_key(&b));
         assert_eq!(admission.used(ResourceClass::RequestContext), 100);
         drop((first, third));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);

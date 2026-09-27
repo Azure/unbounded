@@ -29,7 +29,7 @@ use crate::{
 use std::{
     any::Any,
     cell::RefCell,
-    collections::VecDeque,
+    collections::BTreeMap,
     future::poll_fn,
     rc::Rc,
     task::{Context, Poll, Waker},
@@ -66,7 +66,8 @@ impl Default for FlightLimits {
 #[derive(Default)]
 struct Table {
     entries: HashMap<PageId, Entry>,
-    sweep: VecDeque<PageId>,
+    sweep: BTreeMap<u64, PageId>,
+    sweep_cursor: u64,
     next_incarnation: u64,
     next_waiter: u64,
     next_operation: u64,
@@ -77,7 +78,9 @@ struct Entry {
     fence: Fence,
     state: FlightState,
     leader: Option<u64>,
-    waiters: HashMap<u64, WaiterRecord>,
+    waiters: BTreeMap<u64, WaiterRecord>,
+    deadlines: BTreeMap<(Instant, u64), ()>,
+    waiter_cursor: u64,
     operations: HashMap<u64, Option<Retained>>,
     outcome: Option<Outcome>,
     result: Option<PageResult>,
@@ -691,7 +694,9 @@ impl Flights {
                         },
                         state: FlightState::RetryPending,
                         leader: None,
-                        waiters: HashMap::default(),
+                        waiters: BTreeMap::new(),
+                        deadlines: BTreeMap::new(),
+                        waiter_cursor: 0,
                         operations: HashMap::default(),
                         outcome: None,
                         result: None,
@@ -700,9 +705,12 @@ impl Flights {
                         _reservation: flight,
                     },
                 );
-                table.sweep.push_back(page.clone());
+                table.sweep.insert(incarnation, page.clone());
             }
             let entry = table.entries.get_mut(&page).unwrap();
+            entry
+                .deadlines
+                .insert((scope.deadline.0.min(budget.deadline), id), ());
             entry.waiters.insert(
                 id,
                 WaiterRecord {
@@ -764,6 +772,7 @@ impl Flights {
                 1,
             )?;
             let id = next(&mut table.next_waiter)?;
+            entry.deadlines.insert((scope.deadline.0, id), ());
             entry.waiters.insert(
                 id,
                 WaiterRecord {
@@ -906,25 +915,53 @@ impl Flights {
             .borrow()
             .entries
             .values()
-            .flat_map(|entry| entry.waiters.values())
-            .filter(|waiter| waiter.error.is_none())
-            .map(|waiter| waiter.scope.deadline.0.min(waiter.budget_deadline))
+            .filter_map(|entry| {
+                entry
+                    .deadlines
+                    .first_key_value()
+                    .map(|((deadline, _), _)| *deadline)
+            })
             .min()
     }
 
     fn sweep_budgeted(&self, work_budget: usize) -> Result<()> {
         self.update(|table, wakes| {
             for _ in 0..work_budget.min(table.sweep.len()) {
-                let page = table.sweep.pop_front().unwrap();
+                let Some((&id, page)) = table
+                    .sweep
+                    .range((
+                        std::ops::Bound::Excluded(table.sweep_cursor),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .or_else(|| table.sweep.first_key_value())
+                else {
+                    break;
+                };
+                let page = page.clone();
+                table.sweep_cursor = id;
                 if let Some(entry) = table.entries.get_mut(&page) {
+                    // One cancellation candidate per entry, independent of fan-in.
+                    let waiter = entry
+                        .waiters
+                        .range((
+                            std::ops::Bound::Excluded(entry.waiter_cursor),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .or_else(|| entry.waiters.first_key_value())
+                        .map(|(id, _)| *id);
+                    if let Some(id) = waiter {
+                        entry.waiter_cursor = id;
+                        refresh_waiter(entry, id, wakes);
+                    }
                     refresh(entry, wakes);
                     if entry.waiters.is_empty() && entry.operations.is_empty() {
                         if let Some(waker) = entry.drain_waker.take() {
                             wakes.push(waker);
                         }
                         table.entries.remove(&page);
-                    } else {
-                        table.sweep.push_back(page);
+                        table.sweep.remove(&id);
                     }
                 }
             }
@@ -952,6 +989,7 @@ impl Flights {
                 entry.state = FlightState::Draining;
                 notify(entry, wakes);
                 entry.waiters.clear();
+                entry.deadlines.clear();
                 settle(entry, wakes);
             }
         });
@@ -1031,7 +1069,21 @@ impl Flights {
             }
             Ok(())
         })?;
-        self.sweep_budgeted(self.limits.entries)
+        self.update(|table, wakes| {
+            if table
+                .entries
+                .get(&fence.page)
+                .is_some_and(|entry| entry.waiters.is_empty() && entry.operations.is_empty())
+            {
+                if let Some(mut entry) = table.entries.remove(&fence.page) {
+                    table.sweep.remove(&entry.fence.incarnation);
+                    if let Some(waker) = entry.drain_waker.take() {
+                        wakes.push(waker);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn leader_entry<'a>(
@@ -1112,18 +1164,20 @@ fn revoke(entry: &mut Entry, error: Error, wakes: &mut Vec<Waker>) {
     settle(entry, wakes);
 }
 fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    for waiter in entry.waiters.values_mut() {
-        if waiter.error.is_none() {
-            waiter.error = waiter.scope.check().err().or_else(|| {
-                (crate::runtime::environment::now() >= waiter.budget_deadline)
-                    .then_some(Error::DeadlineExceeded)
-            });
-            if waiter.error.is_some() {
-                if let Some(waker) = waiter.waker.take() {
-                    wakes.push(waker);
-                }
-            }
+    if let Some(id) = entry.leader {
+        refresh_waiter(entry, id, wakes);
+    }
+    // Deadline work is bounded independently of the number of waiters. More
+    // expired entries retain their index and are serviced on the next turn.
+    for _ in 0..64 {
+        let Some((&(deadline, id), _)) = entry.deadlines.first_key_value() else {
+            break;
+        };
+        if deadline > crate::runtime::environment::now() {
+            break;
         }
+        entry.deadlines.remove(&(deadline, id));
+        refresh_waiter(entry, id, wakes);
     }
     if entry.state == FlightState::Acquiring
         && entry
@@ -1142,6 +1196,25 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
     if entry.state == FlightState::RetryPending && !entry.waiters.values().any(eligible) {
         entry.outcome = Some(Outcome::Failed(Error::Unavailable));
         settle(entry, wakes);
+    }
+}
+fn refresh_waiter(entry: &mut Entry, id: u64, wakes: &mut Vec<Waker>) {
+    let Some(waiter) = entry.waiters.get_mut(&id) else {
+        return;
+    };
+    if waiter.error.is_none() {
+        waiter.error = waiter.scope.check().err().or_else(|| {
+            (crate::runtime::environment::now() >= waiter.budget_deadline)
+                .then_some(Error::DeadlineExceeded)
+        });
+    }
+    if waiter.error.is_some() {
+        entry
+            .deadlines
+            .remove(&(waiter.scope.deadline.0.min(waiter.budget_deadline), id));
+        if let Some(waker) = waiter.waker.take() {
+            wakes.push(waker);
+        }
     }
 }
 fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
@@ -1183,14 +1256,18 @@ impl Registration {
     fn detach(&mut self) -> Result<FlightState> {
         let state = self.flights.update(|table, wakes| {
             let entry = registered(table, self)?;
-            entry.waiters.remove(&self.id);
+            if let Some(waiter) = entry.waiters.remove(&self.id) {
+                entry
+                    .deadlines
+                    .remove(&(waiter.scope.deadline.0.min(waiter.budget_deadline), self.id));
+            }
             refresh(entry, wakes);
             if entry.waiters.is_empty() && entry.operations.is_empty() {
                 if let Some(waker) = entry.drain_waker.take() {
                     wakes.push(waker);
                 }
                 table.entries.remove(&self.fence.page);
-                table.sweep.retain(|page| page != &self.fence.page);
+                table.sweep.remove(&self.fence.incarnation);
                 if let Some(waker) = table.drain_waker.take() {
                     wakes.push(waker);
                 }
@@ -1491,6 +1568,16 @@ mod tests {
             .get_mut(&b.registration.id)
             .unwrap()
             .budget_deadline = Instant::now();
+        {
+            let mut table = flights.table.borrow_mut();
+            let entry = table.entries.get_mut(&fence().page).unwrap();
+            entry
+                .deadlines
+                .retain(|(_, id), _| *id != b.registration.id);
+            entry
+                .deadlines
+                .insert((Instant::now(), b.registration.id), ());
+        }
         flights.poll_budgeted(1).unwrap();
         assert!(count.0.load(Ordering::Relaxed) > 0);
         failed(&mut b, Error::DeadlineExceeded);
@@ -1969,6 +2056,16 @@ mod tests {
             .get_mut(&b.registration.id)
             .unwrap()
             .budget_deadline = Instant::now();
+        {
+            let mut table = flights.table.borrow_mut();
+            let entry = table.entries.get_mut(&fence().page).unwrap();
+            entry
+                .deadlines
+                .retain(|(_, id), _| *id != b.registration.id);
+            entry
+                .deadlines
+                .insert((Instant::now(), b.registration.id), ());
+        }
         flights.poll_budgeted(1).unwrap();
         assert!(count.0.load(Ordering::Relaxed) > 0);
         failed(&mut b, Error::DeadlineExceeded);

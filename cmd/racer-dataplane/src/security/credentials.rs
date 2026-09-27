@@ -108,6 +108,41 @@ pub struct CredentialCrypto {
     admission: Rc<Admission>,
 }
 impl CredentialCrypto {
+    /// Independently admitted same-worker context. No trust boundary is crossed;
+    /// retain exact fields and zeroization without a credential AEAD round trip.
+    pub(crate) fn local_context(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<ChargedOriginContext> {
+        scope.check()?;
+        let metadata = context
+            .metadata
+            .as_ref()
+            .map(OpaqueMetadata::as_header)
+            .transpose()?;
+        let raw = context
+            .authorization
+            .as_ref()
+            .map(Authorization::expose_for_origin)
+            .transpose()?;
+        let size = bounds(&context.object, metadata, raw.map_or(0, <[u8]>::len))?;
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::RequestContext,
+            size,
+        )?;
+        let context = OriginContext {
+            object: context.object.clone(),
+            metadata: metadata.map(OpaqueMetadata::from_header).transpose()?,
+            authorization: raw.map(Authorization::from_header).transpose()?,
+        };
+        scope.check()?;
+        Ok(ChargedOriginContext {
+            context,
+            _reservation: reservation,
+        })
+    }
     pub fn new(keys: Rc<Keyring>, admission: Rc<Admission>) -> Self {
         Self { keys, admission }
     }
@@ -278,6 +313,64 @@ impl CredentialCrypto {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
+        let keys = std::rc::Rc::new(crate::security::keyring::tests::keys());
+        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let crypto = super::CredentialCrypto::new(keys, admission.clone());
+        let scope = crate::runtime::deadline::RequestScope::new(
+            crate::model::identity::RequestId([4; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let context = crate::model::context::OriginContext {
+            object: crate::model::identity::ObjectId {
+                cache: crate::model::identity::CacheId(
+                    "00000000-0000-4000-8000-000000000001".into(),
+                ),
+                key: crate::model::identity::CacheKey([3; 32]),
+            },
+            metadata: Some(
+                crate::model::context::OpaqueMetadata::from_header(b"meta\xff").unwrap(),
+            ),
+            authorization: Some(
+                crate::model::context::Authorization::from_header(b"opaque\x80").unwrap(),
+            ),
+        };
+        let first = crypto.local_context(&context, &scope).unwrap();
+        let used = admission.used(crate::model::limits::ResourceClass::RequestContext);
+        let second = crypto.local_context(&context, &scope).unwrap();
+        assert_eq!(
+            admission.used(crate::model::limits::ResourceClass::RequestContext),
+            2 * used
+        );
+        drop(context);
+        assert_eq!(
+            first
+                .authorization
+                .as_ref()
+                .unwrap()
+                .expose_for_origin()
+                .unwrap(),
+            b"opaque\x80"
+        );
+        assert_eq!(
+            second.metadata.as_ref().unwrap().as_header().unwrap(),
+            b"meta\xff"
+        );
+        scope.cancel().unwrap();
+        assert!(matches!(
+            crypto.local_context(&first, &scope),
+            Err(crate::error::Error::Cancelled)
+        ));
+        drop((first, second));
+        assert_eq!(
+            admission.used(crate::model::limits::ResourceClass::RequestContext),
+            0
+        );
+    }
     use super::*;
     use crate::model::identity::{CacheId, CacheKey};
     fn scope() -> RequestScope {

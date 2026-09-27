@@ -168,6 +168,7 @@ impl Drop for Receipt {
     }
 }
 struct Active {
+    runnable: Arc<super::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,
     caller: RequestScope,
@@ -499,6 +500,22 @@ impl WorkerDirectory {
             return Err(Error::InvalidRequest);
         }
         let owner = self.page_owner(&page)?;
+        if self.is_local(owner) {
+            let local = self.local()?;
+            let context = local.local_context(context, scope)?;
+            let scope = scope.clone();
+            return Ok(Box::pin(async move {
+                let mut budget = budget;
+                let result = local
+                    .acquire(page.clone(), membership, &context, &scope, &mut budget)
+                    .await
+                    .and_then(|value| {
+                        value.validate_for(&page)?;
+                        Ok(value)
+                    });
+                Ok((result, budget))
+            }));
+        }
         let work = Work::Acquire(page.clone(), membership, self.seal(context, scope)?);
         let receipt = self.submit(owner, work, scope, Some(budget))?;
         Ok(Box::pin(async move {
@@ -654,9 +671,11 @@ impl WorkerEndpoint {
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         self.mailbox.state.lock().unwrap().waker = Some(cx.waker().clone());
+        let mut remaining_polls = self.active.len();
         for _ in 0..work_budget {
             let command = self.mailbox.state.lock().unwrap().queue.pop_front();
             if let Some(command) = command {
+                remaining_polls += 1;
                 let local = self.local.clone();
                 let caller = command.scope.clone();
                 let mut scope = caller.clone();
@@ -664,6 +683,7 @@ impl WorkerEndpoint {
                 let active_scope = scope.clone();
                 let reply = command.reply.clone();
                 self.active.push_back(Active {
+                    runnable: super::drivers::Runnable::new(),
                     scope: active_scope,
                     caller,
                     reply,
@@ -689,7 +709,10 @@ impl WorkerEndpoint {
                     }),
                 });
             }
-            if let Some(mut active) = self.active.pop_front() {
+            if remaining_polls != 0
+                && let Some(mut active) = self.active.pop_front()
+            {
+                remaining_polls -= 1;
                 let registration = active.caller.cancellation.register(cx.waker());
                 if registration.is_err()
                     || active.reply.abandoned.load(Ordering::Acquire)
@@ -697,7 +720,11 @@ impl WorkerEndpoint {
                 {
                     let _ = active.scope.cancel();
                 }
-                match active.future.as_mut().poll(cx) {
+                let force = active.scope.check().is_err();
+                match active
+                    .runnable
+                    .poll(std::pin::Pin::new(&mut active.future), cx, force)
+                {
                     Poll::Pending => self.active.push_back(active),
                     Poll::Ready(result) => result?,
                 }
@@ -914,6 +941,7 @@ mod tests {
         for id in 0..3 {
             let order = order.clone();
             endpoint.active.push_back(Active {
+                runnable: crate::read::drivers::Runnable::new(),
                 scope: scope(),
                 caller: scope(),
                 reply: Arc::new(Reply {
@@ -936,12 +964,17 @@ mod tests {
         for _ in 0..6 {
             endpoint.poll(&mut cx, 1).unwrap();
         }
-        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(&*order.borrow(), &[0, 1, 2]);
         assert_eq!(
             count.count(),
             0,
             "active length does not imply runnable work"
         );
+        for active in &endpoint.active {
+            std::task::Wake::wake_by_ref(&active.runnable);
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
         endpoint.active.clear(); // Test futures have no accepted I/O to fence.
     }
 

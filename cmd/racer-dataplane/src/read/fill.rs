@@ -264,22 +264,12 @@ impl Fill {
                     AcquisitionEvent::Lead(leader) => {
                         let driver_permit = super::drivers::reserve()?;
                         let acquisition = waiter.acquisition(&leader)?;
-                        // Seal/open creates an independently admitted operation owner;
-                        // no raw secret clone or request borrow escapes into a worker job.
-                        let mut nonce = [0; 16];
-                        crate::runtime::environment::fill_random(&mut nonce)
-                            .map_err(|_| Error::Unavailable)?;
-                        let attempt = crate::model::identity::AttemptId(nonce);
-                        let sealed = self.dependencies.credentials.seal(
-                            acquisition.origin,
-                            attempt,
-                            acquisition.scope,
-                        )?;
-                        let owned_context = self.dependencies.credentials.open_charged(
-                            sealed,
-                            acquisition.scope.request,
-                            attempt,
-                        )?;
+                        // The acquisition driver stays on this owner. Admit an
+                        // independent zeroizing context without crossing an AEAD domain.
+                        let owned_context = self
+                            .dependencies
+                            .credentials
+                            .local_context(acquisition.origin, acquisition.scope)?;
                         let operation = self
                             .dependencies
                             .flights
