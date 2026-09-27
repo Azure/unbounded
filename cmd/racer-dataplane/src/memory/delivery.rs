@@ -554,7 +554,12 @@ mod tests {
             .unwrap();
         drive(&reactor, delivery.finish(reader, &scope())).unwrap();
         assert!(weak.upgrade().is_none());
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "idle pipe remains admitted"
+        );
+        assert!(delivery.pipes.acquire().is_ok());
         let mut bytes = Vec::new();
         peer.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"selected");
@@ -856,7 +861,12 @@ mod tests {
         assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
         assert_eq!(reactor.in_flight(), 0);
         assert!(weak.upgrade().is_none());
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "idle pipe remains admitted"
+        );
+        assert!(delivery.pipes.acquire().is_ok());
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
 
@@ -975,10 +985,15 @@ mod tests {
             drop(operation);
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
-            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert_eq!(
+                admission.used(ResourceClass::Pipe),
+                1,
+                "idle pipe remains admitted"
+            );
             assert_eq!(admission.used(ResourceClass::Connection), 0);
             // The reactor's own ring allocation remains admitted until drop.
             drop(delivery);
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
             drop(reactor);
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(scope.check(), Ok(()));
@@ -1026,7 +1041,12 @@ mod tests {
         assert_eq!(received, bytes);
         assert_eq!(completed.as_ref().unwrap().tx_remaining, Some(0));
         assert!(weak.upgrade().is_none());
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "idle pipe remains admitted"
+        );
+        assert!(delivery.pipes.acquire().is_ok());
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         drop(completed);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -1061,7 +1081,12 @@ mod tests {
             }
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
-            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert_eq!(
+                admission.used(ResourceClass::Pipe),
+                1,
+                "idle pipe remains admitted"
+            );
+            assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
     }
@@ -1081,7 +1106,12 @@ mod tests {
         drop(operation);
         assert_eq!(reactor.in_flight(), 0);
         assert!(weak.upgrade().is_none());
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "idle pipe remains admitted"
+        );
+        assert!(delivery.pipes.acquire().is_ok());
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
     }
@@ -1104,7 +1134,11 @@ mod tests {
         assert_eq!(connection.tx_remaining, Some(0));
         assert!(weak.upgrade().is_none());
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "idle pipe remains admitted"
+        );
         let mut replacement = delivery.pipes.acquire().unwrap();
         replacement.try_write(&[0xff; 4096]).unwrap();
         let mut received = vec![0; bytes.len()];

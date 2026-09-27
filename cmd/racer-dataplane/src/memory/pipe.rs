@@ -1,7 +1,8 @@
 //! Bounded, nonblocking, per-reader kernel pipes.
 //!
-//! Each lease owns both descriptors and its admission charge. No descriptor or
-//! backing page is recycled while a reader owns the lease. Writes copy into kernel
+//! Each lease owns both descriptors and its admission charge. Idle empty pipes
+//! retain that charge in the worker-local pool. No descriptor or backing page is
+//! recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
@@ -19,7 +20,7 @@ use std::{
     future::poll_fn,
     io,
     os::fd::{AsFd, AsRawFd, FromRawFd},
-    rc::Rc,
+    rc::{Rc, Weak},
     task::{Poll, Waker},
 };
 
@@ -32,6 +33,7 @@ pub struct PipePool {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     waiting: Waiters,
+    idle: Rc<RefCell<Vec<PipeResources>>>,
 }
 
 type Waiters = Rc<RefCell<VecDeque<Rc<RefCell<Option<Waker>>>>>>;
@@ -72,14 +74,35 @@ impl Drop for Waiting {
 }
 
 pub struct PipeLease {
+    resources: Option<PipeResources>,
+    pool: Weak<RefCell<Vec<PipeResources>>>,
+    admission: Weak<Admission>,
+    _notify: Notify,
+}
+
+struct PipeResources {
     read: OwnedFd,
     write: OwnedFd,
     capacity: usize,
     buffered: usize,
     // Declared after the descriptors so capacity is returned only after closing.
     _reservation: Reservation,
-    // Wake only after descriptors close and admission is returned.
-    _notify: Notify,
+}
+
+impl Drop for PipeLease {
+    fn drop(&mut self) {
+        // Reactor ownership keeps the lease alive through every accepted CQE.
+        // Never recycle canceled/partially drained payloads: close those pipes.
+        if let Some(resources) = self.resources.take() {
+            if resources.buffered == 0 && self.admission.upgrade().is_some_and(|a| !a.is_stopped())
+            {
+                if let Some(pool) = self.pool.upgrade() {
+                    pool.borrow_mut().push(resources);
+                }
+            }
+        }
+        // Notify drops after the pipe has been recycled or its charge released.
+    }
 }
 
 impl PipePool {
@@ -88,6 +111,7 @@ impl PipePool {
             admission,
             reactor,
             waiting: Rc::default(),
+            idle: Rc::default(),
         }
     }
 
@@ -97,6 +121,11 @@ impl PipePool {
 
     pub(crate) fn reactor(&self) -> &Reactor {
         &self.reactor
+    }
+
+    /// Empty retained pipes, still charged to the worker's fixed pipe budget.
+    pub fn idle_count(&self) -> usize {
+        self.idle.borrow().len()
     }
 
     /// FIFO scheduling above immediate raw admission. At most queue_entries wait
@@ -154,19 +183,24 @@ impl PipePool {
 
     /// Reserve before creating descriptors. Exhaustion never waits for a reader.
     pub fn acquire(&self) -> Result<PipeLease> {
+        if self.admission.is_stopped() {
+            return Err(Error::Unavailable);
+        }
+        if let Some(resources) = self.idle.borrow_mut().pop() {
+            return Ok(self.lease(resources));
+        }
         let reservation = self.admission.reserve(None, ResourceClass::Pipe, 1)?;
         reservation.validate(ResourceClass::Pipe, 1)?;
         #[cfg(test)]
         if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
             let (read, write) = sim.pipe(MAX_PIPE_BYTES);
-            return Ok(PipeLease {
+            return Ok(self.lease(PipeResources {
                 read,
                 write,
                 capacity: MAX_PIPE_BYTES,
                 buffered: 0,
                 _reservation: reservation,
-                _notify: Notify(self.waiting.clone()),
-            });
+            }));
         }
         let mut fds = [-1; 2];
         // SAFETY: pipe2 initializes exactly two descriptors on success.
@@ -190,75 +224,87 @@ impl PipePool {
         if capacity <= 0 || capacity as usize > MAX_PIPE_BYTES {
             return Err(Error::Io);
         }
-        Ok(PipeLease {
+        Ok(self.lease(PipeResources {
             read,
             write,
             capacity: capacity as usize,
             buffered: 0,
             _reservation: reservation,
+        }))
+    }
+
+    fn lease(&self, resources: PipeResources) -> PipeLease {
+        PipeLease {
+            resources: Some(resources),
+            pool: Rc::downgrade(&self.idle),
+            admission: Rc::downgrade(&self.admission),
             _notify: Notify(self.waiting.clone()),
-        })
+        }
     }
 }
 
 impl PipeLease {
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.resources.as_ref().unwrap().capacity
     }
 
     pub fn buffered(&self) -> usize {
-        self.buffered
+        self.resources.as_ref().unwrap().buffered
     }
 
     /// Copy at most the available capacity. WouldBlock and Interrupted are exposed
     /// to the caller; this method never waits or retains a borrowed buffer.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let OwnedFd::Sim(handle) = &self.write {
+        if let OwnedFd::Sim(handle) = &pipe.write {
             let written = handle.pipe_write(bytes)?;
-            self.buffered += written;
+            pipe.buffered += written;
             return Ok(written);
         }
         // SAFETY: the initialized slice stays live for this nonblocking syscall.
         // The read end is owned by this lease, so this cannot generate SIGPIPE.
         let written = unsafe {
             libc::write(
-                self.write.as_raw_fd(),
+                pipe.write.as_raw_fd(),
                 bytes.as_ptr().cast(),
-                bytes.len().min(self.capacity),
+                bytes.len().min(pipe.capacity),
             )
         };
         let written = syscall_count(written)?;
-        self.buffered += written;
+        pipe.buffered += written;
         Ok(written)
     }
 
     /// Read currently buffered bytes, or return WouldBlock for an empty pipe.
     pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let OwnedFd::Sim(handle) = &self.read {
+        if let OwnedFd::Sim(handle) = &pipe.read {
             let read = handle.pipe_read(bytes)?;
-            self.buffered -= read;
+            pipe.buffered -= read;
             return Ok(read);
         }
         // SAFETY: the destination is exclusively borrowed until read returns.
         let read = unsafe {
             libc::read(
-                self.read.as_raw_fd(),
+                pipe.read.as_raw_fd(),
                 bytes.as_mut_ptr().cast(),
                 bytes.len(),
             )
         };
         let read = syscall_count(read)?;
-        self.buffered -= read;
+        pipe.buffered -= read;
         Ok(read)
     }
 
     pub fn try_splice_descriptor(&mut self, socket: &OwnedFd, count: usize) -> io::Result<usize> {
         #[cfg(test)]
-        if let (OwnedFd::Sim(pipe), OwnedFd::Sim(socket)) = (&self.read, socket) {
-            let sent = pipe.splice(socket, count.min(self.buffered))?;
-            self.buffered -= sent;
+        if let (OwnedFd::Sim(pipe), OwnedFd::Sim(socket)) =
+            (&self.resources.as_ref().unwrap().read, socket)
+        {
+            let sent = pipe.splice(socket, count.min(self.buffered()))?;
+            self.resources.as_mut().unwrap().buffered -= sent;
             return Ok(sent);
         }
         self.try_splice_to(socket, count)
@@ -268,6 +314,7 @@ impl PipeLease {
     /// caller retains both owners through this synchronous syscall. Unsupported
     /// splice errors leave the bytes in the pipe for an independent copy fallback.
     pub fn try_splice_to(&mut self, socket: &impl AsFd, count: usize) -> io::Result<usize> {
+        let pipe = self.resources.as_mut().unwrap();
         let fd = socket.as_fd().as_raw_fd();
         // SPLICE_F_NONBLOCK controls the pipe side; the socket must also be
         // nonblocking. Never risk a blocking call for an arbitrary caller's FD.
@@ -298,7 +345,7 @@ impl PipeLease {
         if kind != libc::SOCK_STREAM {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        if count == 0 || self.buffered == 0 {
+        if count == 0 || pipe.buffered == 0 {
             return Ok(0);
         }
         // Unlike send, splice has no MSG_NOSIGNAL. Mask only on this worker and
@@ -308,11 +355,11 @@ impl PipeLease {
         // pointers, and both ends are nonblocking. No vmsplice/GIFT is involved.
         let result = syscall_count(unsafe {
             libc::splice(
-                self.read.as_raw_fd(),
+                pipe.read.as_raw_fd(),
                 std::ptr::null_mut(),
                 fd,
                 std::ptr::null_mut(),
-                count.min(self.buffered),
+                count.min(pipe.buffered),
                 libc::SPLICE_F_NONBLOCK,
             )
         });
@@ -324,7 +371,7 @@ impl PipeLease {
         }
         drop(signal);
         if let Ok(sent) = result {
-            self.buffered -= sent;
+            pipe.buffered -= sent;
         }
         result
     }
@@ -426,6 +473,34 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn empty_pipe_reuses_descriptors_and_partial_pipe_is_closed() {
+        let admission = admission(1);
+        let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
+        let mut pipe = pool.acquire().unwrap();
+        let read = pipe.resources.as_ref().unwrap().read.as_raw_fd();
+        let write = pipe.resources.as_ref().unwrap().write.as_raw_fd();
+        pipe.try_write(b"secret").unwrap();
+        let mut bytes = [0; 6];
+        assert_eq!(pipe.try_read(&mut bytes).unwrap(), 6);
+        drop(pipe);
+        assert_eq!(admission.used(ResourceClass::Pipe), 1);
+        let mut pipe = pool.acquire().unwrap();
+        assert_eq!(pipe.resources.as_ref().unwrap().read.as_raw_fd(), read);
+        assert_eq!(pipe.resources.as_ref().unwrap().write.as_raw_fd(), write);
+        assert_eq!(
+            pipe.try_read(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        pipe.try_write(b"discard").unwrap();
+        drop(pipe);
+        assert!(pool.idle.borrow().is_empty());
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        // SAFETY: only query the closed descriptor numbers, without reusing them.
+        assert_eq!(unsafe { libc::fcntl(read, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(write, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
     fn exhaustion_and_drop_return_capacity_even_after_pool_drop() {
         let admission = admission(1);
         let reactor = Rc::new(Reactor::new(admission.clone()));
@@ -487,6 +562,12 @@ pub(super) mod tests {
         assert!(pool.waiting.borrow().is_empty());
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         drop(leases);
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            2,
+            "idle pipes remain admitted"
+        );
+        drop(pool);
         assert_eq!(admission.used(ResourceClass::Pipe), 0);
     }
 
@@ -542,6 +623,7 @@ pub(super) mod tests {
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
             drop(held);
+            drop(pool);
             assert_eq!(admission.used(ResourceClass::Pipe), 0);
         }
     }
@@ -553,7 +635,8 @@ pub(super) mod tests {
         let pool = PipePool::new(admission, reactor);
         let mut first = pool.acquire().unwrap();
         let mut second = pool.acquire().unwrap();
-        for fd in [&first.read, &first.write] {
+        let resources = first.resources.as_ref().unwrap();
+        for fd in [&resources.read, &resources.write] {
             // SAFETY: these descriptors are owned for the duration of the query.
             assert_ne!(
                 unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,

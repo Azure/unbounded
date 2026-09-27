@@ -1882,6 +1882,22 @@ mod tests {
         }
     }
 
+    fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePool) {
+        use crate::model::limits::ResourceClass;
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        assert_eq!(
+            fixture.listeners.admission.used(ResourceClass::Pipe),
+            pipes.idle_count()
+        );
+        for class in [
+            ResourceClass::Plaintext,
+            ResourceClass::Ciphertext,
+            ResourceClass::Connection,
+        ] {
+            assert_eq!(fixture.listeners.admission.used(class), 0, "{class:?}");
+        }
+    }
+
     #[test]
     fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
         let (mut fixture, _pipes) = body_fixture_with_large_page(2, false, true);
@@ -1946,7 +1962,7 @@ mod tests {
         output.extend(fixture.receive(&mut socket, true));
         assert!(output.len() - head_end < crate::model::range::PAGE_BYTES as usize);
         assert!(output[head_end..].iter().all(|byte| *byte == b'x'));
-        assert_no_body_leases(&fixture);
+        assert_only_idle_pipes(&fixture, &_pipes);
     }
 
     #[test]
@@ -1967,7 +1983,7 @@ mod tests {
             assert!(output.starts_with(b"HTTP/1.1 206 "));
             assert!(output.ends_with(b"\r\n\r\nhello"));
         }
-        assert_no_body_leases(&fixture);
+        assert_only_idle_pipes(&fixture, &pipes);
     }
 
     #[test]
@@ -1978,7 +1994,7 @@ mod tests {
         let output = fixture.receive(&mut socket, true);
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
         assert!(output.ends_with(b"\r\n\r\n"));
-        assert_no_body_leases(&fixture);
+        assert_only_idle_pipes(&fixture, &_pipes);
         fixture.assert_metrics(1, 1, 0);
     }
 
@@ -2003,7 +2019,7 @@ mod tests {
             assert!(output.ends_with(b"\r\n\r\n"));
             drop(held);
             futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
-            assert_no_body_leases(&fixture);
+            assert_only_idle_pipes(&fixture, &pipes);
             fixture.assert_metrics(1, 1, 0);
         }
     }

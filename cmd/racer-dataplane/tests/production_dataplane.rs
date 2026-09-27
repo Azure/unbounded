@@ -378,6 +378,7 @@ struct Rig {
     dispatcher: Rc<Dispatcher>,
     io: Rc<HttpIo>,
     responses: Rc<Responses>,
+    pipes: Rc<PipePool>,
     writer_task: RefCell<Option<Operation<'static, ()>>>,
     adapter: Adapter,
     _scratch: Scratch,
@@ -593,8 +594,9 @@ impl Rig {
                 owners: directory.clone(),
             },
         ));
+        let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+            pipes.clone(),
             // This fixture polls real crypto inline rather than on its paired
             // production thread. Debug-build page crypto must not count as a
             // two-second client stall while the fixture executor is occupied.
@@ -630,6 +632,7 @@ impl Rig {
             dispatcher,
             io: client_io,
             responses,
+            pipes,
             writer_task: RefCell::new(None),
             adapter,
             _scratch: scratch,
@@ -1111,7 +1114,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let cancel = std::future::poll_fn(|_| {
         if slow_head.load(Ordering::Acquire) && fast_done.load(Ordering::Acquire) {
             assert!(
-                rig.admission.used(ResourceClass::Pipe) > 0,
+                rig.admission.used(ResourceClass::Pipe) > rig.pipes.idle_count(),
                 "slow reader must retain a delivery lease"
             );
             slow_scope.cancel().unwrap();
@@ -1132,7 +1135,9 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     drop(slow_reader.join().unwrap());
     check(&fast_reader.join().unwrap(), 1, 0, P, P);
     rig.drive(std::future::poll_fn(|_| {
-        if rig.reactor.in_flight() == 0 && rig.admission.used(ResourceClass::Pipe) == 0 {
+        if rig.reactor.in_flight() == 0
+            && rig.admission.used(ResourceClass::Pipe) == rig.pipes.idle_count()
+        {
             Poll::Ready(())
         } else {
             Poll::Pending
