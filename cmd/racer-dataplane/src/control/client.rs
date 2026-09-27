@@ -47,6 +47,8 @@ pub struct ControlClient {
     renewal_error: Cell<Option<Error>>,
     renew_next: Cell<Option<Instant>>,
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
+    binding_check: Cell<bool>,
+    restart_required: Cell<bool>,
 }
 struct Busy<'a>(&'a Cell<bool>);
 struct ActiveTurn<'a>(&'a RefCell<Option<RequestScope>>);
@@ -105,6 +107,8 @@ impl ControlClient {
             renewal_error: Cell::new(None),
             renew_next: Cell::new(None),
             startup_bundle: RefCell::new(None),
+            binding_check: Cell::new(false),
+            restart_required: Cell::new(false),
         }
     }
     /// Reads the projected token at submission; retries reuse the same request ID.
@@ -146,6 +150,9 @@ impl ControlClient {
             let _busy = enter(&self.poll_busy)?;
             if self.stopped.get() {
                 return Err(Error::Cancelled);
+            }
+            if self.restart_required.get() {
+                return Err(Error::NodeIdentityChanged);
             }
             let identity = self.identity.borrow().clone().ok_or(Error::Unauthorized)?;
             let connection = self.transport.authenticated(&identity, scope).await?;
@@ -240,6 +247,9 @@ impl ControlClient {
     /// Replace the initially unresolved worker-local view with one built from the
     /// same shared epochs and the authenticated startup NodeId, then activate it.
     pub fn bind_keyring(&self, keys: Rc<Keyring>) -> Result<()> {
+        if self.restart_required.get() {
+            return Err(Error::NodeIdentityChanged);
+        }
         let identity = self.identity.borrow();
         let identity = identity.as_ref().ok_or(Error::Unauthorized)?;
         if keys.node() != identity.node() || keys.cluster() != identity.cluster() {
@@ -266,6 +276,9 @@ impl ControlClient {
                 return Err(Error::Cancelled);
             }
             if self.started.get() {
+                if self.restart_required.get() {
+                    return Err(Error::NodeIdentityChanged);
+                }
                 return self.identity.borrow().clone().ok_or(Error::Unauthorized);
             }
             if self
@@ -297,15 +310,14 @@ impl ControlClient {
         }
         self.enrollment
             .set_peer_trust_roots(bundle.peer_trust_roots.clone())?;
-        let identity = match self.enrollment.load_identity_async(scope).await? {
-            Some(i) => i,
-            None => {
-                let request = self.enrollment.prepare(scope).await?;
-                self.enrollment
-                    .accept_response_async(self.enroll(&request, scope).await?, scope)
-                    .await?
-            }
-        };
+        // Recover interrupted persistence, but a disk certificate is not evidence
+        // of the current Kubernetes Node binding, even while it remains valid.
+        self.enrollment.load_identity_async(scope).await?;
+        let request = self.enrollment.prepare(scope).await?;
+        let identity = self
+            .enrollment
+            .accept_response_async(self.enroll(&request, scope).await?, scope)
+            .await?;
         *self.identity.borrow_mut() = Some(identity.clone());
         *self.startup_bundle.borrow_mut() = Some(bundle);
         self.started.set(true);
@@ -313,6 +325,9 @@ impl ControlClient {
         Ok(identity)
     }
     pub fn activate_identity(&self) -> Result<()> {
+        if self.restart_required.get() {
+            return Err(Error::NodeIdentityChanged);
+        }
         let identity = self.identity.borrow().clone().ok_or(Error::Unauthorized)?;
         let keys = self.keys.borrow();
         if keys.node() != identity.node() || keys.cluster() != identity.cluster() {
@@ -338,6 +353,9 @@ impl ControlClient {
             }
             if !self.started.get() {
                 return Err(Error::InvalidConfiguration);
+            }
+            if self.restart_required.get() {
+                return Err(Error::NodeIdentityChanged);
             }
             if self
                 .next
@@ -379,11 +397,12 @@ impl ControlClient {
             }
             Err(e) => self.projection_error.set(Some(e)),
         }
-        let renewal = self
-            .identity
-            .borrow()
-            .as_ref()
-            .is_none_or(|i| i.renewal_due());
+        let renewal = self.binding_check.get()
+            || self
+                .identity
+                .borrow()
+                .as_ref()
+                .is_none_or(|i| i.renewal_due());
         if renewal
             && (self
                 .identity
@@ -397,6 +416,7 @@ impl ControlClient {
         {
             match self.renew(scope).await {
                 Ok(()) => {
+                    self.binding_check.set(false);
                     self.renewal_error.set(None);
                     self.renew_next.set(None);
                 }
@@ -418,15 +438,21 @@ impl ControlClient {
                 }
             }
         }
-        match self
+        let polled = self
             .poll(
                 SnapshotRequest {
                     after: self.snapshots.cursor()?,
                 },
                 scope,
             )
-            .await?
-        {
+            .await;
+        // A deleted UID may disappear from the controller's informer index and
+        // yield 503 indefinitely. Recheck via token enrollment on the next bounded
+        // retry rather than waiting for the old certificate's renewal deadline.
+        if matches!(polled, Err(Error::Unavailable)) {
+            self.binding_check.set(true);
+        }
+        match polled? {
             SnapshotResponse::Updated(publication) => {
                 scope.check()?;
                 // Validate before acceptance; event delivery is infallible after this.
@@ -448,18 +474,30 @@ impl ControlClient {
     async fn renew(&self, scope: &RequestScope) -> Result<()> {
         let request = self.enrollment.prepare(scope).await?;
         let response = self.enroll(&request, scope).await?;
-        let identity = self
-            .enrollment
-            .accept_response_async(response, scope)
-            .await?;
-        if self
+        self.accept_renewal(response, scope).await
+    }
+    // Only called with a response from server-authenticated token enrollment.
+    async fn accept_renewal(
+        &self,
+        response: EnrollmentResponse,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let changed = self
             .identity
             .borrow()
             .as_ref()
-            .is_some_and(|old| old.node() != identity.node())
-        {
-            return Err(Error::Unauthorized);
+            .is_some_and(|old| old.node() != &response.node);
+        // The response arrived over authenticated TLS. Latch before persistence:
+        // cancellation or a failed fsync after rename must also stop this graph.
+        // Enrollment still validates all evidence before committing any identity.
+        self.restart_required.set(changed);
+        let accepted = self.enrollment.accept_response_async(response, scope).await;
+        if changed {
+            // No new identity enters old keyrings, snapshots, replay, or sessions.
+            // Startup reauthenticates whether persistence succeeded or failed.
+            return Err(Error::NodeIdentityChanged);
         }
+        let identity = accepted?;
         let keys = self.keys.borrow();
         keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
         *self.identity.borrow_mut() = Some(identity);
@@ -547,6 +585,73 @@ mod tests {
             Rc::new(SnapshotStore::new(cluster, Arc::new(PublishedState), 2)),
             Rc::new(CacheRegistry),
         )
+    }
+    #[test]
+    fn changed_binding_latches_restart_across_abandoned_or_failed_persistence() {
+        for abandon in [false, true] {
+            let Some(r) = testing::reactor() else { return };
+            let d = testing::Directory::new();
+            let client = client(&d);
+            let (ca, key) = testing::ca();
+            client
+                .enrollment
+                .set_peer_trust_roots(vec![ca.der().to_vec()])
+                .unwrap();
+            let request = client.enrollment.prepare_now().unwrap();
+            let old = client
+                .enrollment
+                .accept_response(testing::issue(
+                    &request,
+                    &ca,
+                    &key,
+                    "22222222-2222-4222-8222-222222222222",
+                ))
+                .unwrap();
+            *client.identity.borrow_mut() = Some(old.clone());
+            client.started.set(true);
+            let request = client.enrollment.prepare_now().unwrap();
+            let response =
+                testing::issue(&request, &ca, &key, "33333333-3333-4333-8333-333333333333");
+            let committed = std::fs::read(d.0.join("identity/identity.json")).unwrap();
+            client.enrollment.attach_reactor(r.clone());
+            let scope = testing::scope();
+            if abandon {
+                let mut renewal = Box::pin(client.accept_renewal(response, &scope));
+                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                assert!(renewal.as_mut().poll(&mut cx).is_pending());
+                drop(renewal);
+            } else {
+                // Disk failure before commit still requires the graph to exit.
+                std::fs::remove_file(d.0.join("identity/pending.json")).unwrap();
+                assert_eq!(
+                    testing::drive(&r, Box::pin(client.accept_renewal(response, &scope))),
+                    Err(Error::NodeIdentityChanged)
+                );
+            }
+            assert_eq!(client.identity().unwrap().node(), old.node());
+            assert_eq!(client.activate_identity(), Err(Error::NodeIdentityChanged));
+            assert_eq!(
+                client.bind_keyring(client.keys.borrow().clone()),
+                Err(Error::NodeIdentityChanged)
+            );
+            assert!(matches!(
+                testing::drive(&r, client.start(&scope)),
+                Err(Error::NodeIdentityChanged)
+            ));
+            assert!(matches!(
+                testing::drive(&r, client.progress(&scope)),
+                Err(Error::NodeIdentityChanged)
+            ));
+            assert!(matches!(
+                testing::drive(&r, client.poll(SnapshotRequest { after: None }, &scope)),
+                Err(Error::NodeIdentityChanged)
+            ));
+            testing::drive(&r, r.drain()).unwrap();
+            assert_eq!(
+                std::fs::read(d.0.join("identity/identity.json")).unwrap(),
+                committed
+            );
+        }
     }
     #[test]
     fn status_policy_backoff_and_shutdown_are_explicit() {

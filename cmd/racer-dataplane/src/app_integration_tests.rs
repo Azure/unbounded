@@ -327,7 +327,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
     let images = crate::store::recovery::read_candidates(&config.slab_directory).unwrap();
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].1.shards.len(), 2);
-    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
 }
 
 struct Fixture {
@@ -337,6 +337,162 @@ struct Fixture {
     config: Option<Config>,
     enrollments: Arc<AtomicUsize>,
     polls: Arc<AtomicUsize>,
+    binding: Arc<Mutex<NodeId>>,
+    bootstrap_status: Arc<AtomicUsize>,
+    poll_status: Arc<AtomicUsize>,
+    certificate_age: Arc<AtomicUsize>,
+}
+
+#[test]
+fn startup_reauthenticates_retained_identity_and_fails_closed() {
+    let mut fixture = Fixture::new();
+    let config = fixture.config.take().unwrap();
+    let start = || {
+        let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(5)).unwrap(),
+        )
+    };
+    let old = start().unwrap();
+    let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
+    let new = NodeId("99999999-9999-4999-8999-999999999999".into());
+    *fixture.binding.lock().unwrap() = new.clone();
+    fixture.bootstrap_status.store(403, Ordering::Release);
+    assert_eq!(start(), Err(Error::Unauthorized));
+    assert_eq!(
+        std::fs::read(config.identity_directory.join("identity.json")).unwrap(),
+        committed
+    );
+    assert!(config.identity_directory.join("pending.json").exists());
+    assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
+    fixture.bootstrap_status.store(200, Ordering::Release);
+    assert_eq!(start().unwrap(), new);
+    assert_ne!(old, new);
+    assert!(!config.identity_directory.join("pending.json").exists());
+    assert_eq!(start().unwrap(), new);
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 3);
+}
+
+#[test]
+fn node_replacement_drains_all_workers_and_restart_converges() {
+    use crate::runtime::affinity::{EffectiveTopology, WorkerPair};
+    for renewal_due in [false, true] {
+        let mut fixture = Fixture::new();
+        let mut config = fixture.config.take().unwrap();
+        let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
+        config.node = bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(15)).unwrap(),
+        )
+        .unwrap();
+        if renewal_due {
+            fixture
+                .certificate_age
+                .store(16 * 3600 + 60, Ordering::Release);
+        }
+        let app = Arc::new(Application {
+            limits: config.limits.clone(),
+            config: Arc::new(config),
+            node: node.clone(),
+            fabric_ports: vec![],
+        });
+        let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
+        let mut group = WorkerGroup::new(AffinityPlan {
+            max_threads: 5,
+            pairs: (0..2)
+                .map(|id| WorkerPair {
+                    worker: WorkerId(id),
+                    io: cpu.clone(),
+                    crypto: cpu.clone(),
+                    nic: None,
+                })
+                .collect(),
+        });
+        group
+            .start(app.clone(), &scope(Duration::from_secs(15)).unwrap())
+            .unwrap();
+        assert!(node.observations.health.ready());
+        let new = NodeId("99999999-9999-4999-8999-999999999999".into());
+        *fixture.binding.lock().unwrap() = new.clone();
+        if !renewal_due {
+            fixture.poll_status.store(503, Ordering::Release);
+        }
+        let until = Instant::now() + Duration::from_secs(15);
+        while node.observations.health.ready() {
+            assert!(
+                Instant::now() < until,
+                "replacement did not stop the worker graph"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(group.join(), Err(Error::NodeIdentityChanged));
+        assert!(!node.observations.health.ready());
+        // The old shared signing epoch was never rebound, even after committing
+        // the replacement to disk. Both workers completed their checkpoint cut.
+        let old_keys = Keyring::new(
+            app.config.cluster.clone(),
+            app.config.node.clone(),
+            node.keys.clone(),
+        );
+        assert_eq!(
+            old_keys.signing_identity().unwrap().node(),
+            &app.config.node
+        );
+        let images = crate::store::recovery::read_candidates(&app.config.slab_directory).unwrap();
+        assert_eq!(images[0].1.shards.len(), 2);
+        fixture.poll_status.store(200, Ordering::Release);
+        fixture.certificate_age.store(1, Ordering::Release);
+        let fresh = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+        drop(group);
+        let app = Arc::try_unwrap(app).ok().unwrap();
+        let mut config = Arc::try_unwrap(app.config).ok().unwrap();
+        config.node = bootstrap(
+            &config,
+            &fresh,
+            &config.limits,
+            &scope(Duration::from_secs(15)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.node, new);
+        let (mut worker, runtime, mut engine) = local_worker(&config, &fresh, 0);
+        drive(
+            &runtime,
+            &mut engine,
+            worker.start(&scope(Duration::from_secs(15)).unwrap()),
+        )
+        .unwrap();
+        assert!(fresh.observations.health.ready());
+        assert_eq!(worker.keys.node(), &new);
+        assert_eq!(
+            worker
+                .snapshots
+                .current()
+                .unwrap()
+                .membership
+                .member(&new)
+                .unwrap()
+                .node,
+            new
+        );
+        drive(
+            &runtime,
+            &mut engine,
+            worker.drain(&scope(Duration::from_secs(5)).unwrap()),
+        )
+        .unwrap();
+        drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
+        drive(
+            &runtime,
+            &mut engine,
+            worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -517,7 +673,15 @@ impl Fixture {
         .unwrap();
         symlink("epoch", directory.join("secrets/..data")).unwrap();
         let node = config.node.clone();
-        let publication = wire::Publication {
+        let binding = Arc::new(Mutex::new(node.clone()));
+        let current_binding = binding.clone();
+        let bootstrap_status = Arc::new(AtomicUsize::new(200));
+        let enrollment_status = bootstrap_status.clone();
+        let poll_status = Arc::new(AtomicUsize::new(200));
+        let snapshot_status = poll_status.clone();
+        let certificate_age = Arc::new(AtomicUsize::new(1));
+        let age = certificate_age.clone();
+        let mut publication = wire::Publication {
             schema_version: 1,
             cluster: config.cluster.clone(),
             sequence: wire::PublicationSequence(1),
@@ -583,7 +747,24 @@ impl Fixture {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
-                let (status, body) = if head.starts_with("POST ") {
+                let node = current_binding.lock().unwrap().clone();
+                publication.members[0].node = node.clone();
+                let requested_status = if head.starts_with("POST ") {
+                    enrollment_status.load(Ordering::Acquire)
+                } else {
+                    snapshot_status.load(Ordering::Acquire)
+                };
+                let (status, body) = if requested_status != 200 {
+                    let code = if requested_status == 503 {
+                        "unavailable"
+                    } else {
+                        "forbidden"
+                    };
+                    (
+                        requested_status,
+                        format!("{{\"code\":\"{code}\"}}").into_bytes(),
+                    )
+                } else if head.starts_with("POST ") {
                     assert!(head.contains("Authorization: Bearer fixture.token"));
                     assert!(stream.conn.peer_certificates().is_none());
                     let request = wire::decode_enrollment_request(&body).unwrap();
@@ -591,10 +772,10 @@ impl Fixture {
                         request.csr_der.clone(),
                     );
                     let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-                    csr.params.not_before =
-                        (std::time::SystemTime::now() - Duration::from_secs(1)).into();
-                    csr.params.not_after =
-                        (std::time::SystemTime::now() + Duration::from_secs(86399)).into();
+                    let not_before = std::time::SystemTime::now()
+                        - Duration::from_secs(age.load(Ordering::Acquire) as u64);
+                    csr.params.not_before = not_before.into();
+                    csr.params.not_after = (not_before + Duration::from_secs(86400)).into();
                     csr.params.subject_alt_names = vec![rcgen::SanType::URI(
                         format!("spiffe://{}/node/{}", request.cluster.0, node.0)
                             .try_into()
@@ -642,6 +823,10 @@ impl Fixture {
             config: Some(config),
             enrollments,
             polls,
+            binding,
+            bootstrap_status,
+            poll_status,
+            certificate_age,
         }
     }
 }
@@ -710,8 +895,8 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     );
     assert_eq!(
         fixture.enrollments.load(Ordering::Acquire),
-        1,
-        "worker uses durably recovered identity"
+        2,
+        "worker reauthenticates the current binding before serving"
     );
     for _ in 0..8 {
         runtime.reactor.poll_budgeted(64).unwrap();
