@@ -58,13 +58,19 @@ crash with stale hostPath sockets.
   require all three page mappings under the projected page key. Launch a new PID
   with the same identity/slabs, reject origin requests, and verify the complete
   pinned object, exactly three disk hits, and zero origin calls/fills. The
-  persisted identity is unchanged and enrollment occurs only once.
+  persisted certificate is freshly issued after token reauthentication; its
+  verified cluster and Node UID remain the same. Each process enrolls twice,
+  during pre-worker bootstrap and control-worker startup, so the two incarnations
+  require four enrollments. Readiness requires completed pending identity cleanup.
 - **Interrupted SIGKILL:** deliver and verify page zero, wait for real slab
   allocation, then pause the origin after sending the first chunk of another
   page. Kill and reap the process without graceful shutdown. Require no published
   checkpoint, launch a fresh PID with the same identity/slabs, and verify every
   byte of the pinned object. Require safe misses and the exact three pinned origin
   page refetches. A subsequent cross-page read succeeds with origin disabled.
+  The same fresh-issuance, authenticated binding, and enrollment-count checks
+  apply after SIGKILL; a valid persisted certificate never bypasses startup
+  token authentication.
 
 Readiness, client I/O, origin I/O, and process-exit waits are bounded. Process
 guards kill and reap children on failure and print their captured logs. This is
