@@ -212,7 +212,7 @@ func assertWorkloadPeerMembership(t *testing.T, ds *appsv1.DaemonSet, peerPort u
 			t.Fatalf("peer listener must bind the exact Pod IP and peer port: %q", listen)
 		}
 
-		members, diagnostics, err := ReconcileMembers([]corev1.Node{memberNode()}, []corev1.Pod{pod}, testDaemonSetUID, nil, peerPort)
+		members, diagnostics, err := ReconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, testDaemonSetUID, nil, peerPort)
 		if err != nil || len(diagnostics) != 0 || len(members) != 1 {
 			t.Fatalf("unready Pod with IPs %v must be published: %v, %v", ips, diagnostics, err)
 		}

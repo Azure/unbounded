@@ -157,8 +157,13 @@ previous attributes while a valid new endpoint can still replace the old one, an
 valid annotation changes can take effect during a Pod gap. Identical rail mappings
 are deduplicated; conflicting mappings for the same rail ID reject the attributes.
 Missing annotations reset to defaults. Missing managed DaemonSets are endpoint gaps.
-Callers supply installation-namespace Pods and the current managed DaemonSet UID;
-endpoint selection checks the `apps/v1` DaemonSet controller owner reference.
+`ReconcileMembers(nodes, podsByNode, daemonSetUID, accepted, port)` takes
+installation-namespace Pods grouped by assigned node name and the current managed
+DaemonSet UID. Topology passes each namespace-scoped, node-indexed list directly
+as a map entry. Endpoint selection still checks each Pod's node assignment and
+the `apps/v1` DaemonSet controller owner reference. Node UID order determines
+diagnostic order, independently of map or Pod order. The result owns its nested
+state, including retained rails and NUMA values.
 
 `BuildCatalog` returns a UID-sorted desired catalog or rejects the whole candidate. It
 delegates canonical path validation to the wire package. Client sockets use fixed

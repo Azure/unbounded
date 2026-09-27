@@ -193,7 +193,7 @@ func TestSelectEndpoint(t *testing.T) {
 func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 	node := memberNode()
 	pod := memberPod("a", 1, "192.0.2.1")
-	initial, diagnostics, err := ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, nil, 7443)
+	initial, diagnostics, err := ReconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, testDaemonSetUID, nil, 7443)
 
 	want := wire.Member{Node: testNodeUID, Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true, PeerEndpoint: "192.0.2.1:7443"}
 	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(initial[testNodeUID], want) {
@@ -217,7 +217,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 			node := node.DeepCopy()
 			node.Annotations = tc.annotations
 
-			got, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, tc.pods, testDaemonSetUID, initial, 7443)
+			got, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, testDaemonSetUID, initial, 7443)
 			if err != nil || len(diagnostics) != tc.diagnostics || got[testNodeUID].Shares != tc.shares || got[testNodeUID].PeerEndpoint != tc.endpoint {
 				t.Fatalf("warm reconcile: %#v, %v, %v", got, diagnostics, err)
 			}
@@ -226,7 +226,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 				t.Fatal("mutated accepted input")
 			}
 
-			cold, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, tc.pods, testDaemonSetUID, nil, 7443)
+			cold, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, testDaemonSetUID, nil, 7443)
 			if err != nil || len(cold) != 0 || len(diagnostics) != tc.diagnostics {
 				t.Fatalf("cold reconcile: %#v, %v, %v", cold, diagnostics, err)
 			}
@@ -244,7 +244,9 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 	node := memberNode()
 	pod := memberPod("a", 1, "192.0.2.1")
 
-	accepted, _, err := ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, nil, 7443)
+	pods := map[string][]corev1.Pod{node.Name: {pod}}
+
+	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +254,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 	for _, label := range []string{"", "false", "true"} {
 		node.Labels = map[string]string{wire.ExclusionLabel: label}
 
-		got, diagnostics, err := ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, accepted, 7443)
+		got, diagnostics, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, accepted, 7443)
 		if err != nil || len(got) != 0 || len(diagnostics) != 0 {
 			t.Fatalf("exclusion: %v, %v, %v", got, diagnostics, err)
 		}
@@ -277,7 +279,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 		t.Fatalf("same-name recreation inherited history: %v, %v", got, err)
 	}
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, accepted, 7443)
+	got, _, err = ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, accepted, 7443)
 	if err != nil || len(got) != 1 || got[testOtherUID].Node != testOtherUID {
 		t.Fatalf("new UID not admitted: %v, %v", got, err)
 	}
@@ -286,7 +288,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 	node.DeletionTimestamp = &metav1.Time{}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, got, 7443)
+	got, _, err = ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, got, 7443)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("readiness removed ownership: %v, %v", got, err)
 	}
@@ -297,12 +299,21 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 	node.Annotations = map[string]string{wire.SharesAnnotation: "8", wire.AlignmentAnnotation: "false", wire.RailsAnnotation: `[{"rail":0,"fabric":"a","numa_node":1}]`}
 	pod := memberPod("a", 1, "192.0.2.1")
 
-	accepted, _, err := ReconcileMembers([]corev1.Node{node}, []corev1.Pod{pod}, testDaemonSetUID, nil, 7443)
+	pods := map[string][]corev1.Pod{node.Name: {pod}}
+
+	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	pods[node.Name][0].Status.PodIP = "192.0.2.9"
+	*pods[node.Name][0].OwnerReferences[0].Controller = false
+	delete(pods, node.Name)
 	node.Annotations[wire.SharesAnnotation] = "invalid"
+
+	if accepted[testNodeUID].PeerEndpoint != "192.0.2.1:7443" || accepted[testNodeUID].Shares != 8 {
+		t.Fatal("candidate aliases Kubernetes inputs")
+	}
 
 	got, _, err := ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
 	if err != nil || !reflect.DeepEqual(got, accepted) {
@@ -315,6 +326,18 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 
 	if accepted[testNodeUID].Rails[0].Fabric != "a" || *accepted[testNodeUID].Rails[0].NUMANode != 1 {
 		t.Fatal("retention aliases accepted state")
+	}
+
+	got, _, err = ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accepted[testNodeUID].Rails[0].Fabric = "changed input"
+
+	*accepted[testNodeUID].Rails[0].NUMANode = 7
+	if got[testNodeUID].Rails[0].Fabric != "a" || *got[testNodeUID].Rails[0].NUMANode != 1 {
+		t.Fatal("accepted input mutation changed retained output")
 	}
 
 	node.Annotations = nil
@@ -348,15 +371,76 @@ func TestReconcileMembersRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestReconcileMembersGroupedPods(t *testing.T) {
+	nodeA, nodeB := memberNode(), memberNode()
+	nodeB.Name, nodeB.UID = "node-b", testOtherUID
+	nodeB.Annotations = map[string]string{wire.SharesAnnotation: "invalid"}
+	podA := memberPod("a", 1, "192.0.2.1")
+	wrongNode := memberPod("wrong-node", 3, "192.0.2.3")
+	wrongNode.Spec.NodeName = nodeB.Name
+	wrongOwner := memberPod("wrong-owner", 4, "192.0.2.4")
+	wrongOwner.OwnerReferences[0].UID = "old-daemonset"
+	nodes := []corev1.Node{nodeB, nodeA}
+	pods := map[string][]corev1.Pod{
+		nodeA.Name: {wrongNode, podA, wrongOwner},
+		nodeB.Name: {podA},
+		"absent":   {wrongNode},
+	}
+
+	podsBefore := make(map[string][]corev1.Pod, len(pods))
+	for name, group := range pods {
+		for _, pod := range group {
+			podsBefore[name] = append(podsBefore[name], *pod.DeepCopy())
+		}
+	}
+
+	var firstDiagnostics []Diagnostic
+
+	for range 2 {
+		members, diagnostics, err := ReconcileMembers(nodes, pods, testDaemonSetUID, nil, 7443)
+		if err != nil || len(members) != 1 || members[testNodeUID].PeerEndpoint != "192.0.2.1:7443" {
+			t.Fatalf("grouped endpoint checks: %v, %v", members, err)
+		}
+
+		if len(diagnostics) != 2 || diagnostics[0].Object != nodeB.Name || diagnostics[0].Field != "annotations" || diagnostics[1].Object != nodeB.Name || diagnostics[1].Field != "peer_endpoint" {
+			t.Fatalf("grouped diagnostics: %v", diagnostics)
+		}
+
+		if firstDiagnostics != nil && !reflect.DeepEqual(diagnostics, firstDiagnostics) {
+			t.Fatalf("input order changed diagnostics: %v, %v", diagnostics, firstDiagnostics)
+		}
+
+		firstDiagnostics = diagnostics
+
+		if !reflect.DeepEqual(pods, podsBefore) {
+			t.Fatal("mutated grouped Pod inputs")
+		}
+
+		slices.Reverse(nodes)
+		slices.Reverse(pods[nodeA.Name])
+		slices.Reverse(podsBefore[nodeA.Name])
+	}
+
+	// Multiple rejected nodes must report in UID order, not input or map order.
+	nodeA.Annotations = nodeB.Annotations
+	for _, nodes := range [][]corev1.Node{{nodeB, nodeA}, {nodeA, nodeB}} {
+		_, diagnostics, err := ReconcileMembers(nodes, nil, testDaemonSetUID, nil, 7443)
+		if err != nil || len(diagnostics) != 4 || diagnostics[0].Object != nodeA.Name || diagnostics[1].Object != nodeA.Name || diagnostics[2].Object != nodeB.Name || diagnostics[3].Object != nodeB.Name {
+			t.Fatalf("node diagnostic order: %v, %v", diagnostics, err)
+		}
+	}
+}
+
 func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	nodeA, nodeB := memberNode(), memberNode()
 	nodeB.Name, nodeB.UID = "node-b", testOtherUID
 	nodeA.Annotations = map[string]string{wire.RailsAnnotation: `[{"rail":2,"fabric":"b"},{"rail":1,"fabric":"a"},{"rail":1,"fabric":"a"}]`}
 	podA, podB := memberPod("a", 1, "192.0.2.1"), memberPod("b", 1, "192.0.2.2")
 	podB.Spec.NodeName = "node-b"
-	nodes, pods := []corev1.Node{nodeB, nodeA}, []corev1.Pod{podA, podB}
+	nodes := []corev1.Node{nodeB, nodeA}
+	pods := map[string][]corev1.Pod{nodeA.Name: {podA}, nodeB.Name: {podB}}
 	nodesBefore := []corev1.Node{*nodeB.DeepCopy(), *nodeA.DeepCopy()}
-	podsBefore := []corev1.Pod{*podA.DeepCopy(), *podB.DeepCopy()}
+	podsBefore := map[string][]corev1.Pod{nodeA.Name: {*podA.DeepCopy()}, nodeB.Name: {*podB.DeepCopy()}}
 
 	members, diagnostics, err := ReconcileMembers(nodes, pods, testDaemonSetUID, nil, 7443)
 	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(nodes, nodesBefore) || !reflect.DeepEqual(pods, podsBefore) {
@@ -371,7 +455,8 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	}
 
 	slices.Reverse(nodes)
-	slices.Reverse(pods)
+
+	pods = map[string][]corev1.Pod{nodeB.Name: {podB}, nodeA.Name: {podA}}
 
 	nodes[0].Annotations[wire.RailsAnnotation] = `[{"rail":1,"fabric":"a"},{"rail":2,"fabric":"b"}]`
 
@@ -435,7 +520,7 @@ func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 	}
 
 	node := memberNode()
-	pods := []corev1.Pod{memberPod("a", 1, "192.0.2.1")}
+	pods := map[string][]corev1.Pod{node.Name: {memberPod("a", 1, "192.0.2.1")}}
 
 	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
 	if err != nil {
