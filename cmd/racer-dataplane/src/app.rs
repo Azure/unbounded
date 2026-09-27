@@ -99,6 +99,9 @@ mod caches;
 mod health;
 #[path = "app_native.rs"]
 mod native;
+#[cfg(test)]
+#[path = "app_peer_tests.rs"]
+mod peer_tests;
 #[path = "app_recovery.rs"]
 mod recovery;
 
@@ -239,7 +242,8 @@ fn partition_limits(node: &Limits, workers: usize, rdma: bool) -> Result<Limits>
         || limits.dirty_bytes.get() < page + 16
         || rdma && native::slot_count(&limits)? == 0
         || limits.request_context_bytes.get()
-            < 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES)
+            < crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
+                + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES)
         || limits.queue_entries.get() < 2
         || limits.client_connections < limits.connections_per_neighbor
     {
@@ -533,7 +537,7 @@ impl WorkerApplication {
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             crate::http::codec::Codec::new(
-                config.limits.header_bytes.get(),
+                crate::peer::wire::MAX_ENVELOPE_HEAD,
                 crate::model::range::PAGE_BYTES + 16,
             ),
             admission.clone(),
@@ -648,8 +652,20 @@ impl WorkerApplication {
             requester.clone(),
         ));
         let origin: Rc<dyn Origin> = Rc::new(
-            OriginClient::new(snapshots.clone(), http.clone(), io.clone())
-                .with_buffers(admission.clone(), buffers.clone()),
+            OriginClient::new(
+                snapshots.clone(),
+                http.clone(),
+                Rc::new(
+                    io.capped(
+                        config
+                            .limits
+                            .header_bytes
+                            .get()
+                            .min(crate::http::codec::MAX_HEAD_BYTES),
+                    ),
+                ),
+            )
+            .with_buffers(admission.clone(), buffers.clone()),
         );
         let flights = Rc::new(Flights::new(admission.clone()));
         let fill = Rc::new(

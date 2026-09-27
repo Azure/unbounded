@@ -49,7 +49,9 @@ impl Signatures {
             return Err(Error::InvalidRequest);
         }
         receiver(&head)?;
-        self.sign_fields(head)
+        let signed = self.sign_fields(head)?;
+        Codec::new(protocol::MAX_HEAD, u64::MAX).encode_head(&signed.head)?;
+        Ok(signed)
     }
     pub(crate) fn sign_fields(&self, mut head: MessageHead) -> Result<SignedHead> {
         let identity = self.keys.signing_identity()?;
@@ -207,7 +209,10 @@ pub fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
             ("@method", StartLine::Request { method, .. }) => method.clone(),
             ("@request-target", StartLine::Request { target, .. }) => target.clone(),
             ("@status", StartLine::Response { status }) => status.to_string(),
-            _ => field(head, &name)?,
+            // The complete outer head was bounded by components(). Its base64
+            // provenance fields can exceed the inner logical field's 64 KiB cap.
+            _ => String::from_utf8(head.unique(&name)?.ok_or(Error::Unauthorized)?.to_vec())
+                .map_err(|_| Error::Unauthorized)?,
         };
         lines.push(format!("\"{name}\": {value}"));
     }

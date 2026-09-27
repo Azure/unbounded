@@ -83,6 +83,10 @@ pub const REQUEST_TARGET: &str = "/racer/peer/v2/exchange";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_SIGNED_HEAD: usize = crate::security::protocol::MAX_HEAD;
 pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
+/// Per-worker progress floor: retained inbound/outbound envelopes, decoded context,
+/// signing/encoding scratch and simultaneous receive/send staging during a relay.
+/// Runtime admission still rejects concurrent work when this shared budget is full.
+pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
 
 /// Logical fields are decoded by the canonical security profile, not inferred
 /// from unauthenticated transport headers. This bridge also owns charged decoding.
@@ -313,5 +317,70 @@ mod tests {
         encoded.extend_from_slice(b"extra");
         assert!(decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
         assert!(decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
+    }
+    #[test]
+    fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
+        let signers = crate::security::signing::tests::network(2);
+        let mut head = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: vec![
+                Header {
+                    name: "racer-receiver".into(),
+                    value: signers[1].node().0.as_bytes().to_vec(),
+                },
+                Header {
+                    name: "padding".into(),
+                    value: b"x".to_vec(),
+                },
+            ],
+        };
+        let small = signers[0].sign(head).unwrap();
+        let codec = Codec::new(MAX_SIGNED_HEAD, u64::MAX);
+        let length = codec.encode_head(&small.head).unwrap().len();
+        head = small.head;
+        head.headers.retain(|h| {
+            !crate::security::signing::is_auth_field(&h.name) || h.name == "racer-receiver"
+        });
+        head.headers
+            .iter_mut()
+            .find(|h| h.name == "padding")
+            .unwrap()
+            .value
+            .resize(1 + MAX_SIGNED_HEAD - length, b'x');
+        let maximum = signers[0].sign(head).unwrap();
+        assert_eq!(
+            codec.encode_head(&maximum.head).unwrap().len(),
+            MAX_SIGNED_HEAD
+        );
+        let encoded = encode_signed(&maximum).unwrap();
+        assert!(encoded.len() > MAX_SIGNED_HEAD);
+        let mut envelope = ForwardedHead {
+            original: Arc::new(maximum),
+            hops: (0..MAX_HOPS)
+                .map(|_| decode_signed(&encoded).unwrap())
+                .collect(),
+        };
+        let mut outer = WireCodec::encode(&envelope, true, 0).unwrap();
+        crate::security::protocol::push(&mut outer, "racer-receiver", &signers[1].node().0);
+        let outer = signers[0].sign_fields(outer).unwrap();
+        signers[1].verify_proof(outer).unwrap();
+        envelope.hops.push(decode_signed(&encoded).unwrap());
+        assert!(WireCodec::encode(&envelope, true, 0).is_err());
+        let mut too_large = decode_signed(&encoded).unwrap();
+        too_large
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "padding")
+            .unwrap()
+            .value
+            .push(b'x');
+        assert!(matches!(
+            encode_signed(&too_large),
+            Err(Error::HeaderTooLarge)
+        ));
+        let mut decoded = STANDARD.decode(&encoded).unwrap();
+        decoded.insert(decoded.len() - 4, b'x');
+        assert!(decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
     }
 }

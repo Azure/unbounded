@@ -277,7 +277,15 @@ verification checks the outstanding request deadline before admitting a result.
 Session authentication is implemented in `security/connection.rs`. No challenge
 installation map or unauthenticated application traffic is accepted on peer sockets.
 
-The signature profile maximum must agree with `peer::wire::MAX_SIGNED_HEAD` (64 KiB).
+The retained signature profile maximum must agree with `peer::wire::MAX_SIGNED_HEAD`
+(64 KiB). The immediate-hop signed HTTP envelope has a separate bounded
+`MAX_ENVELOPE_HEAD` cap (1,179,648 bytes), covering base64 provenance for the
+maximum forwarding path plus session authentication overhead. Signature
+canonicalization uses that total bound for outer values; logical protocol fields
+retain their 64 KiB bound. Client/origin HTTP remains at 32 KiB. Production peer
+I/O must use the envelope cap and admitted staging, including signing scratch;
+worker sizing must fund relay progress before listeners start. See
+`cmd/racer-dataplane/src/peer/INTEGRATION.md` for the budget formula and tests.
 Logical encoders validate bounded fields before allocation. Historical original
 signatures must also enforce freshness/deadline validity, while sequence admission
 is only for the fresh immediate-hop HTTP head. Immutable response descriptors must

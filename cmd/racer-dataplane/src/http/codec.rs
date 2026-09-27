@@ -8,6 +8,7 @@
 //! Raw heads deliberately do not implement Debug (they can contain credentials).
 use crate::error::{Error, Result};
 use zeroize::Zeroize;
+/// Client/origin profile cap. Other endpoints must supply their own bounded cap.
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 
 pub enum StartLine {
@@ -92,7 +93,7 @@ pub struct Codec {
 impl Codec {
     pub fn new(header_limit: usize, body_limit: u64) -> Self {
         Self {
-            header_limit: header_limit.min(MAX_HEAD_BYTES),
+            header_limit,
             body_limit,
         }
     }

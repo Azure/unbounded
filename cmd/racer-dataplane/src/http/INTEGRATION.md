@@ -16,8 +16,11 @@ socket addresses; this component never performs blocking DNS resolution.
   socket, sets NONBLOCK/CLOEXEC, and reserves one connection.
 - `HttpIo::capped(header_limit)` shares reactor/admission with a smaller head cap.
 - `receive_head_limited(connection, scope, header_limit)` enforces a smaller cap
-  before allocation. Codec limits never exceed 32 KiB. SDK semantic field/ETag
-  limits remain the endpoint adapter's responsibility.
+  before allocation. `Codec::new` honors the supplied endpoint cap; `limited` can
+  only reduce it. Client/origin I/O remains capped at 32 KiB (or the smaller
+  configured limit). Peer I/O uses `peer::wire::MAX_ENVELOPE_HEAD`, with 64 KiB
+  embedded signed heads and handshakes. SDK semantic field/ETag limits remain
+  the endpoint adapter's responsibility.
 - Raw head size includes the received start line, separators and CRLF bytes up to
   the terminating CRLFCRLF, excluding read-ahead. `Codec::decode_head` returns that
   exact consumed byte count. Semantic parsers must not reconstruct it from decoded
@@ -53,6 +56,11 @@ Bytes above ASCII remain unchanged. Raw Header values, encoded send scratch, and
 staging allocations are zeroized. Consumed head bytes are scrubbed before keeping
 body read-ahead. `Codec::encode_head` retains its existing Vec return signature;
 direct users must wrap its result in zeroize::Zeroizing when it contains secrets.
+Receive staging is admitted before allocation. Incremental delimiter/syntax scans
+inspect only new bytes and delimiter overlap before the complete bounded head is
+parsed, avoiding quadratic rescans on fragmented peer traffic. Send staging and
+scratch are admitted before session signing and encoding. Insufficient quota
+returns `Overloaded` before submission, rather than changing the protocol cap.
 
 ## Pool lifecycle and completion ownership
 

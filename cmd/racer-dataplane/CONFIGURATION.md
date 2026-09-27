@@ -180,7 +180,7 @@ is no replay-entry capacity setting. MiB means 1048576 bytes.
 | `RACER_CIPHERTEXT_BYTES` | `268435456` (256 MiB) | 64 GiB |
 | `RACER_DIRTY_BYTES` | `134217728` (128 MiB) | 64 GiB |
 | `RACER_REGISTERED_BYTES` | `134217728` (128 MiB) | 64 GiB |
-| `RACER_REQUEST_CONTEXT_BYTES` | `16777216` (16 MiB) | 64 GiB |
+| `RACER_REQUEST_CONTEXT_BYTES` | `67108864` (64 MiB) | 64 GiB |
 | `RACER_FLIGHTS` | `64` | 65536 |
 | `RACER_WAITERS_PER_FLIGHT` | `64` | 4096 |
 | `RACER_QUEUE_ENTRIES` | `256` | 65536 |
@@ -195,6 +195,13 @@ is no replay-entry capacity setting. MiB means 1048576 bytes.
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
+
+`RACER_HEADER_BYTES` controls client/origin heads only. Peer envelopes use a
+separate 1,179,648-byte cap with 64 KiB embedded signed heads/handshakes, allowing
+base64 expansion and the maximum forwarding path. Each worker requires at least
+`8 * 1179648 + 4 * max(RACER_HEADER_BYTES, 8192)` request-context bytes for relay
+progress. Runtime reduces worker count to fit; an underfunded single worker fails
+startup. Concurrent staging remains admitted and returns `Overloaded` on pressure.
 
 Route searches use explored visited sets and the existing four/eight-link hop
 limits, with no total-work setting. Each worker admits at most
