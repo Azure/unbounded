@@ -33,6 +33,7 @@ struct Dirty {
     staging: Option<Reservation>,
 }
 pub struct StoreWriter {
+    keys: Option<Rc<crate::security::keyring::Keyring>>,
     metrics: crate::telemetry::metrics::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
@@ -60,6 +61,7 @@ impl DirtyTicket {
 impl StoreWriter {
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, slabs: Rc<Slabs>) -> Self {
         Self {
+            keys: None,
             metrics: crate::telemetry::metrics::Metrics::default(),
             index,
             segments,
@@ -76,6 +78,11 @@ impl StoreWriter {
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }
+    }
+    /// Recheck live epochs at enqueue and after I/O, without rotation history.
+    pub fn with_keys(mut self, keys: Rc<crate::security::keyring::Keyring>) -> Self {
+        self.keys = Some(keys);
+        self
     }
     pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
         self.metrics = metrics;
@@ -127,6 +134,18 @@ impl StoreWriter {
     }
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
+        if let Some(keys) = &self.keys {
+            if keys
+                .lease(
+                    Some(&e.page.version.object.cache),
+                    e.key_id,
+                    crate::security::keyring::KeyPurpose::Page,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
         !self
             .retired
             .borrow()
@@ -464,13 +483,17 @@ impl StoreWriter {
     }
     /// Stops new/late publication immediately. Call drain/fence before releasing keys.
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
-        // Bounded tombstones fail closed. Epoch compaction is an explicit startup operation.
-        if self.retired.borrow().len() >= 65536
-            && !self.retired.borrow().contains(&(cache.clone(), key))
-        {
-            return Err(Error::Overloaded);
+        if let Some(keys) = &self.keys {
+            keys.block_page_publication(cache, key)?;
+        } else {
+            // Standalone writers without a keyring retain exact fail-closed fences.
+            if self.retired.borrow().len() >= 65536
+                && !self.retired.borrow().contains(&(cache.clone(), key))
+            {
+                return Err(Error::Overloaded);
+            }
+            self.retired.borrow_mut().insert((cache.clone(), key));
         }
-        self.retired.borrow_mut().insert((cache.clone(), key));
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
         pending.retain(|_, d| {

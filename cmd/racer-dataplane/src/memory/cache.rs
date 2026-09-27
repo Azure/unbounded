@@ -15,6 +15,7 @@ use crate::{
 };
 use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 pub struct MemoryCache {
+    keys: Option<Rc<crate::security::keyring::Keyring>>,
     pool: Rc<BufferPool>,
     entries: RefCell<VecDeque<PageResult>>,
     retired: RefCell<HashSet<(CacheId, KeyId)>>,
@@ -23,11 +24,17 @@ pub struct MemoryCache {
 impl MemoryCache {
     pub fn new(pool: Rc<BufferPool>) -> Self {
         Self {
+            keys: None,
             pool,
             entries: RefCell::new(VecDeque::new()),
             retired: RefCell::new(HashSet::default()),
             removed: RefCell::new(HashSet::default()),
         }
+    }
+    /// Production publication uses the bounded live keyring instead of key tombstones.
+    pub fn with_keys(mut self, keys: Rc<crate::security::keyring::Keyring>) -> Self {
+        self.keys = Some(keys);
+        self
     }
     pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
         let mut entries = self.entries.borrow_mut();
@@ -52,6 +59,13 @@ impl MemoryCache {
         let cache = &id.version.object.cache;
         if self.removed.borrow().contains(cache) {
             return Err(Error::Unavailable);
+        }
+        if let Some(keys) = &self.keys {
+            keys.lease(
+                Some(cache),
+                page.ciphertext.envelope().key_id,
+                crate::security::keyring::KeyPurpose::Page,
+            )?;
         }
         if self
             .retired
@@ -150,7 +164,9 @@ impl MemoryCache {
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
         let mut retired = self.retired.borrow_mut();
         let id = (cache.clone(), key);
-        if !retired.contains(&id) {
+        if let Some(keys) = &self.keys {
+            keys.block_page_publication(cache, key)?;
+        } else if !retired.contains(&id) {
             if retired.len() >= self.pool.entry_limit() {
                 return Err(Error::Overloaded);
             }
@@ -357,5 +373,49 @@ mod tests {
             cache.remove_cache(&CacheId("other".into())),
             Err(Error::Overloaded)
         );
+    }
+    #[test]
+    fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
+        use crate::{
+            control::wire::{CacheKeyPurpose, CacheKeyRef},
+            security::keyring::{RetirementBarriers, tests::rotation_bundle},
+        };
+        struct Fence;
+        impl RetirementBarriers for Fence {
+            fn fence(&self, _: &CacheKeyRef) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let admission = admission(1024);
+        let keys = Rc::new(crate::security::keyring::tests::keys());
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        keys.register_retirement_barriers(Arc::new(Fence)).unwrap();
+        let memory = MemoryCache::new(Rc::new(BufferPool::new(admission))).with_keys(keys.clone());
+        let scope = crate::runtime::deadline::RequestScope::new(
+            crate::model::identity::RequestId([0; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        for generation in 2u64..=6 {
+            let mut next = rotation_bundle(generation, roots.clone());
+            let templates = std::mem::take(&mut next.cache_keys);
+            for cache in 0u64..356 {
+                for template in &templates {
+                    let mut key = template.clone();
+                    key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
+                    key.material[8..16].copy_from_slice(&cache.to_be_bytes());
+                    next.cache_keys.push(key);
+                }
+            }
+            keys.install(next).unwrap();
+            for key in keys.pending_retirements().unwrap() {
+                if key.purpose == CacheKeyPurpose::Page {
+                    assert_eq!(memory.retire_key(&key.cache, key.id), Ok(0));
+                }
+                futures::executor::block_on(keys.retire(&key, &scope)).unwrap();
+            }
+        }
+        assert!(memory.retired.borrow().is_empty());
+        assert!(memory.entries.borrow().is_empty());
     }
 }

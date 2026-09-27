@@ -10,6 +10,13 @@ pub const AEAD_TAG_BYTES: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KeyId(pub [u8; 16]);
+impl KeyId {
+    /// Controller-issued epoch namespace; legacy IDs remain opaque.
+    pub(crate) fn generation(self) -> Option<u64> {
+        (self.0[..4] == *b"RKG1")
+            .then(|| u64::from_be_bytes(self.0[4..12].try_into().expect("generation bytes")))
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nonce(pub [u8; 24]);
 

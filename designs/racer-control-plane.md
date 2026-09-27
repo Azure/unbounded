@@ -320,6 +320,12 @@ establishes 100,000-node HTTPS capacity.
   activation. Caches added during an existing preparation retain their initial
   active keys until the next cycle. Removed cache UIDs lose their key scopes;
   recreation receives unrelated keys.
+  New cache-key IDs bind the first published bundle generation in the existing
+  16-byte ID (`RKG1`, big-endian u64 generation, four random suffix bytes). Existing
+  IDs are never rewritten during activation, pruning, or reconciliation replay.
+  Nodes use the creation generation and accepted bundle high-water mark to reject
+  resurrected epochs without accumulating rotation history. Legacy keys in an
+  existing Secret remain unchanged and age out through normal rotation.
 - Before accepting growth, reserve active/prepared keys and
   `ceil(RetainFor / (Interval + PrepareFor))` retiring generations, with both key
   purposes, worst-case generation digits, and bounded root encoding. Capacity

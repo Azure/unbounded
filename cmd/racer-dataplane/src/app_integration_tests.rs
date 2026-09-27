@@ -144,6 +144,25 @@ fn two_worker_removal_waits_for_late_driver_and_blocks_late_memory_and_disk_fill
     .unwrap();
     let (mut first, rt0, mut crypto0) = local_worker(&config, &node, 0);
     let (mut second, rt1, mut crypto1) = local_worker(&config, &node, 1);
+    // The retained page must have a live epoch, just like a real authenticated fill.
+    first
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: 1,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(2),
+            peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
+            cache_keys: vec![wire::CacheEncryptionKey {
+                key: wire::CacheKeyRef {
+                    cache: definition().id,
+                    id: crate::model::envelope::KeyId([7; 16]),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                state: wire::CacheKeyState::Active,
+                material: [19; 32],
+            }],
+        })
+        .unwrap();
     first
         .telemetry
         .attach_io(rt0.reactor.clone(), rt0.admission.clone())

@@ -119,7 +119,10 @@ Uncheckpointed slab contents are unreachable and are never scanned.
   I/O, and awaits checkpoint.invalidate_persisted_async to remove both recoverable
   generations before key release. This sacrifices unrelated cache recovery
   instead of requiring payload scans. The security owner
-  additionally drains memory/crypto/peer leases. Tombstone bounds fail closed.
+  additionally drains memory/crypto/peer leases. Production writers use `with_keys`
+  to gate enqueue and post-I/O publication on the bounded live keyring, so normal
+  rotations do not accumulate writer tombstones. Standalone writers without a
+  keyring and removed-cache UID tombstone bounds still fail closed.
 - Stopping Admission does not prevent previously accepted fills from handing over
   their dirty reservations. Enqueue uses Admission::reserve_completion for padded
   staging, with the same hard ciphertext limit, and must follow Store::open.

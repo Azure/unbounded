@@ -547,7 +547,7 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
-        let memory = Rc::new(MemoryCache::new(buffers.clone()));
+        let memory = Rc::new(MemoryCache::new(buffers.clone()).with_keys(keys.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(Delivery::new(pipes, config.reader_stall_timeout));
 
@@ -577,6 +577,7 @@ impl WorkerApplication {
         );
         let writer = Rc::new(
             StoreWriter::new(index.clone(), segments.clone(), slabs)
+                .with_keys(keys.clone())
                 .with_metrics(node.metrics.clone()),
         );
         writer.configure(

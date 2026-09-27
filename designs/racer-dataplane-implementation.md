@@ -117,7 +117,7 @@ copy is introduced here.
   worker memory/writer tombstones, asynchronously invalidate both checkpoint slots,
   and resume only after all removal acknowledgments. Capacity rejection precedes
   the pause; superseding an uncommitted removal can retain the old cache. Retired
-  UIDs remain fenced for the process lifetime. Key retirement additionally waits
+  cache UIDs remain fenced for the process lifetime. Key retirement additionally waits
   for retained read drivers, crypto/kernel/native completions and the last key
   lease. Only the control worker prepares and binds listeners on resume. Startup
   continuously drives prepared listeners during control retries. Shutdown waits
@@ -128,11 +128,30 @@ copy is introduced here.
   central recovery/cut, late fills, failed publication rollback, nonempty-cache
   non-listener resume, and multiworker membership churn with retained leases.
   Remaining limitations: retirement pauses unrelated caches and diagnostics;
-  tombstone exhaustion requires restart; allocation failure after cache acceptance
-  retains the pause and retries. Recovery/checkpoint publication filesystem work
+  removed-cache UID tombstone exhaustion requires restart; allocation failure after
+  cache acceptance retains the pause and retries. Recovery/checkpoint publication filesystem work
   remains synchronous. Actual Go-controller interoperability and provider-backed
   RDMA retirement are not established by these application fixtures. Strict Clippy
   is blocked by warnings in other component paths; owned app warnings are fixed.
+
+- Reviewed key-rotation lifetime fix (2026-09-27): production memory and writer
+  publication now require a live, unblocked page epoch in the shared keyring,
+  including the writer's post-I/O publication check. Retirement evicts local
+  entries and blocks the epoch without adding per-worker key tombstones. Worker,
+  checkpoint, native/kernel/crypto completion, and last-key-lease fences still
+  precede material erasure. Controller-issued IDs now encode their creation bundle
+  generation (`RKG1`, big-endian u64, four random suffix bytes). An unknown epoch
+  must be newer than the node's accepted bundle high-water mark and no newer than
+  its containing bundle. Existing epochs retain their original IDs across state
+  transitions and skipped projections. Thus erased generation-bound epochs cannot
+  reappear, even in a newer bundle, without process-lifetime ID history.
+  Legacy opaque IDs keep bounded exact tombstones; deploy the updated controller
+  as well as the dataplane to stop generating legacy history. Standalone memory
+  and writer instances without a keyring retain their original bounded fences.
+  Removed-cache UID limits and the node-wide retirement pause are unchanged.
+  Regression coverage includes 65,538 rotations through memory, writer, and both
+  key purposes, held pages/keys and in-flight write completion, late publication,
+  resurrection rejection, and four retirements across 356 empty stable caches.
 
 - Final integrator additional membership review: SnapshotStore retained_limit is
   an OLD-generation count (`control/snapshot.rs:136`), but PeerNetwork is constructed

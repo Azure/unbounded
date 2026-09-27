@@ -312,6 +312,20 @@ be absent. A removed key must stop new leases immediately, then await registered
 retirement fences and existing leases. Reappearing retired IDs cannot resurrect old
 material. Retirement is retryable and must retain material if barriers are absent.
 
+New controller-issued cache-key IDs use `RKG1 || creation_generation_be_u64 ||
+random_4_bytes` within the existing 16-byte wire field. Generation zero and future
+creation generations fail closed. After initial installation, an unknown ID must
+have a creation generation strictly greater than the last accepted bundle; known
+IDs may persist through any number of bundles. The accepted bundle high-water mark
+therefore fences erased epochs without retaining their IDs. Equal-generation exact
+replay acknowledges configuration but never restores an explicitly retired key.
+Legacy opaque IDs retain exact bounded retirement history, preserving their
+anti-resurrection behavior during rollout. Both controller and dataplane must be
+updated for sustained rotations to stop adding legacy history. The versioned ID
+namespace is reserved; a legacy random ID coinciding with it fails closed if its
+embedded generation is invalid. The new format does not change AEAD material,
+nonces, key-reference scoping, wire lengths, or disk formats.
+
 ## Component verification
 
 Run `cargo test --lib security::` from `cmd/racer-dataplane` for the normal suite.

@@ -22,6 +22,7 @@ struct State {
     cluster: Option<ClusterId>,
     generation: Option<BundleGeneration>,
     fingerprint: Option<[u8; 32]>,
+    // Only legacy opaque IDs require history. Generation-bound IDs use generation.
     retired: Vec<CacheKeyRef>,
     roots: Arc<Vec<Vec<u8>>>,
     entries: Vec<Entry>,
@@ -42,6 +43,83 @@ pub(crate) mod tests {
         keys.install(bundle(1, roots, CacheKeyState::Active))
             .unwrap();
         keys
+    }
+    pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
+        let mut next = bundle(generation, roots, CacheKeyState::Active);
+        for (i, key) in next.cache_keys.iter_mut().enumerate() {
+            key.key.id.0[..4].copy_from_slice(b"RKG1");
+            key.key.id.0[4..12].copy_from_slice(&generation.to_be_bytes());
+            key.key.id.0[12..].copy_from_slice(&(i as u32).to_be_bytes());
+            key.material[..8].copy_from_slice(&generation.to_be_bytes());
+        }
+        next
+    }
+    #[test]
+    fn generation_bound_ids_reject_resurrection_skips_future_and_zero_epochs() {
+        struct Fence;
+        impl RetirementBarriers for Fence {
+            fn fence(&self, _: &CacheKeyRef) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let keys = keys();
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        let first = rotation_bundle(2, roots.clone());
+        keys.install(first.clone()).unwrap();
+        keys.register_retirement_barriers(Arc::new(Fence)).unwrap();
+        let scope = RequestScope::new(
+            crate::model::identity::RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        for key in keys.pending_retirements().unwrap() {
+            futures::executor::block_on(keys.retire(&key, &scope)).unwrap();
+        }
+        // Skipped bundle generations are normal after projected-secret delays.
+        let next = rotation_bundle(100, roots.clone());
+        keys.install(next.clone()).unwrap();
+        let held = first.cache_keys[0].key.clone();
+        for key in keys.pending_retirements().unwrap() {
+            futures::executor::block_on(keys.retire(&key, &scope)).unwrap();
+        }
+        assert!(
+            keys.lease(Some(&held.cache), held.id, KeyPurpose::Page)
+                .is_err()
+        );
+        for generation in [0, 2, 99, 100, 102] {
+            let mut bad = rotation_bundle(generation, roots.clone());
+            bad.generation = BundleGeneration(101);
+            bad.cache_keys[0].key.id.0[15] ^= 128;
+            assert_eq!(keys.install(bad), Err(Error::InvalidConfiguration));
+        }
+        let mut resurrected = first.clone();
+        resurrected.generation = BundleGeneration(101);
+        assert_eq!(keys.install(resurrected), Err(Error::InvalidConfiguration));
+        assert_eq!(keys.install(first), Err(Error::InvalidConfiguration));
+        assert_eq!(keys.install(next), Ok(BundleGeneration(100)));
+        assert_eq!(keys.epochs.state.lock().unwrap().retired.len(), 2);
+        let mut overlap = rotation_bundle(101, roots.clone());
+        let mut retiring = rotation_bundle(100, roots).cache_keys;
+        for key in &mut retiring {
+            key.state = CacheKeyState::Retiring;
+        }
+        overlap.cache_keys.extend(retiring);
+        keys.install(overlap.clone()).unwrap();
+        let active = &overlap.cache_keys[0].key;
+        assert_eq!(
+            keys.block_page_publication(&active.cache, active.id),
+            Err(Error::InvalidRequest)
+        );
+        let old = &overlap.cache_keys[2].key;
+        keys.block_page_publication(&old.cache, old.id).unwrap();
+        futures::executor::block_on(keys.retire(old, &scope)).unwrap();
+        assert_eq!(keys.install(overlap.clone()), Ok(BundleGeneration(101)));
+        assert!(
+            keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
+                .is_err()
+        );
+        overlap.generation = BundleGeneration(102);
+        assert_eq!(keys.install(overlap), Err(Error::InvalidConfiguration));
     }
     fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
         KeyringBundle {
@@ -431,6 +509,15 @@ impl Keyring {
             if state.retired.contains(&candidate.key) {
                 return Err(Error::InvalidConfiguration);
             }
+            if let Some(generation) = candidate.key.id.generation() {
+                if generation == 0
+                    || generation > bundle.generation.0
+                    || (state.generation.is_some_and(|g| generation <= g.0)
+                        && !state.entries.iter().any(|e| e.reference == candidate.key))
+                {
+                    return Err(Error::InvalidConfiguration);
+                }
+            }
             if let Some(old) = state.entries.iter().find(|e| e.reference == candidate.key) {
                 if *old.secret.0 != candidate.material
                     || (old.blocked && candidate.state != CacheKeyState::Retiring)
@@ -598,6 +685,22 @@ impl Keyring {
         state.barriers = Some(barriers);
         Ok(())
     }
+    /// Fence publication through the same bounded live-epoch table as key leases.
+    /// Missing epochs are already fenced; active/prepared epochs cannot be retired.
+    pub(crate) fn block_page_publication(&self, cache: &CacheId, id: KeyId) -> Result<()> {
+        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+        if let Some(entry) = state.entries.iter_mut().find(|e| {
+            &e.reference.cache == cache
+                && e.reference.id == id
+                && e.reference.purpose == CacheKeyPurpose::Page
+        }) {
+            if entry.state != CacheKeyState::Retiring {
+                return Err(Error::InvalidRequest);
+            }
+            entry.blocked = true;
+        }
+        Ok(())
+    }
     pub fn retire<'a>(
         &'a self,
         key: &'a CacheKeyRef,
@@ -634,10 +737,12 @@ impl Keyring {
             if Arc::strong_count(&state.entries[index].secret) != 1 {
                 return Err(Error::Unavailable);
             }
-            if state.retired.len() >= 8192 {
-                return Err(Error::Overloaded);
+            if key.id.generation().is_none() {
+                if state.retired.len() >= 8192 {
+                    return Err(Error::Overloaded);
+                }
+                state.retired.push(key.clone());
             }
-            state.retired.push(key.clone());
             state.entries.remove(index);
             Ok(())
         })
