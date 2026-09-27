@@ -76,7 +76,7 @@ impl Relay {
             let search_budget = super::search_budget(budget, &network.local)?;
             let route = self
                 .paths
-                .shortest_async(membership.clone(), &network.local, &search_budget)
+                .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             if let Some(handshake) = &self.handshake {

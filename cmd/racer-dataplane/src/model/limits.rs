@@ -18,7 +18,6 @@ pub struct Limits {
     pub range_window_pages: NonZeroUsize,
     pub replay_entries: NonZeroUsize,
     pub header_bytes: NonZeroUsize,
-    pub route_search_work: NonZeroUsize,
     pub cached_rankings: NonZeroUsize,
     pub cached_paths: NonZeroUsize,
     /// Old live membership generations in addition to current; cache-only

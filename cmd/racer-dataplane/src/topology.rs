@@ -9,7 +9,7 @@ pub mod rails;
 mod hash;
 
 /// Algorithm changes require a new version and new interoperability vectors.
-pub const ALGORITHM_VERSION: u32 = 1;
+pub const ALGORITHM_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod fixtures;

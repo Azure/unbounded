@@ -862,7 +862,6 @@ mod tests {
             range_window_pages: n,
             replay_entries: n,
             header_bytes: NonZeroUsize::new(32768).unwrap(),
-            route_search_work: n,
             cached_rankings: n,
             cached_paths: n,
             retained_snapshots: n,

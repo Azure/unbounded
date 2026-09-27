@@ -117,7 +117,6 @@ fn limits(pages: usize) -> Limits {
         range_window_pages: nz(2),
         replay_entries: n,
         header_bytes: nz(32768),
-        route_search_work: n,
         cached_rankings: n,
         cached_paths: n,
         retained_snapshots: n,
@@ -538,7 +537,7 @@ impl Rig {
             Rc::new(Handshake::new(signatures, None).with_http(network.clone(), transfers.clone()));
         let peers = Rc::new(
             Requester::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 64, 64)),
+                Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
                 Rc::new(Rails),
                 forwarding,
                 handshake,

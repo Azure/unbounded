@@ -742,7 +742,6 @@ impl Harness {
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
         config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
         config.limits.replay_entries = NonZeroUsize::new(8192).unwrap();
-        config.limits.route_search_work = NonZeroUsize::new(4096).unwrap();
         config.limits.metadata_entries = NonZeroUsize::new(128).unwrap();
         config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
         config.limits.request_context_bytes = NonZeroUsize::new(4 * 1024 * 1024).unwrap();

@@ -1,9 +1,16 @@
-# Racer topology algorithm v1
+# Racer topology algorithm v2
 
-This document specifies `ALGORITHM_VERSION = 1`. Hash domains, field order,
+This document specifies `ALGORITHM_VERSION = 2`. Hash domains, field order,
 integer arithmetic, ordering, and tie rules are interoperability contracts.
 Changing them requires a new algorithm version and coordinated deployment.
 Membership wire versions are snapshot counters, not algorithm versions.
+
+Version 2 changes shortest-route tie selection and removes the total-work
+configuration. Deploy participating dataplanes together; there is no dual-version
+route implementation or algorithm negotiation. The algorithm constant identifies
+this specification, not a wire negotiation field. The existing peer/control
+encodings, placement hashes, ciphertext forwarding, graph edges, and RDMA rail
+selection remain the same; their v1 hash domains are retained.
 
 ## Membership
 
@@ -90,21 +97,36 @@ The latter enumerates exactly the inverse edges by lifting i into [0,18*N).
 Union both sets, remove self and duplicates, and sort numerically. This uses
 36 candidates regardless of N and produces at most 36 symmetric neighbors.
 
-Search uses two BFS balls of radius floor(L/2) and ceil(L/2), then compares
-intersections. Each side's node distances/parents occupy O(N) memory; there
-is no all-pairs table. Among all shortest paths choose the lexicographically
-smallest sequence of sorted node positions. Forward BFS visits neighbors in
-ascending order; reverse BFS chooses the smallest successor on equal distance.
-Meeting candidates are compared by (path length, complete node sequence).
-Shortest paths cannot contain a loop. Visited nodes are excluded from search.
+Search alternates complete BFS layers, starting from the source. Each wave has
+a FIFO queue and a sparse visited map holding the first-discovery parent. Visit
+neighbors in ascending sorted position, never replace parents, and check the
+opposite visited map immediately on discovery. Return at the first intersection,
+reconstructing just that path. A yield never changes the layer or queue order.
+Before each layer the visited balls are disjoint, so an intersection must have
+distance equal to the sum of their previous radii plus one: any shorter route
+would already have intersected. This chooses a deterministic shortest path,
+without globally lexicographic equivalent-path enumeration.
+
+Stop after L total layers (source radius ceil(L/2), destination radius floor(L/2))
+or when either wave's reachable component is exhausted. Each side discovers a
+node at most once, and expands only nodes inside its radius. Visited nodes from
+prior senders are excluded; shortest paths cannot contain a loop. There is no
+membership-wide initialization, final scan, or all-pairs table. Sparse maps and
+queues use O(V) scratch storage for explored vertices, at most O(N) per search.
+Each expansion examines at most 36 edges; ordered map operations cost O(log V).
+Thus worst-case search work is O(N log N) with at most 2N expansions. Healthy
+four-link routes expand at most 2*(1+36) = 74 vertices and store at most
+2*(1+36+36*35) = 2594 visited entries, independent of membership size.
 
 Only the source's incident failed links are excluded: local health does not
 claim the neighbor is unreachable through another node. Every relay replans
 using its own local information. A route cache key includes the snapshot,
 source, destination, remaining links, visited set, and unavailable source
 links. Successful routes are bounded FIFO entries; failures are not cached.
-Concurrent cold searches are limited to `clamp(cache_capacity, 1, 8)` to bound
-aggregate scratch memory; dropping an operation releases that admission.
+Concurrent cold searches per worker are limited to `clamp(cache_capacity, 1, 8)`
+to bound aggregate scratch memory; saturated admission fails `Overloaded`.
+The 100,000-member validation ceiling also bounds failed eight-link searches.
+Dropping an operation releases its scratch state and admission immediately.
 
 Normal admission chooses 4 links; failure-tolerant admission may choose 8.
 An already admitted attempt never increases its budget. `visited` contains
@@ -128,13 +150,14 @@ search-state transitions, not a replacement for the peer wire conversion.
 Expired deadlines fail `DeadlineExceeded`; unknown nodes or versions fail
 `IncompatibleMembership`; loops/malformed state fail `InvalidRequest`; zero
 remaining links before reaching destination fails `HopBudgetExhausted`.
-No admissible path within the remaining links fails `Unavailable`. Work-limit
-exhaustion fails `Overloaded`, distinctly from no route. The limit counts edge
-examinations plus meeting-node comparisons. `shortest_async` yields every
-256 vertex expansions/comparisons, rechecks the original deadline each poll,
-and validates current local health again before returning. At 100,000 nodes,
-a 150,000 work allowance covers the tested healthy four-link searches;
-failure searches may require a larger allowance and still fail closed at it.
+No admissible path within the remaining links fails `Unavailable`. There is no
+configurable total-work allowance: visited sets and hop limits bound the search.
+`shortest_async` yields after at most 32 vertex expansions (1152 edge visits),
+checks request-scope cancellation and deadline each poll, checks the route deadline
+before each vertex expansion, and validates current local health again before
+returning. A canceled scope returns `Cancelled` and releases admission without
+caching a route. Dropping the future also cancels computation. The synchronous
+API runs the same search and checks the route deadline before each expansion.
 
 ## Local circuits
 
@@ -204,25 +227,21 @@ d62f99be192c5c55bf7fcdd6f6e82510e4dfb15edc633c10e7e3c9920e6b1a15
 Integer edge vectors: sample 0 costs 274877906944, sample 2^63-1 costs
 4294967296, and sample 2^64-1 costs 1. Equal ratios tie on node ID.
 
+Version 2 route vectors (sorted positions, healthy graph, four-link budget):
+
+| Members | Source | Destination | Route |
+| --- | --- | --- | --- |
+| 1000 | 0 | 999 | 0,55,999 |
+| 100000 | 0 | 80003 | 0,13,246,4444,80003 |
+| 401 | 37 | 309 | 37,358,309 |
+
 ## Scoped verification
 
-Run `cargo test --lib topology::` from `cmd/racer-dataplane`. During shared
-worktree integration, unrelated compile errors can be bypassed with
-`standalone_tests.rs`, which imports the real boundary modules rather than
-mock copies. With dependencies already built, from the repository root:
-
-```sh
-rustc --edition 2024 --test cmd/racer-dataplane/src/topology/standalone_tests.rs \
-  -L dependency=cmd/racer-dataplane/target/debug/deps \
-  --extern sha2=$(realpath cmd/racer-dataplane/target/debug/deps/libsha2-*.rlib) \
-  --extern futures=$(realpath cmd/racer-dataplane/target/debug/deps/libfutures-*.rlib) \
-  -o cmd/racer-dataplane/src/topology/.topology-tests
-cmd/racer-dataplane/src/topology/.topology-tests --test-threads=2
-```
-
-Select one matching dependency artifact if multiple profiles are present.
+Run `cargo test --lib topology:: --all-features` from `cmd/racer-dataplane`.
 Tests cover small graph inverse edges exhaustively, every 100,000-node edge
 for symmetry/degree, four-link reachability to every destination from five
-sources, shortest-path oracle comparisons, local failure isolation, monotonic
-budgets, bounded cooperative work/cache ownership, distribution, churn,
+sources, default-config routing at every distance from zero through four,
+independent shortest-path oracle comparisons, local failure isolation, monotonic
+budgets, bounded cooperative work/cache ownership, cancellation, deadlines,
+admission saturation, distribution, churn,
 membership order invariance, and end-to-end rail/hardware fallback.

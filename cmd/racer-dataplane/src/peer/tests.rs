@@ -547,7 +547,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let relay = Rc::new(
         relay::Relay::new(
             paths,
@@ -770,7 +770,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             .unwrap(),
         );
         let relay = relay::Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 1, 1000)),
+            Rc::new(Paths::new(Rc::new(LinkHealth), 1)),
             forwarding.clone(),
             Rc::new(Destination {
                 auth: Forwarding::new(signers[2].clone()),
@@ -936,7 +936,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
             ),
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let relay = Rc::new(
         relay::Relay::new(
             paths.clone(),
@@ -1071,7 +1071,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let (signers, discovery) = identities();
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
         let relay = Rc::new(relay::Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4, 1000)),
+            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
             forwarding.clone(),
             Rc::new(Never),
             admission.clone(),

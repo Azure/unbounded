@@ -477,7 +477,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     };
     let source_handshake = handshake(a, source_network.clone());
     let destination_handshake = handshake(b, destination_network.clone());
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8, 1000));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
     let relay = Rc::new(
         Relay::new(

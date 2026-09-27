@@ -68,7 +68,6 @@ impl Rig {
             range_window_pages: n,
             replay_entries: n,
             header_bytes: NonZeroUsize::new(LIMIT).unwrap(),
-            route_search_work: n,
             cached_rankings: n,
             cached_paths: n,
             retained_snapshots: n,

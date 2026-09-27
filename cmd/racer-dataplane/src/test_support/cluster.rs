@@ -169,7 +169,6 @@ pub fn config(enable_rdma: bool) -> Config {
             range_window_pages: count,
             replay_entries: count,
             header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
-            route_search_work: count,
             cached_rankings: count,
             cached_paths: count,
             retained_snapshots: count,

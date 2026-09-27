@@ -179,12 +179,20 @@ unchanged. Replay has one shared node-wide table. MiB means 1048576 bytes.
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
 | `RACER_REPLAY_ENTRIES` | `4096` | 1048576 |
 | `RACER_HEADER_BYTES` | `32768` | 32768 |
-| `RACER_ROUTE_SEARCH_WORK` | `4096` | 1048576 |
 | `RACER_CACHED_RANKINGS` | `128` | 1048576 |
 | `RACER_CACHED_PATHS` | `128` | 1048576 |
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
+
+Route searches use explored visited sets and the existing four/eight-link hop
+limits, with no total-work setting. Each worker admits at most
+`clamp(partitioned_cached_paths, 1, 8)` concurrent cold searches. Saturation
+returns `Overloaded`; exhausted reachability returns `Unavailable`. Sparse
+search state is bounded by the 100,000-member membership ceiling per wave.
+Searches yield after at most 32 vertex expansions, obey request cancellation
+and deadlines, and release admission on completion or drop. See
+`src/topology/ALGORITHM_V2.md` for the deterministic route and deployment contract.
 
 `RACER_CONNECTIONS_PER_NEIGHBOR` caps TCP peer connections (and RDMA sessions),
 not local origin adapters. `RACER_ORIGIN_CONNECTIONS_PER_CACHE` caps concurrent

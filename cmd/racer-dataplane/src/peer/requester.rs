@@ -103,7 +103,7 @@ impl PeerClient for Requester {
             let search_budget = super::search_budget(&request.route, &network.local)?;
             let route = self
                 .paths
-                .shortest_async(membership.clone(), &network.local, &search_budget)
+                .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
                 .await?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let _capabilities = self
@@ -143,7 +143,7 @@ impl PeerTransport for Requester {
                     let search = super::search_budget(budget, &network.local)?;
                     let route = self
                         .paths
-                        .shortest_async(membership.clone(), &network.local, &search)
+                        .shortest_async(membership.clone(), &network.local, &search, &scope)
                         .await?;
                     if route.nodes.get(1) != Some(&next) {
                         return Err(Error::Unavailable);

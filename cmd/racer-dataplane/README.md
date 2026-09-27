@@ -417,7 +417,7 @@ in the implementation test environment.
 ## Protocol and verification references
 
 - `CLIENT_ORIGIN_API.md`: approved SDK and origin-adapter wire contract.
-- `src/topology/ALGORITHM_V1.md`: deterministic placement and routing profile.
+- `src/topology/ALGORITHM_V2.md`: deterministic placement and routing profile.
 - `designs/racer-peer-security.md`: authenticated peer and encryption profile.
 - `designs/racer-store-protocol.md`: record/checkpoint formats and recovery rules.
 - `designs/racer-sdk-conformance.md`: independent wire and Go SDK checks.

@@ -628,11 +628,7 @@ impl WorkerApplication {
             (None, None, None)
         };
 
-        let paths = Rc::new(Paths::new(
-            Rc::new(LinkHealth),
-            limits.cached_paths.get(),
-            config.limits.route_search_work.get(),
-        ));
+        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), limits.cached_paths.get()));
         let rails = Rc::new(Rails);
         let placement = Rc::new(Placement::new(limits.cached_rankings.get()));
         let network = Rc::new(crate::peer::PeerNetwork::new(

@@ -418,7 +418,6 @@ pub(super) mod tests {
             range_window_pages: small,
             replay_entries: small,
             header_bytes: small,
-            route_search_work: small,
             cached_rankings: small,
             cached_paths: small,
             retained_snapshots: small,
