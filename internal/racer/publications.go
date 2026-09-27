@@ -105,7 +105,12 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 		v.Members = append(v.Members, member)
 	}
 
-	content, membership, err := wire.ContentHashes(v)
+	candidate, err := wire.NewCanonicalCandidate(v)
+	if err != nil {
+		return nil, err
+	}
+
+	content, membership, err := candidate.ContentHashes()
 	if err != nil {
 		return nil, err
 	}
@@ -128,9 +133,8 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 	}
 
 	record.ContentHash, record.MembershipHash = content, membership
-	v.Sequence, v.MembershipVersion = record.Sequence, record.MembershipVersion
 
-	encoded, err := wire.EncodePublication(v)
+	encoded, err := candidate.EncodePublication(record.Sequence, record.MembershipVersion)
 	if err != nil {
 		return nil, err
 	}

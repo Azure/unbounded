@@ -172,8 +172,11 @@ Capacity admission then retains
 existing keyed UIDs and fills free slots in UID order. Topology publishes only
 caches with both active key purposes in the committed keyring. Nodes remain present
 until absent from the input lists (or explicitly excluded); only Pod
-endpoint selection filters deletion timestamps. Complete publication byte bounds
-and canonical hashes are checked by `wire.ContentHashes` before version assignment.
+endpoint selection filters deletion timestamps. `Publications.Prepare` uses a
+`wire.CanonicalCandidate` to validate and deep-copy canonical content once, then
+hashes that content before version assignment. Counter-free hash documents and
+the final encoding are independently byte-bounded; final encoding also checks
+the assigned counters without repeating collection validation or sorting.
 
 ClusterCache admission requires a lowercase ASCII DNS subdomain name, at most 82
 characters total and 63 characters per dot-separated label. Kubernetes validates
