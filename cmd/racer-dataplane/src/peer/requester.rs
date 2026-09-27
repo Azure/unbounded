@@ -149,9 +149,7 @@ impl PeerTransport for Requester {
             } else {
                 crate::topology::rails::TransportPlan::Http
             };
-            if !self.health.try_acquire(&next)? {
-                return Err(Error::Unavailable);
-            }
+            let _probe = self.health.acquire(&next)?;
             let response = self
                 .transfers
                 .exchange_planned(endpoint, request, plan, &scope)

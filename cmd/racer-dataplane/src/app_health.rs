@@ -81,14 +81,7 @@ impl WorkerApplication {
             );
         }
         let credentials = self.keys.signing_identity().ok().and_then(|identity| {
-            let expiry = identity
-                .certificate_chain()
-                .iter()
-                .filter_map(|der| {
-                    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
-                    u64::try_from(cert.validity().not_after.timestamp()).ok()
-                })
-                .min()?;
+            let expiry = identity.expires_at_seconds();
             if self.control.is_some() {
                 self.telemetry.metrics.set_gauge(
                     crate::telemetry::metrics::Gauge::IdentityExpiresAtSeconds,

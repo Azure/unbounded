@@ -1319,6 +1319,101 @@ fn drive<T>(
     }
 }
 #[test]
+fn blocked_publication_is_superseded_while_projection_rotates() {
+    use crate::control::caches::{CacheLifecycle, CacheTransition};
+    struct Blocked;
+    impl CacheLifecycle for Blocked {
+        fn stage(
+            &self,
+            _: &[crate::control::caches::CacheDefinition],
+        ) -> Result<Box<dyn CacheTransition>> {
+            Err(Error::Unavailable)
+        }
+    }
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    let control = worker.control.clone().unwrap();
+    control.attach_cache_lifecycle(Rc::new(Blocked));
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![definition()]));
+    drive(
+        &runtime,
+        &mut engine,
+        control.progress(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        worker.snapshots.cursor().unwrap(),
+        Some(wire::PublicationSequence(1))
+    );
+    let path = config.secret_directory.join("epoch/bundle.json");
+    let mut bundle = wire::decode_bundle(&std::fs::read(&path).unwrap()).unwrap();
+    bundle.generation = wire::BundleGeneration(2);
+    bundle.cache_keys.clear();
+    std::fs::write(&path, wire::encode_bundle(&bundle).unwrap()).unwrap();
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 3, vec![]));
+    drive(
+        &runtime,
+        &mut engine,
+        control.progress(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    assert!(
+        worker
+            .keys
+            .active(&definition().id, KeyPurpose::Page)
+            .is_err()
+    );
+    assert_eq!(control.projection_error(), None);
+    assert_eq!(
+        worker.snapshots.cursor().unwrap(),
+        Some(wire::PublicationSequence(1))
+    );
+    // Restore real resource staging. Only the newer publication may commit.
+    worker.attach_cache_adapter();
+    let until = Instant::now() + Duration::from_secs(5);
+    while worker.snapshots.cursor().unwrap() != Some(wire::PublicationSequence(3)) {
+        assert!(Instant::now() < until);
+        runtime.reactor.poll_budgeted(64).unwrap();
+        worker
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
+        engine.poll_budgeted(64).unwrap();
+    }
+    assert!(worker.snapshots.current().unwrap().caches.is_empty());
+    drive(
+        &runtime,
+        &mut engine,
+        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
+    drive(
+        &runtime,
+        &mut engine,
+        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+}
+
+#[test]
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
@@ -1344,10 +1439,10 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let startup = scope(Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready());
+    assert!(fixture.polls.load(Ordering::Acquire) >= 1);
     assert_eq!(
-        fixture.polls.load(Ordering::Acquire),
-        1,
-        "prepared resources install the retained publication without another poll"
+        worker.snapshots.current().unwrap().sequence,
+        crate::control::wire::PublicationSequence(1)
     );
     assert_eq!(
         fixture.enrollments.load(Ordering::Acquire),

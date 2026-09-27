@@ -17,6 +17,11 @@ pub struct Snapshot {
     pub caches: Vec<CacheDefinition>,
 }
 pub type SnapshotLease = Arc<Snapshot>;
+pub struct PreparedPublication {
+    pub(super) snapshot: SnapshotLease,
+    content_hash: [u8; 32],
+    membership_hash: [u8; 32],
+}
 /// One node-wide publication cell. Its implementation publishes immutable leases
 /// atomically; worker handles never become independent authorities for membership.
 pub struct PublishedState {
@@ -123,20 +128,15 @@ impl SnapshotStore {
         publication: Publication,
         transition: Option<Box<dyn super::caches::CacheTransition>>,
     ) -> Result<SnapshotLease> {
-        self.validate_or_publish(publication, transition, true)
+        let prepared = self.prepare(publication)?;
+        self.publish_prepared(&prepared, transition)
     }
     /// Validate the entire downloaded publication before local resource staging.
     /// Capacity can change while leases drain, so installation rechecks it.
     pub fn validate(&self, publication: Publication) -> Result<()> {
-        self.validate_or_publish(publication, None, false)
-            .map(|_| ())
+        self.prepare(publication).map(|_| ())
     }
-    fn validate_or_publish(
-        &self,
-        publication: Publication,
-        transition: Option<Box<dyn super::caches::CacheTransition>>,
-        install: bool,
-    ) -> Result<SnapshotLease> {
+    pub fn prepare(&self, publication: Publication) -> Result<PreparedPublication> {
         if publication.cluster != self.cluster {
             return Err(Error::Unauthorized);
         }
@@ -146,37 +146,81 @@ impl SnapshotStore {
         let (content, membership) = super::wire::canonical_content(&publication)?;
         let content_hash: [u8; 32] = Sha256::digest(content).into();
         let membership_hash: [u8; 32] = Sha256::digest(membership).into();
+        let mut next = Snapshot {
+            cluster: publication.cluster,
+            sequence: publication.sequence,
+            membership: Arc::new(Membership::validate(
+                publication.membership_version,
+                publication.members,
+            )?),
+            caches: publication.caches,
+        };
+        if let Ok(current) = self.current() {
+            if current.membership.version == next.membership.version {
+                next.membership = current.membership.clone();
+            }
+        }
+        let prepared = PreparedPublication {
+            snapshot: Arc::new(next),
+            content_hash,
+            membership_hash,
+        };
+        self.check_prepared(&prepared)?;
+        Ok(prepared)
+    }
+    fn check_prepared(&self, prepared: &PreparedPublication) -> Result<()> {
+        let state = self
+            .published
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable)?;
+        Self::check_state(&state, prepared)
+    }
+    fn check_state(state: &State, prepared: &PreparedPublication) -> Result<()> {
+        let next = &prepared.snapshot;
+        if let Some(old) = &state.current {
+            if next.sequence < old.sequence || next.membership.version.0 < old.membership.version.0
+            {
+                return Err(Error::Replay);
+            }
+            if next.sequence == old.sequence
+                && (prepared.content_hash != state.content_hash
+                    || next.membership.version != old.membership.version)
+            {
+                return Err(Error::Replay);
+            }
+            if next.membership.version == old.membership.version
+                && prepared.membership_hash != state.membership_hash
+            {
+                return Err(Error::IncompatibleMembership);
+            }
+        }
+        Ok(())
+    }
+    pub fn publish_prepared(
+        &self,
+        prepared: &PreparedPublication,
+        transition: Option<Box<dyn super::caches::CacheTransition>>,
+    ) -> Result<SnapshotLease> {
         let mut state = self
             .published
             .state
             .lock()
             .map_err(|_| Error::Unavailable)?;
-        if let Some(old) = &state.current {
-            if publication.sequence < old.sequence
-                || publication.membership_version.0 < old.membership.version.0
-            {
-                return Err(Error::Replay);
-            }
-            if publication.sequence == old.sequence {
-                return if content_hash == state.content_hash
-                    && publication.membership_version == old.membership.version
-                {
-                    Ok(old.clone())
-                } else {
-                    Err(Error::Replay)
-                };
-            }
-            if publication.membership_version == old.membership.version
-                && membership_hash != state.membership_hash
-            {
-                return Err(Error::IncompatibleMembership);
-            }
+        Self::check_state(&state, prepared)?;
+        let publication = &prepared.snapshot;
+        if let Some(old) = state
+            .current
+            .as_ref()
+            .filter(|old| old.sequence == publication.sequence)
+        {
+            return Ok(old.clone());
         }
         state.memberships.retain(|(_, m)| m.strong_count() != 0);
         let same_membership = state
             .current
             .as_ref()
-            .filter(|s| s.membership.version == publication.membership_version);
+            .filter(|s| s.membership.version == publication.membership.version);
         let membership = if let Some(current) = same_membership {
             current.membership.clone()
         } else {
@@ -187,23 +231,21 @@ impl SnapshotStore {
             let replaceable = state.current.as_ref().is_some_and(|s| {
                 Arc::strong_count(s) == 1 && Arc::strong_count(&s.membership) == 1
             });
-            if install && state.memberships.len() - usize::from(replaceable) > self.retained_limit {
+            if state.memberships.len() - usize::from(replaceable) > self.retained_limit {
                 return Err(Error::Overloaded);
             }
-            Arc::new(Membership::validate(
-                publication.membership_version,
-                publication.members,
-            )?)
+            publication.membership.clone()
         };
-        let next = Arc::new(Snapshot {
-            cluster: publication.cluster,
-            sequence: publication.sequence,
-            membership,
-            caches: publication.caches,
-        });
-        if !install {
-            return Ok(next);
-        }
+        let next = if Arc::ptr_eq(&membership, &publication.membership) {
+            publication.clone()
+        } else {
+            Arc::new(Snapshot {
+                cluster: publication.cluster.clone(),
+                sequence: publication.sequence,
+                membership,
+                caches: publication.caches.clone(),
+            })
+        };
         if let Some(transition) = transition {
             transition.commit();
         }
@@ -218,8 +260,8 @@ impl SnapshotStore {
                 .memberships
                 .push((next.membership.version, Arc::downgrade(&next.membership)));
         }
-        state.content_hash = content_hash;
-        state.membership_hash = membership_hash;
+        state.content_hash = prepared.content_hash;
+        state.membership_hash = prepared.membership_hash;
         Ok(next)
     }
 }

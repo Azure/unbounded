@@ -6,12 +6,35 @@ use crate::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rustls::{RootCertStore, pki_types::CertificateDer};
-use std::{rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 pub struct Certificates {
     cluster: ClusterId,
     keys: Rc<Keyring>,
+    cache: RefCell<VecDeque<CachedPeer>>,
+}
+struct CachedPeer {
+    roots: Arc<Vec<Vec<u8>>>,
+    chain: Vec<Vec<u8>>,
+    node: NodeId,
+    key: VerifyingKey,
+    until: u64,
+    checked: u64,
+}
+/// Conservative validity intersection includes all configured trust anchors.
+pub(crate) fn validity<'a>(certificates: impl Iterator<Item = &'a Vec<u8>>) -> Result<(u64, u64)> {
+    let mut start = 0;
+    let mut end = u64::MAX;
+    for der in certificates {
+        let (_, cert) = parse_x509_certificate(der).map_err(|_| Error::Unauthorized)?;
+        start = start.max(cert.validity().not_before.timestamp().max(0) as u64);
+        end = end.min(
+            u64::try_from(cert.validity().not_after.timestamp())
+                .map_err(|_| Error::Unauthorized)?,
+        );
+    }
+    Ok((start, end))
 }
 pub struct VerifiedPeer {
     node: NodeId,
@@ -48,6 +71,57 @@ pub(crate) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
 mod tests {
     use super::super::identity::tests::{CLUSTER, NODE};
     use super::*;
+    #[test]
+    fn cache_requires_exact_chain_current_trust_time_and_fresh_signature() {
+        let (pending, chain, roots) = super::super::identity::tests::issued();
+        let keys = Rc::new(Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::new(super::super::keyring::KeyEpochs::default()),
+        ));
+        let bundle = |generation, roots| crate::control::wire::KeyringBundle {
+            schema_version: 1,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: crate::control::wire::BundleGeneration(generation),
+            peer_trust_roots: roots,
+            cache_keys: vec![],
+        };
+        keys.install(bundle(1, roots.clone())).unwrap();
+        let identity = pending
+            .accept(
+                ClusterId(CLUSTER.into()),
+                NodeId(NODE.into()),
+                chain.clone(),
+                &roots,
+            )
+            .unwrap();
+        let certs = Certificates::new(ClusterId(CLUSTER.into()), keys.clone());
+        let node = NodeId(NODE.into());
+        let signature = identity.sign(b"message").unwrap();
+        certs
+            .verify_signed(&chain, &node, b"message", &signature)
+            .unwrap();
+        certs
+            .verify_signed(&chain, &node, b"message", &signature)
+            .unwrap();
+        assert_eq!(certs.cache.borrow().len(), 1);
+        assert!(
+            certs
+                .verify_signed(&chain, &node, b"tampered", &signature)
+                .is_err()
+        );
+        let mut changed = chain.clone();
+        changed[0].push(0);
+        assert!(certs.verify(&changed, &node).is_err());
+        // Force expiry of the cached result; validation must replace it.
+        certs.cache.borrow_mut()[0].until = 0;
+        certs.verify(&chain, &node).unwrap();
+        assert!(certs.cache.borrow()[0].until > 0);
+        let (_, _, replacement) = super::super::identity::tests::issued();
+        keys.install(bundle(2, replacement)).unwrap();
+        assert!(certs.verify(&chain, &node).is_err());
+        assert!(certs.cache.borrow().is_empty());
+    }
     #[test]
     fn validates_chain_node_and_strict_signature() {
         let (pending, chain, roots) = super::super::identity::tests::issued();
@@ -222,14 +296,48 @@ pub(crate) fn verify_chain(
 }
 impl Certificates {
     pub fn new(cluster: ClusterId, keys: Rc<Keyring>) -> Self {
-        Self { cluster, keys }
+        Self {
+            cluster,
+            keys,
+            cache: RefCell::new(VecDeque::new()),
+        }
+    }
+    fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
+        let roots = self.keys.peer_trust_roots()?;
+        let now = crate::runtime::environment::unix_time().as_secs();
+        let mut cache = self.cache.borrow_mut();
+        cache.retain(|entry| {
+            Arc::ptr_eq(&entry.roots, &roots) && now >= entry.checked && now < entry.until
+        });
+        if let Some(entry) = cache
+            .iter()
+            .find(|entry| &entry.node == expected && entry.chain == chain)
+        {
+            return Ok(entry.key);
+        }
+        drop(cache);
+        let key = verify_chain(&roots, chain, &self.cluster, expected)?;
+        let (_, until) = validity(chain.iter().chain(roots.iter()))?;
+        let mut cache = self.cache.borrow_mut();
+        // At most 64 exact, wire-bounded chains (4 MiB of chain bytes).
+        if cache.len() == 64 {
+            cache.pop_front();
+        }
+        cache.push_back(CachedPeer {
+            roots,
+            chain: chain.to_vec(),
+            node: expected.clone(),
+            key,
+            until,
+            checked: now,
+        });
+        Ok(key)
     }
     pub fn verify(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifiedPeer> {
         if &self.cluster != self.keys.cluster() {
             return Err(Error::Unauthorized);
         }
-        let roots = self.keys.peer_trust_roots()?;
-        verify_chain(&roots, chain, &self.cluster, expected)?;
+        self.key(chain, expected)?;
         Ok(VerifiedPeer {
             node: expected.clone(),
         })
@@ -244,8 +352,7 @@ impl Certificates {
         if &self.cluster != self.keys.cluster() {
             return Err(Error::Unauthorized);
         }
-        let roots = self.keys.peer_trust_roots()?;
-        let key = verify_chain(&roots, chain, &self.cluster, expected)?;
+        let key = self.key(chain, expected)?;
         let signature = Signature::from_slice(signature).map_err(|_| Error::Unauthorized)?;
         key.verify_strict(message, &signature)
             .map_err(|_| Error::Unauthorized)?;

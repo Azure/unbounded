@@ -414,6 +414,7 @@ impl Drop for SignalGuard {
 /// Node-level control events enter through bounded worker commands. Mutable state
 /// is not implicitly made global by Arc/Mutex or by a background async runtime.
 pub struct WorkerApplication {
+    next_health: std::time::Instant,
     environment: crate::runtime::environment::Environment,
     drivers: Rc<crate::read::drivers::DriverQueue>,
     http: Rc<HttpPool>,
@@ -801,6 +802,7 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
+            next_health: crate::runtime::environment::now(),
         })
     }
 
@@ -1105,7 +1107,11 @@ impl WorkerApplication {
                 Poll::Pending => return Err(Error::InvalidConfiguration),
             }
         }
-        self.observe_health()?;
+        let now = crate::runtime::environment::now();
+        if now >= self.next_health {
+            self.observe_health()?;
+            self.next_health = now + Duration::from_millis(100);
+        }
         Ok(())
     }
 

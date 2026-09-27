@@ -33,12 +33,12 @@ fn page(key: u8, version: u8) -> PageId {
 #[test]
 fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget() {
     for new_objects in [false, true] {
-        let rig = Rig::new(113, true, 4);
+        let rig = Rig::new(P, true, 4);
         for version in 1..=10 {
             rig.adapter.state.lock().unwrap().version = version;
             let key = if new_objects { version } else { 0xab };
             let reply = fetch(&rig, key);
-            check(&reply, version, 0, 113, 113);
+            check(&reply, version, 0, P, P);
             assert_eq!(reply.fields["racer-expires-at"], "0");
             rig.flush();
             assert_eq!(rig.adapter.calls().len(), version as usize);
@@ -89,14 +89,20 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
             }
         })
         .await;
-        assert_eq!(rig.admission.used(ResourceClass::Plaintext), 2 * P as usize);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Plaintext),
+            P as usize + 113
+        );
         rig.serve(blocked, &blocked_scope).await.unwrap();
         assert_eq!(
             rig.adapter.calls().len(),
             2,
             "overload must precede origin I/O"
         );
-        assert_eq!(rig.admission.used(ResourceClass::Plaintext), 2 * P as usize);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Plaintext),
+            P as usize + 113
+        );
         assert!(rig.memory.get(&page(0xab, 1)).unwrap().is_some());
         assert_eq!(held.bytes()[0], byte(1, 0));
         pending_scope.cancel().unwrap();
@@ -107,13 +113,13 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
     assert_eq!(receive(pending_remote, false).status, 503);
     assert_eq!(blocked_reader.join().unwrap().status, 503);
     rig.drive(std::future::poll_fn(|_| {
-        if rig.admission.used(ResourceClass::Plaintext) == P as usize {
+        if rig.admission.used(ResourceClass::Plaintext) == 113 {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
     }));
-    assert_eq!(rig.admission.used(ResourceClass::Plaintext), P as usize);
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 113);
     rig.adapter.state.lock().unwrap().paused = false;
     check(&fetch(&rig, 3), 2, 0, 113, 113);
     rig.flush();
@@ -136,6 +142,9 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
     rig.flush();
     rig.adapter.offline();
     for attempt in 0..3 {
+        // These are separate half-open probes, rather than retries inside the
+        // circuit's exponential backoff window.
+        thread::sleep(Duration::from_secs(1));
         assert_eq!(fetch(&rig, 0xab).status, 503);
         assert_eq!(
             rig.adapter.calls().len(),
@@ -146,6 +155,7 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
         assert_eq!(rig.admission.used(ResourceClass::Ciphertext), 0);
         assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
     }
+    thread::sleep(Duration::from_secs(1));
     {
         let mut state = rig.adapter.state.lock().unwrap();
         state.online = true;

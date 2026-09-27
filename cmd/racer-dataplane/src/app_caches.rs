@@ -110,13 +110,22 @@ impl WorkerApplication {
         let Some(node) = self.node.clone() else {
             return Ok(());
         };
-        let (generation, definitions, committed) = {
+        let (generation, definitions) = {
             let cut = node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
-            (cut.generation, cut.definitions.clone(), cut.committed)
+            if cut.generation == 0 || cut.committed || cut.prepared.contains(&self.worker) {
+                return Ok(());
+            }
+            (
+                cut.generation,
+                if self.cache_prepare_task.is_none()
+                    || self.cache_preparing_generation != cut.generation
+                {
+                    cut.definitions.clone()
+                } else {
+                    Vec::new()
+                },
+            )
         };
-        if generation == 0 || committed {
-            return Ok(());
-        }
         if self.cache_preparing_generation != generation {
             self.cache_prepare_task.take();
             self.prepared_listeners.borrow_mut().take();

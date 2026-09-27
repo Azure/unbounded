@@ -1519,6 +1519,10 @@ impl Harness {
     }
 
     fn origin_fault(&mut self) {
+        // Prior malformed replies now open endpoint circuits. Advance beyond the
+        // maximum backoff before requiring this distinct fault to reach origin.
+        self.clock.advance(Duration::from_secs(26));
+        self.settle();
         if self.origin_faults.is_empty() {
             self.origin_faults.extend([
                 OriginFault::Reject,
@@ -1726,6 +1730,16 @@ impl Harness {
                             .into_iter()
                             .map(move |entry| (n, w, entry))
                     })
+            })
+            .filter(|(_, _, (page, _))| {
+                let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
+                object > 1
+                    && self
+                        .catalog
+                        .borrow()
+                        .current
+                        .get(&object)
+                        .is_some_and(|v| v.tag.as_bytes() == page.version.etag.as_bytes())
             })
             .collect();
         if entries.is_empty() {

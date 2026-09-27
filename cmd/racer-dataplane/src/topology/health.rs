@@ -7,7 +7,7 @@ use crate::{
 use sha2::Digest;
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,18 @@ use std::{
 pub struct LinkHealth {
     capacity: usize,
     states: RefCell<BTreeMap<NodeId, Circuit>>,
+    probes: RefCell<BTreeSet<NodeId>>,
+}
+pub struct LinkProbe<'a> {
+    health: &'a LinkHealth,
+    node: Option<NodeId>,
+}
+impl Drop for LinkProbe<'_> {
+    fn drop(&mut self) {
+        if let Some(node) = &self.node {
+            self.health.probes.borrow_mut().remove(node);
+        }
+    }
 }
 
 // Preserve the scaffold's `Rc::new(LinkHealth)` expression with isolated state.
@@ -35,6 +47,22 @@ pub enum LinkOutcome {
     ProtocolFailure,
 }
 impl LinkHealth {
+    pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
+        if !self.try_acquire(node)? {
+            return Err(Error::Unavailable);
+        }
+        let probe = self.states.borrow().contains_key(node);
+        if probe {
+            if self.probes.borrow().len() >= self.capacity {
+                return Err(Error::Overloaded);
+            }
+            self.probes.borrow_mut().insert(node.clone());
+        }
+        Ok(LinkProbe {
+            health: self,
+            node: probe.then(|| node.clone()),
+        })
+    }
     /// Endpoint operations share the same bounded backoff and half-open policy.
     /// Application misses and credential rejection never open a transport circuit.
     pub async fn run<T>(
@@ -42,9 +70,7 @@ impl LinkHealth {
         endpoint: &NodeId,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        if !self.try_acquire(endpoint)? {
-            return Err(Error::Unavailable);
-        }
+        let _probe = self.acquire(endpoint)?;
         let result = operation.await;
         let outcome = match &result {
             Err(Error::Io | Error::Unavailable) => Some(LinkOutcome::Refused),
@@ -62,6 +88,7 @@ impl LinkHealth {
         Self {
             capacity,
             states: RefCell::new(BTreeMap::new()),
+            probes: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -96,6 +123,9 @@ impl LinkHealth {
     }
 
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
+        if self.probes.borrow().contains(neighbor) {
+            return Ok(false);
+        }
         Ok(self.states.borrow().get(neighbor).is_none_or(|state| {
             now >= state.retry_at && state.probe_until.is_none_or(|until| now >= until)
         }))
@@ -106,6 +136,9 @@ impl LinkHealth {
     }
 
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
+        if self.probes.borrow().contains(neighbor) {
+            return Ok(false);
+        }
         let mut states = self.states.borrow_mut();
         let Some(state) = states.get_mut(neighbor) else {
             return Ok(true);
@@ -151,6 +184,36 @@ mod tests {
         },
     };
 
+    #[test]
+    fn owned_half_open_probe_remains_exclusive_until_completion_or_drop() {
+        let health = LinkHealth::new(1);
+        let node = NodeId("peer".into());
+        health
+            .observe_at(
+                &node,
+                LinkOutcome::Timeout,
+                crate::runtime::environment::now() - Duration::from_secs(60),
+            )
+            .unwrap();
+        let probe = health.acquire(&node).unwrap();
+        assert!(
+            !health
+                .try_acquire_at(
+                    &node,
+                    crate::runtime::environment::now() + Duration::from_secs(60)
+                )
+                .unwrap()
+        );
+        drop(probe);
+        assert!(
+            health
+                .try_acquire_at(
+                    &node,
+                    crate::runtime::environment::now() + Duration::from_secs(60)
+                )
+                .unwrap()
+        );
+    }
     #[test]
     fn endpoint_application_errors_do_not_open_circuits_and_probes_are_bounded() {
         let health = LinkHealth::new(2);

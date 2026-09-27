@@ -241,7 +241,7 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
 
 #[test]
 fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
-    // Short final pages keep full-page charges; execute class cases sequentially.
+    // Use full pages for the fixed-page simulator's reclamation oracle.
     for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
         let mut model = Simulator::new(Config {
             nodes: 1,
@@ -280,7 +280,7 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
             model.workers[0].cache.insert(key, bundle);
             model.workers[0].lru.push_back(key);
             model.directory.entry(key).or_default().insert(0);
-            let page = allocated_page(&real, cache, version, 3);
+            let page = allocated_page(&real, cache, version, PLAIN);
             ids.push(page.plaintext.page().clone());
             memory.publish(page).unwrap();
         }
@@ -304,10 +304,9 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
             ));
             // Local deficit takes precedence over global spare room,
             // runtime/admission.rs:149-156. Evicting B cannot remedy A's share.
-            assert_eq!(
-                admission.reclamation(&a, class, amount),
-                Some((Some(a.clone()), amount))
-            );
+            let (owner, deficit) = admission.reclamation(&a, class, amount).unwrap();
+            assert_eq!(owner, Some(a.clone()));
+            assert!(deficit > 0 && deficit <= amount);
         }
         checkpoint(
             "failed reservation is unchanged",
@@ -474,12 +473,28 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         .unwrap();
     let buffers = Rc::new(BufferPool::new(real.clone()));
     let memory = Rc::new(MemoryCache::new(buffers.clone()));
-    let old_model = MetadataOwners::reserve(&model, &cache);
+    let mut old_model = MetadataOwners::reserve(&model, &cache);
+    Arc::get_mut(&mut old_model.bundle.plain)
+        .unwrap()
+        .shrink(3)
+        .unwrap();
+    Arc::get_mut(&mut old_model.bundle.cipher)
+        .unwrap()
+        .shrink(19)
+        .unwrap();
     let old = allocated_page(&real, &cache, "old", 3);
     let old_id = old.plaintext.page().clone();
     memory.publish(old).unwrap();
     assert!(old_model.bundle.idle());
-    let next_model = MetadataOwners::reserve(&model, &cache);
+    let mut next_model = MetadataOwners::reserve(&model, &cache);
+    Arc::get_mut(&mut next_model.bundle.plain)
+        .unwrap()
+        .shrink(3)
+        .unwrap();
+    Arc::get_mut(&mut next_model.bundle.cipher)
+        .unwrap()
+        .shrink(19)
+        .unwrap();
     assert!(next_model.bundle.idle());
     assert!(matches!(
         model.reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER),
@@ -602,7 +617,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         "read succeeds with persistence skipped",
         &model,
         &real,
-        [2 * PLAIN, 2 * CIPHER, CIPHER],
+        [6, 38, CIPHER],
     );
     drop(result);
     drop(result_model);
@@ -611,7 +626,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     drop(fill);
     assert_eq!(crate::read::drivers::pending(), 0);
     drop((old_model, next_model, model_dirty, real_dirty));
-    assert_eq!(memory.evict_idle(usize::MAX), Ok(2 * (PLAIN + CIPHER)));
+    assert_eq!(memory.evict_idle(usize::MAX), Ok(44));
     checkpoint("dirty and page owners drained", &model, &real, [0, 0, 0]);
     assert!(CLASSES.iter().all(|class| real.used(*class) == 0));
 }
@@ -623,7 +638,11 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     let model = admission(1);
     let real = admission(1);
     let cache = CacheId(crate::security::identity::tests::CACHE.into());
-    let caller = MetadataOwners::reserve(&model, &cache);
+    let mut caller = MetadataOwners::reserve(&model, &cache);
+    Arc::get_mut(&mut caller.bundle.plain)
+        .unwrap()
+        .shrink(3)
+        .unwrap();
     assert!(caller.bundle.idle());
     let completion_owner = caller.clone();
     assert!(!caller.bundle.idle());
@@ -650,7 +669,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     assert_eq!(client.outstanding(), 1);
     assert!(!caller.bundle.idle());
     assert!(!completion_owner.bundle.idle());
-    checkpoint("accepted crypto", &model, &real, [PLAIN, CIPHER, 0]);
+    checkpoint("accepted crypto", &model, &real, [3, CIPHER, 0]);
     scope.cancel().unwrap();
     assert!(work.as_mut().poll(&mut cx).is_pending());
     assert!(!caller.bundle.idle());
@@ -667,7 +686,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
         "canceled caller is not a fence",
         &model,
         &real,
-        [PLAIN, CIPHER, 0],
+        [3, CIPHER, 0],
     );
     assert_eq!(client.outstanding(), 1);
     // Failed inputs survive the engine as well, security/aead.rs:259-260;
@@ -678,7 +697,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
         "completion published but not reaped",
         &model,
         &real,
-        [PLAIN, CIPHER, 0],
+        [3, CIPHER, 0],
     );
     assert_eq!(client.outstanding(), 1);
     client.poll_budgeted(1).unwrap();

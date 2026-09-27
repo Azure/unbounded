@@ -49,7 +49,8 @@ pub struct ControlClient {
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
     binding_check: Cell<bool>,
     restart_required: Cell<bool>,
-    pending: RefCell<Option<wire::Publication>>,
+    pending: RefCell<Option<Rc<super::snapshot::PreparedPublication>>>,
+    install_next: Cell<Option<Instant>>,
 }
 struct Busy<'a>(&'a Cell<bool>);
 struct ActiveTurn<'a>(&'a RefCell<Option<RequestScope>>);
@@ -111,6 +112,7 @@ impl ControlClient {
             binding_check: Cell::new(false),
             restart_required: Cell::new(false),
             pending: RefCell::new(None),
+            install_next: Cell::new(None),
         }
     }
     /// Reads the projected token at submission; retries reuse the same request ID.
@@ -360,15 +362,11 @@ impl ControlClient {
                 return Err(Error::NodeIdentityChanged);
             }
             if self.pending.borrow().is_some() {
-                self.install_pending()?;
-                return self.state();
-            }
-            if self
-                .next
-                .get()
-                .is_some_and(|n| n > crate::runtime::environment::now())
-            {
-                return self.state();
+                match self.install_pending() {
+                    Ok(()) => return self.state(),
+                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => (),
+                    Err(error) => return Err(error),
+                }
             }
             let mut turn = scope.clone();
             turn.deadline.0 = turn.deadline.0.min(
@@ -376,18 +374,51 @@ impl ControlClient {
             );
             *self.active_scope.borrow_mut() = Some(turn.clone());
             let _turn = ActiveTurn(&self.active_scope);
-            let result = self.advance(&turn).await;
+            let mut advance = Box::pin(self.advance(&turn));
+            let result = std::future::poll_fn(|cx| {
+                if self.pending.borrow().is_some()
+                    && self
+                        .install_next
+                        .get()
+                        .is_none_or(|next| next <= crate::runtime::environment::now())
+                {
+                    self.install_next.set(Some(
+                        crate::runtime::environment::now() + Duration::from_millis(10),
+                    ));
+                    match self.install_pending() {
+                        Ok(()) | Err(Error::Unavailable | Error::Overloaded | Error::Io) => (),
+                        Err(error) => return std::task::Poll::Ready(Err(error)),
+                    }
+                }
+                std::future::Future::poll(advance.as_mut(), cx)
+            })
+            .await;
             match result {
                 Ok(()) => {
                     if self.renewal_error.get().is_none() {
                         self.failures.set(0);
                     }
-                    self.next.set(Some(crate::runtime::environment::now()));
+                    if self
+                        .next
+                        .get()
+                        .is_none_or(|next| next <= crate::runtime::environment::now())
+                    {
+                        self.next.set(Some(crate::runtime::environment::now()));
+                    }
                     self.state()
                 }
                 Err(e) => {
                     if transient(e) {
-                        self.next.set(Some(self.backoff()?));
+                        self.next.set(Some(
+                            match self
+                                .renew_next
+                                .get()
+                                .filter(|next| *next > crate::runtime::environment::now())
+                            {
+                                Some(next) => next,
+                                None => self.backoff()?,
+                            },
+                        ));
                     }
                     Err(e)
                 }
@@ -395,6 +426,90 @@ impl ControlClient {
         })
     }
     async fn advance(&self, scope: &RequestScope) -> Result<()> {
+        // Each duty owns its future. A held long poll or renewal cannot prevent
+        // projection reload or local installation from being driven by the owner.
+        let projection_done = Cell::new(false);
+        let renewal_done = Cell::new(false);
+        let mut projection = Box::pin(async {
+            loop {
+                self.reload(scope).await?;
+                projection_done.set(true);
+                self.transport
+                    .io()?
+                    .sleep(
+                        crate::runtime::environment::now() + Duration::from_secs(1),
+                        scope,
+                    )
+                    .await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), Error>(())
+        });
+        let mut renewal = Box::pin(async {
+            loop {
+                self.renew_if_due(scope).await?;
+                renewal_done.set(true);
+                self.transport
+                    .io()?
+                    .sleep(
+                        crate::runtime::environment::now() + Duration::from_secs(1),
+                        scope,
+                    )
+                    .await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), Error>(())
+        });
+        let mut polling = Box::pin(async {
+            std::future::poll_fn(|_| {
+                if self
+                    .identity
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|identity| identity.valid_now())
+                {
+                    std::task::Poll::Ready(())
+                } else if renewal_done.get() {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if self
+                .next
+                .get()
+                .filter(|next| *next > crate::runtime::environment::now())
+                .is_some()
+            {
+                return Ok(());
+            }
+            self.poll_publication(scope).await
+        });
+        let mut polled = None;
+        std::future::poll_fn(|cx| {
+            use std::{future::Future, task::Poll};
+            if let Poll::Ready(result) = projection.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if let Poll::Ready(result) = renewal.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if polled.is_none() {
+                if let Poll::Ready(result) = polling.as_mut().poll(cx) {
+                    polled = Some(result);
+                }
+            }
+            if projection_done.get() && renewal_done.get() {
+                if let Some(result) = polled.take() {
+                    return Poll::Ready(result);
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+    async fn reload(&self, scope: &RequestScope) -> Result<()> {
         // A malformed projection retains the installed epoch and does not stop polls.
         match self.secrets.reload_async(scope).await {
             Ok((_, roots)) => {
@@ -403,6 +518,9 @@ impl ControlClient {
             }
             Err(e) => self.projection_error.set(Some(e)),
         }
+        Ok(())
+    }
+    async fn renew_if_due(&self, scope: &RequestScope) -> Result<()> {
         let renewal = self.binding_check.get()
             || self
                 .identity
@@ -410,15 +528,10 @@ impl ControlClient {
                 .as_ref()
                 .is_none_or(|i| i.renewal_due());
         if renewal
-            && (self
-                .identity
-                .borrow()
-                .as_ref()
-                .is_none_or(|i| !i.valid_now())
-                || self
-                    .renew_next
-                    .get()
-                    .is_none_or(|n| n <= crate::runtime::environment::now()))
+            && self
+                .renew_next
+                .get()
+                .is_none_or(|n| n <= crate::runtime::environment::now())
         {
             match self.renew(scope).await {
                 Ok(()) => {
@@ -444,14 +557,16 @@ impl ControlClient {
                 }
             }
         }
-        let polled = self
-            .poll(
-                SnapshotRequest {
-                    after: self.snapshots.cursor()?,
-                },
-                scope,
-            )
-            .await;
+        Ok(())
+    }
+    async fn poll_publication(&self, scope: &RequestScope) -> Result<()> {
+        let after = self
+            .pending
+            .borrow()
+            .as_ref()
+            .map(|p| p.snapshot.sequence)
+            .or(self.snapshots.cursor()?);
+        let polled = self.poll(SnapshotRequest { after }, scope).await;
         // A deleted UID may disappear from the controller's informer index and
         // yield 503 indefinitely. Recheck via token enrollment on the next bounded
         // retry rather than waiting for the old certificate's renewal deadline.
@@ -461,16 +576,25 @@ impl ControlClient {
         match polled? {
             SnapshotResponse::Updated(publication) => {
                 scope.check()?;
-                self.snapshots.validate(publication.clone())?;
-                *self.pending.borrow_mut() = Some(publication);
-                self.install_pending()?;
+                let prepared = self.snapshots.prepare(publication)?;
+                if self
+                    .pending
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|old| prepared.snapshot.sequence > old.snapshot.sequence)
+                {
+                    *self.pending.borrow_mut() = Some(Rc::new(prepared));
+                }
+                match self.install_pending() {
+                    Ok(()) | Err(Error::Unavailable | Error::Overloaded | Error::Io) => (),
+                    Err(error) => return Err(error),
+                }
             }
             SnapshotResponse::Unchanged => (),
         }
         Ok(())
     }
-    /// Retry local preparation/installation without projection, renewal, or HTTP.
-    /// One bounded full publication survives transient failures and expired turns.
+    /// Retry prepared immutable state independently of remote progress.
     fn install_pending(&self) -> Result<()> {
         let publication = self
             .pending
@@ -482,9 +606,9 @@ impl ControlClient {
             .lifecycle
             .borrow()
             .as_ref()
-            .map(|l| l.stage(&publication.caches))
+            .map(|l| l.stage(&publication.snapshot.caches))
             .transpose()?;
-        let snapshot = self.snapshots.publish_staged(publication, transition)?;
+        let snapshot = self.snapshots.publish_prepared(&publication, transition)?;
         self.events
             .borrow_mut()
             .extend(self.caches.reconcile(&snapshot.caches)?);

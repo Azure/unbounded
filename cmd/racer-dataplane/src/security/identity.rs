@@ -19,6 +19,8 @@ pub struct SigningIdentity {
     node: NodeId,
     key: SigningKey,
     chain: Vec<Vec<u8>>,
+    expires: u64,
+    valid_from: u64,
 }
 impl PendingIdentity {
     pub fn generate() -> Result<Self> {
@@ -70,10 +72,14 @@ impl PendingIdentity {
         if public != self.key.verifying_key() {
             return Err(Error::Unauthorized);
         }
+        let (valid_from, expires) =
+            super::certificates::validity(chain.iter().chain(roots.iter()))?;
         Ok(SigningIdentity {
             cluster,
             node,
             key: self.key,
+            expires,
+            valid_from,
             chain,
         })
     }
@@ -167,6 +173,9 @@ pub(crate) mod tests {
     }
 }
 impl SigningIdentity {
+    pub fn expires_at_seconds(&self) -> u64 {
+        self.expires
+    }
     pub fn from_pkcs8(
         cluster: ClusterId,
         node: NodeId,
@@ -186,9 +195,8 @@ impl SigningIdentity {
         &self.chain
     }
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-        let (_, leaf) =
-            x509_parser::parse_x509_certificate(&self.chain[0]).map_err(|_| Error::Unauthorized)?;
-        if !leaf.validity().is_valid() {
+        let now = crate::runtime::environment::unix_time().as_secs();
+        if now < self.valid_from || now >= self.expires {
             return Err(Error::Unauthorized);
         }
         Ok(self.key.sign(message).to_bytes().to_vec())

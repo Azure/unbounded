@@ -25,6 +25,7 @@ struct State {
     roots: Arc<Vec<Vec<u8>>>,
     entries: Vec<Entry>,
     identity: Option<Arc<SigningIdentity>>,
+    identity_trust: Option<(Arc<Vec<Vec<u8>>>, u64, u64)>,
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -530,12 +531,8 @@ impl Keyring {
             hash.update(key.material);
         }
         let fingerprint: [u8; 32] = hash.finalize().into();
-        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.cluster.as_ref().is_some_and(|c| c != &self.cluster)
-            || state.generation.is_some_and(|g| bundle.generation < g)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
+        // Validate the downloaded epoch before acquiring the shared publication
+        // lock. Existing immutable secret leases remain usable during validation.
         for (i, candidate) in bundle.cache_keys.iter().enumerate() {
             if !super::certificates::canonical_uuid(&candidate.key.cache.0) {
                 return Err(Error::InvalidConfiguration);
@@ -564,6 +561,14 @@ impl Keyring {
                     return Err(Error::InvalidConfiguration);
                 }
             }
+        }
+        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+        if state.cluster.as_ref().is_some_and(|c| c != &self.cluster)
+            || state.generation.is_some_and(|g| bundle.generation < g)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        for candidate in &bundle.cache_keys {
             if state.generation == Some(bundle.generation) {
                 continue;
             }
@@ -625,7 +630,21 @@ impl Keyring {
                 });
             }
         }
-        state.roots = Arc::new(bundle.peer_trust_roots.clone());
+        state.entries.sort_by(|a, b| {
+            (
+                &a.reference.cache,
+                a.reference.purpose as u8,
+                a.reference.id.0,
+            )
+                .cmp(&(
+                    &b.reference.cache,
+                    b.reference.purpose as u8,
+                    b.reference.id.0,
+                ))
+        });
+        if *state.roots != bundle.peer_trust_roots {
+            state.roots = Arc::new(bundle.peer_trust_roots.clone());
+        }
         state.cluster = Some(self.cluster.clone());
         state.generation = Some(bundle.generation);
         state.fingerprint = Some(fingerprint);
@@ -640,16 +659,21 @@ impl Keyring {
         if identity.node() != &self.node || identity.cluster() != &self.cluster {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.cluster.as_ref() != Some(&self.cluster) {
-            return Err(Error::MissingKey);
-        }
+        let roots = self.peer_trust_roots()?;
         super::certificates::verify_chain(
-            &state.roots,
+            &roots,
             identity.certificate_chain(),
             &self.cluster,
             &self.node,
         )?;
+        let (_, until) =
+            super::certificates::validity(identity.certificate_chain().iter().chain(roots.iter()))?;
+        let checked = crate::runtime::environment::unix_time().as_secs();
+        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+        if !Arc::ptr_eq(&roots, &state.roots) {
+            return Err(Error::Unavailable);
+        }
+        state.identity_trust = Some((roots, checked, until));
         state.identity = Some(identity);
         Ok(())
     }
@@ -659,13 +683,38 @@ impl Keyring {
         if identity.node() != &self.node || identity.cluster() != &self.cluster {
             return Err(Error::Unauthorized);
         }
+        let now = crate::runtime::environment::unix_time().as_secs();
+        let identity = identity.clone();
+        if state
+            .identity_trust
+            .as_ref()
+            .is_some_and(|(roots, checked, until)| {
+                Arc::ptr_eq(roots, &state.roots) && now >= *checked && now < *until
+            })
+        {
+            return Ok(identity);
+        }
+        let roots = state.roots.clone();
+        drop(state);
         super::certificates::verify_chain(
-            &state.roots,
+            &roots,
             identity.certificate_chain(),
             &self.cluster,
             &self.node,
         )?;
-        Ok(identity.clone())
+        let (_, until) =
+            super::certificates::validity(identity.certificate_chain().iter().chain(roots.iter()))?;
+        let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+        if !Arc::ptr_eq(&roots, &state.roots)
+            || !state
+                .identity
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &identity))
+        {
+            return Err(Error::Unavailable);
+        }
+        state.identity_trust = Some((roots, now, until));
+        Ok(identity)
     }
     pub fn lease(
         &self,
@@ -682,11 +731,22 @@ impl Keyring {
         if state.cluster.as_ref() != Some(&self.cluster) {
             return Err(Error::MissingKey);
         }
-        let entry = state
+        let position = state
             .entries
-            .iter()
-            .find(|e| e.reference == reference)
-            .ok_or(Error::MissingKey)?;
+            .binary_search_by(|entry| {
+                (
+                    &entry.reference.cache,
+                    entry.reference.purpose as u8,
+                    entry.reference.id.0,
+                )
+                    .cmp(&(
+                        &reference.cache,
+                        reference.purpose as u8,
+                        reference.id.0,
+                    ))
+            })
+            .map_err(|_| Error::MissingKey)?;
+        let entry = &state.entries[position];
         Ok(KeyLease {
             reference,
             secret: entry.secret.clone(),
@@ -698,14 +758,15 @@ impl Keyring {
         if state.cluster.as_ref() != Some(&self.cluster) {
             return Err(Error::MissingKey);
         }
-        let entry = state
-            .entries
+        let first = state.entries.partition_point(|entry| {
+            (&entry.reference.cache, entry.reference.purpose as u8) < (cache, purpose as u8)
+        });
+        let entry = state.entries[first..]
             .iter()
-            .find(|e| {
-                &e.reference.cache == cache
-                    && e.reference.purpose == purpose
-                    && e.state == CacheKeyState::Active
+            .take_while(|entry| {
+                &entry.reference.cache == cache && entry.reference.purpose == purpose
             })
+            .find(|entry| entry.state == CacheKeyState::Active)
             .ok_or(Error::MissingKey)?;
         Ok(KeyLease {
             reference: entry.reference.clone(),
