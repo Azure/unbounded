@@ -48,6 +48,21 @@ func (r *KeyringReconciler) now() time.Time {
 	return time.Now().UTC().Truncate(time.Second)
 }
 
+func (s RotationState) nextTransition() time.Time {
+	deadline := s.NextRotation
+	if s.PreparedIssuer != "" {
+		deadline = s.ActivateAt
+	}
+
+	for _, at := range s.Retiring {
+		if at.Before(deadline) {
+			deadline = at
+		}
+	}
+
+	return deadline
+}
+
 func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyState, generation wire.Generation) (wire.CacheKey, error) {
 	if generation == 0 {
 		return wire.CacheKey{}, wire.Unavailable
@@ -219,16 +234,7 @@ func (r *KeyringReconciler) planRotation(b wire.KeyringBundle, s RotationState, 
 		s.ActivateAt = now.Add(r.Config.Rotation.PrepareFor)
 	}
 
-	s.NextTransition = s.NextRotation
-	if !s.ActivateAt.IsZero() {
-		s.NextTransition = s.ActivateAt
-	}
-
-	for _, deadline := range s.Retiring {
-		if deadline.Before(s.NextTransition) {
-			s.NextTransition = deadline
-		}
-	}
+	s.NextTransition = s.nextTransition()
 
 	if _, err := wire.EncodeBundle(b); err != nil {
 		return b, s, err
@@ -644,13 +650,10 @@ func (c *credentialState) validateRotation() error {
 
 	expected := map[string]time.Time{}
 
-	deadline := s.NextRotation
 	if !s.ActivateAt.IsZero() {
 		if !containsRoot(b, s.PreparedIssuer) || s.PreparedIssuer == s.ActiveIssuer || !s.ActivateAt.After(s.NextRotation) {
 			return wire.Unavailable
 		}
-
-		deadline = s.ActivateAt
 	}
 
 	for _, root := range b.PeerTrustRoots {
@@ -691,13 +694,9 @@ func (c *credentialState) validateRotation() error {
 		if at.IsZero() {
 			return wire.Unavailable
 		}
-
-		if at.Before(deadline) {
-			deadline = at
-		}
 	}
 
-	if !deadline.Equal(s.NextTransition) {
+	if !s.nextTransition().Equal(s.NextTransition) {
 		return wire.Unavailable
 	}
 

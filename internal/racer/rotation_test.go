@@ -622,15 +622,51 @@ func TestPlanRotationInputValidation(t *testing.T) {
 }
 
 func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
-	for _, corrupt := range []string{"timestamp", "active issuer", "bundle", "private key", "generation", "binding"} {
+	for _, corrupt := range []string{"timestamp", "transition mismatch", "zero root retirement", "zero key retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
 		t.Run(corrupt, func(t *testing.T) {
 			r, now := testKeyring(t)
 			runKeys(t, r)
+
+			switch corrupt {
+			case "zero root retirement", "zero key retirement", "unknown retirement":
+				_, _, initial, _ := keyState(t, r)
+				*now = initial.NextRotation
+
+				runKeys(t, r)
+				_, _, prepared, _ := keyState(t, r)
+				*now = prepared.ActivateAt
+
+				runKeys(t, r)
+			}
+
 			shared, b, s, _ := keyState(t, r)
 
 			switch corrupt {
 			case "timestamp":
 				s.NextTransition = time.Time{}
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "transition mismatch":
+				s.NextTransition = s.NextTransition.Add(time.Second)
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "zero root retirement":
+				for _, root := range b.PeerTrustRoots {
+					if id := rootID(root); id != s.ActiveIssuer {
+						s.Retiring[id] = time.Time{}
+					}
+				}
+
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "zero key retirement":
+				for _, key := range b.CacheKeys {
+					if key.State == wire.RetiringKey {
+						s.Retiring[keyID(key)] = time.Time{}
+						break
+					}
+				}
+
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "unknown retirement":
+				s.Retiring["unknown"] = s.NextTransition.Add(time.Hour)
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "active issuer":
 				s.ActiveIssuer = "missing"
