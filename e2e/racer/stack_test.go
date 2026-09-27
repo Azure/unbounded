@@ -98,6 +98,7 @@ func TestOperatorImagePull(t *testing.T) {
 	h.kubectl("rollout", "status", "deployment/unbounded-operator", "-n", namespace, "--timeout=90s")
 	h.kubectl("wait", "--for=condition=Established", "crd/clustercaches.racer.unbounded-cloud.io", "--timeout=60s")
 	require.Empty(t, strings.TrimSpace(h.kubectl("get", "deployment/racer-controller", "-n", namespace, "--ignore-not-found", "-o", "name")))
+	h.apply(rotationOverrides)
 	h.apply("apiVersion: racer.unbounded-cloud.io/v1alpha1\nkind: ClusterCache\nmetadata:\n  name: gantry\n")
 	h.waitResource("deployment/racer-controller")
 	// Only the elected controller leader reports ready.
@@ -125,6 +126,9 @@ func TestOperatorImagePull(t *testing.T) {
 
 	peers := h.peerNodes()
 	peerFixture := h.newPeerFixture(peers)
+	rotationFixture := h.newSeededPeerFixture(peers, 82)
+	rotationFixture.authorization = rotationAuthorization
+	rotationPressure := h.rotationDiskFixtures()
 	lifecycle := newLifecycleOrigin(t)
 	origin := h.serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v2/fixture/lifecycle/") {
@@ -133,7 +137,20 @@ func TestOperatorImagePull(t *testing.T) {
 		}
 
 		if strings.HasPrefix(r.URL.Path, "/v2/fixture/peers/") {
+			for _, filler := range rotationPressure {
+				if strings.HasSuffix(r.URL.Path, filler.id) {
+					filler.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			if strings.HasSuffix(r.URL.Path, rotationFixture.id) {
+				rotationFixture.ServeHTTP(w, r)
+				return
+			}
+
 			peerFixture.ServeHTTP(w, r)
+
 			return
 		}
 
@@ -192,6 +209,7 @@ func TestOperatorImagePull(t *testing.T) {
 	h.waitHTTP(racerURL + "/readyz")
 	t.Logf("containerd pulled and unpacked %s/fixture/image@%s through operator-installed Racer and Gantry (%d objects)", registry, fixture.manifest, len(fixture.blobs))
 	h.verifyPeerCache(peers, peerFixture)
+	h.verifyLiveRotation(peers, rotationFixture, rotationPressure)
 	h.verifyCacheRecreation(peers, lifecycle)
 }
 

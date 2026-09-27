@@ -34,6 +34,7 @@ type Config struct {
 	InstallationConfigMapName string
 	Limits                    Limits
 	Rotation                  RotationPolicy
+	CertificateLifetime       time.Duration
 }
 
 type Limits struct {
@@ -78,7 +79,35 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		Rotation: RotationPolicy{Interval: 24 * time.Hour, PrepareFor: time.Hour, RetainFor: 48 * time.Hour},
 	}
 
+	for _, setting := range []struct {
+		name  string
+		value *time.Duration
+	}{
+		{"RACER_CERTIFICATE_LIFETIME", &cfg.CertificateLifetime},
+		{"RACER_ROTATION_INTERVAL", &cfg.Rotation.Interval},
+		{"RACER_ROTATION_PREPARE_FOR", &cfg.Rotation.PrepareFor},
+		{"RACER_ROTATION_RETAIN_FOR", &cfg.Rotation.RetainFor},
+	} {
+		if value, ok := lookup(setting.name); ok {
+			duration, err := time.ParseDuration(value)
+			if err != nil || duration <= 0 || duration%time.Second != 0 {
+				return Config{}, fmt.Errorf("%s: %w", setting.name, wire.InvalidRequest)
+			}
+
+			*setting.value = duration
+		}
+	}
+
 	return cfg, cfg.Validate()
+}
+
+// A zero value preserves the lifetime used by existing programmatic callers.
+func (c Config) certificateLifetime() time.Duration {
+	if c.CertificateLifetime == 0 {
+		return wire.CertificateLifetime
+	}
+
+	return c.CertificateLifetime
 }
 
 func (c Config) Validate() error {
@@ -96,7 +125,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)
 	}
 
-	if c.IssuerSecretName == c.KeyringSecretName || c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < wire.CertificateLifetime || c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
+	// Two minutes leaves a full poll turn between renewal at two-thirds of the
+	// lifetime and expiry. X.509 and rotation deadlines have second precision.
+	lifetime := c.certificateLifetime()
+	if lifetime < 2*time.Minute || lifetime > wire.CertificateLifetime || lifetime%time.Second != 0 {
+		return fmt.Errorf("certificate lifetime: %w", wire.InvalidRequest)
+	}
+
+	if c.IssuerSecretName == c.KeyringSecretName || c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime || c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
 		return fmt.Errorf("credential names or rotation policy: %w", wire.InvalidRequest)
 	}
 

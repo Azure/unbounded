@@ -268,6 +268,7 @@ pub(crate) mod tests {
             material: [10; 32],
         });
         keys.install(rotated.clone()).unwrap();
+        assert_eq!(keys.generation().unwrap(), Some(2));
         assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         assert_eq!(secret.strong_count(), 1);
         assert!(
@@ -287,6 +288,7 @@ pub(crate) mod tests {
         );
         rotated.generation = BundleGeneration(3);
         keys.install(rotated).unwrap();
+        assert_eq!(keys.generation().unwrap(), Some(3));
         drop(held);
         assert!(secret.upgrade().is_none());
     }
@@ -463,6 +465,16 @@ impl KeyLease {
     }
 }
 impl Keyring {
+    /// Locally installed coherent bundle, not a controller acknowledgment.
+    pub fn generation(&self) -> Result<Option<u64>> {
+        Ok(self
+            .epochs
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .generation
+            .map(|g| g.0))
+    }
     pub fn new(cluster: ClusterId, node: NodeId, epochs: Arc<KeyEpochs>) -> Self {
         Self {
             cluster,

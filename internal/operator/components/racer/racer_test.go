@@ -530,3 +530,31 @@ func TestAdmissionFailureGatesBindingAndWorkloads(t *testing.T) {
 		})
 	}
 }
+
+func TestControllerRotationConfigUsesPreservedConfigMap(t *testing.T) {
+	env := testEnv(t, cache("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+
+	for name, value := range map[string]string{
+		"RACER_CERTIFICATE_LIFETIME": "2m", "RACER_ROTATION_INTERVAL": "5m",
+		"RACER_ROTATION_PREPARE_FOR": "1m", "RACER_ROTATION_RETAIN_FOR": "2m",
+	} {
+		cm.Data[name] = value
+		t.Setenv(name, "invalid-operator-process-value")
+	}
+
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
+	cm.Data["RACER_ROTATION_RETAIN_FOR"] = "119s"
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	_, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "rotation policy")
+}

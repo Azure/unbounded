@@ -282,7 +282,18 @@ retiring generations. It includes all 20 generation-counter digits, the longest
 key-state spelling, and a 1 KiB DER allowance per issuer root (enforced on generated
 roots). The reserve intentionally includes a prepared generation even when the
 oldest retiree would expire before preparation. Custom Go `RotationPolicy` values
-therefore change the maximum; these durations are not environment settings.
+therefore change the maximum. `RACER_ROTATION_INTERVAL`,
+`RACER_ROTATION_PREPARE_FOR`, and `RACER_ROTATION_RETAIN_FOR` accept Go durations
+with whole-second precision, retaining the defaults above. Preparation must be
+positive and no longer than the interval; interval and retention are capped at
+365 days. `RACER_CERTIFICATE_LIFETIME` accepts whole-second durations from two
+minutes through the default 24 hours. Retention must cover that entire lifetime.
+Rust renews at two-thirds of the issued lifetime (16 hours by default), capped at
+16 hours. The minimum leaves a full control-poll turn before expiration.
+Issuer lifetime and staged-root viability checks use the configured leaf lifetime.
+For operator-managed installations, set these environment variables using a
+`racer` Deployment workload override. Changing retention on an existing
+installation does not shorten already persisted retirement deadlines.
 Policies whose trust-root reserve alone cannot fit fail before credential
 initialization consumes its one-way claim.
 

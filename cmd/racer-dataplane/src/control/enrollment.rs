@@ -93,7 +93,7 @@ impl Enrollment {
         }
     }
     /// Persist a fresh private key and retry-stable request before submission.
-    /// All issuance uses the projected token, including renewal at 16 hours.
+    /// All issuance uses the projected token, including lifetime-based renewal.
     pub fn prepare<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, EnrollmentRequest> {
         Box::pin(async move {
             let r = self.reactor()?;
@@ -614,8 +614,11 @@ impl LocalSigningIdentity {
             && crate::runtime::environment::wall_now() < self.expires_at()
     }
     pub fn renewal_due(&self) -> bool {
+        let lifetime = Duration::from_secs(self.not_after - self.not_before);
         crate::runtime::environment::wall_now()
-            >= UNIX_EPOCH + Duration::from_secs(self.not_before) + wire::RENEW_AFTER
+            >= UNIX_EPOCH
+                + Duration::from_secs(self.not_before)
+                + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
     }
 }
 #[cfg(test)]
@@ -624,6 +627,34 @@ mod tests {
     use crate::control::testing;
     const OLD_NODE: &str = "22222222-2222-4222-8222-222222222222";
     const NEW_NODE: &str = "33333333-3333-4333-8333-333333333333";
+
+    #[test]
+    fn renewal_tracks_short_issued_lifetime_and_preserves_default() {
+        for (lifetime, due) in [(120, 80), (86400, 57600), (86700, 57600)] {
+            let identity = LocalSigningIdentity {
+                cluster: ClusterId(String::new()),
+                node: NodeId(String::new()),
+                enrollment: EnrollmentId(String::new()),
+                private_material: Vec::new(),
+                certificate_chain: Vec::new(),
+                not_before: 1000,
+                not_after: 1000 + lifetime,
+            };
+            let clock = crate::runtime::environment::SimulationClock::new_at(
+                51,
+                std::time::Instant::now(),
+                UNIX_EPOCH + Duration::from_secs(1000 + due - 1),
+            );
+            let _time = clock.environment(1).enter();
+            assert!(!identity.renewal_due());
+            clock.advance(Duration::from_secs(1));
+            assert!(identity.renewal_due());
+            assert!(identity.valid_now());
+            clock.advance(Duration::from_secs(lifetime - due));
+            assert!(!identity.valid_now());
+            assert!(identity.renewal_due());
+        }
+    }
 
     #[test]
     fn authenticated_replacement_preserves_cluster_key_and_correlation_checks() {

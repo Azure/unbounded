@@ -269,7 +269,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 			return ctrl.Result{}, err
 		}
 
-		if now.Add(r.Config.Rotation.PrepareFor + wire.CertificateLifetime).After(cert.NotAfter) {
+		if now.Add(r.Config.Rotation.PrepareFor + r.Config.certificateLifetime()).After(cert.NotAfter) {
 			roots := b.PeerTrustRoots[:0]
 			for _, root := range b.PeerTrustRoots {
 				if rootID(root) != s.PreparedIssuer {
@@ -303,7 +303,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 				return ctrl.Result{}, err
 			}
 
-			if now.Add(r.Config.Rotation.PrepareFor + wire.CertificateLifetime).After(cert.NotAfter) {
+			if now.Add(r.Config.Rotation.PrepareFor + r.Config.certificateLifetime()).After(cert.NotAfter) {
 				pending = ""
 			}
 		}

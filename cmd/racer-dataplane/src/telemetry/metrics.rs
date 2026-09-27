@@ -5,8 +5,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 16;
-pub const GAUGE_COUNT: usize = 3;
+pub const EVENT_COUNT: usize = 17;
+pub const GAUGE_COUNT: usize = 6;
 #[derive(Clone, Default)]
 pub struct Metrics(Arc<Counters>);
 #[derive(Default)]
@@ -24,6 +24,7 @@ pub enum Event {
     PeerHit,
     OriginFill,
     DirtyDiscard,
+    DiskPublication,
     Overload,
     CorruptMiss,
     DiagnosticAccepted,
@@ -42,6 +43,7 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::PeerHit,
     Event::OriginFill,
     Event::DirtyDiscard,
+    Event::DiskPublication,
     Event::Overload,
     Event::CorruptMiss,
     Event::DiagnosticAccepted,
@@ -62,6 +64,7 @@ impl Event {
             Self::PeerHit => "racer_peer_hits_total",
             Self::OriginFill => "racer_origin_fills_total",
             Self::DirtyDiscard => "racer_dirty_discards_total",
+            Self::DiskPublication => "racer_disk_publications_total",
             Self::Overload => "racer_overloads_total",
             Self::CorruptMiss => "racer_corrupt_misses_total",
             Self::DiagnosticAccepted => "racer_diagnostic_accepted_total",
@@ -80,11 +83,17 @@ pub enum Gauge {
     DiagnosticConnections,
     ActiveRequests,
     ActiveFills,
+    KeyringGeneration,
+    IdentityExpiresAtSeconds,
+    PendingDiskWrites,
 }
 pub const GAUGES: [Gauge; GAUGE_COUNT] = [
     Gauge::DiagnosticConnections,
     Gauge::ActiveRequests,
     Gauge::ActiveFills,
+    Gauge::KeyringGeneration,
+    Gauge::IdentityExpiresAtSeconds,
+    Gauge::PendingDiskWrites,
 ];
 impl Gauge {
     pub fn name(self) -> &'static str {
@@ -92,6 +101,9 @@ impl Gauge {
             Self::DiagnosticConnections => "racer_diagnostic_connections",
             Self::ActiveRequests => "racer_active_requests",
             Self::ActiveFills => "racer_active_fills",
+            Self::KeyringGeneration => "racer_keyring_generation",
+            Self::IdentityExpiresAtSeconds => "racer_identity_expires_at_seconds",
+            Self::PendingDiskWrites => "racer_pending_disk_writes",
         }
     }
 }
@@ -153,6 +165,9 @@ impl Metrics {
     }
     pub fn gauge(&self, gauge: Gauge) -> u64 {
         self.0.gauges[gauge as usize].load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_gauge(&self, gauge: Gauge, value: u64) {
+        self.0.gauges[gauge as usize].store(value, Ordering::Relaxed);
     }
     pub fn lease(&self, gauge: Gauge) -> Result<GaugeLease> {
         self.0.gauges[gauge as usize]
@@ -234,5 +249,20 @@ mod tests {
         );
         assert!(!output.contains('{'));
         assert!(output.len() < 4096);
+    }
+
+    #[test]
+    fn installed_credential_gauges_replace_values_across_shared_handles() {
+        let metrics = Metrics::default();
+        let worker = metrics.clone();
+        worker.set_gauge(Gauge::KeyringGeneration, 3);
+        worker.set_gauge(Gauge::IdentityExpiresAtSeconds, 120);
+        worker.set_gauge(Gauge::IdentityExpiresAtSeconds, 200);
+        assert_eq!(metrics.gauge(Gauge::KeyringGeneration), 3);
+        assert_eq!(metrics.gauge(Gauge::IdentityExpiresAtSeconds), 200);
+        let mut output = String::new();
+        metrics.write_prometheus(&mut output).unwrap();
+        assert!(output.contains("racer_keyring_generation 3\n"));
+        assert!(output.contains("racer_identity_expires_at_seconds 200\n"));
     }
 }

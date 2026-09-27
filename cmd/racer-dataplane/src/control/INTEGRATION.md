@@ -79,7 +79,9 @@ restart the container (or a standalone supervisor must restart the process).
 
 Snapshot 503 responses schedule token reauthentication on the next backoff-bounded
 turn, covering a deleted UID absent from controller discovery without waiting for
-certificate renewal. Ordinary token renewal still uses the 16-hour deadline. A
+certificate renewal. Ordinary token renewal uses two-thirds of the issued
+certificate lifetime, capped at 16 hours (the default 24-hour leaf renews at
+16 hours). A
 403 remains terminal. Failure to authenticate never falls back to a disk identity.
 
 Restart recreates node-bound signing views, connection sessions, membership,

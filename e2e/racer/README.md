@@ -106,6 +106,77 @@ metrics thresholds or fixed sleeps are used. Release is idempotent and the held
 handler also exits on test cancellation. The existing `make e2e-racer` target
 includes this phase without additional tools or images.
 
+## Live key and issuer rotation
+
+Between peer recovery and cache recreation, the same two live Rust dataplanes
+exercise Go-controller-driven rotation. A supported `racer` Deployment override
+sets a two-minute leaf TTL, one-minute preparation, and two-minute retention.
+The normal rotation interval stays at 24 hours so earlier accounting checks cannot
+race activation. The test advances only `rotation.json`'s scheduling deadline
+with a resourceVersion precondition; the real Go reconciler generates and
+publishes all prepared, active, retiring, and pruned keys and issuer roots.
+No credential bundle is constructed by the test.
+
+The phase checks:
+
+- Both Rust processes install the prepared Secret projection before activation.
+  One pod's mount namespace temporarily pins a copy of that genuine projection;
+  kubelet, token projection, and control polling continue normally. The other
+  node installs activation while the delayed node demonstrably remains prepared.
+- Warm data stays byte-correct. After activation, fresh admission to retired
+  keys closes and the previously warm server must refill from origin. The delayed
+  reader must return correct bytes through bounded origin fallback. Unmounting
+  the pin exposes the newest real projection, and both nodes converge.
+- Each live node persists a distinct controller-issued leaf signed by the newly
+  activated root, with the two-minute TTL. Its running identity-expiry gauge must
+  match that leaf. After the original certificates have actually expired, a
+  still-cold reader must get a validated peer page with no origin GET/fill.
+- The Go controller removes old shared keys, the public root, and private issuer
+  material. Both Rust processes install the pruned generation and remain ready.
+  Key IDs are compared as opaque bytes, with no assumed encoding.
+- Twenty full-page pressure objects exceed the default 256 MiB node plaintext
+  budget, distributed across worker buckets. Before rotation and after prune,
+  reading the evicted target must increment the disk-hit counter exactly once
+  without an origin GET/fill. Every page read checks exact bytes, HTTP 206, ETag,
+  and Content-Range. Pod UIDs and restart counts must remain unchanged.
+
+Before warming the target, the test waits for zero pending disk writes and records
+the disk-publication counter. The isolated cold target fill must produce exactly
+one new publication and return to zero pending writes within ten seconds before
+pressure starts. The same precondition applies to its active-key refill. Publication
+is counted only after completed slab I/O and successful index installation;
+abandoned or retired writes cannot satisfy it. These are bounded observations,
+not request retries or a sleep hoping that writeback has finished.
+
+The rotation blob requires an exact public synthetic Authorization value for
+both HEAD and GET. This exercises active origin-key sealing in page dispatch and
+peer requests before and after rotation, with exact delivery to the Go origin
+adapter. It does not establish cross-node credential decryption: both nodes are
+ranked candidates, so the predecessor request is CopyOnly and deliberately never
+opens Authorization. The server's origin-fill count must not change during that
+probe. Cross-node Acquire credential decryption needs a noncandidate reader.
+
+The fixed, unlabeled `racer_keyring_generation` and
+`racer_identity_expires_at_seconds` gauges describe installed local credentials;
+they are observations, not controller acknowledgments. Public certificate chains
+are decoded in memory; private keys and bundles are not written to diagnostic
+artifacts. Metrics snapshots are retained. The projection pin is removed during
+failure cleanup as well as on success.
+
+The pin uses a mode-0700 parent, validates the complete decoded bundle against the
+expected controller bundle before/after copying and after mounting, and retries
+copy races for at most eight seconds. Release removes both the bind mount and the
+private copied material. Bundles never enter diagnostic artifacts. The fixed
+`racer_pending_disk_writes` gauge counts accepted pending writes, and
+`racer_disk_publications_total` counts completed index publications across workers.
+
+Polling is one second, with 45-second projection bounds, 100-second renewal
+bounds, and pruning bounded by the actual retirement deadline plus 15 seconds.
+The existing 25-second curl / 30-second request bounds apply. Cached reads also
+run while awaiting pruning. There are no fixed expiry sleeps, new clusters, or
+additional image builds in the test; the seven-minute shared deadline and
+ten-minute `make e2e-racer` timeout remain in force.
+
 ## Iteration and diagnostics
 
 ### CI coverage

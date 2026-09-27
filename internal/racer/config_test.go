@@ -6,6 +6,7 @@ package racer
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -53,5 +54,84 @@ func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 	loaded, err := LoadConfig()
 	if err != nil || loaded.PeerPort != 65535 || loaded.InstallationConfigMapName != "permanent-installation" {
 		t.Fatalf("deployment overrides: %+v, %v", loaded, err)
+	}
+}
+
+func TestConfigShortRotationDurations(t *testing.T) {
+	testConfig(t)
+
+	cfg, err := LoadConfig()
+	if err != nil || cfg.certificateLifetime() != wire.CertificateLifetime {
+		t.Fatalf("default lifetime: %v", err)
+	}
+
+	for name, value := range map[string]string{
+		"RACER_CERTIFICATE_LIFETIME": "2m",
+		"RACER_ROTATION_INTERVAL":    "5m",
+		"RACER_ROTATION_PREPARE_FOR": "20s",
+		"RACER_ROTATION_RETAIN_FOR":  "2m",
+	} {
+		t.Setenv(name, value)
+	}
+
+	cfg, err = LoadConfig()
+	if err != nil || cfg.certificateLifetime() != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}) {
+		t.Fatalf("short rotation config: %v", err)
+	}
+
+	for name, value := range map[string]string{
+		"RACER_CERTIFICATE_LIFETIME": "119s",
+		"RACER_ROTATION_INTERVAL":    "19s",
+		"RACER_ROTATION_PREPARE_FOR": "500ms",
+		"RACER_ROTATION_RETAIN_FOR":  "119s",
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, invalid := range []string{value, "", "nonsense", "0", "-1s", "8761h", "120.5s"} {
+				t.Setenv(name, invalid)
+
+				if _, err := LoadConfig(); !errors.Is(err, wire.InvalidRequest) {
+					t.Fatalf("%s=%q accepted: %v", name, invalid, err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigDurationsUseProvidedLookup(t *testing.T) {
+	values := map[string]string{
+		"RACER_CLUSTER_ID":           string(testConfig(t).Cluster),
+		"RACER_CERTIFICATE_LIFETIME": "2m",
+		"RACER_ROTATION_INTERVAL":    "5m",
+		"RACER_ROTATION_PREPARE_FOR": "1m",
+		"RACER_ROTATION_RETAIN_FOR":  "2m",
+	}
+	for name := range values {
+		t.Setenv(name, "invalid-process-value")
+	}
+
+	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+
+	cfg, err := ConfigFromLookup(lookup)
+	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, time.Minute, 2 * time.Minute}) {
+		t.Fatalf("custom lookup ignored: %v", err)
+	}
+
+	for _, name := range []string{"RACER_CERTIFICATE_LIFETIME", "RACER_ROTATION_INTERVAL", "RACER_ROTATION_PREPARE_FOR", "RACER_ROTATION_RETAIN_FOR"} {
+		previous := values[name]
+
+		values[name] = "invalid-lookup-value"
+		if _, err := ConfigFromLookup(lookup); !errors.Is(err, wire.InvalidRequest) {
+			t.Fatalf("invalid custom %s accepted: %v", name, err)
+		}
+
+		values[name] = previous
+	}
+
+	delete(values, "RACER_CERTIFICATE_LIFETIME")
+	delete(values, "RACER_ROTATION_RETAIN_FOR")
+
+	cfg, err = ConfigFromLookup(lookup)
+	if err != nil || cfg.certificateLifetime() != wire.CertificateLifetime || cfg.Rotation.RetainFor != 48*time.Hour {
+		t.Fatalf("absent custom values did not use defaults: %v", err)
 	}
 }

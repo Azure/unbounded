@@ -27,6 +27,7 @@ use std::{
     rc::Rc,
 };
 struct Dirty {
+    _metric: crate::telemetry::metrics::GaugeLease,
     ticket: u64,
     page: CiphertextCopy,
     _reservation: Rc<Reservation>,
@@ -191,6 +192,9 @@ impl StoreWriter {
         pending.insert(
             id.clone(),
             Dirty {
+                _metric: self
+                    .metrics
+                    .lease(crate::telemetry::metrics::Gauge::PendingDiskWrites)?,
                 ticket,
                 page,
                 _reservation: Rc::new(dirty),
@@ -441,6 +445,8 @@ impl StoreWriter {
                     key_id: page.ciphertext.envelope().key_id,
                 },
             )?;
+            self.metrics
+                .record(crate::telemetry::metrics::Event::DiskPublication, 1)?;
         } else if self.pending.borrow().contains_key(id) {
             self.note_discard(1);
         }

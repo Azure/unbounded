@@ -74,6 +74,12 @@ impl WorkerApplication {
             return Ok(());
         };
         let now = crate::runtime::environment::now();
+        if self.control.is_some() {
+            self.telemetry.metrics.set_gauge(
+                crate::telemetry::metrics::Gauge::KeyringGeneration,
+                self.keys.generation()?.unwrap_or(0),
+            );
+        }
         let credentials = self.keys.signing_identity().ok().and_then(|identity| {
             let expiry = identity
                 .certificate_chain()
@@ -83,6 +89,12 @@ impl WorkerApplication {
                     u64::try_from(cert.validity().not_after.timestamp()).ok()
                 })
                 .min()?;
+            if self.control.is_some() {
+                self.telemetry.metrics.set_gauge(
+                    crate::telemetry::metrics::Gauge::IdentityExpiresAtSeconds,
+                    expiry,
+                );
+            }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
                 .duration_since(crate::runtime::environment::wall_now())
                 .ok()?;

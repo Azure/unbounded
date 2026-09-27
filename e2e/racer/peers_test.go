@@ -61,20 +61,25 @@ func (h *harness) peerNodes() [2]peerNode {
 }
 
 type peerOrigin struct {
-	body  []byte
-	id    string
-	mu    sync.Mutex
-	gets  map[string]int
-	heads int
+	authorization string
+	body          []byte
+	id            string
+	mu            sync.Mutex
+	gets          map[string]int
+	heads         int
 }
 
 func (h *harness) newPeerFixture(nodes [2]peerNode) *peerOrigin {
+	return h.newSeededPeerFixture(nodes, 81)
+}
+
+func (h *harness) newSeededPeerFixture(nodes [2]peerNode, seed byte) *peerOrigin {
 	h.t.Helper()
 	cache := strings.TrimSpace(h.kubectl("get", "clustercache", "gantry", "-o", "jsonpath={.metadata.uid}"))
 	require.NotEmpty(h.t, cache)
 
 	fixture := &peerOrigin{body: make([]byte, 2*peerPageSize+113), gets: make(map[string]int)}
-	random := rand.NewChaCha8([32]byte{81})
+	random := rand.NewChaCha8([32]byte{seed})
 	_, err := random.Read(fixture.body)
 	require.NoError(h.t, err)
 	// Equal default shares rank by quantized HRW cost and then node ID. Select an
@@ -156,6 +161,11 @@ func peerExponentialCost(sample uint64) uint64 {
 func (o *peerOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v2/fixture/peers/blobs/"+o.id {
 		http.NotFound(w, r)
+		return
+	}
+
+	if o.authorization != "" && r.Header.Get("Authorization") != o.authorization {
+		http.Error(w, "fixture authorization missing or changed", http.StatusUnauthorized)
 		return
 	}
 
@@ -282,7 +292,13 @@ func (h *harness) readPeerPage(node peerNode, fixture *peerOrigin, page int) {
 	defer cancel()
 	// kind's node image includes curl. Use the actual client UDS, same UID as
 	// Gantry, and explicit pins to distinguish metadata HEADs from data GETs.
-	raw := h.command(ctx, "docker", "exec", node.name, "curl", "--include", "--silent", "--show-error", "--fail", "--max-time", "25", "--noproxy", "*", "--unix-socket", "/run/racer/gantry/client/socket", "-H", "Host: racer", "-H", "If-Match: \""+fixture.id+"\"", "-H", "Range: bytes="+strconv.Itoa(first)+"-"+strconv.Itoa(last), "-H", "Racer-Metadata: "+metadata, "http://racer/v1/objects/"+strings.TrimPrefix(fixture.id, "sha256:"))
+	args := []string{"exec", node.name, "curl", "--include", "--silent", "--show-error", "--fail", "--max-time", "25", "--noproxy", "*", "--unix-socket", "/run/racer/gantry/client/socket", "-H", "Host: racer", "-H", "If-Match: \"" + fixture.id + "\"", "-H", "Range: bytes=" + strconv.Itoa(first) + "-" + strconv.Itoa(last), "-H", "Racer-Metadata: " + metadata}
+	if fixture.authorization != "" {
+		args = append(args, "-H", "Authorization: "+fixture.authorization)
+	}
+
+	args = append(args, "http://racer/v1/objects/"+strings.TrimPrefix(fixture.id, "sha256:"))
+	raw := h.command(ctx, "docker", args...)
 	response, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), nil)
 	require.NoError(h.t, err)
 
@@ -399,4 +415,34 @@ func TestPeerOriginAccounting(t *testing.T) {
 	gets[""]++
 	unchanged, _ := origin.counts()
 	require.Equal(t, 1, unchanged[""], "baselines must be detached snapshots")
+}
+
+func TestRotationOriginRequiresExactAuthorization(t *testing.T) {
+	body := []byte("authorized immutable fixture")
+
+	origin := &peerOrigin{body: body, id: digest(body), authorization: rotationAuthorization, gets: make(map[string]int)}
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		for _, auth := range []string{"", "Bearer wrong", rotationAuthorization} {
+			request := httptest.NewRequest(method, "/v2/fixture/peers/blobs/"+origin.id, nil)
+			request.Header.Set("Authorization", auth)
+
+			response := httptest.NewRecorder()
+			origin.ServeHTTP(response, request)
+
+			if auth != rotationAuthorization {
+				require.Equal(t, http.StatusUnauthorized, response.Code)
+				continue
+			}
+
+			require.Equal(t, http.StatusOK, response.Code)
+
+			if method == http.MethodGet {
+				require.Equal(t, body, response.Body.Bytes())
+			}
+		}
+	}
+
+	gets, heads := origin.counts()
+	require.Equal(t, map[string]int{"": 1}, gets)
+	require.Equal(t, 1, heads)
 }

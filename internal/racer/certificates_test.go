@@ -182,6 +182,48 @@ func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 	}
 }
 
+func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
+	r, now := testKeyring(t)
+	r.Config.CertificateLifetime = 2 * time.Minute
+	r.Config.Rotation = RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}
+	r.Issuer.Config = r.Config
+	runKeys(t, r)
+	identity, request, _ := issuanceRequest(t, r)
+
+	response, err := r.Issuer.Issue(context.Background(), identity, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaf, err := x509.ParseCertificate(response.CertificateChain[0])
+	if err != nil || leaf.NotAfter.Sub(leaf.NotBefore) != 2*time.Minute {
+		t.Fatalf("short leaf lifetime: %v", err)
+	}
+
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	runKeys(t, r)
+	_, _, prepared, _ := keyState(t, r)
+	*now = prepared.ActivateAt
+
+	runKeys(t, r)
+
+	renewed, err := r.Issuer.Issue(context.Background(), identity, request)
+	if err != nil || bytes.Equal(response.CertificateChain[1], renewed.CertificateChain[1]) {
+		t.Fatalf("short rotation issuer activation: %v", err)
+	}
+
+	*now = now.Add(2 * time.Minute)
+
+	runKeys(t, r)
+
+	_, bundle, _, material := keyState(t, r)
+	if containsRoot(bundle, initial.ActiveIssuer) || len(material.Keys) != 1 {
+		t.Fatal("short rotation did not retire old public/private issuer")
+	}
+}
+
 func TestIssuerConcurrentIssuanceAndReconciliation(t *testing.T) {
 	r, _ := testKeyring(t)
 	runKeys(t, r)

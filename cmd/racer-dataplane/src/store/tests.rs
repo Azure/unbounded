@@ -365,6 +365,16 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     let second_id = second.ciphertext.envelope().page.clone();
     f.enqueue(first).unwrap();
     f.enqueue(second).unwrap();
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        2
+    );
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        0
+    );
     let request = scope();
     let mut progress = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -376,12 +386,32 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     );
     assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
     let original = index.lookup(&first_id).unwrap().unwrap().location;
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        1
+    );
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        1
+    );
     // The queued page now turns over the full index and performs real I/O.
     let mut progress = f.store.writer.progress(1, &request);
     assert!(progress.as_mut().poll(&mut cx).is_pending());
     assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
     assert!(index.lookup(&second_id).unwrap().is_some());
     assert!(index.lookup(&first_id).unwrap().is_none());
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        2
+    );
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        0
+    );
     assert_eq!(f.store.writer.discarded_count(), 0);
     assert!(f.store.writer.is_idle());
     assert_eq!(f.store.writer.queued_count(), 0);
@@ -526,6 +556,16 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
         1
     );
     assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        0
+    );
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        0
+    );
     assert!(f.admission.used(ResourceClass::Ciphertext) > 0);
     assert!(!f.store.writer.is_idle());
     assert_eq!(f.store.writer.writes_in_flight(), 1);
@@ -563,7 +603,27 @@ fn retirement_during_write_fences_late_publication() {
     drive(&f.reactor, operation).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     assert_eq!(f.store.writer.pending_count(), 1);
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        1
+    );
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        0
+    );
     drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+    assert_eq!(
+        f.metrics
+            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        0
+    );
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::metrics::Event::DiskPublication),
+        1
+    );
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
