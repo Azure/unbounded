@@ -34,7 +34,7 @@ type Application struct {
 // c supplies indexed discovery (configured by SetupWithManager in production);
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
-	publications := NewPublications(cfg.Limits)
+	publications := NewPublications()
 	lifecycle := newLifecycle(publications)
 	trust := &Trust{}
 	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}

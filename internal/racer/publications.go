@@ -78,19 +78,17 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 	return written, nil
 }
 
-// Publications owns only the current immutable publication, bounded poll
-// admission, and one broadcast notification. Older state belongs to dataplanes.
+// Publications owns only the current immutable publication and one broadcast
+// notification. Older state belongs to dataplanes; poll admission belongs to Server.
 type Publications struct {
-	Limits    Limits
 	mu        sync.Mutex
 	current   *CommittedPublication
 	changed   chan struct{}
-	polls     map[wire.NodeID]struct{}
 	suspended bool
 }
 
-func NewPublications(limits Limits) *Publications {
-	return &Publications{Limits: limits, changed: make(chan struct{}), polls: make(map[wire.NodeID]struct{})}
+func NewPublications() *Publications {
+	return &Publications{changed: make(chan struct{})}
 }
 
 func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, members AcceptedMembers, caches []wire.CacheDefinition) (*PreparedPublication, error) {
@@ -213,8 +211,9 @@ func (p *Publications) Suspend() {
 	}
 }
 
-// Wait admits one poll per node, rejects future cursors, and honors context
-// cancellation/certificate expiration. It never allocates a publication per poll.
+// Wait rejects invalid identities/cursors and honors context cancellation and
+// certificate expiration. It shares publication bytes and broadcast notifications;
+// callers own admission for the full response lifetime, including writes and flush.
 func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *wire.Sequence) (*CommittedPublication, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -242,15 +241,7 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 		return nil, wire.Conflict
 	}
 
-	if _, exists := p.polls[identity.node]; exists || len(p.polls) >= p.Limits.MaxPolls {
-		p.mu.Unlock()
-		return nil, wire.Overloaded
-	}
-
-	p.polls[identity.node] = struct{}{}
 	p.mu.Unlock()
-
-	defer func() { p.mu.Lock(); delete(p.polls, identity.node); p.mu.Unlock() }()
 
 	timer := time.NewTimer(wire.PollWait)
 	defer timer.Stop()

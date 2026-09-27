@@ -278,13 +278,13 @@ composition tests; do not add tests that merely enumerate every placeholder.
   concurrent write admission, and HTTP write deadlines around it and close active
   connections on leadership loss. Never convert the entire encoding to `[]byte`
   per response. Retained publication references are bounded by admitted handlers.
-- `Publications.Wait(ctx, NodeIdentity, *wire.Sequence)` owns bounded waiting
-  admission (global `Limits.MaxPolls`, one waiter per node). Nil cursor returns
+- `Publications.Wait(ctx, NodeIdentity, *wire.Sequence)` validates and waits without
+  owning admission. Nil cursor returns
   current immediately, lower cursor returns latest, future/zero cursor conflicts,
   equal waits at most 30 seconds. `(nil, nil)` is normal 204 timeout. Expiration,
   request cancellation, and committed leadership cancellation terminate waits.
-  Phase 5 must keep HTTP admission through response completion so a node cannot
-  overlap a waiting/writing response; `Wait` releases its slot when it returns.
+  `Server` owns global `Limits.MaxPolls` and per-node admission through response
+  write and flush so a node cannot overlap a waiting/writing response.
 - `Application.Lifecycle` is shared with Keyring and Server. It is a one-shot
   leader runnable and waits for manager cache sync. Phase 4 calls
   `SetIssuerReady(bool)` only for usable issuer/trust, resetting on failure.
@@ -435,8 +435,10 @@ deployment integration check and is not exercised by envtest.
   query parameters, snapshot bodies, and bootstrap media/encoding mismatches fail
   with protocol errors. No ServeMux redirects or implicit HEAD endpoint exists.
   Errors contain only bounded wire codes; 429/503 include `Retry-After: 1`.
-- HTTP admission holds one slot per Node and a global poll bound through response
-  flush, in addition to `Publications.Wait`'s waiting admission. Handshake trust
+- `Server` is the sole poll admission owner, holding one slot per Node and a global
+  poll bound through response write and flush, including errors and cancellation.
+  `Publications.Wait` validates identities/cursors and shares the current immutable
+  publication and broadcast notification without tracking admission. Handshake trust
   selection, local certificate verification and enrollment share bounded authentication slots;
   slow snapshot writes have separate bounded slots. Saturation rejects immediately.
   Long polls are capped by the earliest verified-chain expiration and reauthorize

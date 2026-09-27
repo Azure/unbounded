@@ -588,7 +588,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		pollDone <- err
 	}()
 
-	awaitPolls(t, apps[leader].Server.Publications, 1)
+	awaitServerPolls(t, apps[leader].Server, 1)
 
 	lease := &coordv1.Lease{}
 	if err := c.Get(t.Context(), client.ObjectKey{Namespace: cfg.Namespace, Name: "racer-controller"}, lease); err != nil {

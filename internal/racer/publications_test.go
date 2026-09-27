@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -24,25 +23,6 @@ func pollIdentity(cfg Config, node wire.NodeID) NodeIdentity {
 	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: time.Now().Add(time.Hour)}
 }
 
-func awaitPolls(t *testing.T, p *Publications, count int) {
-	t.Helper()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		p.mu.Lock()
-		n := len(p.polls)
-		p.mu.Unlock()
-
-		if n == count {
-			return
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-
-	t.Fatalf("poll admission did not reach %d", count)
-}
-
 func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 	r := initializedTopology(t)
 
@@ -53,7 +33,7 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 		}
 	}
 
-	if err := NewPublications(r.Config.Limits).Install(p); !errors.Is(err, wire.InvalidRequest) {
+	if err := NewPublications().Install(p); !errors.Is(err, wire.InvalidRequest) {
 		t.Fatalf("foreign install: %v", err)
 	}
 
@@ -144,77 +124,80 @@ func TestPublicationDeepIsolationAndReplay(t *testing.T) {
 	}
 }
 
-func TestPollAdmissionAndCancellation(t *testing.T) {
-	r := initializedTopology(t)
+func TestPollValidationAndCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
 
-	leader, loseLeadership := context.WithCancel(context.Background())
-	defer loseLeadership()
+		leader, loseLeadership := context.WithCancel(context.Background())
+		defer loseLeadership()
 
-	current := reconcileTopology(t, r, leader)
-	r.Publications.Limits.MaxPolls = 1
-	identity := pollIdentity(r.Config, testNodeUID)
-	sequence := current.Version().Sequence
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+		current := reconcileTopology(t, r, leader)
+		identity := pollIdentity(r.Config, testNodeUID)
+		sequence := current.Version().Sequence
 
-	go func() { _, err := r.Publications.Wait(ctx, identity, &sequence); done <- err }()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	awaitPolls(t, r.Publications, 1)
+		done := make(chan error, 1)
 
-	for _, node := range []wire.NodeID{testNodeUID, testOtherUID} {
-		if _, err := r.Publications.Wait(context.Background(), pollIdentity(r.Config, node), &sequence); !errors.Is(err, wire.Overloaded) {
-			t.Fatalf("poll limit: %v", err)
+		go func() { _, err := r.Publications.Wait(ctx, identity, &sequence); done <- err }()
+
+		synctest.Wait()
+
+		cancel()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait cancellation: %v", err)
 		}
-	}
 
-	cancel()
-
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait cancellation: %v", err)
-	}
-
-	awaitPolls(t, r.Publications, 0)
-
-	if got, err := r.Publications.Wait(context.Background(), identity, nil); err != nil || got != current {
-		t.Fatalf("immediate shared snapshot: %p, %v", got, err)
-	}
-
-	for _, cursor := range []wire.Sequence{0, sequence + 1} {
-		if _, err := r.Publications.Wait(context.Background(), identity, &cursor); !errors.Is(err, wire.Conflict) {
-			t.Fatalf("future/zero cursor: %v", err)
+		if got, err := r.Publications.Wait(context.Background(), identity, nil); err != nil || got != current {
+			t.Fatalf("immediate shared snapshot: %p, %v", got, err)
 		}
-	}
 
-	wrong := identity
+		for _, cursor := range []wire.Sequence{0, sequence + 1} {
+			if _, err := r.Publications.Wait(context.Background(), identity, &cursor); !errors.Is(err, wire.Conflict) {
+				t.Fatalf("future/zero cursor: %v", err)
+			}
+		}
 
-	wrong.cluster = testNodeUID
-	if _, err := r.Publications.Wait(context.Background(), wrong, nil); !errors.Is(err, wire.Forbidden) {
-		t.Fatalf("wrong cluster: %v", err)
-	}
+		wrong := identity
 
-	expired := identity
+		wrong.cluster = testNodeUID
+		if _, err := r.Publications.Wait(context.Background(), wrong, nil); !errors.Is(err, wire.Forbidden) {
+			t.Fatalf("wrong cluster: %v", err)
+		}
 
-	expired.expires = time.Now().Add(-time.Second)
-	if _, err := r.Publications.Wait(context.Background(), expired, nil); !errors.Is(err, wire.Unauthenticated) {
-		t.Fatalf("expired identity: %v", err)
-	}
+		expired := identity
 
-	go func() { _, err := r.Publications.Wait(context.Background(), identity, &sequence); done <- err }()
+		expired.expires = time.Now().Add(-time.Second)
+		if _, err := r.Publications.Wait(context.Background(), expired, nil); !errors.Is(err, wire.Unauthenticated) {
+			t.Fatalf("expired identity: %v", err)
+		}
 
-	awaitPolls(t, r.Publications, 1)
-	loseLeadership()
+		invalid := identity
 
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("leadership did not cancel wait: %v", err)
-	}
+		invalid.node = "not-a-uuid"
+		if _, err := r.Publications.Wait(context.Background(), invalid, nil); !errors.Is(err, wire.Unauthenticated) {
+			t.Fatalf("invalid identity: %v", err)
+		}
 
-	if _, err := r.Publications.Current(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("old leadership still serves: %v", err)
-	}
+		go func() { _, err := r.Publications.Wait(context.Background(), identity, &sequence); done <- err }()
 
-	if _, err := current.WriteTo(io.Discard); !errors.Is(err, context.Canceled) {
-		t.Fatalf("write after leadership: %v", err)
-	}
+		synctest.Wait()
+		loseLeadership()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("leadership did not cancel wait: %v", err)
+		}
+
+		if _, err := r.Publications.Current(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("old leadership still serves: %v", err)
+		}
+
+		if _, err := current.WriteTo(io.Discard); !errors.Is(err, context.Canceled) {
+			t.Fatalf("write after leadership: %v", err)
+		}
+	})
 }
 
 func TestPollCertificateExpiration(t *testing.T) {
@@ -230,8 +213,6 @@ func TestPollCertificateExpiration(t *testing.T) {
 	if _, err := r.Publications.Wait(ctx, identity, &sequence); !errors.Is(err, wire.Unauthenticated) {
 		t.Fatalf("expiration: %v", err)
 	}
-
-	awaitPolls(t, r.Publications, 0)
 }
 
 func TestPollNormalTimeout(t *testing.T) {
@@ -250,90 +231,93 @@ func TestPollNormalTimeout(t *testing.T) {
 }
 
 func TestDurableLossWithdrawsPublication(t *testing.T) {
-	r := initializedTopology(t)
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	p := reconcileTopology(t, r, ctx)
-	sequence := p.Version().Sequence
-	done := make(chan error, 1)
+		p := reconcileTopology(t, r, ctx)
+		sequence := p.Version().Sequence
+		done := make(chan error, 1)
 
-	go func() {
-		_, err := r.Publications.Wait(ctx, pollIdentity(r.Config, testNodeUID), &sequence)
-		done <- err
-	}()
+		go func() {
+			_, err := r.Publications.Wait(ctx, pollIdentity(r.Config, testNodeUID), &sequence)
+			done <- err
+		}()
 
-	awaitPolls(t, r.Publications, 1)
+		synctest.Wait()
 
-	cm, _, err := readVersion(ctx, r.APIReader, r.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := r.Delete(ctx, cm); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
-		t.Fatal("missing counter accepted")
-	}
-
-	if err := <-done; !errors.Is(err, wire.Unavailable) {
-		t.Fatalf("waiting poll did not fail closed: %v", err)
-	}
-
-	if _, err := r.Publications.Current(); !errors.Is(err, wire.Unavailable) {
-		t.Fatalf("durable loss still serves: %v", err)
-	}
-}
-
-func TestPollFanoutSharesOnePublication(t *testing.T) {
-	r := initializedTopology(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	current := reconcileTopology(t, r, ctx)
-	sequence := current.Version().Sequence
-
-	const count = 256
-
-	results := make(chan *CommittedPublication, count)
-	errors := make(chan error, count)
-
-	var wg sync.WaitGroup
-
-	for i := range count {
-		identity := pollIdentity(r.Config, wire.NodeID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)))
-
-		wg.Go(func() { p, err := r.Publications.Wait(ctx, identity, &sequence); results <- p; errors <- err })
-	}
-
-	awaitPolls(t, r.Publications, count)
-
-	cache := catalogCache("cache", testNodeUID)
-	if err := r.Create(ctx, &cache); err != nil {
-		t.Fatal(err)
-	}
-
-	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
-
-	next := reconcileTopology(t, r, ctx)
-
-	wg.Wait()
-
-	for range count {
-		if err := <-errors; err != nil {
+		cm, _, err := readVersion(ctx, r.APIReader, r.Config)
+		if err != nil {
 			t.Fatal(err)
 		}
 
-		if p := <-results; p != next {
-			t.Fatalf("waiter copied or missed publication: %p != %p", p, next)
+		if err := r.Delete(ctx, cm); err != nil {
+			t.Fatal(err)
 		}
-	}
 
-	awaitPolls(t, r.Publications, 0)
+		if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
+			t.Fatal("missing counter accepted")
+		}
+
+		if err := <-done; !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("waiting poll did not fail closed: %v", err)
+		}
+
+		if _, err := r.Publications.Current(); !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("durable loss still serves: %v", err)
+		}
+	})
+}
+
+func TestPollFanoutSharesOnePublication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		current := reconcileTopology(t, r, ctx)
+		sequence := current.Version().Sequence
+
+		const count = 256
+
+		results := make(chan *CommittedPublication, count)
+		errors := make(chan error, count)
+
+		var wg sync.WaitGroup
+
+		// Direct waiters share a node deliberately: only the HTTP server owns admission.
+		for range count {
+			identity := pollIdentity(r.Config, testNodeUID)
+
+			wg.Go(func() { p, err := r.Publications.Wait(ctx, identity, &sequence); results <- p; errors <- err })
+		}
+
+		synctest.Wait()
+
+		cache := catalogCache("cache", testNodeUID)
+		if err := r.Create(ctx, &cache); err != nil {
+			t.Fatal(err)
+		}
+
+		runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
+
+		next := reconcileTopology(t, r, ctx)
+
+		wg.Wait()
+
+		for range count {
+			if err := <-errors; err != nil {
+				t.Fatal(err)
+			}
+
+			if p := <-results; p != next {
+				t.Fatalf("waiter copied or missed publication: %p != %p", p, next)
+			}
+		}
+	})
 }
 
 type boundedWriter struct {

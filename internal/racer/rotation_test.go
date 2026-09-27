@@ -157,7 +157,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("retirement pruning/reset")
 	}
 	// Topology CAS preserves the one-way initialization claim.
-	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(r.Config.Limits), Accepted: make(AcceptedMembers)}
+	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(), Accepted: make(AcceptedMembers)}
 	reconcileTopology(t, topology, context.Background())
 	keyState(t, r)
 }

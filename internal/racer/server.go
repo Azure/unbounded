@@ -206,6 +206,28 @@ func (s *Server) initializeAdmission() {
 	})
 }
 
+// admitPoll is the sole per-node/global poll guard. The handler must retain it
+// through response Write and Flush, including error responses and aborted writes.
+func (s *Server) admitPoll(node wire.NodeID) bool {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+
+	if _, exists := s.polls[node]; exists || len(s.polls) >= s.Config.Limits.MaxPolls {
+		return false
+	}
+
+	s.polls[node] = struct{}{}
+
+	return true
+}
+
+func (s *Server) releasePoll(node wire.NodeID) {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+
+	delete(s.polls, node)
+}
+
 func take(slots chan struct{}) bool {
 	select {
 	case slots <- struct{}{}:
@@ -391,20 +413,12 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.admission.Lock()
-
-	_, exists := s.polls[identity.node]
-	if exists || len(s.polls) >= s.Config.Limits.MaxPolls {
-		s.admission.Unlock()
+	if !s.admitPoll(identity.node) {
 		writeFailure(w, wire.Overloaded)
 
 		return
 	}
-
-	s.polls[identity.node] = struct{}{}
-	s.admission.Unlock()
-
-	defer func() { s.admission.Lock(); delete(s.polls, identity.node); s.admission.Unlock() }()
+	defer s.releasePoll(identity.node)
 
 	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
 	defer cancel()

@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -538,13 +539,56 @@ type blockingResponse struct {
 	*httptest.ResponseRecorder
 	entered, unblock chan struct{}
 	once             sync.Once
+	blockFlush       bool
+	fail             bool
 }
 
 func (w *blockingResponse) Write(b []byte) (int, error) {
-	w.once.Do(func() { close(w.entered); <-w.unblock })
+	if !w.blockFlush {
+		w.once.Do(func() { close(w.entered); <-w.unblock })
+
+		if w.fail {
+			return 0, io.ErrClosedPipe
+		}
+	}
+
 	return w.ResponseRecorder.Write(b)
 }
+
+func (w *blockingResponse) FlushError() error {
+	if w.blockFlush {
+		w.once.Do(func() { close(w.entered); <-w.unblock })
+
+		if w.fail {
+			return io.ErrClosedPipe
+		}
+	}
+
+	w.Flush()
+
+	return nil
+}
+
 func (w *blockingResponse) Unwrap() http.ResponseWriter { return w.ResponseRecorder }
+
+func awaitServerPolls(t *testing.T, s *Server, count int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.admission.Lock()
+		n := len(s.polls)
+		s.admission.Unlock()
+
+		if n == count {
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("poll admission did not reach %d", count)
+}
 
 func (f *servingFixture) requestState(t *testing.T) *tls.ConnectionState {
 	t.Helper()
@@ -563,36 +607,169 @@ func (f *servingFixture) requestState(t *testing.T) *tls.ConnectionState {
 }
 
 func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
-	f := newServingFixture(t)
-	handler := f.a.Server.Handler()
-	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
-	r.TLS = f.requestState(t)
-	w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{})}
-	done := make(chan struct{})
+	for _, tc := range []struct {
+		name        string
+		flush, fail bool
+		status      int
+	}{
+		{"write", false, false, http.StatusOK},
+		{"flush", true, false, http.StatusOK},
+		{"failed write", false, true, http.StatusOK},
+		{"failed flush", true, true, http.StatusOK},
+		{"no content flush", true, false, http.StatusNoContent},
+		{"error write", false, false, http.StatusConflict},
+		{"error flush", true, false, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newServingFixture(t)
+				f.a.Server.Config.Limits.MaxPolls = 1
+				f.a.Server.Config.Limits.MaxConcurrentWrites = 1
+				other := *f
+				other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
+				otherState := other.requestState(t)
+				handler := f.a.Server.Handler()
+				r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
-	go func() { defer close(done); handler.ServeHTTP(w, r) }()
+				r.TLS = f.requestState(t)
+				if tc.status != http.StatusOK {
+					current, err := f.a.Server.Publications.Current()
+					if err != nil {
+						t.Fatal(err)
+					}
 
-	select {
-	case <-w.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not start")
+					cursor := current.record.Sequence
+					if tc.status == http.StatusConflict {
+						cursor++
+					}
+
+					r.URL.RawQuery = fmt.Sprintf("after=%d", cursor)
+				}
+
+				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: tc.flush, fail: tc.fail}
+
+				unblock := sync.OnceFunc(func() { close(w.unblock) })
+				defer unblock()
+
+				done := make(chan any, 1)
+
+				go func() { defer func() { done <- recover() }(); handler.ServeHTTP(w, r) }()
+
+				select {
+				case <-w.entered:
+				case <-time.After(wire.PollWait + time.Second):
+					t.Fatal("response did not start")
+				}
+
+				// Use an immediate cursor so this also proves error responses retain admission.
+				r = r.Clone(f.ctx)
+
+				r.URL.RawQuery = ""
+				for _, state := range []*tls.ConnectionState{r.TLS, otherState} {
+					second := httptest.NewRecorder()
+					request := r.Clone(f.ctx)
+					request.TLS = state
+					handler.ServeHTTP(second, request)
+					responseBody(t, second.Result(), nil, http.StatusTooManyRequests)
+				}
+
+				wantWrites := 1
+				if tc.status == http.StatusConflict {
+					wantWrites = 0
+				}
+
+				if got := len(f.a.Server.writes); got != wantWrites {
+					t.Fatalf("write slots during response: %d, want %d", got, wantWrites)
+				}
+
+				unblock()
+
+				aborted := <-done
+				if tc.fail && aborted != http.ErrAbortHandler || !tc.fail && aborted != nil {
+					t.Fatalf("response abort: %v", aborted)
+				}
+
+				if !tc.fail && w.Code != tc.status {
+					t.Fatalf("response status: %d, want %d", w.Code, tc.status)
+				}
+
+				if len(f.a.Server.writes) != 0 {
+					t.Fatal("write slot leaked")
+				}
+
+				third := httptest.NewRecorder()
+				handler.ServeHTTP(third, r.Clone(f.ctx))
+
+				if third.Code != 200 {
+					t.Fatalf("admission leaked: %d", third.Code)
+				}
+			})
+		})
 	}
+}
 
-	second := httptest.NewRecorder()
-	handler.ServeHTTP(second, r.Clone(f.ctx))
+func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
+	for _, limit := range []int{1, 2} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			f := newServingFixture(t)
+			f.a.Server.Config.Limits.MaxPolls = limit
+			other := *f
+			other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
+			handler := f.a.Server.Handler()
 
-	if second.Code != 429 {
-		t.Fatalf("overlapping node write admitted: %d", second.Code)
-	}
+			current, err := f.a.Server.Publications.Current()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	close(w.unblock)
-	<-done
+			ctx, cancel := context.WithCancel(f.ctx)
+			defer cancel()
 
-	third := httptest.NewRecorder()
-	handler.ServeHTTP(third, r.Clone(f.ctx))
+			r := httptest.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.record.Sequence), nil)
+			r.TLS = f.requestState(t)
+			done := make(chan *httptest.ResponseRecorder, 1)
 
-	if third.Code != 200 {
-		t.Fatalf("admission leaked: %d", third.Code)
+			go func() { w := httptest.NewRecorder(); handler.ServeHTTP(w, r); done <- w }()
+
+			awaitServerPolls(t, f.a.Server, 1)
+
+			if len(f.a.Server.writes) != 0 {
+				t.Fatal("long poll consumed write slot")
+			}
+
+			for _, state := range []*tls.ConnectionState{r.TLS, other.requestState(t)} {
+				request := httptest.NewRequest("GET", wire.SnapshotPath, nil)
+				request.TLS = state
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, request)
+
+				want := http.StatusTooManyRequests
+				if state != r.TLS && limit == 2 {
+					want = http.StatusOK
+				}
+
+				responseBody(t, w.Result(), nil, want)
+			}
+
+			cancel()
+
+			select {
+			case w := <-done:
+				responseBody(t, w.Result(), nil, http.StatusServiceUnavailable)
+			case <-time.After(5 * time.Second):
+				t.Fatal("canceled poll did not return")
+			}
+
+			awaitServerPolls(t, f.a.Server, 0)
+
+			for _, state := range []*tls.ConnectionState{r.TLS, other.requestState(t)} {
+				request := httptest.NewRequest("GET", wire.SnapshotPath, nil)
+				request.TLS = state
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, request)
+				responseBody(t, w.Result(), nil, http.StatusOK)
+			}
+		})
 	}
 }
 
@@ -763,6 +940,8 @@ func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("server shutdown blocked")
 	}
+
+	awaitServerPolls(t, f.a.Server, 0)
 }
 
 func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
@@ -868,7 +1047,7 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
 	r.TLS = f.requestState(t)
-	for _, resource := range []string{"write", "global poll", "bootstrap", "headers"} {
+	for _, resource := range []string{"write", "bootstrap", "headers"} {
 		t.Run(resource, func(t *testing.T) {
 			request := r.Clone(f.ctx)
 
@@ -876,9 +1055,6 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 			case "write":
 				take(f.a.Server.writes)
 				defer release(f.a.Server.writes)
-			case "global poll":
-				f.a.Server.polls[wire.NodeID(testOtherUID)] = struct{}{}
-				defer delete(f.a.Server.polls, wire.NodeID(testOtherUID))
 			case "bootstrap":
 				take(f.a.Server.bootstrapSlots)
 				defer release(f.a.Server.bootstrapSlots)
@@ -1026,9 +1202,9 @@ func TestTLSRevocationWhilePolling(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 
 	for {
-		f.a.Server.Publications.mu.Lock()
-		n := len(f.a.Server.Publications.polls)
-		f.a.Server.Publications.mu.Unlock()
+		f.a.Server.admission.Lock()
+		n := len(f.a.Server.polls)
+		f.a.Server.admission.Unlock()
 
 		if n == 1 {
 			break
