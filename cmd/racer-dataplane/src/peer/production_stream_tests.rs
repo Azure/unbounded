@@ -70,7 +70,76 @@ fn sdk_sustained_full_images_avoid_remote_relay_congestion() {
 #[test]
 #[ignore = "build the SDK fixture and run with --release"]
 fn sdk_sustained_full_images_retry_proven_unspent_acquisition() {
-    sdk_fixture_inner(true, false, true, false, true, false, true);
+    sdk_fixture_inner(true, false, true, false, true, false, true, false);
+}
+
+#[test]
+#[ignore = "build the SDK fixture and run with --release"]
+fn sdk_sustained_full_images_route_around_rejecting_first_hops() {
+    sdk_fixture_inner(true, false, true, false, true, false, true, true);
+}
+
+/// Remove only direct edges in this small graph to require transit. Route choice,
+/// signed receiver, transport and receipt handling remain production Requester.
+pub(super) struct RoutedIngress {
+    pub(super) inner: Rc<requester::Requester>,
+    pub(super) recovered: Cell<usize>,
+}
+impl requester::PeerClient for RoutedIngress {
+    fn request<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, wire::VerifiedResponse> {
+        Box::pin(async move {
+            self.request_reserved_avoiding(request, scope, &mut None, &[])
+                .await
+        })
+    }
+    fn request_reserved<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<Reservation>,
+    ) -> crate::error::Operation<'a, wire::VerifiedResponse> {
+        self.request_reserved_avoiding(request, scope, output, &[])
+    }
+    fn request_reserved_avoiding<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<Reservation>,
+        saturated: &'a [NodeId],
+    ) -> crate::error::Operation<'a, wire::VerifiedResponse> {
+        Box::pin(async move {
+            let mut excluded = saturated.to_vec();
+            excluded.push(request.route.destination.clone());
+            let response = self
+                .inner
+                .request_reserved_avoiding(request, scope, output, &excluded)
+                .await;
+            if saturated.len() >= 2
+                && response
+                    .as_ref()
+                    .is_ok_and(|r| matches!(r.response(), PeerResponse::Page { .. }))
+            {
+                let verified = response.as_ref().unwrap();
+                assert!(
+                    !verified.forwarders().is_empty(),
+                    "the detour must traverse a real relay"
+                );
+                assert!(
+                    verified
+                        .forwarders()
+                        .iter()
+                        .all(|peer| !saturated.contains(peer.node())),
+                    "successful detour must avoid the rejecting first hops"
+                );
+                self.recovered.set(self.recovered.get() + 1);
+            }
+            response
+        })
+    }
 }
 
 /// Select an explicit first hop so this small graph exercises a relay, as the
@@ -126,6 +195,7 @@ struct SdkScenario {
     relay_pressure: bool,
     expired_fill: bool,
     acquisition_progress: bool,
+    ingress_routes: bool,
 }
 
 fn sdk_fixture(
@@ -144,9 +214,11 @@ fn sdk_fixture(
         relay_pressure,
         expired_fill,
         false,
+        false,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sdk_fixture_inner(
     busy_peers: bool,
     idle_pressure: bool,
@@ -155,6 +227,7 @@ fn sdk_fixture_inner(
     relay_pressure: bool,
     expired_fill: bool,
     acquisition_progress: bool,
+    ingress_routes: bool,
 ) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -193,6 +266,7 @@ fn sdk_fixture_inner(
                 relay_pressure,
                 expired_fill,
                 acquisition_progress,
+                ingress_routes,
             },
         );
     }
@@ -207,6 +281,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         relay_pressure,
         expired_fill,
         acquisition_progress,
+        ingress_routes,
     } = scenario;
     let hotspot = incoming_pressure && relay_pressure;
     let remote_hotspot = hotspot && idle_pressure;
@@ -218,7 +293,11 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
         "00000004-1111-4111-8111-111111111111",
         "00000005-1111-4111-8111-111111111111",
     ];
-    let count = if remote_hotspot { 5 } else { 4 };
+    let count = if remote_hotspot || ingress_routes {
+        5
+    } else {
+        4
+    };
     let (signers, discovery) = named_identities(&names[..count], 8192);
     for signer in &signers {
         for peer in &signers {
@@ -340,7 +419,7 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
     // Four two-page windows must make progress without an eighth full-page charge.
     let nodes: Vec<_> = (0..count)
         .map(|i| {
-            build_node_with_relay_pressure(
+            build_node_with_ingress_routes(
                 i,
                 membership.clone(),
                 signers[i].clone(),
@@ -362,6 +441,8 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                     16
                 },
                 relay_pressure,
+                |_| {},
+                ingress_routes,
             )
         })
         .collect();
@@ -793,7 +874,11 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                 pressure_rounds += 1;
                 // Match the observed 8/8 live boundary with finite competing
                 // owners. The SDK continues on already established connections.
-                for node in nodes.iter().skip(1) {
+                for node in nodes
+                    .iter()
+                    .skip(1)
+                    .take(if ingress_routes { 2 } else { count - 1 })
+                {
                     for _ in 0..8 {
                         relay_charges.push(
                             node.admission
@@ -805,11 +890,24 @@ fn run(warm: bool, binary: &std::path::Path, scenario: SdkScenario) {
                 pressure_seeded = true;
                 relay_release = Some(
                     Instant::now()
-                        + Duration::from_millis(if acquisition_progress { 650 } else { 150 }),
+                        + Duration::from_millis(if ingress_routes {
+                            2500
+                        } else if acquisition_progress {
+                            650
+                        } else {
+                            150
+                        }),
                 );
                 fs::write(&release_path, b"release").unwrap();
             }
             if relay_release.is_some_and(|at| Instant::now() >= at) {
+                if ingress_routes {
+                    assert!(
+                        nodes[0].routed_ingress.as_ref().unwrap().recovered.get() > 0,
+                        "production Requester must deliver a page after rejecting two first hops while both remain saturated"
+                    );
+                    nodes[0].routed_ingress.as_ref().unwrap().recovered.set(0);
+                }
                 relay_charges.clear();
                 relay_release = None;
             }

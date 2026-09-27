@@ -126,6 +126,17 @@ its original attempt and link balances remain positive, with the existing
 and signature. Relays never replay an envelope, and receipt processing never
 increases the original call's total work allowance.
 
+When the authenticated rejecting responder is the original request's first receiver,
+the noncandidate acquisition owner retains that neighbor as a local first-edge
+exclusion and retries the unreached candidate before advancing its rank. The list
+lives only for that acquisition and contains at most 36 neighbors. A downstream
+receipt, ordinary overload, ambiguous transport failure, or invalid signature cannot
+add an exclusion. The requester selects the shortest eligible route before signing
+the new attempt and carries that route's transport plan into the exchange; it never
+changes a signed receiver. If exclusions leave no route within the remaining hop
+ceiling, the requester may use the canonical route again under the same original
+budgets and backoff. This is local route selection, not placement or origin authority.
+
 This extends the closed v1 outcome vocabulary. Older decoders reject the unknown
 outcome and receive no refund, preserving fail-closed security during mixed-version
 operation. They cannot benefit from this recovery until upgraded. No unsigned

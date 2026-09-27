@@ -173,6 +173,15 @@ impl VerifiedResponseHead {
     }
 }
 impl VerifiedResponse {
+    /// An adjacent transit peer's authenticated non-submission receipt can guide
+    /// a fresh route. A downstream rejection says nothing about this first hop.
+    pub(crate) fn rejected_first_hop(&self) -> Result<Option<NodeId>> {
+        if !matches!(self.response(), PeerResponse::NotForwarded) || self.binding.path.len() != 1 {
+            return Ok(None);
+        }
+        let next = crate::security::signing::receiver(&self.binding.original.head)?;
+        Ok((self.origin.node() == &next).then_some(next))
+    }
     /// A verified pre-forward rejection is a receipt for unused delegation, not
     /// a refund of the attempted request or the links to its rejecting relay.
     /// Only original requesters reconcile it; destination failures are ambiguous.
@@ -1371,6 +1380,7 @@ mod tests {
             deadline: binding.deadline,
         };
         let verified = f[1].verify_response(response, &b_binding).unwrap();
+        assert_eq!(verified.rejected_first_hop().unwrap(), None);
         assert_eq!(
             verified.unused_delegation().unwrap(),
             None,
@@ -1403,6 +1413,11 @@ mod tests {
             Err(Error::DeadlineExceeded)
         ));
         let verified = f[0].verify_response(duplicate(), &binding).unwrap();
+        assert_eq!(
+            verified.rejected_first_hop().unwrap(),
+            None,
+            "downstream congestion must not exclude the adjacent peer"
+        );
         assert_eq!(verified.unused_delegation().unwrap(), Some((3, 2)));
         assert!(matches!(
             f[0].verify_response(duplicate(), &binding),
@@ -1427,6 +1442,35 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn only_authenticated_adjacent_non_submission_guides_a_fresh_route() {
+        let signatures = network(3);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        for (i, outcome) in [
+            PeerResponse::NotForwarded,
+            PeerResponse::Overloaded,
+            PeerResponse::Unavailable,
+            PeerResponse::Miss,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut logical = request(i as u8 + 20);
+            logical.route.destination = node(2);
+            let (signed, binding) = f[0].sign_request_to(logical, &node(1)).unwrap();
+            let admitted = f[1].verify_request(signed).unwrap();
+            let response = f[1].sign_response(admitted.binding(), outcome).unwrap();
+            let verified = f[0].verify_response(response, &binding).unwrap();
+            assert_eq!(
+                verified.rejected_first_hop().unwrap(),
+                (i == 0).then(|| node(1))
+            );
+        }
     }
 
     #[test]

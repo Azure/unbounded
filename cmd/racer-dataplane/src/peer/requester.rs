@@ -12,6 +12,16 @@ use crate::{
 };
 use std::rc::Rc;
 pub trait PeerClient {
+    /// Local routing hints for a fresh attempt, never changes a signed envelope.
+    fn request_reserved_avoiding<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+        _saturated: &'a [crate::model::identity::NodeId],
+    ) -> Operation<'a, VerifiedResponse> {
+        self.request_reserved(request, scope, output)
+    }
     /// Optional pre-admitted output, consumed only when the transport takes it.
     /// Implementations returning independently owned pages may leave it untouched.
     fn request_reserved<'a>(
@@ -107,25 +117,54 @@ impl PeerClient for Requester {
         scope: &'a RequestScope,
         output: &'a mut Option<crate::runtime::admission::Reservation>,
     ) -> Operation<'a, VerifiedResponse> {
+        self.request_reserved_avoiding(request, scope, output, &[])
+    }
+    fn request_reserved_avoiding<'a>(
+        &'a self,
+        request: PeerRequest,
+        scope: &'a RequestScope,
+        output: &'a mut Option<crate::runtime::admission::Reservation>,
+        saturated: &'a [crate::model::identity::NodeId],
+    ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request, scope)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let search_budget = super::search_budget(&request.route, &network.local)?;
+            let membership = network.membership(request.route.membership)?;
             let route = self
                 .paths
-                .shortest_async(
-                    network.membership(request.route.membership)?,
+                .shortest_available_async(
+                    membership.clone(),
                     &network.local,
                     &search_budget,
+                    saturated,
                 )
-                .await?;
+                .await;
+            let route = match route {
+                // If every viable first hop has rejected this acquisition, allow
+                // a new bounded pass after the owner's existing backoff.
+                Err(Error::Unavailable) if !saturated.is_empty() => {
+                    self.paths
+                        .shortest_async(membership, &network.local, &search_budget)
+                        .await?
+                }
+                result => result?,
+            };
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let _capabilities = self
                 .handshake
                 .negotiate_at(next, request.route.membership, &scope)
                 .await?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
-            let response = self.exchange_reserved(signed, &scope, output).await?;
+            // Use the route selected before signing, including its admission
+            // exclusions. Recomputing a canonical route here rejects valid detours.
+            let plan = if let super::wire::Operation::Page { page, .. } = &signed.request.operation
+            {
+                self.rails.select(&route, page)?
+            } else {
+                crate::topology::rails::TransportPlan::Http
+            };
+            let response = self.exchange_on_route(signed, &scope, output, plan).await?;
             scope.check()?;
             self.forwarding.verify_response(response, &binding)
         })
@@ -168,42 +207,58 @@ impl Requester {
             let next = crate::security::signing::receiver(&signed_head.head)?;
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
-            let endpoint = network.endpoint(budget.membership, &next)?;
-            let mut plan =
-                if let super::wire::Operation::Page { page, .. } = &request.request.operation {
-                    let search = super::search_budget(budget, &network.local)?;
-                    let route = self
-                        .paths
-                        .shortest_async(
-                            network.membership(budget.membership)?,
-                            &network.local,
-                            &search,
-                        )
-                        .await?;
-                    if route.nodes.get(1) != Some(&next) {
-                        return Err(Error::Unavailable);
-                    }
-                    self.rails.select(&route, page)?
-                } else {
-                    crate::topology::rails::TransportPlan::Http
-                };
-            if matches!(plan, crate::topology::rails::TransportPlan::Rdma { .. }) {
-                let capabilities = self.handshake.negotiate(&next).await?;
-                if !capabilities.rdma || !capabilities.scoped_grants {
-                    plan = crate::topology::rails::TransportPlan::Http;
+            let plan = if let super::wire::Operation::Page { page, .. } = &request.request.operation
+            {
+                let search = super::search_budget(budget, &network.local)?;
+                let route = self
+                    .paths
+                    .shortest_async(
+                        network.membership(budget.membership)?,
+                        &network.local,
+                        &search,
+                    )
+                    .await?;
+                if route.nodes.get(1) != Some(&next) {
+                    return Err(Error::Unavailable);
                 }
-            }
-            self.transfers
-                .exchange_reserved(endpoint, request, plan, &scope, output)
-                .await
-                .inspect_err(|error| {
-                    // A restarted peer has a new receiver challenge. Rediscover it
-                    // on the next attempt instead of retaining a stale cache hit.
-                    if matches!(error, Error::Io | Error::Unauthorized | Error::Replay) {
-                        self.handshake.invalidate(&next);
-                    }
-                })
+                self.rails.select(&route, page)?
+            } else {
+                crate::topology::rails::TransportPlan::Http
+            };
+            self.exchange_on_route(request, &scope, output, plan).await
         })
+    }
+    async fn exchange_on_route(
+        &self,
+        request: SignedRequest,
+        scope: &RequestScope,
+        output: &mut Option<crate::runtime::admission::Reservation>,
+        mut plan: crate::topology::rails::TransportPlan,
+    ) -> crate::error::Result<SignedResponse> {
+        let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signed_head = request
+            .authentication
+            .hops
+            .last()
+            .unwrap_or(&request.authentication.original);
+        let next = crate::security::signing::receiver(&signed_head.head)?;
+        let endpoint = network.endpoint(request.request.route.membership, &next)?;
+        if matches!(plan, crate::topology::rails::TransportPlan::Rdma { .. }) {
+            let capabilities = self.handshake.negotiate(&next).await?;
+            if !capabilities.rdma || !capabilities.scoped_grants {
+                plan = crate::topology::rails::TransportPlan::Http;
+            }
+        }
+        self.transfers
+            .exchange_reserved(endpoint, request, plan, scope, output)
+            .await
+            .inspect_err(|error| {
+                // A restarted peer has a new receiver challenge. Rediscover it
+                // on the next attempt instead of retaining a stale cache hit.
+                if matches!(error, Error::Io | Error::Unauthorized | Error::Replay) {
+                    self.handshake.invalidate(&next);
+                }
+            })
     }
 }
 #[cfg(test)]

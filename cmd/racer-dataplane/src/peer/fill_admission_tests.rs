@@ -153,6 +153,7 @@ impl Origin for Adapter {
     }
 }
 struct Node {
+    routed_ingress: Option<Rc<production_stream_tests::RoutedIngress>>,
     coordinator: Rc<Coordinator>,
     owners: Arc<WorkerDirectory>,
     client_io: Rc<HttpIo>,
@@ -298,6 +299,35 @@ fn build_node_with_limits_adjustment(
     relay_pressure: bool,
     adjust: impl FnOnce(&mut crate::model::limits::Limits),
 ) -> Node {
+    build_node_with_ingress_routes(
+        i,
+        membership,
+        signer,
+        discovery,
+        data,
+        concurrency,
+        peer_limit,
+        queue_limit,
+        relay_pressure,
+        adjust,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_node_with_ingress_routes(
+    i: usize,
+    membership: Arc<Membership>,
+    signer: Rc<Signatures>,
+    discovery: &Discovery,
+    data: Rc<Data>,
+    concurrency: usize,
+    peer_limit: usize,
+    queue_limit: usize,
+    relay_pressure: bool,
+    adjust: impl FnOnce(&mut crate::model::limits::Limits),
+    ingress_routes: bool,
+) -> Node {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = NonZeroUsize::new(queue_limit).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new((concurrency + 1) * (P + 16)).unwrap();
@@ -382,7 +412,15 @@ fn build_node_with_limits_adjustment(
         )
         .with_network(network.clone()),
     );
-    let fill_peers: Rc<dyn requester::PeerClient> = if relay_pressure && i == 0 {
+    let routed_ingress = (ingress_routes && i == 0).then(|| {
+        Rc::new(production_stream_tests::RoutedIngress {
+            inner: peers.clone(),
+            recovered: Cell::new(0),
+        })
+    });
+    let fill_peers: Rc<dyn requester::PeerClient> = if let Some(routed) = &routed_ingress {
+        routed.clone()
+    } else if relay_pressure && i == 0 {
         Rc::new(production_stream_tests::ViaRelay {
             membership: membership.clone(),
             auth: auth.clone(),
@@ -497,6 +535,7 @@ fn build_node_with_limits_adjustment(
         delivery,
     ));
     Node {
+        routed_ingress,
         coordinator,
         owners,
         client_io,

@@ -205,13 +205,19 @@ impl CandidatePolicy {
             let mut evidence = Vec::new();
             let mut saw_transient = false;
             let mut saw_version = false;
+            // One acquisition's authenticated first-hop rejections. Keep these
+            // across backoff so the next send does not immediately revisit the
+            // same bottleneck. The original attempts and graph degree bound it.
+            let mut rejected = Vec::new();
             let count = rank.unwrap_or(candidates.ordered.len());
-            loop {
+            'passes: loop {
                 // Only a candidate's one predecessor pass can mint authority.
                 // Noncandidate retries retain no unbounded history of outcomes.
                 evidence.clear();
                 let mut retry = false;
-                for (index, destination) in candidates.ordered[..count].iter().enumerate() {
+                let mut index = 0;
+                while index < count {
+                    let destination = &candidates.ordered[index];
                     let mode = if rank.is_some() {
                         FetchMode::CopyOnly
                     } else {
@@ -228,11 +234,25 @@ impl CandidatePolicy {
                             budget,
                             (count - index) as u32,
                             output,
+                            &mut rejected,
                         )
                         .await
                     {
                         Ok(response) => {
                             retry |= matches!(response.response(), PeerResponse::NotForwarded);
+                            if rank.is_none() && response.rejected_first_hop()?.is_some() {
+                                // This candidate has not been reached. Try its
+                                // next eligible first hop before moving to a
+                                // lower rank with costlier predecessor probes.
+                                saw_transient = true;
+                                budget.note_route_failure();
+                                if budget.remaining_attempts() == 0 || budget.remaining_links() == 0
+                                {
+                                    break 'passes;
+                                }
+                                self.overload_backoff(scope, budget, output).await?;
+                                continue;
+                            }
                             match classify(response.response(), &operation)? {
                                 None => return Ok(CandidateResolution::Copy(response)),
                                 Some(outcome) => {
@@ -266,6 +286,7 @@ impl CandidatePolicy {
                         }
                         Err(error) => return Err(error),
                     }
+                    index += 1;
                 }
                 // Only explicit non-submission receipts justify revisiting ranked
                 // candidates. Each new send still spends one original attempt and
@@ -330,6 +351,7 @@ impl CandidatePolicy {
                 .position(|node| node == &self.node)
                 .ok_or(Error::Unauthorized)?;
             let mut transient = false;
+            let mut rejected = Vec::new();
             for destination in candidates.ordered.iter().skip(rank + 1) {
                 match self
                     .request(
@@ -342,6 +364,7 @@ impl CandidatePolicy {
                         budget,
                         1,
                         output,
+                        &mut rejected,
                     )
                     .await
                 {
@@ -378,6 +401,7 @@ impl CandidatePolicy {
         budget: &mut AcquisitionBudget,
         remaining_candidates: u32,
         output: &mut Option<crate::runtime::admission::Reservation>,
+        rejected: &mut Vec<NodeId>,
     ) -> Result<VerifiedResponse> {
         scope.check()?;
         // Reserve the complete permitted route before sending. Only an explicit,
@@ -420,8 +444,17 @@ impl CandidatePolicy {
                 deadline: Deadline(deadline),
             },
         };
-        let response = self.peers.request_reserved(request, scope, output).await?;
+        let response = self
+            .peers
+            .request_reserved_avoiding(request, scope, output, rejected)
+            .await?;
         scope.check()?;
+        if let Some(next) = response.rejected_first_hop()?
+            && rejected.len() < 2 * crate::topology::graph::RADIX
+            && !rejected.contains(&next)
+        {
+            rejected.push(next);
+        }
         if let Some((unused_attempts, unused_links)) = response.unused_delegation()? {
             if unused_attempts != attempts || unused_links >= links {
                 return Err(Error::Unauthorized);
@@ -549,12 +582,25 @@ mod tests {
         struct Receipts {
             auth: Vec<Forwarding>,
             calls: RefCell<Vec<(u32, u8)>>,
+            routes: RefCell<Vec<(NodeId, Vec<NodeId>)>>,
             fail: usize,
             ordinary: bool,
             corrupt: bool,
             lost: bool,
         }
         impl PeerClient for Receipts {
+            fn request_reserved_avoiding<'a>(
+                &'a self,
+                request: PeerRequest,
+                scope: &'a RequestScope,
+                _: &'a mut Option<crate::runtime::admission::Reservation>,
+                rejected: &'a [NodeId],
+            ) -> Operation<'a, VerifiedResponse> {
+                self.routes
+                    .borrow_mut()
+                    .push((request.route.destination.clone(), rejected.to_vec()));
+                self.request(request, scope)
+            }
             fn request<'a>(
                 &'a self,
                 request: PeerRequest,
@@ -629,6 +675,7 @@ mod tests {
             let peers = Rc::new(Receipts {
                 auth: signatures.into_iter().map(Forwarding::new).collect(),
                 calls: RefCell::new(Vec::new()),
+                routes: RefCell::new(Vec::new()),
                 fail: if case == "success" { 3 } else { usize::MAX },
                 ordinary: case == "ordinary",
                 corrupt: case == "corrupt",
@@ -710,6 +757,30 @@ mod tests {
             };
             drop(work);
             let calls = peers.calls.borrow();
+            let routes = peers.routes.borrow();
+            assert!(
+                routes[0].1.is_empty(),
+                "fresh acquisition inherits no rejection hints"
+            );
+            if matches!(case, "success" | "exhausted" | "links") {
+                assert!(
+                    routes
+                        .iter()
+                        .all(|(destination, _)| destination == &routes[0].0),
+                    "an unreached candidate retains priority across first-hop retries"
+                );
+                assert!(
+                    routes
+                        .iter()
+                        .skip(1)
+                        .all(|(_, rejected)| rejected == &vec![node(1)])
+                );
+            } else {
+                assert!(
+                    routes.iter().all(|(_, rejected)| rejected.is_empty()),
+                    "ordinary, ambiguous and unauthenticated failures cannot exclude an edge"
+                );
+            }
             match case {
                 "success" => {
                     assert!(matches!(result, Some(Ok(CandidateResolution::Copy(_)))));
