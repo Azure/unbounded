@@ -119,7 +119,11 @@ impl ReadyListeners {
                 .await
         }));
         if let Some(wait) = &mut self.wait {
-            let _ = wait.as_mut().poll(cx);
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                result?;
+                self.wait.take();
+                cx.waker().wake_by_ref();
+            }
         }
         Ok(None)
     }

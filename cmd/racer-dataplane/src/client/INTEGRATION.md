@@ -85,8 +85,14 @@ cache UIDs remain serving. Global shutdown cannot be reversed by a prepared comm
 `reconcile(&[CacheDefinition], &RequestScope)` to bind sockets, then
 `poll_budgeted(&mut Context, usize)` with the retained worker driver waker alongside
 reactor polling. Cooperative continuations and completion notifications wake the
-worker; its bounded 1 ms fallback still drives deadlines, nonblocking accepts, and
-round-robin passes over blocked connections. `stop_admission()` retires
+worker; its bounded fallback checks deadlines. Client futures use task-specific
+wakes, with one forced poll at a new deadline/cancellation event. Real listener
+acceptance uses an epoll readiness index and a completion-owned reactor wait,
+without scanning idle cache listeners. Production hands accepted descriptors and
+target-worker connection reservations through bounded ingress queues before any
+session installation. The canonical path owner publishes shared generation
+retirement tokens; each installed connection stays on its target reactor.
+`stop_admission()` retires
 listeners and idle keepalive connections; `drain(&RequestScope)` bounds active
 response completion. Removed cache generations cannot begin another request.
 

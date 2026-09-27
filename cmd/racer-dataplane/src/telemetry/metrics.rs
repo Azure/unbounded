@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 pub const EVENT_COUNT: usize = 17;
-pub const GAUGE_COUNT: usize = 6;
+pub const GAUGE_COUNT: usize = 7;
 #[derive(Clone, Default)]
 pub struct Metrics(Arc<Counters>);
 #[derive(Default)]
@@ -86,6 +86,7 @@ pub enum Gauge {
     KeyringGeneration,
     IdentityExpiresAtSeconds,
     PendingDiskWrites,
+    ActiveDeliveries,
 }
 pub const GAUGES: [Gauge; GAUGE_COUNT] = [
     Gauge::DiagnosticConnections,
@@ -94,6 +95,7 @@ pub const GAUGES: [Gauge; GAUGE_COUNT] = [
     Gauge::KeyringGeneration,
     Gauge::IdentityExpiresAtSeconds,
     Gauge::PendingDiskWrites,
+    Gauge::ActiveDeliveries,
 ];
 impl Gauge {
     pub fn name(self) -> &'static str {
@@ -104,6 +106,7 @@ impl Gauge {
             Self::KeyringGeneration => "racer_keyring_generation",
             Self::IdentityExpiresAtSeconds => "racer_identity_expires_at_seconds",
             Self::PendingDiskWrites => "racer_pending_disk_writes",
+            Self::ActiveDeliveries => "racer_active_deliveries",
         }
     }
 }

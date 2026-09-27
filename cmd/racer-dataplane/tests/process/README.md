@@ -103,7 +103,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n' \
   --ignored --test-threads=1
 ```
 
-The second command explicitly runs all eleven privileged tests in this target,
+The second command explicitly runs all thirteen privileged tests in this target,
 including the two restart tests. It requires mount namespaces, io_uring,
 O_DIRECT, and enough allowed physical cores/quota for four worker pairs. Missing
 prerequisites fail visibly. Ordinary Cargo runs ignore these tests and are not
@@ -134,6 +134,13 @@ excluded from the exact userspace worker-pair count.
   clients, and verifies recovery. The 200 ms probe is a diagnostic bound. At four
   pairs each existing 32-socket worker partition retains eight outbound and two
   control slots while accepting 22 ingress sockets.
+- `production_aggregate_delivery_capacity` holds all 16 aggregate delivery pipes
+  concurrently at 1/2/4 pairs, then verifies every response and zero remaining
+  active delivery leases. `racer_active_deliveries` tracks actual ReaderLease
+  ownership, including reactor-retained completions.
+- `production_idle_cache_acceptance_fairness` publishes 128 caches, holds 64
+  incomplete heads, and requires traffic at the start/end/middle of the listener
+  catalog to finish within five seconds while readiness remains healthy.
 - `production_churn_diagnostic` reads 512 distinct small objects across two
   caches with concurrency two at 1/2/4 pairs. It allows only HTTP 503 failures,
   records exact successes and failures, and checks server-counter consistency.
@@ -151,7 +158,7 @@ adapter generates bytes on the same host. These are end-to-end fixture results,
 not a hardware maximum. CPU observation brackets include small setup/sampling
 overhead; RSS/FD samples are not peaks. Reports enumerate unavailable counters:
 per-worker reservation failures, queue residence, reactor lag, allocation/copy
-bytes, and ranking misses. No new production counters were added.
+bytes, and ranking misses. Phase 3 adds the fixed active-delivery ownership gauge.
 
 ### Configurable measurements for later phases
 

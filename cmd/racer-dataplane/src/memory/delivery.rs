@@ -29,6 +29,7 @@ const SEND_BUDGET_BYTES: usize = 256 * 1024;
 const SEND_BUDGET_CALLS: usize = 32;
 
 pub struct Delivery {
+    metrics: crate::telemetry::metrics::Metrics,
     pipes: Rc<PipePool>,
     stall_timeout: Duration,
 }
@@ -36,6 +37,7 @@ pub struct Delivery {
 /// A reader pins an immutable page and a separately admitted pipe for its lifetime.
 /// Each reader has its own staging pipe and socket-accepted cursor.
 pub struct ReaderLease {
+    _active: crate::telemetry::metrics::GaugeLease,
     page: VerifiedPage,
     pipe: PipeLease,
     slice: PageSlice,
@@ -85,9 +87,14 @@ impl ReaderLease {
 impl Delivery {
     pub fn new(pipes: Rc<PipePool>, stall_timeout: Duration) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             pipes,
             stall_timeout,
         }
+    }
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     pub fn attach(&self, page: VerifiedPage, slice: PageSlice) -> Result<ReaderLease> {
@@ -107,6 +114,9 @@ impl Delivery {
     ) -> Result<ReaderLease> {
         validate_slice(&page, slice)?;
         Ok(ReaderLease {
+            _active: self
+                .metrics
+                .lease(crate::telemetry::metrics::Gauge::ActiveDeliveries)?,
             page,
             pipe,
             slice,

@@ -551,7 +551,9 @@ impl WorkerApplication {
         let memory =
             Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
-        let delivery = Rc::new(Delivery::new(pipes, config.reader_stall_timeout));
+        let delivery = Rc::new(
+            Delivery::new(pipes, config.reader_stall_timeout).with_metrics(node.metrics.clone()),
+        );
 
         let index = Rc::new(
             Index::new(worker, limits.metadata_entries.get())

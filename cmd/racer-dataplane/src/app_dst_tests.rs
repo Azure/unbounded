@@ -1731,9 +1731,23 @@ impl Harness {
                             .map(move |entry| (n, w, entry))
                     })
             })
-            .filter(|(_, _, (page, _))| {
+            .filter(|(node, worker, (page, entry))| {
                 let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
                 object > 1
+                    && self.nodes[*node].workers[*worker]
+                        .app
+                        .keys
+                        .lease(
+                            Some(&page.version.object.cache),
+                            entry.key_id,
+                            KeyPurpose::Page,
+                        )
+                        .is_ok()
+                    && self.nodes[*node].workers[*worker]
+                        .app
+                        .caches
+                        .iter()
+                        .any(|cache| cache.id == page.version.object.cache)
                     && self
                         .catalog
                         .borrow()
@@ -1760,7 +1774,12 @@ impl Harness {
             self.traffic(1, false);
             return;
         }
-        let client = self.request_on(object, true, false, *node);
+        let mut client = self.request_on(object, true, false, *node);
+        // The corruption probe must request the selected persisted page rather
+        // than a random range that may entirely miss that record.
+        client.first = page.number.0 as usize * PAGE_BYTES as usize;
+        client.end = (client.first + PAGE_BYTES as usize).min(client.size);
+        client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes={}-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.first, client.end - 1).into_bytes();
         let path = self.nodes[*node]
             .config
             .slab_directory

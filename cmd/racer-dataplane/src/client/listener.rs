@@ -150,6 +150,9 @@ impl Drop for BoundListener {
 }
 
 struct Active {
+    runnable: Arc<crate::read::drivers::Runnable>,
+    deadline: Rc<Cell<std::time::Instant>>,
+    expired: Option<std::time::Instant>,
     cache: CacheId,
     retired: Arc<crate::runtime::ingress::Retired>,
     idle: Rc<Cell<bool>>,
@@ -237,6 +240,8 @@ impl ClientListeners {
         let idle = Rc::new(Cell::new(true));
         let task_idle = idle.clone();
         let timeout = self.request_timeout;
+        let deadline = Rc::new(Cell::new(crate::runtime::environment::now() + timeout));
+        let task_deadline = deadline.clone();
         let parser = self.parser.clone();
         let reads = self.reads.clone();
         let responses = self.responses.clone();
@@ -258,10 +263,14 @@ impl ClientListeners {
                 task_idle,
                 timeout,
                 &metrics,
+                task_deadline,
             )
             .await
         });
         self.active.borrow_mut().push_back(Active {
+            runnable: crate::read::drivers::Runnable::new(),
+            deadline,
+            expired: None,
             cache,
             retired,
             idle,
@@ -336,7 +345,17 @@ impl ClientListeners {
             if active.retired.get() && active.idle.get() {
                 let _ = active.cancellation.cancel();
             }
-            match active.operation.as_mut().poll(cx) {
+            let deadline = active.deadline.get();
+            let force = active.expired != Some(deadline)
+                && (crate::runtime::environment::now() >= deadline
+                    || active.cancellation.is_cancelled());
+            if force {
+                active.expired = Some(deadline);
+            }
+            match active
+                .runnable
+                .poll(std::pin::Pin::new(&mut active.operation), cx, force)
+            {
                 Poll::Pending => self.active.borrow_mut().push_back(active),
                 Poll::Ready(_) => {}
             }
@@ -431,6 +450,8 @@ impl ClientListeners {
                     let idle = Rc::new(Cell::new(true));
                     let task_idle = idle.clone();
                     let timeout = self.request_timeout;
+                    let deadline = Rc::new(Cell::new(crate::runtime::environment::now() + timeout));
+                    let task_deadline = deadline.clone();
                     let parser = self.parser.clone();
                     let reads = self.reads.clone();
                     let responses = self.responses.clone();
@@ -452,10 +473,14 @@ impl ClientListeners {
                             task_idle,
                             timeout,
                             &metrics,
+                            task_deadline,
                         )
                         .await
                     });
                     self.active.borrow_mut().push_back(Active {
+                        runnable: crate::read::drivers::Runnable::new(),
+                        deadline,
+                        expired: None,
                         cache,
                         retired,
                         idle,
@@ -597,6 +622,7 @@ async fn serve_connection(
     idle: Rc<Cell<bool>>,
     timeout: Duration,
     metrics: &crate::telemetry::metrics::Metrics,
+    deadline: Rc<Cell<std::time::Instant>>,
 ) -> Result<()> {
     loop {
         if retired.get() {
@@ -611,6 +637,7 @@ async fn serve_connection(
             super::request::MAX_HEAD_BYTES,
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;
+        deadline.set(idle_scope.deadline.0);
         let received = io
             .receive_request_head_limited(connection, &idle_scope, parser.header_limit())
             .await?;
@@ -623,6 +650,7 @@ async fn serve_connection(
         // Idle/header admission has its own bound. A healthy pooled connection
         // gets a fresh operation budget only after each complete request head.
         let scope = new_scope(timeout, cancellation.clone())?;
+        deadline.set(scope.deadline.0);
         let scope = &scope;
         let request = match received.value.and_then(|head| parser.parse(cache, head)) {
             Ok(request) => request,
@@ -1343,6 +1371,7 @@ mod tests {
     }
 
     struct GatedRead {
+        wake: RefCell<Option<std::task::Waker>>,
         inner: Rc<dyn ReadService>,
         scopes: RefCell<Vec<RequestScope>>,
         release: Cell<bool>,
@@ -1355,7 +1384,8 @@ mod tests {
         ) -> Operation<'a, ReadResponse> {
             Box::pin(async move {
                 self.scopes.borrow_mut().push(scope.clone());
-                std::future::poll_fn(|_| {
+                std::future::poll_fn(|cx| {
+                    *self.wake.borrow_mut() = Some(cx.waker().clone());
                     if let Err(error) = scope.check() {
                         Poll::Ready(Err(error))
                     } else if self.release.get() {
@@ -1427,6 +1457,7 @@ mod tests {
             inner: fixture.reads.clone(),
             scopes: RefCell::new(Vec::new()),
             release: Cell::new(false),
+            wake: RefCell::new(None),
         });
         fixture.listeners.reads = reads.clone();
         fixture.reconcile(&[definition()]).unwrap();
@@ -1447,6 +1478,9 @@ mod tests {
         assert!(first.deadline.0 >= before + timeout);
         assert!(first.deadline.0 <= Instant::now() + timeout);
         reads.release.set(true);
+        if let Some(waker) = reads.wake.borrow().as_ref() {
+            waker.wake_by_ref();
+        }
         assert!(
             fixture
                 .receive(&mut socket, false)
@@ -1499,6 +1533,9 @@ mod tests {
             senders.push(send);
             let order = order.clone();
             fixture.listeners.active.borrow_mut().push_back(Active {
+                runnable: crate::read::drivers::Runnable::new(),
+                deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
+                expired: None,
                 cache: definition().id,
                 retired: Arc::new(crate::runtime::ingress::Retired::default()),
                 idle: Rc::new(Cell::new(false)),
@@ -1514,8 +1551,20 @@ mod tests {
         for _ in 0..6 {
             assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
         }
-        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(&*order.borrow(), &[0, 1, 2]);
         assert_eq!(count.count(), 1, "blocked clients do not self-wake");
+        for active in fixture.listeners.active.borrow().iter() {
+            std::task::Wake::wake_by_ref(&active.runnable);
+        }
+        for _ in 0..3 {
+            fixture.listeners.poll_budgeted(&mut cx, 1).unwrap();
+        }
+        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(
+            count.count(),
+            4,
+            "only the three explicit notifications wake the worker"
+        );
         std::thread::spawn(move || {
             for send in senders {
                 send.send(()).unwrap();
@@ -1525,7 +1574,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             count.count(),
-            4,
+            7,
             "listener forwards the real completion waker"
         );
         assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 2).unwrap(), 2);
@@ -1534,6 +1583,9 @@ mod tests {
         assert_eq!(fixture.listeners.active_connections(), 0);
         let mut yielded = false;
         fixture.listeners.active.borrow_mut().push_back(Active {
+            runnable: crate::read::drivers::Runnable::new(),
+            deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
+            expired: None,
             cache: definition().id,
             retired: Arc::new(crate::runtime::ingress::Retired::default()),
             idle: Rc::new(Cell::new(false)),
@@ -1551,7 +1603,7 @@ mod tests {
         assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
         assert_eq!(
             count.count(),
-            5,
+            8,
             "cooperative client continuation reaches driver"
         );
         assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
@@ -1839,6 +1891,7 @@ mod tests {
             inner: fixture.listeners.reads.clone(),
             scopes: RefCell::new(Vec::new()),
             release: Cell::new(false),
+            wake: RefCell::new(None),
         });
         fixture.listeners.reads = reads.clone();
         let mut socket = fixture.connect();
@@ -1855,6 +1908,9 @@ mod tests {
         // Consume part of the total budget before committing response headers.
         sleep_until(scope.deadline.0 - timeout / 2);
         reads.release.set(true);
+        if let Some(waker) = reads.wake.borrow().as_ref() {
+            waker.wake_by_ref();
+        }
         let mut output = fixture.receive(&mut socket, false);
         assert!(output.starts_with(b"HTTP/1.1 206 "));
         let head_end = output
@@ -2476,6 +2532,7 @@ mod tests {
             inner: fixture.reads.clone(),
             scopes: RefCell::new(vec![]),
             release: Cell::new(false),
+            wake: RefCell::new(None),
         });
         fixture.listeners.reads = gated.clone();
         fixture.reconcile(&[definition()]).unwrap();
@@ -2494,6 +2551,9 @@ mod tests {
         assert_eq!(fixture.listeners.active_connections(), 1);
         fixture.reconcile(&[definition()]).unwrap();
         gated.release.set(true);
+        if let Some(waker) = gated.wake.borrow().as_ref() {
+            waker.wake_by_ref();
+        }
         let response = fixture.receive(&mut socket, true);
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert_eq!(fixture.listeners.active_connections(), 0);

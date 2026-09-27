@@ -78,11 +78,13 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
 
 ## Completion and memory ownership
 
-`read::drivers` is a bounded worker-local round-robin owner. Fill transfers the
+`read::drivers` is a bounded worker-local runnable-aware owner. Fill transfers the
 leader, retained FlightOperation, charged context, and original budget into an
 owned driver. Dropping ingress detaches the waiter and requests cancellation;
 accepted work remains owned until completion. Flights::poll_with_context drives
 these tasks outside the flight-table borrow, including during drain.
+Parked acquisition and directory-command futures are polled only after their
+task-specific wake; command cancellation/deadline checks retain bounded turns.
 
 Origin, peer, disk, and crypto methods returning after accepted submission must
 fence their actual completions before returning cancellation. The runtime owner
@@ -90,7 +92,10 @@ fixed CryptoClient's early cancellation return. The strengthened regression
 `canceled_supplier_retains_crypto_fence_before_replacement_origin_work` now passes.
 Never substitute buffer retention or a timeout for that completion fence.
 
-CredentialCrypto::open_charged returns a quota-owning context. Driver queue permits
+CredentialCrypto::open_charged returns a quota-owning context for encrypted
+envelopes. Same-owner range pages and acquisition drivers use `local_context`,
+which admits independent zeroizing fields before allocation without an AEAD or
+mailbox round trip. Driver queue permits
 are acquired before retaining a FlightOperation; submission is infallible after
 reservation. No credential-bearing context enters a completed flight or cache.
 

@@ -99,3 +99,6 @@ crate, `bash src/telemetry/check-component.sh` compiles these same telemetry tes
 with production reactor, admission, deadline, and model modules against built
 dependencies. Raw TCP tests drive the real io_uring reactor on the calling test
 thread. No socket test is silently skipped when io_uring is unavailable.
+Phase 3 adds `racer_active_deliveries`, a fixed gauge held by each `ReaderLease`.
+It counts actual attached delivery pipes, including completion-owned leases after
+ingress cancellation. It is not a count of queued requests or a sampled peak.

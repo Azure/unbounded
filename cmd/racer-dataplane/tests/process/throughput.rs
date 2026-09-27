@@ -554,6 +554,101 @@ fn production_ingress_baseline() {
 }
 
 #[test]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and 8 CPU capacity"]
+fn production_aggregate_delivery_capacity() {
+    for pairs in [1, 2, 4] {
+        let scratch = Scratch::new();
+        let profile = Profile::new(pairs, PAGE_BYTES, 1);
+        let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+        let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+        let path = socket_path(&process, 0);
+        let expected = Expected {
+            start: 0,
+            end: PAGE_BYTES,
+            length: PAGE_BYTES,
+        };
+        assert_eq!(request(&path, 0, &expected, false), Ok(PAGE_BYTES));
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let mut socket = connect(&path).unwrap();
+            write!(socket, "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nIf-Match: \"restart-v1\"\r\nRange: bytes=0-{}\r\nConnection: close\r\n\r\n", 0, PAGE_BYTES - 1).unwrap();
+            readers.push(socket);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let active = counters(&process)["racer_active_deliveries"];
+            if active == 16 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{pairs} pairs admitted only {active}/16 delivery pipes"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::scope(|threads| {
+            let handles: Vec<_> = readers
+                .into_iter()
+                .map(|socket| {
+                    let expected = &expected;
+                    threads.spawn(move || {
+                        measurement::response(
+                            &mut BufReader::with_capacity(64 << 10, socket),
+                            expected,
+                            |offset| object_byte(0, offset),
+                            Duration::ZERO,
+                        )
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(PAGE_BYTES));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while counters(&process)["racer_active_deliveries"] != 0 {
+            assert!(Instant::now() < deadline, "delivery leases leaked");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process.stop(libc::SIGTERM).success());
+    }
+}
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT"]
+fn production_idle_cache_acceptance_fairness() {
+    let scratch = Scratch::new();
+    let profile = Profile::new(4, 113, 128);
+    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+    let expected = Expected {
+        start: 0,
+        end: 113,
+        length: 113,
+    };
+    let mut held = Vec::new();
+    for cache in 0..64 {
+        let mut socket = connect(&socket_path(&process, cache)).unwrap();
+        socket.write_all(b"GET /v1/objects/").unwrap();
+        held.push(socket);
+    }
+    for cache in [127, 65, 96, 0] {
+        let start = Instant::now();
+        assert_eq!(
+            request(&socket_path(&process, cache), 0, &expected, false),
+            Ok(113)
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cache {cache} starved behind idle listeners"
+        );
+    }
+    assert_eq!(process.diagnostic("/readyz").unwrap().status, 200);
+    drop(held);
+    assert!(process.stop(libc::SIGTERM).success());
+}
+
+#[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; blocked control publication with live data"]
 fn production_blocked_control_progress() {
     let scratch = Scratch::new();
