@@ -35,8 +35,26 @@ io_uring enabled, native build dependencies, and the native adapter build.
 Compilation and tests share a verified 12 GiB cgroup limit with swap disabled;
 two compilation jobs and serial tests bound overlapping allocations. The target
 includes library, binary, integration, and documentation tests with all features.
-Explicitly ignored hardware, SDK, privileged benchmark, and release-only tests
+CI also sets up Go from `go.mod` and runs `make racer-sdk-conformance` in a
+separate five-minute bounded service, reusing the Rust build cache. This target
+explicitly selects the ignored SDK client/origin wire test, builds the actual Go
+SDK from the same checkout, and exercises it against Rust over Unix sockets.
+The existing privileged `process_restart` suite runs in its own service too.
+Other explicitly ignored hardware, privileged benchmark, and release-only tests
 still require their documented opt-in commands.
+
+To run just the cross-language check locally (Linux, Go from `go.mod`, Rust, and
+a native C toolchain are required):
+
+```sh
+CARGO_BUILD_JOBS=2 GOMAXPROCS=2 \
+  bash hack/scripts/memory-safe-run.sh -- make racer-sdk-conformance
+```
+
+The target creates the fixture scratch directories and sets `RACER_SDK_ROOT` to
+the repository root. `RACER_CARGO_TARGET_DIR` can isolate concurrent builds.
+Full deployed-image coverage runs separately in the
+[operator-installed kind suite](../../e2e/racer/README.md).
 
 ## Metadata contention simulation
 

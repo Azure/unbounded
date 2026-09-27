@@ -78,6 +78,29 @@ deployed.
 
 ## Iteration and diagnostics
 
+### CI coverage
+
+The `Racer Full-stack Image Pull` job in `.github/workflows/ci.yaml` runs this
+suite on every pull request to `main` or `release-*`, every merge group, release
+branch pushes, and manual CI dispatches. It uses an Ubuntu 24.04 Docker host,
+Go from `go.mod`, kind v0.28.0, and kubectl v1.33.1 to match the suite's node
+image. Host io_uring and inotify limits are configured before cluster creation.
+
+CI builds all four images above serially with `VERSION=e2e`, with a separate
+GitHub Actions BuildKit cache per component, and loads them into the local Docker
+daemon. The kind node image is pulled before the test. The complete job has a
+60-minute budget; the test step has a 15-minute limit around the existing
+ten-minute Go test timeout, allowing Go compilation and diagnostic upload.
+The `racer-e2e-diagnostics` artifact retains the test output, pod/event logs,
+port-forward logs, and peer metric/packet-counter logs for seven days. Only logs
+are uploaded; the generated kubeconfig and manifests stay on the runner.
+
+The separate `Racer Rust Suite` job also explicitly runs the real Go SDK/Rust
+wire test with `make racer-sdk-conformance`. See the
+[dataplane test instructions](../../cmd/racer-dataplane/README.md).
+
+### Local debugging
+
 - Rebuild changed components before rerunning the test; it always uses locally
   built `docker.io/library/*:e2e` images by default. For concurrent development,
   build all four images with a unique repository prefix and set

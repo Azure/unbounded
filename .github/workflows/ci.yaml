@@ -139,7 +139,7 @@ jobs:
     name: Racer Rust Suite
     # Run directly on the VM: container seccomp profiles can deny io_uring.
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,6 +149,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev
           sudo sysctl -w kernel.io_uring_disabled=0
+
+      - name: Set up Go for SDK conformance
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Set up pinned Rust
         # Match the Racer builder image in Makefile and images/racer-dataplane/Containerfile.
@@ -182,6 +188,19 @@ jobs:
             bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
             make racer-dataplane-native-build racer-rust-test
 
+      - name: Test Go SDK interoperability with Rust
+        # Keep the Go fixture compiler and Rust test in the same bounded cgroup.
+        # The target opts in only to SDK conformance, using this checkout's SDK.
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --property="User=$(id -un)" --property="WorkingDirectory=$PWD" \
+            --property=MemoryMax=12G --property=MemorySwapMax=0 \
+            --property=RuntimeMaxSec=5min --property=TimeoutStopSec=30s \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
+            --setenv=CARGO_BUILD_JOBS=2 --setenv=GOMAXPROCS=2 \
+            bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
+            make racer-sdk-conformance
+
       - name: Test privileged executable restarts with bounded memory
         # Select only this ignored suite. Cargo builds as the checkout owner;
         # its runner elevates the tests for child-only private mount namespaces.
@@ -198,6 +217,111 @@ jobs:
             cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
             --all-features --test process_restart -j 2 -- \
             --ignored --test-threads=1 --nocapture
+
+  # Every PR and merge group exercises the shipped images through the operator.
+  racer-e2e:
+    name: Racer Full-stack Image Pull
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Prepare Docker, kind, kubectl, and host I/O
+        # Match kubectl to the node image pinned in e2e/racer/stack_test.go.
+        # Download the node before the suite's bounded cluster setup starts.
+        run: |
+          docker info
+          sudo sysctl -w kernel.io_uring_disabled=0
+          sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=524288
+          mkdir -p bin
+          GOBIN="$PWD/bin" go install sigs.k8s.io/kind@v0.28.0
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl -o bin/kubectl
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl.sha256 -o bin/kubectl.sha256
+          printf '%s  bin/kubectl\n' "$(<bin/kubectl.sha256)" | sha256sum --check
+          chmod +x bin/kubectl
+          bin/kind version
+          bin/kubectl version --client
+          docker pull kindest/node:v1.33.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # Build serially to bound memory and load into Docker for kind, not a registry.
+      # VERSION=e2e is also the operator's component image tag at runtime.
+      - name: Build operator image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/unbounded-operator/Containerfile
+          build-args: VERSION=e2e
+          tags: docker.io/library/unbounded-operator:e2e
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=racer-e2e-operator
+          cache-to: type=gha,mode=max,scope=racer-e2e-operator
+
+      - name: Build Racer controller image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-controller/Containerfile
+          build-args: VERSION=e2e
+          tags: docker.io/library/racer-controller:e2e
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=racer-e2e-controller
+          cache-to: type=gha,mode=max,scope=racer-e2e-controller
+
+      - name: Build Racer dataplane image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-dataplane/Containerfile
+          build-args: VERSION=e2e
+          tags: docker.io/library/racer-dataplane:e2e
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=racer-e2e-dataplane
+          cache-to: type=gha,mode=max,scope=racer-e2e-dataplane
+
+      - name: Build Gantry image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/gantry/Containerfile
+          build-args: VERSION=e2e
+          tags: docker.io/library/gantry:e2e
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=racer-e2e-gantry
+          cache-to: type=gha,mode=max,scope=racer-e2e-gantry
+
+      - name: Test operator-installed image pull and peer recovery
+        timeout-minutes: 15
+        run: |
+          mkdir -p tmp
+          set -o pipefail
+          make e2e-racer 2>&1 | tee tmp/racer-e2e-test.log
+
+      - name: Upload full-stack diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-e2e-diagnostics
+          path: |
+            tmp/racer-e2e-test.log
+            tmp/racer-e2e-*/*.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   racer-envtest:
     name: Racer API Server Integration Tests

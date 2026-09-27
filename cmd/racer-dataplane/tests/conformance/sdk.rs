@@ -89,13 +89,11 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
         let rig = Rig::new();
         rig.drive(async {
             let mut connection = rig.lease(accepted);
-            for (index, (first, length)) in [(0, size.min(P)), (P, size.saturating_sub(P))]
-                .into_iter()
-                .enumerate()
-            {
-                if index == 1 && length == 0 {
-                    break;
-                }
+            // Empty objects still perform one bootstrap exchange. Nonempty
+            // objects continue one page at a time, including a short final page.
+            for index in 0..size.div_ceil(P).max(1) {
+                let first = index * P;
+                let length = size.saturating_sub(first).min(P);
                 let scope = scope();
                 let received = rig.io.receive_head(connection, &scope).await.unwrap();
                 let parsed = RequestParser::new(LIMIT)
@@ -130,15 +128,15 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
                         ReadKind::Pinned {
                             etag: StrongEtag::parse(b"\"v\"").unwrap(),
                             range: ByteRange::Closed {
-                                first: P,
-                                last: size - 1
+                                first,
+                                last: first + length - 1
                             }
                         }
                     );
                 }
                 drop(parsed);
                 // This is a scripted HTTP peer, not a substitute Coordinator. It
-                // checks SDK's full-remainder request and real Rust framing with
+                // checks SDK's page-sized requests and real Rust framing with
                 // bounded chunks. Page acquisition is a separate acceptance gate.
                 let mut fields = vec![
                     ("Content-Length", length.to_string()),

@@ -278,6 +278,7 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-racer                        Run the operator-installed Racer e2e suite (prebuilt images)"
+	@echo "  racer-sdk-conformance             Run the opt-in Go SDK / Rust wire integration test"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
@@ -578,7 +579,7 @@ e2e-racer: ## Run the operator-installed Racer e2e suite with prebuilt Docker im
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-rust-test racer-server-test racer-envtest racer-envtest-ci racer-scale racer-generate racer-manifests
+.PHONY: racer-controller racer-controller-build racer-test racer-rust-test racer-sdk-conformance racer-server-test racer-envtest racer-envtest-ci racer-scale racer-generate racer-manifests
 racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
 
 racer-controller-build: ## Build the Racer controller without lint/test
@@ -642,6 +643,15 @@ racer-rust-test: ## Check the complete Rust suite, including integration tests a
 	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
 	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-targets --all-features
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features -- $(RACER_TEST_ARGS)
+
+racer-sdk-conformance: ## Run the ignored real Go SDK / Rust conformance test (requires Go and Linux)
+	@# The fixture uses these paths independently of Cargo's build cache.
+	@mkdir -p cmd/racer-dataplane/target tmp
+	RACER_SDK_ROOT="$(CURDIR)" $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--all-features --test client_origin_conformance \
+		sdk::sdk_client_to_rust_http_and_request_parser_over_uds -- \
+		--exact --ignored --test-threads=1 --nocapture
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
