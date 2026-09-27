@@ -1056,8 +1056,8 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 				take(f.a.Server.writes)
 				defer release(f.a.Server.writes)
 			case "bootstrap":
-				take(f.a.Server.bootstrapSlots)
-				defer release(f.a.Server.bootstrapSlots)
+				take(f.a.Server.authSlots)
+				defer release(f.a.Server.authSlots)
 
 				request.Method = "POST"
 				request.URL.Path = wire.BootstrapPath
@@ -1114,7 +1114,7 @@ func TestBootstrapReadDeadlineAndChunkedBound(t *testing.T) {
 	_, _ = io.Copy(io.Discard, conn)
 	deadline := time.After(time.Second)
 
-	for len(f.a.Server.bootstrapSlots) != 0 {
+	for len(f.a.Server.authSlots) != 0 {
 		select {
 		case <-deadline:
 			t.Fatal("slow body retained admission")

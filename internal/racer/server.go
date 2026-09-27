@@ -22,16 +22,16 @@ import (
 )
 
 type Server struct {
-	Config         Config
-	Trust          *Trust
-	Bootstrap      *Bootstrap
-	Publications   *Publications
-	Lifecycle      *Lifecycle
-	once           sync.Once
-	admission      sync.Mutex
-	polls          map[wire.NodeID]struct{}
-	bootstrapSlots chan struct{}
-	writes         chan struct{}
+	Config       Config
+	Trust        *Trust
+	Bootstrap    *Bootstrap
+	Publications *Publications
+	Lifecycle    *Lifecycle
+	once         sync.Once
+	admission    sync.Mutex
+	polls        map[wire.NodeID]struct{}
+	authSlots    chan struct{}
+	writes       chan struct{}
 }
 
 var (
@@ -68,10 +68,10 @@ func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tl
 			return nil, err
 		}
 
-		if !take(s.bootstrapSlots) {
+		if !take(s.authSlots) {
 			return nil, wire.Overloaded
 		}
-		defer release(s.bootstrapSlots)
+		defer release(s.authSlots)
 
 		roots, err := s.Trust.pool()
 		if err != nil {
@@ -201,7 +201,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.polls = make(map[wire.NodeID]struct{})
-		s.bootstrapSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
+		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
 		s.writes = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentWrites))
 	})
 }
@@ -325,11 +325,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
-	if !take(s.bootstrapSlots) {
+	if !take(s.authSlots) {
 		writeFailure(w, wire.Overloaded)
 		return
 	}
-	defer release(s.bootstrapSlots)
+	defer release(s.authSlots)
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
 	defer cancel()
@@ -390,6 +390,18 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (NodeIdentity, error) {
+	if !take(s.authSlots) {
+		return NodeIdentity{}, wire.Overloaded
+	}
+	defer release(s.authSlots)
+
+	ctx, cancel := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
+	defer cancel()
+
+	return AuthenticateCertificate(ctx, s.Trust, s.Config, state)
+}
+
 func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	after, err := snapshotCursor(r)
 	if err != nil {
@@ -397,17 +409,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !take(s.bootstrapSlots) {
-		writeFailure(w, wire.Overloaded)
-		return
-	}
-
-	auth, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
-	identity, err := AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
-
-	cancel()
-	release(s.bootstrapSlots)
-
+	identity, err := s.authenticateSnapshot(r.Context(), r.TLS)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -446,18 +448,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Revalidate local trust after waiting: rotation or observed invalidity must
 	// also take effect on pooled connections before returning snapshot bytes.
-	if !take(s.bootstrapSlots) {
-		writeFailure(w, wire.Overloaded)
-		return
-	}
-
-	auth, stop := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
-	_, err = AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
-
-	stop()
-	release(s.bootstrapSlots)
-
-	if err != nil {
+	if _, err := s.authenticateSnapshot(ctx, r.TLS); err != nil {
 		writeFailure(w, err)
 		return
 	}
