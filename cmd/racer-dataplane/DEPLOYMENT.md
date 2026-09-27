@@ -109,7 +109,8 @@ account for them when setting container PID limits.
 Aggregate budgets are divided among workers; insufficient per-worker page
 progress reserves reduce the pair count (`src/app.rs:176-194,226-263`). Defaults
 are 256 MiB plaintext, 256 MiB ciphertext, 128 MiB dirty, 128 MiB registered,
-and 16 MiB request context. These admission dimensions are not a process RSS
+and 64 MiB request context. Peer relay staging also has a per-worker progress
+floor that can reduce pair count. These admission dimensions are not a process RSS
 limit. Allow headroom for stacks, TLS/control state, indexes, queues, buffers,
 kernel socket/pipe/ring resources, and allocator overhead. Measure the deployment
 before choosing a cgroup memory limit. See [CONFIGURATION.md](CONFIGURATION.md)

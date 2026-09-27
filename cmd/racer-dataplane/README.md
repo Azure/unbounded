@@ -512,7 +512,7 @@ the conservative memory envelope. Unsupported/unresolvable cgroup layouts fail
 closed. Per-worker **fixture limits**, not partitioned production defaults, remain
 256 MiB plaintext, 512 MiB ciphertext, 128 MiB dirty, 16 MiB request context,
 16 delivery pipes, and 256 queue entries/client connections. Production defaults
-instead divide node-wide 256/256/128/16 MiB and 16 pipes among workers
+instead divide node-wide 256/256/128/64 MiB and 16 pipes among workers
 (`src/config.rs:173-185`, `src/app.rs:234-249`). No limits are raised on overload.
 
 At four pairs the envelope is 12,416 MiB (plus 64 bytes): the full 4,096 MiB device,

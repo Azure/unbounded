@@ -176,7 +176,7 @@ impl Config {
             ciphertext_bytes: limit("RACER_CIPHERTEXT_BYTES", 256 * MIB)?,
             dirty_bytes: limit("RACER_DIRTY_BYTES", 128 * MIB)?,
             registered_bytes: limit("RACER_REGISTERED_BYTES", 128 * MIB)?,
-            request_context_bytes: limit("RACER_REQUEST_CONTEXT_BYTES", 16 * MIB)?,
+            request_context_bytes: limit("RACER_REQUEST_CONTEXT_BYTES", 64 * MIB)?,
             flights: limit("RACER_FLIGHTS", 64)?,
             waiters_per_flight: limit("RACER_WAITERS_PER_FLIGHT", 64)?,
             queue_entries: limit("RACER_QUEUE_ENTRIES", 256)?,

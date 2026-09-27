@@ -743,7 +743,9 @@ impl Harness {
         config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
         config.limits.metadata_entries = NonZeroUsize::new(128).unwrap();
         config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
-        config.limits.request_context_bytes = NonZeroUsize::new(4 * 1024 * 1024).unwrap();
+        // Match one quarter of the production node budget, including peer envelope
+        // staging. This fixture assembles workers directly, bypassing size_workers.
+        config.limits.request_context_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
         let worker_count = 1 + self.rng.pick(2);
         self.coverage.trace.record(format!(
             "node:{id}:{restart:?}:{worker_count}:{}",

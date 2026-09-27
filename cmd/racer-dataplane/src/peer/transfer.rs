@@ -63,6 +63,10 @@ pub struct Transfers {
     )>,
 }
 impl Transfers {
+    #[cfg(test)]
+    pub(crate) fn transport_io(&self) -> &Rc<HttpIo> {
+        &self.io
+    }
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
             signatures: std::cell::RefCell::new(None),

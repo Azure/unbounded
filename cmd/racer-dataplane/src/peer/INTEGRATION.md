@@ -28,6 +28,23 @@ let server = PeerServer::new(peer_io, forwarding, admission, local_service, rela
     .with_transfers(transfers);
 ```
 
+Application assembly supplies this peer I/O to both `Transfers` and `PeerServer`.
+Origins get a separate capped view and clients use their own 32 KiB profile.
+`MAX_SIGNED_HEAD` is 64 KiB; `MAX_ENVELOPE_HEAD` is 1,179,648 bytes, including
+the immediate-hop signature. The envelope budget allows the original plus eight
+bounded base64 proofs and authentication/native-control overhead. Metadata and
+encrypted Authorization are base64 encoded inside the original and again in the
+outer envelope; accepted 8,192-byte client fields must not be limited to a 32 KiB
+peer head. The forwarding verifier permits at most eight links (seven relays).
+
+Worker sizing requires `8 * MAX_ENVELOPE_HEAD` request-context bytes plus the
+existing `4 * max(configured header cap, 8192)` allowance. This funds retained
+inbound/outbound heads, decoded context, signing/encoding scratch, and peer I/O
+staging during a relay. It reduces worker count to fit the node budget, failing
+startup if even one worker cannot fit. The default node request-context budget
+is 64 MiB. This is a progress floor, not a concurrency guarantee: live requests
+still share bounded admission and saturation returns `Overloaded`.
+
 The worker must poll `server.listen(address, scope)` and drive its reactor. HTTP
 connections and ciphertext retain quota through I/O completion. The listener scope
 bounds connection lifetime. At the start of every exchange, including the first
@@ -118,3 +135,7 @@ Accept-loop tests exercise the production selection helper across pending and re
 accepts, concurrent connection completions, cancellation, and abandonment.
 They are under `peer::tests`, `peer::server::tests`, and
 `peer::wire::tests`; run `cargo test --lib peer::` and the all-feature variant.
+`app::peer_tests` additionally exercises the assembled requester/server I/O over
+real sockets: all three maximum client fields, credential encryption/decryption,
+session authentication, eight-link forwarding and signed reverse responses,
+oversized heads, worker budget boundaries, and staging-pressure rejection.

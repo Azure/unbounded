@@ -140,7 +140,11 @@ impl HttpIo {
         let mut io = Self::with_admission(
             reactor,
             super::codec::Codec::new(
-                admission.limits().header_bytes.get(),
+                admission
+                    .limits()
+                    .header_bytes
+                    .get()
+                    .min(super::codec::MAX_HEAD_BYTES),
                 crate::model::range::PAGE_BYTES + 16,
             ),
             admission,
@@ -219,6 +223,7 @@ impl HttpIo {
             let codec = self.codec.limited(header_limit);
             let mut buffer = self.buffer(codec.header_limit())?;
             let mut used = 0;
+            let mut scanned: usize = 0;
             if let Some((ahead, range)) = connection.read_ahead.take() {
                 if range.len() > buffer.bytes.len() {
                     drop(ahead);
@@ -229,7 +234,24 @@ impl HttpIo {
                 buffer.bytes[..used].copy_from_slice(&ahead.bytes[range]);
             }
             loop {
-                let decoded = match codec.decode_head(&buffer.bytes[..used]) {
+                // Scan each received byte once, including the delimiter overlap.
+                // Large peer heads must not cause quadratic rescans on trickled I/O.
+                let complete = buffer.bytes[scanned.saturating_sub(3)..used]
+                    .windows(4)
+                    .any(|w| w == b"\r\n\r\n");
+                let malformed = !complete
+                    && (scanned.saturating_sub(1)..used).any(|i| {
+                        (buffer.bytes[i] == b'\n' && (i == 0 || buffer.bytes[i - 1] != b'\r'))
+                            || (buffer.bytes[i] == b'\r'
+                                && i + 1 < used
+                                && buffer.bytes[i + 1] != b'\n')
+                    });
+                scanned = used;
+                let decoded = match if complete || malformed || used == codec.header_limit() {
+                    codec.decode_head(&buffer.bytes[..used])
+                } else {
+                    Ok(None)
+                } {
                     Ok(decoded) => decoded,
                     Err(error @ (Error::InvalidRequest | Error::HeaderTooLarge)) => {
                         drop(buffer);
@@ -304,16 +326,7 @@ impl HttpIo {
             connection.begin_io();
             let length =
                 Self::framing_with_limit(&head, connection.request_is_head, self.send_body_limit)?;
-            let head = if let Some(session) = connection.session.as_mut() {
-                session.sign(head)?
-            } else {
-                head
-            };
-            connection.close |= head.closes_connection()?;
-            if let StartLine::Request { method, .. } = &head.start {
-                connection.request_is_head = method == "HEAD";
-            }
-            // Reserve worst-case staging before the codec allocates encoded bytes.
+            // Admit staging and scratch before session signing or HTTP encoding.
             let mut buffer = self.buffer(self.codec.header_limit())?;
             let scratch = self
                 .admission
@@ -324,6 +337,15 @@ impl HttpIo {
                     ResourceClass::RequestContext,
                     self.codec.header_limit().max(1),
                 )?;
+            let head = if let Some(session) = connection.session.as_mut() {
+                session.sign(head)?
+            } else {
+                head
+            };
+            connection.close |= head.closes_connection()?;
+            if let StartLine::Request { method, .. } = &head.start {
+                connection.request_is_head = method == "HEAD";
+            }
             let encoded = Zeroizing::new(self.codec.encode_head(&head)?);
             buffer.bytes[..encoded.len()].copy_from_slice(&encoded);
             let encoded_length = encoded.len();
@@ -802,6 +824,61 @@ mod tests {
                 ),
                 Err(Error::InvalidRequest)
             ));
+        }
+        drain(&reactor);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+    #[test]
+    fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
+        let (admission, reactor, _, scope) = setup();
+        let peer = HttpIo::with_admission(
+            reactor.clone(),
+            Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 16),
+            admission.clone(),
+        );
+        let client = HttpIo::for_clients(reactor.clone(), admission.clone());
+        let origin = peer.capped(super::super::codec::MAX_HEAD_BYTES);
+        for (io, limit) in [
+            (&client, admission.limits().header_bytes.get()),
+            (&origin, super::super::codec::MAX_HEAD_BYTES),
+            (&peer, crate::peer::wire::MAX_ENVELOPE_HEAD),
+        ] {
+            for extra in [0, 1] {
+                let mut head = request("GET");
+                let overhead = Codec::new(usize::MAX, 16).encode_head(&head).unwrap().len();
+                let value_length = head.headers[0].value.len() + limit - overhead + extra;
+                head.headers[0].value.resize(value_length, b'x');
+                let raw = Codec::new(limit + 1, 16).encode_head(&head).unwrap();
+                assert_eq!(raw.len(), limit + extra);
+                let (socket, mut other) = UnixStream::pair().unwrap();
+                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let writer = std::thread::spawn(move || {
+                    let _ = other.write_all(&raw);
+                });
+                let result = drive(&reactor, io.receive_head(connection, &scope));
+                if extra == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(Error::HeaderTooLarge)));
+                }
+                drop(result);
+                writer.join().unwrap();
+                let (socket, mut other) = UnixStream::pair().unwrap();
+                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let reader = std::thread::spawn(move || {
+                    let mut received = Vec::new();
+                    other.read_to_end(&mut received).unwrap();
+                    received.len()
+                });
+                let result = drive(&reactor, io.send_head(connection, head, &scope));
+                if extra == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(Error::HeaderTooLarge)));
+                }
+                drop(result);
+                assert_eq!(reader.join().unwrap(), if extra == 0 { limit } else { 0 });
+            }
         }
         drain(&reactor);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
