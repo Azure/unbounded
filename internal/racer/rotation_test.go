@@ -72,10 +72,11 @@ func keyState(t *testing.T, r *KeyringReconciler) (*corev1.Secret, wire.KeyringB
 
 func TestKeyringRotationLifecycle(t *testing.T) {
 	r, now := testKeyring(t)
+	started := *now
 	result := runKeys(t, r)
 
 	shared, initial, state, _ := keyState(t, r)
-	if initial.Generation != 1 || len(initial.CacheKeys) != 2 || len(initial.PeerTrustRoots) != 1 || result.RequeueAfter != r.Config.Rotation.Interval || !r.Lifecycle.issuer {
+	if initial.Generation != 1 || len(initial.CacheKeys) != 2 || len(initial.PeerTrustRoots) != 1 || result.RequeueAfter != r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor || !r.Lifecycle.issuer {
 		t.Fatal("initial credentials or readiness")
 	}
 
@@ -100,6 +101,10 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	result = runKeys(t, r)
 
 	_, staged, prepared, _ := keyState(t, r)
+	if !prepared.ActivateAt.Equal(started.Add(r.Config.Rotation.Interval)) {
+		t.Fatal("activation cadence must include the preparation interval")
+	}
+
 	if staged.Generation != 2 || len(staged.CacheKeys) != 4 || len(staged.PeerTrustRoots) != 2 || prepared.ActiveIssuer != state.ActiveIssuer || prepared.PreparedIssuer == "" || result.RequeueAfter != r.Config.Rotation.PrepareFor {
 		t.Fatal("replacement not staged")
 	}
@@ -156,7 +161,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	runKeys(t, restarted)
 
 	_, pruned, prunedState, material := keyState(t, r)
-	if containsRoot(pruned, state.ActiveIssuer) || len(pruned.CacheKeys) != 4 || len(material.Keys) != 2 || !prunedState.Retiring[active.ActiveIssuer].Equal(overlapping.Retiring[active.ActiveIssuer]) {
+	if containsRoot(pruned, state.ActiveIssuer) || len(pruned.CacheKeys) != 6 || len(material.Keys) != 3 || !prunedState.Retiring[active.ActiveIssuer].Equal(overlapping.Retiring[active.ActiveIssuer]) {
 		t.Fatal("retirement pruning/reset")
 	}
 	// Topology CAS preserves the one-way initialization claim.

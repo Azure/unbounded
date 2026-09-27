@@ -19,11 +19,11 @@ import (
 const reservedRootBytes = 1024
 
 // catalogCapacity reserves active + prepared + ceil(retention / cycle) retiring
-// generations. Actual transitions are at least Interval+PrepareFor apart. The
+// generations. Actual activations are at least Interval apart. The
 // extra prepared slot is reserved even when the oldest retiree expires before
 // preparation. This deliberately favors a stable limit over phase-dependent fit.
 func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
-	cycle := cfg.Rotation.Interval + cfg.Rotation.PrepareFor
+	cycle := cfg.Rotation.Interval
 
 	retiring := cfg.Rotation.RetainFor / cycle
 	if cfg.Rotation.RetainFor%cycle != 0 {

@@ -168,7 +168,7 @@ func (r *KeyringReconciler) PlanRotation(b wire.KeyringBundle, s RotationState, 
 		s.Retiring[s.ActiveIssuer] = now.Add(r.Config.Rotation.RetainFor)
 		s.ActiveIssuer, s.PreparedIssuer = s.PreparedIssuer, ""
 		s.ActivateAt = time.Time{}
-		s.NextRotation = now.Add(r.Config.Rotation.Interval)
+		s.NextRotation = now.Add(r.Config.Rotation.Interval - r.Config.Rotation.PrepareFor)
 	} else if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
 		if s.PreparedIssuer == "" {
 			return b, s, wire.Unavailable
@@ -445,6 +445,10 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// Initial keys must exist before preparing their replacement, including when
+	// preparation occupies the entire interval. Schedule that next reconcile now.
+	s.NextRotation = now.Add(r.Config.Rotation.Interval - r.Config.Rotation.PrepareFor)
+	s.NextTransition = s.NextRotation
 	// PlanRotation normally plans the next CAS generation. Initial publication
 	// has no previous bundle and is generation one.
 	for i := range b.CacheKeys {
@@ -494,7 +498,7 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		}
 	}
 
-	return ctrl.Result{RequeueAfter: r.Config.Rotation.Interval}, nil
+	return ctrl.Result{RequeueAfter: max(time.Second, r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor)}, nil
 }
 
 func containsRoot(b wire.KeyringBundle, id string) bool {
