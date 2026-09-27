@@ -239,25 +239,34 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 		return nil, wire.Unauthenticated
 	}
 
-	p.mu.Lock()
-
-	current, err := p.currentLocked()
+	current, changed, err := p.CurrentAndSubscribe()
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 
 	if identity.cluster != current.record.Cluster {
-		p.mu.Unlock()
 		return nil, wire.Forbidden
 	}
 
 	if after != nil && (*after == 0 || *after > current.record.Sequence) {
-		p.mu.Unlock()
 		return nil, wire.Conflict
 	}
 
-	p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if !time.Now().Before(identity.expires) {
+		return nil, wire.Unauthenticated
+	}
+
+	if after == nil || current.record.Sequence > *after {
+		if err := current.leadership.Err(); err != nil {
+			return nil, err
+		}
+
+		return current, nil
+	}
 
 	timer := time.NewTimer(wire.PollWait)
 	defer timer.Stop()
@@ -266,23 +275,6 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 	defer expiration.Stop()
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		if !time.Now().Before(identity.expires) {
-			return nil, wire.Unauthenticated
-		}
-
-		current, changed, err := p.CurrentAndSubscribe()
-		if err != nil {
-			return nil, err
-		}
-
-		if after == nil || current.record.Sequence > *after {
-			return current, nil
-		}
-
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -305,6 +297,23 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 
 			return nil, nil
 		case <-changed:
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		if !time.Now().Before(identity.expires) {
+			return nil, wire.Unauthenticated
+		}
+
+		current, changed, err = p.CurrentAndSubscribe()
+		if err != nil {
+			return nil, err
+		}
+
+		if current.record.Sequence > *after {
+			return current, nil
 		}
 	}
 }
