@@ -18,6 +18,27 @@ use std::{
 /// Runtime adapter: readiness registration must retain the FD until deregistration.
 /// Dropping a wait cancels its registration. Timers and DNS run on the sole owner.
 pub trait ControlIo {
+    fn ready_charged<'a>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        read: bool,
+        write: bool,
+        charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            if let Some(reactor) = self.reactor() {
+                let interest =
+                    if read { libc::POLLIN } else { 0 } | if write { libc::POLLOUT } else { 0 };
+                reactor
+                    .readiness_with_lease(fd, interest as u32, charge, scope)
+                    .await?;
+                scope.check()
+            } else {
+                self.ready(fd, read, write, scope).await
+            }
+        })
+    }
     /// Production supplies the same owner-local reactor for filesystem and TLS.
     fn reactor(&self) -> Option<Rc<crate::runtime::reactor::Reactor>> {
         None
@@ -137,10 +158,14 @@ impl ControlIo for ReactorControlIo {
     }
 }
 pub struct ControlTransport {
+    health: Rc<crate::topology::health::LinkHealth>,
     endpoint: ControlEndpoint,
     io: RefCell<Option<Rc<dyn ControlIo>>>,
 }
 pub struct ControlConnection {
+    health: Rc<crate::topology::health::LinkHealth>,
+    endpoint: crate::model::identity::NodeId,
+    charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
     stream: ControlStream,
     fd: Rc<OwnedFd>,
     tls: rustls::ClientConnection,
@@ -234,6 +259,7 @@ fn endpoint(url: &str) -> Result<Endpoint> {
 impl ControlTransport {
     pub fn new(endpoint: ControlEndpoint) -> Self {
         Self {
+            health: Rc::new(crate::topology::health::LinkHealth::new(1)),
             endpoint,
             io: RefCell::new(None),
         }
@@ -255,6 +281,20 @@ impl ControlTransport {
         self.connect(Some(identity), scope)
     }
     fn connect<'a>(
+        &'a self,
+        identity: Option<&'a LocalSigningIdentity>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ControlConnection> {
+        Box::pin(async move {
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(self.endpoint.url.clone()),
+                    self.connect_inner(identity, scope),
+                )
+                .await
+        })
+    }
+    fn connect_inner<'a>(
         &'a self,
         identity: Option<&'a LocalSigningIdentity>,
         scope: &'a RequestScope,
@@ -312,33 +352,44 @@ impl ControlTransport {
             let mut connected = None;
             for address in addresses {
                 scope.check()?;
+                let charge = io
+                    .reactor()
+                    .map(|r| {
+                        r.reserve_connection(crate::model::limits::ResourceClass::ControlConnection)
+                            .map(Rc::new)
+                    })
+                    .transpose()?;
                 #[cfg(test)]
                 if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
                     if let Ok(fd) =
                         sim.connect(crate::runtime::reactor::SocketAddress::Inet(address))
                     {
                         let fd = Rc::new(fd);
-                        connected = Some((ControlStream::Sim(fd.clone()), fd));
+                        connected = Some((ControlStream::Sim(fd.clone()), fd, charge));
                         break;
                     }
                     continue;
                 }
                 if let Ok(stream) = connect_socket(address) {
                     let fd = Rc::new(OwnedFd::from(stream.try_clone().map_err(|_| Error::Io)?));
-                    io.ready(fd.clone(), false, true, scope).await?;
+                    io.ready_charged(fd.clone(), false, true, charge.clone(), scope)
+                        .await?;
                     if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                        connected = Some((ControlStream::Real(stream), fd));
+                        connected = Some((ControlStream::Real(stream), fd, charge));
                         break;
                     }
                 }
             }
-            let (stream, fd) = connected.ok_or(Error::Unavailable)?;
+            let (stream, fd, charge) = connected.ok_or(Error::Unavailable)?;
             let server = rustls::pki_types::ServerName::try_from(endpoint.host)
                 .map_err(|_| Error::InvalidConfiguration)?;
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
                 .map_err(|_| Error::Unauthorized)?;
             tls.set_buffer_limit(Some(64 * 1024));
             let mut connection = ControlConnection {
+                health: self.health.clone(),
+                endpoint: crate::model::identity::NodeId(self.endpoint.url.clone()),
+                charge,
                 stream,
                 fd,
                 tls,
@@ -471,10 +522,11 @@ impl ControlConnection {
                     .min(crate::runtime::environment::now() + remaining);
             }
             self.io
-                .ready(
+                .ready_charged(
                     self.fd.clone(),
                     self.tls.wants_read(),
                     self.tls.wants_write(),
+                    self.charge.clone(),
                     &bounded,
                 )
                 .await?;
@@ -483,6 +535,26 @@ impl ControlConnection {
     }
     /// One request per connection; no pooled session can cross identity rotation.
     pub fn request<'a>(
+        self,
+        method: &'a str,
+        path: &'a str,
+        token: Option<&'a str>,
+        body: &'a [u8],
+        limit: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HttpResponse> {
+        Box::pin(async move {
+            let health = self.health.clone();
+            let endpoint = self.endpoint.clone();
+            health
+                .run(
+                    &endpoint,
+                    self.request_inner(method, path, token, body, limit, scope),
+                )
+                .await
+        })
+    }
+    fn request_inner<'a>(
         mut self,
         method: &'a str,
         path: &'a str,

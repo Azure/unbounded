@@ -69,7 +69,9 @@ impl PeerServer {
             let reactor = self.reactor.as_ref().ok_or(Error::InvalidConfiguration)?;
             let fd = Rc::new(crate::runtime::reactor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
-            let maximum = self.admission.limits().client_connections.get();
+            let maximum = self
+                .admission
+                .limit(crate::model::limits::ResourceClass::IngressConnection);
             loop {
                 scope.check()?;
                 if active.len() >= maximum {

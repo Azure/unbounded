@@ -39,4 +39,7 @@ pub enum ResourceClass {
     Pipe,
     ControlProgress,
     Relay,
+    IngressConnection,
+    OutboundConnection,
+    ControlConnection,
 }

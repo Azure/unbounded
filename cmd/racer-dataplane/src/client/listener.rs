@@ -287,11 +287,17 @@ impl ClientListeners {
         if count == 0 {
             return Ok(worked + cleaned);
         }
-        let maximum = self.admission.limits().client_connections.get();
+        let maximum = self
+            .admission
+            .limit(crate::model::limits::ResourceClass::IngressConnection);
         // Reserve some acceptance opportunity even when all active readers wait.
         let attempts = budget.saturating_sub(worked).min(count);
         for step in 0..attempts {
-            if self.active.borrow().len() >= maximum {
+            if self
+                .admission
+                .used(crate::model::limits::ResourceClass::IngressConnection)
+                >= maximum
+            {
                 break;
             }
             let index = (self.accept_cursor.get() + step) % count;

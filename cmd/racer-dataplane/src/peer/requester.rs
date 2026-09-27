@@ -58,6 +58,7 @@ pub trait PeerTransport {
     ) -> Operation<'a, SignedResponse>;
 }
 pub struct Requester {
+    health: Rc<crate::topology::health::LinkHealth>,
     paths: Rc<Paths>,
     rails: Rc<Rails>,
     forwarding: Rc<Forwarding>,
@@ -74,6 +75,7 @@ impl Requester {
     ) -> Self {
         transfers.set_signatures(handshake.signatures.clone());
         Self {
+            health: paths.link_health(),
             paths,
             rails,
             forwarding,
@@ -147,10 +149,28 @@ impl PeerTransport for Requester {
             } else {
                 crate::topology::rails::TransportPlan::Http
             };
+            if !self.health.try_acquire(&next)? {
+                return Err(Error::Unavailable);
+            }
             let response = self
                 .transfers
                 .exchange_planned(endpoint, request, plan, &scope)
                 .await;
+            // A signed application response (including miss, 401 or 403) proves
+            // the immediate transport works. It is verified by the logical owner.
+            use crate::topology::health::LinkOutcome;
+            let outcome = match &response {
+                Ok(_) => Some(LinkOutcome::Success),
+                Err(Error::Io | Error::Unavailable) => Some(LinkOutcome::Refused),
+                Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
+                Err(Error::CorruptRecord | Error::InvalidRequest) => {
+                    Some(LinkOutcome::ProtocolFailure)
+                }
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                self.health.observe(&next, outcome)?;
+            }
             drop(membership);
             response
         })

@@ -1,19 +1,18 @@
 //! Bounded nonblocking TCP/Unix pools. Unfinished exchanges never return to idle.
 use super::io::OwnedBuffer;
-use crate::runtime::collections::HashMap;
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     model::limits::ResourceClass,
     runtime::{
-        admission::{Admission, Reservation},
+        admission::{Admission, ConnectionReservation, Reservation},
         deadline::RequestScope,
         reactor::Reactor,
     },
 };
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::poll_fn,
     net::SocketAddr,
     path::PathBuf,
@@ -22,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum Endpoint {
     Unix(PathBuf),
     /// Cache incarnation is pool identity; the name-derived path is only a dial address.
@@ -37,7 +36,7 @@ pub enum Endpoint {
 struct Idle {
     session: Option<crate::security::connection::Session>,
     fd: Rc<OwnedFd>,
-    reservation: Reservation,
+    reservation: ConnectionReservation,
     since: Instant,
 }
 #[derive(Default)]
@@ -47,7 +46,9 @@ struct Entry {
     generation: u64,
 }
 struct PoolState {
-    entries: HashMap<Endpoint, Entry>,
+    entries: BTreeMap<Endpoint, Entry>,
+    expiry_cursor: Option<Endpoint>,
+    next_expiry: Instant,
     next_generation: u64,
     closed: bool,
     waiting: VecDeque<Rc<WaitingEntry>>,
@@ -102,7 +103,7 @@ pub struct ConnectionLease {
     pub(crate) control_reservation: Option<Reservation>,
     pub(crate) fd: Rc<OwnedFd>,
     reusable: bool,
-    reservation: Option<Reservation>,
+    reservation: Option<ConnectionReservation>,
     pool: Option<ReturnToPool>,
     pub(crate) read_ahead: Option<(OwnedBuffer, std::ops::Range<usize>)>,
     pub(crate) rx_remaining: Option<u64>,
@@ -115,10 +116,14 @@ impl ConnectionLease {
     /// reserves connection admission. No pool return is associated with this FD.
     pub fn from_accepted(fd: OwnedFd, admission: &Admission) -> Result<Self> {
         set_nonblocking(&fd)?;
-        let reservation = admission.reserve(None, ResourceClass::Connection, 1)?;
+        let reservation = admission.reserve_connection(ResourceClass::IngressConnection)?;
         Ok(Self::new(Rc::new(fd), reservation, None))
     }
-    fn new(fd: Rc<OwnedFd>, reservation: Reservation, pool: Option<ReturnToPool>) -> Self {
+    fn new(
+        fd: Rc<OwnedFd>,
+        reservation: ConnectionReservation,
+        pool: Option<ReturnToPool>,
+    ) -> Self {
         Self {
             fd,
             session: None,
@@ -252,7 +257,9 @@ impl HttpPool {
             max_endpoints,
             idle_timeout,
             state: Rc::new(RefCell::new(PoolState {
-                entries: HashMap::default(),
+                entries: BTreeMap::new(),
+                expiry_cursor: None,
+                next_expiry: crate::runtime::environment::now(),
                 next_generation: 0,
                 closed: false,
                 waiting: VecDeque::new(),
@@ -361,6 +368,7 @@ impl HttpPool {
     /// Wake a bounded round-robin batch, including child futures whose executor
     /// does not repoll them merely because the outer worker received a timer tick.
     pub fn poll_waiters(&self, budget: usize) {
+        self.expire_idle_budgeted(budget);
         let mut state = self.state.borrow_mut();
         let now = crate::runtime::environment::now();
         if budget == 0 || state.waiting.is_empty() || now < state.next_waiter_poll {
@@ -388,7 +396,6 @@ impl HttpPool {
         if self.admission.is_stopped() {
             return Err(Error::Unavailable);
         }
-        self.expire_idle();
         let (idle, generation) = {
             let mut state = self.state.borrow_mut();
             if state.closed {
@@ -415,6 +422,10 @@ impl HttpPool {
                 );
             }
             let entry = state.entries.get_mut(endpoint).ok_or(Error::Unavailable)?;
+            let now = crate::runtime::environment::now();
+            entry
+                .idle
+                .retain(|idle| now.saturating_duration_since(idle.since) < self.idle_timeout);
             let limit = match endpoint {
                 Endpoint::Unix(_) | Endpoint::Origin { .. } => self.per_origin,
                 Endpoint::Peer(_) => self.per_endpoint,
@@ -440,13 +451,17 @@ impl HttpPool {
                 return Ok((connection, None));
             }
         }
-        let reservation = match self.admission.reserve(None, ResourceClass::Connection, 1) {
+        let reservation = match self
+            .admission
+            .reserve_connection(ResourceClass::OutboundConnection)
+        {
             Err(Error::Overloaded) => {
                 // Idle sockets must not strand this pool's connection quota.
                 for entry in self.state.borrow_mut().entries.values_mut() {
                     entry.idle.clear();
                 }
-                self.admission.reserve(None, ResourceClass::Connection, 1)?
+                self.admission
+                    .reserve_connection(ResourceClass::OutboundConnection)?
             }
             result => result?,
         };
@@ -479,6 +494,36 @@ impl HttpPool {
                 .retain(|idle| now.duration_since(idle.since) < self.idle_timeout);
             entry.active != 0 || !entry.idle.is_empty()
         });
+    }
+    /// Autonomous worker tick: visit at most `budget` endpoint buckets, resuming
+    /// from an ordered cursor. No checkout or waiter is required for expiration.
+    pub fn expire_idle_budgeted(&self, budget: usize) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let now = crate::runtime::environment::now();
+        let mut state = self.state.borrow_mut();
+        if budget == 0 || now < state.next_expiry {
+            return;
+        }
+        state.next_expiry = now + Duration::from_millis(100);
+        for _ in 0..budget.min(state.entries.len()) {
+            let next = state
+                .expiry_cursor
+                .as_ref()
+                .and_then(|cursor| state.entries.range((Excluded(cursor), Unbounded)).next())
+                .or_else(|| state.entries.iter().next())
+                .map(|(key, _)| key.clone());
+            let Some(key) = next else {
+                break;
+            };
+            let entry = state.entries.get_mut(&key).expect("selected endpoint");
+            entry
+                .idle
+                .retain(|idle| now.saturating_duration_since(idle.since) < self.idle_timeout);
+            if entry.active == 0 && entry.idle.is_empty() {
+                state.entries.remove(&key);
+            }
+            state.expiry_cursor = Some(key);
+        }
     }
     /// Invalidate an endpoint generation without closing active operations. Old
     /// leases finish normally but cannot enter the new generation's idle pool.
@@ -589,7 +634,7 @@ mod tests {
         let mut connection = ConnectionLease::new(
             Rc::new(socket.into()),
             pool.admission
-                .reserve(None, ResourceClass::Connection, 1)
+                .reserve_connection(ResourceClass::OutboundConnection)
                 .unwrap(),
             Some(ReturnToPool {
                 state: Rc::downgrade(&pool.state),
@@ -603,6 +648,24 @@ mod tests {
         (connection, peer)
     }
 
+    #[test]
+    fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
+        let (admission, _, mut pool) = setup();
+        pool.idle_timeout = Duration::ZERO;
+        let mut peers = Vec::new();
+        for port in 1..=3 {
+            let endpoint = Endpoint::Peer(format!("127.0.0.1:{port}"));
+            let (lease, peer) = held(&pool, &endpoint);
+            peers.push(peer);
+            drop(lease);
+        }
+        for remaining in (0..3).rev() {
+            pool.state.borrow_mut().next_expiry = crate::runtime::environment::now();
+            pool.poll_waiters(1);
+            assert_eq!(pool.state.borrow().entries.len(), remaining);
+            assert_eq!(admission.used(ResourceClass::Connection), remaining);
+        }
+    }
     #[test]
     fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
         let (admission, reactor, pool) = setup();
@@ -939,7 +1002,7 @@ mod tests {
             let mut connection = ConnectionLease::new(
                 Rc::new(socket.into()),
                 admission
-                    .reserve(None, ResourceClass::Connection, 1)
+                    .reserve_connection(ResourceClass::OutboundConnection)
                     .unwrap(),
                 Some(ReturnToPool {
                     state: Rc::downgrade(&pool.state),
@@ -988,7 +1051,7 @@ mod tests {
         let connection = ConnectionLease::new(
             Rc::new(socket.into()),
             admission
-                .reserve(None, ResourceClass::Connection, 1)
+                .reserve_connection(ResourceClass::OutboundConnection)
                 .unwrap(),
             Some(ReturnToPool {
                 state: Rc::downgrade(&pool.state),

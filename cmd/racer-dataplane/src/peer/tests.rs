@@ -799,6 +799,109 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 }
 
 #[test]
+fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
+    use super::requester::PeerClient;
+    use crate::{
+        http::{codec::Codec, io::HttpIo, pool::HttpPool},
+        runtime::reactor::Reactor,
+        topology::{
+            health::LinkHealth,
+            membership::{Member, Membership},
+            paths::Paths,
+            rails::Rails,
+        },
+    };
+    use std::task::{Context, Poll};
+    let (signers, _) = identities();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(HttpIo::with_admission(
+        reactor.clone(),
+        Codec::new(wire::MAX_ENVELOPE_HEAD, 0),
+        admission.clone(),
+    ));
+    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
+    let transfers = Rc::new(
+        transfer::Transfers::new(pool, io, None)
+            .with_wire(admission.clone(), Rc::new(codec(&admission))),
+    );
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    let members = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, B, C]
+                .iter()
+                .map(|name| Member {
+                    node: NodeId((*name).into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: address.clone(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let health = Rc::new(LinkHealth::new(36));
+    let paths = Rc::new(Paths::new(health.clone(), 4));
+    let requester = requester::Requester::new(
+        paths.clone(),
+        Rc::new(Rails),
+        Rc::new(Forwarding::new(signers[0].clone())),
+        Rc::new(handshake::Handshake::new(signers[0].clone(), None)),
+        transfers,
+    )
+    .with_network(Rc::new(
+        PeerNetwork::new(
+            NodeId(A.into()),
+            crate::control::snapshot::PublishedState::for_membership(members.clone()),
+        )
+        .unwrap(),
+    ));
+    let original = request(&admission, 1);
+    let budget = super::search_budget(&original.route, &NodeId(A.into())).unwrap();
+    let scope = original.origin.scope().clone();
+    let direct = paths
+        .shortest(members.clone(), &NodeId(A.into()), &budget)
+        .unwrap();
+    assert_eq!(direct.nodes, vec![NodeId(A.into()), NodeId(C.into())]);
+    let mut attempt = requester.request(original, members.clone(), &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let result = loop {
+        scope.check().unwrap();
+        if let Poll::Ready(result) = attempt.as_mut().poll(&mut cx) {
+            break result;
+        }
+        reactor.poll_budgeted(64).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+    assert!(matches!(result, Err(Error::Io | Error::Unavailable)));
+    assert!(!health.available(&NodeId(C.into())).unwrap());
+    assert!(health.available(&NodeId(B.into())).unwrap());
+    let alternate = paths
+        .shortest(members.clone(), &NodeId(A.into()), &budget)
+        .unwrap();
+    assert_eq!(
+        alternate.nodes,
+        vec![NodeId(A.into()), NodeId(B.into()), NodeId(C.into())]
+    );
+    assert!(alternate.nodes.len() - 1 <= usize::from(budget.remaining_links));
+    let mut exhausted = budget.clone();
+    exhausted.remaining_links = 1;
+    assert!(
+        paths
+            .shortest(members, &NodeId(A.into()), &exhausted)
+            .is_err()
+    );
+    drop(attempt);
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+}
+
+#[test]
 fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     use super::requester::PeerClient;
     use crate::{
@@ -938,6 +1041,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     .with_network(destination_network)
     .with_wire(codec)
     .with_handshake(destination_handshake);
+    let health = paths.link_health();
     let requester = requester::Requester::new(
         paths,
         Rc::new(Rails),
@@ -976,6 +1080,11 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
     assert!(matches!(response.response(), PeerResponse::Miss));
+    assert_eq!(
+        health.tracked_links(),
+        0,
+        "application miss is not a broken link"
+    );
 }
 
 #[test]

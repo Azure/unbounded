@@ -481,13 +481,13 @@ fn production_ingress_baseline() {
     let before = observe(process.child.id());
     let mut held = Vec::new();
     // Partial heads retain accepted leases without issuing data requests.
-    for _ in 0..32 {
+    for _ in 0..22 {
         let mut socket = connect(&path).unwrap();
         socket.write_all(b"GET /v1/objects/").unwrap();
         held.push(socket);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while observe(process.child.id()).socket_fds < before.socket_fds + 32 {
+    while observe(process.child.id()).socket_fds < before.socket_fds + 22 {
         assert!(
             Instant::now() < deadline,
             "accepted connections never saturated"

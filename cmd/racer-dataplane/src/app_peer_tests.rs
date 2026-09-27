@@ -39,6 +39,9 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
 
 fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let mut config = crate::test_support::cluster::config(false);
+    // One fixture represents both ends of eight nodes' sockets. Fund those
+    // ingress leases plus the reserved outbound/control partition explicitly.
+    config.limits.client_connections = NonZeroUsize::new(32).unwrap();
     config.limits.header_bytes = NonZeroUsize::new(32 * 1024).unwrap();
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
     // Use the exact worker progress floor rather than the generous fixture budget.

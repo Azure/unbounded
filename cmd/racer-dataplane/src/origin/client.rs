@@ -87,6 +87,7 @@ pub trait Origin {
     ) -> Operation<'a, OriginPage>;
 }
 pub struct OriginClient {
+    health: crate::topology::health::LinkHealth,
     snapshots: Rc<SnapshotStore>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
@@ -96,6 +97,7 @@ pub struct OriginClient {
 impl OriginClient {
     pub fn new(snapshots: Rc<SnapshotStore>, pool: Rc<HttpPool>, io: Rc<HttpIo>) -> Self {
         Self {
+            health: crate::topology::health::LinkHealth::new(64),
             snapshots,
             pool,
             io,
@@ -406,7 +408,11 @@ impl Origin for OriginClient {
             scope.check()?;
             authority.validate(&context.object, PageNumber(0))?;
             let endpoint = self.endpoint(context)?;
-            self.bootstrap_reserved_at(&endpoint, context, reservation, scope)
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
+                )
                 .await
         })
     }
@@ -425,7 +431,11 @@ impl Origin for OriginClient {
             }
             authority.validate(&page.version.object, page.number)?;
             let endpoint = self.endpoint(context)?;
-            self.page_reserved_at(&endpoint, context, page, reservation, scope)
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    self.page_reserved_at(&endpoint, context, page, reservation, scope),
+                )
                 .await
         })
     }
@@ -439,7 +449,12 @@ impl Origin for OriginClient {
             scope.check()?;
             authority.validate(&context.object, PageNumber(0))?;
             let endpoint = self.endpoint(context)?;
-            self.bootstrap_at(&endpoint, context, scope).await
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    self.bootstrap_at(&endpoint, context, scope),
+                )
+                .await
         })
     }
     fn metadata<'a>(
@@ -453,7 +468,12 @@ impl Origin for OriginClient {
             scope.check()?;
             authority.validate(&context.object, PageNumber(0))?;
             let endpoint = self.endpoint(context)?;
-            self.metadata_at(&endpoint, context, selector, scope).await
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    self.metadata_at(&endpoint, context, selector, scope),
+                )
+                .await
         })
     }
     fn page<'a>(
@@ -470,7 +490,12 @@ impl Origin for OriginClient {
             }
             authority.validate(&page.version.object, page.number)?;
             let endpoint = self.endpoint(context)?;
-            self.page_at(&endpoint, context, page, scope).await
+            self.health
+                .run(
+                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    self.page_at(&endpoint, context, page, scope),
+                )
+                .await
         })
     }
 }

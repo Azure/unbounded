@@ -51,11 +51,7 @@ impl PeerNetwork {
         {
             return Err(Error::InvalidRequest);
         }
-        let member = membership
-            .members()
-            .iter()
-            .find(|member| &member.node == node)
-            .ok_or(Error::IncompatibleMembership)?;
+        let member = membership.member(node)?;
         Ok(crate::http::pool::Endpoint::Peer(
             member.peer_endpoint.clone(),
         ))

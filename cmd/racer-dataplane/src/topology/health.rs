@@ -35,6 +35,29 @@ pub enum LinkOutcome {
     ProtocolFailure,
 }
 impl LinkHealth {
+    /// Endpoint operations share the same bounded backoff and half-open policy.
+    /// Application misses and credential rejection never open a transport circuit.
+    pub async fn run<T>(
+        &self,
+        endpoint: &NodeId,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        if !self.try_acquire(endpoint)? {
+            return Err(Error::Unavailable);
+        }
+        let result = operation.await;
+        let outcome = match &result {
+            Err(Error::Io | Error::Unavailable) => Some(LinkOutcome::Refused),
+            Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
+            Err(Error::BadGateway | Error::CorruptRecord) => Some(LinkOutcome::ProtocolFailure),
+            Err(Error::Cancelled | Error::Overloaded) => None,
+            _ => Some(LinkOutcome::Success),
+        };
+        if let Some(outcome) = outcome {
+            let _ = self.observe(endpoint, outcome);
+        }
+        result
+    }
     pub const fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -128,6 +151,34 @@ mod tests {
         },
     };
 
+    #[test]
+    fn endpoint_application_errors_do_not_open_circuits_and_probes_are_bounded() {
+        let health = LinkHealth::new(2);
+        let endpoint = NodeId("origin".into());
+        for error in [
+            Error::Unauthorized,
+            Error::NotFound,
+            Error::VersionUnavailable,
+        ] {
+            assert_eq!(
+                futures::executor::block_on(health.run(&endpoint, async { Err::<(), _>(error) })),
+                Err(error)
+            );
+            assert_eq!(health.tracked_links(), 0);
+        }
+        assert_eq!(
+            futures::executor::block_on(health.run(&endpoint, async { Err::<(), _>(Error::Io) })),
+            Err(Error::Io)
+        );
+        assert_eq!(
+            futures::executor::block_on(health.run(&endpoint, async {
+                panic!("open circuit attempted I/O");
+                #[allow(unreachable_code)]
+                Ok(())
+            })),
+            Err(Error::Unavailable)
+        );
+    }
     #[test]
     fn circuit_backoff_probes_success_and_isolation() {
         let first = LinkHealth::new(2);

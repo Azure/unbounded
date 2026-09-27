@@ -683,6 +683,22 @@ impl Reactor {
         interest: u32,
         scope: &'a RequestScope,
     ) -> Operation<'a, u32> {
+        self.readiness_with_lease(fd, interest, (), scope)
+    }
+    pub fn reserve_connection(
+        &self,
+        role: ResourceClass,
+    ) -> Result<super::admission::ConnectionReservation> {
+        self.admission.reserve_connection(role)
+    }
+    /// Retain progress admission alongside the descriptor until all CQE fences.
+    pub fn readiness_with_lease<'a, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        interest: u32,
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, u32> {
         Box::pin(async move {
             if interest == 0 || interest & !((libc::POLLIN | libc::POLLOUT) as u32) != 0 {
                 return Err(Error::InvalidRequest);
@@ -697,6 +713,7 @@ impl Reactor {
             );
             self.submit(sqe, scope, false, move |result| {
                 drop(fd);
+                drop(lease);
                 Ok(result?.value()? as u32)
             })?
             .await

@@ -127,6 +127,9 @@ impl Drop for SearchAdmission<'_> {
     }
 }
 impl Paths {
+    pub fn link_health(&self) -> Rc<LinkHealth> {
+        self.health.clone()
+    }
     pub fn new(health: Rc<LinkHealth>, capacity: usize) -> Self {
         Self {
             health,
@@ -228,6 +231,11 @@ impl Paths {
             .collect::<Result<Vec<_>>>()?;
         visited.sort_unstable();
         let mut failed = Vec::new();
+        let neighbors: Vec<_> = neighbor_positions(membership.members().len(), source)
+            .into_iter()
+            .map(|position| membership.members()[position].node.clone())
+            .collect();
+        self.health.retain_neighbors(&neighbors);
         for neighbor in neighbor_positions(membership.members().len(), source) {
             if !self
                 .health

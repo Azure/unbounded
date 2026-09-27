@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-const CLASSES: usize = 11;
+const CLASSES: usize = 14;
 fn index(class: ResourceClass) -> usize {
     class as usize
 }
@@ -105,7 +105,30 @@ pub struct FillReservation {
     pub ciphertext: Reservation,
     pub dirty: Option<Reservation>,
 }
+/// Socket role admission, retained by the connection through kernel completion.
+pub struct ConnectionReservation {
+    _total: Reservation,
+    _role: Reservation,
+}
 impl Admission {
+    /// Partition the existing socket ceiling. Ingress cannot consume outbound or
+    /// control progress slots; outbound traffic cannot consume control slots.
+    pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
+        if !matches!(
+            role,
+            ResourceClass::IngressConnection
+                | ResourceClass::OutboundConnection
+                | ResourceClass::ControlConnection
+        ) {
+            return Err(Error::InvalidConfiguration);
+        }
+        let role_charge = self.reserve(None, role, 1)?;
+        let total = self.reserve(None, ResourceClass::Connection, 1)?;
+        Ok(ConnectionReservation {
+            _total: total,
+            _role: role_charge,
+        })
+    }
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
@@ -143,6 +166,14 @@ impl Admission {
                 .get()
                 .saturating_mul(self.limits.waiters_per_flight.get()),
             ResourceClass::Connection => self.limits.client_connections.get(),
+            ResourceClass::ControlConnection => (self.limits.client_connections.get() / 8).min(2),
+            ResourceClass::OutboundConnection => self.limits.client_connections.get() / 4,
+            ResourceClass::IngressConnection => {
+                self.limits.client_connections.get().saturating_sub(
+                    self.limit(ResourceClass::ControlConnection)
+                        + self.limit(ResourceClass::OutboundConnection),
+                )
+            }
             ResourceClass::Pipe => self.limits.pipes.get(),
             ResourceClass::ControlProgress => self.limits.queue_entries.get(),
             ResourceClass::Relay => self.limits.relay_transfers.get(),
@@ -291,6 +322,47 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ingress_saturation_preserves_outbound_and_control_without_raising_total() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let ingress: Vec<_> = (0..admission.limit(ResourceClass::IngressConnection))
+            .map(|_| {
+                admission
+                    .reserve_connection(ResourceClass::IngressConnection)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            admission
+                .reserve_connection(ResourceClass::IngressConnection)
+                .is_err()
+        );
+        let outbound: Vec<_> = (0..admission.limit(ResourceClass::OutboundConnection))
+            .map(|_| {
+                admission
+                    .reserve_connection(ResourceClass::OutboundConnection)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            admission
+                .reserve_connection(ResourceClass::OutboundConnection)
+                .is_err()
+        );
+        let control: Vec<_> = (0..admission.limit(ResourceClass::ControlConnection))
+            .map(|_| {
+                admission
+                    .reserve_connection(ResourceClass::ControlConnection)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            admission.used(ResourceClass::Connection),
+            admission.limit(ResourceClass::Connection)
+        );
+        drop((ingress, outbound, control));
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
     #[test]
     fn split_and_shrink_preserve_live_ownership_and_reject_growth() {
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);
