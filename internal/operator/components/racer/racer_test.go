@@ -558,3 +558,102 @@ func TestControllerRotationConfigUsesPreservedConfigMap(t *testing.T) {
 	_, _, err := (Component{}).Plan(t.Context(), env, nil)
 	require.ErrorContains(t, err, "rotation policy")
 }
+
+func TestDataplaneApplyFailures(t *testing.T) {
+	for _, scenario := range []string{"conflict", "forbidden", "canceled", "canceled-after-read"} {
+		t.Run(scenario, func(t *testing.T) {
+			env := testEnv(t, cache("cache"))
+			initialize(t, env)
+
+			plan := planPass(t, env)
+			for _, op := range plan.Operations {
+				if op.Object.GetKind() == "DaemonSet" {
+					require.Equal(t, component.OpApply, op.Kind)
+					require.Nil(t, op.Base)
+				}
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			var failure error
+
+			switch scenario {
+			case "conflict":
+				failure = apierrors.NewConflict(appsv1.Resource("daemonsets"), dataplaneName, errors.New("concurrent writer"))
+			case "forbidden":
+				failure = apierrors.NewForbidden(appsv1.Resource("daemonsets"), dataplaneName, errors.New("denied"))
+			default:
+				failure = context.Canceled
+			}
+
+			if scenario == "canceled" {
+				cancel()
+			}
+
+			applies := 0
+			executor := *env
+			executor.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					err := c.Get(ctx, key, obj, opts...)
+					if obj.GetObjectKind().GroupVersionKind().Kind == "DaemonSet" && scenario == "canceled-after-read" {
+						cancel()
+					}
+
+					return err
+				},
+				Apply: func(ctx context.Context, _ client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+					obj := cfg.(interface{ GetKind() string })
+					if obj.GetKind() != "DaemonSet" {
+						return nil
+					}
+
+					applies++
+
+					options := &client.ApplyOptions{}
+					for _, opt := range opts {
+						opt.ApplyToApply(options)
+					}
+
+					require.Equal(t, component.FieldOwner, options.FieldManager)
+					require.NotNil(t, options.Force)
+					require.True(t, *options.Force)
+
+					if errors.Is(failure, context.Canceled) {
+						// The production client receives the canceled context; the
+						// executor reports its error rather than inventing a retry.
+						require.ErrorIs(t, ctx.Err(), context.Canceled)
+						return ctx.Err()
+					}
+
+					return failure
+				},
+			})
+			result, err := executor.Execute(ctx, plan)
+			require.NoError(t, err)
+			require.Equal(t, 1, applies)
+
+			if scenario == "conflict" {
+				require.NoError(t, result.Err())
+				require.Len(t, result.DeferredResults(), 1)
+				require.Equal(t, dataplaneName, result.Deferred[0].Name)
+				require.ErrorIs(t, result.DeferredResults()[0].Err, failure)
+				// A new plan consumes current configuration after the lost write.
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+				cm.Data["RACER_PEER_PORT"] = "7443"
+				require.NoError(t, env.Client.Update(t.Context(), cm))
+				persist(t, env, planPass(t, env))
+
+				ds := &appsv1.DaemonSet{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+				require.Equal(t, int32(7443), ds.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
+			} else {
+				require.ErrorIs(t, result.Err(), failure)
+				require.Len(t, result.Failed(), 1)
+				require.Equal(t, dataplaneName, result.Failed()[0].Ref.Name)
+				require.Empty(t, result.Deferred)
+			}
+		})
+	}
+}

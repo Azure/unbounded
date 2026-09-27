@@ -506,13 +506,43 @@ Projection requires a kubelet and remains deployment verification.
   ConfigMap environment changes and serving certificate replacement require a
   controller rollout; bootstrap trust remains a live projected directory.
 
-Phase 6 retains named builder/projection/storage/affinity and optimistic executor
-tests. Operator tests cover provisioning without Sites, retention, config edits,
+Phase 6 retains direct builder/projection/storage/affinity tests. Workload repair,
+API defaults, ownership, conflicts, and cancellation are tested through the
+production operator planner and executor. Operator tests cover provisioning
+without Sites, retention, config edits,
 policy-before-workload ordering, real SSA override removal, and RBAC/admission
 denial of administrator-object writes. Real manager tests verify Racer does not
 create or mutate the operator workload. Rust tests parse the deployed runtime
 profile and exercise actual worker sizing and admission progress floors. Kubelet
 projection and host-filesystem behavior remain deployment checks.
+
+Workload coverage follows the production SSA contract rather than the retired
+test-only optimistic workload reconciler:
+
+- `components/racer/TestEnvtestDataplaneApply` checks upgrade and desired-field
+  repair, preservation of administrator annotations, stable resourceVersion after
+  API defaulting, recreation after deletion, and an API Invalid failure for a
+  different immutable selector. `TestDataplaneApplyFailures` checks forced operator
+  field ownership, conflict deferral followed by re-planning from edited config,
+  Forbidden propagation, and propagation of cancellation to the apply client.
+- `internal/operator/racer_integration_test.go` already asserts legacy UID
+  preservation during adoption and unchanged UID/selector after customization.
+  Its override-removal assertions require empty node selectors, tolerations, and
+  resource limits, and absence of the override volume and environment variable.
+  These cover removal of operator-owned additions; SSA does not replace every
+  field added by another owner.
+- `component/TestCreateIfAbsentReportsLosingTheRaceAsStale` asserts one stale
+  ConfigMap and refreshes its payload to the winner's value.
+  `TestStaleCreateDefersItsDependents` asserts the workload is deferred, no
+  DaemonSet apply occurs, and the result has no failure. These cover prerequisite
+  create races; the production DaemonSet operation is Apply, not CreateIfAbsent.
+- `component/TestApplyObjectSkipsMatchingPayload` asserts zero apply calls and
+  unchanged desired labels. `TestApplyObjectRepairsDriftDespiteMatchingHash`
+  asserts one apply despite a matching hash, and
+  `TestDesiredFieldsMatchIgnoresExtraCurrentFields` accepts extra user metadata.
+
+Run the workload API-server checks with repository-local assets:
+`KUBEBUILDER_ASSETS=<absolute-repository-path> go test ./internal/operator/components/racer ./internal/operator -run '^TestEnvtest'`.
 
 ## Phase 7 server verification and measurements
 
