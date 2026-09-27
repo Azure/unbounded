@@ -44,9 +44,30 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	issuer.CatalogGate = catalogGate
 
 	return &Application{
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogGate: catalogGate, Trust: trust},
-		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Lifecycle: lifecycle, CatalogGate: catalogGate, Trust: trust},
-		Server:    &Server{Config: cfg, Trust: trust, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Topology: &TopologyReconciler{
+			Client:       c,
+			APIReader:    reader,
+			Config:       cfg,
+			Publications: publications,
+			Accepted:     make(AcceptedMembers),
+			CatalogGate:  catalogGate,
+			Trust:        trust,
+		},
+		Keyring: &KeyringReconciler{
+			Client:      c,
+			APIReader:   reader,
+			Config:      cfg,
+			Lifecycle:   lifecycle,
+			CatalogGate: catalogGate,
+			Trust:       trust,
+		},
+		Server: &Server{
+			Config:       cfg,
+			Trust:        trust,
+			Bootstrap:    bootstrap,
+			Publications: publications,
+			Lifecycle:    lifecycle,
+		},
 		Lifecycle: lifecycle,
 	}
 }

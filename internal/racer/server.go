@@ -132,7 +132,16 @@ func (s *Server) Start(ctx context.Context) error {
 // serve owns the listener and every accepted connection. Close, rather than a
 // grace period for active traffic, is required as soon as leadership is lost.
 func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) (result error) {
-	server := &http.Server{Handler: s.Handler(), TLSConfig: config, ReadHeaderTimeout: s.Config.Limits.WriteTimeout, ReadTimeout: s.Config.Limits.WriteTimeout, WriteTimeout: wire.PollWait + 3*s.Config.Limits.WriteTimeout, IdleTimeout: wire.PollWait, MaxHeaderBytes: s.Config.Limits.HeaderBytes, BaseContext: func(net.Listener) context.Context { return ctx }}
+	server := &http.Server{
+		Handler:           s.Handler(),
+		TLSConfig:         config,
+		ReadHeaderTimeout: s.Config.Limits.WriteTimeout,
+		ReadTimeout:       s.Config.Limits.WriteTimeout,
+		WriteTimeout:      wire.PollWait + 3*s.Config.Limits.WriteTimeout,
+		IdleTimeout:       wire.PollWait,
+		MaxHeaderBytes:    s.Config.Limits.HeaderBytes,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
 
 	var connections sync.Map
 
