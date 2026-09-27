@@ -177,8 +177,14 @@ Precreate directories with suitable traversal/write permissions; accepted
 `socket_mode` governs the client socket. The dataplane neither changes the
 adapter's ownership nor creates its origin listener
 (`src/control/caches.rs:55-95`, `src/client/listener.rs:498-514`). Avoid symlinked
-ancestors. An existing socket is not blindly unlinked; after a crash, establish
-that its owner is gone before removing a stale client socket.
+ancestors. Startup holds an exclusive nonblocking flock on each client directory
+through preparation and the lifetime of its listener generations. It recovers an
+abandoned canonical client socket only when it is owned by the process UID, a
+nonblocking connection returns `ECONNREFUSED`, and an inode-pinned recheck confirms
+the same socket. Live listeners, full backlogs, foreign owners, regular files, and
+symlinks are preserved. The origin socket is never recovered by the dataplane.
+All dataplane instances sharing a client directory must honor this directory lock;
+external code must not replace entries during preparation or serving.
 
 ## Networking, readiness, and shutdown
 

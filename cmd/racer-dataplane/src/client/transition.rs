@@ -161,19 +161,24 @@ pub(super) fn prepare<'a>(
             let mut random = [0; 16];
             getrandom::getrandom(&mut random).map_err(|_| Error::Unavailable)?;
             let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
-            let next = Rc::new(bind(&owner.root, definition.clone(), &temporary)?);
             let previous = old
                 .values()
                 .find(|current| current.definition.name == definition.name)
                 .cloned();
+            let next = Rc::new(bind(
+                &owner.root,
+                definition.clone(),
+                &temporary,
+                previous.as_deref(),
+            )?);
             if let Some(previous) = &previous {
                 if !owns(previous, "socket")
                     || !same_directory(&previous.directory, &next.directory)?
                 {
                     return Err(Error::Io);
                 }
-            } else if !absent(&next.directory, "socket") {
-                return Err(Error::Io);
+            } else {
+                recover_dead_socket(&next.directory)?;
             }
             prepared.next.insert(definition.id.clone(), next.clone());
             pending.push(Replacement {
@@ -229,6 +234,66 @@ fn owns(listener: &BoundListener, basename: &str) -> bool {
             && metadata.dev() == listener.device
             && metadata.ino() == listener.inode
     })
+}
+
+// The caller holds the client directory's exclusive flock. A refused connection
+// proves that a same-UID socket has no listener, including older processes that
+// predate directory locking. Live, full-backlog, foreign, and non-socket paths
+// fail closed. Pin and recheck the inode before unlinking; never follow symlinks.
+fn recover_dead_socket(directory: &File) -> Result<()> {
+    let path = anchored(directory).join("socket");
+    let pinned = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(Error::Io),
+    };
+    let metadata = pinned.metadata().map_err(|_| Error::Io)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::Io);
+    }
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(Error::Io);
+    }
+    let probe = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as _;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return Err(Error::Io);
+    }
+    for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+        *to = *from as _;
+    }
+    let connected = unsafe {
+        libc::connect(
+            probe.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    };
+    if connected == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ECONNREFUSED)
+    {
+        return Err(Error::Io);
+    }
+    let current = fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
+    if !current.file_type().is_socket()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+    {
+        return Err(Error::Io);
+    }
+    fs::remove_file(path).map_err(|_| Error::Io)
 }
 
 fn absent(directory: &File, basename: &str) -> bool {

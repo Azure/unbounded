@@ -40,6 +40,15 @@ Rollback never overwrites an externally substituted inode; if external code
 replaces a prepared pathname, the last-good descriptor remains owned but pathname
 restoration cannot be guaranteed without overwriting that foreign entry.
 
+The pinned client directory also carries an exclusive nonblocking flock, shared
+by owned replacement generations until the last owner drops. Startup can recover
+a same-UID canonical socket left by a crashed process only after a nonblocking
+connection returns `ECONNREFUSED` and a pinned-inode recheck succeeds. Other socket
+errors, live listeners (including full backlogs), foreign owners, non-sockets, and
+symlinks fail closed. This recovery never touches origin sockets or durable node
+state. Cooperating processes must use the directory lock; external pathname
+replacement remains outside the exclusive-ownership contract described above.
+
 Commit swaps listener maps and retires old generations entirely in memory.
 Worker `poll_budgeted` subsequently cleans up old owned socket names. Unchanged
 definitions preserve descriptors. Permission changes and UID/name reuse create a

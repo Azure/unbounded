@@ -429,6 +429,12 @@ impl Fixture {
         Self::with_bootstrap_failures(Vec::new())
     }
     fn with_bootstrap_failures(failures: Vec<BootstrapFailure>) -> Self {
+        Self::with_caches(failures, Vec::new())
+    }
+    fn with_caches(
+        failures: Vec<BootstrapFailure>,
+        caches: Vec<crate::control::caches::CacheDefinition>,
+    ) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -514,7 +520,7 @@ impl Fixture {
                 rails: vec![],
                 alignment_enabled: false,
             }],
-            caches: vec![],
+            caches,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -786,6 +792,90 @@ fn drive<T>(
         runtime.reactor.wait(Duration::from_millis(1))?;
     }
 }
+#[test]
+fn startup_recovers_dead_client_socket_without_replacing_durable_identity() {
+    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    let definition = crate::control::caches::CacheDefinition {
+        id: crate::model::identity::CacheId("33333333-3333-4333-8333-333333333333".into()),
+        name: "gantry".into(),
+        client_socket: "/run/racer/gantry/client/socket".into(),
+        origin_socket: "/run/racer/gantry/origin/socket".into(),
+        socket_mode: 0o660,
+    };
+    let mut fixture = Fixture::with_caches(Vec::new(), vec![definition]);
+    let mut config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(5)).unwrap(),
+    )
+    .unwrap();
+    let identity = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
+    let root = fixture.directory.join("sockets");
+    let client = root.join("gantry/client");
+    std::fs::create_dir_all(&client).unwrap();
+    let directory = std::fs::File::open(&client).unwrap();
+    let socket = PathBuf::from(format!(
+        "/proc/self/fd/{}/socket",
+        std::os::fd::AsRawFd::as_raw_fd(&directory)
+    ));
+    drop(UnixListener::bind(&socket).unwrap());
+    let stale_inode = std::fs::metadata(&socket).unwrap().ino();
+    let admission = Rc::new(Admission::new(config.limits.clone()));
+    let (io, engine) = crate::runtime::crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
+    let runtime = WorkerRuntime {
+        reactor: Rc::new(Reactor::new(admission.clone())),
+        admission,
+        crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
+    };
+    let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
+    let mut worker = WorkerApplication::assemble(
+        &config,
+        &node,
+        WorkerId(0),
+        WorkerRuntime {
+            reactor: runtime.reactor.clone(),
+            admission: runtime.admission.clone(),
+            crypto: runtime.crypto.clone(),
+        },
+    )
+    .unwrap();
+    worker.node = Some(node.clone());
+    worker.clients = Rc::new(Rc::try_unwrap(worker.clients).ok().unwrap().with_root(root));
+    let result = drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(3)).unwrap()),
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "dead client socket must not prevent initial snapshot acceptance"
+    );
+    assert!(node.observations.health.ready());
+    assert_ne!(std::fs::metadata(&socket).unwrap().ino(), stale_inode);
+    assert_eq!(
+        std::fs::read(config.identity_directory.join("identity.json")).unwrap(),
+        identity
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
+    assert!(fixture.polls.load(Ordering::Acquire) >= 2);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    drive(
+        &runtime,
+        &mut engine,
+        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+}
+
 #[test]
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = Fixture::new();

@@ -38,7 +38,9 @@ pub use transition::PreparedListeners;
 struct BoundListener {
     definition: CacheDefinition,
     listener: UnixListener,
-    directory: File,
+    // Shared by replacement generations; the directory flock survives until the
+    // final listener owner releases it. No persistent lock file is needed.
+    directory: Rc<File>,
     device: u64,
     inode: u64,
     retired: Rc<Cell<bool>>,
@@ -512,12 +514,33 @@ fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
     }
 }
 
-fn bind(root: &Path, definition: CacheDefinition, basename: &str) -> Result<BoundListener> {
+fn bind(
+    root: &Path,
+    definition: CacheDefinition,
+    basename: &str,
+    previous: Option<&BoundListener>,
+) -> Result<BoundListener> {
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
     let directory = child_directory(&cache, b"client")?;
+    let directory = if let Some(previous) = previous {
+        let current = directory.metadata().map_err(|_| Error::Io)?;
+        let old = previous.directory.metadata().map_err(|_| Error::Io)?;
+        if current.dev() != old.dev() || current.ino() != old.ino() {
+            return Err(Error::Io);
+        }
+        previous.directory.clone()
+    } else {
+        // Serialize startup recovery and all prepared/live generations, including
+        // two processes racing to recover the same abandoned client pathname.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(Error::Io);
+        }
+        Rc::new(directory)
+    };
     let path = anchored(&directory).join(basename);
-    // Never unlink an existing socket, even if it appears stale: it is not ours.
+    // The randomized staging name must always be new. Canonical crash recovery
+    // is separately verified under the directory lock before publication.
     let listener = UnixListener::bind(&path).map_err(|_| Error::Io)?;
     let metadata = fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
     let bound = BoundListener {
@@ -1608,6 +1631,86 @@ mod tests {
         );
         assert!(fixture.listeners.listeners.borrow().contains_key(&other.id));
         assert!(fixture.root.0.join("other/client/socket").exists());
+    }
+
+    #[test]
+    fn startup_recovers_dead_socket_but_preserves_live_and_foreign_paths() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.socket().parent().unwrap()).unwrap();
+        let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
+        let path = anchored(&directory).join("socket");
+        let live = UnixListener::bind(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        // A listener whose backlog is full must also be preserved. The probe is
+        // nonblocking, so a startup attempt cannot wait behind its queued peers.
+        assert_eq!(unsafe { libc::listen(live.as_raw_fd(), 0) }, 0);
+        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        drop(live);
+        fixture.reconcile(&[definition()]).unwrap();
+        let mut socket = fixture.connect();
+        socket.write_all(&request("HEAD", "")).unwrap();
+        assert!(
+            fixture
+                .receive(&mut socket, false)
+                .starts_with(b"HTTP/1.1 200")
+        );
+        fixture.reconcile(&[]).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        fs::remove_file(&path).unwrap();
+        let foreign = anchored(&directory).join("foreign");
+        drop(UnixListener::bind(&foreign).unwrap());
+        let inode = fs::metadata(&foreign).unwrap().ino();
+        std::os::unix::fs::symlink("foreign", &path).unwrap();
+        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::metadata(&foreign).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn directory_ownership_survives_preparation_rollback_and_replacements() {
+        let fixture = Fixture::new();
+        let mut contender = Fixture::new();
+        contender.listeners.root = fixture.root.0.clone();
+        let prepared =
+            futures::executor::block_on(fixture.listeners.prepare(&[definition()], &scope()))
+                .unwrap();
+        let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
+        // Even before accepting, another owner must not replace our prepared path.
+        assert_eq!(contender.reconcile(&[definition()]), Err(Error::Io));
+        assert_ne!(
+            unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(prepared);
+        assert!(!fixture.socket().exists());
+        assert_eq!(
+            unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(contender.reconcile(&[definition()]), Err(Error::Io));
+        drop(directory);
+        fixture.reconcile(&[definition()]).unwrap();
+        let mut changed = definition();
+        changed.socket_mode = 0o660;
+        let prepared =
+            futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
+                .unwrap();
+        drop(prepared);
+        assert_eq!(contender.reconcile(&[definition()]), Err(Error::Io));
+        fixture.reconcile(&[changed]).unwrap();
+        assert_eq!(contender.reconcile(&[definition()]), Err(Error::Io));
+        fixture.reconcile(&[]).unwrap();
+        contender.reconcile(&[definition()]).unwrap();
     }
 
     #[test]
