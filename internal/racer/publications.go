@@ -185,6 +185,18 @@ func (p *Publications) Current() (*CommittedPublication, error) {
 	return p.currentLocked()
 }
 
+// CurrentAndSubscribe atomically reads the current publication and subscribes to
+// changes, including when unavailable. The channel closes on install or suspension;
+// leadership cancellation must be observed separately by the caller.
+func (p *Publications) CurrentAndSubscribe() (*CommittedPublication, <-chan struct{}, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	current, err := p.currentLocked()
+
+	return current, p.changed, err
+}
+
 func (p *Publications) currentLocked() (*CommittedPublication, error) {
 	if p.current == nil || p.suspended {
 		return nil, wire.Unavailable
@@ -258,11 +270,7 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 			return nil, wire.Unauthenticated
 		}
 
-		p.mu.Lock()
-		current, err = p.currentLocked()
-		changed := p.changed
-		p.mu.Unlock()
-
+		current, changed, err := p.CurrentAndSubscribe()
 		if err != nil {
 			return nil, err
 		}

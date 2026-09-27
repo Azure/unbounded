@@ -23,6 +23,67 @@ func pollIdentity(cfg Config, node wire.NodeID) NodeIdentity {
 	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: time.Now().Add(time.Hour)}
 }
 
+func TestPublicationCurrentAndSubscribe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
+		p := r.Publications
+
+		leader, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		current, changed, err := p.CurrentAndSubscribe()
+		if current != nil || !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("empty publication: %p, %v", current, err)
+		}
+
+		installed := reconcileTopology(t, r, leader)
+		// Install between the snapshot and waiting must close the captured channel.
+		<-changed
+
+		current, changed, err = p.CurrentAndSubscribe()
+		if current != installed || err != nil {
+			t.Fatalf("installed publication: %p, %v", current, err)
+		}
+
+		go p.Suspend()
+
+		<-changed
+
+		current, changed, err = p.CurrentAndSubscribe()
+		if current != nil || !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("suspended publication: %p, %v", current, err)
+		}
+
+		replayed := make(chan error, 1)
+
+		go func() { replayed <- p.Install(installed) }()
+
+		<-changed
+
+		if err := <-replayed; err != nil {
+			t.Fatal(err)
+		}
+
+		current, changed, err = p.CurrentAndSubscribe()
+		if current != installed || err != nil {
+			t.Fatalf("resumed publication: %p, %v", current, err)
+		}
+
+		select {
+		case <-changed:
+			t.Fatal("subscription returned an already-closed channel for unchanged state")
+		default:
+		}
+
+		cancel()
+
+		current, _, err = p.CurrentAndSubscribe()
+		if current != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost leadership: %p, %v", current, err)
+		}
+	})
+}
+
 func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 	r := initializedTopology(t)
 

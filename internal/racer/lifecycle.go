@@ -32,6 +32,32 @@ func newLifecycle(p *Publications) *Lifecycle {
 
 func (*Lifecycle) NeedLeaderElection() bool { return true }
 
+// LeaderContext binds a child of parent to the current leadership. Missing or
+// canceled leadership returns an already-canceled child. Cancel releases the link.
+func (l *Lifecycle) LeaderContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if l == nil {
+		cancel()
+		return ctx, cancel
+	}
+
+	l.mu.Lock()
+	leader := l.leader
+	l.mu.Unlock()
+
+	if leader == nil {
+		cancel()
+		return ctx, cancel
+	}
+
+	stop := context.AfterFunc(leader, cancel)
+	if leader.Err() != nil {
+		cancel()
+	}
+
+	return ctx, func() { stop(); cancel() }
+}
+
 func (l *Lifecycle) notifyLocked() { close(l.changed); l.changed = make(chan struct{}) }
 
 func (l *Lifecycle) Start(ctx context.Context) error {
@@ -90,14 +116,18 @@ func (l *Lifecycle) readyLocked(serving bool) error {
 		return wire.Unavailable
 	}
 
-	return l.publications.Ready(nil)
+	return nil
 }
 
 func (l *Lifecycle) Ready(_ *http.Request) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return l.readyLocked(true)
+	if err := l.readyLocked(true); err != nil {
+		return err
+	}
+
+	return l.publications.Ready(nil)
 }
 
 // Wait gates listener startup on leadership, synchronized inputs, issuer/trust,
@@ -116,13 +146,10 @@ func (l *Lifecycle) Wait(ctx context.Context) error {
 		if l.leader != nil {
 			stopped = l.leader.Done()
 		}
-		// Subscribe before rechecking readiness to avoid losing an installation.
-		l.publications.mu.Lock()
-		published := l.publications.changed
-		l.publications.mu.Unlock()
 
-		if err != nil {
-			err = l.readyLocked(false)
+		_, published, publicationErr := l.publications.CurrentAndSubscribe()
+		if err == nil {
+			err = publicationErr
 		}
 		l.mu.Unlock()
 

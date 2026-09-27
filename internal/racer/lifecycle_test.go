@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,66 @@ import (
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+func TestLifecycleLeaderContext(t *testing.T) {
+	for _, source := range []string{"parent", "leader", "child"} {
+		t.Run(source, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				leader, loseLeadership := context.WithCancel(t.Context())
+				defer loseLeadership()
+
+				parent, stopParent := context.WithTimeout(t.Context(), time.Minute)
+				defer stopParent()
+
+				key := connectionKey{}
+				parent = context.WithValue(parent, key, source)
+				l := newLifecycle(NewPublications())
+				l.leader = leader
+
+				child, cancel := l.LeaderContext(parent)
+				defer cancel()
+
+				deadline, ok := child.Deadline()
+
+				parentDeadline, _ := parent.Deadline()
+				if child.Err() != nil || child.Value(key) != source || !ok || deadline != parentDeadline {
+					t.Fatal("child did not retain parent values, deadline, and live context")
+				}
+
+				switch source {
+				case "parent":
+					stopParent()
+				case "leader":
+					loseLeadership()
+				case "child":
+					cancel()
+				}
+
+				synctest.Wait()
+
+				if !errors.Is(child.Err(), context.Canceled) {
+					t.Fatalf("child ignored %s cancellation: %v", source, child.Err())
+				}
+
+				if source != "leader" && leader.Err() != nil || source != "parent" && parent.Err() != nil {
+					t.Fatal("child cancellation propagated to an independent parent")
+				}
+			})
+		})
+	}
+
+	leader, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for _, l := range []*Lifecycle{nil, newLifecycle(NewPublications()), {leader: leader}} {
+		child, stop := l.LeaderContext(t.Context())
+		if !errors.Is(child.Err(), context.Canceled) {
+			t.Fatal("absent or canceled leadership did not immediately cancel child")
+		}
+
+		stop()
+	}
+}
 
 func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
 	r := initializedTopology(t)

@@ -113,7 +113,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
-	serving, cancel := s.leaderContext(ctx)
+	serving, cancel := s.Lifecycle.LeaderContext(ctx)
 	defer cancel()
 
 	config, err := s.TLSConfig(serving)
@@ -238,26 +238,6 @@ func take(slots chan struct{}) bool {
 }
 func release(slots chan struct{}) { <-slots }
 
-func (s *Server) leaderContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
-
-	s.Lifecycle.mu.Lock()
-	leader := s.Lifecycle.leader
-	s.Lifecycle.mu.Unlock()
-
-	if leader == nil {
-		cancel()
-		return ctx, cancel
-	}
-
-	stop := context.AfterFunc(leader, cancel)
-	if leader.Err() != nil {
-		cancel()
-	}
-
-	return ctx, func() { stop(); cancel() }
-}
-
 func (s *Server) Ready(r *http.Request) error {
 	if s.Lifecycle == nil {
 		return wire.Unavailable
@@ -305,7 +285,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 
-		ctx, cancel := s.leaderContext(r.Context())
+		ctx, cancel := s.Lifecycle.LeaderContext(r.Context())
 		defer cancel()
 
 		stop := context.AfterFunc(ctx, func() {
