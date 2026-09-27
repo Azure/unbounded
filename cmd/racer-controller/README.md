@@ -304,8 +304,10 @@ evict a working cache. Deleting a rejected object changes nothing; deleting an
 admitted object frees a slot for the next waiting UID. Recreation has a new UID
 and unrelated keys. Topology reads authoritative inputs and publishes additions
 only after their keys commit; a Secret watch drives that follow-up reconciliation.
-Catalog and keyring reconciliation share a leader-local gate to prevent a stale
-in-progress topology candidate from racing key pruning. Kubelet projection and
+Topology, keyring reconciliation, and issuance share a context-aware, leader-local
+`CatalogGate` to serialize authoritative catalog and credential operations and
+prevent an in-progress topology candidate from racing key pruning. Canceled
+admission preserves accepted trust and publications. Kubelet projection and
 snapshot delivery are still asynchronous, not an atomic dataplane transaction.
 
 Capacity rejection alone preserves usable admitted credentials, rotation, and

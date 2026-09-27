@@ -189,9 +189,11 @@ count limit. The default maximum is 356 caches. See the controller README's
 for the reserve formula, rejection diagnostics, stable existing-UID priority,
 deletion/recreation behavior, and upgrade/policy-change prerequisites. Active key
 scopes in the existing Secret retain admission across restart; no additional
-catalog checkpoint is introduced. Topology and keyring reconciliation share a
-leader-local mutex, use authoritative catalog/credential reads, and watch common
-Secret changes so additions are published only after their keys commit.
+catalog checkpoint is introduced. Topology, keyring reconciliation, and issuance
+share a context-aware, leader-local `CatalogGate` for authoritative catalog and
+credential operations. Canceled admission preserves accepted trust and publications.
+Both reconcilers watch common Secret changes so additions are published only after
+their keys commit.
 
 ## Authentication
 
@@ -247,7 +249,7 @@ not a tested capacity claim. Phase 7 measured 100,000 publication waiters and
    manager startup enqueue, and leadership cancellation (complete).
 4. Implement issuer/shared-key Secret rotation, including failure recovery (complete).
 5. Implement token bootstrap and mTLS serving with adversarial identity tests (complete).
-6. Implement server-side managed workload reconciliation and deployment wiring (complete).
+6. Implement workload and deployment wiring (complete; workload ownership now belongs to the operator).
 7. Exercise envtest integration, failover, rotation, and bounded fanout (server-only complete;
    measured limits and remaining deployment/client validation are listed below).
 
@@ -285,21 +287,26 @@ composition tests; do not add tests that merely enumerate every placeholder.
   request cancellation, and committed leadership cancellation terminate waits.
   `Server` owns global `Limits.MaxPolls` and per-node admission through response
   write and flush so a node cannot overlap a waiting/writing response.
+  `Publications.CurrentAndSubscribe()` owns the lock for an atomic current-state
+  read and change subscription; callers observe leadership cancellation separately.
 - `Application.Lifecycle` is shared with Keyring and Server. It is a one-shot
   leader runnable and waits for manager cache sync. Phase 4 calls
-  `SetIssuerReady(bool)` only for usable issuer/trust, resetting on failure.
+  `SetIssuerReady(bool)` according to accepted local trust. Observed invalidity or
+  deletion withdraws trust; transient authority read failures preserve accepted trust.
   Phase 5 calls `Lifecycle.Wait(ctx)` before listener startup, then
   `SetServingReady(true)` when accepting authenticated connections, resetting on
   shutdown. `Server.Ready` delegates to all lifecycle gates plus publications.
-  `Server.Start` implements these gates in Phase 5. Controller
-  reconciliation currently has no per-reconcile timeout; committed publications
+  `Lifecycle.LeaderContext(parent)` owns the leadership lock and links serving and
+  request cancellation to leadership. `Server.Start` implements these gates in Phase 5.
+  Controller reconciliation currently has no per-reconcile timeout; committed publications
   retain that leader-derived context. Do not introduce a short-lived reconcile
   timeout without separately supplying the full leadership context for serving.
-- All three controllers use `initialEnqueue()` as a raw source, so startup runs
+- Both reconcilers use `initialEnqueue()` as a raw source, so startup runs
   even for empty lists. Sources/workers are leader-scoped; cache synchronization
   precedes worker execution. Pod `spec.nodeName` is indexed; predicates ignore
   readiness/unrelated inputs and map relevant events to one singleton key.
-  Workload reconciliation is implemented in server-only Phase 6; keyring in Phase 4.
+  The operator owns workload reconciliation; the Racer manager registers only
+  topology and keyring reconcilers.
 
 Targeted fake-client and race tests cover initialization crash ordering, ambiguous
 responses, CAS conflicts, cancellation before writes/install, counter transitions,
@@ -313,7 +320,9 @@ establishes 100,000-node HTTPS capacity.
   both credential Secrets through `APIReader`. It uses resource-version CAS and
   singleton `RequeueAfter` deadlines, with no rotation goroutine or acknowledgments.
   Conflicts restart from authoritative inputs. Cancellation is terminal and checked
-  before every write; failures reset `Lifecycle.SetIssuerReady(false)`.
+  before every write. Readiness follows accepted local trust: observed invalidity
+  or deletion withdraws it, while transient authority read failures neither discard
+  accepted trust nor restore previously withdrawn trust.
 - Credential initialization CAS-adds the one-way
   `racer.unbounded-cloud.io/credentials` annotation to the existing version
   ConfigMap, binding the two Secret names and initial root fingerprint. Topology
@@ -332,14 +341,17 @@ establishes 100,000-node HTTPS capacity.
   is included. Only `bundle.json` is a dataplane wire contract.
 - Rotation metadata persists the next rotation, preparation deadline, selected
   active/prepared issuer fingerprints, retirement deadlines for roots and scoped
-  cache-key IDs, and earliest next transition. Both cache-key purposes rotate.
+  cache-key IDs, and earliest next transition. `RotationState.nextTransition()`
+  supplies the same deadline calculation for planning and validation of persisted
+  `NextTransition`. Both cache-key purposes rotate.
   Initial cache keys are active immediately; replacements are prepared before
   activation. Caches added during an existing preparation retain their initial
   active keys until the next cycle. Removed cache UIDs lose their key scopes;
   recreation receives unrelated keys.
   New cache-key IDs bind the first published bundle generation in the existing
-  16-byte ID (`RKG1`, big-endian u64 generation, four random suffix bytes). Existing
-  IDs are never rewritten during activation, pruning, or reconciliation replay.
+  16-byte ID (`RKG1`, big-endian u64 generation, four random suffix bytes). Initialization
+  explicitly uses creation generation 1; later plans use the next bundle generation.
+  Existing IDs are never rewritten during activation, pruning, or reconciliation replay.
   Nodes use the creation generation and accepted bundle high-water mark to reject
   resurrected epochs without accumulating rotation history. Legacy keys in an
   existing Secret remain unchanged and age out through normal rotation.
@@ -378,8 +390,10 @@ establishes 100,000-node HTTPS capacity.
   its authorization expiration, and gate issuance on leadership. There is no
   enrollment receipt ledger. `AuthenticateCertificate` is implemented in Phase 5.
 - `Issuer.TrustRoots(ctx)` returns a new owned pool from authoritative committed
-  credentials, distinct from deployment HTTPS server trust. Reconciliation installs
-  validated roots locally for TLS admission and snapshot chain verification.
+  credentials, distinct from deployment HTTPS server trust. Signing material is
+  parsed once per authoritative credential read. Reconciliation performs a fresh
+  post-reconcile load before installing validated roots locally for TLS admission
+  and snapshot chain verification; candidate signing state never installs trust.
   Pooled TLS `VerifiedChains` alone cannot authorize retired roots. Serving uses `Lifecycle.Wait(ctx)`
   and `SetServingReady` hooks, and must cancel serving on leadership loss.
 
@@ -441,6 +455,9 @@ deployment integration check and is not exercised by envtest.
   publication and broadcast notification without tracking admission. Handshake trust
   selection, local certificate verification and enrollment share bounded authentication slots;
   slow snapshot writes have separate bounded slots. Saturation rejects immediately.
+  `Server.authenticateSnapshot` shares admission and certificate verification before
+  and after waiting. The shared `authSlots` pool retains the public configuration
+  name `Limits.MaxConcurrentBootstrap`.
   Long polls are capped by the earliest verified-chain expiration and reauthorize
   after waiting, before writing. Expiration can return a bounded 401 recovery error.
   Snapshot bytes use `WriteTo` with bounded scratch and request cancellation checks.
@@ -458,7 +475,7 @@ Phase 5 tests include real TLS enrollment/snapshots, strict errors/routes/bounds
 live UID/ownership/audience attacks, pooled trust retirement and expiry, disabled
 resumption, expired-identity recovery, poll expiration/cancellation, write-completion
 admission, API/body deadlines, listener startup/readiness and leadership shutdown.
-Scaffold composition tests remain; Phase 6 owns server-side workload wiring and
+Scaffold composition tests remain; the operator owns the Phase 6 workload wiring and
 Phase 7 verifies the real API-server/election and measures capacity constraints.
 Projection requires a kubelet and remains deployment verification.
 
@@ -684,7 +701,7 @@ read failure cannot automatically accept the withdrawn state; successful control
 validation is required to restore it. Read outages alone preserve accepted state
 while leadership remains valid. Trust retirement and leadership loss remain tested.
 
-Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:115`); the pinned
+Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:118`); the pinned
 controller-runtime v0.25.1 `pkg/client/config/config.go:96-105` sets default QPS=-1,
 disabling client-side throttling in favor of API priority/fairness. It does not
 inherit standalone client-go's zero-config 5-QPS/10-burst defaults. The envtest
