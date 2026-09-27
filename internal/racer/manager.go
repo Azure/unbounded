@@ -108,7 +108,7 @@ func Run(ctx context.Context, cfg Config) error {
 	app := Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
 	// Recovery validates permanent configuration and counters before starting any
 	// manager runnable. The leader revalidates authoritatively for every commit.
-	if _, _, err := app.Topology.readVersion(ctx); err != nil {
+	if _, _, err := readVersion(ctx, mgr.GetAPIReader(), cfg); err != nil {
 		return fmt.Errorf("recover Racer installation: %w", err)
 	}
 

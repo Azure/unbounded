@@ -97,7 +97,7 @@ func TestPublicationDeepIsolationAndReplay(t *testing.T) {
 	ctx := context.Background()
 	old := reconcileTopology(t, r, ctx)
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestDurableLossWithdrawsPublication(t *testing.T) {
 
 	awaitPolls(t, r.Publications, 1)
 
-	cm, _, err := r.readVersion(ctx)
+	cm, _, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -68,7 +68,7 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 }
 
 func (r *TopologyReconciler) reconcile(ctx context.Context) error {
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return err
@@ -93,13 +93,13 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	// before its keys exist; only the subsequent Secret event may publish it.
 	// Read authoritatively so a stale informer cannot admit rejected growth.
 	if claim := cm.Annotations[credentialClaim]; claim != "" {
-		_, _, bundle, _, _, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+		credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
 		if err != nil {
 			r.suspendInvalidAuthority(err)
 			return err
 		}
 
-		keyed := keyedCaches(bundle)
+		keyed := keyedCaches(credentials.bundle)
 
 		accepted := catalog[:0]
 		for _, cache := range catalog {

@@ -217,7 +217,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 		t.Fatal(err)
 	}
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}

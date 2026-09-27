@@ -256,8 +256,10 @@ composition tests; do not add tests that merely enumerate every placeholder.
 
 ## Phase 3 handoff interfaces
 
-- `Initialize(ctx, Config)` / `TopologyReconciler.InitializeVersion(ctx)` implement
-  the one-shot command. `Config.InstallationConfigMapName` binds permanent
+- `Initialize(ctx, Config)` and `TopologyReconciler.InitializeVersion(ctx)` share
+  the package-local `initializeVersion` one-shot implementation. Durable marker
+  and counter reads use `readInstallation` and `readVersion` with explicit reader
+  and configuration dependencies. `Config.InstallationConfigMapName` binds permanent
   configuration; `Run` validates it and counters before starting manager runnables.
   Defaults are loaded from `RACER_*` and `POD_NAMESPACE`. Later phases must add
   TLS/workload-specific validation when implementing those entry points.

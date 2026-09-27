@@ -29,6 +29,10 @@ import (
 
 const credentialClaim = "racer.unbounded-cloud.io/credentials"
 
+func validCredentialClaim(cfg Config, claim string) bool {
+	return strings.HasPrefix(claim, cfg.IssuerSecretName+"/"+cfg.KeyringSecretName+"/")
+}
+
 func rootID(der []byte) string { sum := sha256.Sum256(der); return hex.EncodeToString(sum[:]) }
 func keyID(k wire.CacheKey) string {
 	return string(k.Key.Cache) + "/" + string(k.Key.Purpose) + "/" + hex.EncodeToString(k.Key.ID)
@@ -224,9 +228,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return ctrl.Result{}, err
 	}
 
-	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config}
-
-	version, _, err := topology.readVersion(ctx)
+	version, _, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -246,14 +248,17 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return r.initializeKeys(ctx, version, catalog)
 	}
 
-	if !strings.HasPrefix(claim, r.Config.IssuerSecretName+"/"+r.Config.KeyringSecretName+"/") {
+	if !validCredentialClaim(r.Config, claim) {
 		return ctrl.Result{}, wire.Unavailable
 	}
 
-	issuer, shared, b, s, material, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+	credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	issuer, shared := credentials.issuer, credentials.shared
+	b, s, material := credentials.bundle, credentials.rotation, credentials.material
 
 	catalog, err = admitCatalog(ctx, r.Config, catalog, b)
 	if err != nil {
@@ -507,7 +512,15 @@ func containsRoot(b wire.KeyringBundle, id string) bool {
 	return false
 }
 
-func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (*corev1.Secret, *corev1.Secret, wire.KeyringBundle, RotationState, issuerMaterial, error) {
+type credentialState struct {
+	issuer   *corev1.Secret
+	shared   *corev1.Secret
+	bundle   wire.KeyringBundle
+	rotation RotationState
+	material issuerMaterial
+}
+
+func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (credentialState, error) {
 	var (
 		issuer, shared corev1.Secret
 		b              wire.KeyringBundle
@@ -515,23 +528,20 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 		material       issuerMaterial
 	)
 
-	fail := func(err error) (*corev1.Secret, *corev1.Secret, wire.KeyringBundle, RotationState, issuerMaterial, error) {
-		return nil, nil, b, s, issuerMaterial{}, err
-	}
 	for _, entry := range []struct {
 		name   string
 		secret *corev1.Secret
 	}{{cfg.IssuerSecretName, &issuer}, {cfg.KeyringSecretName, &shared}} {
 		if err := ctx.Err(); err != nil {
-			return fail(err)
+			return credentialState{}, err
 		}
 
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: entry.name}, entry.secret); err != nil {
-			return fail(authorityReadFailure(err))
+			return credentialState{}, authorityReadFailure(err)
 		}
 
 		if claim == "" || entry.secret.Annotations[credentialClaim] != claim || entry.secret.DeletionTimestamp != nil || entry.secret.ResourceVersion == "" {
-			return fail(wire.Unavailable)
+			return credentialState{}, wire.Unavailable
 		}
 	}
 
@@ -539,18 +549,18 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 
 	b, err = wire.DecodeBundle(bytes.NewReader(shared.Data["bundle.json"]))
 	if err != nil {
-		return fail(err)
+		return credentialState{}, err
 	}
 
 	if b.Cluster != cfg.Cluster || json.Unmarshal(shared.Data["rotation.json"], &s) != nil || json.Unmarshal(issuer.Data["issuer.json"], &material) != nil {
-		return fail(wire.Unavailable)
+		return credentialState{}, wire.Unavailable
 	}
 
 	if err := validateRotation(b, s, material); err != nil {
-		return fail(err)
+		return credentialState{}, err
 	}
 
-	return &issuer, &shared, b, s, material, nil
+	return credentialState{issuer: &issuer, shared: &shared, bundle: b, rotation: s, material: material}, nil
 }
 
 func validateRotation(b wire.KeyringBundle, s RotationState, m issuerMaterial) error {

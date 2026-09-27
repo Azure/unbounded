@@ -129,24 +129,22 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, err
 	}
 
-	topology := &TopologyReconciler{APIReader: reader, Config: cfg}
-
-	version, _, err := topology.readVersion(ctx)
+	version, _, err := readVersion(ctx, reader, cfg)
 	if err != nil {
 		return signingState{}, err
 	}
 
 	claim := version.Annotations[credentialClaim]
-	if !strings.HasPrefix(claim, cfg.IssuerSecretName+"/"+cfg.KeyringSecretName+"/") {
+	if !validCredentialClaim(cfg, claim) {
 		return signingState{}, wire.Unavailable
 	}
 
-	_, _, b, s, material, err := readCredentials(ctx, reader, cfg, claim)
+	credentials, err := readCredentials(ctx, reader, cfg, claim)
 	if err != nil {
 		return signingState{}, err
 	}
 
-	cert, key, err := parseSigning(material.Keys[s.ActiveIssuer])
+	cert, key, err := parseSigning(credentials.material.Keys[credentials.rotation.ActiveIssuer])
 	if err != nil {
 		return signingState{}, err
 	}
@@ -157,7 +155,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 
 	roots := x509.NewCertPool()
 
-	for _, der := range b.PeerTrustRoots {
+	for _, der := range credentials.bundle.PeerTrustRoots {
 		root, err := x509.ParseCertificate(der)
 		if err != nil {
 			return signingState{}, wire.Unavailable

@@ -180,7 +180,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 		t.Fatal(err)
 	}
 
-	marker, err := r.installation(ctx, false)
+	marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 		t.Fatal("consumed initialization accepted")
 	}
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 	r.Client = c
 
-	cm, previous, err = r.readVersion(ctx)
+	cm, previous, err = readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 			t.Fatal("ambiguous initialization retried Create")
 		}
 
-		if _, _, err := restarted.Topology.readVersion(ctx); (err == nil) != afterCreate {
+		if _, _, err := readVersion(ctx, restarted.Topology.APIReader, restarted.Topology.Config); (err == nil) != afterCreate {
 			t.Fatalf("crash recovery afterCreate=%t: %v", afterCreate, err)
 		}
 	}

@@ -272,7 +272,7 @@ func TestCatalogCapacityRejectsBeforeInitializationClaim(t *testing.T) {
 		t.Fatalf("impossible root reserve: %v", err)
 	}
 
-	cm, _, err := (&TopologyReconciler{APIReader: r.APIReader, Config: r.Config}).readVersion(t.Context())
+	cm, _, err := readVersion(t.Context(), r.APIReader, r.Config)
 	if err != nil || cm.Annotations[credentialClaim] != "" {
 		t.Fatalf("impossible policy consumed credential claim: %v", err)
 	}

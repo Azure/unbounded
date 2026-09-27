@@ -54,19 +54,17 @@ func runKeys(t *testing.T, r *KeyringReconciler) ctrl.Result {
 func keyState(t *testing.T, r *KeyringReconciler) (*corev1.Secret, wire.KeyringBundle, RotationState, issuerMaterial) {
 	t.Helper()
 
-	topology := &TopologyReconciler{APIReader: r.APIReader, Config: r.Config}
-
-	version, _, err := topology.readVersion(context.Background())
+	version, _, err := readVersion(context.Background(), r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, shared, b, s, m, err := readCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim])
+	credentials, err := readCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return shared, b, s, m
+	return credentials.shared, credentials.bundle, credentials.rotation, credentials.material
 }
 
 func TestKeyringRotationLifecycle(t *testing.T) {
