@@ -38,6 +38,33 @@ fn drive<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
         }
     }
 }
+
+// Match the production service's wake-driven FuturesUnordered and reactor wait,
+// rather than repeatedly polling a blocked future with a noop waker.
+fn drive_worker<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
+    use futures::{Stream, stream::FuturesUnordered};
+    use std::{sync::Arc, task::Wake};
+    struct WakeReactor(crate::runtime::reactor::ReactorWake);
+    impl Wake for WakeReactor {
+        fn wake(self: Arc<Self>) {
+            self.0.wake().unwrap();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(WakeReactor(reactor.waker().unwrap())));
+    let mut active = FuturesUnordered::new();
+    active.push(work);
+    let until = Instant::now() + Duration::from_secs(8);
+    loop {
+        reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(Some(result)) =
+            std::pin::Pin::new(&mut active).poll_next(&mut Context::from_waker(&waker))
+        {
+            return result;
+        }
+        assert!(Instant::now() < until, "wake-driven relay watchdog");
+        reactor.wait(Duration::from_millis(10)).unwrap();
+    }
+}
 struct Fixture {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
@@ -237,6 +264,85 @@ fn unsupported_splice_with_buffered_pipe_drains_suffix_and_keeps_exact_frame() {
 }
 
 #[test]
+fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let length = 16 * 1024 * 1024 + 16;
+    let (source, destination, mut writer, mut reader) = f.connections(length);
+    let size: libc::c_int = 64 * 1024;
+    // SAFETY: live TCP descriptor and correctly sized option storage.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                destination.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    let producer = std::thread::spawn(move || {
+        writer.write_all(&vec![83; length]).unwrap();
+        writer
+    });
+    let mut pipe = f.pipes.acquire().unwrap();
+    pipe.prepare_transit();
+    let mut relay = Box::pin(f.io.relay_body(source, destination, Some(pipe), &f.scope));
+    let mut waiting = f.pipes.acquire_wait(&f.scope);
+    assert!(poll(waiting.as_mut()).is_pending());
+    // The reader is deliberately not running. A page cannot fit in the bounded
+    // send/receive buffers, so transit must retain its owners under backpressure.
+    let pause = Instant::now() + Duration::from_millis(40);
+    while Instant::now() < pause {
+        f.reactor.poll_budgeted(64).unwrap();
+        assert!(poll(relay.as_mut()).is_pending());
+        std::thread::yield_now();
+    }
+    assert!(poll(waiting.as_mut()).is_pending());
+    assert_eq!(f.admission.used(ResourceClass::Relay), 1);
+    assert_eq!(f.admission.used(ResourceClass::Pipe), 1);
+    assert_eq!(f.admission.used(ResourceClass::Connection), 2);
+    let consumer = std::thread::spawn(move || {
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        assert!(body.iter().all(|b| *b == 83));
+        reader
+    });
+    let (connection, pipe) = drive_worker(&f.reactor, async { futures::join!(relay, waiting) });
+    let mut connection = connection.unwrap();
+    let mut pipe = pipe.unwrap();
+    assert!(connection.is_reusable());
+    assert_eq!(f.admission.used(ResourceClass::Relay), 0);
+    assert_eq!(pipe.buffered(), 0);
+    assert_eq!(f.admission.used(ResourceClass::Connection), 1);
+    // Reusing the pipe must not corrupt bytes already accepted by the socket.
+    pipe.try_write(b"replacement").unwrap();
+    let mut bytes = [0; 11];
+    assert_eq!(pipe.try_read(&mut bytes).unwrap(), 11);
+    assert_eq!(&bytes, b"replacement");
+    drop(pipe);
+    drop(producer.join().unwrap());
+    let mut reader = consumer.join().unwrap();
+    connection.rx_remaining = Some(0);
+    connection.tx_remaining = Some(4);
+    let mut suffix = f.io.buffer(4).unwrap();
+    suffix.bytes_mut().unwrap().copy_from_slice(b"next");
+    drop(drive_worker(&f.reactor, f.io.write_body(connection, suffix, &f.scope)).unwrap());
+    let mut next = [0; 4];
+    reader.read_exact(&mut next).unwrap();
+    assert_eq!(&next, b"next");
+    assert_eq!(reader.read(&mut next).unwrap(), 0);
+    f.drain();
+    assert_eq!(f.admission.used(ResourceClass::Connection), 0);
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+    // HttpIo retains its bounded reusable read/write buffers after completion.
+    assert!(f.io.retained_buffer_bytes() <= MAX_PIPE_BYTES);
+    assert_eq!(f.pipes.idle_count(), 1);
+}
+
+#[test]
 #[ignore = "isolated relay body CPU benchmark; run explicitly"]
 fn opaque_body_cpu_benchmark() {
     fn cpu() -> Duration {
@@ -285,7 +391,7 @@ fn opaque_body_cpu_benchmark() {
                 .unwrap();
                 let mut offset = 0;
                 while offset < length {
-                    let done = drive(
+                    let done = drive_worker(
                         &f.reactor,
                         f.io.read_body_range(source, buffer, offset..length, &f.scope),
                     )
@@ -314,14 +420,15 @@ fn opaque_body_cpu_benchmark() {
                 let page = crate::memory::pool::BufferPool::new(f.admission.clone())
                     .ciphertext(reservation, envelope, bytes)
                     .unwrap();
-                let done = drive(&f.reactor, f.io.write_body(destination, page, &f.scope)).unwrap();
+                let done =
+                    drive_worker(&f.reactor, f.io.write_body(destination, page, &f.scope)).unwrap();
                 drop(done);
                 drop(source);
             } else {
                 let mut pipe = f.pipes.acquire().unwrap();
                 pipe.prepare_transit();
                 drop(
-                    drive(
+                    drive_worker(
                         &f.reactor,
                         f.io.relay_body(source, destination, Some(pipe), &f.scope),
                     )
