@@ -46,6 +46,28 @@ fn assembly_applies_configured_client_request_timeout() {
     }
 }
 
+#[test]
+fn assembly_uses_node_metrics_for_sparse_worker_ids() {
+    use crate::telemetry::metrics::{Event, Gauge};
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
+    let (first, _, _) = local_worker(&config, &node, 9);
+    let (second, _, _) = local_worker(&config, &node, 2);
+    first.telemetry.metrics.record(Event::MemoryHit, 2).unwrap();
+    second
+        .telemetry
+        .metrics
+        .record(Event::MemoryHit, 3)
+        .unwrap();
+    let request = first.telemetry.metrics.request().unwrap();
+    assert_eq!(second.telemetry.metrics.count(Event::MemoryHit), 5);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 1);
+    drop(first);
+    drop(request);
+    assert_eq!(second.telemetry.metrics.count(Event::RequestError), 1);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
+}
+
 pub(super) fn definition() -> crate::control::caches::CacheDefinition {
     let (client_socket, origin_socket) =
         crate::control::caches::canonical_socket_paths("app-lifecycle").unwrap();

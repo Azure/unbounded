@@ -117,7 +117,7 @@ pub struct Application {
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
     ingress: Arc<crate::runtime::ingress::Ingress>,
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: Vec<(WorkerId, crate::telemetry::metrics::Metrics)>,
     failures: crate::telemetry::failures::Failures,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
@@ -155,7 +155,11 @@ impl NodeState {
         Ok(Self {
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             publications: Arc::new(PublishedState::default()),
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: workers
+                .iter()
+                .copied()
+                .zip(crate::telemetry::metrics::Metrics::for_workers(count)?)
+                .collect(),
             failures: crate::telemetry::failures::Failures::default(),
             keys: Arc::new(KeyEpochs::default()),
             control_worker: WorkerId(0),
@@ -497,6 +501,12 @@ impl WorkerApplication {
         runtime: WorkerRuntime,
     ) -> Result<Self> {
         let environment = crate::runtime::environment::Environment::current();
+        let metrics = node
+            .metrics
+            .iter()
+            .find(|(id, _)| *id == worker)
+            .map(|(_, metrics)| metrics.clone())
+            .ok_or(Error::InvalidConfiguration)?;
         let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
@@ -575,7 +585,7 @@ impl WorkerApplication {
             Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(
-            Delivery::new(pipes, config.reader_stall_timeout).with_metrics(node.metrics.clone()),
+            Delivery::new(pipes, config.reader_stall_timeout).with_metrics(metrics.clone()),
         );
 
         let index = Rc::new(
@@ -603,12 +613,12 @@ impl WorkerApplication {
                 slabs.clone(),
                 buffers.clone(),
             )
-            .with_metrics(node.metrics.clone()),
+            .with_metrics(metrics.clone()),
         );
         let writer = Rc::new(
             StoreWriter::new(index.clone(), segments.clone(), slabs)
                 .with_availability(availability.clone())
-                .with_metrics(node.metrics.clone()),
+                .with_metrics(metrics.clone()),
         );
         writer.configure(
             admission.clone(),
@@ -738,7 +748,7 @@ impl WorkerApplication {
                 admission: admission.clone(),
                 metadata_owner: node.workers.clone(),
             })
-            .with_metrics(node.metrics.clone()),
+            .with_metrics(metrics.clone()),
         );
         let metadata = Rc::new(MetadataService::new(
             candidates,
@@ -813,7 +823,7 @@ impl WorkerApplication {
             admission,
         )
         .with_request_timeout(config.request_timeout)
-        .with_metrics(node.metrics.clone());
+        .with_metrics(metrics.clone());
         let clients = Rc::new(if distributed {
             clients.with_ingress(node.ingress.clone())
         } else {
@@ -822,7 +832,7 @@ impl WorkerApplication {
 
         let mut telemetry = Telemetry::default();
         telemetry.failures = node.failures.clone();
-        telemetry.metrics = node.metrics.clone();
+        telemetry.metrics = metrics;
         telemetry.health = node.observations.health.clone();
         Ok(Self {
             ingress_peers: futures::stream::FuturesUnordered::new(),

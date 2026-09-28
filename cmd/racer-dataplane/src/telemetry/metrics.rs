@@ -7,12 +7,37 @@ use std::sync::{
 
 pub const EVENT_COUNT: usize = 20;
 pub const GAUGE_COUNT: usize = 11;
-#[derive(Clone, Default)]
-pub struct Metrics(Arc<Counters>);
+/// Clones retain their writer shard; reads aggregate the fixed node registry.
+#[derive(Clone)]
+pub struct Metrics {
+    registry: Arc<Registry>,
+    shard: usize,
+}
+struct Registry {
+    // Retain every shard until the registry is dropped, even after a worker exits.
+    shards: Box<[Counters]>,
+    gauges: [GaugeCounter; GAUGE_COUNT],
+}
+// Match the runtime's 64-byte cache-line policy. Padding the entire writer block
+// avoids false sharing between workers without padding every event separately.
+#[repr(align(64))]
 #[derive(Default)]
 struct Counters {
     events: [AtomicU64; EVENT_COUNT],
-    gauges: [AtomicU64; GAUGE_COUNT],
+}
+// Gauges retain exact node-wide lease overflow checks and replacement semantics.
+// Separate lines prevent unrelated resource classes from invalidating each other.
+#[repr(align(64))]
+#[derive(Default)]
+struct GaugeCounter(AtomicU64);
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::for_workers(1)
+            .expect("one metrics worker")
+            .pop()
+            .unwrap()
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -162,10 +187,30 @@ impl Drop for RequestMetrics {
 }
 impl Drop for GaugeLease {
     fn drop(&mut self) {
-        self.metrics.0.gauges[self.gauge as usize].fetch_sub(1, Ordering::Relaxed);
+        self.metrics.registry.gauges[self.gauge as usize]
+            .0
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 impl Metrics {
+    /// Allocate a fixed registry at startup, with one event writer per worker.
+    /// No registration, locking, or registry reference-count changes on record.
+    pub(crate) fn for_workers(count: usize) -> Result<Vec<Self>> {
+        if count == 0 {
+            return Err(crate::error::Error::InvalidConfiguration);
+        }
+        let registry = Arc::new(Registry {
+            shards: (0..count).map(|_| Counters::default()).collect(),
+            gauges: std::array::from_fn(|_| GaugeCounter::default()),
+        });
+        Ok((0..count)
+            .map(|shard| Self {
+                registry: registry.clone(),
+                shard,
+            })
+            .collect())
+    }
+
     pub(crate) fn request(&self) -> Result<RequestMetrics> {
         let active = self.lease(Gauge::ActiveRequests)?;
         self.record(Event::Request, 1)?;
@@ -177,7 +222,7 @@ impl Metrics {
     }
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) -> Result<()> {
-        let _ = self.0.events[event as usize].fetch_update(
+        let _ = self.registry.shards[self.shard].events[event as usize].fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |old| Some(old.saturating_add(amount)),
@@ -185,19 +230,28 @@ impl Metrics {
         Ok(())
     }
     pub fn count(&self, event: Event) -> u64 {
-        self.0.events[event as usize].load(Ordering::Relaxed)
+        self.registry.shards.iter().fold(0u64, |total, shard| {
+            total.saturating_add(shard.events[event as usize].load(Ordering::Relaxed))
+        })
     }
     pub fn gauge(&self, gauge: Gauge) -> u64 {
-        self.0.gauges[gauge as usize].load(Ordering::Relaxed)
+        self.registry.gauges[gauge as usize]
+            .0
+            .load(Ordering::Relaxed)
     }
     pub(crate) fn set_gauge(&self, gauge: Gauge, value: u64) {
-        self.0.gauges[gauge as usize].store(value, Ordering::Relaxed);
+        self.registry.gauges[gauge as usize]
+            .0
+            .store(value, Ordering::Relaxed);
     }
     pub(crate) fn add_gauge(&self, gauge: Gauge, value: u64) {
-        self.0.gauges[gauge as usize].fetch_add(value, Ordering::Relaxed);
+        self.registry.gauges[gauge as usize]
+            .0
+            .fetch_add(value, Ordering::Relaxed);
     }
     pub fn lease(&self, gauge: Gauge) -> Result<GaugeLease> {
-        self.0.gauges[gauge as usize]
+        self.registry.gauges[gauge as usize]
+            .0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 old.checked_add(1)
             })
@@ -208,6 +262,7 @@ impl Metrics {
         })
     }
     /// The destination is bounded by the diagnostic server; no intermediate String.
+    /// Relaxed per-series observations are not a coherent snapshot of all workers.
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         for event in EVENTS {
             writeln!(
@@ -235,8 +290,9 @@ mod tests {
     use super::*;
     #[test]
     fn request_drop_counts_failure_once_and_workers_share_counters() {
-        let metrics = Metrics::default();
-        let worker = metrics.clone();
+        let mut workers = Metrics::for_workers(2).unwrap();
+        let metrics = workers.pop().unwrap();
+        let worker = workers.pop().unwrap();
         std::thread::spawn(move || {
             let mut success = worker.request().unwrap();
             success.success();
@@ -280,8 +336,9 @@ mod tests {
 
     #[test]
     fn installed_credential_gauges_replace_values_across_shared_handles() {
-        let metrics = Metrics::default();
-        let worker = metrics.clone();
+        let mut workers = Metrics::for_workers(2).unwrap();
+        let metrics = workers.pop().unwrap();
+        let worker = workers.pop().unwrap();
         worker.set_gauge(Gauge::KeyringGeneration, 3);
         worker.set_gauge(Gauge::IdentityExpiresAtSeconds, 120);
         worker.set_gauge(Gauge::IdentityExpiresAtSeconds, 200);
@@ -291,5 +348,110 @@ mod tests {
         metrics.write_prometheus(&mut output).unwrap();
         assert!(output.contains("racer_keyring_generation 3\n"));
         assert!(output.contains("racer_identity_expires_at_seconds 200\n"));
+    }
+
+    #[test]
+    fn fixed_registry_is_aligned_and_clones_keep_their_writer() {
+        assert!(matches!(
+            Metrics::for_workers(0),
+            Err(crate::error::Error::InvalidConfiguration)
+        ));
+        let workers = Metrics::for_workers(3).unwrap();
+        assert_eq!(std::mem::align_of::<Counters>(), 64);
+        assert_eq!(std::mem::size_of::<Counters>() % 64, 0);
+        assert_eq!(std::mem::size_of::<GaugeCounter>(), 64);
+        for (index, worker) in workers.iter().enumerate() {
+            assert_eq!(worker.shard, index);
+            let clone = worker.clone();
+            assert_eq!(clone.shard, index);
+            assert!(Arc::ptr_eq(&clone.registry, &workers[0].registry));
+            clone.record(Event::MemoryHit, (index + 1) as u64).unwrap();
+            let shard = &worker.registry.shards[index];
+            assert_eq!(std::ptr::from_ref(shard) as usize % 64, 0);
+            assert_eq!(
+                shard.events[Event::MemoryHit as usize].load(Ordering::Relaxed),
+                (index + 1) as u64
+            );
+        }
+        assert_eq!(workers[0].count(Event::MemoryHit), 6);
+    }
+
+    #[test]
+    fn concurrent_writers_and_scrapes_retain_totals_after_worker_exit() {
+        let workers = Metrics::for_workers(4).unwrap();
+        let reader = workers[0].clone();
+        let barrier = Arc::new(std::sync::Barrier::new(workers.len() + 1));
+        std::thread::scope(|scope| {
+            for worker in workers {
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..1000 {
+                        let mut request = worker.request().unwrap();
+                        worker.record(Event::MemoryHit, 1).unwrap();
+                        request.success();
+                    }
+                });
+            }
+            barrier.wait();
+            let mut last = 0;
+            for _ in 0..100 {
+                let count = reader.count(Event::Request);
+                assert!((last..=4000).contains(&count));
+                last = count;
+                let mut output = String::new();
+                reader.write_prometheus(&mut output).unwrap();
+                assert_eq!(
+                    output.lines().filter(|line| !line.starts_with('#')).count(),
+                    EVENT_COUNT + GAUGE_COUNT
+                );
+                assert!(!output.contains('{'));
+            }
+        });
+        assert_eq!(reader.count(Event::Request), 4000);
+        assert_eq!(reader.count(Event::MemoryHit), 4000);
+        assert_eq!(reader.count(Event::RequestError), 0);
+        assert_eq!(reader.gauge(Gauge::ActiveRequests), 0);
+    }
+
+    #[test]
+    fn aggregate_events_saturate_without_wrapping() {
+        let workers = Metrics::for_workers(2).unwrap();
+        for event in EVENTS {
+            workers[0].record(event, u64::MAX - 1).unwrap();
+            workers[1].record(event, 2).unwrap();
+            assert_eq!(workers[0].count(event), u64::MAX);
+            workers[1].record(event, u64::MAX).unwrap();
+            assert_eq!(workers[1].count(event), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn gauges_preserve_node_wide_overflow_replacement_and_cross_thread_release() {
+        let workers = Metrics::for_workers(2).unwrap();
+        for gauge in GAUGES {
+            workers[0].set_gauge(gauge, u64::MAX - 1);
+            let lease = workers[1].lease(gauge).unwrap();
+            assert_eq!(workers[0].gauge(gauge), u64::MAX);
+            assert!(matches!(
+                workers[0].lease(gauge),
+                Err(crate::error::Error::Overloaded)
+            ));
+            assert!(matches!(
+                workers[1].lease(gauge),
+                Err(crate::error::Error::Overloaded)
+            ));
+            std::thread::spawn(move || drop(lease)).join().unwrap();
+            assert_eq!(workers[0].gauge(gauge), u64::MAX - 1);
+            workers[1].set_gauge(gauge, 0);
+            workers[0].add_gauge(gauge, 2);
+            workers[1].add_gauge(gauge, 3);
+            assert_eq!(workers[0].gauge(gauge), 5);
+        }
+        let lease = workers[1].lease(Gauge::ActiveRequests).unwrap();
+        let reader = workers[0].clone();
+        drop(workers);
+        std::thread::spawn(move || drop(lease)).join().unwrap();
+        assert_eq!(reader.gauge(Gauge::ActiveRequests), 5);
     }
 }

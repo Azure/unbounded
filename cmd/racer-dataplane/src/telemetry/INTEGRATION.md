@@ -31,9 +31,11 @@ kernel resources. The app owner must integrate these explicit hooks:
    fence before releasing attachment. Abandoned I/O retains buffers, reservations,
    and connection gauges through completion.
 
-`Metrics`, `Health`, and `Tracing` are cheap cloneable shared handles. If worker
-telemetry should be node-wide, assign clones of these fields before wrapping each
-worker's `Telemetry` in `Rc`. Only the designated worker attaches/binds diagnostics.
+`Metrics`, `Health`, and `Tracing` are cheap cloneable shared handles. Initialize
+node-wide metrics with `Metrics::for_workers` and assign one returned handle per
+worker before wrapping its `Telemetry` in `Rc`. Clones retain that worker's event
+shard; clone `Health` and `Tracing` for shared state. Only the designated worker
+attaches/binds diagnostics.
 `metrics.record(Event, amount)` has fixed saturating counters;
 `metrics.lease(Gauge)` returns a resource-lifetime gauge guard. Keep guards with
 the actual owned resource, not just its waiting future. No request or cache labels
@@ -43,8 +45,20 @@ callbacks, or logging sinks can be attached. Trace records are not HTTP output.
 
 ## Dataplane metrics
 
-The application shares one `Metrics` handle across all workers, client listeners,
-page fills, and store readers/writers. Scrape GET `/metrics` on the existing
+The application allocates a fixed metrics registry at startup and gives each
+worker a separate 64-byte-aligned event counter block. Its client listeners, page
+fills, and store readers/writers clone that worker's handle. Recording touches
+only that block; reads sum all blocks with saturation. The registry retains counts
+after worker handles are dropped. No registration or locks occur on event writes.
+
+Gauges remain node-wide, with each atomic on a separate 64-byte cache line. This
+preserves exact aggregate lease overflow rejection, cross-thread guard release,
+additive capacity totals, and replacement values for credentials and checkpoints.
+Active-resource gauges still share writes between workers of the same resource
+class; sharding them would require a separate aggregate overflow protocol.
+Scrapes use relaxed atomic observations, not a coherent multi-worker snapshot.
+
+Scrape GET `/metrics` on the existing
 diagnostics listener. Every series is label-free and process-wide; Prometheus can
 attach target labels. Counters reset on process restart and saturate at `u64::MAX`.
 
