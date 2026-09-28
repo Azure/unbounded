@@ -18,7 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const PROFILE: &str = "racer-peer-v2";
+pub const PROFILE: &str = "racer-peer-v3";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_HEAD: usize = 64 * 1024;
 
@@ -224,6 +224,12 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     push(&mut head, "racer-kind", "request");
     push(&mut head, "content-length", 0);
     let (op_object, mode) = match &request.operation {
+        Operation::Bootstrap { object: id, mode } => {
+            object(&mut head, id)?;
+            push(&mut head, "racer-operation", "bootstrap");
+            push(&mut head, "racer-selector", "fresh");
+            (id, mode)
+        }
         Operation::Page { page, mode } => {
             push(&mut head, "racer-operation", "page");
             version(&mut head, &page.version)?;
@@ -319,6 +325,46 @@ pub fn response_head(
     push_binary(&mut head, "racer-request-binding", request_digest);
     push(&mut head, "racer-response-path", nodes(path)?);
     let (outcome, length) = match response {
+        PeerResponse::Bootstrap {
+            metadata: m,
+            page_zero,
+        } => match page_zero {
+            Some(page) => {
+                if m.length == 0 || page.envelope().page.number.0 != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                let page_head = response_head(
+                    &PeerResponse::Page {
+                        metadata: m.clone(),
+                        ciphertext: page.clone(),
+                    },
+                    request_digest,
+                    path,
+                )?;
+                for header in page_head.headers {
+                    if !matches!(
+                        header.name.as_str(),
+                        "racer-kind"
+                            | "racer-request-binding"
+                            | "racer-response-path"
+                            | "racer-outcome"
+                            | "content-length"
+                    ) {
+                        head.headers.push(header);
+                    }
+                }
+                push(&mut head, "racer-page-present", 1);
+                ("bootstrap", u64::from(page.envelope().ciphertext_length))
+            }
+            None => {
+                if m.length != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                metadata(&mut head, m)?;
+                push(&mut head, "racer-page-present", 0);
+                ("bootstrap", 0)
+            }
+        },
         PeerResponse::Page {
             metadata: m,
             ciphertext,

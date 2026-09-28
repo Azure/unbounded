@@ -14,6 +14,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::{
         cache::MemoryCache,
+        page::{AcquiredPage, UnverifiedPage},
         pool::{BufferPool, CiphertextPage},
     },
     model::{
@@ -61,7 +62,14 @@ pub struct Fill {
     dependencies: FillDependencies,
     metrics: Metrics,
 }
+enum Prefetch {
+    Origin(crate::origin::page::OriginPage),
+    Ciphertext(UnverifiedPage),
+}
 impl Fill {
+    pub(crate) fn record_peer_bootstrap(&self) -> Result<()> {
+        self.metrics.record(Event::PeerBootstrap, 1)
+    }
     /// Admit required memory first; dirty-only saturation skips persistence without
     /// disturbing queued writes or unrelated idle pages. Failure rolls charges back.
     fn reserve_progress(
@@ -199,7 +207,31 @@ impl Fill {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, PageResult> {
-        self.acquire_with_prefetch(page, membership, context, scope, budget, None)
+        Box::pin(async move {
+            match self
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, true)
+                .await?
+            {
+                AcquiredPage::Plaintext(page) => Ok(page),
+                AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+            }
+        })
+    }
+
+    pub fn acquire_ciphertext<'a>(
+        &'a self,
+        page: PageId,
+        membership: MembershipLease,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+    ) -> Operation<'a, crate::memory::page::CiphertextCopy> {
+        Box::pin(async move {
+            Ok(self
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, false)
+                .await?
+                .copy())
+        })
     }
 
     /// An initial GET discovers the identity before its body can enter a page
@@ -217,7 +249,54 @@ impl Fill {
             version: origin.metadata.version.clone(),
             number: crate::model::identity::PageNumber(0),
         };
-        self.acquire_with_prefetch(page, membership, context, scope, budget, Some(origin))
+        Box::pin(async move {
+            match self
+                .acquire_with_prefetch(
+                    page,
+                    membership,
+                    context,
+                    scope,
+                    budget,
+                    Some(Prefetch::Origin(origin)),
+                    true,
+                )
+                .await?
+            {
+                AcquiredPage::Plaintext(page) => Ok(page),
+                AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+            }
+        })
+    }
+
+    pub(crate) fn accept_ciphertext<'a>(
+        &'a self,
+        copy: crate::memory::page::CiphertextCopy,
+        membership: MembershipLease,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+    ) -> Operation<'a, PageResult> {
+        Box::pin(async move {
+            let page = copy.ciphertext.envelope().page.clone();
+            match self
+                .acquire_with_prefetch(
+                    page,
+                    membership,
+                    context,
+                    scope,
+                    budget,
+                    Some(Prefetch::Ciphertext(UnverifiedPage {
+                        copy,
+                        disk_token: None,
+                    })),
+                    true,
+                )
+                .await?
+            {
+                AcquiredPage::Plaintext(page) => Ok(page),
+                AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+            }
+        })
     }
 
     fn acquire_with_prefetch<'a>(
@@ -227,8 +306,9 @@ impl Fill {
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        mut prefetch: Option<crate::origin::page::OriginPage>,
-    ) -> Operation<'a, PageResult> {
+        mut prefetch: Option<Prefetch>,
+        plaintext: bool,
+    ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
             scope.check()?;
             if page.version.object != context.object {
@@ -237,31 +317,37 @@ impl Fill {
             if let Some(result) = self.dependencies.memory.get(&page)? {
                 result.validate_for(&page)?;
                 self.metrics.record(Event::MemoryHit, 1)?;
-                return Ok(result);
+                return Ok(result.into());
             }
-            let mut waiter = match self.dependencies.flights.join(
+            let mut waiter = match self.dependencies.flights.join_for(
                 page.clone(),
                 membership,
                 context,
                 scope,
                 budget,
+                plaintext,
             )? {
                 JoinedFlight::Complete(result) => {
                     // join checks current UID/key admission before sharing a
                     // completed bundle; registered waiters retain their own rights.
                     result.validate_for(&page)?;
-                    return Ok(result);
+                    return Ok(result.into());
                 }
+                JoinedFlight::Ciphertext(copy) => return Ok(AcquiredPage::Ciphertext(copy)),
                 JoinedFlight::Waiter(waiter) => waiter,
             };
             loop {
                 match waiter.wait().await? {
                     AcquisitionEvent::Complete(result) => {
                         result.validate_for(&page)?;
-                        return Ok(result);
+                        return Ok(result.into());
+                    }
+                    AcquisitionEvent::Ciphertext(copy) => {
+                        return Ok(AcquiredPage::Ciphertext(copy));
                     }
                     AcquisitionEvent::Failed(error) => return Err(error),
                     AcquisitionEvent::Lead(leader) => {
+                        let ready = self.dependencies.flights.ciphertext_for(&leader)?;
                         let driver_permit = super::drivers::reserve()?;
                         let acquisition = waiter.acquisition(&leader)?;
                         // The acquisition driver stays on this owner. Admit an
@@ -285,7 +371,34 @@ impl Fill {
                         let (send, mut receive) = futures::channel::oneshot::channel();
                         driver_permit.submit(Box::pin(async move {
                             let mut work = Box::pin(async {
-                                if let Some(origin) = prefetched {
+                                let (ready, prefetched) = match prefetched {
+                                    Some(Prefetch::Ciphertext(copy)) => {
+                                        (ready.or(Some(copy)), None)
+                                    }
+                                    other => (ready, other),
+                                };
+                                if let Some(copy) = ready {
+                                    let reservation =
+                                        fill.reserve_bootstrap(&owned_page.version.object.cache)?;
+                                    match fill
+                                        .decrypt(&owned_page, copy.copy, reservation, &owned_scope)
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            fill.publish(result.clone(), None, &owned_scope)
+                                                .await?;
+                                            return Ok(result.into());
+                                        }
+                                        Err(Error::CorruptRecord | Error::MissingKey) => {
+                                            flights.discard_ciphertext(&leader)?;
+                                            if let Some(token) = copy.disk_token {
+                                                fill.dependencies.disk.invalidate(&token)?;
+                                            }
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                if let Some(Prefetch::Origin(origin)) = prefetched {
                                     fill.admit_bootstrap(
                                         origin,
                                         &owned_page,
@@ -293,6 +406,7 @@ impl Fill {
                                         &owned_scope,
                                     )
                                     .await
+                                    .map(AcquiredPage::from)
                                 } else {
                                     fill.acquire_once(
                                         &owned_page,
@@ -300,6 +414,7 @@ impl Fill {
                                         &owned_context,
                                         &owned_scope,
                                         &mut owned_budget,
+                                        plaintext,
                                     )
                                     .await
                                 }
@@ -315,7 +430,18 @@ impl Fill {
                             operation.complete()?;
                             match result {
                                 Ok(result) => {
-                                    let _ = flights.publish(leader, result);
+                                    let result = if matches!(&result, AcquiredPage::Plaintext(_))
+                                        && !plaintext
+                                        && !flights.has_plaintext_reader(&leader)?
+                                    {
+                                        AcquiredPage::Ciphertext(UnverifiedPage {
+                                            copy: result.copy(),
+                                            disk_token: None,
+                                        })
+                                    } else {
+                                        result
+                                    };
+                                    let _ = flights.publish_acquired(leader, result);
                                 }
                                 Err(Error::OriginRejected) => {
                                     let _ =
@@ -445,6 +571,9 @@ impl Fill {
                 Err(error) => return Err(error),
             }
             match self.dependencies.flights.join_copy(page, scope)? {
+                JoinedCopy::Ciphertext(copy) => {
+                    Ok(Some((copy.copy.metadata, copy.copy.ciphertext)))
+                }
                 JoinedCopy::Miss => Ok(None),
                 JoinedCopy::Complete(result) => {
                     result.validate_for(page)?;
@@ -453,7 +582,8 @@ impl Fill {
                 JoinedCopy::Waiter(mut waiter) => {
                     let result = waiter.wait().await?;
                     result.validate_for(page)?;
-                    Ok(Some((result.metadata, result.ciphertext)))
+                    let copy = result.copy();
+                    Ok(Some((copy.metadata, copy.ciphertext)))
                 }
             }
         })
@@ -466,7 +596,8 @@ impl Fill {
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-    ) -> Result<PageResult> {
+        want_plaintext: bool,
+    ) -> Result<AcquiredPage> {
         scope.check()?;
         let candidates = self
             .dependencies
@@ -476,7 +607,11 @@ impl Fill {
         let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
-        let plaintext = self.reserve_bootstrap(&context.object.cache)?;
+        let plaintext = if want_plaintext {
+            Some(self.reserve_bootstrap(&context.object.cache)?)
+        } else {
+            None
+        };
         let local = self.dependencies.writer.copy_only(page)?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
@@ -500,7 +635,25 @@ impl Fill {
             },
         };
         if let Some(copy) = local {
-            match self.decrypt(page, copy, plaintext, scope).await {
+            if !want_plaintext && validate_copy(&copy, page).is_ok() {
+                self.metrics.record(
+                    if token.is_some() {
+                        Event::DiskHit
+                    } else {
+                        Event::MemoryHit
+                    },
+                    1,
+                )?;
+                return Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                    copy,
+                    disk_token: token,
+                }));
+            }
+            let reservation = match plaintext {
+                Some(value) => value,
+                None => self.reserve_bootstrap(&context.object.cache)?,
+            };
+            match self.decrypt(page, copy, reservation, scope).await {
                 Ok(result) => {
                     self.publish(result.clone(), None, scope).await?;
                     self.metrics.record(
@@ -511,7 +664,7 @@ impl Fill {
                         },
                         1,
                     )?;
-                    return Ok(result);
+                    return Ok(result.into());
                 }
                 Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
                     if error == Error::CorruptRecord {
@@ -526,13 +679,36 @@ impl Fill {
         } else {
             drop(plaintext);
         }
-        let reservation = self.reserve_progress(&context.object.cache, persist)?;
+        // Cipher-only acquisitions reserve no plaintext until origin actually
+        // supplies a page. Requester consumers still authenticate before acceptance.
+        let mut plaintext = if want_plaintext {
+            Some(self.reserve_bootstrap(&context.object.cache)?)
+        } else {
+            None
+        };
+        let ciphertext = self.reserve_with_reclamation(
+            &context.object.cache,
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize + 16,
+        )?;
+        let dirty = if persist {
+            match self.dependencies.admission.reserve(
+                Some(&context.object.cache),
+                ResourceClass::DirtyCiphertext,
+                PAGE_BYTES as usize + 16,
+            ) {
+                Ok(reservation) => Some(reservation),
+                Err(Error::Overloaded) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let operation = PeerOperation::Page {
             page: page.clone(),
             mode: FetchMode::Acquire,
         };
         // Keep the accepted ranking to probe later cached copies on an origin 412.
-        let mut plaintext = Some(reservation.plaintext);
         let resolution = self
             .dependencies
             .candidates
@@ -547,9 +723,18 @@ impl Fill {
                 budget,
                 |response| {
                     let reserved = plaintext.take();
-                    Box::pin(
-                        async move { self.decrypt_response(page, response, reserved, scope).await },
-                    )
+                    Box::pin(async move {
+                        if want_plaintext {
+                            self.decrypt_response(page, response, reserved, scope)
+                                .await
+                                .map(AcquiredPage::from)
+                        } else {
+                            Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                                copy: response_copy(response.response(), page)?,
+                                disk_token: None,
+                            }))
+                        }
+                    })
                 },
             )
             .await?;
@@ -583,18 +768,14 @@ impl Fill {
                         let (plaintext, ciphertext) = self
                             .dependencies
                             .crypto
-                            .encrypt(
-                                page.clone(),
-                                origin.plaintext,
-                                reservation.ciphertext,
-                                scope,
-                            )
+                            .encrypt(page.clone(), origin.plaintext, ciphertext, scope)
                             .await?;
                         PageResult {
                             metadata: origin.metadata,
                             plaintext,
                             ciphertext,
                         }
+                        .into()
                     }
                     Err(Error::VersionUnavailable) => {
                         let operation = PeerOperation::Page {
@@ -610,7 +791,18 @@ impl Fill {
                                 scope,
                                 budget,
                                 |response| {
-                                    Box::pin(self.decrypt_response(page, response, None, scope))
+                                    Box::pin(async move {
+                                        if want_plaintext {
+                                            self.decrypt_response(page, response, None, scope)
+                                                .await
+                                                .map(AcquiredPage::from)
+                                        } else {
+                                            Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                                                copy: response_copy(response.response(), page)?,
+                                                disk_token: None,
+                                            }))
+                                        }
+                                    })
                                 },
                             )
                             .await?
@@ -624,8 +816,18 @@ impl Fill {
         };
         result.validate_for(page)?;
         scope.check()?;
-        self.publish(result.clone(), reservation.dirty, scope)
-            .await?;
+        if let AcquiredPage::Plaintext(page) = &result {
+            if want_plaintext {
+                self.publish(page.clone(), dirty, scope).await?;
+            } else if let Some(dirty) = dirty {
+                match self.dependencies.writer.enqueue(page.copy(), dirty) {
+                    Ok(_)
+                    | Err(Error::Overloaded | Error::Io | Error::Unavailable | Error::MissingKey) =>
+                        {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         self.metrics.record(source, 1)?;
         Ok(result)
     }
@@ -665,6 +867,7 @@ impl Fill {
     ) -> Result<PageResult> {
         validate_copy(&copy, page)?;
         // Keep the original immutable ciphertext lease across crypto submission.
+        self.metrics.record(Event::PageDecrypt, 1)?;
         let plaintext = self
             .dependencies
             .crypto

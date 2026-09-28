@@ -492,6 +492,10 @@ impl Origin {
                                     continue;
                                 }
                                 assert_eq!(method, "GET");
+                                if length == 0 {
+                                    if write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"restart-v1\"\r\nRacer-Expires-At: 0\r\n\r\n").is_err() { return; }
+                                    continue;
+                                }
                                 let (first, last) = fields["range"].strip_prefix("bytes=").unwrap().split_once('-').unwrap();
                                 let first: u64 = first.parse().unwrap();
                                 let last: u64 = last.parse().unwrap();

@@ -432,7 +432,10 @@ async fn validated_copy<'a, T>(
         // Only page content validation is recoverable here. Transport/security
         // errors never enter this helper, and Unauthorized remains terminal.
         Err(Error::CorruptRecord | Error::MissingKey)
-            if matches!(operation, PeerOperation::Page { .. }) =>
+            if matches!(
+                operation,
+                PeerOperation::Page { .. } | PeerOperation::Bootstrap { .. }
+            ) =>
         {
             Ok(Err(ProbeOutcome::UnusableCopy))
         }
@@ -460,10 +463,15 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
     match operation {
         PeerOperation::Page { page, .. } => (&page.version.object, page.number),
         PeerOperation::Metadata { object, .. } => (object, PageNumber(0)),
+        PeerOperation::Bootstrap { object, .. } => (object, PageNumber(0)),
     }
 }
 fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
     match operation {
+        PeerOperation::Bootstrap { object, .. } => PeerOperation::Bootstrap {
+            object: object.clone(),
+            mode,
+        },
         PeerOperation::Page { page, .. } => PeerOperation::Page {
             page: page.clone(),
             mode,
@@ -487,6 +495,7 @@ fn classify(
     match response {
         PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
         PeerResponse::NotFound => match operation {
+            PeerOperation::Bootstrap { .. } if acquire => Err(Error::NotFound),
             PeerOperation::Metadata {
                 selector: MetadataSelector::Fresh,
                 ..
@@ -498,6 +507,24 @@ fn classify(
         PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
         PeerResponse::OriginRejected => Err(Error::OriginRejected),
         PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
+        PeerResponse::Bootstrap {
+            metadata,
+            page_zero,
+        } => match operation {
+            PeerOperation::Bootstrap { object, .. } if &metadata.version.object == object => {
+                if let Some(page) = page_zero {
+                    metadata.immutable().validate_page(page.envelope())?;
+                    if page.envelope().page.number.0 != 0 {
+                        return Err(Error::CorruptRecord);
+                    }
+                }
+                if page_zero.is_some() != (metadata.length != 0) {
+                    return Err(Error::CorruptRecord);
+                }
+                Ok(None)
+            }
+            _ => Err(Error::CorruptRecord),
+        },
         PeerResponse::Page {
             metadata,
             ciphertext,
@@ -868,7 +895,9 @@ mod tests {
         ) -> Operation<'a, VerifiedResponse> {
             Box::pin(async move {
                 let copy = match request.operation {
-                    PeerOperation::Page { mode, .. } | PeerOperation::Metadata { mode, .. } => {
+                    PeerOperation::Bootstrap { mode, .. }
+                    | PeerOperation::Page { mode, .. }
+                    | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)
                     }
                 };

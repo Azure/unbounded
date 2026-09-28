@@ -316,6 +316,95 @@ fn drive<T>(
 }
 
 #[test]
+fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
+    let mut f = fixture();
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let original = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(f.origin.calls.get(), 1);
+    let copy = original.copy();
+    drop(original);
+    // Pending original ciphertext is retained by the writer, without plaintext.
+    f.fill
+        .dependencies
+        .memory
+        .remove_cache(&f.context.object.cache)
+        .unwrap();
+    let flights = f.fill.dependencies.flights.clone();
+    let mut holder_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let JoinedFlight::Waiter(holder) = flights
+        .join_for(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut holder_budget,
+            false,
+        )
+        .unwrap()
+    else {
+        panic!("registration")
+    };
+    let mut cipher_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = drive(
+        f.fill.acquire_ciphertext(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut cipher_budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.ciphertext.bytes(), copy.ciphertext.bytes());
+    assert_eq!(metrics.count(Event::PageDecrypt), 0);
+    let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let (a, b) = drive(
+        async {
+            futures::join!(
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut first_budget
+                ),
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut second_budget
+                )
+            )
+        },
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(&a.plaintext.inner, &b.plaintext.inner));
+    assert_eq!(metrics.count(Event::PageDecrypt), 1);
+    assert_eq!(f.origin.calls.get(), 1);
+    drop(holder);
+}
+
+#[test]
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     use crate::security::keyring::{KeyPurpose, tests::rotation_bundle};
     let mut f = fixture_with_availability(3, None, true);
@@ -539,7 +628,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let admitted_copy = futures::executor::block_on(old_copy.wait()).unwrap();
     assert_eq!(admitted.plaintext.bytes(), b"abc");
     assert_eq!(
-        admitted_copy.ciphertext.bytes(),
+        admitted_copy.copy().ciphertext.bytes(),
         original.ciphertext.bytes()
     );
     assert_eq!(admitted.ciphertext.envelope().key_id, old_key);

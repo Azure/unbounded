@@ -288,6 +288,13 @@ impl Transfers {
             let response = codec.response(authentication, body, scope)?;
             // Logical decoding must account for every body byte before pooling.
             match &response.response {
+                PeerResponse::Bootstrap {
+                    page_zero: Some(ciphertext),
+                    ..
+                } if ciphertext.bytes().len() == length => {}
+                PeerResponse::Bootstrap {
+                    page_zero: Some(_), ..
+                } => return Err(Error::InvalidRequest),
                 PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == length => {}
                 PeerResponse::Page { .. } => return Err(Error::InvalidRequest),
                 _ if length == 0 => {}

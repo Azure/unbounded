@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 17;
+pub const EVENT_COUNT: usize = 19;
 pub const GAUGE_COUNT: usize = 7;
 #[derive(Clone, Default)]
 pub struct Metrics(Arc<Counters>);
@@ -34,6 +34,8 @@ pub enum Event {
     DiagnosticRejected,
     DiagnosticIoError,
     DiagnosticTimeout,
+    PageDecrypt,
+    PeerBootstrap,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::Request,
@@ -53,6 +55,8 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::DiagnosticRejected,
     Event::DiagnosticIoError,
     Event::DiagnosticTimeout,
+    Event::PageDecrypt,
+    Event::PeerBootstrap,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -74,6 +78,8 @@ impl Event {
             Self::DiagnosticRejected => "racer_diagnostic_rejected_total",
             Self::DiagnosticIoError => "racer_diagnostic_io_errors_total",
             Self::DiagnosticTimeout => "racer_diagnostic_timeouts_total",
+            Self::PageDecrypt => "racer_page_decrypts_total",
+            Self::PeerBootstrap => "racer_peer_bootstraps_total",
         }
     }
 }

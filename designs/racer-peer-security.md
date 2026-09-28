@@ -1,4 +1,26 @@
-# Racer peer security v2
+# Racer peer security v3
+
+Phase 4 is a coordinated dataplane upgrade. The signed profile is
+`racer-peer-v3`, outer version is `3`, and exchange target is
+`/racer/peer/v3/exchange`. Versions 1, 2, and unknown versions are rejected before
+logical execution; there is no downgrade or silent Metadata/Page substitution.
+The existing v2 session endpoint and digest domain labels remain unchanged;
+session messages carry the v3 signed profile, so mixed-profile sessions fail closed.
+
+`Bootstrap { object, mode }` is an explicit fresh metadata-plus-page-zero intent.
+Its signed response is `bootstrap`, with complete immutable metadata and
+`racer-page-present` equal to 0 for an empty object, otherwise 1. Nonempty replies
+carry the ordinary page envelope, page number exactly zero, and exact ciphertext
+body length. Empty replies have zero body and no page fields. All fields remain
+bound by the original request digest and destination signature. Requester AEAD
+verification is mandatory before client delivery. CopyOnly Bootstrap never
+contacts origin. HEAD remains Metadata and cannot join a body-fetching refresh.
+Bootstrap initially uses HTTP because the ETag used to choose an RDMA rail is not
+known until its response. Pinned page transfers retain native RDMA eligibility.
+
+The peer codecs are Rust-owned; repository inspection found no Go peer codec.
+Go SDK client/origin framing and control DTOs remain unchanged by this peer-only
+revision. No generated control artifacts or client API version changes are needed.
 
 This document is owned by the security implementer. It defines the peer protocol,
 not the control HTTPS or SDK Unix-socket protocol. Implemented exported encoders
@@ -34,7 +56,7 @@ Use RFC 9421 signature-base construction and structured `Signature-Input` and
 `@status`. Cover every security/operation header in deterministic order. Reject
 duplicate fields, malformed structured fields, unsupported signature algorithms,
 unknown profile versions, and logical fields that disagree with the signed head.
-The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v2`.
+The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v3`.
 No body digest is used: the signed page envelope and AEAD tag protect page bytes.
 
 Signature components begin with request derived components in the order above (or
@@ -44,7 +66,7 @@ case-insensitively. Header values must be ASCII without leading/trailing whitesp
 The signature parameters have this exact canonical structured-field serialization:
 
 ```
-("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v2"
+("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v3"
 ```
 
 The base consists of RFC 9421 `"component": value` lines joined by LF, followed by
@@ -114,7 +136,7 @@ application head; it is not the application result. Client/origin mapping preser
 
 `PeerResponse::NotFound` serializes `racer-outcome: not-found` with signed
 application `@status` 404 and zero content length, inside the outer 200 envelope.
-It is valid only for metadata Acquire with selector Fresh, and only the requested
+It is valid only for metadata Acquire with selector Fresh or Bootstrap Acquire, and only the requested
 destination may sign the original response. Both signing and verification enforce
 these restrictions. Relays preserve and countersign the destination's response;
 they cannot originate authoritative absence. The exact request binding and every
@@ -291,7 +313,7 @@ signatures must also enforce freshness/deadline validity, while sequence admissi
 is only for the fresh immediate-hop HTTP head. Immutable response descriptors must
 match the requested object/version/page, not only a self-consistent signed response.
 The canonical application target is `/racer/peer/v1`; the transport envelope uses
-`/racer/peer/v2/exchange`, with the original signed application head carried intact.
+`/racer/peer/v3/exchange`, with the original signed application head carried intact.
 
 Current compiler integration requests:
 

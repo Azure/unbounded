@@ -77,7 +77,9 @@ impl PeerClient for Peers {
         assert_eq!(scope.deadline.0, request.origin.scope().deadline.0);
         assert_eq!(scope.request, request.route.request);
         let copy = match &request.operation {
-            PeerOperation::Metadata { mode, .. } | PeerOperation::Page { mode, .. } => {
+            PeerOperation::Bootstrap { mode, .. }
+            | PeerOperation::Metadata { mode, .. }
+            | PeerOperation::Page { mode, .. } => {
                 matches!(mode, FetchMode::CopyOnly)
             }
         };

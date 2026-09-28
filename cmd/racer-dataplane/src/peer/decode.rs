@@ -164,6 +164,10 @@ impl LogicalCodec for SecurityCodec {
             length.checked_add(512).ok_or(Error::InvalidRequest)?,
         )?;
         let operation = match p::field(head, "racer-operation")?.as_str() {
+            "bootstrap" => Operation::Bootstrap {
+                object: object.clone(),
+                mode,
+            },
             "page" => Operation::Page {
                 page: PageId {
                     version: version(head)?,
@@ -231,8 +235,9 @@ impl LogicalCodec for SecurityCodec {
     ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
-        let response = match p::field(head, "racer-outcome")?.as_str() {
-            "page" => {
+        let outcome = p::field(head, "racer-outcome")?;
+        let response = match outcome.as_str() {
+            "page" | "bootstrap" if outcome == "page" || present(head, "racer-page-present")? => {
                 let metadata = metadata(head)?;
                 let envelope = PageEnvelope {
                     page: PageId {
@@ -259,9 +264,20 @@ impl LogicalCodec for SecurityCodec {
                     ResourceClass::Ciphertext,
                     body.len(),
                 )?;
-                PeerResponse::Page {
-                    metadata,
-                    ciphertext: self.buffers.ciphertext(reservation, envelope, body)?,
+                let ciphertext = self.buffers.ciphertext(reservation, envelope, body)?;
+                if outcome == "bootstrap" {
+                    if ciphertext.envelope().page.number.0 != 0 {
+                        return Err(Error::InvalidRequest);
+                    }
+                    PeerResponse::Bootstrap {
+                        metadata,
+                        page_zero: Some(ciphertext),
+                    }
+                } else {
+                    PeerResponse::Page {
+                        metadata,
+                        ciphertext,
+                    }
                 }
             }
             outcome => {
@@ -269,6 +285,10 @@ impl LogicalCodec for SecurityCodec {
                     return Err(Error::InvalidRequest);
                 }
                 match outcome {
+                    "bootstrap" => PeerResponse::Bootstrap {
+                        metadata: metadata(head)?,
+                        page_zero: None,
+                    },
                     "metadata" => PeerResponse::Metadata(metadata(head)?),
                     "miss" => PeerResponse::Miss,
                     "not-found" => PeerResponse::NotFound,

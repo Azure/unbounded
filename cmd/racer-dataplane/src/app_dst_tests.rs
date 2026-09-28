@@ -1496,7 +1496,9 @@ impl Harness {
         self.coverage.action("native-fault");
         for _ in 0..32 {
             self.update(5);
-            let client = self.request(5, false, false);
+            // Bootstrap now carries page zero over HTTP before its ETag is known.
+            // Exercise native fault injection with an explicitly pinned page.
+            let client = self.request(5, true, false);
             self.exchange(client, true);
             if self.fabric.pending_faults() == 0 {
                 *self

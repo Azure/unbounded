@@ -464,6 +464,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
         &f.context,
         &f.scope,
         &mut budget,
+        true,
     ));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());

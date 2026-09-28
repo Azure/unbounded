@@ -18,7 +18,7 @@
 use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
-    memory::page::PageResult,
+    memory::page::{AcquiredPage, PageResult, UnverifiedPage},
     model::{context::OriginContext, identity::PageId, limits::ResourceClass},
     runtime::{
         admission::{Admission, Reservation},
@@ -84,6 +84,7 @@ struct Entry {
     operations: HashMap<u64, Option<Retained>>,
     outcome: Option<Outcome>,
     result: Option<PageResult>,
+    ciphertext: Option<UnverifiedPage>,
     error: Option<Error>,
     drain_waker: Option<Waker>,
     _reservation: Reservation,
@@ -91,6 +92,7 @@ struct Entry {
 struct WaiterRecord {
     scope: RequestScope,
     acquisition: bool,
+    plaintext: bool,
     budget_deadline: Instant,
     issued: bool,
     error: Option<Error>,
@@ -102,7 +104,7 @@ struct Retained {
     _reservation: Reservation,
 }
 enum Outcome {
-    Published(PageResult),
+    Published(AcquiredPage),
     Failed(Error),
     Retry,
 }
@@ -371,16 +373,19 @@ pub struct CopyWaiter<'a> {
 pub enum JoinedFlight<'a> {
     Waiter(AcquisitionWaiter<'a>),
     Complete(PageResult),
+    Ciphertext(UnverifiedPage),
 }
 pub enum JoinedCopy<'a> {
     Miss,
     Waiter(CopyWaiter<'a>),
     Complete(PageResult),
+    Ciphertext(UnverifiedPage),
 }
 pub enum AcquisitionEvent {
     /// Initial election or retry. Only this caller can lend the matching context.
     Lead(FlightLeader),
     Complete(PageResult),
+    Ciphertext(UnverifiedPage),
     Failed(Error),
 }
 
@@ -451,12 +456,17 @@ impl AcquisitionWaiter<'_> {
                 if let Some(result) = &entry.result {
                     return Poll::Ready(Ok(AcquisitionEvent::Complete(result.clone())));
                 }
+                if !waiter.plaintext {
+                    if let Some(copy) = &entry.ciphertext {
+                        return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
+                    }
+                }
                 if let Some(error) = entry.error {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
                 if entry.state == FlightState::RetryPending && !waiter.issued {
                     if crate::runtime::environment::now() >= self.budget.deadline
-                        || self.budget.attempts == 0
+                        || (self.budget.attempts == 0 && entry.ciphertext.is_none())
                     {
                         let error = if self.budget.attempts == 0 {
                             Error::Unavailable
@@ -520,7 +530,7 @@ impl AcquisitionWaiter<'_> {
 impl CopyWaiter<'_> {
     /// Observe existing work only. Failure/no eligible acquisition callers ends
     /// the wait; it never creates a retry. Results include original ciphertext.
-    pub fn wait(&mut self) -> Operation<'_, PageResult> {
+    pub fn wait(&mut self) -> Operation<'_, AcquiredPage> {
         Box::pin(poll_fn(move |cx| {
             if let Err(error) = self.scope.cancellation.register(cx.waker()) {
                 self.registration.cancel(error);
@@ -541,7 +551,10 @@ impl CopyWaiter<'_> {
                     return Poll::Ready(Err(error));
                 }
                 if let Some(result) = &entry.result {
-                    return Poll::Ready(Ok(result.clone()));
+                    return Poll::Ready(Ok(result.clone().into()));
+                }
+                if let Some(copy) = &entry.ciphertext {
+                    return Poll::Ready(Ok(AcquiredPage::Ciphertext(copy.clone())));
                 }
                 store_waker(&mut waiter.waker, cx);
                 Poll::Pending
@@ -605,10 +618,15 @@ impl Flights {
             return Err(Error::Unavailable);
         }
         let result = entry.and_then(|entry| {
-            entry.result.as_ref().or(match &entry.outcome {
-                Some(Outcome::Published(result)) => Some(result),
-                _ => None,
-            })
+            entry
+                .result
+                .as_ref()
+                .map(PageResult::copy)
+                .or_else(|| entry.ciphertext.as_ref().map(|p| p.copy.clone()))
+                .or_else(|| match &entry.outcome {
+                    Some(Outcome::Published(result)) => Some(result.copy()),
+                    _ => None,
+                })
         });
         if result.is_some_and(|result| {
             !availability.page(
@@ -642,6 +660,18 @@ impl Flights {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Result<JoinedFlight<'a>> {
+        self.join_for(page, membership, context, scope, budget, true)
+    }
+
+    pub(crate) fn join_for<'a>(
+        self: &Rc<Self>,
+        page: PageId,
+        membership: MembershipLease,
+        context: &'a OriginContext,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        plaintext: bool,
+    ) -> Result<JoinedFlight<'a>> {
         validate_context(&page, context)?;
         scope.check()?;
         self.update(|table, wakes| {
@@ -654,6 +684,11 @@ impl Flights {
                 if let Some(result) = &entry.result {
                     return Ok(JoinedFlight::Complete(result.clone()));
                 }
+                if !plaintext {
+                    if let Some(copy) = &entry.ciphertext {
+                        return Ok(JoinedFlight::Ciphertext(copy.clone()));
+                    }
+                }
                 if let Some(error) = entry.error {
                     return Err(error);
                 }
@@ -664,7 +699,12 @@ impl Flights {
             if crate::runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
-            if budget.attempts == 0 {
+            if budget.attempts == 0
+                && table
+                    .entries
+                    .get(&page)
+                    .is_none_or(|e| e.ciphertext.is_none())
+            {
                 return Err(Error::Unavailable);
             }
             let reservation = self.admission.reserve(
@@ -700,6 +740,7 @@ impl Flights {
                         operations: HashMap::default(),
                         outcome: None,
                         result: None,
+                        ciphertext: None,
                         error: None,
                         drain_waker: None,
                         _reservation: flight,
@@ -716,6 +757,7 @@ impl Flights {
                 WaiterRecord {
                     scope: scope.clone(),
                     acquisition: true,
+                    plaintext,
                     budget_deadline: budget.deadline,
                     issued: false,
                     error: None,
@@ -760,6 +802,9 @@ impl Flights {
             if let Some(result) = &entry.result {
                 return Ok(JoinedCopy::Complete(result.clone()));
             }
+            if let Some(copy) = &entry.ciphertext {
+                return Ok(JoinedCopy::Ciphertext(copy.clone()));
+            }
             if matches!(entry.state, FlightState::Failed | FlightState::Draining) {
                 return Ok(JoinedCopy::Miss);
             }
@@ -778,6 +823,7 @@ impl Flights {
                 WaiterRecord {
                     scope: scope.clone(),
                     acquisition: false,
+                    plaintext: false,
                     budget_deadline: scope.deadline.0,
                     issued: false,
                     error: None,
@@ -801,7 +847,35 @@ impl Flights {
     /// page. Wake all readers with clones of the complete credential-free bundle.
     /// This cannot update a current-version freshness pointer. Release raw caller
     /// borrows at request completion; owned I/O/crypto state still obeys its fences.
-    pub fn publish(&self, mut leader: FlightLeader, page: PageResult) -> Result<FlightState> {
+    pub fn publish(&self, leader: FlightLeader, page: PageResult) -> Result<FlightState> {
+        self.publish_acquired(leader, page.into())
+    }
+
+    pub(crate) fn ciphertext_for(&self, leader: &FlightLeader) -> Result<Option<UnverifiedPage>> {
+        self.update(|table, wakes| Ok(self.leader_entry(table, leader, wakes)?.ciphertext.clone()))
+    }
+
+    pub(crate) fn discard_ciphertext(&self, leader: &FlightLeader) -> Result<()> {
+        self.update(|table, wakes| {
+            self.leader_entry(table, leader, wakes)?.ciphertext = None;
+            Ok(())
+        })
+    }
+    pub(crate) fn has_plaintext_reader(&self, leader: &FlightLeader) -> Result<bool> {
+        self.update(|table, wakes| {
+            Ok(self
+                .leader_entry(table, leader, wakes)?
+                .waiters
+                .values()
+                .any(|w| w.plaintext && w.error.is_none()))
+        })
+    }
+
+    pub(crate) fn publish_acquired(
+        &self,
+        mut leader: FlightLeader,
+        page: AcquiredPage,
+    ) -> Result<FlightState> {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
             page.validate_for(&entry.fence.page)?;
@@ -1134,10 +1208,22 @@ fn settle(entry: &mut Entry, wakes: &mut Vec<Waker>) {
     if let Some(outcome) = entry.outcome.take() {
         entry.leader = None;
         match outcome {
-            Outcome::Published(result) => {
-                entry.result = Some(result);
-                entry.state = FlightState::Complete;
-            }
+            Outcome::Published(result) => match result {
+                AcquiredPage::Plaintext(page) => {
+                    entry.result = Some(page);
+                    entry.ciphertext = None;
+                    entry.state = FlightState::Complete;
+                }
+                AcquiredPage::Ciphertext(page) => {
+                    entry.ciphertext = Some(page);
+                    entry.state = FlightState::RetryPending;
+                    for waiter in entry.waiters.values_mut() {
+                        if waiter.plaintext {
+                            waiter.issued = false;
+                        }
+                    }
+                }
+            },
             Outcome::Failed(error) => {
                 entry.error = Some(error);
                 entry.state = FlightState::Failed;
@@ -1193,7 +1279,10 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         revoke(entry, error, wakes);
     }
     settle(entry, wakes);
-    if entry.state == FlightState::RetryPending && !entry.waiters.values().any(eligible) {
+    if entry.state == FlightState::RetryPending
+        && entry.ciphertext.is_none()
+        && !entry.waiters.values().any(eligible)
+    {
         entry.outcome = Some(Outcome::Failed(Error::Unavailable));
         settle(entry, wakes);
     }
@@ -1385,7 +1474,9 @@ mod tests {
             .unwrap()
         {
             JoinedFlight::Waiter(waiter) => waiter,
-            JoinedFlight::Complete(_) => panic!("unexpected completed entry"),
+            JoinedFlight::Complete(_) | JoinedFlight::Ciphertext(_) => {
+                panic!("unexpected completed entry")
+            }
         }
     }
     fn poll<T>(mut future: Operation<'_, T>) -> Poll<Result<T>> {
@@ -2110,7 +2201,7 @@ mod tests {
         assert!(poll(copy.wait()).is_pending());
         operation.complete().unwrap();
         let shared = match poll(copy.wait()) {
-            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Ok(result)) => result.verified(),
             _ => panic!("expected result"),
         };
         assert!(std::sync::Arc::ptr_eq(
@@ -2302,8 +2393,10 @@ mod tests {
         result: PageResult,
     ) -> Result<PageResult> {
         match flights.join(page.clone(), membership, context, scope, budget)? {
+            JoinedFlight::Ciphertext(_) => Err(Error::CorruptRecord),
             JoinedFlight::Complete(result) => Ok(result),
             JoinedFlight::Waiter(mut caller) => match caller.wait().await? {
+                AcquisitionEvent::Ciphertext(_) => Err(Error::CorruptRecord),
                 AcquisitionEvent::Complete(result) => Ok(result),
                 AcquisitionEvent::Failed(error) => Err(error),
                 AcquisitionEvent::Lead(leader) => {
@@ -2333,12 +2426,13 @@ mod tests {
         let ticket = flights.abandon(abandoned)?;
         flights.finish_draining(ticket).await?;
         match flights.join_copy(&page, scope)? {
+            JoinedCopy::Ciphertext(_) => Err(Error::CorruptRecord),
             JoinedCopy::Miss => Ok(None),
             JoinedCopy::Complete(result) => Ok(Some(result)),
             JoinedCopy::Waiter(mut waiter) => {
                 let result = waiter.wait().await?;
                 waiter.detach()?;
-                Ok(Some(result))
+                Ok(Some(result.verified()))
             }
         }
     }

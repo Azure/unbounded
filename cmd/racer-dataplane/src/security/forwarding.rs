@@ -574,13 +574,15 @@ fn response_hop_head(
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
     if outcome == "not-found"
-        && (field(request, "racer-operation")? != "metadata"
-            || field(request, "racer-mode")? != "acquire"
+        && (!matches!(
+            field(request, "racer-operation")?.as_str(),
+            "metadata" | "bootstrap"
+        ) || field(request, "racer-mode")? != "acquire"
             || field(request, "racer-selector")? != "fresh")
     {
         return Err(Error::Unauthorized);
     }
-    if outcome != "page" && outcome != "metadata" {
+    if outcome != "page" && outcome != "metadata" && outcome != "bootstrap" {
         return Ok(());
     }
     if field(request, "racer-operation")? != outcome {
@@ -599,6 +601,15 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
     if outcome == "page" && field(response, "racer-page")? != field(request, "racer-page")? {
         return Err(Error::Unauthorized);
     }
+    if outcome == "bootstrap" {
+        let length = protocol::number(response, "racer-length")?;
+        let present = protocol::number(response, "racer-page-present")?;
+        if present != u64::from(length != 0)
+            || (present == 1 && protocol::number(response, "racer-page")? != 0)
+        {
+            return Err(Error::Unauthorized);
+        }
+    }
     Ok(())
 }
 /// A relay may report its own failure, but only the requested destination may
@@ -610,7 +621,7 @@ fn response_authority(
 ) -> Result<()> {
     if matches!(
         field(response, "racer-outcome")?.as_str(),
-        "page" | "metadata" | "not-found"
+        "page" | "metadata" | "bootstrap" | "not-found"
     ) && signer != &node_field(request, "racer-route-destination")?
     {
         return Err(Error::Unauthorized);
@@ -732,6 +743,96 @@ mod tests {
             response: PeerResponse::Miss,
         }
     }
+    #[test]
+    fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
+        use crate::memory::pool::tests::bundle_for;
+        use crate::model::metadata::{ExpiresAt, ObjectMetadata};
+        let mut request = request(90);
+        request.operation = Operation::Bootstrap {
+            object: request.origin.object.clone(),
+            mode: FetchMode::Acquire,
+        };
+        request.route.remaining_attempts = 2;
+        let head = protocol::request_head(&request).unwrap();
+        let mut metadata = ObjectMetadata {
+            version: ObjectVersion {
+                object: request.origin.object.clone(),
+                etag: StrongEtag::test_value("bootstrap"),
+            },
+            length: 0,
+            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+        };
+        let empty = protocol::response_head(
+            &PeerResponse::Bootstrap {
+                metadata: metadata.clone(),
+                page_zero: None,
+            },
+            &[0; 32],
+            &[node(0), node(2)],
+        )
+        .unwrap();
+        assert_eq!(response_matches(&empty, &head), Ok(()));
+        assert_eq!(
+            response_authority(&empty, &head, &node(1)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(response_authority(&empty, &head, &node(2)), Ok(()));
+        metadata.length = 3;
+        let admission = std::rc::Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let page = bundle_for(&admission, metadata.immutable());
+        let response = protocol::response_head(
+            &PeerResponse::Bootstrap {
+                metadata: metadata.clone(),
+                page_zero: Some(page.ciphertext),
+            },
+            &[0; 32],
+            &[node(0), node(2)],
+        )
+        .unwrap();
+        assert_eq!(response_matches(&response, &head), Ok(()));
+        for name in [
+            "racer-page",
+            "racer-page-present",
+            "racer-cache",
+            "racer-key",
+        ] {
+            let mut bad = crate::http::codec::Codec::new(65536, 32)
+                .decode_head(
+                    &crate::http::codec::Codec::new(65536, 32)
+                        .encode_head(&response)
+                        .unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .0;
+            bad.headers
+                .iter_mut()
+                .find(|h| h.name == name)
+                .unwrap()
+                .value = b"9".to_vec();
+            assert!(response_matches(&bad, &head).is_err(), "{name}");
+        }
+        request.operation = Operation::Metadata {
+            object: request.origin.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        };
+        assert!(response_matches(&response, &protocol::request_head(&request).unwrap()).is_err());
+        assert!(
+            protocol::response_head(
+                &PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: None
+                },
+                &[0; 32],
+                &[node(0), node(2)]
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn every_signed_request_field_must_agree_with_the_logical_request() {
         let signatures = network(3);

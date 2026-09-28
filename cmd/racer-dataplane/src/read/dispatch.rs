@@ -591,6 +591,9 @@ impl WorkerDirectory {
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             let owner = match &request.request().operation {
+                crate::peer::wire::Operation::Bootstrap { object, .. } => {
+                    self.metadata_owner(object)?
+                }
                 crate::peer::wire::Operation::Page { page, .. } => self.page_owner(page)?,
                 crate::peer::wire::Operation::Metadata { object, .. } => {
                     self.metadata_owner(object)?

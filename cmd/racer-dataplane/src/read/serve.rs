@@ -336,6 +336,7 @@ impl LocalPageService for Coordinator {
                 return Err(Error::Unauthorized);
             }
             let object = match &request.operation {
+                PeerOperation::Bootstrap { object, .. } => object,
                 PeerOperation::Page { page, .. } => &page.version.object,
                 PeerOperation::Metadata { object, .. } => object,
             };
@@ -361,6 +362,17 @@ impl LocalPageService for Coordinator {
             // Copy-only never opens credentials and never invokes acquisition.
             // The ingress lease is still retained while serving those bytes.
             let result = match request.operation {
+                PeerOperation::Bootstrap {
+                    object,
+                    mode: FetchMode::CopyOnly,
+                } => {
+                    let context = OriginContext {
+                        object,
+                        metadata: None,
+                        authorization: None,
+                    };
+                    self.metadata.bootstrap_copy(&context, &effective).await
+                }
                 PeerOperation::Page {
                     page,
                     mode: FetchMode::CopyOnly,
@@ -406,15 +418,30 @@ impl LocalPageService for Coordinator {
                     let mut budget = inherited_budget(&request.route, &effective)?;
                     let context = self.open_context(request.origin)?;
                     match operation {
+                        PeerOperation::Bootstrap {
+                            mode: FetchMode::Acquire,
+                            ..
+                        } => {
+                            self.fill.record_peer_bootstrap()?;
+                            self.metadata
+                                .bootstrap_peer(membership, &context, &effective, &mut budget)
+                                .await
+                        }
                         PeerOperation::Page {
                             page,
                             mode: FetchMode::Acquire,
                         } => self
                             .fill
-                            .acquire(page.clone(), membership, &context, &effective, &mut budget)
+                            .acquire_ciphertext(
+                                page.clone(),
+                                membership,
+                                &context,
+                                &effective,
+                                &mut budget,
+                            )
                             .await
                             .and_then(|page_result| {
-                                page_result.validate_for(&page)?;
+                                page_result.validate_metadata()?;
                                 Ok(PeerResponse::Page {
                                     metadata: page_result.metadata,
                                     ciphertext: page_result.ciphertext,

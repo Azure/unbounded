@@ -156,6 +156,9 @@ impl LocalPageService for CandidateService {
                 wire::Operation::Metadata {
                     mode: FetchMode::Acquire,
                     ..
+                } | wire::Operation::Bootstrap {
+                    mode: FetchMode::Acquire,
+                    ..
                 }
             ));
             let inherited = super::serve::inherited_budget(&logical.route, scope)?;

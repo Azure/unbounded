@@ -298,14 +298,23 @@ impl PeerServer {
             }
             let body = match &response.response {
                 PeerResponse::Page { ciphertext, .. } => ciphertext.bytes(),
+                PeerResponse::Bootstrap {
+                    page_zero: Some(ciphertext),
+                    ..
+                } => ciphertext.bytes(),
                 _ => &[],
             };
             let head = WireCodec::encode(&response.authentication, true, body.len())?;
             let sent = self.io.send_head(connection, head, &request_scope).await?;
             let mut connection = sent.connection;
             if !body.is_empty() {
-                let PeerResponse::Page { ciphertext, .. } = &response.response else {
-                    return Err(Error::InvalidRequest);
+                let ciphertext = match &response.response {
+                    PeerResponse::Page { ciphertext, .. }
+                    | PeerResponse::Bootstrap {
+                        page_zero: Some(ciphertext),
+                        ..
+                    } => ciphertext,
+                    _ => return Err(Error::InvalidRequest),
                 };
                 let sent = self
                     .io

@@ -984,3 +984,134 @@ fn production_peer_and_failed_neighbor_progress() {
         assert!(processes[receiver].stop(libc::SIGTERM).success());
     }
 }
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate bootstrap"]
+fn production_remote_bootstrap_one_get_and_empty() {
+    use racer_dataplane::{
+        model::identity::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
+        topology::{
+            membership::{Member, Membership},
+            placement::Placement,
+        },
+    };
+    for length in [0, 113] {
+        let roots: Vec<_> = (0..4).map(|_| Scratch::new()).collect();
+        let profile = Profile::new(1, length, 1);
+        let control = control::Control::start_with(&roots[0].0, profile.caches.clone());
+        let sockets: Vec<_> = (0..4)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ids: Vec<_> = (0..4)
+            .map(|i| {
+                if i == 0 {
+                    NODE.to_owned()
+                } else {
+                    format!("33333333-3333-4333-8333-{i:012x}")
+                }
+            })
+            .collect();
+        let members: Vec<_> = ids
+            .iter()
+            .zip(&sockets)
+            .map(|(id, socket)| Member {
+                node: NodeId(id.clone()),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: socket.local_addr().unwrap().to_string(),
+                rails: vec![],
+                alignment_enabled: false,
+            })
+            .collect();
+        control.publication.lock().unwrap().members = members.clone();
+        let membership = Arc::new(Membership::validate(MembershipVersion(1), members).unwrap());
+        let ranked = Placement::new(128)
+            .rank(
+                membership,
+                &ObjectId {
+                    cache: CacheId(profile.caches[0].0.clone()),
+                    key: CacheKey([0; 32]),
+                },
+                PageNumber(0),
+            )
+            .unwrap();
+        let receiver = ids
+            .iter()
+            .position(|id| !ranked.ordered.iter().any(|n| &n.0 == id))
+            .unwrap();
+        let source = ids
+            .iter()
+            .position(|id| &ranked.ordered[0].0 == id)
+            .unwrap();
+        let addresses: Vec<_> = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
+        drop(sockets);
+        let mut processes = Vec::new();
+        let mut origins = Vec::new();
+        for i in 0..4 {
+            if i != 0 {
+                fs::copy(roots[0].0.join("trust.pem"), roots[i].0.join("trust.pem")).unwrap();
+                fs::write(
+                    roots[i].0.join("token"),
+                    format!("fixture.token.{}", ids[i]),
+                )
+                .unwrap();
+                fs::create_dir_all(roots[i].0.join("secrets/epoch")).unwrap();
+                fs::copy(
+                    roots[0].0.join("secrets/epoch/bundle.json"),
+                    roots[i].0.join("secrets/epoch/bundle.json"),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink("epoch", roots[i].0.join("secrets/..data")).unwrap();
+            }
+            let mut configured = profile.clone();
+            configured.peer = Some(addresses[i]);
+            let (process, origin) =
+                Process::start_profile(&roots[i], &control, 0, Some(&configured));
+            processes.push(process);
+            origins.push(origin);
+        }
+        let mut socket = connect(&socket_path(&processes[receiver], 0)).unwrap();
+        write!(socket, "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n", 0).unwrap();
+        if length == 0 {
+            let head = read_head(&mut socket).unwrap();
+            assert!(head.starts_with("HTTP/1.1 200 "));
+            let fields = fields(&head);
+            assert_eq!(fields["content-length"], "0");
+            assert_eq!(fields["etag"], "\"restart-v1\"");
+            assert!(!fields.contains_key("content-range"));
+            let mut rest = Vec::new();
+            socket.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty());
+        } else {
+            assert_eq!(
+                measurement::response(
+                    &mut BufReader::new(socket),
+                    &Expected {
+                        start: 0,
+                        end: length,
+                        length
+                    },
+                    |offset| object_byte(0, offset),
+                    Duration::ZERO
+                ),
+                Ok(length)
+            );
+        }
+        let calls: Vec<_> = origins.iter().flatten().flat_map(|o| o.calls()).collect();
+        assert_eq!(calls.len(), 1, "one origin request for remote bootstrap");
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].pin, None);
+        assert_eq!(calls[0].range.as_deref(), Some("bytes=0-16777215"));
+        assert_eq!(
+            counters(&processes[source])["racer_peer_bootstraps_total"],
+            1
+        );
+        assert_eq!(counters(&processes[source])["racer_page_decrypts_total"], 0);
+        assert_eq!(
+            counters(&processes[receiver])["racer_page_decrypts_total"],
+            u64::from(length != 0)
+        );
+        for process in &mut processes {
+            assert!(process.stop(libc::SIGTERM).success());
+        }
+    }
+}

@@ -47,11 +47,13 @@ const DEFAULT_LINKS: u8 = 96;
 struct RefreshKey {
     object: ObjectId,
     pin: Option<StrongEtag>,
+    bootstrap: bool,
 }
 impl RefreshKey {
     fn new(object: &ObjectId, selector: &MetadataSelector) -> Self {
         Self {
             object: object.clone(),
+            bootstrap: false,
             pin: match selector {
                 MetadataSelector::Fresh => None,
                 MetadataSelector::Pinned(etag) => Some(etag.clone()),
@@ -73,7 +75,7 @@ struct Refresh {
 #[derive(Clone)]
 struct RefreshOutput {
     metadata: ObjectMetadata,
-    page: Option<super::fill::PageResult>,
+    page: Option<crate::memory::page::AcquiredPage>,
 }
 #[derive(Default)]
 struct RefreshTable {
@@ -470,9 +472,10 @@ impl MetadataService {
                     });
                 }
             }
-            let registration = self
-                .refreshes
-                .join(RefreshKey::new(&context.object, &selector), self.capacity)?;
+            let mut key = RefreshKey::new(&context.object, &selector);
+            // HEAD cannot join a body-fetching bootstrap leader or elect one.
+            key.bootstrap = bootstrap;
+            let registration = self.refreshes.join(key, self.capacity)?;
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
@@ -590,10 +593,17 @@ impl MetadataService {
             .candidates
             .candidates_async(membership.clone(), &context.object, PageNumber(0))
             .await?;
-        let operation = PeerOperation::Metadata {
-            object: context.object.clone(),
-            selector: selector.clone(),
-            mode: FetchMode::Acquire,
+        let operation = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
+            PeerOperation::Bootstrap {
+                object: context.object.clone(),
+                mode: FetchMode::Acquire,
+            }
+        } else {
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: selector.clone(),
+                mode: FetchMode::Acquire,
+            }
         };
         let mut bootstrap_page = None;
         let metadata = match self
@@ -602,6 +612,24 @@ impl MetadataService {
             .await?
         {
             CandidateResolution::Copy(response) => match response.response() {
+                PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero,
+                } if bootstrap => {
+                    if let Some(ciphertext) = page_zero {
+                        bootstrap_page = Some(crate::memory::page::AcquiredPage::Ciphertext(
+                            crate::memory::page::UnverifiedPage {
+                                copy: crate::memory::page::CiphertextCopy {
+                                    metadata: metadata.clone(),
+                                    ciphertext: ciphertext.clone(),
+                                },
+                                disk_token: None,
+                            },
+                        ));
+                    }
+                    metadata.clone()
+                }
+                PeerResponse::Bootstrap { .. } => return Err(Error::CorruptRecord.into()),
                 PeerResponse::Metadata(metadata) => metadata.clone(),
                 PeerResponse::OriginRejected => {
                     return Err(RefreshFailure::Rejected(Error::OriginRejected));
@@ -681,7 +709,7 @@ impl MetadataService {
                         version: reply.metadata.version.clone(),
                         number: PageNumber(0),
                     })?;
-                    bootstrap_page = Some(result);
+                    bootstrap_page = Some(result.into());
                 }
                 reply.metadata
             }
@@ -699,6 +727,97 @@ impl MetadataService {
             page: bootstrap_page,
         })
     }
+    pub(crate) async fn bootstrap_copy(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<PeerResponse> {
+        let Some(metadata) = self
+            .copy_only(MetadataSelector::Fresh, context, scope)
+            .await?
+        else {
+            return Ok(PeerResponse::Miss);
+        };
+        if metadata.length == 0 {
+            return Ok(PeerResponse::Bootstrap {
+                metadata,
+                page_zero: None,
+            });
+        }
+        let page = PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        };
+        match self.storage.fill.copy_only(&page, scope).await? {
+            Some((descriptor, ciphertext)) => {
+                validate_bootstrap_metadata(&metadata, &descriptor)?;
+                Ok(PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: Some(ciphertext),
+                })
+            }
+            None => Ok(PeerResponse::Miss),
+        }
+    }
+
+    pub(crate) async fn bootstrap_peer(
+        &self,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PeerResponse> {
+        if let response @ PeerResponse::Bootstrap { .. } =
+            self.bootstrap_copy(context, scope).await?
+        {
+            return Ok(response);
+        }
+        let output = self
+            .resolve_inner(
+                MetadataSelector::Fresh,
+                membership.clone(),
+                context,
+                scope,
+                budget,
+                false,
+                true,
+            )
+            .await?;
+        if output.metadata.length == 0 {
+            return Ok(PeerResponse::Bootstrap {
+                metadata: output.metadata,
+                page_zero: None,
+            });
+        }
+        let ciphertext = match output.page {
+            Some(page) => page.copy().ciphertext,
+            None => {
+                self.storage
+                    .fill
+                    .acquire_ciphertext(
+                        PageId {
+                            version: output.metadata.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        membership,
+                        context,
+                        scope,
+                        budget,
+                    )
+                    .await?
+                    .ciphertext
+            }
+        };
+        output
+            .metadata
+            .immutable()
+            .validate_page(ciphertext.envelope())?;
+        Ok(PeerResponse::Bootstrap {
+            metadata: output.metadata,
+            page_zero: Some(ciphertext),
+        })
+    }
+
     pub fn copy_only<'a>(
         &'a self,
         selector: MetadataSelector,
@@ -809,7 +928,19 @@ impl MetadataService {
                     number: PageNumber(0),
                 };
                 let result = match resolved.page {
-                    Some(page) => Ok(page),
+                    Some(crate::memory::page::AcquiredPage::Plaintext(page)) => Ok(page),
+                    Some(crate::memory::page::AcquiredPage::Ciphertext(copy)) => {
+                        self.storage
+                            .fill
+                            .accept_ciphertext(
+                                copy.copy,
+                                membership.clone(),
+                                context,
+                                scope,
+                                budget,
+                            )
+                            .await
+                    }
                     None => {
                         self.storage
                             .fill

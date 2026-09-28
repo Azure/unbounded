@@ -199,6 +199,61 @@ CRC64 and rotating request MAC remain to be delivered.
 
 ### Current scope and compatibility
 
+### Continued acquisition/bootstrap increment
+
+The page flight now has ciphertext-ready state and a single elected plaintext
+promotion in the same table. `UnverifiedPage` cannot enter client delivery;
+`AcquiredPage` explicitly separates it from PageResult. CopyOnly and peer Acquire
+can consume ciphertext without plaintext allocation/decrypt on pending/disk hits.
+Plaintext waiters elect one promotion, preserving the original ciphertext, disk
+invalidation token, remaining budget, and completion fences. Origin encryption
+remains elected once; origin-produced plaintext is retained for concurrent local
+readers. Requester copy validation remains mandatory and corrupt-copy fallback
+retains existing bounded candidate policy. New counters expose page decrypts and
+peer Bootstrap acquisitions.
+
+Peer v3 adds explicit Bootstrap through codec, signature binding, forwarding,
+candidate policy, dispatch, metadata coordinator and HTTP body transport. Empty
+objects have metadata only. HEAD and Bootstrap refresh keys differ so a HEAD
+cannot acquire body-fetch side effects. Bootstrap responses retain unverified
+ciphertext until the local plaintext consumer enters the page flight. The four
+actual-Application test proves a cold noncandidate gets one logical Bootstrap,
+exactly one unpinned origin GET, no HEAD, zero candidate decrypts, and one requester
+decrypt for a nonempty object (zero for empty). Signed checks cover destination,
+intent, object, page-zero and presence/length agreement; wire tests reject v1/v2,
+unknown profiles, and the old exchange target. Bootstrap uses HTTP because rail
+selection needs the not-yet-known ETag; native fault tests now explicitly request
+a pinned page and retain all required native fault coverage.
+
+Compatibility supersedes the earlier partial handoff below: peer signed profile
+and outer exchange are v3, requiring a coordinated upgrade, with no downgrade.
+Existing v2 session endpoint/digest domains remain, but their signed profile is
+v3. Records remain v1, control and client/origin HTTP remain unchanged. No Go peer
+codec exists in this checkout; no unrelated Go control schema is changed.
+
+Bounded verification for this increment (same mandatory external timeout prefix):
+
+| Command | Result |
+| --- | --- |
+| `cargo test --locked --all-features --lib ciphertext_ready -j 2 -- --test-threads=2 --quiet` | One passed: zero ciphertext-serving decrypts, one shared plaintext promotion, one ingest. |
+| `cargo test --locked --all-features --lib read:: -j 2 -- --test-threads=2 --quiet` | 109 passed. |
+| `cargo test --locked --all-features --lib security:: -j 2 -- --test-threads=2 --quiet` | 59 passed. |
+| `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet` | 743 passed, seven explicit ignores, 61.77 s. |
+| `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet` | All 14 selected process tests passed, 115.78 s. |
+| `cargo test --locked --all-features --test production_dataplane --test client_origin_conformance -j 2 -- --test-threads=2 --quiet` | Production 13 passed/two ignores, conformance 19 passed/one ignore. |
+
+Initial failures were fixture expectations: empty Bootstrap is HTTP 200 (the
+range measurement oracle requires 206), remote absence now permits explicit
+Bootstrap, and native-fault injection must use a known pinned page. No tests were
+removed or required coverage weakened. No external timeout fired.
+
+Still outstanding: comprehensive new Bootstrap corruption/credential/version
+mutation cases, durable ciphertext-only memory residency, full disk/page/network
+recycling, CRC64/versioned records, and rotating shared-key MAC. Existing mutation,
+credential retry, disk invalidation, version and cancellation regressions pass.
+
+### Historical partial handoff (superseded above for A/B)
+
 This is a partial Phase 4 implementation, not full phase acceptance.
 
 | Goal | Delivered | Still required |
