@@ -46,6 +46,62 @@ fn assembly_applies_configured_client_request_timeout() {
 }
 
 #[test]
+fn distributed_peer_listener_recovers_from_queue_pressure() {
+    let mut config = crate::test_support::cluster::config(false);
+    config.limits.queue_entries = NonZeroUsize::new(8).unwrap();
+    let node = Arc::new(NodeState::default());
+    let (app, runtime, _) = local_worker(&config, &node, 0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let scope = scope(Duration::from_secs(5)).unwrap();
+    let mut serving = app.peers.listen(address, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
+    let mut pressure = Vec::new();
+    for _ in 0..8 {
+        let mut wait = runtime
+            .reactor
+            .readiness(reader.clone(), libc::POLLIN as u32, &scope);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        pressure.push(wait);
+    }
+    for _ in 0..32 {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runtime.reactor.in_flight(), 8);
+    }
+    let _client = std::net::TcpStream::connect(address).unwrap();
+    drop(pressure);
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Some(accepted) = node
+            .ingress
+            .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+            .unwrap()[0]
+            .take()
+        {
+            assert!(matches!(accepted.kind, crate::runtime::ingress::Kind::Peer));
+            break;
+        }
+        assert!(Instant::now() < until, "distributed peer accept stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    scope.cancel().unwrap();
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+            assert_eq!(result, Err(Error::Cancelled));
+            break;
+        }
+        assert!(Instant::now() < until, "peer cancellation stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+#[test]
 fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     use crate::telemetry::metrics::{Event, Gauge};
     let config = crate::test_support::cluster::config(false);

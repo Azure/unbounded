@@ -1208,6 +1208,40 @@ mod tests {
     }
 
     #[test]
+    fn client_listener_readiness_recovers_from_queue_pressure() {
+        let mut limits = limits();
+        limits.queue_entries = NonZeroUsize::new(8).unwrap();
+        let fixture = Fixture::with_limits(limits);
+        fixture.reconcile(&[definition()]).unwrap();
+        let scope = scope();
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut pressure = Vec::new();
+        for _ in 0..8 {
+            let mut wait = fixture
+                .reactor
+                .readiness(reader.clone(), libc::POLLIN as u32, &scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            pressure.push(wait);
+        }
+        for _ in 0..32 {
+            fixture.listeners.poll_budgeted(&mut cx, 16).unwrap();
+            assert_eq!(fixture.reactor.in_flight(), 8);
+        }
+        drop(pressure);
+        let mut client = fixture.connect();
+        client
+            .write_all(&request("HEAD", "Connection: close\r\n"))
+            .unwrap();
+        assert!(
+            fixture
+                .receive(&mut client, true)
+                .starts_with(b"HTTP/1.1 200")
+        );
+    }
+
+    #[test]
     fn crash_owner_child() {
         let Ok(root) = std::env::var("RACER_SOCKET_CRASH_ROOT") else {
             return;

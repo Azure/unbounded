@@ -111,6 +111,52 @@ fn good_resources() -> super::super::health::Resources {
 }
 
 #[test]
+fn diagnostic_accept_recovers_after_full_entry_table() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
+    let admission = Rc::new(Admission::new(limits));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
+    let telemetry = Telemetry::default();
+    telemetry.health.observe(good_resources()).unwrap();
+    telemetry
+        .health
+        .transition(super::super::health::State::Ready)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let scope = scope();
+    let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = Rc::new(OwnedFd::from(reader));
+    let mut pressure = Vec::new();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..8 {
+        let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &scope);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        pressure.push(wait);
+    }
+    assert_eq!(reactor.in_flight(), 8);
+    for _ in 0..32 {
+        assert!(server.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(reactor.in_flight(), 8);
+    }
+    drop(pressure);
+    for path in ["/readyz", "/metrics"] {
+        let response = exchange_raw(
+            address,
+            format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes(),
+            &mut server,
+            &reactor,
+        );
+        assert_response(&response, "200 OK", None);
+    }
+    finish(server, &scope, &reactor);
+    assert_eq!(reactor.in_flight(), 0);
+    assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
+}
+
+#[test]
 fn failure_endpoint_exports_full_ring_with_maximum_numeric_fields() {
     use crate::{
         model::identity::{AttemptId, WorkerId},

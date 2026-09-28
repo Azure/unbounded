@@ -2586,6 +2586,107 @@ fn healthy_relayed_page_reads() {
 }
 
 #[test]
+fn listeners_survive_repeated_reactor_queue_pressure() {
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(73);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
+    harness.add(None);
+    // The DST harness bypasses control enrollment and already attaches diagnostic
+    // resources; install the same service task as start_diagnostics.
+    let app = &mut harness.nodes[0].app;
+    let diagnostic_scope = scope(Duration::from_secs(30)).unwrap();
+    app.diagnostic_scope = Some(diagnostic_scope.clone());
+    let telemetry = app.telemetry.clone();
+    let listen = app.diagnostics_address;
+    app.diagnostic_task = Some(Box::pin(async move {
+        telemetry.serve(listen, &diagnostic_scope).await
+    }));
+    harness.tick();
+    let reactor = harness.nodes[0].runtime.reactor.clone();
+    let limit = harness.nodes[0].config.limits.queue_entries.get();
+    let address = SocketAddress::Inet(harness.nodes[0].config.diagnostics_listen);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for round in 0..4 {
+        // Complete the existing diagnostic accept, then fill the shared table
+        // before the service consumes that CQE and submits its next accept.
+        let probe = sim.connect(address.clone()).unwrap();
+        let peer = sim
+            .connect(SocketAddress::Inet(harness.nodes[0].config.peer_listen))
+            .unwrap();
+        reactor.poll_budgeted(128).unwrap();
+        reactor.poll_budgeted(128).unwrap();
+        let pressure_scope = scope(Duration::from_secs(30)).unwrap();
+        let (reader, _writer) = sim.socket_pair();
+        let reader = Rc::new(reader);
+        let mut pressure = Vec::new();
+        while reactor.in_flight() < limit {
+            let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &pressure_scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            pressure.push(wait);
+        }
+        for _ in 0..32 {
+            harness.nodes[0].app.poll_budgeted(&mut cx, 64).unwrap();
+            assert_eq!(reactor.in_flight(), limit);
+            assert!(harness.nodes[0].app.diagnostic_task.is_some());
+            assert!(harness.nodes[0].app.peer_task.is_some());
+        }
+        drop(probe);
+        drop(peer);
+        pressure_scope.cancel().unwrap();
+        drop(pressure);
+        for _ in 0..32 {
+            harness.tick();
+        }
+        for path in ["/readyz", "/metrics"] {
+            let socket = sim.connect(address.clone()).unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
+            assert_eq!(
+                handle(&socket).send(request.as_bytes()).unwrap(),
+                request.len()
+            );
+            let mut response = Vec::new();
+            let mut closed = false;
+            for _ in 0..1000 {
+                harness.tick();
+                let mut bytes = [0; 4096];
+                match handle(&socket).recv(&mut bytes) {
+                    Ok(0) => {
+                        closed = true;
+                        break;
+                    }
+                    Ok(count) => response.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert!(closed, "round {round} {path} stalled");
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
+        }
+        assert!(reactor.in_flight() < limit);
+    }
+    let worker = &mut harness.nodes[0].workers[0];
+    worker.app.stop_admission().unwrap();
+    worker
+        .app
+        .diagnostic_scope
+        .as_ref()
+        .unwrap()
+        .cancel()
+        .unwrap();
+    for _ in 0..32 {
+        worker.runtime.reactor.poll_budgeted(128).unwrap();
+        worker.app.poll_budgeted(&mut cx, 64).unwrap();
+    }
+    assert!(worker.app.diagnostic_task.is_none());
+    assert!(worker.app.peer_task.is_none());
+    assert_eq!(reactor.in_flight(), 0);
+}
+
+#[test]
 fn healthy_relayed_page_reads_opaque_opt_in() {
     healthy_relayed_page_reads_with_mode(true);
 }

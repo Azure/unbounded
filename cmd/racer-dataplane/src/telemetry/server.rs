@@ -144,7 +144,9 @@ pub(super) fn serve<'a>(
                 }
             }
             if accepting.is_none() && io.resources.active.get() < MAX_CONNECTIONS {
-                accepting = Some(io.reactor.accept(listener.clone(), scope));
+                accepting = Some(crate::runtime::listener::retry(scope, || {
+                    io.reactor.accept(listener.clone(), scope)
+                }));
             }
             if let Some(accept) = &mut accepting {
                 match accept.as_mut().poll(cx) {
