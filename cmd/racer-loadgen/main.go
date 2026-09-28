@@ -49,6 +49,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.Float64Var(&opts.image.Jitter, "jitter", 0.2, "Deterministic per-layer size jitter fraction in [0,1)")
 	f.StringVar(&opts.image.Seed, "seed", "benchmark-v1", "Content seed; keep identical on all nodes")
 	f.IntVar(&opts.catalogImages, "catalog-images", 1, "Number of deterministic images, 1-512; keep identical on all origins")
+	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle or zipf")
+	f.Float64Var(&opts.pull.ZipfExponent, "zipf-exponent", defaultZipfExponent, "Finite positive Zipf exponent; larger values increase skew (zipf profile only)")
 	f.DurationVar(&opts.startupTimeout, "startup-timeout", 0, "Deadline for serial catalog generation and hashing; zero disables the deadline")
 	f.StringVar(&opts.pull.Target, "target", "http://127.0.0.1:5000", "Gantry mirror URL (or origin URL for baseline)")
 	f.StringVar(&opts.pull.Namespace, "namespace", "loadgen.invalid", "Gantry upstream registry name sent as ns query parameter")
@@ -79,6 +81,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if opts.startupTimeout < 0 {
 		return opts, errors.New("startup-timeout must be nonnegative")
+	}
+
+	if err := validateProfile(opts.pull.Profile, opts.pull.ZipfExponent); err != nil {
+		return opts, err
 	}
 
 	return opts, nil
@@ -115,6 +121,8 @@ func run(parent context.Context, opts options) error {
 		return err
 	}
 	defer p.transport.CloseIdleConnections()
+
+	slog.Info("catalog selection configured", "profile", p.opts.Profile, "zipf_exponent", p.opts.ZipfExponent)
 
 	var ready atomic.Pointer[imageCatalog]
 

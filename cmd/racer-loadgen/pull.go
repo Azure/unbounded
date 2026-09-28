@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,6 +22,8 @@ import (
 )
 
 type pullOptions struct {
+	Profile          string
+	ZipfExponent     float64
 	Target           string
 	Namespace        string
 	Concurrency      int
@@ -40,11 +43,21 @@ type puller struct {
 	client    *http.Client
 	transport *http.Transport
 	buffers   sync.Pool
+	// Shared by workers; production uses the concurrency-safe package RNG.
+	randomFloat64 func() float64
 }
 
 func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
 	if img == nil || metrics == nil {
 		return nil, errors.New("image and metrics are required")
+	}
+
+	if opts.Profile == "" {
+		opts.Profile = profileShuffle
+	}
+
+	if err := validateProfile(opts.Profile, opts.ZipfExponent); err != nil {
+		return nil, err
 	}
 
 	if opts.Concurrency < 0 || opts.LayerConcurrency < 1 || opts.Timeout <= 0 || opts.RetryDelay <= 0 || opts.Interval < 0 {
@@ -75,7 +88,8 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 	transport.MaxIdleConnsPerHost = max(2, opts.Concurrency*opts.LayerConcurrency)
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
-		img: img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
+		randomFloat64: rand.Float64,
+		img:           img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
 		client: &http.Client{
 			Transport: transport,
 			// Read redirect responses as failures so every received body is accounted for.
@@ -94,10 +108,15 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 func (p *puller) run(ctx context.Context) {
 	defer p.transport.CloseIdleConnections()
 
+	var cdf []float64
+	if p.opts.Profile == profileZipf {
+		cdf = newZipfCDF(len(p.images), p.opts.ZipfExponent)
+	}
+
 	var workers sync.WaitGroup
 	for range p.opts.Concurrency {
 		workers.Go(func() {
-			var traversal catalogTraversal
+			traversal := catalogTraversal{zipfCDF: cdf, randomFloat64: p.randomFloat64}
 
 			for ctx.Err() == nil {
 				delay := p.opts.Interval

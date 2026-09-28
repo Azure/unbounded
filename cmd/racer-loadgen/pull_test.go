@@ -37,7 +37,8 @@ func pullTestImage(t *testing.T) *syntheticImage {
 
 func pullTestOptions(target string) pullOptions {
 	return pullOptions{
-		Target: target, Namespace: "registry.example:5000/a b&c", Concurrency: 1,
+		ZipfExponent: defaultZipfExponent,
+		Target:       target, Namespace: "registry.example:5000/a b&c", Concurrency: 1,
 		LayerConcurrency: 2, Timeout: 5 * time.Second, RetryDelay: 200 * time.Millisecond,
 		Verify: true,
 	}

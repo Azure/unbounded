@@ -5,14 +5,62 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
+	"sort"
 
 	"github.com/opencontainers/go-digest"
 )
 
 const maxCatalogImages = 512
+
+const (
+	profileShuffle      = "shuffle"
+	profileZipf         = "zipf"
+	defaultZipfExponent = 1.2
+)
+
+func validateProfile(profile string, exponent float64) error {
+	if profile != profileShuffle && profile != profileZipf {
+		return fmt.Errorf("profile must be shuffle or zipf, got %q", profile)
+	}
+
+	if math.IsNaN(exponent) || math.IsInf(exponent, 0) || exponent <= 0 {
+		return errors.New("zipf-exponent must be finite and positive")
+	}
+
+	return nil
+}
+
+// newZipfCDF builds a finite distribution with weight (index+1)^(-exponent).
+// Unlike rand.NewZipf, this supports every positive exponent, including <= 1.
+// Callers supply a nonempty catalog and a validated exponent. The table is
+// immutable and shared by workers; rank never depends on worker or node identity.
+func newZipfCDF(count int, exponent float64) []float64 {
+	cdf := make([]float64, count)
+
+	var total float64
+	for index := range cdf {
+		total += math.Pow(float64(index+1), -exponent)
+		cdf[index] = total
+	}
+
+	for index := range cdf {
+		cdf[index] /= total
+	}
+	// Close the distribution exactly, including when tiny tail weights round away.
+	cdf[count-1] = 1
+
+	return cdf
+}
+
+func zipfIndex(cdf []float64, draw float64) int {
+	// draw is in [0,1). Strict comparison skips zero-width, rounded-away bins.
+	return sort.Search(len(cdf), func(index int) bool { return cdf[index] > draw })
+}
 
 type imageCatalog struct {
 	images     []*syntheticImage
@@ -74,14 +122,21 @@ func catalogFromImages(images []*syntheticImage) *imageCatalog {
 	return c
 }
 
-// Each worker independently shuffles a complete pass. Randomness affects only
-// traversal, not catalog content. Failed attempts advance too, avoiding a hot key.
+// The zero value independently shuffles a complete pass, preserving the baseline.
+// Zipf draws with replacement on every attempt, including after failures.
+// Randomness affects only traversal, not catalog content or popularity rank.
 type catalogTraversal struct {
-	order []int
-	next  int
+	order         []int
+	next          int
+	zipfCDF       []float64
+	randomFloat64 func() float64
 }
 
 func (t *catalogTraversal) nextImage(images []*syntheticImage) *syntheticImage {
+	if len(t.zipfCDF) != 0 {
+		return images[zipfIndex(t.zipfCDF, t.randomFloat64())]
+	}
+
 	if len(t.order) == 0 {
 		t.order = rand.Perm(len(images))
 	} else if t.next == len(t.order) {

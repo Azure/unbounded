@@ -35,6 +35,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 			Jitter: 0.2, Seed: "benchmark-v1",
 		},
 		pull: pullOptions{
+			Profile: profileShuffle, ZipfExponent: defaultZipfExponent,
 			Target: "http://127.0.0.1:5000", Namespace: "loadgen.invalid",
 			Concurrency: 64, LayerConcurrency: 4, Timeout: 2 * time.Minute,
 			RetryDelay: time.Second, Verify: true,
@@ -50,12 +51,14 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--concurrency=0", "--layer-concurrency=3", "--pull-timeout=9s",
 		"--retry-delay=20ms", "--interval=30ms", "--verify=false", "--start-delay=0", "--duration=1m",
 		"--catalog-images=512", "--startup-timeout=4m",
+		"--profile=zipf", "--zipf-exponent=0.8",
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
 		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute, catalogImages: 512, startupTimeout: 4 * time.Minute,
 		image: imageOptions{Repository: "custom/image", Layers: 2, LayerBytes: 4096, Seed: "custom"},
 		pull: pullOptions{
+			Profile: profileZipf, ZipfExponent: 0.8,
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
 			Concurrency: 0, LayerConcurrency: 3, Timeout: 9 * time.Second,
 			RetryDelay: 20 * time.Millisecond, Interval: 30 * time.Millisecond,
@@ -82,6 +85,13 @@ func TestParseOptionsInvalid(t *testing.T) {
 		{"negative catalog", []string{"--catalog-images=-1"}, "catalog-images must be"},
 		{"oversized catalog", []string{"--catalog-images=513"}, "catalog-images must be"},
 		{"negative startup deadline", []string{"--startup-timeout=-1s"}, "must be nonnegative"},
+		{"unknown profile", []string{"--profile=random"}, "profile must be"},
+		{"empty profile", []string{"--profile="}, "profile must be"},
+		{"zero exponent", []string{"--zipf-exponent=0"}, "finite and positive"},
+		{"negative exponent", []string{"--zipf-exponent=-1"}, "finite and positive"},
+		{"nan exponent", []string{"--zipf-exponent=NaN"}, "finite and positive"},
+		{"infinite exponent", []string{"--zipf-exponent=+Inf"}, "finite and positive"},
+		{"negative infinite exponent", []string{"--zipf-exponent=-Inf"}, "finite and positive"},
 		{"positional", []string{"image"}, "unexpected positional arguments"},
 		{"after separator", []string{"--", "image"}, "unexpected positional arguments"},
 	} {
@@ -105,7 +115,7 @@ func TestParseOptionsHelp(t *testing.T) {
 				"-layers", "-layer-bytes", "-jitter", "-seed", "-target", "-namespace",
 				"-concurrency", "zero serves only the origin", "-layer-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
-				"-catalog-images", "-startup-timeout",
+				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent",
 			} {
 				require.Contains(t, output.String(), text)
 			}

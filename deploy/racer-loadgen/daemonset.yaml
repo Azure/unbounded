@@ -45,6 +45,7 @@ spec:
             - --layer-bytes=67108864
             - --jitter=0.2
             - --seed=benchmark-v1
+            - --profile=shuffle
             - --concurrency=64
             - --layer-concurrency=4
             - --pull-timeout=2m
