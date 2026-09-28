@@ -715,19 +715,20 @@ func TestPlanRotationInputValidation(t *testing.T) {
 }
 
 func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
-	for _, corrupt := range []string{"timestamp", "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
+	for _, corrupt := range []string{"timestamp", "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "nil retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
 		t.Run(corrupt, func(t *testing.T) {
 			r, now := testKeyring(t)
 			runKeys(t, r)
 
 			switch corrupt {
-			case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "unknown retirement":
+			case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
 				_, _, initial, _ := keyState(t, r)
 				*now = initial.NextRotation
 
 				runKeys(t, r)
 
-				if corrupt == "zero root retirement" || corrupt == "zero key retirement" || corrupt == "unknown retirement" {
+				switch corrupt {
+				case "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
 					_, _, prepared, _ := keyState(t, r)
 					*now = prepared.ActivateAt
 
@@ -751,22 +752,38 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 			case "missing prepared issuer":
 				s.PreparedIssuer = ""
 				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "zero root retirement":
+			case "zero root retirement", "missing root retirement", "replaced retirement":
 				for _, root := range b.PeerTrustRoots {
 					if id := rootID(root); id != s.ActiveIssuer {
-						s.Retiring[id] = time.Time{}
+						switch corrupt {
+						case "zero root retirement":
+							s.Retiring[id] = time.Time{}
+						case "missing root retirement":
+							delete(s.Retiring, id)
+						case "replaced retirement":
+							s.Retiring[s.ActiveIssuer] = s.Retiring[id]
+							delete(s.Retiring, id)
+						}
 					}
 				}
 
 				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "zero key retirement":
+			case "zero key retirement", "missing key retirement":
 				for _, key := range b.CacheKeys {
 					if key.State == wire.RetiringKey {
-						s.Retiring[keyID(key)] = time.Time{}
+						if corrupt == "zero key retirement" {
+							s.Retiring[keyID(key)] = time.Time{}
+						} else {
+							delete(s.Retiring, keyID(key))
+						}
+
 						break
 					}
 				}
 
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "nil retirement":
+				s.Retiring = nil
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "unknown retirement":
 				s.Retiring["unknown"] = s.NextRotation.Add(time.Hour)
