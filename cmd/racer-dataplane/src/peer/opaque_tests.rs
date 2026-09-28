@@ -155,7 +155,7 @@ fn exchange(
         relay::Relay::new(paths, auth.clone(), requester, admissions[1].clone())
             .with_network(network.clone()),
     );
-    let mut server = server::PeerServer::new(
+    let server = server::PeerServer::new(
         ios[1].clone(),
         auth,
         admissions[1].clone(),
@@ -165,8 +165,8 @@ fn exchange(
     .with_network(network)
     .with_wire(Rc::new(codec(&admissions[1])))
     .with_handshake(handshake)
-    .with_transfers(transfers);
-    server.materialize_relay = materialized;
+    .with_transfers(transfers)
+    .with_opaque_relay(!materialized);
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(25)).unwrap();
     let plaintext: Vec<_> = (0..crate::model::range::PAGE_BYTES as usize)
@@ -443,6 +443,10 @@ fn signed_full_page_bootstrap_and_page_stream_without_transit_allocation() {
     for fallback in [false, true] {
         exchange(false, fallback, 2, true, false);
     }
+}
+#[test]
+fn signed_materialized_full_page_bootstrap_and_page_keepalive() {
+    exchange(true, false, 2, true, false);
 }
 #[test]
 fn signed_success_truncation_closes_relay_and_pooled_destination() {

@@ -46,6 +46,8 @@ pub struct Config {
     /// Opt into logical-CPU sizing and unique pinned roles, preferring SMT pairs.
     pub allow_smt: bool,
     pub enable_rdma: bool,
+    /// Opt into experimental opaque HTTP transit; materialized relay is the default.
+    pub opaque_relay: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
     pub diagnostics_listen: std::net::SocketAddr,
@@ -164,6 +166,11 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
+        let opaque_relay = match text("RACER_OPAQUE_RELAY", Some("false"))?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let peer_listen =
             parse_listener_address(&text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?)?;
         let diagnostics_listen =
@@ -239,6 +246,7 @@ impl Config {
             max_threads,
             allow_smt,
             enable_rdma,
+            opaque_relay,
             control_endpoint,
             peer_listen,
             diagnostics_listen,
@@ -1143,6 +1151,7 @@ mod tests {
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
         assert!(!config.enable_rdma);
         assert_eq!(config.slab_bytes / config.segment_bytes, 16);
+        assert!(!config.opaque_relay);
         assert_eq!(config.free_segment_reserve, 2);
         assert!(config.diagnostics_listen.ip().is_loopback());
         assert_eq!(config.request_timeout, Duration::from_secs(30));
@@ -1150,6 +1159,49 @@ mod tests {
         assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
+    }
+
+    #[test]
+    fn opaque_relay_requires_an_exact_explicit_boolean() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            // Use the executable's parser, including native auto selection.
+            let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+                if name == "RACER_OPAQUE_RELAY" {
+                    Ok(Some(value.into()))
+                } else {
+                    lookup(name)
+                }
+            })
+            .unwrap();
+            assert_eq!(config.opaque_relay, expected);
+        }
+        assert!(
+            !Config::from_lookup_with_fabric_ports(lookup)
+                .unwrap()
+                .0
+                .opaque_relay
+        );
+        for value in [
+            "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(&[("RACER_OPAQUE_RELAY", value)]),
+                    Err(Error::InvalidConfiguration)
+                ),
+                "{value:?}"
+            );
+        }
+        assert!(matches!(
+            Config::from_lookup_with_fabric_ports(|name| {
+                if name == "RACER_OPAQUE_RELAY" {
+                    Err(Error::InvalidConfiguration)
+                } else {
+                    lookup(name)
+                }
+            }),
+            Err(Error::InvalidConfiguration)
+        ));
     }
 
     #[test]

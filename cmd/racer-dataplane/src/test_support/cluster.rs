@@ -142,6 +142,7 @@ pub fn config(enable_rdma: bool) -> Config {
         node: NodeId("00000000-0000-4000-8000-000000000002".into()),
         max_threads: 2,
         allow_smt: false,
+        opaque_relay: false,
         enable_rdma,
         control_endpoint: "https://control.invalid".into(),
         peer_listen: "127.0.0.1:0".parse().unwrap(),

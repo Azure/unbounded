@@ -614,6 +614,7 @@ struct Harness {
         crate::rdma::lifecycle::simulation::Fault,
     )>,
     payload_regression: bool,
+    opaque_relay: bool,
     concurrent_layers: bool,
 }
 impl Harness {
@@ -655,6 +656,7 @@ impl Harness {
             security_faults: vec![],
             native_rules: vec![],
             payload_regression: false,
+            opaque_relay: false,
             concurrent_layers: false,
         }
     }
@@ -737,6 +739,7 @@ impl Harness {
             .unwrap();
         let _fabric = fabric.enter();
         let mut config = crate::test_support::cluster::config(self.native);
+        config.opaque_relay = self.opaque_relay;
         config.node = node_id(id);
         config.peer_listen = format!("127.0.0.1:{}", 20000 + id).parse().unwrap();
         config.diagnostics_listen = format!("127.0.0.1:{}", 30000 + id).parse().unwrap();
@@ -2579,6 +2582,15 @@ fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
 
 #[test]
 fn healthy_relayed_page_reads() {
+    healthy_relayed_page_reads_with_mode(false);
+}
+
+#[test]
+fn healthy_relayed_page_reads_opaque_opt_in() {
+    healthy_relayed_page_reads_with_mode(true);
+}
+
+fn healthy_relayed_page_reads_with_mode(opaque: bool) {
     let sim = Simulation::new();
     let _os = sim.enter();
     let clock = SimulationClock::new(71);
@@ -2586,12 +2598,18 @@ fn healthy_relayed_page_reads() {
     let _time = environment.enter();
     let _strict = crate::runtime::environment::require_simulated();
     let mut harness = Harness::new(71, sim, clock, false);
+    harness.opaque_relay = opaque;
     // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
     // exceeds resident capacity and forces receive admission to reclaim idle data.
     harness.payload_regression = true;
     harness.update(1);
     for _ in 0..40 {
         harness.add(None);
+    }
+    for node in &harness.nodes {
+        for worker in &node.workers {
+            assert_eq!(worker.app.peers.opaque_relay(), opaque);
+        }
     }
     for node in 0..40 {
         let mut client = harness.request_on(1, true, false, node);
@@ -2606,10 +2624,20 @@ fn healthy_relayed_page_reads() {
     assert_eq!(harness.coverage.success, 40);
     assert_eq!(harness.coverage.failures, 0);
     assert_eq!(harness.coverage.bytes, 40 * (4 * PAGE_BYTES as usize + 257));
+    assert!(harness.coverage.relay_turns > 0);
 }
 
 #[test]
 fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
+    concurrent_relayed_layers_with_mode(false);
+}
+
+#[test]
+fn concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery() {
+    concurrent_relayed_layers_with_mode(true);
+}
+
+fn concurrent_relayed_layers_with_mode(opaque: bool) {
     let sim = Simulation::new();
     let _os = sim.enter();
     let clock = SimulationClock::new(73);
@@ -2618,6 +2646,7 @@ fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
     let _strict = crate::runtime::environment::require_simulated();
     let mut harness = Harness::new(73, sim, clock, false);
     harness.concurrent_layers = true;
+    harness.opaque_relay = opaque;
     for object in 1..=4 {
         harness.update(object);
     }

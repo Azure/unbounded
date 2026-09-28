@@ -23,6 +23,7 @@ let requester = Rc::new(Requester::new(paths.clone(), rails, forwarding.clone(),
 let relay = Rc::new(Relay::new(paths, forwarding.clone(), requester.clone(), admission.clone())
     .with_network(network.clone()));
 let server = PeerServer::new(peer_io, forwarding, admission, local_service, relay)
+    .with_opaque_relay(config.opaque_relay)
     .with_request_timeout(config.request_timeout)
     .with_network(network).with_wire(codec).with_handshake(handshake).with_reactor(reactor)
     .with_transfers(transfers);
@@ -129,7 +130,8 @@ Fill reserves separate encryption output only after selecting local origin.
 
 ### Opaque HTTP relay bodies
 
-The HTTP server uses `PeerTransport::exchange_relay` for transit requests without
+Only with explicit `RACER_OPAQUE_RELAY=true`, the HTTP server uses
+`PeerTransport::exchange_relay` for transit requests without
 an admitted native offer. `Transfers` returns the unfinished downstream HTTP
 connection after its session-authenticated head. `Forwarding::forward_opaque`
 decodes/re-encodes canonical metadata and verifies the original signature, request
@@ -152,8 +154,9 @@ and cancellation CQEs. Partial body failure closes both dirty connections withou
 an appended error or pool return. Before success headers, pipe pressure returns a
 signed Overloaded response. Keepalive requires exact completion on both sides.
 
-This is automatic on Linux, with no wire version, dependency or configuration
-change. Existing `pipes` is now shared by clients and transit, so the concurrent
+The default is off: absent or `false` retains the previous materialized relay.
+Opt-in requires no wire version or dependency change. Existing `pipes` is shared
+by clients and opted-in transit, so the concurrent
 relay-body ceiling can be lower than `relay_transfers`. Each live pipe uses two
 descriptors; pipe capacity is charged in existing pipe units. Growth to 64 KiB is
 best-effort and remains bounded if kernel/user pipe limits reject it. The request

@@ -799,6 +799,7 @@ impl WorkerApplication {
         )
         .with_request_timeout(config.request_timeout)
         .with_network(network.clone())
+        .with_opaque_relay(config.opaque_relay)
         .with_wire(wire)
         .with_handshake(handshake)
         .with_transfers(transfers)

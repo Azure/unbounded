@@ -35,8 +35,7 @@ pub trait LocalPageService {
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
-    #[cfg(test)]
-    pub(super) materialize_relay: bool,
+    opaque_relay: bool,
     pipes: Rc<crate::memory::pipe::PipePool>,
     ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
     io: Rc<crate::http::io::HttpIo>,
@@ -158,8 +157,7 @@ impl PeerServer {
         relay: Rc<Relay>,
     ) -> Self {
         Self {
-            #[cfg(test)]
-            materialize_relay: false,
+            opaque_relay: false,
             pipes: Rc::new(crate::memory::pipe::PipePool::new(
                 admission.clone(),
                 io.reactor().clone(),
@@ -540,12 +538,13 @@ impl PeerServer {
             self.forwarding.sign_response(&binding, response)
         })
     }
-    fn opaque_relay(&self) -> bool {
-        #[cfg(test)]
-        if self.materialize_relay {
-            return false;
-        }
-        true
+    /// Enable experimental opaque HTTP transit without changing endpoint/native paths.
+    pub fn with_opaque_relay(mut self, enabled: bool) -> Self {
+        self.opaque_relay = enabled;
+        self
+    }
+    pub(crate) fn opaque_relay(&self) -> bool {
+        self.opaque_relay
     }
 }
 /// Drain completed connections without abandoning the outstanding accept, which

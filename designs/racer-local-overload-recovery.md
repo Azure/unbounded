@@ -95,3 +95,18 @@ No protocol, wire schema, dependency, controller, cluster configuration, cache
 flush, or admission/retry increase is needed for the cancellation fix itself.
 No claim of restored live throughput is made without a separately authorized
 deployment and accepted measurement window.
+
+### Integrated default-off relay gate
+
+The separate follow-up adds `RACER_OPAQUE_RELAY`, default `false`, to
+`cmd/racer-dataplane/src/config.rs` and passes it through worker assembly in
+`cmd/racer-dataplane/src/app.rs`. Absent or explicit `false` selects the previous
+materialized path; exact `true` retains the experimental opaque path. Invalid
+values fail startup. Both paths retain authentication and bounded admission.
+The assembled relayed-page and pressure/recovery regressions exercise both modes.
+
+A future image from the integrated branch includes other concurrent improvements,
+including worker metric sharding (`29a08798`), not just cancellation cleanup.
+Keeping opaque relay off removes that experiment from the comparison but does not
+make a fleet comparison a cancellation-only attribution. No image build or
+deployment is part of this integration.
