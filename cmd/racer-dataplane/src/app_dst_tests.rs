@@ -2611,8 +2611,8 @@ fn listeners_survive_repeated_reactor_queue_pressure() {
     let address = SocketAddress::Inet(harness.nodes[0].config.diagnostics_listen);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for round in 0..4 {
-        // Complete the existing diagnostic accept, then fill the shared table
-        // before the service consumes that CQE and submits its next accept.
+        // Complete the existing diagnostic accept, then fill the ordinary
+        // partition before the service consumes that CQE and submits its receive.
         let probe = sim.connect(address.clone()).unwrap();
         let peer = sim
             .connect(SocketAddress::Inet(harness.nodes[0].config.peer_listen))
@@ -2623,14 +2623,21 @@ fn listeners_survive_repeated_reactor_queue_pressure() {
         let (reader, _writer) = sim.socket_pair();
         let reader = Rc::new(reader);
         let mut pressure = Vec::new();
-        while reactor.in_flight() < limit {
+        loop {
             let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &pressure_scope);
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
-            pressure.push(wait);
+            match wait.as_mut().poll(&mut cx) {
+                Poll::Pending => pressure.push(wait),
+                Poll::Ready(Err(Error::Overloaded)) => break,
+                _ => panic!("unexpected pressure result"),
+            }
         }
+        assert!(!pressure.is_empty());
+        let ordinary_in_flight = reactor.in_flight();
+        assert!(ordinary_in_flight < limit);
         for _ in 0..32 {
             harness.nodes[0].app.poll_budgeted(&mut cx, 64).unwrap();
-            assert_eq!(reactor.in_flight(), limit);
+            assert!(reactor.in_flight() >= ordinary_in_flight);
+            assert!(reactor.in_flight() <= limit);
             assert!(harness.nodes[0].app.diagnostic_task.is_some());
             assert!(harness.nodes[0].app.peer_task.is_some());
         }
