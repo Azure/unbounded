@@ -1230,8 +1230,8 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 				take(f.a.Server.writes)
 				defer release(f.a.Server.writes)
 			case "bootstrap":
-				take(f.a.Server.authSlots)
-				defer release(f.a.Server.authSlots)
+				take(f.a.Server.bootstrapSlots)
+				defer release(f.a.Server.bootstrapSlots)
 
 				request.Method = "POST"
 				request.URL.Path = wire.BootstrapPath
@@ -1280,7 +1280,7 @@ func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
 			s.Bootstrap.Issuer.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				reads++
 
-				if len(s.writes) != wantWrites || len(s.authSlots) != 1 {
+				if len(s.writes) != wantWrites || len(s.bootstrapSlots) != 1 || len(s.authSlots) != 0 {
 					t.Error("issuance changed write/auth admission timing")
 				}
 
@@ -1308,7 +1308,7 @@ func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
 			handler.ServeHTTP(w, r)
 
 			encoded := responseBody(t, w.Result(), nil, wantStatus)
-			if reads == 0 || len(s.authSlots) != 0 || len(s.writes) != wantWrites {
+			if reads == 0 || len(s.bootstrapSlots) != 0 || len(s.authSlots) != 0 || len(s.writes) != wantWrites {
 				t.Fatal("issuance skipped or admission leaked")
 			}
 
@@ -1356,7 +1356,7 @@ func TestBootstrapReadDeadlineAndChunkedBound(t *testing.T) {
 	_, _ = io.Copy(io.Discard, conn)
 	deadline := time.After(time.Second)
 
-	for len(f.a.Server.authSlots) != 0 {
+	for len(f.a.Server.bootstrapSlots) != 0 {
 		select {
 		case <-deadline:
 			t.Fatal("slow body retained admission")

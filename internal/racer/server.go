@@ -22,16 +22,17 @@ import (
 )
 
 type Server struct {
-	Config       Config
-	Trust        *Trust
-	Bootstrap    *Bootstrap
-	Publications *Publications
-	Lifecycle    *Lifecycle
-	once         sync.Once
-	admission    sync.Mutex
-	polls        map[wire.NodeID]struct{}
-	authSlots    chan struct{}
-	writes       chan struct{}
+	Config         Config
+	Trust          *Trust
+	Bootstrap      *Bootstrap
+	Publications   *Publications
+	Lifecycle      *Lifecycle
+	once           sync.Once
+	admission      sync.Mutex
+	polls          map[wire.NodeID]struct{}
+	authSlots      chan struct{}
+	bootstrapSlots chan struct{}
+	writes         chan struct{}
 }
 
 var (
@@ -226,6 +227,9 @@ func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.polls = make(map[wire.NodeID]struct{})
 		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
+		// API-backed enrollment must not starve local TLS/snapshot authentication.
+		// Both pools remain bounded, but only bootstrap owns slots across API waits.
+		s.bootstrapSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
 		s.writes = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentWrites))
 	})
 }
@@ -336,11 +340,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
-	if !take(s.authSlots) {
+	if !take(s.bootstrapSlots) {
 		writeFailure(w, wire.Overloaded)
 		return
 	}
-	defer release(s.authSlots)
+	defer release(s.bootstrapSlots)
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
 	defer cancel()

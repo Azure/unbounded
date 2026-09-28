@@ -482,11 +482,14 @@ deployment integration check and is not exercised by envtest.
   poll bound through response write and flush, including errors and cancellation.
   `Publications.Wait` validates identities/cursors and shares the current immutable
   publication and broadcast notification without tracking admission. Handshake trust
-  selection, local certificate verification and enrollment share bounded authentication slots;
-  slow snapshot writes have separate bounded slots. Saturation rejects immediately.
+  selection and local certificate verification share bounded authentication slots.
+  API-backed enrollment owns a separate bounded pool so API/gate/body waits cannot
+  starve TLS setup or snapshot authentication. Slow snapshot writes have separate
+  bounded slots. Saturation rejects immediately.
   `Server.authenticateSnapshot` shares admission and certificate verification before
-  and after waiting. The shared `authSlots` pool retains the public configuration
-  name `Limits.MaxConcurrentBootstrap`.
+  and after waiting. Both `authSlots` and `bootstrapSlots` are independently sized
+  by the existing `Limits.MaxConcurrentBootstrap` setting (32 each by default),
+  preserving the enrollment API concurrency bound.
   Go reports ClientHello admission failure as a TLS `internal_error` alert before
   HTTP is available. The dataplane treats that alert as unavailable and retries
   with its bounded jittered backoff, including the worker's enrollment after

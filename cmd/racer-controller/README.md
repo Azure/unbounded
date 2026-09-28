@@ -353,6 +353,13 @@ Membership controls routing, not authorization. Startup re-enrollment and renewa
 still resolve recreated Node identities; a changed UID fences and restarts the
 Rust runtime rather than rebinding an active graph.
 
+Enrollment has its own bounded admission pool (32 by default), separate from the
+equally bounded local TLS/snapshot authentication pool. Slow Kubernetes API calls,
+credential-gate waits, and incomplete enrollment bodies cannot consume local
+authentication capacity. Enrollment saturation returns HTTP 429 after TLS setup;
+local authentication saturation can still reject a handshake. This isolation does
+not increase concurrent enrollment API work or remove its request deadline.
+
 Trust is installed by controller reconciliation after validating committed durable
 credentials and installation binding. Observed invalidity or deletion withdraws
 trust; subsequent API read failures cannot restore it. Temporary API read outages
