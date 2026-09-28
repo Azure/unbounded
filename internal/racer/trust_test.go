@@ -355,6 +355,7 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 
 			if operation == "keyring" {
 				r.Client = writer
+
 				result, err = r.Reconcile(t.Context(), ctrl.Request{})
 				if err != nil || result.RequeueAfter != retryConflictDelay {
 					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
@@ -366,6 +367,7 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 			} else {
 				topology := Assemble(r.Config, writer, r.APIReader).Topology
 				topology.Trust = r.Trust
+
 				result, err = topology.Reconcile(t.Context(), ctrl.Request{})
 				if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
 					t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
