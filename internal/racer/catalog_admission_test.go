@@ -386,7 +386,9 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	a := integrationInstallation(t, c, "catalog-capacity")
 	// Use a root-heavy valid policy to exercise real admission with a small
 	// catalog. Unit tests above run the default maximum through repeated cycles.
-	a.Keyring.Config.Rotation = RotationPolicy{Interval: time.Hour, PrepareFor: time.Hour, RetainFor: 600 * time.Hour}
+	// Reserve generations by activation interval, not interval plus preparation.
+	// 302 roots fit the wire budget; 602 roots would reject initialization itself.
+	a.Keyring.Config.Rotation = RotationPolicy{Interval: time.Hour, PrepareFor: time.Hour, RetainFor: 300 * time.Hour}
 
 	a.Topology.Config = a.Keyring.Config
 	if err := a.Topology.InitializeVersion(t.Context()); err != nil {
