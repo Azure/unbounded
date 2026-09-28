@@ -7,9 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"reflect"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -97,7 +95,7 @@ func (c *credentialState) validateRotation() error {
 		c.signing[id] = parsedSigning{certificate: cert, key: key}
 	}
 
-	expected := map[string]time.Time{}
+	required := map[string]struct{}{}
 
 	if !s.ActivateAt.IsZero() {
 		if !containsRoot(b, s.PreparedIssuer) || s.PreparedIssuer == s.ActiveIssuer || !s.ActivateAt.After(s.NextRotation) {
@@ -114,7 +112,7 @@ func (c *credentialState) validateRotation() error {
 		}
 
 		if id != s.ActiveIssuer && id != s.PreparedIssuer {
-			expected[id] = s.Retiring[id]
+			required[id] = struct{}{}
 		}
 	}
 
@@ -122,7 +120,7 @@ func (c *credentialState) validateRotation() error {
 
 	for _, key := range b.CacheKeys {
 		if key.State == wire.RetiringKey {
-			expected[keyID(key)] = s.Retiring[keyID(key)]
+			required[keyID(key)] = struct{}{}
 		}
 
 		if key.State == wire.PreparedKey {
@@ -135,12 +133,12 @@ func (c *credentialState) validateRotation() error {
 		}
 	}
 
-	if !reflect.DeepEqual(expected, s.Retiring) {
+	if len(required) != len(s.Retiring) {
 		return wire.Unavailable
 	}
 
-	for _, at := range expected {
-		if at.IsZero() {
+	for id := range required {
+		if at, ok := s.Retiring[id]; !ok || at.IsZero() {
 			return wire.Unavailable
 		}
 	}
