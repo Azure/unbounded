@@ -136,6 +136,11 @@ do not extend that response. Superseding its image or suspending authority revok
 the response, even if authority recovers before its next write. Blocked writes and
 flushes are bounded by that pinned deadline, certificate/token expiry, and the write
 timeout. Poll and write admission remain held through explicit response flush.
+Public snapshot and bootstrap responses also pin a separate trust freshness
+deadline and revocable trust generation. Trust invalidation cancels active writes
+even if publications remain fresh or trust immediately recovers. Normal validated
+rotation permits already-admitted responses to finish within their original
+deadlines; new requests authenticate against current trust.
 
 Controllers also expose `GET /internal/v1/snapshot` on the same TLS listener before
 public readiness, avoiding replication startup deadlock. This is not a dataplane

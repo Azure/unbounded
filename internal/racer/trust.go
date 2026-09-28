@@ -30,6 +30,8 @@ type Trust struct {
 	// Otherwise a rejected rollback could be accepted on the next reconcile.
 	highWater wire.Generation
 	digest    [sha256.Size]byte
+	authority context.Context
+	revoke    context.CancelFunc
 }
 
 // acceptedKeyring owns an immutable, bounded wire encoding, never issuer material.
@@ -72,7 +74,12 @@ func (t *Trust) install(ctx context.Context, roots *x509.CertPool, bundle wire.K
 
 	t.highWater, t.digest = accepted.generation, digest
 	t.roots = roots
+
 	t.confirmed = time.Now()
+	if t.authority == nil || t.authority.Err() != nil {
+		t.authority, t.revoke = context.WithCancel(context.Background())
+	}
+
 	t.bundle = accepted
 	t.notifyLocked()
 
@@ -87,12 +94,48 @@ func (t *Trust) notifyLocked() {
 	t.changed = make(chan struct{})
 }
 
+// writeContext captures trust before response authentication/issuance. Explicit
+// invalidation permanently revokes that generation, even across recovery. Normal
+// validated rotation allows admitted responses to finish, but neither rotation nor
+// reconfirmation extends their captured freshness deadline.
+func (t *Trust) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	if t == nil {
+		return nil, nil, wire.Unavailable
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.roots == nil || t.authority == nil || t.authority.Err() != nil || t.maxAge > 0 && time.Since(t.confirmed) >= t.maxAge {
+		return nil, nil, wire.Unavailable
+	}
+
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+
+	if t.maxAge > 0 {
+		ctx, cancel = context.WithDeadline(parent, t.confirmed.Add(t.maxAge))
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
+
+	stop := context.AfterFunc(t.authority, cancel)
+
+	return ctx, func() { stop(); cancel() }, nil
+}
+
 func (t *Trust) invalidate() {
 	if t != nil {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 
 		t.roots, t.bundle = nil, nil
+		if t.revoke != nil {
+			t.revoke()
+		}
+
 		t.notifyLocked()
 	}
 }
@@ -105,7 +148,7 @@ func (t *Trust) keyring() (*acceptedKeyring, <-chan struct{}, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.roots == nil || t.bundle == nil {
+	if t.roots == nil || t.bundle == nil || t.maxAge > 0 && time.Since(t.confirmed) >= t.maxAge {
 		return nil, nil, wire.Unavailable
 	}
 

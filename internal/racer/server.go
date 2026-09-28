@@ -399,13 +399,27 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encoded, err := s.Bootstrap.Enroll(ctx, r, request)
+	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer cancelTrust()
+
+	trustDeadline, _ := trustCtx.Deadline()
+
+	stopTrustWrite := boundConnection(trustCtx, trustDeadline)
+	defer stopTrustWrite()
+
+	responseControl(http.NewResponseController(w).SetWriteDeadline(trustDeadline))
+
+	encoded, err := s.Bootstrap.Enroll(trustCtx, r, request)
 	if err != nil {
 		writeFailure(w, err)
 		return
 	}
 
-	if ctx.Err() != nil || s.Ready(r) != nil {
+	if trustCtx.Err() != nil || s.Ready(r) != nil {
 		writeFailure(w, wire.Unavailable)
 		return
 	}
@@ -419,9 +433,11 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 
-	if _, err := w.Write(encoded); err == nil {
-		responseControl(http.NewResponseController(w).Flush())
+	if _, err := (requestWriter{ctx: trustCtx, writer: w}).Write(encoded); err != nil || trustCtx.Err() != nil {
+		panic(http.ErrAbortHandler)
 	}
+
+	responseControl(http.NewResponseController(w).Flush())
 }
 
 func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (NodeIdentity, error) {
@@ -482,7 +498,14 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Revalidate local trust after waiting: rotation or observed invalidity must
 	// also take effect on pooled connections before returning snapshot bytes.
-	if _, err := s.authenticateSnapshot(ctx, r.TLS); err != nil {
+	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer cancelTrust()
+
+	if _, err := s.authenticateSnapshot(trustCtx, r.TLS); err != nil {
 		writeFailure(w, err)
 		return
 	}
@@ -502,7 +525,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeCtx, cancelWrite, err := image.writeContext(ctx)
+	writeCtx, cancelWrite, err := image.writeContext(trustCtx)
 	if err != nil {
 		writeFailure(w, err)
 		return

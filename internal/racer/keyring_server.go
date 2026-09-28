@@ -100,6 +100,15 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
 	defer cancel()
 
+	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer cancelTrust()
+
+	ctx = trustCtx
+
 	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+2*s.Config.Limits.WriteTimeout))))
 
 	bundle, err := s.Trust.waitKeyring(ctx, after)
@@ -162,6 +171,9 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	defer release(s.writes)
 
 	deadline := minTime(identity.expires, time.Now().Add(s.Config.Limits.WriteTimeout))
+	if freshness, ok := ctx.Deadline(); ok {
+		deadline = minTime(deadline, freshness)
+	}
 
 	stopWrite := boundConnection(ctx, deadline)
 	defer stopWrite()
