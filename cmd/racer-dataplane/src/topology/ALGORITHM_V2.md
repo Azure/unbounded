@@ -1,13 +1,16 @@
 # Racer topology algorithm v2
 
-This document specifies `ALGORITHM_VERSION = 2`. Hash domains, field order,
+This document specifies algorithm version 2, still the production default.
+The latest supported `ALGORITHM_VERSION` is now 3; see `ALGORITHM_V3.md` for the
+opt-in routing contract and rollout. Hash domains, field order,
 integer arithmetic, ordering, and tie rules are interoperability contracts.
 Changing them requires a new algorithm version and coordinated deployment.
 Membership wire versions are snapshot counters, not algorithm versions.
 
 Version 2 changes shortest-route tie selection and removes the total-work
-configuration. Deploy participating dataplanes together; there is no dual-version
-route implementation or algorithm negotiation. The algorithm constant identifies
+configuration. The original v2 release had no dual-version route implementation;
+the v3 release retains v2 through explicit local configuration, without algorithm
+negotiation. The algorithm constant identifies
 this specification, not a wire negotiation field. The existing peer/control
 encodings, placement hashes, ciphertext forwarding, graph edges, and RDMA rail
 selection remain the same; their v1 hash domains are retained.

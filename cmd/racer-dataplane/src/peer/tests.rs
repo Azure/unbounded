@@ -801,6 +801,104 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 }
 
 #[test]
+fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+    use crate::topology::{
+        RoutingAlgorithm,
+        health::{LinkHealth, LinkOutcome},
+        membership::{Member, Membership},
+        paths::Paths,
+    };
+    let signers = signers();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let nodes = std::iter::once(A.to_owned())
+        .chain((0..1498).map(|i| format!("00000002-1111-4111-8111-{i:012x}")))
+        .chain(std::iter::once(C.to_owned()));
+    let members = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            nodes
+                .map(|node| Member {
+                    node: NodeId(node),
+                    shares: std::num::NonZeroU32::new(4).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, RoutingAlgorithm::V3);
+    let health = Rc::new(LinkHealth::new(36));
+    let cold = Paths::with_algorithm(health.clone(), 0, RoutingAlgorithm::V3);
+    let mut selected = std::collections::BTreeSet::new();
+    for attempt in 1..=32 {
+        let original = request(&admission, attempt);
+        let scope = original.origin.scope().clone();
+        let budget = super::search_budget(&original.route, &NodeId(A.into())).unwrap();
+        let planned = futures::executor::block_on(paths.shortest_async(
+            members.clone(),
+            &NodeId(A.into()),
+            &budget,
+            &scope,
+        ))
+        .unwrap();
+        let next = &planned.nodes[1];
+        selected.insert(next.clone());
+        let (signed, _) = Forwarding::new(signers[0].clone())
+            .sign_request_to(original, next)
+            .unwrap();
+        let receiver =
+            crate::security::signing::receiver(&signed.authentication.original.head).unwrap();
+        let (envelope, _) = WireCodec::decode(
+            WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+            false,
+        )
+        .unwrap();
+        let decoded = codec(&admission).request(envelope, &scope).unwrap();
+        let search = super::search_budget(&decoded.request.route, &NodeId(A.into())).unwrap();
+        let recomputed = futures::executor::block_on(cold.shortest_async(
+            members.clone(),
+            &NodeId(A.into()),
+            &search,
+            &scope,
+        ))
+        .unwrap();
+        assert_eq!(recomputed.nodes, planned.nodes);
+        assert_eq!(recomputed.nodes[1], receiver);
+        health
+            .observe_at(
+                &receiver,
+                LinkOutcome::Timeout,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        let changed = cold
+            .shortest(members.clone(), &NodeId(A.into()), &search)
+            .unwrap();
+        assert_ne!(changed.nodes[1], receiver);
+        assert_eq!(changed.nodes.len(), planned.nodes.len());
+        health.observe(&receiver, LinkOutcome::Success).unwrap();
+        // Force eviction before repeating the exact signed state.
+        let mut other = budget.clone();
+        other.destination = members.members()[1498].node.clone();
+        paths
+            .shortest(members.clone(), &NodeId(A.into()), &other)
+            .unwrap();
+        assert_eq!(
+            paths
+                .shortest(members.clone(), &NodeId(A.into()), &search)
+                .unwrap()
+                .nodes,
+            planned.nodes
+        );
+    }
+    assert!(selected.len() > 1);
+}
+
+#[test]
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use super::requester::PeerClient;
     use crate::{
@@ -849,7 +947,11 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .unwrap(),
     );
     let health = Rc::new(LinkHealth::new(36));
-    let paths = Rc::new(Paths::new(health.clone(), 4));
+    let paths = Rc::new(Paths::with_algorithm(
+        health.clone(),
+        4,
+        crate::topology::RoutingAlgorithm::V3,
+    ));
     let requester = requester::Requester::new(
         paths.clone(),
         Rc::new(Rails),
@@ -871,6 +973,43 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .shortest(members.clone(), &NodeId(A.into()), &budget)
         .unwrap();
     assert_eq!(direct.nodes, vec![NodeId(A.into()), NodeId(C.into())]);
+    // Reject a signed receiver that differs from v3 recomputation before I/O.
+    let mut page_request = request(&admission, 2);
+    page_request.operation = Operation::Page {
+        page: PageId {
+            version: ObjectVersion {
+                object: page_request.origin.object.clone(),
+                etag: StrongEtag::test_value("v3"),
+            },
+            number: PageNumber(0),
+        },
+        mode: FetchMode::CopyOnly,
+    };
+    let (wrong, _) = Forwarding::new(signers[0].clone())
+        .sign_request_to(page_request, &NodeId(B.into()))
+        .unwrap();
+    assert!(matches!(
+        futures::executor::block_on(requester::PeerTransport::exchange(
+            &requester,
+            wrong,
+            members.clone(),
+            &scope
+        )),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert!(health.available(&NodeId(B.into())).unwrap());
+    let mut original = original;
+    original.operation = Operation::Page {
+        page: PageId {
+            version: ObjectVersion {
+                object: original.origin.object.clone(),
+                etag: StrongEtag::test_value("v3"),
+            },
+            number: PageNumber(0),
+        },
+        mode: FetchMode::CopyOnly,
+    };
     let mut attempt = requester.request(original, members.clone(), &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let result = loop {

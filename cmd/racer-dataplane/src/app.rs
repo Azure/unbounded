@@ -660,7 +660,11 @@ impl WorkerApplication {
             (None, None, None)
         };
 
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), limits.cached_paths.get()));
+        let paths = Rc::new(Paths::with_algorithm(
+            Rc::new(LinkHealth),
+            limits.cached_paths.get(),
+            config.routing_algorithm,
+        ));
         let rails = Rc::new(Rails);
         let placement = Rc::new(Placement::with_memory_budget(
             limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,

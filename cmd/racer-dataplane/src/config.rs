@@ -45,6 +45,7 @@ pub struct Config {
     pub max_threads: usize,
     /// Opt into logical-CPU sizing and unique pinned roles, preferring SMT pairs.
     pub allow_smt: bool,
+    pub routing_algorithm: crate::topology::RoutingAlgorithm,
     pub enable_rdma: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
@@ -170,6 +171,11 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
+        let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("2"))?.as_str() {
+            "2" => crate::topology::RoutingAlgorithm::V2,
+            "3" => crate::topology::RoutingAlgorithm::V3,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let peer_listen =
             parse_listener_address(&text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?)?;
         let diagnostics_listen =
@@ -243,6 +249,7 @@ impl Config {
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads,
             allow_smt,
+            routing_algorithm,
             enable_rdma,
             opaque_relay,
             control_endpoint,
@@ -1144,6 +1151,10 @@ mod tests {
         let config = parse(&[]).unwrap();
         assert_eq!(config.max_threads, 8);
         assert!(!config.allow_smt);
+        assert_eq!(
+            config.routing_algorithm,
+            crate::topology::RoutingAlgorithm::V2
+        );
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
         assert!(!config.enable_rdma);
         assert_eq!(config.slab_bytes / config.segment_bytes, 16);
@@ -1198,6 +1209,22 @@ mod tests {
             }),
             Err(Error::InvalidConfiguration)
         ));
+    }
+
+    #[test]
+    fn routing_algorithm_requires_a_supported_explicit_version() {
+        use crate::topology::RoutingAlgorithm;
+        for (value, expected) in [("2", RoutingAlgorithm::V2), ("3", RoutingAlgorithm::V3)] {
+            assert_eq!(
+                parse(&[("RACER_ROUTING_ALGORITHM", value)])
+                    .unwrap()
+                    .routing_algorithm,
+                expected
+            );
+        }
+        for value in ["", "1", "4", "03", " 3", "3 ", "auto"] {
+            assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
+        }
     }
 
     #[test]
