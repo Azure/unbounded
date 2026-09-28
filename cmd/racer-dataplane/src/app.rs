@@ -1379,6 +1379,14 @@ impl WorkerApplication {
             self.poll_cache_preparation(cx)?;
         }
         if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
+            if let Err(error) = &result
+                && !self.stopping
+            {
+                eprintln!(
+                    "racer-dataplane: worker={} stage=diagnostic-service error={error:?}",
+                    self.worker.0
+                );
+            }
             if !self.stopping {
                 result?;
                 return Err(Error::Unavailable);
@@ -1391,14 +1399,34 @@ impl WorkerApplication {
             }
         }
         if let Some(endpoint) = &mut self.endpoint {
-            endpoint.poll(cx, budget)?;
+            endpoint.poll(cx, budget).inspect_err(|error| {
+                eprintln!(
+                    "racer-dataplane: worker={} stage=worker-endpoint error={error:?}",
+                    self.worker.0
+                );
+            })?;
         }
         self.flights.poll_with_context(cx, budget)?;
-        self.clients.poll_budgeted(cx, budget)?;
+        self.clients
+            .poll_budgeted(cx, budget)
+            .inspect_err(|error| {
+                eprintln!(
+                    "racer-dataplane: worker={} stage=client-listeners error={error:?}",
+                    self.worker.0
+                );
+            })?;
         if let Some(rdma) = &self.rdma {
             rdma.progress()?;
         }
         if let Some(result) = poll_task(&mut self.peer_task, cx) {
+            if let Err(error) = &result
+                && !self.stopping
+            {
+                eprintln!(
+                    "racer-dataplane: worker={} stage=peer-listener error={error:?}",
+                    self.worker.0
+                );
+            }
             if !self.stopping {
                 result?;
                 return Err(Error::Unavailable);

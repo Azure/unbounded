@@ -2115,6 +2115,54 @@ mod tests {
     }
 
     #[test]
+    fn listener_retry_recovers_from_full_sq_without_losing_owners() {
+        // Cancellation SQEs also consume SQ space without new table entries.
+        // A smaller test ring isolates SQ publication failure from table pressure
+        // deterministically, without depending on kernel cancellation timing.
+        let reactor = Reactor::new(Rc::new(Admission::new(limits(8))));
+        reactor.init().expect("real io_uring required");
+        reactor.state.borrow_mut().ring = Some(IoUring::new(2).unwrap());
+        let scope = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = Rc::new(OwnedFd::from(socket));
+        let mut first = reactor.readiness(fd.clone(), libc::POLLIN as u32, &scope);
+        let mut second = reactor.readiness(fd, libc::POLLIN as u32, &scope);
+        assert!(poll(&mut first).is_pending());
+        assert!(poll(&mut second).is_pending());
+        assert_eq!(reactor.in_flight(), 2);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = Rc::new(OwnedFd::from(listener));
+        let baseline = reactor.admission.used(ResourceClass::RequestContext);
+        let mut raw = reactor.accept(listener.clone(), &scope);
+        assert!(matches!(
+            poll(&mut raw),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        drop(raw);
+        assert_eq!(reactor.in_flight(), 2);
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            baseline
+        );
+        let mut accept =
+            crate::runtime::listener::retry(&scope, || reactor.accept(listener.clone(), &scope));
+        assert!(poll(&mut accept).is_pending());
+        assert_eq!(reactor.in_flight(), 2);
+        assert_eq!(Rc::strong_count(&listener), 1);
+        let _client = std::net::TcpStream::connect(address).unwrap();
+        drop(drive(&reactor, accept).unwrap());
+        // Retrying the listener did not abandon unrelated operations.
+        assert_eq!(reactor.in_flight(), 2);
+        drop(first);
+        drop(second);
+        drive(&reactor, reactor.drain()).unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(Rc::strong_count(&listener), 1);
+    }
+
+    #[test]
     fn real_cancellation_abandonment_limits_and_drop_fence() {
         let Some(reactor) = kernel_reactor(1) else {
             return;

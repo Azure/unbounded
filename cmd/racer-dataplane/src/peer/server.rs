@@ -85,9 +85,10 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let Some(ingress) = &self.ingress {
-                    reactor
-                        .readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
-                        .await?;
+                    crate::runtime::listener::retry(scope, || {
+                        reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
+                    })
+                    .await?;
                     let offer = std::future::poll_fn(|cx| {
                         if let Err(error) = scope
                             .cancellation
@@ -127,8 +128,12 @@ impl PeerServer {
                     let _ = active.next().await;
                     continue;
                 }
-                let accepted =
-                    next_accepted(reactor.accept(fd.clone(), scope), &mut active, scope).await?;
+                let accepted = next_accepted(
+                    crate::runtime::listener::retry(scope, || reactor.accept(fd.clone(), scope)),
+                    &mut active,
+                    scope,
+                )
+                .await?;
                 let connection = match crate::http::pool::ConnectionLease::from_accepted(
                     accepted,
                     &self.admission,
