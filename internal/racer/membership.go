@@ -143,14 +143,11 @@ func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, 
 // installs the returned history only after the candidate publication commits.
 // Inputs and nested accepted state are never mutated or aliased by the result.
 // Accepted must contain only previously committed results from this function.
-func ReconcileMembers(nodes []corev1.Node, pods []corev1.Pod, daemonSetUID types.UID, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
+// The caller supplies installation-namespace Pods grouped by assigned node name.
+// Each group is still checked for node assignment and DaemonSet ownership.
+func ReconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, daemonSetUID types.UID, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
 	if port == 0 {
 		return nil, nil, wire.InvalidRequest
-	}
-
-	byNode := make(map[string][]corev1.Pod)
-	for _, pod := range pods {
-		byNode[pod.Spec.NodeName] = append(byNode[pod.Spec.NodeName], pod)
 	}
 
 	nodes = slices.Clone(nodes)
@@ -183,7 +180,7 @@ func ReconcileMembers(nodes []corev1.Node, pods []corev1.Pod, daemonSetUID types
 			}
 		}
 
-		endpoint, endpointErr := SelectEndpoint(byNode[node.Name], daemonSetUID, node.Name, port)
+		endpoint, endpointErr := SelectEndpoint(podsByNode[node.Name], daemonSetUID, node.Name, port)
 		if endpointErr != nil {
 			if !errors.Is(endpointErr, wire.Unavailable) {
 				return nil, nil, endpointErr

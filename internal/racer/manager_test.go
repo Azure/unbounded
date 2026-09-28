@@ -22,8 +22,17 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("topology and HTTP must share the single publication owner")
 	}
 
-	if a.Keyring.Issuer != a.Server.Bootstrap.Issuer {
-		t.Fatal("rotation and issuance must share the issuer")
+	issuer := a.Server.Bootstrap.Issuer
+	if issuer == nil {
+		t.Fatal("bootstrap must have an issuer")
+	}
+
+	if a.Server.Trust == nil || a.Keyring.Trust != a.Server.Trust || a.Topology.Trust != a.Server.Trust || issuer.Trust != a.Server.Trust {
+		t.Fatal("controllers, issuance, and serving must share trust")
+	}
+
+	if a.Keyring.CatalogGate == nil || a.Topology.CatalogGate != a.Keyring.CatalogGate || issuer.CatalogGate != a.Keyring.CatalogGate {
+		t.Fatal("controllers and issuance must share the catalog gate")
 	}
 
 	if a.Keyring.Lifecycle != a.Lifecycle || a.Server.Lifecycle != a.Lifecycle {

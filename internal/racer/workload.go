@@ -48,54 +48,227 @@ func DesiredDaemonSet(c Config) (*appsv1.DaemonSet, error) {
 		diagnosticsPort++
 	}
 
-	ds := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels}, Spec: appsv1.DaemonSetSpec{
-		Selector:       &metav1.LabelSelector{MatchLabels: labels},
-		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: ptr.To(intstr.FromInt32(1)), MaxSurge: ptr.To(intstr.FromInt32(0))}},
-		// Require sustained readiness across probe periods before advancing a rollout.
-		MinReadySeconds: 10,
-		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
-			ServiceAccountName: c.DataplaneServiceAccount, AutomountServiceAccountToken: ptr.To(false),
-			RestartPolicy: corev1.RestartPolicyAlways, DNSPolicy: corev1.DNSClusterFirst, SchedulerName: corev1.DefaultSchedulerName,
-			EnableServiceLinks: ptr.To(false), PreemptionPolicy: ptr.To(corev1.PreemptLowerPriority),
-			TerminationGracePeriodSeconds: ptr.To(int64(30)),
-			SecurityContext:               &corev1.PodSecurityContext{RunAsUser: ptr.To(int64(0))},
-			Affinity:                      &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: wire.ExclusionLabel, Operator: corev1.NodeSelectorOpDoesNotExist}, {Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}}}}}}},
-			Containers: []corev1.Container{{
-				Name: "dataplane", Image: c.DataplaneImage, ImagePullPolicy: corev1.PullIfNotPresent,
-				TerminationMessagePath: corev1.TerminationMessagePathDefault, TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-				Env: []corev1.EnvVar{
-					{Name: "RACER_CLUSTER_ID", Value: string(c.Cluster)},
-					{Name: "RACER_CONTROL_ENDPOINT", Value: c.ControlURL},
-					// This is only a bind address, never an authority for node identity.
-					// Define it first so kubelet expands either Pod IP family below.
-					{Name: "RACER_POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}},
-					{Name: "RACER_PEER_LISTEN", Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(c.PeerPort))},
-					{Name: "RACER_DIAGNOSTICS_LISTEN", Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(diagnosticsPort))},
-					{Name: "RACER_TRUST_BUNDLE", Value: "/etc/racer/bootstrap/ca.crt"},
-					{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
-					{Name: "RACER_SECRET_DIRECTORY", Value: "/etc/racer/keyring"},
-					// Kubelet creates the hostPath mount with mode 0755. Let the
-					// dataplane create its private 0700 directory beneath it.
-					{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},
-					{Name: "RACER_SLAB_DIRECTORY", Value: "/var/lib/racer/slabs"},
-				},
-				Ports: []corev1.ContainerPort{{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP}, {Name: "diagnostics", ContainerPort: diagnosticsPort, Protocol: corev1.ProtocolTCP}},
-				// Readiness may wait on enrollment/recovery indefinitely without probe
-				// restarts. Membership must continue to include unready Pods.
-				ReadinessProbe: &corev1.Probe{
-					ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromString("diagnostics"), Scheme: corev1.URISchemeHTTP}},
-					PeriodSeconds: 5, TimeoutSeconds: 2, SuccessThreshold: 1, FailureThreshold: 1,
-				},
-				SecurityContext: &corev1.SecurityContext{AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}},
-				VolumeMounts:    []corev1.VolumeMount{{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true}, {Name: "keyring", MountPath: "/etc/racer/keyring", ReadOnly: true}, {Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true}, {Name: "identity", MountPath: "/var/lib/racer/identity"}, {Name: "slabs", MountPath: "/var/lib/racer/slabs"}, {Name: "sockets", MountPath: "/run/racer"}},
-			}},
-			Volumes: []corev1.Volume{
-				{Name: "token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{DefaultMode: ptr.To(int32(0o400)), Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: wire.TokenAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}}}}}},
-				{Name: "keyring", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: c.KeyringSecretName, DefaultMode: ptr.To(int32(0o400)), Items: []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}}}}},
-				{Name: "bootstrap", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.BootstrapTrustConfigMap}, DefaultMode: ptr.To(int32(0o444)), Items: []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}}}}},
+	affinity := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{
+						{
+							Key:      wire.ExclusionLabel,
+							Operator: corev1.NodeSelectorOpDoesNotExist,
+						},
+						{
+							Key:      "kubernetes.io/os",
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{"linux"},
+						},
+					},
+				}},
 			},
-		}},
-	}}
+		},
+	}
+	projectedVolumes := []corev1.Volume{
+		{
+			Name: "token",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					DefaultMode: ptr.To(int32(0o400)),
+					Sources: []corev1.VolumeProjection{{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience:          wire.TokenAudience,
+							ExpirationSeconds: ptr.To(int64(3600)),
+							Path:              "token",
+						},
+					}},
+				},
+			},
+		},
+		{
+			Name: "keyring",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  c.KeyringSecretName,
+					DefaultMode: ptr.To(int32(0o400)),
+					Items: []corev1.KeyToPath{{
+						Key:  "bundle.json",
+						Path: "bundle.json",
+					}},
+				},
+			},
+		},
+		{
+			Name: "bootstrap",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: c.BootstrapTrustConfigMap},
+					DefaultMode:          ptr.To(int32(0o444)),
+					Items: []corev1.KeyToPath{{
+						Key:  "ca.crt",
+						Path: "ca.crt",
+					}},
+				},
+			},
+		},
+	}
+
+	ds := &appsv1.DaemonSet{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apps/v1",
+			Kind:       "DaemonSet",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.DaemonSetName,
+			Namespace: c.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
+				Type: appsv1.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
+					MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+					MaxSurge:       ptr.To(intstr.FromInt32(0)),
+				},
+			},
+			// Require sustained readiness across probe periods before advancing a rollout.
+			MinReadySeconds: 10,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName:            c.DataplaneServiceAccount,
+					AutomountServiceAccountToken:  ptr.To(false),
+					RestartPolicy:                 corev1.RestartPolicyAlways,
+					DNSPolicy:                     corev1.DNSClusterFirst,
+					SchedulerName:                 corev1.DefaultSchedulerName,
+					EnableServiceLinks:            ptr.To(false),
+					PreemptionPolicy:              ptr.To(corev1.PreemptLowerPriority),
+					TerminationGracePeriodSeconds: ptr.To(int64(30)),
+					SecurityContext:               &corev1.PodSecurityContext{RunAsUser: ptr.To(int64(0))},
+					Affinity:                      affinity,
+					Containers: []corev1.Container{{
+						Name:                     "dataplane",
+						Image:                    c.DataplaneImage,
+						ImagePullPolicy:          corev1.PullIfNotPresent,
+						TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+						Env: []corev1.EnvVar{
+							{
+								Name:  "RACER_CLUSTER_ID",
+								Value: string(c.Cluster),
+							},
+							{
+								Name:  "RACER_CONTROL_ENDPOINT",
+								Value: c.ControlURL,
+							},
+							// This is only a bind address, never an authority for node identity.
+							// Define it first so kubelet expands either Pod IP family below.
+							{
+								Name: "RACER_POD_IP",
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										APIVersion: "v1",
+										FieldPath:  "status.podIP",
+									},
+								},
+							},
+							{
+								Name:  "RACER_PEER_LISTEN",
+								Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(c.PeerPort)),
+							},
+							{
+								Name:  "RACER_DIAGNOSTICS_LISTEN",
+								Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(diagnosticsPort)),
+							},
+							{
+								Name:  "RACER_TRUST_BUNDLE",
+								Value: "/etc/racer/bootstrap/ca.crt",
+							},
+							{
+								Name:  "RACER_SERVICE_ACCOUNT_TOKEN",
+								Value: "/var/run/racer-token/token",
+							},
+							{
+								Name:  "RACER_SECRET_DIRECTORY",
+								Value: "/etc/racer/keyring",
+							},
+							// Kubelet creates the hostPath mount with mode 0755. Let the
+							// dataplane create its private 0700 directory beneath it.
+							{
+								Name:  "RACER_IDENTITY_DIRECTORY",
+								Value: "/var/lib/racer/identity/private",
+							},
+							{
+								Name:  "RACER_SLAB_DIRECTORY",
+								Value: "/var/lib/racer/slabs",
+							},
+						},
+						Ports: []corev1.ContainerPort{
+							{
+								Name:          "peer",
+								ContainerPort: int32(c.PeerPort),
+								Protocol:      corev1.ProtocolTCP,
+							},
+							{
+								Name:          "diagnostics",
+								ContainerPort: diagnosticsPort,
+								Protocol:      corev1.ProtocolTCP,
+							},
+						},
+						// Readiness may wait on enrollment/recovery indefinitely without probe
+						// restarts. Membership must continue to include unready Pods.
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/readyz",
+									Port:   intstr.FromString("diagnostics"),
+									Scheme: corev1.URISchemeHTTP,
+								},
+							},
+							PeriodSeconds:    5,
+							TimeoutSeconds:   2,
+							SuccessThreshold: 1,
+							FailureThreshold: 1,
+						},
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: ptr.To(false),
+							ReadOnlyRootFilesystem:   ptr.To(true),
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      "token",
+								MountPath: "/var/run/racer-token",
+								ReadOnly:  true,
+							},
+							{
+								Name:      "keyring",
+								MountPath: "/etc/racer/keyring",
+								ReadOnly:  true,
+							},
+							{
+								Name:      "bootstrap",
+								MountPath: "/etc/racer/bootstrap",
+								ReadOnly:  true,
+							},
+							{
+								Name:      "identity",
+								MountPath: "/var/lib/racer/identity",
+							},
+							{
+								Name:      "slabs",
+								MountPath: "/var/lib/racer/slabs",
+							},
+							{
+								Name:      "sockets",
+								MountPath: "/run/racer",
+							},
+						},
+					}},
+					Volumes: projectedVolumes,
+				},
+			},
+		},
+	}
 	for _, mount := range []struct{ name, path string }{{"identity", "/var/lib/racer/identity"}, {"slabs", "/var/lib/racer/slabs"}, {"sockets", "/run/racer"}} {
 		ds.Spec.Template.Spec.Volumes = append(ds.Spec.Template.Spec.Volumes, corev1.Volume{Name: mount.name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.path, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
 	}

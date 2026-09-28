@@ -16,6 +16,13 @@ func canonicalPublication(v Publication) Publication {
 	v.Caches = append([]CacheDefinition{}, v.Caches...)
 	for i := range v.Members {
 		v.Members[i].Rails = append([]Rail{}, v.Members[i].Rails...)
+		for j := range v.Members[i].Rails {
+			if n := v.Members[i].Rails[j].NUMANode; n != nil {
+				value := *n
+				v.Members[i].Rails[j].NUMANode = &value
+			}
+		}
+
 		slices.SortFunc(v.Members[i].Rails, func(a, b Rail) int { return cmp.Compare(a.Rail, b.Rail) })
 	}
 
@@ -25,15 +32,58 @@ func canonicalPublication(v Publication) Publication {
 	return v
 }
 
+// CanonicalCandidate owns validated, sorted publication content, including nested
+// pointers. Its private state can be reused for hashing and encoding after counter
+// assignment without retaining caller-owned mutable state. The zero value is invalid.
+type CanonicalCandidate struct {
+	publication Publication
+}
+
+// NewCanonicalCandidate validates and copies content once. Input counters are
+// ignored; final encoding checks the assigned counters and complete byte bound.
+func NewCanonicalCandidate(v Publication) (CanonicalCandidate, error) {
+	if err := validatePublication(v, false); err != nil {
+		return CanonicalCandidate{}, err
+	}
+
+	return CanonicalCandidate{publication: canonicalPublication(v)}, nil
+}
+
+// EncodePublication encodes the candidate with nonzero counters. It does not
+// mutate the candidate, and each call returns independently owned bytes.
+func (c CanonicalCandidate) EncodePublication(sequence Sequence, membership MembershipVersion) ([]byte, error) {
+	v := c.publication
+	if err := validateHeader(v.SchemaVersion, v.Cluster); err != nil {
+		return nil, err
+	}
+
+	if sequence == 0 || membership == 0 {
+		return nil, InvalidRequest
+	}
+
+	v.Sequence, v.MembershipVersion = sequence, membership
+
+	return encode(v, MaxPublicationBytes)
+}
+
 // CanonicalContent returns counter-free canonical JSON for durable version CAS.
 // The membership document includes schema and cluster, and every member input.
 // Input counters may be zero because callers hash candidates before assigning them.
 func CanonicalContent(v Publication) (content, membership []byte, err error) {
-	if err := validatePublication(v, false); err != nil {
+	c, err := NewCanonicalCandidate(v)
+	if err != nil {
 		return nil, nil, err
 	}
 
-	v = canonicalPublication(v)
+	return c.canonicalContent()
+}
+
+func (c CanonicalCandidate) canonicalContent() (content, membership []byte, err error) {
+	v := c.publication
+	if err := validateHeader(v.SchemaVersion, v.Cluster); err != nil {
+		return nil, nil, err
+	}
+
 	m := struct {
 		SchemaVersion uint32    `json:"schema_version"`
 		Cluster       ClusterID `json:"cluster"`
@@ -58,7 +108,18 @@ func CanonicalContent(v Publication) (content, membership []byte, err error) {
 
 // ContentHashes returns lowercase SHA-256 hex, suitable for VersionRecord fields.
 func ContentHashes(v Publication) (content, membership string, err error) {
-	p, m, err := CanonicalContent(v)
+	c, err := NewCanonicalCandidate(v)
+	if err != nil {
+		return "", "", err
+	}
+
+	return c.ContentHashes()
+}
+
+// ContentHashes returns the same counter-free hashes as ContentHashes without
+// repeating validation, copying, or sorting of the candidate's collections.
+func (c CanonicalCandidate) ContentHashes() (content, membership string, err error) {
+	p, m, err := c.canonicalContent()
 	if err != nil {
 		return "", "", err
 	}

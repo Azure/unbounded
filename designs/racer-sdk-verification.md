@@ -1,6 +1,6 @@
 # Racer SDK verification and measurements
 
-## Acceptance: VERIFIED, not yet merged (2026-09-28)
+## Acceptance: VERIFIED (2026-09-28)
 
 All final gates passed for the approved high-throughput rewrite in the
 `tmp/racer-sdk-throughput` worktree. This records acceptance of the tested
@@ -10,7 +10,7 @@ is [Racer Go SDK](racer-sdk.md); detailed measurements and limitations are in
 
 Final gate results supplied by the verification owners:
 
-- Full `make fmt` and full `make lint` passed; lint reported zero issues.
+- `make fmt` across affected packages and full `make lint` passed; lint reported zero issues.
 - Aggregate Go race tests passed:
   `go test -race ./pkg/racersdk ./internal/gantry/... ./cmd/gantry ./cmd/racer-loadgen ./deploy/gantry ./internal/operator/components/gantry`.
 - Rust: 803 passed, 12 opt-in tests ignored. The separate Go/Rust UDS conformance
@@ -30,6 +30,14 @@ renewal, pruning, post-expiry peer use and post-prune disk reuse; and cache UID
 recreation with fresh reusable pages on both nodes without dataplane restart.
 Application and E2E source hashes remained unchanged during that run
 (`REPORT.md:39-42`).
+
+After integrating controller changes through `b634bd23`, the combined tree also
+passed full `make e2e-racer` in **405.627s** after rebuilding the operator and
+controller images. Evidence is retained in
+`tmp/e2e-final-20260927/combined-merge/REPORT.md`. Full lint and race tests for
+`./internal/racer/... ./internal/operator/... ./deploy/gantry` passed on the
+combined tree. The operator tests required rendering their local prerequisites
+with `make machina-manifests token-refresher-manifests net-manifests` first.
 
 Final unpaced local process-integration runs had zero mixed-load errors,
 admission rejections, or queue timeouts in both cold and warm phases:

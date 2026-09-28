@@ -7,7 +7,7 @@ handoffs, line numbers, and pass/fail counts. It is historical evidence, not a
 current failure list or acceptance of the approved high-throughput rewrite.
 Use [Racer Go SDK](racer-sdk.md) for the current contract and
 [Racer SDK throughput performance](racer-sdk-throughput-performance.md) for new
-verification results. The rewrite is **VERIFIED, not yet merged**, as of
+verification results. The rewrite is **VERIFIED**, as of
 2026-09-28: separate UDS conformance and deployed E2E both passed. See the
 [dated acceptance summary](racer-sdk-verification.md) for all final gates and
 the distinction between the Rust suite's 12 ignored tests and the separately

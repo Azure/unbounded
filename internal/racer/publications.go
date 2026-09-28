@@ -78,19 +78,17 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 	return written, nil
 }
 
-// Publications owns only the current immutable publication, bounded poll
-// admission, and one broadcast notification. Older state belongs to dataplanes.
+// Publications owns only the current immutable publication and one broadcast
+// notification. Older state belongs to dataplanes; poll admission belongs to Server.
 type Publications struct {
-	Limits    Limits
 	mu        sync.Mutex
 	current   *CommittedPublication
 	changed   chan struct{}
-	polls     map[wire.NodeID]struct{}
 	suspended bool
 }
 
-func NewPublications(limits Limits) *Publications {
-	return &Publications{Limits: limits, changed: make(chan struct{}), polls: make(map[wire.NodeID]struct{})}
+func NewPublications() *Publications {
+	return &Publications{changed: make(chan struct{})}
 }
 
 func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, members AcceptedMembers, caches []wire.CacheDefinition) (*PreparedPublication, error) {
@@ -107,7 +105,12 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 		v.Members = append(v.Members, member)
 	}
 
-	content, membership, err := wire.ContentHashes(v)
+	candidate, err := wire.NewCanonicalCandidate(v)
+	if err != nil {
+		return nil, err
+	}
+
+	content, membership, err := candidate.ContentHashes()
 	if err != nil {
 		return nil, err
 	}
@@ -130,9 +133,8 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 	}
 
 	record.ContentHash, record.MembershipHash = content, membership
-	v.Sequence, v.MembershipVersion = record.Sequence, record.MembershipVersion
 
-	encoded, err := wire.EncodePublication(v)
+	encoded, err := candidate.EncodePublication(record.Sequence, record.MembershipVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +189,18 @@ func (p *Publications) Current() (*CommittedPublication, error) {
 	return p.currentLocked()
 }
 
+// CurrentAndSubscribe atomically reads the current publication and subscribes to
+// changes, including when unavailable. The channel closes on install or suspension;
+// leadership cancellation must be observed separately by the caller.
+func (p *Publications) CurrentAndSubscribe() (*CommittedPublication, <-chan struct{}, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	current, err := p.currentLocked()
+
+	return current, p.changed, err
+}
+
 func (p *Publications) currentLocked() (*CommittedPublication, error) {
 	if p.current == nil || p.suspended {
 		return nil, wire.Unavailable
@@ -213,8 +227,9 @@ func (p *Publications) Suspend() {
 	}
 }
 
-// Wait admits one poll per node, rejects future cursors, and honors context
-// cancellation/certificate expiration. It never allocates a publication per poll.
+// Wait rejects invalid identities/cursors and honors context cancellation and
+// certificate expiration. It shares publication bytes and broadcast notifications;
+// callers own admission for the full response lifetime, including writes and flush.
 func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *wire.Sequence) (*CommittedPublication, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -224,33 +239,34 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 		return nil, wire.Unauthenticated
 	}
 
-	p.mu.Lock()
-
-	current, err := p.currentLocked()
+	current, changed, err := p.CurrentAndSubscribe()
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 
 	if identity.cluster != current.record.Cluster {
-		p.mu.Unlock()
 		return nil, wire.Forbidden
 	}
 
 	if after != nil && (*after == 0 || *after > current.record.Sequence) {
-		p.mu.Unlock()
 		return nil, wire.Conflict
 	}
 
-	if _, exists := p.polls[identity.node]; exists || len(p.polls) >= p.Limits.MaxPolls {
-		p.mu.Unlock()
-		return nil, wire.Overloaded
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	p.polls[identity.node] = struct{}{}
-	p.mu.Unlock()
+	if !time.Now().Before(identity.expires) {
+		return nil, wire.Unauthenticated
+	}
 
-	defer func() { p.mu.Lock(); delete(p.polls, identity.node); p.mu.Unlock() }()
+	if after == nil || current.record.Sequence > *after {
+		if err := current.leadership.Err(); err != nil {
+			return nil, err
+		}
+
+		return current, nil
+	}
 
 	timer := time.NewTimer(wire.PollWait)
 	defer timer.Stop()
@@ -259,27 +275,6 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 	defer expiration.Stop()
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		if !time.Now().Before(identity.expires) {
-			return nil, wire.Unauthenticated
-		}
-
-		p.mu.Lock()
-		current, err = p.currentLocked()
-		changed := p.changed
-		p.mu.Unlock()
-
-		if err != nil {
-			return nil, err
-		}
-
-		if after == nil || current.record.Sequence > *after {
-			return current, nil
-		}
-
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -302,6 +297,23 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 
 			return nil, nil
 		case <-changed:
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		if !time.Now().Before(identity.expires) {
+			return nil, wire.Unauthenticated
+		}
+
+		current, changed, err = p.CurrentAndSubscribe()
+		if err != nil {
+			return nil, err
+		}
+
+		if current.record.Sequence > *after {
+			return current, nil
 		}
 	}
 }

@@ -2,7 +2,7 @@
 
 ## Scope and evidence
 
-The approved high-throughput rewrite is **VERIFIED, not yet merged**, as of
+The approved high-throughput rewrite is **VERIFIED**, as of
 2026-09-28. This document describes the current implementation contract, including
 the Go SDK, its Gantry integration, and Rust range delivery. It supersedes the
 original design's page-by-page continuation, Transport, and digest-holdback claims.

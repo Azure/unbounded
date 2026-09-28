@@ -116,8 +116,8 @@ func cacheChanges() predicate.Predicate {
 	})
 }
 
-func namedChanges(namespace string, names ...string) predicate.Predicate {
-	return changes(func(obj client.Object) bool {
+func namedObjects(namespace string, names ...string) func(client.Object) bool {
+	return func(obj client.Object) bool {
 		if obj.GetNamespace() != namespace {
 			return false
 		}
@@ -129,14 +129,16 @@ func namedChanges(namespace string, names ...string) predicate.Predicate {
 		}
 
 		return false
-	}, func(a, b client.Object) bool { return a.GetResourceVersion() == b.GetResourceVersion() })
+	}
+}
+
+func namedChanges(namespace string, names ...string) predicate.Predicate {
+	return changes(namedObjects(namespace, names...), func(a, b client.Object) bool { return a.GetResourceVersion() == b.GetResourceVersion() })
 }
 
 // Ignore our own resource-version-only CAS writes to avoid an endless hot loop.
 func versionChanges(cfg Config) predicate.Predicate {
-	named := namedChanges(cfg.Namespace, cfg.VersionConfigMapName, cfg.InstallationConfigMapName)
-
-	return changes(func(obj client.Object) bool { return named.Generic(event.GenericEvent{Object: obj}) }, func(a, b client.Object) bool {
+	return changes(namedObjects(cfg.Namespace, cfg.VersionConfigMapName, cfg.InstallationConfigMapName), func(a, b client.Object) bool {
 		x, xok := a.(*corev1.ConfigMap)
 
 		y, yok := b.(*corev1.ConfigMap)

@@ -22,16 +22,16 @@ import (
 )
 
 type Server struct {
-	Config         Config
-	Trust          *Trust
-	Bootstrap      *Bootstrap
-	Publications   *Publications
-	Lifecycle      *Lifecycle
-	once           sync.Once
-	admission      sync.Mutex
-	polls          map[wire.NodeID]struct{}
-	bootstrapSlots chan struct{}
-	writes         chan struct{}
+	Config       Config
+	Trust        *Trust
+	Bootstrap    *Bootstrap
+	Publications *Publications
+	Lifecycle    *Lifecycle
+	once         sync.Once
+	admission    sync.Mutex
+	polls        map[wire.NodeID]struct{}
+	authSlots    chan struct{}
+	writes       chan struct{}
 }
 
 var (
@@ -68,10 +68,10 @@ func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tl
 			return nil, err
 		}
 
-		if !take(s.bootstrapSlots) {
+		if !take(s.authSlots) {
 			return nil, wire.Overloaded
 		}
-		defer release(s.bootstrapSlots)
+		defer release(s.authSlots)
 
 		roots, err := s.Trust.pool()
 		if err != nil {
@@ -113,7 +113,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
-	serving, cancel := s.leaderContext(ctx)
+	serving, cancel := s.Lifecycle.LeaderContext(ctx)
 	defer cancel()
 
 	config, err := s.TLSConfig(serving)
@@ -131,8 +131,20 @@ func (s *Server) Start(ctx context.Context) error {
 
 // serve owns the listener and every accepted connection. Close, rather than a
 // grace period for active traffic, is required as soon as leadership is lost.
-func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) (result error) {
-	server := &http.Server{Handler: s.Handler(), TLSConfig: config, ReadHeaderTimeout: s.Config.Limits.WriteTimeout, ReadTimeout: s.Config.Limits.WriteTimeout, WriteTimeout: wire.PollWait + 3*s.Config.Limits.WriteTimeout, IdleTimeout: wire.PollWait, MaxHeaderBytes: s.Config.Limits.HeaderBytes, BaseContext: func(net.Listener) context.Context { return ctx }}
+func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	server := &http.Server{
+		Handler:           s.Handler(),
+		TLSConfig:         config,
+		ReadHeaderTimeout: s.Config.Limits.WriteTimeout,
+		ReadTimeout:       s.Config.Limits.WriteTimeout,
+		WriteTimeout:      wire.PollWait + 3*s.Config.Limits.WriteTimeout,
+		IdleTimeout:       wire.PollWait,
+		MaxHeaderBytes:    s.Config.Limits.HeaderBytes,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
 
 	var connections sync.Map
 
@@ -140,18 +152,44 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 	server.ConnState = func(conn net.Conn, state http.ConnState) {
 		if state == http.StateNew {
 			connections.Store(conn, struct{}{})
+			// Accept may race teardown's connection sweep. Every new connection
+			// must also check cancellation after registering itself.
+			if ctx.Err() != nil {
+				closeTransport(conn)
+			}
 		}
 
 		if state == http.StateClosed {
 			connections.Delete(conn)
 		}
-
-		if ctx.Err() != nil {
-			closeTransport(conn)
-		}
 	}
 
-	closeAll := func() {
+	done := make(chan error, 1)
+
+	go func(done chan<- error) { done <- server.Serve(tls.NewListener(listener, config)) }(done)
+
+	s.Lifecycle.SetServingReady(true)
+
+	var result error
+
+	select {
+	case err := <-done:
+		result = err
+		done = nil
+	case <-ctx.Done():
+	}
+
+	s.Lifecycle.SetServingReady(false)
+	cancel()
+
+	shutdown, stop := context.WithTimeout(context.Background(), s.Config.Limits.ShutdownTimeout)
+	defer stop()
+
+	closed := make(chan error, 1)
+
+	go func(closed chan<- error) {
+		// Force-close TCP before net/http closes TLS connections: close-notify
+		// can otherwise block on a slow reader. No graceful drain is allowed.
 		connections.Range(func(key, _ any) bool {
 			if conn, ok := key.(net.Conn); ok {
 				closeTransport(conn)
@@ -159,51 +197,59 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 
 			return true
 		})
-	}
 
-	stop := context.AfterFunc(ctx, closeAll)
-	defer stop()
-	defer s.Lifecycle.SetServingReady(false)
-	defer func() { result = errors.Join(result, server.Close()) }()
+		closed <- server.Close()
+	}(closed)
 
-	done := make(chan error, 1)
+	var closeErr error
 
-	go func() { done <- server.Serve(tls.NewListener(listener, config)) }()
-
-	s.Lifecycle.SetServingReady(true)
-
-	select {
-	case err := <-done:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-
-		return err
-	case <-ctx.Done():
-		s.Lifecycle.SetServingReady(false)
-		closeAll()
-
-		closeErr := server.Close()
-
-		shutdown, cancel := context.WithTimeout(context.Background(), s.Config.Limits.ShutdownTimeout)
-		defer cancel()
-
-		shutdownErr := server.Shutdown(shutdown)
+	for done != nil || closed != nil {
 		select {
-		case <-done:
-			return errors.Join(closeErr, shutdownErr)
+		case result = <-done:
+			done = nil
+		case closeErr = <-closed:
+			closed = nil
 		case <-shutdown.Done():
-			return errors.Join(closeErr, shutdownErr, shutdown.Err())
+			closeErr = errors.Join(closeErr, shutdown.Err())
+			done, closed = nil, nil
 		}
 	}
+
+	if errors.Is(result, http.ErrServerClosed) {
+		result = nil
+	}
+
+	return errors.Join(result, closeErr)
 }
 
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.polls = make(map[wire.NodeID]struct{})
-		s.bootstrapSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
+		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
 		s.writes = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentWrites))
 	})
+}
+
+// admitPoll is the sole per-node/global poll guard. The handler must retain it
+// through response Write and Flush, including error responses and aborted writes.
+func (s *Server) admitPoll(node wire.NodeID) bool {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+
+	if _, exists := s.polls[node]; exists || len(s.polls) >= s.Config.Limits.MaxPolls {
+		return false
+	}
+
+	s.polls[node] = struct{}{}
+
+	return true
+}
+
+func (s *Server) releasePoll(node wire.NodeID) {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+
+	delete(s.polls, node)
 }
 
 func take(slots chan struct{}) bool {
@@ -215,26 +261,6 @@ func take(slots chan struct{}) bool {
 	}
 }
 func release(slots chan struct{}) { <-slots }
-
-func (s *Server) leaderContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
-
-	s.Lifecycle.mu.Lock()
-	leader := s.Lifecycle.leader
-	s.Lifecycle.mu.Unlock()
-
-	if leader == nil {
-		cancel()
-		return ctx, cancel
-	}
-
-	stop := context.AfterFunc(leader, cancel)
-	if leader.Err() != nil {
-		cancel()
-	}
-
-	return ctx, func() { stop(); cancel() }
-}
 
 func (s *Server) Ready(r *http.Request) error {
 	if s.Lifecycle == nil {
@@ -283,7 +309,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 
-		ctx, cancel := s.leaderContext(r.Context())
+		ctx, cancel := s.Lifecycle.LeaderContext(r.Context())
 		defer cancel()
 
 		stop := context.AfterFunc(ctx, func() {
@@ -303,11 +329,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
-	if !take(s.bootstrapSlots) {
+	if !take(s.authSlots) {
 		writeFailure(w, wire.Overloaded)
 		return
 	}
-	defer release(s.bootstrapSlots)
+	defer release(s.authSlots)
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
 	defer cancel()
@@ -368,6 +394,18 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (NodeIdentity, error) {
+	if !take(s.authSlots) {
+		return NodeIdentity{}, wire.Overloaded
+	}
+	defer release(s.authSlots)
+
+	ctx, cancel := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
+	defer cancel()
+
+	return AuthenticateCertificate(ctx, s.Trust, s.Config, state)
+}
+
 func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	after, err := snapshotCursor(r)
 	if err != nil {
@@ -375,36 +413,18 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !take(s.bootstrapSlots) {
-		writeFailure(w, wire.Overloaded)
-		return
-	}
-
-	auth, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
-	identity, err := AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
-
-	cancel()
-	release(s.bootstrapSlots)
-
+	identity, err := s.authenticateSnapshot(r.Context(), r.TLS)
 	if err != nil {
 		writeFailure(w, err)
 		return
 	}
 
-	s.admission.Lock()
-
-	_, exists := s.polls[identity.node]
-	if exists || len(s.polls) >= s.Config.Limits.MaxPolls {
-		s.admission.Unlock()
+	if !s.admitPoll(identity.node) {
 		writeFailure(w, wire.Overloaded)
 
 		return
 	}
-
-	s.polls[identity.node] = struct{}{}
-	s.admission.Unlock()
-
-	defer func() { s.admission.Lock(); delete(s.polls, identity.node); s.admission.Unlock() }()
+	defer s.releasePoll(identity.node)
 
 	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
 	defer cancel()
@@ -432,18 +452,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Revalidate local trust after waiting: rotation or observed invalidity must
 	// also take effect on pooled connections before returning snapshot bytes.
-	if !take(s.bootstrapSlots) {
-		writeFailure(w, wire.Overloaded)
-		return
-	}
-
-	auth, stop := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
-	_, err = AuthenticateCertificate(auth, s.Trust, s.Config, r.TLS)
-
-	stop()
-	release(s.bootstrapSlots)
-
-	if err != nil {
+	if _, err := s.authenticateSnapshot(ctx, r.TLS); err != nil {
 		writeFailure(w, err)
 		return
 	}

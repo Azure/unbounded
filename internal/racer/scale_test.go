@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -217,7 +216,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 		t.Fatal(err)
 	}
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +240,8 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	}
 
 	sequence := current.Version().Sequence
+	server := &Server{Config: r.Config}
+	server.initializeAdmission()
 
 	waiting, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -262,6 +263,15 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 		identity := pollIdentity(r.Config, id)
 
 		wg.Go(func() {
+			if !server.admitPoll(id) {
+				results <- nil
+
+				failures <- wire.Overloaded
+
+				return
+			}
+			defer server.releasePoll(id)
+
 			p, err := r.Publications.Wait(waiting, identity, &sequence)
 			results <- p
 
@@ -273,10 +283,10 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	defer cancel()
 
 	eventually(t, "100000 admitted waiters", func() bool {
-		r.Publications.mu.Lock()
-		defer r.Publications.mu.Unlock()
+		server.admission.Lock()
+		defer server.admission.Unlock()
 
-		return len(r.Publications.polls) == count
+		return len(server.polls) == count
 	})
 
 	admit := time.Since(start)
@@ -284,13 +294,13 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	runtime.GC()
 	runtime.ReadMemStats(&parked)
 
-	if _, err := r.Publications.Wait(ctx, pollIdentity(r.Config, testOtherUID), &sequence); !errors.Is(err, wire.Overloaded) {
-		t.Fatalf("global bound failed: %v", err)
+	if server.admitPoll(testOtherUID) {
+		t.Fatal("global bound failed")
 	}
 
 	for id := range members {
-		if _, err := r.Publications.Wait(ctx, pollIdentity(r.Config, id), &sequence); !errors.Is(err, wire.Overloaded) {
-			t.Fatalf("duplicate bound failed: %v", err)
+		if server.admitPoll(id) {
+			t.Fatal("duplicate bound failed")
 		}
 
 		break
@@ -318,6 +328,6 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 		}
 	}
 
-	awaitPolls(t, r.Publications, 0)
+	awaitServerPolls(t, server, 0)
 	t.Logf("waiters=%d GOMAXPROCS=%d admission=%s install=%s all_delivered=%s heap_delta=%d stack_delta=%d next_bytes=%d", count, runtime.GOMAXPROCS(0), admit, install, fanout, int64(parked.HeapAlloc)-int64(before.HeapAlloc), int64(parked.StackInuse)-int64(before.StackInuse), len(next.Encoding()))
 }

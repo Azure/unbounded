@@ -27,6 +27,12 @@ both the test-only reference codec and the existing Rust runtime codec.
 - `internal/operator/components/racer`: the sole controller Deployment and dataplane
   DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet` builder.
 
+Topology lists Pods in the installation namespace using the assigned-node index
+and passes those grouped lists directly to the pure `ReconcileMembers` helper.
+Endpoint selection verifies node assignment and the current DaemonSet owner UID.
+Membership diagnostics follow Node UID order; candidate history owns its nested
+state and is installed only after the publication commits.
+
 There is no Kubernetes abstraction, custom queue/leader-election framework,
 per-node Secret, enrollment ledger, or goal-state checkpoint store. Only the
 version ConfigMap (including its one-way credential initialization claim), shared
@@ -304,8 +310,10 @@ evict a working cache. Deleting a rejected object changes nothing; deleting an
 admitted object frees a slot for the next waiting UID. Recreation has a new UID
 and unrelated keys. Topology reads authoritative inputs and publishes additions
 only after their keys commit; a Secret watch drives that follow-up reconciliation.
-Catalog and keyring reconciliation share a leader-local gate to prevent a stale
-in-progress topology candidate from racing key pruning. Kubelet projection and
+Topology, keyring reconciliation, and issuance share a context-aware, leader-local
+`CatalogGate` to serialize authoritative catalog and credential operations and
+prevent an in-progress topology candidate from racing key pruning. Canceled
+admission preserves accepted trust and publications. Kubelet projection and
 snapshot delivery are still asynchronous, not an atomic dataplane transaction.
 
 Capacity rejection alone preserves usable admitted credentials, rotation, and

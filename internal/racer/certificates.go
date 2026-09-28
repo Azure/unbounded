@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,11 +34,11 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 // Issuer accesses a controller-only Secret. Its private key is never projected
 // into dataplane Pods or included in a response or diagnostic.
 type Issuer struct {
-	APIReader client.Reader
-	Config    Config
-	Trust     *Trust
-	CatalogMu *sync.Mutex
-	Now       func() time.Time
+	APIReader   client.Reader
+	Config      Config
+	Trust       *Trust
+	CatalogGate *CatalogGate
+	Now         func() time.Time
 }
 
 type signingMaterial struct {
@@ -114,6 +113,11 @@ func parseSigning(m signingMaterial) (*x509.Certificate, ed25519.PrivateKey, err
 	return cert, key, nil
 }
 
+type parsedSigning struct {
+	certificate *x509.Certificate
+	key         ed25519.PrivateKey
+}
+
 type signingState struct {
 	certificate *x509.Certificate
 	key         ed25519.PrivateKey
@@ -129,27 +133,23 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, err
 	}
 
-	topology := &TopologyReconciler{APIReader: reader, Config: cfg}
-
-	version, _, err := topology.readVersion(ctx)
+	version, _, err := readVersion(ctx, reader, cfg)
 	if err != nil {
 		return signingState{}, err
 	}
 
 	claim := version.Annotations[credentialClaim]
-	if !strings.HasPrefix(claim, cfg.IssuerSecretName+"/"+cfg.KeyringSecretName+"/") {
+	if !validCredentialClaim(cfg, claim) {
 		return signingState{}, wire.Unavailable
 	}
 
-	_, _, b, s, material, err := readCredentials(ctx, reader, cfg, claim)
+	credentials, err := readCredentials(ctx, reader, cfg, claim)
 	if err != nil {
 		return signingState{}, err
 	}
 
-	cert, key, err := parseSigning(material.Keys[s.ActiveIssuer])
-	if err != nil {
-		return signingState{}, err
-	}
+	active := credentials.signing[credentials.rotation.ActiveIssuer]
+	cert, key := active.certificate, active.key
 
 	if now.Before(cert.NotBefore) || now.Add(cfg.certificateLifetime()).After(cert.NotAfter) {
 		return signingState{}, wire.Unavailable
@@ -157,11 +157,8 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 
 	roots := x509.NewCertPool()
 
-	for _, der := range b.PeerTrustRoots {
-		root, err := x509.ParseCertificate(der)
-		if err != nil {
-			return signingState{}, wire.Unavailable
-		}
+	for _, der := range credentials.bundle.PeerTrustRoots {
+		root := credentials.signing[rootID(der)].certificate
 
 		if !now.Before(root.NotBefore) && now.Before(root.NotAfter) {
 			roots.AddCert(root)
@@ -200,20 +197,13 @@ func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
 func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
 	// Serialize observations with controller installation so an in-flight valid
 	// read cannot restore trust after another operation observes invalidity.
-	if i.CatalogMu != nil {
-		// Controller API work can stall. Waiting for its lock must still honor
+	if i.CatalogGate != nil {
+		// Controller API work can stall. Waiting for its gate must still honor
 		// the enrollment deadline and release bounded authentication admission.
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for !i.CatalogMu.TryLock() {
-			select {
-			case <-ctx.Done():
-				return signingState{}, ctx.Err()
-			case <-ticker.C:
-			}
+		if err := i.CatalogGate.Acquire(ctx); err != nil {
+			return signingState{}, err
 		}
-		defer i.CatalogMu.Unlock()
+		defer i.CatalogGate.Release()
 	}
 
 	state, err := loadSigning(ctx, i.APIReader, i.Config, now)

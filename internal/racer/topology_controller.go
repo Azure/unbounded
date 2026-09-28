@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"errors"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,7 +27,7 @@ type TopologyReconciler struct {
 	Config       Config
 	Publications *Publications
 	Accepted     AcceptedMembers
-	CatalogMu    *sync.Mutex
+	CatalogGate  *CatalogGate
 	Trust        *Trust
 }
 
@@ -36,9 +35,11 @@ type TopologyReconciler struct {
 // authoritatively, commits counters/hashes with CAS, then installs the result.
 // Conflicts requeue from fresh inputs; missing established counters fail closed.
 func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if r.CatalogMu != nil {
-		r.CatalogMu.Lock()
-		defer r.CatalogMu.Unlock()
+	if r.CatalogGate != nil {
+		if err := r.CatalogGate.Acquire(ctx); err != nil {
+			return ctrl.Result{}, reconcile.TerminalError(err)
+		}
+		defer r.CatalogGate.Release()
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -68,7 +69,7 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 }
 
 func (r *TopologyReconciler) reconcile(ctx context.Context) error {
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return err
@@ -93,13 +94,13 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	// before its keys exist; only the subsequent Secret event may publish it.
 	// Read authoritatively so a stale informer cannot admit rejected growth.
 	if claim := cm.Annotations[credentialClaim]; claim != "" {
-		_, _, bundle, _, _, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+		credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
 		if err != nil {
 			r.suspendInvalidAuthority(err)
 			return err
 		}
 
-		keyed := keyedCaches(bundle)
+		keyed := keyedCaches(credentials.bundle)
 
 		accepted := catalog[:0]
 		for _, cache := range catalog {
@@ -119,7 +120,7 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	}
 	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
 	// Node. Ownership is still verified against the current DaemonSet UID.
-	var pods []corev1.Pod
+	podsByNode := make(map[string][]corev1.Pod, len(nodes.Items))
 
 	for _, node := range nodes.Items {
 		if err := ctx.Err(); err != nil {
@@ -131,10 +132,10 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 			return err
 		}
 
-		pods = append(pods, list.Items...)
+		podsByNode[node.Name] = list.Items
 	}
 
-	candidate, diagnostics, err := ReconcileMembers(nodes.Items, pods, ds.UID, r.Accepted, r.Config.PeerPort)
+	candidate, diagnostics, err := ReconcileMembers(nodes.Items, podsByNode, ds.UID, r.Accepted, r.Config.PeerPort)
 	if err != nil {
 		return err
 	}

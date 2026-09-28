@@ -118,7 +118,7 @@ func TestInitializeCrashOrdering(t *testing.T) {
 				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					writes = append(writes, "create")
 
-					marker, err := r.installation(ctx, false)
+					marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
 					if err != nil || marker.Immutable == nil || !*marker.Immutable {
 						t.Fatalf("counter create before marker freeze: %v", err)
 					}
@@ -158,7 +158,7 @@ func TestInitializeCrashOrdering(t *testing.T) {
 				t.Fatal("consumed marker reused")
 			}
 
-			_, _, err = r.readVersion(context.Background())
+			_, _, err = readVersion(context.Background(), r.APIReader, r.Config)
 
 			valid := stage == "before marker" || stage == "create response lost" || stage == "success"
 			if (err == nil) != valid {
@@ -195,7 +195,7 @@ func TestInitializeConflictAndExistingState(t *testing.T) {
 		t.Fatalf("existing counters accepted: %v", err)
 	}
 
-	if _, err := r.installation(context.Background(), true); err != nil {
+	if _, err := readInstallation(context.Background(), r.APIReader, r.Config, true); err != nil {
 		t.Fatalf("marker consumed despite existing counters: %v", err)
 	}
 }
@@ -209,7 +209,7 @@ func TestInitializeCanceledBeforeMarker(t *testing.T) {
 		t.Fatalf("canceled initialize: %v", err)
 	}
 
-	if _, err := r.installation(context.Background(), true); err != nil {
+	if _, err := readInstallation(context.Background(), r.APIReader, r.Config, true); err != nil {
 		t.Fatalf("canceled initialize consumed marker: %v", err)
 	}
 }
@@ -218,7 +218,7 @@ func TestStalePreparedPublicationCannotCommit(t *testing.T) {
 	r := initializedTopology(t)
 	ctx := context.Background()
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,12 +294,12 @@ func TestRecoveryNeverRecreatesCounters(t *testing.T) {
 			r := initializedTopology(t)
 			ctx := context.Background()
 
-			cm, _, err := r.readVersion(ctx)
+			cm, _, err := readVersion(ctx, r.APIReader, r.Config)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			marker, err := r.installation(ctx, false)
+			marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -392,7 +392,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 		t.Fatalf("member counters: %+v", v)
 	}
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +520,7 @@ func TestCancellationBeforeWritesAndInstall(t *testing.T) {
 	r := initializedTopology(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
