@@ -240,7 +240,7 @@ impl OriginClient {
         }
         let connection = self
             .pool
-            .checkout_wait(endpoint, scope)
+            .checkout_metadata(endpoint, scope)
             .await
             .map_err(response_error)?;
         let sent = self

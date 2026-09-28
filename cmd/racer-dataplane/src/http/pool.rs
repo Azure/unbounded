@@ -57,6 +57,7 @@ struct PoolState {
 }
 struct WaitingEntry {
     endpoint: Endpoint,
+    metadata: bool,
     waker: RefCell<Option<Waker>>,
 }
 struct Waiting {
@@ -329,6 +330,26 @@ impl HttpPool {
         endpoint: &'a Endpoint,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
+        self.checkout_wait_class(endpoint, scope, false)
+    }
+
+    /// Metadata does not queue behind origin page transfers. Where the endpoint
+    /// cap permits it, GETs leave one slot free for HEAD. Global outbound and
+    /// context quotas remain authoritative; this is not an unaccounted socket.
+    pub fn checkout_metadata<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        self.checkout_wait_class(endpoint, scope, true)
+    }
+
+    fn checkout_wait_class<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        scope: &'a RequestScope,
+        metadata: bool,
+    ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
             let mut waiting = None;
@@ -344,14 +365,14 @@ impl HttpPool {
                     .borrow()
                     .waiting
                     .iter()
-                    .find(|entry| &entry.endpoint == endpoint)
+                    .find(|entry| &entry.endpoint == endpoint && entry.metadata == metadata)
                     .cloned();
                 let turn = first.as_ref().is_none_or(|first| {
                     waiting
                         .as_ref()
                         .is_some_and(|waiting: &Waiting| Rc::ptr_eq(first, &waiting.entry))
                 });
-                if turn {
+                if turn && self.class_available(endpoint, metadata) {
                     match self.prepare_connection(endpoint) {
                         Err(Error::Overloaded) => (),
                         result => return Poll::Ready(result),
@@ -379,6 +400,7 @@ impl HttpPool {
                     )?;
                     let entry = Rc::new(WaitingEntry {
                         endpoint: endpoint.clone(),
+                        metadata,
                         waker: RefCell::new(None),
                     });
                     self.state.borrow_mut().waiting.push_back(entry.clone());
@@ -395,6 +417,17 @@ impl HttpPool {
             drop(waiting);
             self.connect(connection, address, scope).await
         })
+    }
+
+    fn class_available(&self, endpoint: &Endpoint, metadata: bool) -> bool {
+        if metadata || !matches!(endpoint, Endpoint::Origin { .. }) || self.per_origin <= 1 {
+            return true;
+        }
+        self.state
+            .borrow()
+            .entries
+            .get(endpoint)
+            .is_none_or(|entry| entry.active < self.per_origin - 1)
     }
 
     /// Wake a bounded round-robin batch, including child futures whose executor
@@ -1010,6 +1043,32 @@ mod tests {
         assert_eq!(pool.state.borrow().entries[&origin].idle.len(), 0);
         drop((lease, quota));
         assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+
+    #[test]
+    fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
+        let (admission, _, pool) = setup();
+        let endpoint = Endpoint::Origin {
+            cache: crate::model::identity::CacheId("cache".into()),
+            path: "/unused/origin".into(),
+        };
+        let (first, _a) = held(&pool, &endpoint);
+        let (idle, _b) = held(&pool, &endpoint);
+        drop(idle);
+        let scope = scope();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut page = pool.checkout_wait(&endpoint, &scope);
+        assert!(page.as_mut().poll(&mut cx).is_pending());
+        let mut metadata = pool.checkout_metadata(&endpoint, &scope);
+        let Poll::Ready(Ok(metadata)) = metadata.as_mut().poll(&mut cx) else {
+            panic!("metadata queued behind page");
+        };
+        assert_eq!(pool.state.borrow().entries[&endpoint].active, 2);
+        assert!(page.as_mut().poll(&mut cx).is_pending());
+        drop((metadata, first, page));
+        pool.close();
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
     }
 
     #[test]

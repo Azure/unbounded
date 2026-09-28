@@ -75,7 +75,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 			return
 		}
 
-		options = []racersdk.ReadOptions{{Offset: racersdk.ByteOffset(offset), Pin: metadata.ETag, Metadata: &metadata}}
+		options = []racersdk.ReadOptions{{Offset: racersdk.ByteOffset(offset), Pin: metadata.ETag, Metadata: &metadata, SmallObject: metadata.Size <= racersdk.PageSize}}
 	}
 
 	if kind == ifaces.KindManifest {
