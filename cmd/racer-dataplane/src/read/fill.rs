@@ -606,8 +606,21 @@ impl Fill {
                 self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
-            match self.dependencies.disk.read(page, scope).await {
-                Ok(Some(copy)) if validate_copy(&copy, page).is_ok() => {
+            // Copy-only forbids new acquisition, not reclamation of idle local
+            // buffers. Disk staging needs the same headroom as an acquire read.
+            match self
+                .dependencies
+                .disk
+                .read_with_token_reclaim(page, scope, |amount| {
+                    self.reserve_with_reclamation(
+                        &page.version.object.cache,
+                        ResourceClass::Ciphertext,
+                        amount,
+                    )
+                })
+                .await
+            {
+                Ok(Some((copy, _))) if validate_copy(&copy, page).is_ok() => {
                     self.metrics.record(Event::DiskHit, 1)?;
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }

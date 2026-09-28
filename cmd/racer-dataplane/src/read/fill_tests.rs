@@ -115,6 +115,7 @@ impl Origin for TestOrigin {
 
 struct Fixture {
     fill: Fill,
+    reactor: Rc<Reactor>,
     keys: Rc<crate::security::keyring::Keyring>,
     origin: Rc<TestOrigin>,
     crypto: Rc<CryptoClient>,
@@ -178,7 +179,7 @@ fn fixture_with_availability(
     let slabs = Rc::new(Slabs::new(
         worker,
         directory.clone(),
-        reactor,
+        reactor.clone(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
     ));
@@ -283,6 +284,7 @@ fn fixture_with_availability(
     });
     Fixture {
         keys,
+        reactor,
         directory,
         fill,
         origin,
@@ -1399,6 +1401,201 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
             .used(ResourceClass::DirtyCiphertext)
             > 0
     );
+}
+
+#[test]
+fn copy_only_disk_read_reclaims_idle_ciphertext_without_revoking_live_copies() {
+    disk_copy_reclaims_idle_ciphertext(false);
+}
+
+#[test]
+fn peer_bootstrap_disk_copy_reclaims_idle_ciphertext_before_fresh_acquisition() {
+    disk_copy_reclaims_idle_ciphertext(true);
+}
+
+fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
+    limits.ciphertext_bytes = limits.plaintext_bytes;
+    limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
+    let mut f = fixture_with(PAGE_BYTES, Some(limits));
+    f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
+    f.reactor.init().unwrap();
+    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let original = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let expected = original.ciphertext.bytes().to_vec();
+    let envelope = original.ciphertext.envelope().clone();
+    let metadata = original.metadata.clone();
+    let run_io = |mut work: crate::error::Operation<'_, usize>| {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        loop {
+            f.scope.check().unwrap();
+            if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                return result.unwrap();
+            }
+            f.reactor.poll_budgeted(64).unwrap();
+            f.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    };
+    assert_eq!(run_io(f.fill.dependencies.writer.progress(1, &f.scope)), 1);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    drop(original);
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    let deps = &f.fill.dependencies;
+    assert!(
+        deps.memory.ciphertext(&f.page).unwrap().is_none(),
+        "target must be disk-only"
+    );
+    let failures = crate::telemetry::failures::Failures::default();
+    deps.admission.set_observer(failures.observer(WorkerId(0)));
+    use crate::read::metadata::{MetadataDependencies, MetadataService};
+    let index = Rc::new(Index::new(WorkerId(0), 64));
+    let mut fresh = metadata.clone();
+    fresh.expires_at = ExpiresAt::from_unix_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000,
+    )
+    .unwrap();
+    index.publish_current(fresh).unwrap();
+    let service = MetadataService::new(
+        deps.candidates.clone(),
+        deps.origin.clone(),
+        deps.peers.clone(),
+        deps.credentials.clone(),
+        64,
+        MetadataDependencies {
+            index,
+            owners: deps.metadata_owner.clone(),
+            fill: Rc::new(Fill::new(deps.clone())),
+        },
+    );
+    let read_copy = || -> crate::error::Operation<'_, (ObjectMetadata, CiphertextPage)> {
+        Box::pin(async {
+            if bootstrap {
+                let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+                let response = service
+                    .bootstrap_peer(f.membership.clone(), &f.context, &f.scope, &mut budget)
+                    .await?;
+                let PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: Some(ciphertext),
+                } = response
+                else {
+                    panic!("expected retained bootstrap page")
+                };
+                assert_eq!(
+                    budget.remaining_attempts(),
+                    4,
+                    "copy needs no acquisition attempt"
+                );
+                Ok((metadata, ciphertext))
+            } else {
+                f.fill
+                    .copy_only(&f.page, &f.scope)
+                    .await
+                    .map(|copy| copy.expect("persisted page"))
+            }
+        })
+    };
+    let mut retained = Vec::new();
+    for number in 1..=30 {
+        let mut metadata = metadata.clone();
+        metadata.version.object.key = CacheKey([number; 32]);
+        let mut envelope = envelope.clone();
+        envelope.page.version = metadata.version.clone();
+        let ciphertext = deps
+            .buffers
+            .ciphertext(
+                deps.admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Ciphertext,
+                        expected.len(),
+                    )
+                    .unwrap(),
+                envelope,
+                expected.clone(),
+            )
+            .unwrap();
+        let page = crate::memory::page::UnverifiedPage {
+            copy: crate::memory::page::CiphertextCopy {
+                metadata,
+                ciphertext,
+            },
+            disk_token: None,
+        };
+        deps.memory.publish_ciphertext(page.clone()).unwrap();
+        retained.push(page);
+    }
+    // All copies are live: fail without revoking a reader or starting origin work.
+    let mut blocked = read_copy();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    match blocked.as_mut().poll(&mut cx) {
+        Poll::Ready(Err(Error::Overloaded)) => {}
+        Poll::Ready(Err(error)) => panic!("unexpected blocked error {error:?}"),
+        Poll::Ready(Ok(_)) => panic!("unexpected blocked success"),
+        Poll::Pending => panic!("unexpected blocked pending"),
+    }
+    drop(blocked);
+    assert_eq!(f.origin.calls.get(), 1);
+    // Keep one copy pinned, but make the remaining working set reclaimable.
+    let busy = retained.pop().unwrap();
+    drop(retained);
+    let mut read = read_copy();
+    let copy = loop {
+        f.scope.check().unwrap();
+        if let Poll::Ready(result) = read.as_mut().poll(&mut cx) {
+            break result.expect("idle cached ciphertext must not reject a disk copy");
+        }
+        f.reactor.poll_budgeted(64).unwrap();
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+    assert_eq!(copy.1.bytes(), expected);
+    assert_eq!(copy.1.envelope(), &envelope);
+    assert_eq!(busy.copy.ciphertext.bytes(), expected);
+    assert!(
+        deps.memory
+            .ciphertext(&busy.copy.ciphertext.envelope().page)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(f.origin.calls.get(), 1);
+    assert!(
+        deps.admission.used(ResourceClass::Ciphertext)
+            <= deps.admission.limit(ResourceClass::Ciphertext)
+    );
+    let mut diagnostics = String::new();
+    failures.write(&mut diagnostics).unwrap();
+    assert!(diagnostics.contains("requested: 33554960"), "{diagnostics}");
+    drop((read, copy, busy));
+    deps.memory.evict_idle(usize::MAX).unwrap();
+    deps.writer.slabs().reclaim_buffer();
+    deps.admission.reclaim_buffers();
+    assert_eq!(deps.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
 }
 
 #[test]
