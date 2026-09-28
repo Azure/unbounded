@@ -1,4 +1,4 @@
-# Racer store version 1 and integration
+# Racer store protocol and integration
 
 Storage ownership is `cmd/racer-dataplane/src/store.rs` and `src/store/` only.
 Checkpoint/recovery implementation is delegated exclusively to the checkpoint,
@@ -18,23 +18,27 @@ alignment padding. Buffers, extents, quotas, FDs, and segment leases remain owne
 through the reactor's final completion fence. Short I/O fails the record; no
 buffered fallback or unaligned continuation is attempted.
 
-Record integers are little endian. Version 1 layout is:
+Record integers are little endian. Version 4 is the only accepted/written layout:
 
-1. Eight bytes `RCRPAGE1`, u32 version (1), u32 header byte count.
+1. Eight bytes `RCRPAGE1`, u32 version (4), u32 header byte count.
 2. u64 segment generation, u64 total object length, u64 page number.
 3. u32 plaintext length, u32 ciphertext length (plaintext plus 16-byte tag).
 4. 16-byte key ID, 24-byte nonce, 32-byte cache key.
 5. u32 cache UID length, u32 ETag length, exact UTF-8 cache UID and strong ETag.
-6. SHA-256 of all preceding header bytes, then exact original ciphertext.
-7. Zero padding to the file's direct-I/O length/next-offset alignment.
+6. u64 CRC-64/XZ of exact ciphertext including the 16-byte AEAD tag.
+7. u32 content-type byte length (zero means absent), then exact content-type bytes.
+8. SHA-256 of all preceding header bytes, then exact original ciphertext.
+9. Zero padding to the file's direct-I/O length/next-offset alignment.
 
 UID and ETag encodings are bounded to 4096 and 8192 bytes; the header is bounded to
 16384 bytes. Strong ETags use the model's quoted HTTP representation. The header
-hash validates framing, not payload authenticity. No payload CRC/hash is added.
+hash validates framing, not payload authenticity. CRC detects accidental corruption,
+not malicious modification; it never replaces AEAD authentication.
 The fill/crypto boundary authenticates the entire ciphertext before delivery.
 Record identity, immutable descriptor, key ID, generation, and expected extent
 must match the selected index entry. The reader returns original nonce/tag/bytes.
-Unknown versions are misses; changing this layout requires a new format version.
+All versions other than 4, including 1-3, are misses; changing this layout requires
+a new format version. There is no legacy reader, migration, or slab rewrite.
 
 ## Index, allocation, and write ordering
 
@@ -174,12 +178,65 @@ maintenance operation; it is not a nonblocking reactor metadata-I/O adapter.
 
 `invalidate_persisted_async` is an explicit reset utility, not a serving-loop key
 or cache retirement requirement. Its filesystem operations retain completion owners.
-# Phase 4 record v2
+## Record v4 checksum implementation
 
-New records write version 2 with an eight-byte little-endian CRC-64/ECMA-182
-ciphertext checksum after cache/ETag bytes and before the header SHA-256. Header
-and logical lengths include these bytes. Version 1 remains readable with no CRC
-field; unknown versions and malformed headers are safe misses. Crypto workers
-verify v2 payload CRC before AEAD plaintext publication. CRC is not authentication;
-AEAD is still mandatory and no unverified bytes reach clients. No destructive
-migration or slab rewrite is required.
+The pre-deployment format change intentionally rejects all earlier record bytes.
+Version 3 used non-reflected CRC-64/ECMA-182 with zero initial/final XOR. Version 4
+uses CRC-64/XZ: polynomial `0x42f0e1eba9ea3693` (reflected representation
+`0xc96c5795d7870f42`), reflected input/output, initial and final XOR `0xffffffffffffffff`.
+Empty input checksums to zero; `123456789` checksums to `0x995dc9bbdf1939fa`.
+
+`crc64fast` **1.1.0** is the locked TiKV implementation (MIT OR Apache-2.0,
+declared MSRV Rust 1.70.0, no runtime dependencies). Its released code, not merely
+the crate description, defines the XZ parameters: `src/lib.rs` initializes and
+complements all-one state and its tests compare against `CRC_64_XZ`.
+The package calls `Digest::new`, not `new_table`, in production:
+
+- `src/pclmulqdq/x86.rs`: runtime PCLMULQDQ + SSE2 + SSE4.1 detection.
+- `src/pclmulqdq/aarch64.rs`: runtime PMULL + NEON detection and `vmull_p64`.
+- `src/pclmulqdq/mod.rs`: eight-way 128-byte folding and Barrett reduction;
+  table processing for short inputs and unaligned prefix/suffix bytes.
+- Unsupported CPUs use the table backend. No global CPU target flags or optional
+  features are needed. The old `pmull` feature is deprecated and has no effect;
+  `fake-simd` must not be enabled.
+
+These source paths refer to the
+[released v1.1.0 source](https://github.com/tikv/crc64fast/tree/v1.1.0).
+This avoids maintaining Racer-specific unsafe SIMD code. The crate's latest
+release at investigation was 1.1.0 (January 2024); no claim of recent release
+cadence or hardware performance is implied.
+
+The store reader always installs the persisted checksum expectation. Crypto workers
+verify it before AEAD plaintext publication. CRC is not authentication: an attacker
+can recompute both CRC and the unkeyed header digest, and AEAD remains mandatory.
+Resource admission, original ciphertext ownership, padding, and completion fences
+are unchanged.
+
+Tests retain legacy fixtures as rejection cases, compare the dispatched and forced
+table backends against an independent bitwise reference, and cover random lengths,
+alignment/folding boundaries, misaligned input, and a full 16 MiB page plus tag.
+The explicit ignored `pclmul_hardware_path_executes_when_available` and
+`pmull_hardware_path_executes_when_available` gates assert their required CPU
+features and fail on the wrong host rather than silently passing. A cross-build
+does not count as executing the ARM backend; Grace hardware verification remains
+a separate requirement.
+
+Replacement verification on the x86 implementation host (Rust 1.96.0):
+
+- All-feature unit suite: 817 library tests and 2 binary tests passed, 12 explicit
+  library ignores. The store subset independently passed 64 tests (one benchmark
+  ignored); the production-dataplane integration target passed 15 (two ignored).
+- The explicit PCLMUL hardware gate passed with `--ignored --exact --nocapture`.
+  Cargo's resolved feature tree enabled neither `fake-simd` nor `pmull`.
+- The released checksum library and Racer checksum facade cross-built for the
+  installed `aarch64-unknown-linux-gnu` target. No cross C linker was installed,
+  so this was not a full dataplane executable cross-build. No Grace hardware was
+  available; the PMULL execution gate was not run or counted as a pass.
+- Tests used two build jobs/two test threads, an external 300-second TERM timeout
+  with ten-second kill grace, and the project memory-safe cgroup wrapper.
+- Cargo formatting ran and changed Rust sources passed targeted rustfmt checks.
+  Its unrelated pre-existing module-order change was reverted. Scoped `make fmt`
+  ran, but installed lint tooling failed: the default binary was built with Go
+  1.26 against Go 1.27 sources, and the available Go-1.27-built binary could not
+  decode Go 1.27 export data version 4. No Go files changed; this is not a clean
+  Go lint result.

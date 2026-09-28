@@ -9,11 +9,11 @@ integration alongside the six throughput phases.
 
 - Peer protocol v4 remains a coordinated-upgrade boundary. Certificate sessions,
   request MACs, authority proofs, and completion fencing remain mandatory.
-- Disk writers emit record v3: CRC64 plus optional content-type metadata. Readers
-  accept released v1 and v2 records, with an explicit v2 compatibility test.
-  Intermediate throughput-branch v2 CRC records were never a released format;
-  they are not a supported migration source. Slab contents remain disposable
-  cache data, verified before client delivery.
+- Disk readers and writers now use only record v4: CRC-64/XZ plus optional
+  content-type metadata. The approved pre-deployment checksum replacement
+  supersedes the earlier v3 writer and v1/v2 compatibility policy. Versions 1-3
+  are explicitly rejected; slab contents remain disposable cache data, verified
+  before client delivery. See `racer-store-protocol.md` for exact parameters.
 - Control deltas are an optional v1 extension with exact base/target hashes and
   full-publication fallback. The Go-generated delta fixture is consumed by Rust.
 - SDK `ClientConfig.PageWindow > 1` enables bounded concurrent continuation

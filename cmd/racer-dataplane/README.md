@@ -394,6 +394,10 @@ in the implementation test environment.
 - `store` accepts only encrypted pages. Slabs require `O_DIRECT` with discovered
   address/offset/length alignment. Aligned padded record lengths differ from
   authenticated ciphertext lengths. Padding is initialized and never delivered.
+  Records use only version 4, with a mandatory CRC-64/XZ over ciphertext and tag;
+  versions 1-3 are rejected, with no compatibility reader. `crc64fast` 1.1.0
+  runtime-dispatches to x86 PCLMULQDQ or ARM PMULL, with a table fallback. CRC is
+  accidental-corruption detection, not authentication; AEAD remains mandatory.
   Memory entries and dirty `CiphertextCopy` bundles retain metadata with each page;
   completed index entries and record headers retain `VersionMetadata`. Total object
   length is never inferred from a page length. Per-page descriptors survive bounded
