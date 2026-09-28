@@ -181,6 +181,11 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				"RACER_KEYRING_SECRET_NAME":         "racer-keyring",
 				"RACER_DAEMONSET_NAME":              dataplaneName,
 				"RACER_DATAPLANE_SERVICE_ACCOUNT":   dataplaneName,
+				"RACER_CONTROLLER_SERVICE_ACCOUNT":  controllerName,
+				"RACER_REPLICATION_TOKEN_FILE":      "/var/run/secrets/racer-controller/token",
+				"RACER_REPLICATION_TRUST_FILE":      "/etc/racer/tls/ca.crt",
+				"RACER_REPLICATION_SERVER_NAME":     controllerName + "." + env.Namespace + ".svc",
+				"RACER_REPLICATION_PORT":            "8443",
 			}
 			for key, value := range values {
 				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {

@@ -7,9 +7,9 @@ metadata:
   namespace: {{ .Namespace | default "unbounded-system" }}
 spec:
   replicas: 3
-  # Only the leader is ready. RollingUpdate cannot retire the last old leader
-  # while preserving an available replica. Accept a control-plane interruption;
-  # running dataplanes retain their last accepted state. See the controller README.
+  # Every synchronized replica becomes ready. Retain Recreate for migration from
+  # old leaders without snapshot replication; new followers cannot sync from them.
+  # This intentionally interrupts control service. See the controller README.
   strategy:
     type: Recreate
     # Clear API-defaulted RollingUpdate settings when updating an existing install.
@@ -34,6 +34,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
           ports:
             - name: https
               containerPort: 8443
@@ -53,6 +61,9 @@ spec:
             - name: tls
               mountPath: /etc/racer/tls
               readOnly: true
+            - name: replication-token
+              mountPath: /var/run/secrets/racer-controller
+              readOnly: true
       volumes:
         - name: tls
           secret:
@@ -62,6 +73,16 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+              - key: ca.crt
+                path: ca.crt
+        - name: replication-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  audience: racer-controller-replication
+                  expirationSeconds: 3600
+                  path: token
 ---
 apiVersion: v1
 kind: Service

@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"maps"
 	"testing"
 	"time"
 
@@ -145,7 +146,41 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	require.Equal(t, env.Config.Image(controllerName), deployment.Spec.Template.Spec.Containers[0].Image)
 	require.Equal(t, appsv1.RecreateDeploymentStrategyType, deployment.Spec.Strategy.Type)
 	require.Nil(t, deployment.Spec.Strategy.RollingUpdate)
-	require.Len(t, deployment.Spec.Template.Spec.Volumes[0].Secret.Items, 2)
+	require.EqualValues(t, 3, *deployment.Spec.Replicas)
+	pod := deployment.Spec.Template.Spec
+	controller := pod.Containers[0]
+	require.Equal(t, "/readyz", controller.ReadinessProbe.HTTPGet.Path)
+	require.Equal(t, "/healthz", controller.LivenessProbe.HTTPGet.Path)
+	require.Equal(t, controllerName, pod.ServiceAccountName)
+
+	service := &corev1.Service{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), service))
+	require.True(t, maps.Equal(service.Spec.Selector, deployment.Spec.Template.Labels), "Service must admit every synchronized replica")
+	require.False(t, service.Spec.PublishNotReadyAddresses)
+
+	for name, field := range map[string]string{"POD_NAMESPACE": "metadata.namespace", "POD_NAME": "metadata.name", "POD_UID": "metadata.uid"} {
+		require.Contains(t, controller.Env, corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: field}}})
+	}
+
+	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: "ca.crt", Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
+	require.Equal(t, cfg.ReplicationTrustFile, controller.VolumeMounts[0].MountPath+"/ca.crt")
+	require.Equal(t, controllerName, cfg.ControllerServiceAccount)
+	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
+	require.EqualValues(t, 8443, cfg.ReplicationPort)
+	require.Equal(t, 30*time.Second, cfg.SnapshotMaxAge)
+
+	projection := pod.Volumes[1].Projected
+	require.NotNil(t, projection)
+	require.EqualValues(t, 0o400, *projection.DefaultMode)
+	require.Len(t, projection.Sources, 1)
+	token := projection.Sources[0].ServiceAccountToken
+	require.NotNil(t, token)
+	require.Equal(t, racercore.ReplicationAudience, token.Audience)
+	require.EqualValues(t, 3600, *token.ExpirationSeconds)
+	require.Equal(t, pod.Volumes[1].Name, controller.VolumeMounts[1].Name)
+	require.True(t, controller.VolumeMounts[1].ReadOnly)
+	require.Empty(t, controller.VolumeMounts[1].SubPath)
+	require.Equal(t, cfg.ReplicationTokenFile, controller.VolumeMounts[1].MountPath+"/"+token.Path)
 
 	for _, item := range deployment.Spec.Template.Spec.Volumes[0].Secret.Items {
 		require.NotEqual(t, "ca.key", item.Key)
@@ -563,6 +598,40 @@ func TestAdmissionFailureGatesBindingAndWorkloads(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplicationWiringUpgradePreservesFreshnessPolicy(t *testing.T) {
+	env := testEnv(t, cache("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+
+	for _, key := range []string{"RACER_CONTROLLER_SERVICE_ACCOUNT", "RACER_REPLICATION_TOKEN_FILE", "RACER_REPLICATION_TRUST_FILE", "RACER_REPLICATION_PORT"} {
+		delete(cm.Data, key)
+	}
+
+	cm.Data["RACER_REPLICATION_SERVER_NAME"] = "wrong-namespace.svc"
+	cm.Data["RACER_SNAPSHOT_MAX_AGE"] = "15s"
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+
+	cfg := configuration(t, env)
+	require.Equal(t, controllerName, cfg.ControllerServiceAccount)
+	require.Equal(t, "/var/run/secrets/racer-controller/token", cfg.ReplicationTokenFile)
+	require.Equal(t, "/etc/racer/tls/ca.crt", cfg.ReplicationTrustFile)
+	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
+	require.EqualValues(t, 8443, cfg.ReplicationPort)
+	require.Equal(t, 15*time.Second, cfg.SnapshotMaxAge)
+
+	// An administrator deletion of tuning is preserved, using the runtime default.
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+	delete(cm.Data, "RACER_SNAPSHOT_MAX_AGE")
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+	require.NotContains(t, cm.Data, "RACER_SNAPSHOT_MAX_AGE")
 }
 
 func TestControllerRotationConfigUsesPreservedConfigMap(t *testing.T) {

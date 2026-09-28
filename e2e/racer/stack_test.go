@@ -103,8 +103,8 @@ func TestOperatorImagePull(t *testing.T) {
 	h.apply(rotationOverrides)
 	h.apply("apiVersion: racer.unbounded-cloud.io/v1alpha1\nkind: ClusterCache\nmetadata:\n  name: gantry\n")
 	h.waitResource("deployment/racer-controller")
-	// Only the elected controller leader reports ready.
-	h.kubectl("wait", "deployment/racer-controller", "-n", namespace, "--for=jsonpath={.status.readyReplicas}=1", "--timeout=90s")
+	// All synchronized replicas serve, not only the elected publisher.
+	h.kubectl("rollout", "status", "deployment/racer-controller", "-n", namespace, "--timeout=90s")
 	h.waitResource("daemonset/racer-dataplane")
 	h.kubectl("rollout", "status", "daemonset/racer-dataplane", "-n", namespace, "--timeout=90s")
 

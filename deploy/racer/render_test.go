@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -133,11 +134,10 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			decode("controller.yaml", &deployment, &service)
 
-			// With leader-only readiness, even maxUnavailable=2 leaves the last
-			// old leader blocking a three-replica RollingUpdate. Recreate must
-			// remove every old pod without waiting for ready replacement pods.
+			// Old leaders cannot replicate snapshots to new followers. Retain
+			// Recreate for this migration even though all synced replicas serve.
 			if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || deployment.Spec.Strategy.RollingUpdate != nil {
-				t.Fatalf("leader-only controller updates require Recreate without rollingUpdate settings: %+v", deployment.Spec.Strategy)
+				t.Fatalf("initial replication migration requires Recreate without rollingUpdate settings: %+v", deployment.Spec.Strategy)
 			}
 
 			pod := deployment.Spec.Template.Spec
@@ -149,8 +149,36 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("serving TLS not wired")
 			}
 
+			if !slices.Equal(pod.Volumes[0].Secret.Items, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: "ca.crt", Path: "ca.crt"}}) || pod.Containers[0].VolumeMounts[0].MountPath+"/ca.crt" != cfg.ReplicationTrustFile {
+				t.Fatal("replication requires the serving CA, never its private key")
+			}
+
+			if cfg.ControllerServiceAccount != pod.ServiceAccountName || cfg.ReplicationServerName != service.Name+"."+namespace+".svc" || cfg.ReplicationPort != 8443 || cfg.SnapshotMaxAge != 30*time.Second {
+				t.Fatal("replication identity, TLS name, port, or freshness not wired")
+			}
+
+			projection := pod.Volumes[1].Projected
+			if projection == nil || projection.DefaultMode == nil || *projection.DefaultMode != 0o400 || len(projection.Sources) != 1 {
+				t.Fatal("replication requires a dedicated protected token projection")
+			}
+
+			token := projection.Sources[0].ServiceAccountToken
+
+			mount := pod.Containers[0].VolumeMounts[1]
+			if token == nil || token.Audience != racer.ReplicationAudience || token.ExpirationSeconds == nil || *token.ExpirationSeconds != 3600 || mount.Name != pod.Volumes[1].Name || !mount.ReadOnly || mount.SubPath != "" || mount.MountPath+"/"+token.Path != cfg.ReplicationTokenFile {
+				t.Fatal("rotating replication token must use its dedicated audience and configured path")
+			}
+
+			for name, field := range map[string]string{"POD_NAMESPACE": "metadata.namespace", "POD_NAME": "metadata.name", "POD_UID": "metadata.uid"} {
+				if !slices.ContainsFunc(pod.Containers[0].Env, func(env corev1.EnvVar) bool {
+					return env.Name == name && env.ValueFrom != nil && env.ValueFrom.FieldRef != nil && env.ValueFrom.FieldRef.FieldPath == field
+				}) {
+					t.Fatalf("missing downward API identity %s", name)
+				}
+			}
+
 			if workloadCfg.ControlURL != "https://"+service.Name+"."+namespace+".svc:8443" || service.Spec.PublishNotReadyAddresses || pod.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" {
-				t.Fatal("service must select ready leader")
+				t.Fatal("service must select every synchronized ready replica")
 			}
 
 			if len(service.Spec.Selector) == 0 || !maps.Equal(service.Spec.Selector, deployment.Spec.Template.Labels) {
@@ -159,13 +187,13 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			controller := pod.Containers[0]
 			if controller.ReadinessProbe.HTTPGet.Port.StrVal != "probes" || controller.LivenessProbe.HTTPGet.Path != "/healthz" || controller.LivenessProbe.HTTPGet.Port.StrVal != "probes" {
-				t.Fatal("followers must remain live while readiness gates service routing")
+				t.Fatal("unsynchronized replicas must remain live while readiness gates service routing")
 			}
 
 			if !slices.ContainsFunc(controller.Ports, func(port corev1.ContainerPort) bool {
 				return port.Name == "probes" && port.ContainerPort == 8081
 			}) {
-				t.Fatal("leader readiness probe port must reach the controller probe listener")
+				t.Fatal("replica readiness probe port must reach the controller probe listener")
 			}
 
 			var (
@@ -208,7 +236,17 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 			}
 
 			if !grants(clusterRole.Rules, "authentication.k8s.io", "tokenreviews", "create") {
-				t.Fatal("missing bootstrap permission")
+				t.Fatal("missing bootstrap and replication authentication permission")
+			}
+
+			for _, resource := range []string{"pods", "serviceaccounts"} {
+				if !grants(role.Rules, "", resource, "get") {
+					t.Fatalf("missing live replication identity read: %s", resource)
+				}
+			}
+
+			if !grants(role.Rules, "coordination.k8s.io", "leases", "get") {
+				t.Fatal("missing direct publisher discovery permission")
 			}
 		})
 	}
