@@ -114,6 +114,10 @@ impl Devices {
             handle: std::rc::Rc::new(DeviceHandle {
                 port: port.clone(),
                 rail: RailId(0),
+                generation: port
+                    .shared
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire),
             }),
             rail: RailId(0),
         });
@@ -151,6 +155,7 @@ impl Devices {
                 return Err(Error::InvalidConfiguration);
             }
             let port = self.port.borrow().clone().ok_or(Error::Unavailable)?;
+            port.reopen()?;
             let charge = super::registered::native_slot_charge(bytes_per_slot)?;
             // One native registered allocation plus one bounded handoff staging
             // allocation per slot. Both remain charged through native quarantine.
@@ -200,6 +205,10 @@ impl Devices {
                     handle: Rc::new(DeviceHandle {
                         port: port.clone(),
                         rail: mapping.rail,
+                        generation: port
+                            .shared
+                            .generation
+                            .load(std::sync::atomic::Ordering::Acquire),
                     }),
                     rail: mapping.rail,
                 })
@@ -238,8 +247,14 @@ impl Devices {
             port.close();
         }
     }
+    pub fn capacity(&self) -> usize {
+        self.port
+            .borrow()
+            .as_ref()
+            .map_or(0, |port| port.capacity())
+    }
     /// Call on every local membership publication. A mapping change revokes all
-    /// old capabilities; rebuild the lifecycle pair before activating new rails.
+    /// old capabilities; drain the lifecycle generation before activating new rails.
     pub fn revalidate(&self, published: &[RailMapping], alignment_enabled: bool) -> bool {
         let actual = self.mappings.borrow();
         let valid = alignment_enabled

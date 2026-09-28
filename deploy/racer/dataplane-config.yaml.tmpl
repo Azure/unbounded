@@ -7,7 +7,8 @@ metadata:
   namespace: {{ .Namespace | default "unbounded-system" }}
 data:
   # Defaults match the Rust runtime. Existing administrator data is preserved.
-  RACER_ENABLE_RDMA: "false"
+  # Native builds activate only trusted, published, NUMA-local hardware mappings.
+  RACER_ENABLE_RDMA: "auto"
   RACER_MAX_THREADS: "8"
   # Proposed during authenticated enrollment; explicit Node shares take precedence.
   RACER_SHARES: "4"

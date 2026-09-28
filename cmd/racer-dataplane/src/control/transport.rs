@@ -673,7 +673,9 @@ impl ControlConnection {
                 .any(|line| {
                     line.split_once(':').is_some_and(|(name, value)| {
                         name.eq_ignore_ascii_case("connection")
-                            && value.trim().eq_ignore_ascii_case("close")
+                            && value
+                                .split(',')
+                                .any(|token| token.trim().eq_ignore_ascii_case("close"))
                     })
                 });
             let body = match framing {
@@ -750,7 +752,15 @@ impl ControlConnection {
                 }
             };
             self.check(scope)?;
-            if !close && matches!(status, 200 | 204) {
+            // A TLS record can contain more plaintext than the last bounded
+            // receive consumed. Never recycle a connection with trailing bytes.
+            let reusable = match self.tls.reader().read(&mut scratch[..1]) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+                Ok(0) => false,
+                Ok(_) => return Err(Error::InvalidRequest),
+                Err(_) => false,
+            };
+            if reusable && !close && matches!(status, 200 | 204) {
                 if let Some(idle) = self.idle.upgrade() {
                     self.idle_since = crate::runtime::environment::now();
                     *idle.borrow_mut() = Some(self);
@@ -1008,16 +1018,20 @@ mod tests {
     }
     #[test]
     fn real_server_auth_and_mutual_tls_chunked_response() {
-        tls_fixture(None);
+        tls_fixture(None, false);
+    }
+    #[test]
+    fn rejects_trailing_tls_plaintext_before_connection_reuse() {
+        tls_fixture(None, true);
     }
     #[test]
     fn real_ring_server_auth_and_mutual_tls() {
         let Some(r) = testing::reactor() else {
             return;
         };
-        tls_fixture(Some(r));
+        tls_fixture(Some(r), false);
     }
-    fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>) {
+    fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>, trailing: bool) {
         let d = testing::Directory::new();
         let (ca, ca_key) = testing::ca();
         let mut params =
@@ -1091,7 +1105,17 @@ mod tests {
                             .contains("Authorization: Bearer fixture.token")
                     );
                 }
-                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n").unwrap();
+                if trailing {
+                    // The framed response ends exactly at receive's 16 KiB
+                    // boundary, leaving the extra byte in rustls's reader.
+                    let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16310\r\n\r\n";
+                    let mut response = head.to_vec();
+                    response.resize(head.len() + 16310, b' ');
+                    response.push(b'x');
+                    stream.write_all(&response).unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n").unwrap();
+                }
                 stream.flush().unwrap();
             }
         });
@@ -1125,19 +1149,26 @@ mod tests {
                     &scope,
                 )
                 .await
-        }))
-        .unwrap();
-        assert_eq!(first.body, b"{}");
+        }));
+        if trailing {
+            assert!(matches!(first, Err(Error::InvalidRequest)));
+        } else {
+            assert_eq!(first.unwrap().body, b"{}");
+        }
         let second = run(Box::pin(async {
             transport
                 .authenticated(&identity, &scope)
                 .await?
                 .request("GET", wire::SNAPSHOT_PATH, None, &[], 65536, &scope)
                 .await
-        }))
-        .unwrap();
-        assert_eq!(second.status, 200);
-        assert_eq!(second.body, b"{}");
+        }));
+        if trailing {
+            assert!(matches!(second, Err(Error::InvalidRequest)));
+        } else {
+            let second = second.unwrap();
+            assert_eq!(second.status, 200);
+            assert_eq!(second.body, b"{}");
+        }
         server.join().unwrap();
     }
     #[test]

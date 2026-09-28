@@ -9,6 +9,7 @@ use crate::runtime::collections::HashMap;
 #[derive(Default)]
 pub(super) struct NativePairs {
     ports: Mutex<HashMap<WorkerId, NativePair>>,
+    numa: Mutex<HashMap<WorkerId, Option<usize>>>,
 }
 type NativePair = (Option<IoPort>, Option<NativePort>);
 
@@ -21,6 +22,21 @@ pub(super) fn slot_count(limits: &Limits) -> Result<usize> {
 }
 
 impl NativePairs {
+    pub(super) fn place(&self, plan: &AffinityPlan) -> Result<()> {
+        let mut numa = self.numa.lock().map_err(|_| Error::Unavailable)?;
+        for pair in &plan.pairs {
+            numa.insert(pair.worker, pair.crypto.numa_node);
+        }
+        Ok(())
+    }
+    pub(super) fn numa(&self, worker: WorkerId) -> Result<Option<Option<usize>>> {
+        Ok(self
+            .numa
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .get(&worker)
+            .copied())
+    }
     pub(super) fn prepare(
         &self,
         workers: impl Iterator<Item = WorkerId>,
@@ -78,18 +94,91 @@ impl Application {
     }
 }
 impl WorkerApplication {
+    pub(super) fn native_publication(&self) -> Result<Vec<crate::topology::rails::RailMapping>> {
+        let snapshot = self.snapshots.current()?;
+        let member = snapshot.membership.member(self.keys.node())?;
+        if !member.alignment_enabled || self.fabric_ports.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rails = member.rails.clone();
+        if let Some(numa) = self.native_numa {
+            // Native allocations are first-touched by this pinned crypto role.
+            // Unknown topology cannot establish the aligned-locality contract.
+            let Some(numa) = numa else {
+                return Ok(Vec::new());
+            };
+            rails.retain(|rail| rail.numa_node == Some(numa));
+        }
+        let capacity = self.devices.as_ref().map_or(0, |d| d.capacity());
+        if !rails.is_empty() {
+            let offset = usize::from(self.worker.0) % rails.len();
+            rails.rotate_left(offset);
+            rails.truncate(capacity);
+            rails.sort_unstable_by_key(|r| r.rail);
+        }
+        Ok(rails)
+    }
+    pub(super) fn poll_native(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if self.stopping {
+            self.native_task.take();
+            return Ok(());
+        }
+        if let Some(task) = self.native_task.as_mut() {
+            if let Poll::Ready(result) = task.as_mut().poll(cx) {
+                self.native_task = None;
+                self.native_retry = crate::runtime::environment::now() + Duration::from_secs(1);
+                match result {
+                    Ok(actual) => self.actual_rails = actual,
+                    Err(_) => {
+                        if let Some(devices) = &self.devices {
+                            devices.close();
+                        }
+                    }
+                }
+            }
+        }
+        if self.stopping
+            || self.native_task.is_some()
+            || !self.actual_rails.is_empty()
+            || crate::runtime::environment::now() < self.native_retry
+        {
+            return Ok(());
+        }
+        let Some(devices) = self.devices.clone() else {
+            return Ok(());
+        };
+        let publication = self.native_publication()?;
+        if publication.is_empty() {
+            return Ok(());
+        }
+        let ports = self.fabric_ports.clone();
+        let admission = self.runtime.admission.clone();
+        let turn = scope(Duration::from_secs(5))?;
+        self.native_task = Some(Box::pin(async move {
+            devices
+                .activate(
+                    publication,
+                    ports,
+                    &admission,
+                    crate::rdma::registered::MAX_CIPHERTEXT,
+                    &turn,
+                )
+                .await
+        }));
+        cx.waker().wake_by_ref();
+        Ok(())
+    }
     pub(super) async fn activate_native(&mut self, startup: &RequestScope) -> Result<()> {
         let Some(devices) = &self.devices else {
             return Ok(());
         };
-        let snapshot = self.snapshots.current()?;
-        let member = snapshot.membership.member(self.keys.node())?;
-        if !member.alignment_enabled || member.rails.is_empty() || self.fabric_ports.is_empty() {
+        let publication = self.native_publication()?;
+        if publication.is_empty() {
             return Ok(());
         }
         match devices
             .activate(
-                member.rails.clone(),
+                publication,
                 self.fabric_ports.clone(),
                 &self.runtime.admission,
                 crate::rdma::registered::MAX_CIPHERTEXT,
@@ -484,6 +573,51 @@ mod tests {
         (worker, CryptoRuntime { port: engine })
     }
 
+    #[test]
+    fn native_worker_selects_only_funded_local_rails_and_recovers() {
+        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _environment = simulated.enter();
+        let mut app = configured();
+        app.fabric_ports[0].device = "test-device".into();
+        app.fabric_ports[0].gid = None;
+        let (mut worker, engine) = worker(&app, true, true);
+        worker.native_numa = Some(None);
+        assert!(worker.native_publication().unwrap().is_empty());
+        worker.native_numa = None;
+        assert_eq!(worker.native_publication().unwrap().len(), 1);
+        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(8).unwrap();
+        }
+        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        let charged = worker.runtime.admission.used(ResourceClass::Registered);
+        assert!(charged > 0);
+        worker.devices.as_ref().unwrap().close();
+        worker.actual_rails.clear();
+        service.poll_budgeted(256).unwrap();
+        assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
+        worker.native_retry = crate::runtime::environment::now();
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(8).unwrap();
+        }
+        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        assert_eq!(
+            worker.runtime.admission.used(ResourceClass::Registered),
+            charged
+        );
+        worker.devices.as_ref().unwrap().close();
+        service.poll_budgeted(256).unwrap();
+        assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
+        drop(service);
+        assert_eq!(sim.live_resources(), 0);
+    }
     #[test]
     fn programmatic_associations_share_config_validation() {
         let mut ports = configured().fabric_ports.clone();

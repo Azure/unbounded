@@ -27,6 +27,7 @@ pub struct Membership {
     members: Vec<Member>,
     placement_identity: [u8; 32],
     retained_bytes: usize,
+    rail_domain: Vec<super::rails::RailId>,
     pub(crate) placement_delta: Option<PlacementDelta>,
 }
 #[derive(Debug)]
@@ -78,7 +79,17 @@ impl Membership {
             super::hash::bytes(&mut hash, member.node.0.as_bytes());
             hash.update(member.shares.get().to_be_bytes());
         }
+        // Compute once per publication, never from a request's selected route.
+        // A partially equipped hop must fall back rather than rehash the page.
+        let rail_domain: Vec<_> = members
+            .iter()
+            .filter(|m| m.alignment_enabled)
+            .flat_map(|m| m.rails.iter().map(|r| r.rail))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let retained_bytes = std::mem::size_of::<Self>()
+            + rail_domain.capacity() * std::mem::size_of::<super::rails::RailId>()
             + members.capacity() * std::mem::size_of::<Member>()
             + members
                 .iter()
@@ -95,6 +106,7 @@ impl Membership {
             members,
             placement_delta: None,
             retained_bytes,
+            rail_domain,
         })
     }
     /// Prepare bounded incremental ranking hints outside the publication lock.
@@ -148,6 +160,9 @@ impl Membership {
     }
     pub fn members(&self) -> &[Member] {
         &self.members
+    }
+    pub fn rail_domain(&self) -> &[super::rails::RailId] {
+        &self.rail_domain
     }
     pub fn position(&self, node: &NodeId) -> Result<usize> {
         self.members

@@ -17,13 +17,21 @@ use std::{
 };
 
 const CLASSES: usize = 14;
+#[repr(align(64))]
+struct CacheLineCounter(AtomicUsize);
+impl std::ops::Deref for CacheLineCounter {
+    type Target = AtomicUsize;
+    fn deref(&self) -> &AtomicUsize {
+        &self.0
+    }
+}
 fn index(class: ResourceClass) -> usize {
     class as usize
 }
 struct Counters {
     active: Option<Arc<AtomicUsize>>,
     retired: Option<(CacheId, Arc<Mutex<std::collections::VecDeque<CacheId>>>)>,
-    used: [AtomicUsize; CLASSES],
+    used: [CacheLineCounter; CLASSES],
     wake: futures::task::AtomicWaker,
 }
 impl Counters {
@@ -31,7 +39,7 @@ impl Counters {
         Self {
             active: None,
             retired: None,
-            used: std::array::from_fn(|_| AtomicUsize::new(0)),
+            used: std::array::from_fn(|_| CacheLineCounter(AtomicUsize::new(0))),
             wake: futures::task::AtomicWaker::new(),
         }
     }

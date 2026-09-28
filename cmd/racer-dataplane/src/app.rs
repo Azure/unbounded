@@ -139,6 +139,8 @@ struct CheckpointCut {
     periodic_generation: u64,
     periodic_started: Option<std::time::Instant>,
     periodic_finished: usize,
+    last_sequence: u64,
+    last_slot: usize,
 }
 impl Default for NodeState {
     fn default() -> Self {
@@ -188,6 +190,7 @@ impl Application {
             self.limits.queue_entries.get(),
         )?);
         if self.config.enable_rdma {
+            self.node.native.place(&plan)?;
             self.node
                 .native
                 .prepare(plan.pairs.iter().map(|p| p.worker), &self.limits)?;
@@ -445,6 +448,9 @@ pub struct WorkerApplication {
     devices: Option<Rc<Devices>>,
     fabric_ports: Vec<crate::rdma::device::FabricPort>,
     actual_rails: Vec<crate::topology::rails::RailMapping>,
+    native_numa: Option<Option<usize>>,
+    native_task: Option<Operation<'static, Vec<crate::topology::rails::RailMapping>>>,
+    native_retry: std::time::Instant,
     telemetry: Rc<Telemetry>,
     network: Rc<crate::peer::PeerNetwork>,
     directory: Arc<WorkerDirectory>,
@@ -810,6 +816,9 @@ impl WorkerApplication {
             devices,
             fabric_ports: Vec::new(),
             actual_rails: Vec::new(),
+            native_numa: node.native.numa(worker)?,
+            native_task: None,
+            native_retry: crate::runtime::environment::now(),
             telemetry: Rc::new(telemetry),
             network,
             directory: node.workers.clone(),
@@ -974,22 +983,29 @@ impl WorkerApplication {
 
     async fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
         let snapshot = self.snapshots.current()?;
+        if self
+            .snapshot_sequence
+            .is_some_and(|sequence| sequence != snapshot.sequence)
+            && self.native_task.is_some()
+        {
+            self.native_task.take();
+            if let Some(devices) = &self.devices {
+                devices.close();
+            }
+        }
         if !self.actual_rails.is_empty() {
-            let compatible = snapshot
-                .membership
-                .member(self.keys.node())
-                .is_ok_and(|member| {
-                    member.alignment_enabled
-                        && self.actual_rails.iter().all(|actual| {
-                            member.rails.iter().any(|published| {
-                                published.rail == actual.rail
-                                    && published.fabric == actual.fabric
-                                    && published
-                                        .numa_node
-                                        .is_none_or(|numa| actual.numa_node == Some(numa))
-                            })
+            let compatible = self.native_publication().is_ok_and(|published_rails| {
+                published_rails.len() == self.actual_rails.len()
+                    && self.actual_rails.iter().all(|actual| {
+                        published_rails.iter().any(|published| {
+                            published.rail == actual.rail
+                                && published.fabric == actual.fabric
+                                && published
+                                    .numa_node
+                                    .is_none_or(|numa| actual.numa_node == Some(numa))
                         })
-                });
+                    })
+            });
             if !compatible {
                 if let Some(devices) = &self.devices {
                     devices.close();
@@ -1098,10 +1114,14 @@ impl WorkerApplication {
         if let Some(task) = self.checkpoint_task.as_mut() {
             if let Poll::Ready(result) = task.as_mut().poll(cx) {
                 self.checkpoint_task = None;
-                node.periodic_checkpoint
+                let mut cut = node
+                    .periodic_checkpoint
                     .lock()
-                    .map_err(|_| Error::Unavailable)?
-                    .result = Some(result);
+                    .map_err(|_| Error::Unavailable)?;
+                if result.is_ok() {
+                    cut.last_slot ^= 1;
+                }
+                cut.result = Some(result);
             }
         }
         let mut cut = node
@@ -1175,19 +1195,19 @@ impl WorkerApplication {
         if self.worker == node.control_worker && cut.shards.len() == node.count && !cut.publishing {
             cut.publishing = true;
             let shards = std::mem::take(&mut cut.shards);
+            let Some(sequence) = cut.last_sequence.checked_add(1) else {
+                cut.result = Some(Err(Error::Unavailable));
+                return Ok(());
+            };
+            cut.last_sequence = sequence;
+            let slot = cut.last_slot ^ 1;
             drop(cut);
-            // Wall-clock sequence dominates prior ordinary process checkpoints.
-            let sequence = crate::runtime::environment::wall_now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| Error::Unavailable)?
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
             match self.store.checkpoint.publish_async(
                 shards,
                 self.runtime.reactor.clone(),
                 scope(self.timeout)?,
                 sequence,
-                generation as usize % 2,
+                slot,
                 self.checkpoint_budget,
             ) {
                 Ok(task) => {
@@ -1216,6 +1236,7 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        self.poll_native(cx)?;
         if !self.stopping
             && let Ok(snapshot) = self.snapshots.current()
         {

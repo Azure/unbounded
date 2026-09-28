@@ -57,5 +57,11 @@ mod tests {
             hex(rail),
             "500304ace38caf7cc36f8f97ae12bdfc89b92f7eb64c8bb060d1daf49f76314c"
         );
+        let mut rail = domain(b"racer/rail/v2\0");
+        object(&mut rail, &fixtures::object(), PageNumber(0));
+        assert_eq!(
+            hex(rail),
+            "9ac860a9df3ce1ac648cde8350aeec1d1efc604eeae5cceb70d67dd55f4443d1"
+        );
     }
 }

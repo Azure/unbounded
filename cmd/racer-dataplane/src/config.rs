@@ -95,7 +95,17 @@ impl Config {
         if inline.is_some() && file.is_some() {
             return Err(Error::InvalidConfiguration);
         }
-        let config = Self::from_lookup(lookup)?;
+        let requested_rdma = lookup("RACER_ENABLE_RDMA")?;
+        let mut config = Self::from_lookup(|name| {
+            if name == "RACER_ENABLE_RDMA" {
+                Ok(match requested_rdma.as_deref() {
+                    None | Some("auto") => Some("false".into()),
+                    _ => requested_rdma.clone(),
+                })
+            } else {
+                lookup(name)
+            }
+        })?;
         let ports = if let Some(file) = file {
             let path = Path::new(&file);
             validate_path(path)?;
@@ -109,6 +119,12 @@ impl Config {
             parse_fabric_ports(inline.as_deref())?
         };
         validate_fabric_ports(&ports)?;
+        if requested_rdma
+            .as_deref()
+            .is_none_or(|value| value == "auto")
+        {
+            config.enable_rdma = cfg!(feature = "rdma") && !ports.is_empty();
+        }
         Ok((config, ports))
     }
 
@@ -1059,6 +1075,7 @@ mod tests {
                     "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                     "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
                     "RACER_FABRIC_PORTS" => Some(ports.into()),
+                    "RACER_ENABLE_RDMA" => Some("false".into()),
                     _ => None,
                 })
             })
@@ -1070,6 +1087,30 @@ mod tests {
         assert!(
             Config::from_lookup_with_fabric_ports(|_| Err(Error::InvalidConfiguration)).is_err()
         );
+    }
+
+    #[test]
+    fn native_auto_requires_build_and_trusted_associations() {
+        for requested in [None, Some("auto"), Some("false")] {
+            for mapped in [false, true] {
+                let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+                    Ok(match name {
+                        "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                        "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                        "RACER_ENABLE_RDMA" => requested.map(str::to_owned),
+                        "RACER_FABRIC_PORTS" if mapped => {
+                            Some(r#"[{"fabric":"f","device":"d","port":1}]"#.into())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap();
+                assert_eq!(
+                    config.enable_rdma,
+                    requested != Some("false") && mapped && cfg!(feature = "rdma")
+                );
+            }
+        }
     }
 
     fn parse(overrides: &[(&str, &str)]) -> Result<Config> {

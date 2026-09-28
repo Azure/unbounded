@@ -51,6 +51,7 @@ impl Verbs {
 pub struct DeviceHandle {
     pub(crate) port: Rc<IoPort>,
     pub(crate) rail: crate::topology::rails::RailId,
+    pub(crate) generation: u64,
 }
 struct Lease {
     slot: Arc<Slot>,
@@ -206,7 +207,9 @@ impl QueuePairHandle {
         immediate(Self::poll_new(device))
     }
     pub(crate) fn poll_new(device: Rc<DeviceHandle>) -> Poll<Result<Rc<Self>>> {
-        if device.port.shared.closed.load(Ordering::Acquire) {
+        if device.port.shared.closed.load(Ordering::Acquire)
+            || device.generation != device.port.shared.generation.load(Ordering::Acquire)
+        {
             return Poll::Ready(Err(Error::Unavailable));
         }
         let mut contended = false;

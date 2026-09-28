@@ -46,6 +46,16 @@ impl WorkerApplication {
             let mut cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
             match candidates {
                 Ok(candidates) => {
+                    if let Some((slot, newest)) =
+                        candidates.iter().max_by_key(|(_, image)| image.sequence)
+                    {
+                        let mut periodic = node
+                            .periodic_checkpoint
+                            .lock()
+                            .map_err(|_| Error::Unavailable)?;
+                        periodic.last_sequence = newest.sequence;
+                        periodic.last_slot = *slot;
+                    }
                     let selected = select(
                         candidates.into_iter().map(|(_, image)| image).collect(),
                         &cut.geometry,

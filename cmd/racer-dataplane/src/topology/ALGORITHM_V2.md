@@ -185,15 +185,17 @@ obsolete circuits. Healthy links can serve concurrent pooled operations.
 
 ## Rails and HTTP fallback
 
-Intersect `(rail_id, fabric)` pairs across every node on the authenticated
-route. Any node with alignment disabled or no rails forces HTTP. Different
-node-local NUMA IDs do not make a shared rail incompatible. Sort surviving
-rails by u16 ID. Compute:
+Prepare the sorted union of aligned members' rail IDs once per authenticated
+membership. Select independently of the route and object version. Any route node
+with alignment disabled, a missing selected rail, or a different selected fabric
+forces HTTP. Different node-local NUMA IDs do not make a shared rail incompatible.
+Compute:
 
-`r = SHA256("racer/rail/v1\0" || object_page || len(strong_etag) || strong_etag)`
+`r = SHA256("racer/rail/v2\0" || object_page)`
 
-Select the first big-endian u64 modulo the compatible rail count. Reversing
-the same route selects the same rail. An empty intersection uses HTTP.
+Select the first big-endian u64 modulo the membership rail-domain count. Alternate
+routes and ETags preserve that choice; an incompatible route uses HTTP rather
+than rehashing onto another rail. A rail-domain publication change may change it.
 `select` considers authenticated publication inputs; `select_with_local` and
 `local_compatible` additionally check actual local hardware. Hardware must
 have one unique selected rail with the same fabric and, when specified, the
@@ -213,7 +215,7 @@ Compatible rails are [2,7]. Ranking values below are node suffixes.
 | --- | --- | --- | --- | --- |
 | 0 | d8b632a58acf4dc92ccc3abe711290968975c95221982118f58393fbdead4781 | 887651 | 1,3,2 | 2 |
 | 1 | 55303dce9847e82a06df4d42dfe8143810ddd6bee5cbb1e00df7c54a492aa9e8 | 348931 | 3,2,1 | 7 |
-| 18446744073709551615 | a267040dcd7fc46c92defba1c1405f9395387059987c839e9b5e812e7861c723 | 665200 | 2,1,3 | 7 |
+| 18446744073709551615 | a267040dcd7fc46c92defba1c1405f9395387059987c839e9b5e812e7861c723 | 665200 | 2,1,3 | 2 |
 
 For slot 887651:
 
@@ -227,9 +229,9 @@ For slot 887651:
 Rail hashes for the three pages above:
 
 ```text
-500304ace38caf7cc36f8f97ae12bdfc89b92f7eb64c8bb060d1daf49f76314c
-d62f99be192c5c55bf7fcdd6f6e82510e4dfb15edc633c10e7e3c9920e6b1a15
-1f5ac57db992579deb3ef38af57963721ecf01c5957e2e23481e471faa6f7c54
+9ac860a9df3ce1ac648cde8350aeec1d1efc604eeae5cceb70d67dd55f4443d1
+2b208c28397d5eaffac1a153cc4f4d2a5c5a8b44c12a79df8cba213bc2dd5feb
+9aafbd2c472f5800e866b05a42a973f6da11526efd3fc2f3433e96a957fae69b
 ```
 
 Integer edge vectors: sample 0 costs 274877906944, sample 2^63-1 costs

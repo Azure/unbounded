@@ -1,21 +1,11 @@
 # Read implementation handoffs
 
-URGENT production composition fix (application/client owner): app constructs one
-HttpIo codec capped PAGE_BYTES+16 and passes it to Responses. HttpIo::framing
-rejects the entire multi-page Content-Length before writing headers. Construct a
-separate client HttpIo sharing reactor/admission with Codec::new(32768,
-i64::MAX as u64), use it for ClientListeners and Responses. Keep origin/peer page
-caps. The production fixture now does this and >3-page live reads succeed; no
-Coordinator metadata/range invariant change is warranted. Debug fixture must also
-not treat inline 16MiB crypto as a two-second client stall (its Delivery timeout is
-now TIMEOUT). Latest exact requested debug run passes all six production tests,
-including disk-only reread and pressure-limited long streaming. The earlier
-transient disk-only failure did not reproduce in release or the final debug run.
-Read-owned regression responses_stream_more_than_three_pages_only_with_client_sized_http_framing
-passes: actual UDS Responses::send rejects a >3-page body before headers with the
-page cap, and streams every ordered byte successfully with client-sized framing.
-Application still uses the shared page-capped io in Responses as of this handoff;
-the application owner must apply the separate client HttpIo composition fix.
+Resolved composition handoff: Application constructs `HttpIo::for_clients` for
+client listeners and responses, separately from page-capped origin/peer framing.
+The regression
+`responses_stream_more_than_three_pages_only_with_client_sized_http_framing`
+and the production/process suites cover ordered multi-page responses. The former
+urgent request to split those codecs is historical, not outstanding work.
 
 Security schema handoff: `racer-route-attempts` is required canonical u32 on the
 original and each hop. The original ceiling is immutable, every hop is nonincreasing,

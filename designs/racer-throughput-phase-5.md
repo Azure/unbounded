@@ -236,3 +236,13 @@ Remaining integrated review includes control delta interoperability/transport
 failure gates, checkpoint CPU/memory bounds at large configured limits, all strict
 process tests, and the final documentation/compatibility pass. These are not
 claimed as covered by the focused SIGKILL or small simulated-cluster tests.
+
+### Final integration
+
+The Phase 6 report records the subsequent complete process, Rust, Go/race and
+operator checks, the shared Go/Rust delta vector, TLS framing fix, and monotonic
+checkpoint sequencing across restart. It also records remaining large-scale
+checkpoint CPU/memory and 100k active-traffic validation gaps. Periodic recovery
+is best-effort: repeated admission/I/O failure does not provide a bounded-loss
+guarantee. This supersedes the interim verification status above without claiming
+that unexecuted large-cluster or hardware gates passed.

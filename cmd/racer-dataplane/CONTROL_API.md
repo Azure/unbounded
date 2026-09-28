@@ -36,20 +36,19 @@ endpoint during Pod gaps; a new node waits for its first endpoint. Pod readiness
 and disconnection do not change ownership. Invalid annotations reject the proposed
 update with a controller diagnostic, preserving accepted state.
 
-Accepted member history is memory-only. After controller recovery, a node without
-an eligible endpoint or with invalid annotations and no accepted values is omitted
-until its inputs are usable. Missing annotations still use their defaults. Recovery
-can therefore change membership; no accepted-member checkpoints are persisted.
-
-This intentionally replaces `tmp/design.md`'s shares environment variable. There
-is no dataplane shares/alignment override, node-report API, or status-write API.
+Accepted member history is retained in a bounded, Node-UID-bound annotation after
+publication. Controller recovery can retain admitted endpoints through Pod gaps;
+Node deletion, UID replacement, and exclusion cannot inherit that identity.
+Authenticated enrollment proposes `RACER_SHARES` (default four). The controller
+records the proposal; an explicit Node shares annotation wins. Local configuration
+never independently changes the topology used for placement.
 
 ## Two HTTPS operations
 
 | Operation | Authentication and result |
 | --- | --- |
 | `POST /v1/bootstrap` | Server-authenticated TLS plus bearer service-account token; returns 200 with the node certificate chain and resolved Node UID |
-| `GET /v1/snapshot?after=<sequence>` | mTLS; returns 200 and the newest full publication, or 204 after a 30-second wait |
+| `GET /v1/snapshot?after=<sequence>` | mTLS; returns 200 with the newest publication or negotiated delta, or 204 after a 30-second wait |
 
 JSON uses snake_case fields, decimal strings for u64 counters, and padded standard
 base64 for bytes. UUIDs use canonical lowercase hyphenated text. DER encodes CSRs
@@ -105,8 +104,19 @@ goal state from synchronized Kubernetes inputs. Compare hashes, commit changed
 counters with resource-version preconditions, then expose the publication. Never
 serve uncommitted counters. Initial creation is explicit cluster initialization;
 missing established state must not silently recreate counters. No publication
-blobs, member history, or checkpoint chunks are persisted. Only the initialized
+blobs or checkpoint chunks are persisted in that ConfigMap. Accepted member
+history is stored separately on each Node. Only the initialized
 leader serves; leadership loss closes connections and cancels long polls.
+
+Clients may send `X-Racer-Delta-Base` with their canonical publication hash. The
+controller shares one bounded predecessor delta across clients when it is smaller
+than the full snapshot. Delta v1 binds cluster, base sequence/hash, target
+sequence/hash, member upserts/removals, and cache definitions. A missing base,
+restart, or skipped generation falls back to a full snapshot. Receivers validate
+the reconstructed canonical hash before installation. The 4 MiB delta cap does not
+replace the full publication cap. TLS connections are reused within an unchanged
+trust/identity epoch. Credential renewal and secret reload remain independent of
+pending publication installation.
 
 Canonical content uses compact UTF-8 JSON, with no whitespace or trailing newline.
 The publication-content object's field order is `schema_version`, `cluster`,

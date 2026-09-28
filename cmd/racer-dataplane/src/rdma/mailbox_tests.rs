@@ -94,6 +94,7 @@ fn signed_setup_waits_for_slot_and_connect_mailboxes_without_consuming_admission
     let device = Rc::new(crate::rdma::verbs::DeviceHandle {
         port: io.clone(),
         rail: RailId(0),
+        generation: io.shared.generation.load(Ordering::Acquire),
     });
     assert!(matches!(
         QueuePairHandle::poll_new(device),

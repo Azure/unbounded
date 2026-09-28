@@ -27,7 +27,10 @@ consumes host disk capacity and is not accounted as a pod ephemeral-storage quot
 | `RACER_CLUSTER_ID` | Required | Persistent non-nil, canonical lowercase hyphenated UUID |
 | `RACER_CONTROL_ENDPOINT` | Required | HTTPS authority, optional port and single trailing slash |
 | `RACER_MAX_THREADS` | `8` | Total userspace thread cap, 2 through 256; odd caps floor to complete pairs |
-| `RACER_ENABLE_RDMA` | `false` | Optional RDMA; hardware/capability failure retains HTTP fallback |
+| `RACER_ENABLE_RDMA` | `auto` in the executable | `auto`, `true`, or `false`; auto requires an RDMA build and trusted fabric associations. Hardware/capability failure retains HTTP fallback |
+| `RACER_SHARES` | `4` | Positive u32 proposed during authenticated enrollment; an explicit Node shares annotation takes precedence |
+| `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index capacity, partitioned independently of metadata capacity |
+| `RACER_CHECKPOINT_BYTES` | `67108864` | Bounded checkpoint working-set budget; periodic publication uses no fsync |
 | `RACER_PEER_LISTEN` | `0.0.0.0:7443` | Numeric local IP:port; brackets accepted for either IP family, required for IPv6 |
 | `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Numeric local IP:port, loopback by default; brackets accepted for either IP family |
 | `RACER_TRUST_BUNDLE` | `/etc/racer/trust/ca.crt` | Deployment bootstrap/server CA file |
@@ -76,9 +79,9 @@ or a syntactically valid non-nil UUID, but cannot authenticate an identity.
 Only verified bootstrap or verified local identity recovery may replace the
 sentinel. Do not replace it with the node name, a random UUID, or an environment UID.
 
-`RACER_NODE_UID`, `RACER_NODE_ID`, `RACER_SHARES`, `RACER_RAILS`, and
+`RACER_NODE_UID`, `RACER_NODE_ID`, `RACER_RAILS`, and
 `RACER_ALIGNED_RAILS` are rejected if present, even when empty. Shares, rails, and
-alignment come from accepted controller membership. Other unrelated environment
+alignment take effect only through accepted controller membership. Other unrelated environment
 variables are ignored. CPU/cpuset/quota discovery belongs to runtime
 `AffinityPlan`; config neither reads CPU files nor overrides allowed CPUs.
 
@@ -127,7 +130,7 @@ startup with `InvalidConfiguration`, including when RDMA is disabled. File read
 errors also fail startup rather than silently discarding an explicit mapping.
 
 Main forwards associations through `Application::with_fabric_ports`. Activation
-still requires the Rust `rdma` feature, `RACER_ENABLE_RDMA=true`, native resources
+still requires the Rust `rdma` feature, enabled `RACER_ENABLE_RDMA`, native resources
 and quota, and authenticated local rail/alignment membership. Native matching
 requires exactly one association and discovered port for each published fabric,
 including GID and published NUMA constraints. Extra unpublished associations do

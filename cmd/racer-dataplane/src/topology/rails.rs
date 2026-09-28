@@ -49,28 +49,27 @@ impl Rails {
         {
             return Ok(TransportPlan::Http);
         }
-        let compatible: Vec<_> = members[0]
-            .rails
-            .iter()
-            .filter(|mapping| {
-                members[1..].iter().all(|member| {
-                    member
-                        .rails
-                        .iter()
-                        .any(|other| mapping.rail == other.rail && mapping.fabric == other.fabric)
-                })
-            })
-            .collect();
-        if compatible.is_empty() {
+        let domain = route.membership.rail_domain();
+        if domain.is_empty() {
             return Ok(TransportPlan::Http);
         }
-        let mut digest = hash::domain(b"racer/rail/v1\0");
+        let mut digest = hash::domain(b"racer/rail/v2\0");
         hash::object(&mut digest, &page.version.object, page.number);
-        hash::bytes(&mut digest, page.version.etag.as_bytes());
         let digest = hash::finish(digest);
         let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
-        let chosen = compatible[(sample % compatible.len() as u64) as usize];
-        Ok(TransportPlan::Rdma { rail: chosen.rail })
+        let rail = domain[(sample % domain.len() as u64) as usize];
+        let Some(chosen) = members[0].rails.iter().find(|m| m.rail == rail) else {
+            return Ok(TransportPlan::Http);
+        };
+        if !members[1..].iter().all(|member| {
+            member
+                .rails
+                .iter()
+                .any(|m| m.rail == rail && m.fabric == chosen.fabric)
+        }) {
+            return Ok(TransportPlan::Http);
+        }
+        Ok(TransportPlan::Rdma { rail })
     }
 
     pub fn select_with_local(
@@ -160,7 +159,7 @@ mod tests {
     #[test]
     fn golden_page_to_rail_vectors() {
         let route = route(|_| {});
-        for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 7)] {
+        for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 2)] {
             assert_eq!(
                 Rails.select(&route, &page(number)).unwrap(),
                 TransportPlan::Rdma { rail: RailId(rail) }
@@ -200,11 +199,27 @@ mod tests {
         ] {
             assert_eq!(Rails.select(&route, &page(0)).unwrap(), TransportPlan::Http);
         }
-        let route = route(|m| m[1].rails.retain(|rail| rail.rail == RailId(7)));
-        assert_eq!(
-            Rails.select(&route, &page(0)).unwrap(),
-            TransportPlan::Rdma { rail: RailId(7) }
-        );
+        let full = route(|_| {});
+        let partial = route(|m| m[1].rails.retain(|rail| rail.rail == RailId(7)));
+        for number in 0..100 {
+            let expected = match Rails.select(&full, &page(number)).unwrap() {
+                TransportPlan::Rdma { rail: RailId(7) } => TransportPlan::Rdma { rail: RailId(7) },
+                _ => TransportPlan::Http,
+            };
+            assert_eq!(Rails.select(&partial, &page(number)).unwrap(), expected);
+            let mut alternate = partial.clone();
+            alternate.nodes.remove(1);
+            assert_eq!(
+                Rails.select(&alternate, &page(number)).unwrap(),
+                Rails.select(&full, &page(number)).unwrap()
+            );
+            let mut version = page(number);
+            version.version.etag = StrongEtag::test_value("\"v2\"");
+            assert_eq!(
+                Rails.select(&full, &version).unwrap(),
+                Rails.select(&full, &page(number)).unwrap()
+            );
+        }
     }
 
     #[test]

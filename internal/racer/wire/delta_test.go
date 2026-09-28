@@ -5,6 +5,7 @@ package wire
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,15 @@ func TestDeltaAddRemoveUpdateAndRejectedBase(t *testing.T) {
 	encoded, err := EncodeDelta(base, next)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	golden, err := os.ReadFile("testdata/delta.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(encoded, bytes.TrimSpace(golden)) {
+		t.Fatalf("cross-language delta changed: %s", encoded)
 	}
 
 	got, err := ApplyDelta(base, bytes.NewReader(encoded))

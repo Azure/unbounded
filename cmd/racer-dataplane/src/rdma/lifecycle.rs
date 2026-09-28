@@ -15,7 +15,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::Waker,
 };
@@ -58,6 +58,9 @@ pub(crate) struct Shared {
     pub engine: AtomicWaker,
     pub io: AtomicWaker,
     pub closed: AtomicBool,
+    pub generation: AtomicU64,
+    drained: AtomicBool,
+    alive: AtomicBool,
     configured: AtomicBool,
     config: Mutex<Option<Configuration>>,
     activation: Mutex<Option<Result<Vec<RailMapping>>>>,
@@ -77,6 +80,7 @@ pub struct NativePort {
 }
 impl Drop for NativePort {
     fn drop(&mut self) {
+        self.shared.alive.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
         for slot in &self.shared.slots {
             slot.waiter.wake();
@@ -114,6 +118,9 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
         engine: AtomicWaker::new(),
         io: AtomicWaker::new(),
         closed: AtomicBool::new(false),
+        generation: AtomicU64::new(1),
+        drained: AtomicBool::new(false),
+        alive: AtomicBool::new(true),
         configured: AtomicBool::new(false),
         config: Mutex::new(None),
         activation: Mutex::new(None),
@@ -131,6 +138,37 @@ impl IoPort {
     }
     pub fn register_driver(&self, waker: &Waker) {
         self.shared.io.register(waker);
+    }
+    /// Reopen only after the native role has destroyed every device owner and
+    /// all I/O leases have released their fenced staging. No timer is a fence.
+    pub(crate) fn reopen(&self) -> Result<()> {
+        if !self.shared.alive.load(Ordering::Acquire) {
+            return Err(Error::Unavailable);
+        }
+        if !self.shared.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.shared.drained.load(Ordering::Acquire) {
+            return Err(Error::Overloaded);
+        }
+        let generation = self
+            .shared
+            .generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(Error::Unavailable)?;
+        for slot in &self.shared.slots {
+            slot.cancel.store(false, Ordering::Release);
+            slot.released.store(false, Ordering::Release);
+            slot.fenced.store(false, Ordering::Release);
+            slot.state.store(IDLE, Ordering::Release);
+        }
+        self.shared.generation.store(generation, Ordering::Release);
+        self.shared.configured.store(false, Ordering::Release);
+        self.shared.drained.store(false, Ordering::Release);
+        self.shared.closed.store(false, Ordering::Release);
+        self.shared.engine.wake();
+        Ok(())
     }
     pub(crate) async fn configure(
         &self,
@@ -183,6 +221,7 @@ impl IoPort {
         }
     }
     pub fn close(&self) {
+        self.shared.drained.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
         for slot in &self.shared.slots {
             slot.cancel.store(true, Ordering::Release);
@@ -322,6 +361,45 @@ impl NativeService {
             self.cursor = (self.cursor + 1) % self.resources.len();
             self.drive(index);
         }
+        if !self.port.shared.drained.load(Ordering::Acquire)
+            && self.port.shared.closed.load(Ordering::Acquire)
+            && self.resources.iter().all(Option::is_none)
+        {
+            let mut drained = true;
+            for slot in &self.port.shared.slots {
+                let Ok(mut mailbox) = slot.mailbox.try_lock() else {
+                    drained = false;
+                    continue;
+                };
+                if slot.state.load(Ordering::Acquire) == RETIRED
+                    && !slot.released.load(Ordering::Acquire)
+                {
+                    drained = false;
+                    continue;
+                }
+                // Backend destruction failures retain another quota owner.
+                if mailbox
+                    .quota
+                    .as_ref()
+                    .is_some_and(|q| Arc::strong_count(q) != 1)
+                {
+                    drained = false;
+                    continue;
+                }
+                mailbox.bytes.clear();
+                mailbox.bytes.shrink_to_fit();
+                mailbox.quota = None;
+                mailbox.endpoint = None;
+                mailbox.command = None;
+                mailbox.result = None;
+                mailbox.descriptor = None;
+                mailbox.length = 0;
+            }
+            if drained {
+                self.port.shared.drained.store(true, Ordering::Release);
+                self.port.shared.io.wake();
+            }
+        }
         Ok(())
     }
     fn drive(&mut self, index: usize) {
@@ -377,8 +455,7 @@ impl NativeService {
                 // A fenced receiver may still need its staging copy. That copy
                 // and its quota survive with the slot's outstanding I/O leases.
                 if state != OWNED || slot.released.load(Ordering::Acquire) {
-                    mailbox.bytes = Vec::new();
-                    mailbox.quota = None;
+                    slot.released.store(true, Ordering::Release);
                 }
                 slot.state.store(RETIRED, Ordering::Release);
                 return;
@@ -394,6 +471,9 @@ impl NativeService {
                     resource.qp = Some(qp);
                 }
                 Err(_) => {
+                    resource.next_retry = Some(
+                        crate::runtime::environment::now() + std::time::Duration::from_millis(100),
+                    );
                     slot.state.store(RETIRED, Ordering::Release);
                     return;
                 }
@@ -584,6 +664,7 @@ mod tests {
         QueuePairHandle::new(Rc::new(DeviceHandle {
             port: io.clone(),
             rail: RailId(0),
+            generation: io.shared.generation.load(Ordering::Acquire),
         }))
         .unwrap()
     }
@@ -593,6 +674,50 @@ mod tests {
         service.poll_budgeted(8).unwrap();
         qp.progress().unwrap();
         assert!(qp.ready());
+    }
+    #[test]
+    fn restart_requires_native_fence_and_last_lease_and_revokes_old_devices() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        let charged = provision_test(&mut native, 0);
+        let old_device = Rc::new(DeviceHandle {
+            port: io.clone(),
+            rail: RailId(0),
+            generation: 1,
+        });
+        let qp = QueuePairHandle::new(old_device.clone()).unwrap();
+        mark_connected(&qp, &mut native);
+        let region = Region::acquire(&qp, 16).unwrap();
+        io.close();
+        backend::lifetime_tests::fail_stop(true);
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        assert_eq!(charged.get(), 1);
+        backend::lifetime_tests::fail_stop(false);
+        native.resources[0].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(1).unwrap();
+        assert!(qp.stopped());
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        assert_eq!(region.copy_to().unwrap().len(), 16);
+        drop(qp);
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        drop(region);
+        native.poll_budgeted(1).unwrap();
+        io.reopen().unwrap();
+        assert_eq!(io.shared.generation.load(Ordering::Acquire), 2);
+        provision_test(&mut native, 0);
+        assert!(matches!(
+            QueuePairHandle::new(old_device),
+            Err(Error::Unavailable)
+        ));
+        let fresh = claim(&io);
+        mark_connected(&fresh, &mut native);
+        drop(fresh);
+        io.close();
+        native.poll_budgeted(1).unwrap();
+        assert!(native.drained());
     }
     #[test]
     fn simultaneous_timeout_and_healthy_write_preserve_worker_and_quarantine() {

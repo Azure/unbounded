@@ -240,7 +240,7 @@ Native operation requires all of:
 
 1. Rust `rdma` feature, compatible `libracer_rdma.so.1`, libibverbs, and the actual
    hardware provider libraries.
-2. `RACER_ENABLE_RDMA=true` (default is `false`).
+2. `RACER_ENABLE_RDMA=auto` (default) with trusted fabric associations, or explicit `true`.
 3. Assigned `/dev/infiniband` uverbs devices with device-cgroup and Unix access,
    host RDMA drivers/fabric configuration, usable active ports, GID index zero,
    4 KiB base pages, and type-2B memory-window support.
