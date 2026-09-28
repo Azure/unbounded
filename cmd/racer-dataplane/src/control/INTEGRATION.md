@@ -56,6 +56,12 @@ staged by async startup. These APIs preserve authenticated NodeId resolution.
    `renewal_error()` for last reload/renewal failure. Call `next_attempt()` after
    an error. `run(scope)` is an optional loop for an already bound graph with a
    cache lifecycle adapter; it does not create an executor.
+   During worker startup, poll local cache preparation alongside `progress` and
+   check the committed snapshot after each poll of that future. A prepared first
+   snapshot can commit while `progress` is still awaiting the next long-poll
+   response. Once committed, startup drops that pending turn and continues local
+   recovery within its original deadline; it must not wait for another remote
+   publication. Reported control errors and cancellation still take precedence.
 4. Call `shutdown()`, drop the owner future, and drain/fence the reactor. Cancellation
    of readiness retains its duplicated FD until the runtime's completion fences.
 

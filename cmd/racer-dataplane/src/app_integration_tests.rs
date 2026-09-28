@@ -359,6 +359,67 @@ struct Fixture {
     publication: Arc<Mutex<Option<wire::Publication>>>,
     bootstrap_requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
     poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
+    hold_long_poll: Arc<AtomicBool>,
+    long_polls: Arc<AtomicUsize>,
+}
+
+#[test]
+fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    fixture.hold_long_poll.store(true, Ordering::Release);
+    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(5)).unwrap(),
+    )
+    .unwrap();
+    let finished = std::sync::Barrier::new(2);
+    let results = thread::scope(|threads| {
+        let mut handles = Vec::new();
+        for id in 0..2 {
+            let (config, node, waiting, finished) =
+                (&config, &node, &fixture.long_polls, &finished);
+            handles.push(threads.spawn(move || {
+                let (mut worker, runtime, mut engine) = local_worker(config, node, id);
+                let startup = scope(Duration::from_secs(3)).unwrap();
+                // Force the first publication to wait for the second worker,
+                // then allow local preparation after the next poll is held.
+                if id == 1 {
+                    while waiting.load(Ordering::Acquire) == 0 {
+                        if startup.check().is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let result = drive(&runtime, &mut engine, worker.start(&startup));
+                finished.wait();
+                if result.is_ok() {
+                    assert!(node.observations.health.ready());
+                    assert!(worker.started);
+                    assert!(worker.snapshots.current().is_ok());
+                }
+                finished.wait();
+                let shutdown = scope(Duration::from_secs(5)).unwrap();
+                drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
+                drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
+                result
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results, vec![Ok(()), Ok(())]);
+    assert!(fixture.hold_long_poll.load(Ordering::Acquire));
+    assert_eq!(fixture.long_polls.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
+    assert!(node.cache_cut.lock().unwrap().committed);
+    fixture.hold_long_poll.store(false, Ordering::Release);
 }
 
 #[test]
@@ -1218,6 +1279,10 @@ impl Fixture {
         let external_publication = published.clone();
         let handshake_alerts = Arc::new(Mutex::new(VecDeque::new()));
         let alerts = handshake_alerts.clone();
+        let hold_long_poll = Arc::new(AtomicBool::new(false));
+        let held = hold_long_poll.clone();
+        let long_polls = Arc::new(AtomicUsize::new(0));
+        let waiting = long_polls.clone();
         let server = thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
@@ -1346,6 +1411,10 @@ impl Fixture {
                         .unwrap()
                         .contains(&format!("?after={} ", publication.sequence.0))
                     {
+                        waiting.fetch_add(1, Ordering::Release);
+                        while held.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                         (204, Vec::new())
                     } else {
                         (200, wire::encode_publication(&publication).unwrap())
@@ -1376,6 +1445,8 @@ impl Fixture {
             bootstrap_requests,
             poll_certificates,
             publication: published,
+            hold_long_poll,
+            long_polls,
         }
     }
 }

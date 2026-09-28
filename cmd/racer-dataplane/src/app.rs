@@ -934,7 +934,19 @@ impl WorkerApplication {
                     let mut progress = control.progress(startup);
                     let result = std::future::poll_fn(|cx| {
                         self.poll_cache_preparation(cx)?;
-                        progress.as_mut().poll(cx)
+                        let result = progress.as_mut().poll(cx).map(|r| r.map(|_| ()));
+                        if matches!(result, Poll::Ready(Err(_))) {
+                            return result;
+                        }
+                        // Progress can install the prepared first snapshot while
+                        // awaiting the next long poll. Startup depends on that
+                        // local commit, not on another controller publication.
+                        startup.check()?;
+                        if self.snapshots.current().is_ok() {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            result
+                        }
                     })
                     .await;
                     match result {
