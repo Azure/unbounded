@@ -46,6 +46,8 @@ func (*Server) NeedLeaderElection() bool { return true }
 // TLSConfig must use VerifyClientCertIfGiven: bootstrap can omit the client
 // certificate, while snapshot explicitly requires VerifiedChains. Resumption
 // and pooled requests must not extend certificate validity or stale trust.
+// The caller owns the reload lifetime and must supply and cancel a cancelable
+// context, including when listener setup fails. Start owns this context itself.
 func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 	if err := s.Config.Validate(); err != nil {
 		return nil, err
@@ -55,16 +57,30 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 		return nil, wire.Unavailable
 	}
 
-	certificate, err := tls.LoadX509KeyPair(s.Config.TLSCertificateFile, s.Config.TLSPrivateKeyFile)
+	if ctx.Done() == nil {
+		return nil, wire.InvalidRequest
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	reloader, err := newServingCertificateReloader(s.Config.TLSCertificateFile, s.Config.TLSPrivateKeyFile)
 	if err != nil {
 		return nil, wire.Unavailable
 	}
 
-	return s.tlsConfig(ctx, certificate), nil
+	go reloader.run(ctx, servingCertificatePollInterval)
+
+	return s.tlsConfigWithCertificate(ctx, reloader.getCertificate), nil
 }
 
 func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tls.Config {
-	base := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{certificate}, ClientAuth: tls.VerifyClientCertIfGiven, SessionTicketsDisabled: true, NextProtos: []string{"http/1.1"}}
+	return s.tlsConfigWithCertificate(ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &certificate, nil })
+}
+
+func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	base := &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: certificate, ClientAuth: tls.VerifyClientCertIfGiven, SessionTicketsDisabled: true, NextProtos: []string{"http/1.1"}}
 	base.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
