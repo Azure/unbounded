@@ -71,7 +71,7 @@ fn exchange(
     truncated: bool,
 ) -> (Duration, Duration) {
     use chacha20poly1305::{
-        XChaCha20Poly1305, XNonce,
+        XChaCha20Poly1305,
         aead::{Aead, KeyInit},
     };
     let signers = signers();
@@ -174,7 +174,7 @@ fn exchange(
         .collect();
     let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
     let body = cipher
-        .encrypt(XNonce::from_slice(&[8; 24]), plaintext.as_slice())
+        .encrypt((&[8; 24]).into(), plaintext.as_slice())
         .unwrap();
     assert_eq!(body.len(), 16 * 1024 * 1024 + 16);
     let metadata = ObjectMetadata {
@@ -389,7 +389,7 @@ fn exchange(
             };
             assert_eq!(
                 cipher
-                    .decrypt(XNonce::from_slice(&[8; 24]), ciphertext.bytes())
+                    .decrypt((&[8; 24]).into(), ciphertext.bytes())
                     .unwrap(),
                 plaintext
             );

@@ -12,7 +12,9 @@ rdma = []
 
 [dependencies]
 base64 = "0.22"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# chacha20/zeroize wipes its core but does not forward to the buffered wrapper.
+cipher = { version = "0.5", features = ["zeroize"] }
 crc64fast = "1.1.0"
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 futures = "0.3"
@@ -20,6 +22,9 @@ getrandom = "0.2"
 httparse = "1"
 io-uring = "0.7"
 libc = "0.2"
+# chacha20poly1305/zeroize does not enable Poly1305 state wiping. Unify its
+# transitive dependency with this explicit feature until upstream forwards it.
+poly1305 = { version = "0.9", features = ["zeroize"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

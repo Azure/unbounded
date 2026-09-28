@@ -19,7 +19,10 @@ use crate::{
         worker::{CryptoRuntime, CryptoService},
     },
 };
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::AeadInPlace};
+use chacha20poly1305::{
+    KeyInit, XChaCha20Poly1305,
+    aead::{AeadInOut, inout::InOutBuf},
+};
 use std::{
     rc::Rc,
     sync::Arc,
@@ -213,11 +216,17 @@ impl PageCryptoEngine {
                     }
                     let mut bytes =
                         Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
-                    bytes[..raw.len()].copy_from_slice(raw);
-                    bytes.truncate(raw.len());
-                    cipher
-                        .encrypt_in_place(XNonce::from_slice(&envelope.nonce.0), &aad, &mut *bytes)
+                    // Input remains immutable until the final cancellation check.
+                    // Admission supplies initialized output, including the tag tail.
+                    let (output, tag_out) = bytes.split_at_mut(raw.len());
+                    let tag = cipher
+                        .encrypt_inout_detached(
+                            (&envelope.nonce.0).into(),
+                            &aad,
+                            InOutBuf::new(raw, output).map_err(|_| Error::CorruptRecord)?,
+                        )
                         .map_err(|_| Error::CorruptRecord)?;
+                    tag_out.copy_from_slice(&tag);
                     (envelope, bytes)
                 }
                 CryptoInput::Decrypt {
@@ -244,14 +253,15 @@ impl PageCryptoEngine {
                     // never an uncharged tag-sized tail under plaintext admission.
                     let length = envelope.plaintext_length as usize;
                     let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
-                    bytes.copy_from_slice(&ciphertext.bytes()[..length]);
-                    let tag = chacha20poly1305::Tag::from_slice(&ciphertext.bytes()[length..]);
+                    let tag = chacha20poly1305::Tag::try_from(&ciphertext.bytes()[length..])
+                        .map_err(|_| Error::CorruptRecord)?;
                     cipher
-                        .decrypt_in_place_detached(
-                            XNonce::from_slice(&envelope.nonce.0),
+                        .decrypt_inout_detached(
+                            (&envelope.nonce.0).into(),
                             &aad,
-                            &mut bytes,
-                            tag,
+                            InOutBuf::new(&ciphertext.bytes()[..length], &mut bytes)
+                                .map_err(|_| Error::CorruptRecord)?,
+                            &tag,
                         )
                         .map_err(|_| Error::CorruptRecord)?;
                     (envelope.clone(), bytes)
@@ -413,7 +423,7 @@ mod tests {
         let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
         let mut bytes = b"hello".to_vec();
         cipher
-            .encrypt_in_place(XNonce::from_slice(&original.nonce.0), &aad, &mut bytes)
+            .encrypt_in_place((&original.nonce.0).into(), &aad, &mut bytes)
             .unwrap();
         for index in 0..8 {
             let mut changed = original.clone();
@@ -437,7 +447,7 @@ mod tests {
             assert!(
                 cipher
                     .decrypt_in_place(
-                        XNonce::from_slice(&changed.nonce.0),
+                        (&changed.nonce.0).into(),
                         &page_aad(&changed).unwrap(),
                         &mut tampered
                     )
@@ -448,11 +458,11 @@ mod tests {
         corrupted[0] ^= 1;
         assert!(
             cipher
-                .decrypt_in_place(XNonce::from_slice(&original.nonce.0), &aad, &mut corrupted)
+                .decrypt_in_place((&original.nonce.0).into(), &aad, &mut corrupted)
                 .is_err()
         );
         cipher
-            .decrypt_in_place(XNonce::from_slice(&original.nonce.0), &aad, &mut bytes)
+            .decrypt_in_place((&original.nonce.0).into(), &aad, &mut bytes)
             .unwrap();
         assert_eq!(bytes, b"hello");
         let mut malformed = original;
@@ -467,7 +477,7 @@ mod tests {
         let mut bytes = b"hello".to_vec();
         XChaCha20Poly1305::new((&[7; 32]).into())
             .encrypt_in_place(
-                XNonce::from_slice(&[2; 24]),
+                (&[2; 24]).into(),
                 &page_aad(&descriptor).unwrap(),
                 &mut bytes,
             )
@@ -479,6 +489,195 @@ mod tests {
                 0xa9, 0x89, 0xcf, 0xfb, 0x34, 0xc3, 0x6f
             ]
         );
+    }
+    #[test]
+    fn libsodium_boundary_and_full_page_detached_vectors() {
+        use crate::{
+            memory::pool::BufferPool,
+            runtime::{
+                admission::Admission,
+                crypto::{CryptoId, pair},
+            },
+        };
+        use sha2::{Digest, Sha256};
+
+        // SHA-256 of the complete ciphertext plus detached tag, independently
+        // generated with libsodium 1.0.18. Reproduce with aead_vectors.py.
+        // Hashes avoid checking in 32 MiB of near-full/full-page ciphertext.
+        let vectors = [
+            (
+                1,
+                "e458e0dc619b62fd62ccfd6b0a64edd478d17dcbe2a90ae5cf5a1236c7e66b42",
+            ),
+            (
+                15,
+                "305a5c76814aa3a7fa7ffd6013674c1569d48050214fd99046b62835558522f7",
+            ),
+            (
+                16,
+                "fd224886bdc4dce663d1cfe23f152b82bf92ec4c3585e459284172817366bfe8",
+            ),
+            (
+                17,
+                "e8a89e5c8b5672afa89102a03e8333065071e9223c08f9829b0211862ed827fb",
+            ),
+            (
+                63,
+                "5732225fec76e8bbe0af47bfd2b89dc4d6b10c76a038ef57cf3dd3f9b26cd0f3",
+            ),
+            (
+                64,
+                "9a74018a50d140c758cbac254d2400f54268efef40ee729109a65b2430a60541",
+            ),
+            (
+                65,
+                "581818d82f394c7c27cd07dcfecf8aaa7281291a0a8ba27226c07a5b8b94b1ff",
+            ),
+            (
+                255,
+                "34061699d97d185ebef4b17f329ee4a94b8e667cd9f0ea86952f76a12337ab35",
+            ),
+            (
+                256,
+                "3691e12ccc85a3ee991d554984da2d1fbcc99f928994986838eea83e5def0b36",
+            ),
+            (
+                257,
+                "d31b2dcd6ee4646e35b0347efe0ff9c277240b821dce4813e1b6e2222a908646",
+            ),
+            (
+                16777215,
+                "19eb6c4a424b572bc65b6200a72e29c0fcfbedfc74ad522ba021cc150f1606d6",
+            ),
+            (
+                16777216,
+                "b8a08e70bf42b3eb50de6a5e9f852c9a664bfa8a4a497aa2a393f5ccc8ad74e0",
+            ),
+        ];
+        let keys = super::super::keyring::tests::keys();
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let pool = BufferPool::new(admission.clone());
+        let (io, _port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
+        for (sequence, (length, expected)) in vectors.into_iter().enumerate() {
+            let mut descriptor = envelope();
+            descriptor.plaintext_length = length as u32;
+            descriptor.ciphertext_length = length as u32 + 16;
+            let cache = &descriptor.page.version.object.cache;
+            let raw: Vec<u8> = (0..length)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            let mut encrypted = vec![0; length + 16];
+            let (output, tag_out) = encrypted.split_at_mut(length);
+            let tag = cipher
+                .encrypt_inout_detached(
+                    (&descriptor.nonce.0).into(),
+                    &page_aad(&descriptor).unwrap(),
+                    InOutBuf::new(&raw, output).unwrap(),
+                )
+                .unwrap();
+            tag_out.copy_from_slice(&tag);
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&encrypted)),
+                expected,
+                "length={length}"
+            );
+            let original = pool
+                .ciphertext(
+                    admission
+                        .reserve(Some(cache), ResourceClass::Ciphertext, length + 16)
+                        .unwrap(),
+                    descriptor.clone(),
+                    encrypted,
+                )
+                .unwrap();
+            let pointer = original.bytes().as_ptr();
+            let Poll::Ready(Ok(permit)) = io.poll_reserve(
+                &mut cx,
+                CryptoId {
+                    worker: WorkerId(0),
+                    generation: 1,
+                    sequence: sequence as u64 + 1,
+                },
+            ) else {
+                panic!("reserve")
+            };
+            let completion = PageCryptoEngine::process(
+                permit.job(
+                    CryptoInput::Decrypt {
+                        ciphertext: original,
+                        plaintext: admission
+                            .reserve(Some(cache), ResourceClass::Plaintext, length)
+                            .unwrap(),
+                    },
+                    keys.active(cache, KeyPurpose::Page).unwrap(),
+                    RequestScope::new(
+                        RequestId([1; 16]),
+                        std::time::Instant::now() + std::time::Duration::from_secs(10),
+                    )
+                    .unwrap(),
+                ),
+            );
+            let CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, original)) =
+                &completion.outcome
+            else {
+                panic!("decrypt length={length}")
+            };
+            assert_eq!(clear.bytes(), raw);
+            assert_eq!(original.bytes().as_ptr(), pointer);
+            assert_eq!(format!("{:x}", Sha256::digest(original.bytes())), expected);
+            assert_eq!(admission.used(ResourceClass::Plaintext), length);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), length + 16);
+            drop(completion);
+            admission.reclaim_buffers();
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+    #[test]
+    fn detached_authentication_failures_do_not_write_output_or_mutate_input() {
+        let descriptor = envelope();
+        let aad = page_aad(&descriptor).unwrap();
+        let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
+        let mut encrypted = [0; 5];
+        let tag = cipher
+            .encrypt_inout_detached(
+                (&descriptor.nonce.0).into(),
+                &aad,
+                InOutBuf::new(b"hello", &mut encrypted).unwrap(),
+            )
+            .unwrap();
+        for fault in 0..4 {
+            let mut nonce = descriptor.nonce.0;
+            let mut aad = aad.clone();
+            let mut input = encrypted;
+            let mut tag = tag;
+            match fault {
+                0 => nonce[0] ^= 1,
+                1 => aad[0] ^= 1,
+                2 => input[0] ^= 1,
+                _ => tag[0] ^= 1,
+            }
+            let retained = input;
+            // A nonzero sentinel proves authentication precedes any output write,
+            // rather than merely observing the zero-initialized production buffer.
+            let mut output = [0xa5; 5];
+            assert!(
+                cipher
+                    .decrypt_inout_detached(
+                        (&nonce).into(),
+                        &aad,
+                        InOutBuf::new(&input, &mut output).unwrap(),
+                        &tag,
+                    )
+                    .is_err()
+            );
+            assert_eq!(output, [0xa5; 5]);
+            assert_eq!(input, retained);
+        }
     }
     #[test]
     fn random_nonces_do_not_repeat() {
@@ -506,18 +705,24 @@ mod tests {
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
         let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        for (sequence, canceled, corrupt) in [(1, false, false), (2, true, false), (3, false, true)]
-        {
+        for sequence in 1..=6 {
+            let canceled = sequence == 2;
+            let corrupt = sequence >= 3;
+            let mut descriptor = descriptor.clone();
             let mut bytes = b"hello".to_vec();
             XChaCha20Poly1305::new((&[7; 32]).into())
                 .encrypt_in_place(
-                    XNonce::from_slice(&descriptor.nonce.0),
+                    (&descriptor.nonce.0).into(),
                     &page_aad(&descriptor).unwrap(),
                     &mut bytes,
                 )
                 .unwrap();
-            if corrupt {
-                bytes[0] ^= 1;
+            match sequence {
+                3 => bytes[0] ^= 1,
+                4 => descriptor.nonce.0[0] ^= 1,
+                5 => descriptor.page.number.0 += 1,
+                6 => bytes[20] ^= 1,
+                _ => {}
             }
             let cipher = pool
                 .ciphertext(
@@ -693,7 +898,7 @@ mod tests {
                     let mut decrypted = cipher.bytes().to_vec();
                     XChaCha20Poly1305::new((&[7; 32]).into())
                         .decrypt_in_place(
-                            XNonce::from_slice(&cipher.envelope().nonce.0),
+                            (&cipher.envelope().nonce.0).into(),
                             &page_aad(cipher.envelope()).unwrap(),
                             &mut decrypted,
                         )
@@ -808,7 +1013,7 @@ mod tests {
                     let mut bytes = encrypted.bytes().to_vec();
                     XChaCha20Poly1305::new((&[7; 32]).into())
                         .decrypt_in_place(
-                            XNonce::from_slice(&encrypted.envelope().nonce.0),
+                            (&encrypted.envelope().nonce.0).into(),
                             &page_aad(encrypted.envelope()).unwrap(),
                             &mut bytes,
                         )

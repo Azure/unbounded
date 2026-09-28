@@ -50,7 +50,7 @@ use crate::{
     },
     runtime::{admission::Admission, deadline::RequestScope},
 };
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::AeadInPlace};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
 use std::{ops::Deref, rc::Rc};
 use zeroize::Zeroizing;
 /// Decrypted context remains charged for the complete local origin operation.
@@ -210,7 +210,7 @@ impl CredentialCrypto {
             let mut bytes = Zeroizing::new(Vec::with_capacity(raw.len() + 16));
             bytes.extend_from_slice(raw);
             cipher
-                .encrypt_in_place(XNonce::from_slice(&nonce.0), &aad, &mut *bytes)
+                .encrypt_in_place((&nonce.0).into(), &aad, &mut *bytes)
                 .map_err(|_| Error::Unauthorized)?;
             Some(EncryptedAuthorization {
                 key_id: key.id(),
@@ -294,7 +294,7 @@ impl CredentialCrypto {
             let aad = aad(key.id(), &context.object, request, attempt, metadata)?;
             let mut bytes = Zeroizing::new(encrypted.ciphertext.clone());
             XChaCha20Poly1305::new(key.material(KeyPurpose::OriginCredentials)?.into())
-                .decrypt_in_place(XNonce::from_slice(&encrypted.nonce.0), &aad, &mut *bytes)
+                .decrypt_in_place((&encrypted.nonce.0).into(), &aad, &mut *bytes)
                 .map_err(|_| Error::Unauthorized)?;
             Some(Authorization::from_header(&bytes)?)
         } else {
