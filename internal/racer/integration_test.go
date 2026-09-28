@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -403,7 +405,7 @@ func integrationTLS(t *testing.T, cfg *Config) *x509.CertPool {
 		t.Fatal(err)
 	}
 
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{cfg.ReplicationServerName}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2"), net.ParseIP("127.0.0.3")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
 	if err != nil {
@@ -437,7 +439,32 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	}
 
 	cfg := a.Topology.Config
+	cfg.ControllerServiceAccount = "racer-controller"
+	cfg.ReplicationServerName = "racer-controller.managers.svc"
 	roots := integrationTLS(t, &cfg)
+	cfg.ReplicationTrustFile = cfg.TLSCertificateFile
+
+	_, port, err := net.SplitHostPort(unusedAddress(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ReplicationPort = uint16(number)
+
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.ControllerServiceAccount}}
+	if err := c.Create(t.Context(), sa); err != nil {
+		t.Fatal(err)
+	}
+
+	kube, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var (
 		apps        [2]*Application
@@ -447,7 +474,31 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	)
 
 	for i := range apps {
-		cfg.ControlAddress, cfg.ProbeAddress = unusedAddress(t), unusedAddress(t)
+		ip := fmt.Sprintf("127.0.0.%d", i+2)
+		cfg.ControlAddress, cfg.ProbeAddress = net.JoinHostPort(ip, port), unusedAddress(t)
+
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: fmt.Sprintf("controller-%d", i)}, Spec: corev1.PodSpec{ServiceAccountName: sa.Name, Containers: []corev1.Container{{Name: "controller", Image: "example.invalid/controller:test"}}}}
+		if err := c.Create(t.Context(), pod); err != nil {
+			t.Fatal(err)
+		}
+
+		pod.Status.PodIP = ip
+		if err := c.Status().Update(t.Context(), pod); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg.PodName, cfg.PodUID = pod.Name, string(pod.UID)
+
+		token, err := kube.CoreV1().ServiceAccounts(cfg.Namespace).CreateToken(t.Context(), sa.Name, &authv1.TokenRequest{Spec: authv1.TokenRequestSpec{Audiences: []string{ReplicationAudience}, ExpirationSeconds: ptr.To(int64(3600)), BoundObjectRef: &authv1.BoundObjectReference{APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID}}}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cfg.ReplicationTokenFile = filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(cfg.ReplicationTokenFile, []byte(token.Status.Token), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
 		options := managerOptions(cfg, scheme)
 		options.LeaseDuration, options.RenewDeadline, options.RetryPeriod = ptr.To(4*time.Second), ptr.To(2*time.Second), ptr.To(500*time.Millisecond)
 		options.Controller.SkipNameValidation = ptr.To(true) // Two real managers in one test process.
@@ -461,6 +512,13 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 				return base.RoundTrip(req)
 			})
 		}
+
+		lockClient, err := kubernetes.NewForConfig(connection)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		options.LeaderElectionResourceLockInterface = &resourcelock.LeaseLock{LeaseMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: "racer-controller"}, Client: lockClient.CoordinationV1(), LockConfig: resourcelock.ResourceLockConfig{Identity: cfg.PodName + "/" + cfg.PodUID}}
 
 		mgr, err := ctrl.NewManager(connection, options)
 		if err != nil {
@@ -495,7 +553,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 
 	eventually(t, "elected manager becomes ready", func() bool {
 		for i, app := range apps {
-			if app.Server.Ready(nil) == nil {
+			if app.Replication.isLeader() && app.Server.Ready(nil) == nil {
 				leader = i
 				return true
 			}
@@ -505,17 +563,13 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	})
 
 	follower := 1 - leader
-	if apps[follower].Server.Ready(nil) == nil {
-		t.Fatal("two serving leaders")
-	}
+
+	eventually(t, "follower installs replicated snapshot and serves", func() bool { return apps[follower].Server.Ready(nil) == nil })
 
 	for i, app := range apps {
 		response, err := http.Get("http://" + app.Server.Config.ProbeAddress + "/readyz")
 
-		want := 500 // controller-runtime healthz reports failed checks as 500.
-		if i == leader {
-			want = 200
-		}
+		want := 200
 
 		if err != nil {
 			t.Fatal(err)
@@ -567,7 +621,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatalf("Racer manager mutated an operator-owned workload: %v", err)
 	}
 
-	peer := integrationEnrollment(t, rc, c, apps[leader], ds, roots)
+	peer := integrationEnrollment(t, rc, c, apps[follower], ds, roots)
 	endpoint := "https://" + apps[leader].Server.Config.ControlAddress
 	response, err := peer.Get(endpoint + wire.SnapshotPath)
 
@@ -576,6 +630,14 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal(err)
 	}
 	// Establish a real authenticated pending HTTPS request before loss of Lease.
+	eventually(t, "follower receives current image before failover", func() bool {
+		p, err := apps[follower].Server.Publications.Current()
+		return err == nil && p.record.Sequence == publication.Sequence
+	})
+
+	followerResponse, followerErr := peer.Get("https://" + apps[follower].Server.Config.ControlAddress + wire.SnapshotPath)
+	responseBody(t, followerResponse, followerErr, http.StatusOK)
+
 	pollDone := make(chan error, 1)
 
 	go func() {
@@ -629,7 +691,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal("old leader listener still accepts after manager exit")
 	}
 
-	eventually(t, "follower takes expired Lease and serves", func() bool { return apps[follower].Server.Ready(nil) == nil })
+	eventually(t, "follower takes expired Lease and serves", func() bool { return apps[follower].Replication.isLeader() && apps[follower].Server.Ready(nil) == nil })
 
 	if err := c.Get(t.Context(), client.ObjectKeyFromObject(lease), lease); err != nil || *lease.Spec.HolderIdentity == oldHolder {
 		t.Fatalf("Lease did not change holder: %v", err)
@@ -639,7 +701,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 
 	recovered, err := wire.DecodePublication(bytes.NewReader(responseBody(t, response, err, 200)))
 	if err != nil || recovered.Sequence != publication.Sequence || recovered.MembershipVersion != publication.MembershipVersion {
-		t.Fatalf("failover changed unchanged counters: %v", err)
+		t.Fatalf("failover changed unchanged counters: before=%+v after=%+v error=%v", publication, recovered, err)
 	}
 
 	t.Logf("actual Lease failover and authenticated HTTPS recovery: %s; sequence=%d membership=%d", time.Since(start), recovered.Sequence, recovered.MembershipVersion)
