@@ -143,6 +143,20 @@ pub struct HeadCompletion<T> {
     _decoded: Option<Reservation>,
 }
 impl HttpIo {
+    /// Watch hangup without consuming request bytes. The pending poll retains both
+    /// descriptor and connection admission through its cancellation CQE.
+    pub(crate) fn disconnected<'a>(
+        &'a self,
+        connection: &ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, u32> {
+        self.reactor.readiness_with_lease(
+            connection.socket(),
+            libc::POLLHUP as u32,
+            connection.reservation.clone(),
+            scope,
+        )
+    }
     pub(crate) fn reactor(&self) -> &Rc<Reactor> {
         &self.reactor
     }

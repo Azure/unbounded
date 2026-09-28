@@ -191,7 +191,12 @@ impl MemoryCache {
             .and_then(|pages| pages.iter().next())
             .and_then(|id| entries.pages.get(id))
         {
-            if known.1.metadata.length != page.metadata.length {
+            if !known
+                .1
+                .metadata
+                .immutable()
+                .compatible(&page.metadata.immutable())
+            {
                 return Err(Error::CorruptRecord);
             }
         }

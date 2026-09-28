@@ -24,7 +24,7 @@ func DecodeBootstrap(r io.Reader) (BootstrapRequest, error) {
 		return BootstrapRequest{}, err
 	}
 
-	if err := validateBootstrapRequest(v); err != nil {
+	if err := ValidateBootstrapRequest(v); err != nil {
 		return BootstrapRequest{}, err
 	}
 
@@ -40,7 +40,7 @@ func EncodeBootstrap(v BootstrapResponse) ([]byte, error) {
 }
 
 func EncodeBootstrapRequest(v BootstrapRequest) ([]byte, error) {
-	if err := validateBootstrapRequest(v); err != nil {
+	if err := ValidateBootstrapRequest(v); err != nil {
 		return nil, err
 	}
 

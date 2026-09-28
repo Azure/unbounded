@@ -36,7 +36,6 @@ func testKeyring(t *testing.T) (*KeyringReconciler, *time.Time) {
 	a := Assemble(topology.Config, topology.Client, topology.APIReader)
 	now := time.Now().UTC().Truncate(time.Second)
 	a.Keyring.Now = func() time.Time { return now }
-	a.Keyring.Issuer.Now = a.Keyring.Now
 
 	return a.Keyring, &now
 }
@@ -55,19 +54,17 @@ func runKeys(t *testing.T, r *KeyringReconciler) ctrl.Result {
 func keyState(t *testing.T, r *KeyringReconciler) (*corev1.Secret, wire.KeyringBundle, RotationState, issuerMaterial) {
 	t.Helper()
 
-	topology := &TopologyReconciler{APIReader: r.APIReader, Config: r.Config}
-
-	version, _, err := topology.readVersion(context.Background())
+	version, _, err := readVersion(context.Background(), r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, shared, b, s, m, err := readCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim])
+	credentials, err := readCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return shared, b, s, m
+	return credentials.shared, credentials.bundle, credentials.rotation, credentials.material
 }
 
 func TestKeyringRotationLifecycle(t *testing.T) {
@@ -119,6 +116,10 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 			t.Fatal("rotation changed an existing epoch or failed to bind the next generation")
 		}
 	}
+
+	if !reflect.DeepEqual(staged.CacheKeys[:len(initial.CacheKeys)], initial.CacheKeys) {
+		t.Fatal("staging changed retained keys")
+	}
 	// A fresh process resumes the persisted deadline, not a new delay.
 	restarted := Assemble(r.Config, r.Client, r.APIReader).Keyring
 	restarted.Now = r.Now
@@ -137,9 +138,13 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("activation/overlap incorrect")
 	}
 
-	for _, k := range activated.CacheKeys {
+	for i, k := range activated.CacheKeys {
 		if k.State == wire.PreparedKey {
 			t.Fatal("prepared key not activated")
+		}
+
+		if !reflect.DeepEqual(k.Key, staged.CacheKeys[i].Key) || !k.EqualMaterial(staged.CacheKeys[i]) {
+			t.Fatal("activation changed key identity or material")
 		}
 	}
 	// Further cycles overlap without evicting an earlier retirement prematurely.
@@ -165,9 +170,102 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("retirement pruning/reset")
 	}
 	// Topology CAS preserves the one-way initialization claim.
-	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(r.Config.Limits), Accepted: make(AcceptedMembers)}
+	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(), Accepted: make(AcceptedMembers)}
 	reconcileTopology(t, topology, context.Background())
 	keyState(t, r)
+}
+
+func TestKeyringDerivedDeadlines(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval time.Duration
+		retain   time.Duration
+		steps    []struct{ at, next time.Duration }
+	}{
+		{
+			name:     "overlapping retirements",
+			interval: 24 * time.Hour,
+			retain:   48 * time.Hour,
+			steps: []struct{ at, next time.Duration }{
+				{0, 23 * time.Hour},
+				{23 * time.Hour, 24 * time.Hour},
+				{24 * time.Hour, 47 * time.Hour},
+				{47 * time.Hour, 48 * time.Hour},
+				{48 * time.Hour, 71 * time.Hour},
+				{71 * time.Hour, 72 * time.Hour},
+			},
+		},
+		{
+			name:     "retirement during preparation",
+			interval: 24 * time.Hour,
+			retain:   24*time.Hour + 30*time.Minute,
+			steps: []struct{ at, next time.Duration }{
+				{0, 23 * time.Hour},
+				{23 * time.Hour, 24 * time.Hour},
+				{24 * time.Hour, 47 * time.Hour},
+				{47 * time.Hour, 48 * time.Hour},
+				{48 * time.Hour, 48*time.Hour + 30*time.Minute},
+				{48*time.Hour + 30*time.Minute, 71 * time.Hour},
+			},
+		},
+		{
+			name:     "retirement before next rotation",
+			interval: 7 * 24 * time.Hour,
+			retain:   24 * time.Hour,
+			steps: []struct{ at, next time.Duration }{
+				{0, 167 * time.Hour},
+				{167 * time.Hour, 168 * time.Hour},
+				{168 * time.Hour, 192 * time.Hour},
+				{192 * time.Hour, 335 * time.Hour},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, now := testKeyring(t)
+			r.Config.Rotation = RotationPolicy{Interval: tc.interval, PrepareFor: time.Hour, RetainFor: tc.retain}
+			start := *now
+
+			for i, step := range tc.steps {
+				*now = start.Add(step.at)
+				result := runKeys(t, r)
+
+				shared, bundle, state, _ := keyState(t, r)
+				if want := start.Add(step.next); !state.nextTransition().Equal(want) || result.RequeueAfter != want.Sub(*now) {
+					t.Fatalf("step %d: deadline=%v requeue=%v, want %v", i, state.nextTransition(), result.RequeueAfter, want)
+				}
+
+				if bundle.Generation != wire.Generation(i+1) {
+					t.Fatalf("step %d did not publish exactly one transition: generation=%d", i, bundle.Generation)
+				}
+
+				var persisted map[string]json.RawMessage
+				if err := json.Unmarshal(shared.Data["rotation.json"], &persisted); err != nil {
+					t.Fatal(err)
+				}
+
+				if _, exists := persisted["next_transition"]; exists {
+					t.Fatal("derived deadline persisted")
+				}
+
+				// Every phase must resume from only primary state without rewriting
+				// credentials or extending a deadline when the process restarts.
+				restarted := Assemble(r.Config, r.Client, r.APIReader).Keyring
+				restarted.Now = r.Now
+
+				*now = now.Add(time.Second)
+				if got := runKeys(t, restarted).RequeueAfter; got != step.next-step.at-time.Second {
+					t.Fatalf("step %d: restart requeue=%v", i, got)
+				}
+
+				unchanged, _, _, _ := keyState(t, restarted)
+				if shared.ResourceVersion != unchanged.ResourceVersion || !reflect.DeepEqual(shared.Data, unchanged.Data) {
+					t.Fatalf("step %d: restart rewrote credentials", i)
+				}
+
+				r = restarted
+			}
+		})
+	}
 }
 
 func TestGenerationBoundCacheKey(t *testing.T) {
@@ -184,6 +282,29 @@ func TestGenerationBoundCacheKey(t *testing.T) {
 		if len(key.Key.ID) != 16 || string(key.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(generation) {
 			t.Fatalf("creation generation not preserved: %x", key.Key.ID)
 		}
+	}
+}
+
+func TestPlanRotationExhaustedKeyCreation(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, b, state, _ := keyState(t, r)
+	b.Generation = math.MaxUint64
+	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
+
+	next, nextState, err := PlanRotation(r.Config.Rotation, b, state, catalog, *now)
+	if err != nil || !reflect.DeepEqual(next, b) || !reflect.DeepEqual(nextState, state) {
+		t.Fatalf("exhausted idle plan: %v", err)
+	}
+
+	catalog = append(catalog, wire.CacheDefinition{ID: wire.CacheID(testOtherUID)})
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, *now); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("exhausted admission plan: %v", err)
+	}
+
+	state.PreparedIssuer = state.ActiveIssuer
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog[:1], state.NextRotation); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("exhausted staging plan: %v", err)
 	}
 }
 
@@ -325,6 +446,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 	for _, lost := range []string{"issuer", "bundle", "both", "version", "marker"} {
 		t.Run("lost "+lost, func(t *testing.T) {
 			r, _ := testKeyring(t)
+			issuer := testIssuer(r)
 			runKeys(t, r)
 
 			for _, name := range []string{r.Config.IssuerSecretName, r.Config.KeyringSecretName} {
@@ -354,7 +476,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 				t.Fatal("lost state accepted")
 			}
 
-			if _, err := r.Issuer.TrustRoots(context.Background()); err == nil {
+			if _, err := issuer.TrustRoots(context.Background()); err == nil {
 				t.Fatal("lost state still trusted")
 			}
 		})
@@ -415,8 +537,9 @@ func TestKeyringConflictCancellationAndAuthoritativeReads(t *testing.T) {
 				t.Fatal("write after cancellation")
 			}
 
-			if r.Lifecycle.issuer {
-				t.Fatal("failed operation left readiness set")
+			// Cancellation before admission observes no authority failure.
+			if r.Lifecycle.issuer != (cancelAt == "before") {
+				t.Fatal("readiness did not reflect whether admission observed a failure")
 			}
 
 			r.Client = base
@@ -435,13 +558,13 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 		catalog = append(catalog, wire.CacheDefinition{ID: wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", n+1))})
 	}
 
-	b, state, err := r.PlanRotation(original, s, catalog, *now)
+	b, state, err := PlanRotation(r.Config.Rotation, original, s, catalog, *now)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	state.PreparedIssuer = state.ActiveIssuer
-	if _, _, err := r.PlanRotation(b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
+	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("overlap bound not enforced: %v", err)
 	}
 
@@ -487,16 +610,188 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 	}
 }
 
+func TestPlanRotationOwnsOutput(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	runKeys(t, r)
+	_, _, prepared, _ := keyState(t, r)
+	*now = prepared.ActivateAt
+
+	runKeys(t, r)
+	_, original, state, _ := keyState(t, r)
+	catalog := []wire.CacheDefinition{{ID: wire.CacheID(testNodeUID)}}
+	// The old codec round trip preserves order, even when it is not sorted.
+	original.PeerTrustRoots[0], original.PeerTrustRoots[1] = original.PeerTrustRoots[1], original.PeerTrustRoots[0]
+	original.CacheKeys[0], original.CacheKeys[1] = original.CacheKeys[1], original.CacheKeys[0]
+
+	before, err := wire.EncodeBundle(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeState, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := wire.DecodeBundle(bytes.NewReader(before))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, nextState, err := PlanRotation(r.Config.Rotation, original, state, catalog, *now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(next, want) || !reflect.DeepEqual(nextState, state) {
+		t.Fatal("idle planner changed bundle representation or rotation state")
+	}
+
+	// Exercise both outer collections and nested bytes, plus the retirement map.
+	next.PeerTrustRoots[0][0] ^= 0xff
+	next.PeerTrustRoots[1] = nil
+	next.CacheKeys[0].Key.ID[0] ^= 0xff
+	next.CacheKeys[1].State = wire.PreparedKey
+
+	for id := range nextState.Retiring {
+		delete(nextState.Retiring, id)
+	}
+
+	after, err := wire.EncodeBundle(original)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("output aliases input bundle: %v", err)
+	}
+
+	afterState, err := json.Marshal(state)
+	if err != nil || !bytes.Equal(beforeState, afterState) {
+		t.Fatalf("output aliases input retirement map: %v", err)
+	}
+}
+
+func TestPlanRotationInputValidation(t *testing.T) {
+	r, now := testKeyring(t)
+	runKeys(t, r)
+
+	_, original, state, _ := keyState(t, r)
+	for _, tc := range []struct {
+		name string
+		edit func(*wire.KeyringBundle)
+		want error
+	}{
+		{"schema", func(b *wire.KeyringBundle) { b.SchemaVersion++ }, wire.UnsupportedVersion},
+		{"generation", func(b *wire.KeyringBundle) { b.Generation = 0 }, wire.InvalidRequest},
+		{"duplicate root", func(b *wire.KeyringBundle) { b.PeerTrustRoots = append(b.PeerTrustRoots, b.PeerTrustRoots[0]) }, wire.InvalidRequest},
+		{"invalid key", func(b *wire.KeyringBundle) {
+			b.CacheKeys = append([]wire.CacheKey(nil), b.CacheKeys...)
+			b.CacheKeys[0].Key.ID = nil
+		}, wire.InvalidRequest},
+		{"encoded size", func(b *wire.KeyringBundle) {
+			key := b.CacheKeys[0]
+
+			b.CacheKeys = make([]wire.CacheKey, 4000)
+			for i := range b.CacheKeys {
+				b.CacheKeys[i] = key
+				b.CacheKeys[i].Key.Cache = wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i+1))
+			}
+		}, wire.TooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := original
+			tc.edit(&b)
+			// An empty catalog would discard all keys; invalid/oversized input
+			// must still fail before the planner can shrink it into a valid output.
+			if _, _, err := PlanRotation(r.Config.Rotation, b, state, nil, *now); !errors.Is(err, tc.want) {
+				t.Fatalf("input validation: got %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	original.CacheKeys = nil
+	state.Retiring = nil
+
+	next, nextState, err := PlanRotation(r.Config.Rotation, original, state, nil, *now)
+	if err != nil || next.CacheKeys == nil || nextState.Retiring == nil {
+		t.Fatalf("empty collection normalization: %v", err)
+	}
+}
+
 func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
-	for _, corrupt := range []string{"timestamp", "active issuer", "bundle", "private key", "generation", "binding"} {
+	for _, corrupt := range []string{"timestamp", "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "nil retirement", "unknown retirement", "active issuer", "bundle", "private key", "generation", "binding"} {
 		t.Run(corrupt, func(t *testing.T) {
 			r, now := testKeyring(t)
 			runKeys(t, r)
+
+			switch corrupt {
+			case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
+				_, _, initial, _ := keyState(t, r)
+				*now = initial.NextRotation
+
+				runKeys(t, r)
+
+				switch corrupt {
+				case "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
+					_, _, prepared, _ := keyState(t, r)
+					*now = prepared.ActivateAt
+
+					runKeys(t, r)
+				}
+			}
+
 			shared, b, s, _ := keyState(t, r)
 
 			switch corrupt {
 			case "timestamp":
-				s.NextTransition = time.Time{}
+				s.NextRotation = time.Time{}
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "transition mismatch":
+				// Preparation must activate strictly after the rotation timestamp.
+				s.ActivateAt = s.NextRotation
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "missing activation":
+				s.ActivateAt = time.Time{}
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "missing prepared issuer":
+				s.PreparedIssuer = ""
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "zero root retirement", "missing root retirement", "replaced retirement":
+				for _, root := range b.PeerTrustRoots {
+					if id := rootID(root); id != s.ActiveIssuer {
+						switch corrupt {
+						case "zero root retirement":
+							s.Retiring[id] = time.Time{}
+						case "missing root retirement":
+							delete(s.Retiring, id)
+						case "replaced retirement":
+							s.Retiring[s.ActiveIssuer] = s.Retiring[id]
+							delete(s.Retiring, id)
+						}
+					}
+				}
+
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "zero key retirement", "missing key retirement":
+				for _, key := range b.CacheKeys {
+					if key.State == wire.RetiringKey {
+						if corrupt == "zero key retirement" {
+							s.Retiring[keyID(key)] = time.Time{}
+						} else {
+							delete(s.Retiring, keyID(key))
+						}
+
+						break
+					}
+				}
+
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "nil retirement":
+				s.Retiring = nil
+				shared.Data["rotation.json"], _ = json.Marshal(s)
+			case "unknown retirement":
+				s.Retiring["unknown"] = s.NextRotation.Add(time.Hour)
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "active issuer":
 				s.ActiveIssuer = "missing"
@@ -541,6 +836,119 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
+	for _, transition := range []string{"idle", "admission", "stage", "empty stage", "activate", "remove", "prune"} {
+		t.Run(transition, func(t *testing.T) {
+			r, now := testKeyring(t)
+
+			r.Config.Rotation.Interval = 7 * 24 * time.Hour
+			if transition == "empty stage" {
+				if err := r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			runKeys(t, r)
+
+			_, _, initial, _ := keyState(t, r)
+			if transition == "activate" || transition == "prune" {
+				*now = initial.NextRotation
+
+				runKeys(t, r)
+				_, _, staged, _ := keyState(t, r)
+				*now = staged.ActivateAt
+
+				if transition == "prune" {
+					runKeys(t, r)
+					_, _, active, _ := keyState(t, r)
+					*now = active.Retiring[initial.ActiveIssuer]
+				}
+			}
+
+			shared, b, _, _ := keyState(t, r)
+			b.Generation = math.MaxUint64
+
+			var err error
+
+			shared.Data["bundle.json"], err = wire.EncodeBundle(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.Update(t.Context(), shared); err != nil {
+				t.Fatal(err)
+			}
+
+			switch transition {
+			case "admission":
+				cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+				if err := r.Create(t.Context(), cache); err != nil {
+					t.Fatal(err)
+				}
+			case "stage", "empty stage":
+				*now = initial.NextRotation
+			case "remove":
+				if err := r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+				t.Fatal("exhausted generation wrote durable state")
+				return nil
+			}})
+			if transition == "idle" {
+				runKeys(t, r)
+			} else if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.Unavailable) {
+				t.Fatalf("exhausted generation transition: %v", err)
+			}
+
+			after, preserved, _, _ := keyState(t, r)
+			if after.ResourceVersion != shared.ResourceVersion || !reflect.DeepEqual(preserved, b) {
+				t.Fatal("exhausted generation changed the published bundle")
+			}
+		})
+	}
+}
+
+func TestKeyringAdmissionAtLastGeneration(t *testing.T) {
+	r, _ := testKeyring(t)
+	runKeys(t, r)
+	shared, b, _, _ := keyState(t, r)
+	b.Generation = math.MaxUint64 - 1
+
+	var err error
+
+	shared.Data["bundle.json"], err = wire.EncodeBundle(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Update(t.Context(), shared); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+	if err := r.Create(t.Context(), cache); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, r)
+
+	_, admitted, _, _ := keyState(t, r)
+	if admitted.Generation != math.MaxUint64 || len(admitted.CacheKeys) != 4 || !reflect.DeepEqual(admitted.CacheKeys[:2], b.CacheKeys) {
+		t.Fatal("last generation admission lost existing keys or new scopes")
+	}
+
+	for _, key := range admitted.CacheKeys[2:] {
+		if key.Key.Cache != wire.CacheID(testOtherUID) || key.State != wire.ActiveKey || binary.BigEndian.Uint64(key.Key.ID[4:12]) != math.MaxUint64 {
+			t.Fatal("admitted key did not bind the last publication generation")
+		}
+	}
+
+	runKeys(t, r)
 }
 
 func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
@@ -608,8 +1016,8 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	runKeys(t, r)
 
 	_, b, s, _ := keyState(t, r)
-	if len(b.CacheKeys) != 0 {
-		t.Fatal("empty catalog has keys")
+	if b.Generation != 1 || len(b.CacheKeys) != 0 {
+		t.Fatal("empty catalog initialization has wrong generation or keys")
 	}
 
 	*now = s.NextRotation
@@ -625,8 +1033,14 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	runKeys(t, r)
 
 	_, added, _, _ := keyState(t, r)
-	if len(added.CacheKeys) != 2 {
+	if added.Generation != 3 || len(added.CacheKeys) != 2 {
 		t.Fatal("new cache missing initial keys")
+	}
+
+	for _, key := range added.CacheKeys {
+		if binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(added.Generation) {
+			t.Fatal("new cache key did not bind its admission generation")
+		}
 	}
 
 	*now = staged.ActivateAt
@@ -635,7 +1049,7 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 
 	_, activated, _, _ := keyState(t, r)
 	for n, key := range activated.CacheKeys {
-		if key.State != wire.ActiveKey || !key.EqualMaterial(added.CacheKeys[n]) {
+		if key.State != wire.ActiveKey || !reflect.DeepEqual(key.Key, added.CacheKeys[n].Key) || !key.EqualMaterial(added.CacheKeys[n]) {
 			t.Fatal("new cache key retired without replacement")
 		}
 	}
@@ -646,7 +1060,6 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 		t.Run(fmt.Sprintf("response-lost=%t", afterWrite), func(t *testing.T) {
 			r, now := testKeyring(t)
 			r.Config.Rotation.Interval = 7 * 24 * time.Hour
-			r.Issuer.Config = r.Config
 			runKeys(t, r)
 			_, _, initial, _ := keyState(t, r)
 			*now = initial.NextRotation

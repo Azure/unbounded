@@ -211,8 +211,9 @@ impl ClientListeners {
             request_timeout: Duration::from_secs(30),
         }
     }
-    /// Bound header/idle admission and each operation with separate fixed budgets.
-    /// Response streaming shares the operation deadline without renewing it.
+    /// Bound header/idle admission and initial metadata/first-page work. After
+    /// headers, distinct pages receive this acquisition budget independently;
+    /// socket writes use Delivery's progress-based stall timeout.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -662,7 +663,35 @@ async fn serve_connection(
         };
         let kind = request.kind.clone();
         let object = request.origin.object.clone();
-        let response = match reads.read(request, scope).await {
+        let socket = connection.socket();
+        let watch_scope = RequestScope {
+            request: scope.request,
+            deadline: scope.deadline,
+            cancellation: Cancellation::new()?,
+        };
+        let mut disconnected = Some(io.disconnected(&connection, &watch_scope));
+        let mut disconnect_observed = false;
+        let mut read = reads.read(request, scope);
+        let read_result = std::future::poll_fn(|cx| {
+            let hangup = match disconnected.as_mut().map(|f| f.as_mut().poll(cx)) {
+                Some(Poll::Ready(result)) => {
+                    disconnected = None;
+                    result.is_ok_and(|events| events & libc::POLLHUP as u32 != 0)
+                }
+                _ => false,
+            };
+            if !disconnect_observed && (socket.peer_disconnected() || hangup) {
+                disconnect_observed = true;
+                let _ = scope.cancel();
+            }
+            read.as_mut().poll(cx)
+        })
+        .await;
+        let _ = watch_scope.cancel();
+        if let Some(watch) = disconnected.take() {
+            let _ = watch.await;
+        }
+        let response = match read_result {
             Ok(response) => response,
             Err(error) => {
                 let error = if error == Error::NotFound && kind.pin().is_some() {
@@ -675,6 +704,7 @@ async fn serve_connection(
                 return Ok(());
             }
         };
+        drop(disconnected);
         if let Err(error) = scope.check() {
             observation.fail(error);
             responses.send_error(connection, error, scope).await?;
@@ -691,10 +721,19 @@ async fn serve_connection(
             responses.send_error(connection, error, scope).await?;
             return Ok(());
         }
-        connection = match responses
-            .send_observed(connection, response, scope, &mut observation)
-            .await
-        {
+        drop(read);
+        let mut send =
+            responses.send_observed(connection, response, scope, &mut observation, timeout);
+        let result = std::future::poll_fn(|cx| {
+            if socket.peer_disconnected() {
+                let _ = scope.cancel();
+            }
+            send.as_mut().poll(cx)
+        })
+        .await;
+        drop(send);
+        drop(socket);
+        connection = match result {
             Ok(connection) => connection,
             Err(error) => {
                 observation.fail(error);
@@ -1047,6 +1086,7 @@ mod tests {
                 self.calls.set(self.calls.get() + 1);
                 Ok(ReadResponse {
                     metadata: ObjectMetadata {
+                        content_type: None,
                         version: ObjectVersion {
                             object: request.origin.object,
                             etag: StrongEtag::parse(b"\"v1\"")?,
@@ -1639,6 +1679,7 @@ mod tests {
                 use std::sync::Arc;
                 let length = if self.late_failure { PAGE_BYTES + 1 } else { 5 };
                 let metadata = ObjectMetadata {
+                    content_type: None,
                     version: ObjectVersion {
                         object: request.origin.object.clone(),
                         etag: StrongEtag::parse(b"\"v1\"")?,
@@ -1959,12 +2000,43 @@ mod tests {
         for _ in 0..64 {
             fixture.pump(16);
         }
-        // A reset at response start or on body progress would still be live.
-        assert_eq!(fixture.listeners.active_connections(), 0);
+        // The initial budget is not renewed: it is no longer the body lifetime.
+        // Delivery remains live under its independent write-stall bound.
+        assert_eq!(fixture.listeners.active_connections(), 1);
         output.extend(fixture.receive(&mut socket, true));
-        assert!(output.len() - head_end < crate::model::range::PAGE_BYTES as usize);
+        assert_eq!(
+            output.len() - head_end,
+            crate::model::range::PAGE_BYTES as usize
+        );
         assert!(output[head_end..].iter().all(|byte| *byte == b'x'));
         assert_only_idle_pipes(&fixture, &_pipes);
+    }
+
+    #[test]
+    fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
+        let mut fixture = Fixture::new();
+        let reads = Rc::new(GatedRead {
+            inner: fixture.reads.clone(),
+            scopes: RefCell::new(Vec::new()),
+            release: Cell::new(false),
+            wake: RefCell::new(None),
+        });
+        fixture.listeners.reads = reads.clone();
+        fixture.reconcile(&[definition()]).unwrap();
+        let mut socket = fixture.connect();
+        socket.write_all(&request("HEAD", "")).unwrap();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        let scope = reads.scopes.borrow()[0].clone();
+        assert_eq!(scope.check(), Ok(()));
+        drop(socket);
+        for _ in 0..64 {
+            fixture.pump(16);
+        }
+        assert!(scope.cancellation.is_cancelled());
+        assert!(Instant::now() < scope.deadline.0);
+        assert_no_body_leases(&fixture);
     }
 
     #[test]
@@ -2041,6 +2113,7 @@ mod tests {
                     }
                     Ok(ReadResponse {
                         metadata: ObjectMetadata {
+                            content_type: None,
                             version: ObjectVersion {
                                 object: request.origin.object,
                                 etag: StrongEtag::parse(b"\"\"")?,
@@ -2320,6 +2393,7 @@ mod tests {
                     }
                     Ok(ReadResponse {
                         metadata: ObjectMetadata {
+                            content_type: None,
                             version: ObjectVersion {
                                 object: request.origin.object,
                                 etag: StrongEtag::parse(b"\"other\"")?,

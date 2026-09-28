@@ -747,7 +747,9 @@ impl Reactor {
         scope: &'a RequestScope,
     ) -> Operation<'a, u32> {
         Box::pin(async move {
-            if interest == 0 || interest & !((libc::POLLIN | libc::POLLOUT) as u32) != 0 {
+            if interest == 0
+                || interest & !((libc::POLLIN | libc::POLLOUT | libc::POLLHUP) as u32) != 0
+            {
                 return Err(Error::InvalidRequest);
             }
             let sqe = submission!(

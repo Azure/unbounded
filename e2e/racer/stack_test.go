@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -40,7 +42,7 @@ const (
 // Only a ClusterCache triggers Racer installation; containerd can reach the
 // fixture image exclusively through Gantry's Racer-backed mirror.
 func TestOperatorImagePull(t *testing.T) {
-	for _, tool := range []string{"docker", "kind", "kubectl", "make"} {
+	for _, tool := range []string{"docker", "kind", "kubectl", "make", "helm"} {
 		_, err := exec.LookPath(tool)
 		require.NoError(t, err, "required e2e tool: %s", tool)
 	}
@@ -107,6 +109,7 @@ func TestOperatorImagePull(t *testing.T) {
 	h.kubectl("rollout", "status", "daemonset/racer-dataplane", "-n", namespace, "--timeout=90s")
 
 	fixture := newImage(t)
+	corruptFixtures := [2]*image{newSeededImage(t, 43), newSeededImage(t, 44)}
 
 	var networks []struct {
 		IPAM struct{ Config []struct{ Gateway string } }
@@ -130,7 +133,7 @@ func TestOperatorImagePull(t *testing.T) {
 	rotationFixture.authorization = rotationAuthorization
 	rotationPressure := h.rotationDiskFixtures()
 	lifecycle := newLifecycleOrigin(t)
-	origin := h.serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	origin, originCA := newTLSOrigin(t, gateway, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v2/fixture/lifecycle/") {
 			lifecycle.ServeHTTP(w, r)
 			return
@@ -154,15 +157,34 @@ func TestOperatorImagePull(t *testing.T) {
 			return
 		}
 
+		id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		for _, corruptFixture := range corruptFixtures {
+			if _, ok := corruptFixture.blobs[id]; ok {
+				corruptFixture.handler().ServeHTTP(w, r)
+				return
+			}
+		}
+
 		fixture.handler().ServeHTTP(w, r)
 	}))
-	originURL := "http://" + net.JoinHostPort(gateway, origin)
-	h.apply(strings.ReplaceAll(fmt.Sprintf(gantryManifest, originURL), "docker.io/library/gantry:e2e", imageRegistry+"/gantry:e2e"))
-	h.kubectl("rollout", "status", "daemonset/gantry-racer-e2e", "-n", namespace, "--timeout=90s")
+	originURL := "https://" + net.JoinHostPort(gateway, fmt.Sprint(origin.Listener.Addr().(*net.TCPAddr).Port))
+	trust, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]string{"name": "racer-e2e-origin-ca", "namespace": namespace}, "data": map[string]string{"ca.crt": originCA}})
+	require.NoError(t, err)
+	h.apply(string(trust))
+	// Racer runs on the two workers; Gantry needs its node-local sockets.
+	h.apply(h.run("helm", "template", "gantry", "deploy/gantry/chart", "--namespace", namespace,
+		"-f", "deploy/gantry/chart/values-racer.yaml", "--set", "nodeConfig.enabled=false",
+		"--set-json", "tolerations=[]",
+		"--set-string", "image.reference="+imageRegistry+"/gantry:e2e", "--set", "image.pullPolicy=Never",
+		"--set-string", "gantry.upstreamRegistries[0].name="+registry,
+		"--set-string", "gantry.upstreamRegistries[0].endpoint="+originURL))
+	// Go loads SSL_CERT_FILE plus the normal system certificate directories.
+	h.kubectl("patch", "daemonset/gantry", "-n", namespace, "--type=strategic", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"gantry","env":[{"name":"SSL_CERT_FILE","value":"/etc/racer-e2e-origin/ca.crt"}],"volumeMounts":[{"name":"origin-ca","mountPath":"/etc/racer-e2e-origin","readOnly":true}]}],"volumes":[{"name":"origin-ca","configMap":{"name":"racer-e2e-origin-ca"}}]}}}}`)
+	h.kubectl("rollout", "status", "daemonset/gantry", "-n", namespace, "--timeout=90s")
 
 	racerPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "-o", "jsonpath={.items[0].metadata.name}"))
-	racerURL := h.forward(racerPod, "9090", "/readyz")
-	gantryPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app=gantry-racer-e2e", "-o", "jsonpath={.items[0].metadata.name}"))
+	racerURL := h.racerDiagnostics(racerPod)
+	gantryPod := strings.TrimSpace(h.kubectl("get", "pod", "-n", namespace, "-l", "app.kubernetes.io/name=gantry", "-o", "jsonpath={.items[0].metadata.name}"))
 	mirrorURL, err := url.Parse(h.forward(gantryPod, "5000", "/v2/"))
 	require.NoError(t, err)
 
@@ -208,9 +230,18 @@ func TestOperatorImagePull(t *testing.T) {
 
 	h.waitHTTP(racerURL + "/readyz")
 	t.Logf("containerd pulled and unpacked %s/fixture/image@%s through operator-installed Racer and Gantry (%d objects)", registry, fixture.manifest, len(fixture.blobs))
-	h.verifyPeerCache(peers, peerFixture)
-	h.verifyLiveRotation(peers, rotationFixture, rotationPressure)
-	h.verifyCacheRecreation(peers, lifecycle)
+	h.verifyConsumerCorruption(worker, gateway, mirrorURL, corruptFixtures)
+
+	for _, phase := range []struct {
+		name string
+		run  func(*harness)
+	}{
+		{"peer cache recovery", func(h *harness) { h.verifyPeerCache(peers, peerFixture) }},
+		{"live rotation", func(h *harness) { h.verifyLiveRotation(peers, rotationFixture, rotationPressure) }},
+		{"cache recreation", func(h *harness) { h.verifyCacheRecreation(peers, lifecycle) }},
+	} {
+		h.runPhase(phase.name, phase.run)
+	}
 }
 
 type harness struct {
@@ -218,6 +249,17 @@ type harness struct {
 	ctx                                  context.Context
 	root, artifacts, cluster, kubeconfig string
 	sequence                             int
+}
+
+func (h *harness) runPhase(name string, run func(*harness)) {
+	h.t.Helper()
+	h.t.Run(name, func(t *testing.T) {
+		child := *h
+		child.t = t
+		// Cleanup runs after FailNow too, preserving artifact sequence ownership.
+		t.Cleanup(func() { h.sequence = child.sequence })
+		run(&child)
+	})
 }
 
 func (h *harness) run(name string, args ...string) string {
@@ -306,6 +348,25 @@ func (h *harness) forward(pod, port, readyPath string) string {
 	return address
 }
 
+func (h *harness) racerDiagnostics(pod string) string {
+	h.t.Helper()
+
+	// The production listener binds the Pod IP, not port-forward's loopback.
+	config, err := clientcmd.BuildConfigFromFlags("", h.kubeconfig)
+	require.NoError(h.t, err)
+	transport, err := rest.TransportFor(config)
+	require.NoError(h.t, err)
+	endpoint, err := url.Parse(config.Host + "/api/v1/namespaces/" + namespace + "/pods/http:" + pod + ":9090/proxy")
+	require.NoError(h.t, err)
+
+	proxy := httputil.NewSingleHostReverseProxy(endpoint)
+	proxy.Transport = transport
+	address := "http://127.0.0.1:" + h.serve(proxy)
+	h.waitHTTP(address + "/readyz")
+
+	return address
+}
+
 func (h *harness) waitHTTP(endpoint string) {
 	h.t.Helper()
 
@@ -331,7 +392,7 @@ func (h *harness) diagnostics() {
 
 	commands = append(commands, []string{"logs", "-n", namespace, "deployment/racer-controller", "--all-containers", "--prefix", "--tail=300"})
 
-	commands = append(commands, []string{"logs", "-n", namespace, "-l", "app=gantry-racer-e2e", "--all-containers", "--prefix", "--tail=300"})
+	commands = append(commands, []string{"logs", "-n", namespace, "-l", "app.kubernetes.io/name=gantry", "--all-containers", "--prefix", "--tail=300"})
 	for i, args := range commands {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		data, _ := exec.CommandContext(ctx, "kubectl", append([]string{"--kubeconfig", h.kubeconfig}, args...)...).CombinedOutput()
@@ -364,10 +425,14 @@ type (
 func digest(body []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(body)) }
 
 func newImage(t *testing.T) *image {
+	return newSeededImage(t, 42)
+}
+
+func newSeededImage(t *testing.T, seed byte) *image {
 	t.Helper()
 	// Incompressible content crosses the 16 MiB Racer page boundary on the wire.
 	payload := make([]byte, 17<<20)
-	random := rand.NewChaCha8([32]byte{42})
+	random := rand.NewChaCha8([32]byte{seed})
 	_, err := random.Read(payload)
 	require.NoError(t, err)
 
@@ -426,55 +491,3 @@ func (image *image) handler() http.Handler {
 		http.ServeContent(w, r, id, time.Time{}, bytes.NewReader(value.body))
 	})
 }
-
-// Same-UID sockets connect the two real agents without legacy storage mounts.
-const gantryManifest = `apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: gantry-racer-e2e
-  namespace: unbounded-system
-data:
-  config.yaml: |
-    mirror_listen: 0.0.0.0:5000
-    mirror_bind_allow_non_loopback: true
-    upstream_registries:
-      - name: racer-e2e.invalid
-        endpoint: %s
----
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: gantry-racer-e2e
-  namespace: unbounded-system
-spec:
-  selector:
-    matchLabels: {app: gantry-racer-e2e}
-  template:
-    metadata:
-      labels: {app: gantry-racer-e2e}
-    spec:
-      containers:
-        - name: gantry
-          image: docker.io/library/gantry:e2e
-          imagePullPolicy: Never
-          args: [agent, --config=/etc/gantry/config.yaml]
-          env:
-            - {name: GANTRY_RACER_ENABLED, value: "true"}
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-          readinessProbe:
-            httpGet: {path: /readyz, port: 9095}
-            periodSeconds: 1
-          volumeMounts:
-            - {name: sockets, mountPath: /run/racer}
-            - {name: config, mountPath: /etc/gantry, readOnly: true}
-      volumes:
-        - name: sockets
-          hostPath: {path: /run/racer, type: Directory}
-        - name: config
-          configMap: {name: gantry-racer-e2e}
-`

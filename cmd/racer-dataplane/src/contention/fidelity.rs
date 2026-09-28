@@ -94,6 +94,7 @@ fn admission(pages: usize) -> Rc<Admission> {
 
 fn descriptor(cache: &CacheId, version: &str, length: usize) -> VersionMetadata {
     VersionMetadata {
+        content_type: None,
         version: ObjectVersion {
             object: ObjectId {
                 cache: cache.clone(),

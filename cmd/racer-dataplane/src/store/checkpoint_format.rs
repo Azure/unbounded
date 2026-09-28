@@ -9,6 +9,8 @@
 //! its descriptor, page:u64, key_id[16], segment:u64, generation:u64, slab:u64,
 //! offset:u64, disk_length:u64. Encoder ordering is canonical by worker, segment,
 //! and full version/page identity. No freshness or payload bytes are serialized.
+//! Version 2 appends a counted ASCII MIME string to every descriptor. Zero length
+//! means unknown. Version 1 remains readable and cannot encode typed descriptors.
 use super::{
     direct::{DirectAlignment, DirectExtent},
     index::{IndexSnapshot, IndexedPage, RecordLocation},
@@ -28,7 +30,7 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-pub const CHECKPOINT_VERSION: u32 = 1;
+pub const CHECKPOINT_VERSION: u32 = 2;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
 const HEADER_BYTES: usize = 32;
@@ -259,7 +261,7 @@ impl CheckpointCodec {
                 if i % 128 == 0 {
                     super::checkpoint::cooperative_turn().await;
                 }
-                out.descriptor(&entry.metadata)?;
+                out.descriptor(&entry.metadata, image.version)?;
                 out.u64(page.number.0)?;
                 out.bytes(&entry.key_id.0)?;
                 out.u64(entry.location.segment.0)?;
@@ -275,7 +277,7 @@ impl CheckpointCodec {
                 if i % 128 == 0 {
                     super::checkpoint::cooperative_turn().await;
                 }
-                out.descriptor(metadata)?;
+                out.descriptor(metadata, image.version)?;
             }
         }
         let length = out
@@ -300,7 +302,11 @@ impl CheckpointCodec {
             return Err(Error::CorruptRecord);
         }
         let mut input = Decoder(body);
-        if input.take(8)? != MAGIC || input.u32()? != CHECKPOINT_VERSION || input.u32()? != 0 {
+        if input.take(8)? != MAGIC {
+            return Err(Error::CorruptRecord);
+        }
+        let version = input.u32()?;
+        if !matches!(version, 1 | 2) || input.u32()? != 0 {
             return Err(Error::CorruptRecord);
         }
         let sequence = input.u64()?;
@@ -339,7 +345,7 @@ impl CheckpointCodec {
             let count = input.count(MAX_ITEMS, 112)?;
             let mut entries = Vec::new();
             for _ in 0..count {
-                let metadata = input.descriptor()?;
+                let metadata = input.descriptor(version)?;
                 let page = PageId {
                     version: metadata.version.clone(),
                     number: PageNumber(input.u64()?),
@@ -367,7 +373,7 @@ impl CheckpointCodec {
             let count = input.count(MAX_ITEMS, 48)?;
             let mut metadata = Vec::new();
             for _ in 0..count {
-                metadata.push(input.descriptor()?);
+                metadata.push(input.descriptor(version)?);
             }
             shards.push(ShardImage {
                 worker,
@@ -380,7 +386,7 @@ impl CheckpointCodec {
             return Err(Error::CorruptRecord);
         }
         let image = CheckpointImage {
-            version: CHECKPOINT_VERSION,
+            version,
             sequence,
             shards,
         };
@@ -411,15 +417,13 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
 }
 
 fn validate_image(image: &CheckpointImage) -> Result<()> {
-    if image.version != CHECKPOINT_VERSION
-        || image.shards.is_empty()
-        || image.shards.len() > MAX_SHARDS
+    if !matches!(image.version, 1 | 2) || image.shards.is_empty() || image.shards.len() > MAX_SHARDS
     {
         return Err(Error::CorruptRecord);
     }
     let mut workers = HashSet::default();
     let mut pages = HashSet::default();
-    let mut lengths = HashMap::default();
+    let mut lengths: HashMap<&ObjectVersion, &VersionMetadata> = HashMap::default();
     for shard in &image.shards {
         if !workers.insert(shard.worker) {
             return Err(Error::CorruptRecord);
@@ -436,12 +440,15 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
             .iter()
             .chain(shard.index.entries.iter().map(|(_, entry)| &entry.metadata))
         {
-            if lengths
-                .insert(&metadata.version, metadata.length)
-                .is_some_and(|length| length != metadata.length)
-            {
-                return Err(Error::CorruptRecord);
+            if let Some(old) = lengths.get(&metadata.version) {
+                if !old.compatible(metadata) {
+                    return Err(Error::CorruptRecord);
+                }
+                if old.content_type.is_some() {
+                    continue;
+                }
             }
+            lengths.insert(&metadata.version, metadata);
         }
     }
     Ok(())
@@ -469,11 +476,22 @@ impl Encoder {
         self.count(value.len())?;
         self.bytes(value)
     }
-    fn descriptor(&mut self, metadata: &VersionMetadata) -> Result<()> {
+    fn descriptor(&mut self, metadata: &VersionMetadata, version: u32) -> Result<()> {
         self.string(metadata.version.object.cache.0.as_bytes())?;
         self.bytes(&metadata.version.object.key.0)?;
         self.string(metadata.version.etag.as_bytes())?;
-        self.u64(metadata.length)
+        self.u64(metadata.length)?;
+        if version >= 2 {
+            self.string(
+                metadata
+                    .content_type
+                    .as_ref()
+                    .map_or(&[][..], |v| v.as_bytes()),
+            )?;
+        } else if metadata.content_type.is_some() {
+            return Err(Error::CorruptRecord);
+        }
+        Ok(())
     }
 }
 
@@ -507,13 +525,28 @@ impl<'a> Decoder<'a> {
         let length = self.count(MAX_STRING_BYTES, 1)?;
         self.take(length)
     }
-    fn descriptor(&mut self) -> Result<VersionMetadata> {
+    fn descriptor(&mut self, version: u32) -> Result<VersionMetadata> {
         let cache = std::str::from_utf8(self.string()?)
             .map_err(|_| Error::CorruptRecord)?
             .to_owned();
         let key = CacheKey(self.array()?);
         let etag = StrongEtag::parse(self.string()?).map_err(|_| Error::CorruptRecord)?;
+        let length = self.u64()?;
+        let content_type = if version >= 2 {
+            let value = self.string()?;
+            if value.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::model::metadata::ContentType::parse(value)
+                        .map_err(|_| Error::CorruptRecord)?,
+                )
+            }
+        } else {
+            None
+        };
         Ok(VersionMetadata {
+            content_type,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId(cache),
@@ -521,7 +554,7 @@ impl<'a> Decoder<'a> {
                 },
                 etag,
             },
-            length: self.u64()?,
+            length,
         })
     }
 }

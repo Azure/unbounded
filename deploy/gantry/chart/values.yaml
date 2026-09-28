@@ -10,6 +10,11 @@ namespace:
 
 manager: helm
 
+# Opt into the Racer backend and its root-owned Unix socket deployment model.
+# Runtime tuning remains in gantry.config (the complete Gantry config YAML).
+racer:
+  enabled: false
+
 nodeSelector:
   kubernetes.io/os: linux
 

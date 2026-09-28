@@ -24,18 +24,24 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Only client range progress creates a new allowance. An explicit aggregate
 /// budget is conserved across pages, just like budgets passed to peer acquisition.
 enum RangeBudget {
     ClientPages { deadline: Instant },
+    ProgressingPages { timeout: Duration },
     Shared(AcquisitionBudget),
 }
 impl RangeBudget {
     fn next_page(&mut self, pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {
+            Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
+                crate::runtime::environment::now() + *timeout,
+                8,
+                16,
+            ))),
             Self::ClientPages { deadline } => {
                 if crate::runtime::environment::now() >= *deadline {
                     return Err(Error::DeadlineExceeded);
@@ -54,7 +60,7 @@ impl RangeBudget {
     }
     fn complete(&mut self, remaining: AcquisitionBudget) -> Result<()> {
         match self {
-            Self::ClientPages { .. } => Ok(()),
+            Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
             Self::Shared(budget) => budget.reunite(remaining),
         }
     }
@@ -208,6 +214,27 @@ impl RangeStreams {
     }
 }
 impl RangeStream {
+    /// Drive admitted acquisitions while the current slice encounters client
+    /// backpressure. Completed pages leave their acquisition scopes promptly;
+    /// this never admits more than the existing bounded window.
+    pub(crate) fn poll_prefetch(&mut self, cx: &mut Context<'_>) {
+        let _ = poll_window(&mut self.ready, &mut self.budget, cx);
+    }
+    /// Only client HTTP delivery may release the initial operation deadline after
+    /// acquiring the first slice. Already admitted pages retain their original deadlines
+    /// and retry budgets; only newly admitted, distinct pages get child scopes.
+    pub(crate) fn enable_progress(&mut self, timeout: Duration) {
+        if matches!(self.budget, RangeBudget::ClientPages { .. }) {
+            self.budget = RangeBudget::ProgressingPages { timeout };
+        }
+    }
+    fn operation_scope(&self) -> RequestScope {
+        let mut scope = self.scope.clone();
+        if let RangeBudget::ProgressingPages { timeout } = self.budget {
+            scope.deadline.0 = crate::runtime::environment::now() + timeout;
+        }
+        scope
+    }
     fn validate(&self, result: &PageResult, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &result.metadata)?;
         result.validate_for(&PageId {
@@ -219,7 +246,7 @@ impl RangeStream {
         self.next_page = (page != self.range.last_page()).then(|| PageNumber(page.0 + 1));
     }
     /// Admit each distinct page once into a bounded sliding window. Client page
-    /// progress gets its own allowance under the original deadline; explicit
+    /// progress gets its own fixed child allowance after headers; explicit
     /// aggregate budgets partition credits. Pending futures live in the stream,
     /// so dropping next_slice cannot restart a page or refill its retries.
     pub fn next_slice(&mut self) -> Operation<'_, Option<ReaderLease>> {
@@ -227,18 +254,19 @@ impl RangeStream {
             if self.terminated {
                 return Ok(None);
             }
-            if let Err(error) = self.scope.check() {
-                self.terminated = true;
-                self.ready.clear();
-                return Err(error);
-            }
             if self.ready.is_empty() && self.next_page.is_none() {
                 self.terminated = true;
                 return Ok(None);
             }
+            let operation_scope = self.operation_scope();
+            if let Err(error) = operation_scope.check() {
+                self.terminated = true;
+                self.ready.clear();
+                return Err(error);
+            }
             // Schedule delivery before starting more page work. Waiting requests
             // cannot pin newly acquired pages merely to discover pipe exhaustion.
-            let pipe = match self.delivery.admit(&self.scope).await {
+            let pipe = match self.delivery.admit(&operation_scope).await {
                 Ok(pipe) => pipe,
                 Err(error) => {
                     self.terminated = true;
@@ -264,11 +292,13 @@ impl RangeStream {
                         return Err(error);
                     }
                 };
+                let mut page_scope = operation_scope.clone();
+                page_scope.deadline.0 = child.deadline();
                 let result = self.directory.start_page(
                     page,
                     self.membership.clone(),
                     &self.context,
-                    &self.scope,
+                    &page_scope,
                     child,
                 );
                 let failed = result.is_err();
@@ -284,7 +314,7 @@ impl RangeStream {
                 self.ready.push_back((number, entry));
             }
             poll_fn(|cx| poll_window(&mut self.ready, &mut self.budget, cx)).await;
-            if let Err(error) = self.scope.check() {
+            if let Err(error) = operation_scope.check() {
                 self.terminated = true;
                 self.ready.clear();
                 return Err(error);
@@ -362,7 +392,7 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
     if expected.version != actual.version {
         return Err(Error::VersionUnavailable);
     }
-    if expected.length != actual.length {
+    if !expected.immutable().compatible(&actual.immutable()) {
         return Err(Error::CorruptRecord);
     }
     Ok(())
@@ -524,6 +554,12 @@ mod tests {
                 stream.advance(PageNumber(number));
             }
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            if !expire {
+                stream.enable_progress(Duration::from_secs(60));
+                // Releasing the client lifetime must not replace these already
+                // admitted page futures or their spent credits.
+                stream.scope.deadline.0 = Instant::now();
+            }
             for _ in 0..10 {
                 // Each temporary next_slice future is dropped while pending.
                 assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
@@ -552,6 +588,7 @@ mod tests {
     }
     fn metadata() -> ObjectMetadata {
         ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),
@@ -710,11 +747,14 @@ mod tests {
         use std::{
             io::{Read, Write},
             os::unix::net::UnixStream,
-            time::{Duration, Instant},
+            time::Duration,
         };
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
-        for capped in [true, false] {
+        for (capped, progressing) in [(true, false), (false, false), (false, true)] {
+            let clock = crate::runtime::environment::SimulationClock::new(55);
+            let environment = clock.environment(0);
+            let _clock = environment.enter();
             let admission = Rc::new(Admission::new(
                 crate::test_support::cluster::config(false).limits,
             ));
@@ -745,9 +785,16 @@ mod tests {
             );
             let mut metadata = metadata();
             metadata.length = total;
-            let scope =
-                RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
-                    .unwrap();
+            let scope = RequestScope::new(
+                RequestId([7; 16]),
+                crate::runtime::environment::now()
+                    + if progressing {
+                        Duration::from_millis(30)
+                    } else {
+                        Duration::from_secs(60)
+                    },
+            )
+            .unwrap();
             let membership = Arc::new(
                 Membership::validate(crate::model::identity::MembershipVersion(1), vec![]).unwrap(),
             );
@@ -813,7 +860,13 @@ mod tests {
                 directory,
                 delivery: delivery.clone(),
                 window_pages: 4,
-                budget: RangeBudget::Shared(AcquisitionBudget::new(scope.deadline.0, 0, 0)),
+                budget: if progressing {
+                    RangeBudget::ClientPages {
+                        deadline: scope.deadline.0,
+                    }
+                } else {
+                    RangeBudget::Shared(AcquisitionBudget::new(scope.deadline.0, 0, 0))
+                },
                 next_page: None,
                 ready,
                 terminated: false,
@@ -860,10 +913,25 @@ mod tests {
             let work = async {
                 let connection = ConnectionLease::from_accepted(server.into(), &admission)?;
                 let head = io.receive_head(connection, &scope).await?;
-                responses
-                    .send(head.connection, response, &scope)
-                    .await
-                    .map(drop)
+                if progressing {
+                    let metrics = crate::telemetry::metrics::Metrics::default();
+                    let mut observation = metrics.request()?;
+                    responses
+                        .send_observed(
+                            head.connection,
+                            response,
+                            &scope,
+                            &mut observation,
+                            Duration::from_millis(30),
+                        )
+                        .await
+                        .map(drop)
+                } else {
+                    responses
+                        .send(head.connection, response, &scope)
+                        .await
+                        .map(drop)
+                }
             };
             let mut work = std::pin::pin!(work);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -873,6 +941,9 @@ mod tests {
                 }
                 reactor.poll_budgeted(128).unwrap();
                 reactor.wait(Duration::from_millis(1)).unwrap();
+                if progressing {
+                    clock.advance(Duration::from_millis(1));
+                }
             };
             if capped {
                 assert_eq!(result, Err(Error::InvalidRequest));
@@ -881,8 +952,46 @@ mod tests {
             }
             reader.join().unwrap();
             admission.reclaim_buffers();
+            if progressing {
+                assert!(
+                    crate::runtime::environment::now() > scope.deadline.0,
+                    "stream must cross the scaled old absolute deadline"
+                );
+            }
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
+    }
+
+    #[test]
+    fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
+        let clock = crate::runtime::environment::SimulationClock::new(81);
+        let _environment = clock.environment(0).enter();
+        let timeout = Duration::from_millis(30);
+        let old_deadline = crate::runtime::environment::now() + timeout;
+        let mut budget = RangeBudget::ProgressingPages { timeout };
+        for _ in 0..12 {
+            let mut page = budget.next_page(false).unwrap().unwrap();
+            let deadline = page.deadline();
+            assert_eq!(deadline, crate::runtime::environment::now() + timeout);
+            for _ in 0..8 {
+                page.begin_attempt(crate::runtime::environment::now(), deadline)
+                    .unwrap();
+            }
+            assert_eq!(
+                page.begin_attempt(crate::runtime::environment::now(), deadline),
+                Err(Error::Unavailable)
+            );
+            clock.advance(Duration::from_millis(20));
+            assert_eq!(page.deadline(), deadline);
+            budget.complete(page).unwrap();
+        }
+        assert!(crate::runtime::environment::now() > old_deadline);
+        let mut stalled = budget.next_page(false).unwrap().unwrap();
+        clock.advance(timeout);
+        assert_eq!(
+            stalled.begin_attempt(crate::runtime::environment::now(), stalled.deadline()),
+            Err(Error::DeadlineExceeded)
+        );
     }
 }

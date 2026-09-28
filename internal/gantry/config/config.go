@@ -60,6 +60,23 @@ type Config struct {
 	// (GANTRY_RACER_ENABLED); the cache name is fixed to gantry.
 	RacerEnabled bool `yaml:"-"`
 
+	// Racer resource limits use SDK defaults when zero; negative values are invalid.
+	RacerMaxConnections               int           `yaml:"racer_max_connections"`
+	RacerMetadataConnections          int           `yaml:"racer_metadata_connections"`
+	RacerMetadataQueuedRequests       int           `yaml:"racer_metadata_queued_requests"`
+	RacerSmallObjectConnections       int           `yaml:"racer_small_object_connections"`
+	RacerSmallObjectQueuedRequests    int           `yaml:"racer_small_object_queued_requests"`
+	RacerMaxQueuedRequests            int           `yaml:"racer_max_queued_requests"`
+	RacerQueueTimeout                 time.Duration `yaml:"racer_queue_timeout"`
+	RacerResponseHeaderTimeout        time.Duration `yaml:"racer_response_header_timeout"`
+	RacerOriginMaxConnections         int           `yaml:"racer_origin_max_connections"`
+	RacerOriginConcurrentRequests     int           `yaml:"racer_origin_concurrent_requests"`
+	RacerOriginConcurrentHeadRequests int           `yaml:"racer_origin_concurrent_head_requests"`
+	RacerOriginRequestTimeout         time.Duration `yaml:"racer_origin_request_timeout"`
+	// RacerWriteTimeout bounds each downstream write, not the full response.
+	// Zero selects the default 30-second stall timeout.
+	RacerWriteTimeout time.Duration `yaml:"racer_write_timeout"`
+
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -474,18 +491,31 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		RacerEnabled:               false,
-		MirrorListen:               "127.0.0.1:5000",
-		MirrorBindAllowNonLoopback: false,
-		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "0.0.0.0:9095",
-		PprofListen:                "",
-		Libp2pListen:               nil,
-		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:      900,
-		Libp2pConnManagerLow:       600,
-		Libp2pConnManagerGrace:     time.Minute,
-		ChairListen:                "0.0.0.0:5002",
+		RacerEnabled:                      false,
+		RacerMaxConnections:               64,
+		RacerMetadataConnections:          4,
+		RacerMetadataQueuedRequests:       16,
+		RacerSmallObjectConnections:       4,
+		RacerSmallObjectQueuedRequests:    128,
+		RacerMaxQueuedRequests:            128,
+		RacerQueueTimeout:                 5 * time.Second,
+		RacerResponseHeaderTimeout:        60 * time.Second,
+		RacerOriginMaxConnections:         128,
+		RacerOriginConcurrentRequests:     64,
+		RacerOriginConcurrentHeadRequests: 4,
+		RacerOriginRequestTimeout:         60 * time.Second,
+		RacerWriteTimeout:                 30 * time.Second,
+		MirrorListen:                      "127.0.0.1:5000",
+		MirrorBindAllowNonLoopback:        false,
+		TransferListen:                    "0.0.0.0:5001",
+		MetricsListen:                     "0.0.0.0:9095",
+		PprofListen:                       "",
+		Libp2pListen:                      nil,
+		Libp2pIdentityPath:                "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:             900,
+		Libp2pConnManagerLow:              600,
+		Libp2pConnManagerGrace:            time.Minute,
+		ChairListen:                       "0.0.0.0:5002",
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -623,6 +653,19 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	}
 
 	setBool("RACER_ENABLED", &c.RacerEnabled)
+	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
+	setInt("RACER_METADATA_CONNECTIONS", &c.RacerMetadataConnections)
+	setInt("RACER_METADATA_QUEUED_REQUESTS", &c.RacerMetadataQueuedRequests)
+	setInt("RACER_SMALL_OBJECT_CONNECTIONS", &c.RacerSmallObjectConnections)
+	setInt("RACER_SMALL_OBJECT_QUEUED_REQUESTS", &c.RacerSmallObjectQueuedRequests)
+	setInt("RACER_MAX_QUEUED_REQUESTS", &c.RacerMaxQueuedRequests)
+	setDur("RACER_QUEUE_TIMEOUT", &c.RacerQueueTimeout)
+	setDur("RACER_RESPONSE_HEADER_TIMEOUT", &c.RacerResponseHeaderTimeout)
+	setInt("RACER_ORIGIN_MAX_CONNECTIONS", &c.RacerOriginMaxConnections)
+	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
+	setInt("RACER_ORIGIN_CONCURRENT_HEAD_REQUESTS", &c.RacerOriginConcurrentHeadRequests)
+	setDur("RACER_ORIGIN_REQUEST_TIMEOUT", &c.RacerOriginRequestTimeout)
+	setDur("RACER_WRITE_TIMEOUT", &c.RacerWriteTimeout)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
@@ -707,6 +750,19 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // BindFlags registers command-line flags on fs that overlay c. Call after
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
+	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
+	fs.IntVar(&c.RacerMetadataConnections, "racer-metadata-connections", c.RacerMetadataConnections, "Racer reserved metadata connections (0 uses 4)")
+	fs.IntVar(&c.RacerMetadataQueuedRequests, "racer-metadata-queued-requests", c.RacerMetadataQueuedRequests, "Racer reserved metadata queue limit (0 uses 16)")
+	fs.IntVar(&c.RacerSmallObjectConnections, "racer-small-object-connections", c.RacerSmallObjectConnections, "Racer reserved small-object connection and live value limit (0 uses 4)")
+	fs.IntVar(&c.RacerSmallObjectQueuedRequests, "racer-small-object-queued-requests", c.RacerSmallObjectQueuedRequests, "Racer reserved small-object queue limit (0 uses 128)")
+	fs.IntVar(&c.RacerMaxQueuedRequests, "racer-max-queued-requests", c.RacerMaxQueuedRequests, "Racer bulk queued request limit (0 uses 128)")
+	fs.DurationVar(&c.RacerQueueTimeout, "racer-queue-timeout", c.RacerQueueTimeout, "Racer admission wait timeout (0 uses 5s)")
+	fs.DurationVar(&c.RacerResponseHeaderTimeout, "racer-response-header-timeout", c.RacerResponseHeaderTimeout, "Racer response header timeout (0 uses 60s)")
+	fs.IntVar(&c.RacerOriginMaxConnections, "racer-origin-max-connections", c.RacerOriginMaxConnections, "Racer origin accepted connection limit (0 uses 128)")
+	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
+	fs.IntVar(&c.RacerOriginConcurrentHeadRequests, "racer-origin-concurrent-head-requests", c.RacerOriginConcurrentHeadRequests, "Racer origin reserved HEAD callback limit (0 uses 4)")
+	fs.DurationVar(&c.RacerOriginRequestTimeout, "racer-origin-request-timeout", c.RacerOriginRequestTimeout, "Racer origin request timeout including body (0 uses 60s)")
+	fs.DurationVar(&c.RacerWriteTimeout, "racer-write-timeout", c.RacerWriteTimeout, "Racer downstream per-write stall timeout (0 uses 30s)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -921,8 +977,28 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
-	// Racer uses only the common listeners, registries, and logging settings.
+	// Racer uses the common settings and its own resource limits.
 	if c.RacerEnabled {
+		for field, value := range map[string]int64{
+			"racer_max_connections":                 int64(c.RacerMaxConnections),
+			"racer_metadata_connections":            int64(c.RacerMetadataConnections),
+			"racer_metadata_queued_requests":        int64(c.RacerMetadataQueuedRequests),
+			"racer_small_object_connections":        int64(c.RacerSmallObjectConnections),
+			"racer_small_object_queued_requests":    int64(c.RacerSmallObjectQueuedRequests),
+			"racer_max_queued_requests":             int64(c.RacerMaxQueuedRequests),
+			"racer_queue_timeout":                   int64(c.RacerQueueTimeout),
+			"racer_response_header_timeout":         int64(c.RacerResponseHeaderTimeout),
+			"racer_origin_max_connections":          int64(c.RacerOriginMaxConnections),
+			"racer_origin_concurrent_requests":      int64(c.RacerOriginConcurrentRequests),
+			"racer_origin_concurrent_head_requests": int64(c.RacerOriginConcurrentHeadRequests),
+			"racer_origin_request_timeout":          int64(c.RacerOriginRequestTimeout),
+			"racer_write_timeout":                   int64(c.RacerWriteTimeout),
+		} {
+			if value < 0 {
+				errs = append(errs, fmt.Errorf("%s: must be >= 0 (zero selects the default)", field))
+			}
+		}
+
 		return errors.Join(errs...)
 	}
 

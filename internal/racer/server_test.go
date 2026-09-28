@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -73,10 +74,12 @@ func newServingFixture(t *testing.T) *servingFixture {
 	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}
 	identity := NodeIdentity{cluster: request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}
 
-	response, err := a.Keyring.Issuer.Issue(ctx, identity, request)
+	encoded, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	response := decodeIssuedResponse(t, encoded)
 
 	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 
@@ -317,6 +320,95 @@ func TestHTTPSBootstrapBoundsAndErrors(t *testing.T) {
 			r.Header.Set("Content-Type", tc.media)
 			response, err := c.Do(r)
 			responseBody(t, response, err, tc.status)
+		})
+	}
+}
+
+func TestHTTPRoutesBeforeReadinessAndTLS(t *testing.T) {
+	f := newServingFixture(t)
+	handler := f.a.Server.Handler()
+
+	for _, ready := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ready=%t", ready), func(t *testing.T) {
+			f.a.Lifecycle.SetServingReady(ready)
+
+			for _, tc := range []struct {
+				method, path string
+				valid        bool
+			}{
+				{http.MethodPost, wire.BootstrapPath, true},
+				{http.MethodGet, wire.SnapshotPath, true},
+				{http.MethodGet, wire.BootstrapPath, false},
+				{http.MethodPost, wire.SnapshotPath, false},
+				{http.MethodHead, wire.BootstrapPath, false},
+				{http.MethodHead, wire.SnapshotPath, false},
+				{http.MethodOptions, wire.BootstrapPath, false},
+				{http.MethodOptions, wire.SnapshotPath, false},
+				{http.MethodPost, "/unknown", false},
+				{http.MethodGet, "/unknown", false},
+				{http.MethodPost, "/v1/%62ootstrap", false},
+				{http.MethodGet, "/v1/%73napshot", false},
+			} {
+				t.Run(tc.method+tc.path, func(t *testing.T) {
+					r := httptest.NewRequest(tc.method, tc.path, nil)
+					w := httptest.NewRecorder()
+					handler.ServeHTTP(w, r)
+
+					wantStatus, wantCode := http.StatusBadRequest, wire.InvalidRequest
+					if tc.valid {
+						wantStatus, wantCode = http.StatusServiceUnavailable, wire.Unavailable
+						if ready {
+							wantStatus, wantCode = http.StatusUnauthorized, wire.Unauthenticated
+						}
+					}
+
+					body := responseBody(t, w.Result(), nil, wantStatus)
+					if string(body) != fmt.Sprintf(`{"code":%q}`, wantCode) {
+						t.Fatalf("response %s, want code %s", body, wantCode)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestHTTPFailureResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		status     int
+		code       wire.ErrorCode
+		retryAfter string
+	}{
+		{"invalid request", wire.InvalidRequest, http.StatusBadRequest, wire.InvalidRequest, ""},
+		{"unauthenticated", wire.Unauthenticated, http.StatusUnauthorized, wire.Unauthenticated, ""},
+		{"forbidden", wire.Forbidden, http.StatusForbidden, wire.Forbidden, ""},
+		{"conflict", wire.Conflict, http.StatusConflict, wire.Conflict, ""},
+		{"too large", wire.TooLarge, http.StatusRequestEntityTooLarge, wire.TooLarge, ""},
+		{"unsupported version", wire.UnsupportedVersion, http.StatusUpgradeRequired, wire.UnsupportedVersion, ""},
+		{"overloaded", wire.Overloaded, http.StatusTooManyRequests, wire.Overloaded, "1"},
+		{"unavailable", wire.Unavailable, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"wrapped protocol error", fmt.Errorf("internal detail: %w", wire.Forbidden), http.StatusForbidden, wire.Forbidden, ""},
+		{"unknown protocol error", wire.ErrorCode("unknown"), http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"nonprotocol error", io.ErrUnexpectedEOF, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"nil error", nil, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeFailure(w, tc.err)
+
+			body := responseBody(t, w.Result(), nil, tc.status)
+			if string(body) != fmt.Sprintf(`{"code":%q}`, tc.code) {
+				t.Fatalf("response %s, want code %s", body, tc.code)
+			}
+
+			if got := w.Header().Get("Retry-After"); got != tc.retryAfter {
+				t.Fatalf("Retry-After %q, want %q", got, tc.retryAfter)
+			}
+
+			if w.Header().Get("Content-Type") != "application/json" || w.Header().Get("Cache-Control") != "no-store" || !w.Flushed {
+				t.Fatal("failure response headers or flush missing")
+			}
 		})
 	}
 }
@@ -567,10 +659,12 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 		t.Fatal("new TLS connection accepted retired root")
 	}
 	// A fresh identity reconnects successfully but cannot resume an old session.
-	responseChain, err := f.a.Keyring.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+	encoded, err := f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	responseChain := decodeIssuedResponse(t, encoded)
 
 	fresh := tls.Certificate{Certificate: responseChain.CertificateChain, PrivateKey: f.key}
 
@@ -591,13 +685,56 @@ type blockingResponse struct {
 	*httptest.ResponseRecorder
 	entered, unblock chan struct{}
 	once             sync.Once
+	blockFlush       bool
+	fail             bool
 }
 
 func (w *blockingResponse) Write(b []byte) (int, error) {
-	w.once.Do(func() { close(w.entered); <-w.unblock })
+	if !w.blockFlush {
+		w.once.Do(func() { close(w.entered); <-w.unblock })
+
+		if w.fail {
+			return 0, io.ErrClosedPipe
+		}
+	}
+
 	return w.ResponseRecorder.Write(b)
 }
+
+func (w *blockingResponse) FlushError() error {
+	if w.blockFlush {
+		w.once.Do(func() { close(w.entered); <-w.unblock })
+
+		if w.fail {
+			return io.ErrClosedPipe
+		}
+	}
+
+	w.Flush()
+
+	return nil
+}
+
 func (w *blockingResponse) Unwrap() http.ResponseWriter { return w.ResponseRecorder }
+
+func awaitServerPolls(t *testing.T, s *Server, count int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.admission.Lock()
+		n := len(s.polls)
+		s.admission.Unlock()
+
+		if n == count {
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("poll admission did not reach %d", count)
+}
 
 func (f *servingFixture) requestState(t *testing.T) *tls.ConnectionState {
 	t.Helper()
@@ -616,36 +753,169 @@ func (f *servingFixture) requestState(t *testing.T) *tls.ConnectionState {
 }
 
 func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
-	f := newServingFixture(t)
-	handler := f.a.Server.Handler()
-	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
-	r.TLS = f.requestState(t)
-	w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{})}
-	done := make(chan struct{})
+	for _, tc := range []struct {
+		name        string
+		flush, fail bool
+		status      int
+	}{
+		{"write", false, false, http.StatusOK},
+		{"flush", true, false, http.StatusOK},
+		{"failed write", false, true, http.StatusOK},
+		{"failed flush", true, true, http.StatusOK},
+		{"no content flush", true, false, http.StatusNoContent},
+		{"error write", false, false, http.StatusConflict},
+		{"error flush", true, false, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newServingFixture(t)
+				f.a.Server.Config.Limits.MaxPolls = 1
+				f.a.Server.Config.Limits.MaxConcurrentWrites = 1
+				other := *f
+				other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
+				otherState := other.requestState(t)
+				handler := f.a.Server.Handler()
+				r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
-	go func() { defer close(done); handler.ServeHTTP(w, r) }()
+				r.TLS = f.requestState(t)
+				if tc.status != http.StatusOK {
+					current, err := f.a.Server.Publications.Current()
+					if err != nil {
+						t.Fatal(err)
+					}
 
-	select {
-	case <-w.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not start")
+					cursor := current.record.Sequence
+					if tc.status == http.StatusConflict {
+						cursor++
+					}
+
+					r.URL.RawQuery = fmt.Sprintf("after=%d", cursor)
+				}
+
+				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: tc.flush, fail: tc.fail}
+
+				unblock := sync.OnceFunc(func() { close(w.unblock) })
+				defer unblock()
+
+				done := make(chan any, 1)
+
+				go func() { defer func() { done <- recover() }(); handler.ServeHTTP(w, r) }()
+
+				select {
+				case <-w.entered:
+				case <-time.After(wire.PollWait + time.Second):
+					t.Fatal("response did not start")
+				}
+
+				// Use an immediate cursor so this also proves error responses retain admission.
+				r = r.Clone(f.ctx)
+
+				r.URL.RawQuery = ""
+				for _, state := range []*tls.ConnectionState{r.TLS, otherState} {
+					second := httptest.NewRecorder()
+					request := r.Clone(f.ctx)
+					request.TLS = state
+					handler.ServeHTTP(second, request)
+					responseBody(t, second.Result(), nil, http.StatusTooManyRequests)
+				}
+
+				wantWrites := 1
+				if tc.status == http.StatusConflict {
+					wantWrites = 0
+				}
+
+				if got := len(f.a.Server.writes); got != wantWrites {
+					t.Fatalf("write slots during response: %d, want %d", got, wantWrites)
+				}
+
+				unblock()
+
+				aborted := <-done
+				if tc.fail && aborted != http.ErrAbortHandler || !tc.fail && aborted != nil {
+					t.Fatalf("response abort: %v", aborted)
+				}
+
+				if !tc.fail && w.Code != tc.status {
+					t.Fatalf("response status: %d, want %d", w.Code, tc.status)
+				}
+
+				if len(f.a.Server.writes) != 0 {
+					t.Fatal("write slot leaked")
+				}
+
+				third := httptest.NewRecorder()
+				handler.ServeHTTP(third, r.Clone(f.ctx))
+
+				if third.Code != 200 {
+					t.Fatalf("admission leaked: %d", third.Code)
+				}
+			})
+		})
 	}
+}
 
-	second := httptest.NewRecorder()
-	handler.ServeHTTP(second, r.Clone(f.ctx))
+func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
+	for _, limit := range []int{1, 2} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			f := newServingFixture(t)
+			f.a.Server.Config.Limits.MaxPolls = limit
+			other := *f
+			other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
+			handler := f.a.Server.Handler()
 
-	if second.Code != 429 {
-		t.Fatalf("overlapping node write admitted: %d", second.Code)
-	}
+			current, err := f.a.Server.Publications.Current()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	close(w.unblock)
-	<-done
+			ctx, cancel := context.WithCancel(f.ctx)
+			defer cancel()
 
-	third := httptest.NewRecorder()
-	handler.ServeHTTP(third, r.Clone(f.ctx))
+			r := httptest.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.record.Sequence), nil)
+			r.TLS = f.requestState(t)
+			done := make(chan *httptest.ResponseRecorder, 1)
 
-	if third.Code != 200 {
-		t.Fatalf("admission leaked: %d", third.Code)
+			go func() { w := httptest.NewRecorder(); handler.ServeHTTP(w, r); done <- w }()
+
+			awaitServerPolls(t, f.a.Server, 1)
+
+			if len(f.a.Server.writes) != 0 {
+				t.Fatal("long poll consumed write slot")
+			}
+
+			for _, state := range []*tls.ConnectionState{r.TLS, other.requestState(t)} {
+				request := httptest.NewRequest("GET", wire.SnapshotPath, nil)
+				request.TLS = state
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, request)
+
+				want := http.StatusTooManyRequests
+				if state != r.TLS && limit == 2 {
+					want = http.StatusOK
+				}
+
+				responseBody(t, w.Result(), nil, want)
+			}
+
+			cancel()
+
+			select {
+			case w := <-done:
+				responseBody(t, w.Result(), nil, http.StatusServiceUnavailable)
+			case <-time.After(5 * time.Second):
+				t.Fatal("canceled poll did not return")
+			}
+
+			awaitServerPolls(t, f.a.Server, 0)
+
+			for _, state := range []*tls.ConnectionState{r.TLS, other.requestState(t)} {
+				request := httptest.NewRequest("GET", wire.SnapshotPath, nil)
+				request.TLS = state
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, request)
+				responseBody(t, w.Result(), nil, http.StatusOK)
+			}
+		})
 	}
 }
 
@@ -816,6 +1086,8 @@ func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("server shutdown blocked")
 	}
+
+	awaitServerPolls(t, f.a.Server, 0)
 }
 
 func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
@@ -921,7 +1193,7 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
 	r.TLS = f.requestState(t)
-	for _, resource := range []string{"write", "global poll", "bootstrap", "headers"} {
+	for _, resource := range []string{"write", "bootstrap", "headers"} {
 		t.Run(resource, func(t *testing.T) {
 			request := r.Clone(f.ctx)
 
@@ -929,12 +1201,9 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 			case "write":
 				take(f.a.Server.writes)
 				defer release(f.a.Server.writes)
-			case "global poll":
-				f.a.Server.polls[wire.NodeID(testOtherUID)] = struct{}{}
-				defer delete(f.a.Server.polls, wire.NodeID(testOtherUID))
 			case "bootstrap":
-				take(f.a.Server.bootstrapSlots)
-				defer release(f.a.Server.bootstrapSlots)
+				take(f.a.Server.authSlots)
+				defer release(f.a.Server.authSlots)
 
 				request.Method = "POST"
 				request.URL.Path = wire.BootstrapPath
@@ -952,6 +1221,74 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 
 			if w.Code != want {
 				t.Fatalf("unbounded %s: %d", resource, w.Code)
+			}
+		})
+	}
+}
+
+func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
+	for _, scenario := range []string{"success", "write saturation", "readiness lost", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newServingFixture(t)
+			s := f.a.Server
+			s.Config.Limits.MaxConcurrentWrites = 1
+			handler := s.Handler()
+
+			ctx, cancel := context.WithCancel(f.ctx)
+			defer cancel()
+
+			wantWrites, wantStatus := 0, http.StatusOK
+
+			if scenario == "write saturation" {
+				take(s.writes)
+				defer release(s.writes)
+
+				wantWrites, wantStatus = 1, http.StatusTooManyRequests
+			} else if scenario != "success" {
+				wantStatus = http.StatusServiceUnavailable
+			}
+
+			reads := 0
+			s.Bootstrap.Issuer.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				reads++
+
+				if len(s.writes) != wantWrites || len(s.authSlots) != 1 {
+					t.Error("issuance changed write/auth admission timing")
+				}
+
+				switch scenario {
+				case "readiness lost":
+					f.a.Lifecycle.SetServingReady(false)
+				case "canceled":
+					cancel()
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			}})
+
+			body, err := wire.EncodeBootstrapRequest(f.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequestWithContext(ctx, "POST", wire.BootstrapPath, bytes.NewReader(body))
+			r.TLS = &tls.ConnectionState{HandshakeComplete: true}
+			r.Header.Set("Authorization", "Bearer "+f.token)
+			r.Header.Set("Content-Type", "application/json")
+
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+
+			encoded := responseBody(t, w.Result(), nil, wantStatus)
+			if reads == 0 || len(s.authSlots) != 0 || len(s.writes) != wantWrites {
+				t.Fatal("issuance skipped or admission leaked")
+			}
+
+			if scenario == "success" {
+				response := decodeIssuedResponse(t, encoded)
+				if response.Enrollment != f.request.Enrollment || response.Node != wire.NodeID(testNodeUID) || !w.Flushed || w.Header().Get("Cache-Control") != "no-store" {
+					t.Fatal("issued response was not served completely")
+				}
 			}
 		})
 	}
@@ -991,7 +1328,7 @@ func TestBootstrapReadDeadlineAndChunkedBound(t *testing.T) {
 	_, _ = io.Copy(io.Discard, conn)
 	deadline := time.After(time.Second)
 
-	for len(f.a.Server.bootstrapSlots) != 0 {
+	for len(f.a.Server.authSlots) != 0 {
 		select {
 		case <-deadline:
 			t.Fatal("slow body retained admission")
@@ -1079,9 +1416,9 @@ func TestTLSRevocationWhilePolling(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 
 	for {
-		f.a.Server.Publications.mu.Lock()
-		n := len(f.a.Server.Publications.polls)
-		f.a.Server.Publications.mu.Unlock()
+		f.a.Server.admission.Lock()
+		n := len(f.a.Server.polls)
+		f.a.Server.admission.Unlock()
 
 		if n == 1 {
 			break

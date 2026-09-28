@@ -24,8 +24,12 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
   consume different representations. Never send an empty signed visited list.
 - Client ingress allocates 32 attempts and 96 forwarded links for metadata or
   bootstrap. A normal pinned client range admits each distinct page once with
-  eight attempts and sixteen aggregate links, under the original request deadline
-  and bounded sliding window. Successful pages do not exhaust a range-wide total.
+   eight attempts and sixteen aggregate links in a bounded sliding window. Initial
+   metadata and the first slice share the admission deadline. After client success
+   headers, newly admitted pages receive fixed child acquisition deadlines;
+   already admitted pages and their retries never renew deadlines or credits.
+   Client writes use a separate progress-based stall timeout. Successful pages do
+   not exhaust a range-wide total. See `CLIENT_ORIGIN_API.md` for wire compatibility.
   Four is the normal per-route ceiling; observed failure permits up to eight from
   that acquisition's allocated allowance. This changes a ceiling, not credits.
 - `RouteBudget.remaining_attempts` is signed, decoded, and preserved by forwarding.
@@ -96,6 +100,11 @@ reader/ciphertext leases and submitted writes remain pinned. Dirty-only saturati
 permits memory-only completion without reclamation. Bootstrap and local disk
 staging use the same policy; writer enqueue staging overload is disposable and
 never fails plaintext delivery.
+Fill-owned writer enqueue also applies this bounded reclamation to the exact
+aligned ciphertext staging charge before accepting a dirty copy. The current
+fill's buffers, other live readers, and submitted writes stay pinned. An idle
+memory cache must not block writeback merely because it consumes the staging
+headroom; unreclaimable live-byte pressure still permits memory-only completion.
 Fresh origin bootstrap uses Fill::reserve_bootstrap for the same bounded
 reclamation before network work, even when no fresh metadata pointer exists.
 

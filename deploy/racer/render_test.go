@@ -78,7 +78,12 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ds, err := racer.DesiredDaemonSet(cfg)
+			workloadCfg, err := racer.WorkloadConfigFromLookup(os.LookupEnv)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ds, err := racer.DesiredDaemonSet(workloadCfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,7 +92,7 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("workload config not wired")
 			}
 
-			if trust.Namespace != namespace || trust.Name != cfg.BootstrapTrustConfigMap || trust.Data["ca.crt"] != data["BootstrapCA"] {
+			if trust.Namespace != namespace || trust.Name != workloadCfg.BootstrapTrustConfigMap || trust.Data["ca.crt"] != data["BootstrapCA"] {
 				t.Fatal("deployment trust not wired")
 			}
 
@@ -114,7 +119,7 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("serving TLS not wired")
 			}
 
-			if cfg.ControlURL != "https://"+service.Name+"."+namespace+".svc:8443" || service.Spec.PublishNotReadyAddresses || pod.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" {
+			if workloadCfg.ControlURL != "https://"+service.Name+"."+namespace+".svc:8443" || service.Spec.PublishNotReadyAddresses || pod.Containers[0].ReadinessProbe.HTTPGet.Path != "/readyz" {
 				t.Fatal("service must select ready leader")
 			}
 

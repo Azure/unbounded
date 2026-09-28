@@ -583,11 +583,11 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
             Some(b"bytes=0-16777215"),
             true,
         );
-        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\na").unwrap();
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\na").unwrap();
         thread::sleep(Duration::from_millis(10));
         stream.write_all(b"bc").unwrap();
         check_request(&receive(&mut stream), "HEAD", Some(b"\"v\""), None, false);
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nRacer-Content-Type: text/plain\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
         check_request(
             &receive(&mut stream),
             "GET",
@@ -595,7 +595,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
             Some(b"bytes=0-16777215"),
             false,
         );
-        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nab").unwrap();
+        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nRacer-Content-Type: text/plain\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nab").unwrap();
         thread::sleep(Duration::from_millis(10));
         stream.write_all(b"c").unwrap();
     });
@@ -604,6 +604,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     let scope = scope();
     let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
     assert_eq!(reply.metadata.expires_at.to_unix_millis().unwrap(), 1234);
+    assert_eq!(reply.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
     assert_eq!(
         reply.page_zero.as_ref().unwrap().plaintext.bytes().unwrap(),
         b"abc"
@@ -615,8 +616,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     drop(reply);
     context.authorization = None;
     context.metadata = None;
-    assert_eq!(
-        drive(
+    let head = drive(
             &reactor,
             client.metadata_at(
                 &endpoint,
@@ -624,14 +624,13 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
                 MetadataSelector::Pinned(page.version.etag.clone()),
                 &scope
             )
-        )
-        .unwrap()
-        .metadata
-        .length,
-        3
-    );
+        ).unwrap();
+    assert_eq!(head.metadata.length, 3);
+    assert_eq!(head.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0, "HEAD must not allocate a body");
     let received = drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)).unwrap();
     assert_eq!(received.plaintext.bytes().unwrap(), b"abc");
+    assert_eq!(received.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
     drop(received);
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     client.pool.close();

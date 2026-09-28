@@ -48,18 +48,16 @@ func Initialize(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	r := &TopologyReconciler{Client: c, APIReader: c, Config: cfg}
-
-	return r.InitializeVersion(ctx)
+	return initializeVersion(ctx, c, c, cfg)
 }
 
-func (r *TopologyReconciler) installation(ctx context.Context, fresh bool) (*corev1.ConfigMap, error) {
+func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fresh bool) (*corev1.ConfigMap, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	cm := &corev1.ConfigMap{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.InstallationConfigMapName}, cm); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, cm); err != nil {
 		return nil, authorityReadFailure(err)
 	}
 
@@ -69,7 +67,7 @@ func (r *TopologyReconciler) installation(ctx context.Context, fresh bool) (*cor
 	}
 
 	immutable := cm.Immutable != nil && *cm.Immutable
-	if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Data["cluster"] != string(r.Config.Cluster) || cm.Data["version_configmap"] != r.Config.VersionConfigMapName || cm.Data["state"] != state || immutable == fresh {
+	if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Data["cluster"] != string(cfg.Cluster) || cm.Data["version_configmap"] != cfg.VersionConfigMapName || cm.Data["state"] != state || immutable == fresh {
 		return nil, fmt.Errorf("installation marker invalid or already consumed: %w", wire.Unavailable)
 	}
 
@@ -79,17 +77,21 @@ func (r *TopologyReconciler) installation(ctx context.Context, fresh bool) (*cor
 // InitializeVersion never retries marker CAS or counter creation, including
 // ambiguous transport failures. See the initialization crash table in the design.
 func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
-	if !wire.ValidUUID(string(r.Config.Cluster)) {
+	return initializeVersion(ctx, r.Client, r.APIReader, r.Config)
+}
+
+func initializeVersion(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
+	if !wire.ValidUUID(string(cfg.Cluster)) {
 		return wire.InvalidRequest
 	}
 
-	marker, err := r.installation(ctx, true)
+	marker, err := readInstallation(ctx, reader, cfg, true)
 	if err != nil {
 		return err
 	}
 
-	key := client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}
-	if err := r.APIReader.Get(ctx, key, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+	key := client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}
+	if err := reader.Get(ctx, key, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		if err != nil {
 			return err
 		}
@@ -97,7 +99,7 @@ func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
 		return fmt.Errorf("version state already exists: %w", wire.Conflict)
 	}
 
-	content, membership, err := wire.ContentHashes(wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster})
+	content, membership, err := wire.ContentHashes(wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: cfg.Cluster})
 	if err != nil {
 		return err
 	}
@@ -110,7 +112,7 @@ func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
 		return err
 	}
 
-	if err := r.Update(ctx, marker); err != nil {
+	if err := writer.Update(ctx, marker); err != nil {
 		return err
 	}
 
@@ -118,9 +120,9 @@ func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
 		return err
 	}
 
-	return r.Create(ctx, &corev1.ConfigMap{
+	return writer.Create(ctx, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Annotations: map[string]string{installationUIDAnnotation: string(marker.UID)}},
-		Data:       versionData(VersionRecord{Cluster: r.Config.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}),
+		Data:       versionData(VersionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}),
 	})
 }
 
@@ -149,8 +151,8 @@ func parseVersion(cm *corev1.ConfigMap, cluster wire.ClusterID, markerUID types.
 	return v, nil
 }
 
-func (r *TopologyReconciler) readVersion(ctx context.Context) (*corev1.ConfigMap, VersionRecord, error) {
-	marker, err := r.installation(ctx, false)
+func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1.ConfigMap, VersionRecord, error) {
+	marker, err := readInstallation(ctx, reader, cfg, false)
 	if err != nil {
 		return nil, VersionRecord{}, err
 	}
@@ -161,11 +163,11 @@ func (r *TopologyReconciler) readVersion(ctx context.Context) (*corev1.ConfigMap
 		return nil, VersionRecord{}, err
 	}
 
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}, cm); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}, cm); err != nil {
 		return nil, VersionRecord{}, authorityReadFailure(err)
 	}
 
-	v, err := parseVersion(cm, r.Config.Cluster, marker.UID)
+	v, err := parseVersion(cm, cfg.Cluster, marker.UID)
 
 	return cm, v, err
 }
@@ -173,11 +175,10 @@ func (r *TopologyReconciler) readVersion(ctx context.Context) (*corev1.ConfigMap
 // ValidateInstallation checks the durable marker and counter binding required by
 // normal startup without modifying state. Provisioners use it before deployment.
 func ValidateInstallation(ctx context.Context, reader client.Reader, namespace, cluster string) error {
-	r := &TopologyReconciler{APIReader: reader, Config: Config{
+	_, _, err := readVersion(ctx, reader, Config{
 		Namespace: namespace, Cluster: wire.ClusterID(cluster),
 		InstallationConfigMapName: "racer-installation", VersionConfigMapName: "racer-version",
-	}}
-	_, _, err := r.readVersion(ctx)
+	})
 
 	return err
 }
@@ -193,7 +194,7 @@ func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPubli
 		return nil, wire.InvalidRequest
 	}
 
-	cm, previous, err := r.readVersion(ctx)
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return nil, err

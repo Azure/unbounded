@@ -247,6 +247,7 @@ mod tests {
                 .index
                 .metadata
                 .push(crate::model::metadata::VersionMetadata {
+                    content_type: None,
                     version: crate::model::identity::ObjectVersion {
                         object: object.clone(),
                         etag: crate::model::identity::StrongEtag::test_value(&version.to_string()),
@@ -305,6 +306,7 @@ mod tests {
             .unwrap();
         let append = segments.append(4096).unwrap();
         let metadata = VersionMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: cache.clone(),
@@ -435,6 +437,7 @@ mod tests {
             .index
             .metadata
             .push(VersionMetadata {
+                content_type: None,
                 version: ObjectVersion {
                     object,
                     etag: StrongEtag::test_value("one"),

@@ -110,11 +110,20 @@ impl Fill {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        let reserve = || {
+        self.reserve_reclaiming(cache, class, amount, || {
             self.dependencies
                 .admission
                 .reserve(Some(cache), class, amount)
-        };
+        })
+    }
+
+    fn reserve_reclaiming(
+        &self,
+        cache: &crate::model::identity::CacheId,
+        class: ResourceClass,
+        amount: usize,
+        reserve: impl Fn() -> Result<Reservation>,
+    ) -> Result<Reservation> {
         let mut result = reserve();
         // At most a cache-fairness pass and a global-deficit pass. No await allows
         // new local charges to interleave; remote completions can only free bytes.
@@ -918,7 +927,7 @@ impl Fill {
             .retained_metadata(&result.metadata.version, scope)
             .await?
         {
-            if existing.length != result.metadata.length {
+            if !existing.compatible(&result.metadata.immutable()) {
                 return Err(Error::CorruptRecord);
             }
         }
@@ -938,7 +947,19 @@ impl Fill {
             Err(error) => return Err(error),
         }
         if let Some(dirty) = dirty {
-            match self.dependencies.writer.enqueue(result.copy(), dirty) {
+            match self
+                .dependencies
+                .writer
+                .enqueue_reclaiming(result.copy(), dirty, |amount| {
+                    let cache = &result.metadata.version.object.cache;
+                    self.reserve_reclaiming(cache, ResourceClass::Ciphertext, amount, || {
+                        self.dependencies.admission.reserve_completion(
+                            Some(cache),
+                            ResourceClass::Ciphertext,
+                            amount,
+                        )
+                    })
+                }) {
                 Ok(_)
                 | Err(Error::Overloaded | Error::Io | Error::Unavailable | Error::MissingKey) => {}
                 Err(error) => return Err(error),
@@ -976,15 +997,18 @@ fn validate_copy(copy: &crate::memory::page::CiphertextCopy, page: &PageId) -> R
 }
 fn merge_metadata(
     found: &mut Option<VersionMetadata>,
-    descriptor: VersionMetadata,
+    mut descriptor: VersionMetadata,
     version: &crate::model::identity::ObjectVersion,
 ) -> Result<()> {
     if &descriptor.version != version
         || found
             .as_ref()
-            .is_some_and(|old| old.length != descriptor.length)
+            .is_some_and(|old| !old.compatible(&descriptor))
     {
         return Err(Error::CorruptRecord);
+    }
+    if descriptor.content_type.is_none() {
+        descriptor.content_type = found.as_ref().and_then(|old| old.content_type.clone());
     }
     *found = Some(descriptor);
     Ok(())
@@ -1010,6 +1034,7 @@ mod tests {
             merge_metadata(
                 &mut found,
                 VersionMetadata {
+                    content_type: None,
                     version: version.clone(),
                     length: 3
                 },
@@ -1021,6 +1046,7 @@ mod tests {
             merge_metadata(
                 &mut found,
                 VersionMetadata {
+                    content_type: None,
                     version: version.clone(),
                     length: 4
                 },
@@ -1035,6 +1061,7 @@ mod tests {
             merge_metadata(
                 &mut found,
                 VersionMetadata {
+                    content_type: None,
                     version: other,
                     length: 3
                 },
@@ -1098,6 +1125,7 @@ mod tests {
                 plaintext.bytes_mut()?.copy_from_slice(b"abc");
                 Ok(crate::origin::page::OriginPage {
                     metadata: ObjectMetadata {
+                        content_type: None,
                         version: page.version.clone(),
                         length: 3,
                         expires_at: crate::model::metadata::ExpiresAt(std::time::UNIX_EPOCH),

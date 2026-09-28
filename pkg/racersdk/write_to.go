@@ -4,7 +4,6 @@
 package racersdk
 
 import (
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -34,20 +33,26 @@ func (s *FDSink) Write(p []byte) (int, error) { return s.connection.Write(p) }
 // only after WriteTo returns; it is not a concurrent metric.
 func (s *FDSink) SplicedBytes() int64 { return s.spliced }
 
-// ServeHTTP serves an unconsumed Value as a fixed-length HTTP response. For plain
+// ServeHTTP serves an unconsumed full-object Value as a fixed-length HTTP response. For plain
 // HTTP/1 it explicitly takes connection ownership through Hijack, flushes headers,
 // and closes the connection after FD delivery. TLS and non-hijackable responses
 // use the normal ResponseWriter lifecycle. The handler owns and closes the Value.
 func (v *Value) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer closeBody(v)
 
-	if v.offset != 0 || v.err() != nil {
+	if v.offset != 0 || v.end != int64(v.metadata.Size) || v.err() != nil {
 		http.Error(w, "value unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
 	w.Header().Set("Content-Length", strconv.FormatUint(uint64(v.metadata.Size), 10))
-	w.Header().Set("Content-Type", "application/octet-stream")
+
+	contentType := v.metadata.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("ETag", v.metadata.ETag.String())
 
 	if r.Method == http.MethodHead {
@@ -87,79 +92,36 @@ func (v *Value) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// WriteTo copies the remaining immutable stream in order. A FDSink permits Linux
-// splice after parsed HTTP read-ahead has been consumed; other writers use
-// bounded scratch. On a destination failure the Value is canceled and closed.
-// Spliced source bodies are closed through net/http rather than returned to its
-// pool, because its private body counter did not observe those bytes.
-func (v *Value) WriteTo(w io.Writer) (int64, error) {
-	var total int64
+// spliceTo bypasses only a fully parsed body with no buffered read-ahead. The
+// custom pool's body counter observes every consumed byte, allowing safe reuse.
+func (v *Value) spliceTo(sink *FDSink) (int64, bool, error) {
+	v.mu.Lock()
+	body, ok := v.body.(*responseBody)
+	terminal := v.terminal
+	v.mu.Unlock()
 
-	buffer := make([]byte, copyBufferSize)
-
-	for {
-		if sink, ok := w.(*FDSink); ok && v.remaining > 0 && v.err() == nil {
-			v.mu.Lock()
-			body, ok := v.body.(*pageBody)
-			v.mu.Unlock()
-
-			if ok && body.socket != nil {
-				// Transport may have consumed body bytes while parsing the head.
-				// Drain those and our raw parser's read-ahead through the official
-				// body reader before touching the descriptor.
-				ahead := v.remaining - body.socket.remaining
-				if ahead == 0 && body.socket.reader.Buffered() == 0 {
-					n, used, err := spliceBody(v.ctx, body.socket, sink, v.remaining)
-					if used {
-						v.offset += n
-						v.remaining -= n
-						total += n
-
-						if err != nil {
-							if v.ctx.Err() != nil {
-								err = v.ctx.Err()
-							}
-
-							v.finish(ioFailure("splice", err))
-
-							return total, v.err()
-						}
-
-						continue
-					}
-				} else {
-					if ahead == 0 {
-						ahead = int64(body.socket.reader.Buffered())
-					}
-
-					buffer = buffer[:min(int64(cap(buffer)), ahead)]
-				}
-			}
-		}
-
-		n, readErr := v.Read(buffer)
-		if n != 0 {
-			written, err := w.Write(buffer[:n])
-
-			total += int64(written)
-			if err == nil && written != n {
-				err = io.ErrShortWrite
-			}
-
-			if err != nil {
-				v.finish(ioFailure("write", err))
-				return total, err
-			}
-		}
-
-		buffer = buffer[:cap(buffer)]
-
-		if readErr == io.EOF {
-			return total, nil
-		}
-
-		if readErr != nil {
-			return total, readErr
-		}
+	if terminal != nil {
+		return 0, false, terminal
 	}
+
+	if !ok || body.conn.reader.Buffered() != 0 {
+		return 0, false, nil
+	}
+
+	n, used, err := spliceBody(v.ctx, body, sink, v.remaining)
+	if used {
+		v.offset += n
+		v.remaining -= n
+	}
+
+	if err != nil {
+		body.mu.Lock()
+		body.reusable = false
+		body.mu.Unlock()
+		v.finish(ioFailure("splice", err))
+
+		return n, used, v.err()
+	}
+
+	return n, used, nil
 }

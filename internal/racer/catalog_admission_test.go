@@ -113,7 +113,7 @@ func TestCatalogAdmissionRotationCycles(t *testing.T) {
 
 			for range 30 {
 				_, before, previous, _ := keyState(t, r)
-				*now = previous.NextTransition
+				*now = previous.nextTransition()
 
 				runKeys(t, r)
 				_, after, state, _ := keyState(t, r)
@@ -272,7 +272,7 @@ func TestCatalogCapacityRejectsBeforeInitializationClaim(t *testing.T) {
 		t.Fatalf("impossible root reserve: %v", err)
 	}
 
-	cm, _, err := (&TopologyReconciler{APIReader: r.APIReader, Config: r.Config}).readVersion(t.Context())
+	cm, _, err := readVersion(t.Context(), r.APIReader, r.Config)
 	if err != nil || cm.Annotations[credentialClaim] != "" {
 		t.Fatalf("impossible policy consumed credential claim: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 	}
 	// Model the older controller's active-only admission without removing the
 	// planner's independent final wire-size check.
-	b, state, err = r.PlanRotation(b, state, catalog, *now)
+	b, state, err = PlanRotation(r.Config.Rotation, b, state, catalog, *now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,8 +351,12 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 
 	<-read
 	// The keyring must be excluded for the entire read/commit/install window.
-	if a.Keyring.CatalogMu.TryLock() {
-		a.Keyring.CatalogMu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	err := a.Keyring.CatalogGate.Acquire(ctx)
+	if err == nil {
+		a.Keyring.CatalogGate.Release()
 		close(proceed)
 		<-done
 		t.Fatal("keyring can prune an in-progress topology candidate")
@@ -364,10 +368,18 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !a.Keyring.CatalogMu.TryLock() {
-		t.Fatal("publication did not release admission gate")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unexpected gate wait error: %v", err)
 	}
-	a.Keyring.CatalogMu.Unlock()
+
+	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	if err := a.Keyring.CatalogGate.Acquire(ctx); err != nil {
+		t.Fatalf("publication did not release admission gate: %v", err)
+	}
+
+	a.Keyring.CatalogGate.Release()
 }
 
 func integrationCatalogCapacity(t *testing.T, c client.Client) {

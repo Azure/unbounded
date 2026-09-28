@@ -100,6 +100,42 @@ func ExampleNewFetchContext() {
 	// true
 }
 
+func ExampleClient_Stat() {
+	tag, _ := racersdk.ParseETag(`"v1"`)
+
+	client, cleanup, err := racersdk.NewFakeClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		m := racersdk.Metadata{Size: 5, ETag: tag, ExpiresAt: time.UnixMilli(0), ContentType: "text/plain"}
+		if r.Operation() == racersdk.OperationHead {
+			return m, nil, nil
+		}
+
+		return m, io.NopCloser(strings.NewReader("hello")), nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer cleanup()
+
+	m, err := client.Stat(context.Background(), racersdk.Request{})
+	if err != nil {
+		panic(err)
+	}
+
+	v, err := client.Get(context.Background(), racersdk.Request{}, racersdk.ReadOptions{Offset: 1, Length: 3, Pin: m.ETag, Metadata: &m})
+	if err != nil {
+		panic(err)
+	}
+	defer v.Close()
+
+	var dst strings.Builder
+	if _, err := v.WriteTo(&dst); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(m.Size, m.ContentType, dst.String())
+	// Output: 5 text/plain ell
+}
+
 func ExampleMetadata_Validate() {
 	tag, err := racersdk.ParseETag(`"revision-7"`)
 	if err != nil {

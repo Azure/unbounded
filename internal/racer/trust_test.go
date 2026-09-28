@@ -15,9 +15,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -132,7 +134,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 			case "keyring":
 				_, err = f.a.Keyring.Reconcile(f.ctx, ctrl.Request{})
 			case "issuance":
-				_, err = f.a.Keyring.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+				_, err = f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
 			default:
 				_, err = f.a.Topology.Reconcile(f.ctx, ctrl.Request{})
 			}
@@ -206,6 +208,183 @@ func TestTrustReadOutageAtEachAuthorityRead(t *testing.T) {
 	}
 }
 
+func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
+	for _, resource := range []string{"racer-installation", "racer-version", "racer-issuer", "racer-keyring"} {
+		for _, failure := range []string{"outage", "deleted", "malformed"} {
+			t.Run(resource+"/"+failure, func(t *testing.T) {
+				r, now := testKeyring(t)
+				runKeys(t, r)
+				_, _, initial, _ := keyState(t, r)
+				*now = initial.NextRotation
+
+				accepted, err := r.Trust.pool()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				reads := 0
+				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == resource {
+						reads++
+						if reads == 2 {
+							switch failure {
+							case "outage":
+								return errors.New("post-reconcile API outage")
+							case "deleted":
+								return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
+							case "malformed":
+								if err := c.Get(ctx, key, obj, opts...); err != nil {
+									return err
+								}
+
+								switch value := obj.(type) {
+								case *corev1.Secret:
+									value.Data = nil
+								case *corev1.ConfigMap:
+									value.Data = nil
+								}
+
+								return nil
+							}
+						}
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				}})
+
+				if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil || reads != 2 {
+					t.Fatalf("post-reconcile failure bypassed: %v, reads=%d", err, reads)
+				}
+
+				current, err := r.Trust.pool()
+				if failure == "outage" {
+					if err != nil || current != accepted || !r.Lifecycle.issuer {
+						t.Fatalf("read outage replaced accepted trust with candidate roots: %v", err)
+					}
+				} else if err == nil || r.Lifecycle.issuer {
+					t.Fatal("observed invalid authority retained or installed trust")
+				}
+
+				r.APIReader = r.Client
+
+				_, staged, _, _ := keyState(t, r)
+				if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
+					t.Fatal("failure preceded successful rotation publication")
+				}
+
+				runKeys(t, r)
+
+				current, err = r.Trust.pool()
+				if err != nil || current.Equal(accepted) {
+					t.Fatalf("fresh successful reconciliation did not install staged trust: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
+	for _, failure := range []string{"outage", "conflict", "success"} {
+		t.Run(failure, func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			_, _, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			reads := 0
+			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == r.Config.KeyringSecretName {
+					reads++
+					if reads == 2 {
+						defer cancel()
+
+						switch failure {
+						case "outage":
+							return errors.New("post-reconcile API outage")
+						case "conflict":
+							return apierrors.NewConflict(corev1.Resource("secrets"), key.Name, wire.Conflict)
+						}
+					}
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			}})
+
+			result, err := r.Reconcile(ctx, ctrl.Request{})
+			if reads != 2 || !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result != (ctrl.Result{}) {
+				t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
+			}
+
+			if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+				t.Fatal("cancellation after admission retained trust or issuer readiness")
+			}
+
+			r.APIReader = r.Client
+
+			_, staged, _, _ := keyState(t, r)
+			if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
+				t.Fatal("cancellation preceded successful rotation publication")
+			}
+		})
+	}
+}
+
+func TestReconcilerAlreadyExistsHandling(t *testing.T) {
+	for _, operation := range []string{"keyring", "topology"} {
+		t.Run(operation, func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			_, _, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			accepted, err := r.Trust.pool()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writes := 0
+			writer := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+				writes++
+				return apierrors.NewAlreadyExists(corev1.Resource("secrets"), obj.GetName())
+			}})
+
+			var result ctrl.Result
+
+			if operation == "keyring" {
+				r.Client = writer
+
+				result, err = r.Reconcile(t.Context(), ctrl.Request{})
+				if err != nil || result.RequeueAfter != retryConflictDelay {
+					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
+				}
+
+				if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+					t.Fatal("keyring write failure retained trust or issuer readiness")
+				}
+			} else {
+				topology := Assemble(r.Config, writer, r.APIReader).Topology
+				topology.Trust = r.Trust
+
+				result, err = topology.Reconcile(t.Context(), ctrl.Request{})
+				if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
+					t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
+				}
+
+				if current, err := r.Trust.pool(); err != nil || current != accepted {
+					t.Fatalf("topology publication write failure changed trust: %v", err)
+				}
+			}
+
+			if writes != 1 {
+				t.Fatalf("expected one failed write, got %d", writes)
+			}
+		})
+	}
+}
+
 func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 	f := newServingFixture(t)
 
@@ -229,9 +408,9 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 
 	for {
-		f.a.Server.Publications.mu.Lock()
-		n := len(f.a.Server.Publications.polls)
-		f.a.Server.Publications.mu.Unlock()
+		f.a.Server.admission.Lock()
+		n := len(f.a.Server.polls)
+		f.a.Server.admission.Unlock()
 
 		if n == 1 {
 			break
@@ -271,8 +450,10 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 
 func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Keyring.CatalogMu.Lock()
-	defer f.a.Keyring.CatalogMu.Unlock()
+	if err := f.a.Keyring.CatalogGate.Acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer f.a.Keyring.CatalogGate.Release()
 
 	ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
 	defer cancel()
@@ -280,20 +461,117 @@ func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := f.a.Keyring.Issuer.TrustRoots(ctx)
+		_, err := f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("lock wait ignored deadline: %v", err)
+			t.Fatalf("gate wait ignored deadline: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("lock wait held enrollment admission past deadline")
+		t.Fatal("gate wait held enrollment admission past deadline")
 	}
 
 	if _, err := f.a.Server.Trust.pool(); err != nil {
-		t.Fatalf("canceled lock wait invalidated accepted trust: %v", err)
+		t.Fatalf("canceled gate wait invalidated accepted trust: %v", err)
+	}
+}
+
+func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
+	for _, operation := range []string{"topology", "keyring", "issuance"} {
+		for _, held := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/held=%t", operation, held), func(t *testing.T) {
+				f := newServingFixture(t)
+
+				roots, err := f.a.Server.Trust.pool()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				publication, err := f.a.Server.Publications.Current()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var reads atomic.Int64
+
+				reader := interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
+					Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+						reads.Add(1)
+						return wire.Unavailable
+					},
+				})
+				f.a.Topology.APIReader = reader
+				f.a.Keyring.APIReader = reader
+				f.a.Server.Bootstrap.Issuer.APIReader = reader
+
+				gate := f.a.Keyring.CatalogGate
+				if held {
+					if err := gate.Acquire(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					defer gate.Release()
+				}
+
+				ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
+				defer cancel()
+
+				want := context.DeadlineExceeded
+
+				if !held {
+					cancel()
+
+					want = context.Canceled
+				}
+
+				done := make(chan error, 1)
+
+				go func() {
+					var err error
+
+					switch operation {
+					case "topology":
+						_, err = f.a.Topology.Reconcile(ctx, ctrl.Request{})
+					case "keyring":
+						_, err = f.a.Keyring.Reconcile(ctx, ctrl.Request{})
+					case "issuance":
+						_, err = f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
+					}
+
+					done <- err
+				}()
+
+				select {
+				case err := <-done:
+					if !errors.Is(err, want) {
+						t.Fatalf("gate wait cancellation: %v", err)
+					}
+
+					if operation != "issuance" && !errors.Is(err, reconcile.TerminalError(nil)) {
+						t.Fatalf("canceled reconcile can retry: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("gate wait ignored cancellation")
+				}
+
+				if reads.Load() != 0 {
+					t.Fatalf("canceled admission read authority: %d", reads.Load())
+				}
+
+				if current, err := f.a.Server.Trust.pool(); err != nil || current != roots {
+					t.Fatalf("canceled admission changed accepted trust: %v", err)
+				}
+
+				if current, err := f.a.Server.Publications.Current(); err != nil || current != publication {
+					t.Fatalf("canceled admission changed publication: %v", err)
+				}
+
+				if err := f.a.Server.Ready(nil); err != nil {
+					t.Fatalf("canceled admission withdrew readiness: %v", err)
+				}
+			})
+		}
 	}
 }

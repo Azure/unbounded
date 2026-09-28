@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,11 +35,11 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 // Issuer accesses a controller-only Secret. Its private key is never projected
 // into dataplane Pods or included in a response or diagnostic.
 type Issuer struct {
-	APIReader client.Reader
-	Config    Config
-	Trust     *Trust
-	CatalogMu *sync.Mutex
-	Now       func() time.Time
+	APIReader   client.Reader
+	Config      Config
+	Trust       *Trust
+	CatalogGate *CatalogGate
+	Now         func() time.Time
 }
 
 type signingMaterial struct {
@@ -115,6 +114,11 @@ func parseSigning(m signingMaterial) (*x509.Certificate, ed25519.PrivateKey, err
 	return cert, key, nil
 }
 
+type parsedSigning struct {
+	certificate *x509.Certificate
+	key         ed25519.PrivateKey
+}
+
 type signingState struct {
 	certificate *x509.Certificate
 	key         ed25519.PrivateKey
@@ -130,27 +134,23 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, err
 	}
 
-	topology := &TopologyReconciler{APIReader: reader, Config: cfg}
-
-	version, _, err := topology.readVersion(ctx)
+	version, _, err := readVersion(ctx, reader, cfg)
 	if err != nil {
 		return signingState{}, err
 	}
 
 	claim := version.Annotations[credentialClaim]
-	if !strings.HasPrefix(claim, cfg.IssuerSecretName+"/"+cfg.KeyringSecretName+"/") {
+	if !validCredentialClaim(cfg, claim) {
 		return signingState{}, wire.Unavailable
 	}
 
-	_, _, b, s, material, err := readCredentials(ctx, reader, cfg, claim)
+	credentials, err := readCredentials(ctx, reader, cfg, claim)
 	if err != nil {
 		return signingState{}, err
 	}
 
-	cert, key, err := parseSigning(material.Keys[s.ActiveIssuer])
-	if err != nil {
-		return signingState{}, err
-	}
+	active := credentials.signing[credentials.rotation.ActiveIssuer]
+	cert, key := active.certificate, active.key
 
 	if now.Before(cert.NotBefore) || now.Add(cfg.certificateLifetime()).After(cert.NotAfter) {
 		return signingState{}, wire.Unavailable
@@ -158,11 +158,8 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 
 	roots := x509.NewCertPool()
 
-	for _, der := range b.PeerTrustRoots {
-		root, err := x509.ParseCertificate(der)
-		if err != nil {
-			return signingState{}, wire.Unavailable
-		}
+	for _, der := range credentials.bundle.PeerTrustRoots {
+		root := credentials.signing[rootID(der)].certificate
 
 		if !now.Before(root.NotBefore) && now.Before(root.NotAfter) {
 			roots.AddCert(root)
@@ -201,24 +198,17 @@ func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
 func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
 	// Serialize observations with controller installation so an in-flight valid
 	// read cannot restore trust after another operation observes invalidity.
-	if i.CatalogMu != nil {
-		// Controller API work can stall. Waiting for its lock must still honor
+	if i.CatalogGate != nil {
+		// Controller API work can stall. Waiting for its gate must still honor
 		// the enrollment deadline and release bounded authentication admission.
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for !i.CatalogMu.TryLock() {
-			select {
-			case <-ctx.Done():
-				return signingState{}, ctx.Err()
-			case <-ticker.C:
-			}
+		if err := i.CatalogGate.Acquire(ctx); err != nil {
+			return signingState{}, err
 		}
-		defer i.CatalogMu.Unlock()
+		defer i.CatalogGate.Release()
 	}
 
 	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
-	if observedAuthorityFailure(err) {
+	if shouldInvalidateTrust(err) {
 		i.Trust.invalidate()
 	}
 
@@ -227,66 +217,69 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 
 // Issue accepts only the identity returned by token authentication. CSR names,
 // extensions and requested usages are discarded. Enrollment is correlation only.
-func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) (wire.BootstrapResponse, error) {
+// It returns an owned, validated JSON response within the bootstrap wire bound.
+func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	now := i.now()
 	if identity.cluster != i.Config.Cluster || !wire.ValidUUID(string(identity.node)) || !identity.expires.After(now) {
-		return wire.BootstrapResponse{}, wire.Forbidden
+		return nil, wire.Forbidden
 	}
 
 	if request.Cluster != identity.cluster {
-		return wire.BootstrapResponse{}, wire.Forbidden
+		return nil, wire.Forbidden
 	}
 
-	if _, err := wire.EncodeBootstrapRequest(request); err != nil {
-		return wire.BootstrapResponse{}, err
+	if err := wire.ValidateBootstrapRequest(request); err != nil {
+		return nil, err
 	}
 
 	csr, err := x509.ParseCertificateRequest(request.CSRDER)
 	if err != nil || csr.CheckSignature() != nil {
-		return wire.BootstrapResponse{}, wire.InvalidRequest
+		return nil, wire.InvalidRequest
 	}
 
 	pub, ok := csr.PublicKey.(ed25519.PublicKey)
 	if !ok {
-		return wire.BootstrapResponse{}, wire.InvalidRequest
+		return nil, wire.InvalidRequest
 	}
 
 	state, err := i.loadSigning(ctx, now)
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	serial, err := serialNumber()
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	uri := &url.URL{Scheme: "spiffe", Host: string(identity.cluster), Path: "/node/" + string(identity.node)}
 	template := &x509.Certificate{SerialNumber: serial, NotBefore: now, NotAfter: now.Add(i.Config.certificateLifetime()), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
 
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	leaf, err := x509.CreateCertificate(rand.Reader, template, state.certificate, pub, state.key)
 	if err != nil {
-		return wire.BootstrapResponse{}, wire.Unavailable
+		return nil, wire.Unavailable
 	}
 
 	response := wire.BootstrapResponse{SchemaVersion: wire.SchemaVersion, Cluster: identity.cluster, Node: identity.node, Enrollment: request.Enrollment, CertificateChain: [][]byte{leaf, state.certificate.Raw}}
-	if _, err := wire.EncodeBootstrap(response); err != nil {
-		return wire.BootstrapResponse{}, err
+
+	encoded, err := wire.EncodeBootstrap(response)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
-	return response, nil
+	return encoded, nil
 }
 
 // AuthenticateCertificate requires a verified chain, the client-auth usage,

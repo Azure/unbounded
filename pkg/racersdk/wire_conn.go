@@ -17,28 +17,47 @@ import (
 // cancellation, sequential framing, and connection closure on ANY head error.
 // Do not pool the returned bytes (they can contain upstream credentials).
 func readRawHead(r *bufio.Reader, response bool) ([]byte, error) {
+	head, err := readHeadBytes(r, response)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateRawHead(head, response); err != nil {
+		return nil, err
+	}
+
+	return head, nil
+}
+
+// readHeadBytes only finds the bounded frame; semantic parsers validate it once.
+func readHeadBytes(r *bufio.Reader, response bool) ([]byte, error) {
 	head := make([]byte, 0, 1024)
 	for len(head) < maxHeadBytes {
-		b, err := r.ReadByte()
+		line, err := r.ReadSlice('\n')
+		if len(line) > maxHeadBytes-len(head) {
+			return head, headFailure(response, true)
+		}
+
+		head = append(head, line...)
+
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+
 		if err != nil {
 			if err == io.EOF && len(head) != 0 {
 				err = io.ErrUnexpectedEOF
 			}
 
-			return nil, ioFailure("head read", err)
+			return head, ioFailure("head read", err)
 		}
 
-		head = append(head, b)
 		if bytes.HasSuffix(head, []byte("\r\n\r\n")) {
-			if err := validateRawHead(head, response); err != nil {
-				return nil, err
-			}
-
 			return head, nil
 		}
 	}
 
-	return nil, headFailure(response, true)
+	return head, headFailure(response, true)
 }
 
 func headFailure(response, limit bool) error {
@@ -107,6 +126,12 @@ func validateRawHead(head []byte, response bool) error {
 		}
 
 		seen[name] = true
+		if name == "racer-content-type" {
+			if len(value) < 2 || value[0] != ' ' || validateContentType(string(value[1:])) != nil {
+				return headFailure(response, false)
+			}
+		}
+
 		if name == "racer-metadata" || name == "authorization" {
 			if len(value) == 0 || value[0] != ' ' {
 				return headFailure(response, false)
@@ -127,7 +152,7 @@ func headerToken(b byte) bool {
 
 func singletonHeader(name string) bool {
 	switch name {
-	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range", "racer-expires-at", "racer-metadata", "authorization":
+	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range", "racer-expires-at", "racer-content-type", "racer-metadata", "authorization":
 		return true
 	default:
 		return false

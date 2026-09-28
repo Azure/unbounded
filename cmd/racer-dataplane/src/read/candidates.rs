@@ -920,6 +920,7 @@ mod tests {
             mode: FetchMode::CopyOnly,
         };
         let mut metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: object(),
                 etag: StrongEtag::test_value("v1"),

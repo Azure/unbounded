@@ -15,8 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func spliceBody(ctx context.Context, source *responseConn, sink *FDSink, length int64) (int64, bool, error) {
-	src, ok := source.Conn.(syscall.Conn)
+func spliceBody(ctx context.Context, source *responseBody, sink *FDSink, length int64) (int64, bool, error) {
+	src, ok := source.conn.Conn.(syscall.Conn)
 	if !ok {
 		return 0, false, nil
 	}
@@ -56,7 +56,7 @@ func spliceBody(ctx context.Context, source *responseConn, sink *FDSink, length 
 	stop := context.AfterFunc(ctx, func() {
 		defer close(stopped)
 
-		if err := source.SetReadDeadline(time.Now()); err != nil {
+		if err := source.conn.SetReadDeadline(time.Now()); err != nil {
 			closeBody(source)
 		}
 
@@ -108,7 +108,11 @@ func spliceBody(ctx context.Context, source *responseConn, sink *FDSink, length 
 			return sent, true, io.ErrUnexpectedEOF
 		}
 
+		source.mu.Lock()
 		source.remaining -= count
+		source.mu.Unlock()
+		source.client.stats.bytesRead.Add(uint64(count))
+
 		for count > 0 {
 			var n int64
 

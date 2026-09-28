@@ -26,7 +26,7 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 			return
 		}
 
-		first, last, err := rangeValue.Resolve(ByteLength(size))
+		first, last, err := rangeValue.resolve(ByteLength(size))
 		if err != nil {
 			t.Error(err)
 			return
@@ -176,7 +176,7 @@ func TestValueServeHTTPLifecycle(t *testing.T) {
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requested, _ := parseRange(r.Header.Get("Range"))
 
-		first, last, err := requested.Resolve(ByteLength(size))
+		first, last, err := requested.resolve(ByteLength(size))
 		if err != nil {
 			t.Error(err)
 			return

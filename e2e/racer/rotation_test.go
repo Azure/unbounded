@@ -234,7 +234,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 		return h.kubectl("get", "pods", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "--sort-by=.metadata.uid", "-o", `jsonpath={range .items[*]}{.metadata.uid}{":"}{.status.containerStatuses[*].restartCount}{"\n"}{end}`)
 	}
 	beforePods := podState()
-	urls := [2]string{h.forward(nodes[0].pod, "9090", "/readyz"), h.forward(nodes[1].pod, "9090", "/readyz")}
+	urls := [2]string{h.racerDiagnostics(nodes[0].pod), h.racerDiagnostics(nodes[1].pod)}
 	initial, initialState, secret := h.rotationState()
 
 	var oldLeaves [2]*x509.Certificate
@@ -262,10 +262,9 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.Equal(h.t, beforeWarm, gets, "pre-rotation cached bytes must be reusable")
 	h.verifyRotationDisk(nodes[0], urls[0], fixture, pressure, "before-rotation")
 
-	// Advance only the persisted scheduling deadline. The real Go reconciler
+	// Advance only the next rotation timestamp. The real Go reconciler
 	// generates, stages, activates and prunes every key/root; no bundle is forged.
 	initialState.NextRotation = time.Now().UTC().Truncate(time.Second)
-	initialState.NextTransition = initialState.NextRotation
 	stateBytes, err := json.Marshal(initialState)
 	require.NoError(h.t, err)
 	patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": secret.ResourceVersion}, "data": map[string][]byte{"rotation.json": stateBytes}})
@@ -352,7 +351,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.Equal(h.t, uint64(1), after["racer_origin_fills_total"]-before["racer_origin_fills_total"])
 
 	gets, _ = fixture.counts()
-	beforeGets[""]++
+	beforeGets["bytes=0-16777215"]++
 	require.Equal(h.t, beforeGets, gets, "retired page must refill once through the deployed origin adapter")
 	// Both nodes are candidates, so reader probes its predecessor with CopyOnly.
 	// The server's retired page cannot be admitted and CopyOnly cannot start an
@@ -370,7 +369,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.Equal(h.t, serverBeforeProbe["racer_origin_fills_total"], serverAfterProbe["racer_origin_fills_total"], "CopyOnly predecessor must not acquire from origin")
 
 	gets, _ = fixture.counts()
-	beforeGets["bytes=16777216-"]++
+	beforeGets["bytes=16777216-33554431"]++
 	require.Equal(h.t, beforeGets, gets, "staggered projection must fetch only the requested origin page")
 	release()
 	h.kubectl("annotate", "pod", nodes[1].pod, "-n", namespace, "e2e.racer/rotation=active", "--overwrite")

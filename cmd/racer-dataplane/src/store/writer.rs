@@ -138,6 +138,20 @@ impl StoreWriter {
             .is_none_or(|a| a.page(&e.page.version.object.cache, e.key_id))
     }
     pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<DirtyTicket> {
+        let cache = page.metadata.version.object.cache.clone();
+        self.enqueue_reclaiming(page, dirty, |length| {
+            self.slabs.reserve_staging(length, &cache)
+        })
+    }
+    /// The fill owner may reclaim idle cached bytes for exact aligned staging.
+    /// Reclamation is synchronous and happens before queue acceptance; no writer
+    /// map borrow may span it because it can release other unsubmitted copies.
+    pub(crate) fn enqueue_reclaiming(
+        &self,
+        page: CiphertextCopy,
+        dirty: Reservation,
+        reserve_staging: impl FnOnce(usize) -> Result<Reservation>,
+    ) -> Result<DirtyTicket> {
         if self.closed.get() {
             return Err(Error::Unavailable);
         }
@@ -162,16 +176,16 @@ impl StoreWriter {
         }
         let id = page.ciphertext.envelope().page.clone();
         if let Some(metadata) = self.index.version(&id.version)? {
-            if metadata != page.metadata.immutable() {
+            if !metadata.compatible(&page.metadata.immutable()) {
                 return Err(Error::CorruptRecord);
             }
         }
         if let Some(metadata) = self.metadata(&id.version)? {
-            if metadata != page.metadata.immutable() {
+            if !metadata.compatible(&page.metadata.immutable()) {
                 return Err(Error::CorruptRecord);
             }
         }
-        let mut pending = self.pending.borrow_mut();
+        let pending = self.pending.borrow();
         if let Some(existing) = pending.get(&id) {
             return Ok(DirtyTicket {
                 id: existing.ticket,
@@ -180,16 +194,21 @@ impl StoreWriter {
         if pending.len() >= self.capacity.get() {
             return Err(Error::Overloaded);
         }
+        drop(pending);
         // Reserve the exact padded staging bytes before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release memory.
         let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
-        let staging = self
-            .slabs
-            .reserve_staging(disk_bytes, &id.version.object.cache)?;
+        let staging = reserve_staging(disk_bytes)?;
+        staging.validate(ResourceClass::Ciphertext, disk_bytes)?;
+        if !self.slabs.owns_reservation(&staging)
+            || staging.cache() != Some(&id.version.object.cache)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
         let ticket = self.next.get();
         self.next
             .set(ticket.checked_add(1).ok_or(Error::Unavailable)?);
-        pending.insert(
+        self.pending.borrow_mut().insert(
             id.clone(),
             Dirty {
                 _metric: self

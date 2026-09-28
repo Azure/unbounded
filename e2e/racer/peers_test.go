@@ -13,11 +13,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/bits"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,31 +27,31 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 )
 
 const peerPageSize = 16 << 20
 
 type peerNode struct {
 	name, uid, pod, ip string
+	port               int32
 }
 
 func (h *harness) peerNodes() [2]peerNode {
 	h.t.Helper()
 
-	var pods struct {
-		Items []struct {
-			Metadata struct{ Name string }
-			Spec     struct{ NodeName string }
-			Status   struct{ PodIP string }
-		}
-	}
+	var pods corev1.PodList
 
 	require.NoError(h.t, json.Unmarshal([]byte(h.kubectl("get", "pods", "-n", namespace, "-l", "app.kubernetes.io/name=racer-dataplane", "-o", "json")), &pods))
 	require.Len(h.t, pods.Items, 2, "peer test requires exactly two deployed dataplanes")
 
 	var nodes [2]peerNode
+
 	for i, pod := range pods.Items {
-		nodes[i] = peerNode{name: pod.Spec.NodeName, pod: pod.Metadata.Name, ip: pod.Status.PodIP}
+		port, err := peerPort(pod)
+		require.NoError(h.t, err)
+
+		nodes[i] = peerNode{name: pod.Spec.NodeName, pod: pod.Name, ip: pod.Status.PodIP, port: port}
 		nodes[i].uid = strings.TrimSpace(h.kubectl("get", "node", nodes[i].name, "-o", "jsonpath={.metadata.uid}"))
 		require.NotEmpty(h.t, nodes[i].ip)
 		require.NotEmpty(h.t, nodes[i].uid)
@@ -58,6 +60,26 @@ func (h *harness) peerNodes() [2]peerNode {
 	require.NotEqual(h.t, nodes[0].name, nodes[1].name)
 
 	return nodes
+}
+
+func peerPort(pod corev1.Pod) (int32, error) {
+	for _, container := range pod.Spec.Containers {
+		if container.Name != "dataplane" {
+			continue
+		}
+
+		for _, port := range container.Ports {
+			if port.Name == "peer" && port.Protocol == corev1.ProtocolTCP && port.ContainerPort > 0 && port.ContainerPort <= 65535 {
+				return port.ContainerPort, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("pod %s has no valid dataplane TCP peer port", pod.Name)
+}
+
+func peerOutageRule(server peerNode) []string {
+	return []string{"OUTPUT", "-d", server.ip, "-p", "tcp", "--dport", strconv.Itoa(int(server.port)), "-m", "comment", "--comment", "racer-e2e-peer-outage", "-j", "REJECT", "--reject-with", "tcp-reset"}
 }
 
 type peerOrigin struct {
@@ -198,8 +220,8 @@ func (h *harness) verifyPeerCache(nodes [2]peerNode, fixture *peerOrigin) {
 	h.t.Helper()
 
 	server, reader := nodes[0], nodes[1]
-	serverURL := h.forward(server.pod, "9090", "/readyz")
-	readerURL := h.forward(reader.pod, "9090", "/readyz")
+	serverURL := h.racerDiagnostics(server.pod)
+	readerURL := h.racerDiagnostics(reader.pod)
 
 	beforeWarm := h.peerMetrics(serverURL, "before-warm")
 	for page := 0; page < 3; page++ {
@@ -210,7 +232,7 @@ func (h *harness) verifyPeerCache(nodes [2]peerNode, fixture *peerOrigin) {
 	require.Equal(h.t, uint64(3), afterWarm["racer_origin_fills_total"]-beforeWarm["racer_origin_fills_total"])
 
 	warmGets, _ := fixture.counts()
-	require.Equal(h.t, map[string]int{"": 1, "bytes=16777216-": 1, "bytes=33554432-": 1}, warmGets, "warm each page exactly once through Gantry's origin adapter")
+	require.Equal(h.t, map[string]int{"bytes=0-16777215": 1, "bytes=16777216-33554431": 1, "bytes=33554432-50331647": 1}, warmGets, "warm each bounded page exactly once through Gantry's origin adapter")
 
 	before := h.peerMetrics(readerURL, "before-peer-hit")
 	h.readPeerPage(reader, fixture, 0)
@@ -224,14 +246,29 @@ func (h *harness) verifyPeerCache(nodes [2]peerNode, fixture *peerOrigin) {
 	// Reject only the reader's traffic to the serving pod's peer port. Keep the
 	// pod, identity, membership, diagnostics, and origin adapter alive. Readiness
 	// is not a membership eviction signal, and the next page is cold on reader.
-	rule := []string{"FORWARD", "-s", reader.ip, "-d", server.ip, "-p", "tcp", "--dport", "7443", "-m", "comment", "--comment", "racer-e2e-peer-outage", "-j", "REJECT", "--reject-with", "tcp-reset"}
-	h.run("docker", append([]string{"exec", server.name, "iptables", "-I"}, rule...)...)
+	containerID := strings.TrimPrefix(strings.TrimSpace(h.kubectl("get", "pod", reader.pod, "-n", namespace, "-o", "jsonpath={.status.containerStatuses[0].containerID}")), "containerd://")
+
+	var inspected struct {
+		Info struct{ PID int }
+	}
+	require.NoError(h.t, json.Unmarshal([]byte(h.run("docker", "exec", reader.name, "crictl", "inspect", containerID)), &inspected))
+	require.Positive(h.t, inspected.Info.PID)
+	// Reject before node-level masquerading can change the source Pod IP.
+	iptables := []string{"exec", reader.name, "nsenter", "-t", fmt.Sprint(inspected.Info.PID), "-n", "--", "iptables"}
+	rule := peerOutageRule(server)
+	h.run("docker", append(append(append([]string{}, iptables...), "-I"), rule...)...)
 
 	blocked := true
 
 	h.t.Cleanup(func() {
 		if blocked {
-			h.command(context.Background(), "docker", append([]string{"exec", server.name, "iptables", "-D"}, rule...)...)
+			// Capture before removal even if the read or a metric assertion fails.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			output, err := exec.CommandContext(ctx, "docker", append(append([]string{}, iptables...), "-L", "OUTPUT", "-v", "-n", "-x")...).CombinedOutput()
+			h.write("peer-outage-cleanup.log", fmt.Sprintf("target=%s:%d error=%v\n%s", server.ip, server.port, err, output))
+			h.command(context.Background(), "docker", append(append(append([]string{}, iptables...), "-D"), rule...)...)
 		}
 	})
 
@@ -241,15 +278,15 @@ func (h *harness) verifyPeerCache(nodes [2]peerNode, fixture *peerOrigin) {
 	h.readPeerPage(reader, fixture, 1)
 
 	elapsed := time.Since(started)
+	rules := h.run("docker", append(append([]string{}, iptables...), "-L", "OUTPUT", "-v", "-n", "-x")...)
+	h.write("peer-outage-iptables.log", rules)
 	require.Less(h.t, elapsed, 30*time.Second, "peer failure must fall back within the bounded read deadline")
 	after = h.peerMetrics(readerURL, "after-peer-fallback")
 	require.Equal(h.t, before["racer_peer_hits_total"], after["racer_peer_hits_total"])
 	require.Equal(h.t, uint64(1), after["racer_origin_fills_total"]-before["racer_origin_fills_total"], "cold reader must acquire the unavailable peer's page from origin")
 
 	gets, _ = fixture.counts()
-	require.Equal(h.t, map[string]int{"": 1, "bytes=16777216-": 2, "bytes=33554432-": 1}, gets, "fallback must fetch only the requested page once")
-	rules := h.run("docker", "exec", server.name, "iptables", "-L", "FORWARD", "-v", "-n", "-x")
-	h.write("peer-outage-iptables.log", rules)
+	require.Equal(h.t, map[string]int{"bytes=0-16777215": 1, "bytes=16777216-33554431": 2, "bytes=33554432-50331647": 1}, gets, "fallback must fetch only the requested page once")
 
 	var rejected uint64
 
@@ -264,7 +301,7 @@ func (h *harness) verifyPeerCache(nodes [2]peerNode, fixture *peerOrigin) {
 
 	require.Positive(h.t, rejected, "the cold-page read must actually contact the interrupted peer")
 
-	h.run("docker", append([]string{"exec", server.name, "iptables", "-D"}, rule...)...)
+	h.run("docker", append(append(append([]string{}, iptables...), "-D"), rule...)...)
 
 	blocked = false
 	before = after

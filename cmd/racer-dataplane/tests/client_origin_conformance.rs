@@ -694,6 +694,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
             let received = rig.io.receive_head(rig.lease(local), &scope).await.unwrap();
             let response = ReadResponse {
                 metadata: ObjectMetadata {
+                    content_type: None,
                     version: ObjectVersion {
                         object: object(),
                         etag: StrongEtag::parse(b"\"v\"").unwrap(),
@@ -809,6 +810,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
             drop(parsed);
             let response = ReadResponse {
                 metadata: ObjectMetadata {
+                    content_type: None,
                     version: ObjectVersion {
                         object: object(),
                         etag: StrongEtag::parse(b"\"v\"").unwrap(),
@@ -889,6 +891,7 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
             .parse(&cache, received.value)
             .unwrap();
         let metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: parsed.origin.object.clone(),
                 etag: StrongEtag::parse(b"\"v\"").unwrap(),

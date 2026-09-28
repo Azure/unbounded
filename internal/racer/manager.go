@@ -8,7 +8,6 @@ package racer
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,20 +33,41 @@ type Application struct {
 // c supplies indexed discovery (configured by SetupWithManager in production);
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
-	publications := NewPublications(cfg.Limits)
+	publications := NewPublications()
 	lifecycle := newLifecycle(publications)
 	trust := &Trust{}
 	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 	// Serialize credential admission/pruning with topology's authoritative read
 	// and publication commit. Informer ordering alone cannot provide this gate.
-	catalogMu := &sync.Mutex{}
-	issuer.CatalogMu = catalogMu
+	catalogGate := newCatalogGate()
+	issuer.CatalogGate = catalogGate
 
 	return &Application{
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: publications, Accepted: make(AcceptedMembers), CatalogMu: catalogMu, Trust: trust},
-		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Issuer: issuer, Lifecycle: lifecycle, CatalogMu: catalogMu, Trust: trust},
-		Server:    &Server{Config: cfg, Trust: trust, Bootstrap: bootstrap, Publications: publications, Lifecycle: lifecycle},
+		Topology: &TopologyReconciler{
+			Client:       c,
+			APIReader:    reader,
+			Config:       cfg,
+			Publications: publications,
+			Accepted:     make(AcceptedMembers),
+			CatalogGate:  catalogGate,
+			Trust:        trust,
+		},
+		Keyring: &KeyringReconciler{
+			Client:      c,
+			APIReader:   reader,
+			Config:      cfg,
+			Lifecycle:   lifecycle,
+			CatalogGate: catalogGate,
+			Trust:       trust,
+		},
+		Server: &Server{
+			Config:       cfg,
+			Trust:        trust,
+			Bootstrap:    bootstrap,
+			Publications: publications,
+			Lifecycle:    lifecycle,
+		},
 		Lifecycle: lifecycle,
 	}
 }
@@ -108,7 +128,7 @@ func Run(ctx context.Context, cfg Config) error {
 	app := Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
 	// Recovery validates permanent configuration and counters before starting any
 	// manager runnable. The leader revalidates authoritatively for every commit.
-	if _, _, err := app.Topology.readVersion(ctx); err != nil {
+	if _, _, err := readVersion(ctx, mgr.GetAPIReader(), cfg); err != nil {
 		return fmt.Errorf("recover Racer installation: %w", err)
 	}
 

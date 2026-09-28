@@ -44,6 +44,35 @@ func (u *testUpstream) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadC
 	return u.pull(ctx, ref)
 }
 
+func (u *testUpstream) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
+	u.pulls.Add(1)
+	// These callbacks describe the fixture metadata and bytes. No Head method
+	// is called: bounded origin responses supply both in the same operation.
+	metadataRef := ref
+	metadataRef.Offset = 0
+
+	size, contentType, err := u.head(ctx, metadataRef)
+	if err != nil || size < 0 {
+		return nil, size, contentType, err
+	}
+
+	if size == 0 && u.pull == nil {
+		return io.NopCloser(strings.NewReader("")), 0, contentType, nil
+	}
+
+	body, pulledSize, err := u.pull(ctx, ref)
+	if err != nil || body == nil {
+		return body, pulledSize, contentType, err
+	}
+
+	if size != pulledSize {
+		_ = body.Close()
+		return nil, -1, contentType, nil
+	}
+
+	return &pageBody{Reader: io.LimitReader(body, length), upstream: body}, size, contentType, nil
+}
+
 func testRef() ifaces.OriginRef {
 	return ifaces.OriginRef{Registry: "registry.example", Repository: "library/image", Digest: digestOf([]byte("fixture"))}
 }
@@ -171,7 +200,7 @@ func TestFakeClientPagesAndCredentials(t *testing.T) {
 					return int64(size), "application/octet-stream", nil
 				},
 				pull: func(ctx context.Context, got ifaces.OriginRef) (io.ReadCloser, int64, error) {
-					if got.Offset < 0 || got.Offset >= int64(size) || got.Offset%int64(racersdk.PageSize) != 0 || got.Digest != ref.Digest || registryauth.Authorization(ctx) != auth {
+					if got.Offset < 0 || (got.Offset >= int64(size) && (size != 0 || got.Offset != 0)) || got.Offset%int64(racersdk.PageSize) != 0 || got.Digest != ref.Digest || registryauth.Authorization(ctx) != auth {
 						return nil, 0, errors.New("incorrect page offset or credential")
 					}
 
@@ -192,7 +221,7 @@ func TestFakeClientPagesAndCredentials(t *testing.T) {
 			defer value.Close()
 
 			metadata := value.Metadata()
-			if metadata.Validate() != nil || metadata.Size != racersdk.ByteLength(size) || metadata.ETag.String() != `"`+ref.Digest.String()+`"` {
+			if metadata.Validate() != nil || metadata.Size != racersdk.ByteLength(size) || metadata.ETag.String() != `"`+ref.Digest.String()+`"` || metadata.ContentType != "application/octet-stream" {
 				t.Fatalf("invalid metadata: %+v", metadata)
 			}
 
@@ -206,13 +235,13 @@ func TestFakeClientPagesAndCredentials(t *testing.T) {
 			}
 
 			pages := (int64(size) + int64(racersdk.PageSize) - 1) / int64(racersdk.PageSize)
-			if upstream.pulls.Load() != pages || upstream.heads.Load() != max(1, pages) {
+			if upstream.pulls.Load() != max(1, pages) || upstream.heads.Load() != 0 {
 				t.Fatalf("heads/pulls = %d/%d, pages = %d", upstream.heads.Load(), upstream.pulls.Load(), pages)
 			}
 
 			deadline := time.After(5 * time.Second)
 
-			for closed.Load() != pages {
+			for closed.Load() != max(1, pages) {
 				select {
 				case <-deadline:
 					t.Fatalf("closed %d of %d upstream bodies", closed.Load(), pages)
@@ -329,8 +358,8 @@ func TestOriginHeadPinAndRanges(t *testing.T) {
 	metadata, body, err := open(context.Background(), upstream, ref, racersdk.OperationPinned, tag, page)
 	requireKind(t, err, racersdk.ErrorUnsatisfiableRange)
 
-	if body != nil || metadata.Size != 0 || metadata.Validate() != nil || upstream.pulls.Load() != 0 {
-		t.Fatal("empty pinned read must return valid 416 metadata without Pull")
+	if body != nil || metadata.Size != 0 || metadata.Validate() != nil || upstream.pulls.Load() != 2 {
+		t.Fatal("empty pinned read must return valid 416 metadata from bounded GET")
 	}
 
 	for _, tc := range []struct {
@@ -371,6 +400,7 @@ func TestOriginErrors(t *testing.T) {
 		kind racersdk.ErrorKind
 	}{
 		{"auth", &ifaces.OriginError{Class: ifaces.FailureAuth}, racersdk.ErrorUnauthorized},
+		{"forbidden", &ifaces.OriginError{Class: ifaces.FailureAuth, StatusCode: 403}, racersdk.ErrorForbidden},
 		{"not found", &ifaces.OriginError{Class: ifaces.FailureNotFound}, racersdk.ErrorNotFound},
 		{"rate limit", &ifaces.OriginError{Class: ifaces.FailureRateLimited}, racersdk.ErrorUnavailable},
 		{"transient", &ifaces.OriginError{Class: ifaces.FailureTransient}, racersdk.ErrorUnavailable},
@@ -398,7 +428,7 @@ func TestOriginErrors(t *testing.T) {
 					t.Fatal("error leaked cause")
 				}
 
-				if upstream.heads.Load() != 1 || upstream.pulls.Load() > 1 {
+				if upstream.heads.Load() != 0 || upstream.pulls.Load() != 1 {
 					t.Fatal("failure retried upstream")
 				}
 			})
@@ -503,7 +533,7 @@ func TestFakeClientContinuationFailureIsTerminal(t *testing.T) {
 		t.Fatalf("missing continuation succeeded: bytes=%d, error=%v", n, err)
 	}
 
-	if upstream.heads.Load() != 2 || upstream.pulls.Load() != 2 {
+	if upstream.heads.Load() != 0 || upstream.pulls.Load() != 2 {
 		t.Fatalf("unexpected retry or fallback: heads=%d, pulls=%d", upstream.heads.Load(), upstream.pulls.Load())
 	}
 }
@@ -585,7 +615,7 @@ func TestOriginNonemptyHeadAndCanceledContext(t *testing.T) {
 func TestRegistryOriginManifestContinuation(t *testing.T) {
 	data := bytes.Repeat([]byte("m"), int(racersdk.PageSize)+23)
 
-	var continuations atomic.Int64
+	var continuations, heads atomic.Int64
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/") {
@@ -597,26 +627,27 @@ func TestRegistryOriginManifestContinuation(t *testing.T) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 
 		if r.Method == http.MethodHead {
+			heads.Add(1)
 			return
 		}
 
 		offset := 0
 
-		if r.Header.Get("Range") != "" {
-			if r.Header.Get("Range") != fmt.Sprintf("bytes=%d-", racersdk.PageSize) {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
+		end := int(racersdk.PageSize) - 1
+		if r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racersdk.PageSize, 2*racersdk.PageSize-1) || r.Header.Get("Range") == fmt.Sprintf("bytes=%d-%d", racersdk.PageSize, len(data)-1) {
 			offset = int(racersdk.PageSize)
+			end = len(data) - 1
 
 			continuations.Add(1)
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)-offset))
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, len(data)-1, len(data)))
-			w.WriteHeader(http.StatusPartialContent)
+		} else if r.Header.Get("Range") != fmt.Sprintf("bytes=0-%d", racersdk.PageSize-1) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 
-		_, _ = w.Write(data[offset:])
+		w.Header().Set("Content-Length", strconv.Itoa(end-offset+1))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, end, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[offset : end+1])
 	}))
 	defer server.Close()
 
@@ -638,8 +669,176 @@ func TestRegistryOriginManifestContinuation(t *testing.T) {
 	}
 	defer value.Close()
 
+	if value.Metadata().ContentType != "application/vnd.oci.image.manifest.v1+json; charset=utf-8" {
+		t.Fatalf("manifest media type lost: %q", value.Metadata().ContentType)
+	}
+
 	got, err := io.ReadAll(value)
-	if err != nil || !bytes.Equal(got, data) || continuations.Load() != 1 {
+	if err != nil || !bytes.Equal(got, data) || digestOf(got) != ref.Digest || continuations.Load() != 1 || heads.Load() != 0 {
 		t.Fatalf("manifest continuation: bytes=%d, ranges=%d, error=%v", len(got), continuations.Load(), err)
+	}
+}
+
+type boundedFixture struct {
+	*testUpstream
+	read func(context.Context, ifaces.OriginRef, int64) (io.ReadCloser, int64, string, error)
+}
+
+func (f boundedFixture) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
+	return f.read(ctx, ref, length)
+}
+
+func TestOriginPinnedMetadataConsistency(t *testing.T) {
+	for _, change := range []string{"size", "content type"} {
+		t.Run(change, func(t *testing.T) {
+			size := int64(racersdk.PageSize) + 3
+			fixture := boundedFixture{testUpstream: &testUpstream{}, read: func(_ context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
+				contentType := "application/octet-stream"
+				total := size
+
+				if ref.Offset > 0 {
+					if change == "size" {
+						total++
+					} else {
+						contentType = "application/vnd.oci.image.index.v1+json"
+					}
+				}
+
+				return io.NopCloser(io.LimitReader(zeroReader{}, min(length, total-ref.Offset))), total, contentType, nil
+			}}
+			client := fakeClient(t, Origin(testConfig(), fixture))
+
+			value, err := client.Get(context.Background(), requestFor(t, testRef(), ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer value.Close()
+
+			n, err := io.Copy(io.Discard, value)
+			if err == nil || n >= size {
+				t.Fatalf("changed pinned metadata accepted: bytes=%d err=%v", n, err)
+			}
+
+			if fixture.heads.Load() != 0 {
+				t.Fatal("page issued HEAD")
+			}
+		})
+	}
+}
+
+func TestOriginCredentialsDoNotChangeIdentity(t *testing.T) {
+	a := requestFor(t, testRef(), "Bearer first")
+
+	b := requestFor(t, testRef(), "Bearer second")
+	if a.Key != b.Key || a.Context.Metadata() != b.Context.Metadata() {
+		t.Fatal("credentials affected cache identity")
+	}
+}
+
+func TestRegistryOriginDistributionManifest(t *testing.T) {
+	for _, kind := range []ifaces.OriginRefKind{ifaces.KindManifest, ifaces.KindBlob} {
+		for _, truncated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/truncated=%v", kind, truncated), func(t *testing.T) {
+				const (
+					data        = `{"schemaVersion":2,"manifests":[]}`
+					contentType = "application/vnd.oci.image.index.v1+json"
+				)
+
+				var gets, heads atomic.Int64
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodHead {
+						heads.Add(1)
+						w.WriteHeader(405)
+
+						return
+					}
+
+					gets.Add(1)
+
+					if r.Header.Get("Range") != fmt.Sprintf("bytes=0-%d", racersdk.PageSize-1) {
+						t.Errorf("Range=%q", r.Header.Get("Range"))
+					}
+
+					if strings.Contains(r.URL.Path, "/blobs/") {
+						w.WriteHeader(404)
+						return
+					}
+
+					w.Header().Set("Content-Type", contentType)
+					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+					w.WriteHeader(200)
+
+					payload := data
+					if truncated {
+						payload = data[:len(data)-1]
+					}
+
+					_, _ = io.WriteString(w, payload)
+				}))
+				defer srv.Close()
+
+				cfg := testConfig()
+				cfg.UpstreamRegistries[0].Endpoint = srv.URL
+
+				upstream, err := registryorigin.New(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				client := fakeClient(t, Origin(cfg, upstream))
+				ref := testRef()
+				ref.Kind, ref.Digest = kind, digestOf([]byte(data))
+
+				value, err := client.Get(context.Background(), requestFor(t, ref, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer value.Close()
+
+				got, err := io.ReadAll(value)
+				if truncated {
+					if err == nil {
+						t.Fatal("truncated manifest accepted")
+					}
+				} else if err != nil || string(got) != data || digestOf(got) != ref.Digest {
+					t.Fatalf("body=%q error=%v", got, err)
+				}
+
+				metadata := value.Metadata()
+
+				wantGets := int64(1)
+				if kind == ifaces.KindBlob {
+					wantGets++
+				}
+
+				if metadata.Size != racersdk.ByteLength(len(data)) || metadata.ContentType != contentType || gets.Load() != wantGets || heads.Load() != 0 {
+					t.Fatalf("metadata=%+v gets=%d heads=%d", metadata, gets.Load(), heads.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestRegistryOriginRejectsDelegatedHTTPBeforeIO(t *testing.T) {
+	var hits atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits.Add(1); w.WriteHeader(401) }))
+	defer srv.Close()
+
+	cfg := testConfig()
+	cfg.UpstreamRegistries[0].Endpoint = srv.URL
+
+	upstream, err := registryorigin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := fakeClient(t, Origin(cfg, upstream))
+	_, err = client.Get(context.Background(), requestFor(t, testRef(), "Bearer public-fixture"))
+	requireKind(t, err, racersdk.ErrorUnauthorized)
+
+	if hits.Load() != 0 {
+		t.Fatal("delegated HTTP request reached origin")
 	}
 }

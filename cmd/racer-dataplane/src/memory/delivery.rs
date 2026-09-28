@@ -153,14 +153,37 @@ impl Delivery {
     /// and update HTTP framing. Errors or abandonment cannot return it to a pool.
     pub fn finish_to<'a>(
         &'a self,
+        reader: ReaderLease,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        self.finish_to_inner(reader, connection, scope, false)
+    }
+
+    /// Client body writes are bounded by lack of socket progress, not total
+    /// object duration. Peer writes retain their absolute operation deadline.
+    pub(crate) fn finish_progressing<'a>(
+        &'a self,
+        reader: ReaderLease,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
+        self.finish_to_inner(reader, connection, scope, true)
+    }
+
+    fn finish_to_inner<'a>(
+        &'a self,
         mut reader: ReaderLease,
         mut connection: ConnectionLease,
         scope: &'a RequestScope,
+        progressing: bool,
     ) -> Operation<'a, ConnectionLease> {
         // Also protect abandonment before the returned future's first poll.
         connection.begin_io();
         Box::pin(async move {
-            scope.check()?;
+            if !progressing {
+                scope.check()?;
+            }
             if reader.connection.is_some() {
                 return Err(Error::InvalidRequest);
             }
@@ -177,13 +200,18 @@ impl Delivery {
             let mut budget = 0;
             let mut calls = 0;
             while reader.remaining() != 0 {
-                scope.check()?;
+                if !progressing {
+                    scope.check()?;
+                }
                 let mut send_scope = scope.clone();
-                send_scope.deadline.0 = send_scope.deadline.0.min(
-                    stalled_at
-                        .checked_add(self.stall_timeout)
-                        .ok_or(Error::InvalidConfiguration)?,
-                );
+                let stall_deadline = stalled_at
+                    .checked_add(self.stall_timeout)
+                    .ok_or(Error::InvalidConfiguration)?;
+                send_scope.deadline.0 = if progressing {
+                    stall_deadline
+                } else {
+                    send_scope.deadline.0.min(stall_deadline)
+                };
                 send_scope.check()?;
                 let sent = match reader.try_send(&connection.socket(), copying) {
                     Ok(sent) => sent,
@@ -1065,7 +1093,7 @@ mod tests {
             connection.tx_remaining = Some(512 * 1024);
             let scope = scope();
             let original = scope.deadline.0;
-            let mut operation = delivery.finish_to(reader, connection, &scope);
+            let mut operation = delivery.finish_progressing(reader, connection, &scope);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
             assert_eq!(reactor.in_flight(), 1);

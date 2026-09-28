@@ -1981,6 +1981,7 @@ mod tests {
         use std::sync::Arc;
         PageResult {
             metadata: ObjectMetadata {
+                content_type: None,
                 version: page.version.clone(),
                 length: 3,
                 expires_at: ExpiresAt(std::time::UNIX_EPOCH),

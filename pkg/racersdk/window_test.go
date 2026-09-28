@@ -53,6 +53,7 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
 	}))
 	c := testClient(t, path, 3)
+	c.config.PageWindow = 3
 
 	v, err := c.Get(context.Background(), Request{})
 	if err != nil {
@@ -122,6 +123,7 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 		stopped <- struct{}{}
 	}))
 	c := testClient(t, path, 3)
+	c.config.PageWindow = 3
 
 	v, err := c.Get(context.Background(), Request{})
 	if err != nil {

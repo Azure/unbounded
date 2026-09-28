@@ -140,6 +140,7 @@ impl Fixture {
             .unwrap();
         CiphertextCopy {
             metadata: ObjectMetadata {
+                content_type: None,
                 version,
                 length: length as u64,
                 expires_at: ExpiresAt(std::time::UNIX_EPOCH),

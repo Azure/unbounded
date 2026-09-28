@@ -170,6 +170,32 @@ func (o *OriginPuller) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadClo
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
+// PullRange implements the bounded origin capability without a HEAD lookup.
+func (o *OriginPuller) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, "", err
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.pullCount[ref.Digest.String()]++
+
+	b, ok := o.entries[ref.Digest.String()]
+	if !ok {
+		return nil, 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: 404}
+	}
+
+	size := int64(len(b))
+	if ref.Offset < 0 || length <= 0 || ref.Offset > size || ref.Offset == size && size != 0 {
+		return nil, 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, StatusCode: 416}
+	}
+
+	end := ref.Offset + min(length, size-ref.Offset)
+
+	return io.NopCloser(bytes.NewReader(b[ref.Offset:end])), size, "", nil
+}
+
 // Head implements ifaces.OriginPuller. The fake returns the same size
 // it would have served from Pull (so callers that HEAD-then-GET see a
 // consistent Content-Length) without consuming a Pull slot. The fake

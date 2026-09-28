@@ -171,8 +171,7 @@ func (c FetchContext) Metadata() AdapterMetadata    { return c.metadata }
 func (c FetchContext) Authorization() Authorization { return c.authorization }
 func (c FetchContext) Format(s fmt.State, _ rune)   { writeDiagnostic(s, "FetchContext([redacted])") }
 
-// Request selects a whole fresh object. Pinning and continuation ranges are
-// private protocol details, not caller-selectable Get options.
+// Request identifies an object and its optional origin fetch context.
 type Request struct {
 	Key     Key
 	Context FetchContext
@@ -180,17 +179,42 @@ type Request struct {
 
 func (r Request) Format(s fmt.State, _ rune) { writeDiagnostic(s, "Request([redacted])") }
 
+// ReadOptions selects a pinned byte range. Length zero reads through EOF. Pin
+// optionally selects an existing immutable version; without a snapshot, zero
+// selects fresh metadata.
+// A range extending beyond the object is rejected rather than silently shortened.
+type ReadOptions struct {
+	// SmallObject selects reserved admission for objects no larger than PageSize.
+	// With no range, pin or snapshot it preserves the normal bootstrap GET.
+	// Larger objects fail with ErrorInvalidArgument before a Value is exposed.
+	SmallObject bool
+	Offset      ByteOffset
+	Length      ByteLength
+	Pin         ETag
+	// Metadata is an optional trusted snapshot for this request's object, usually
+	// from Stat. It skips HEAD and pins the GET to its ETag. A nonzero Pin must
+	// match. Get validates and copies the snapshot; do not mutate it during Get.
+	Metadata *Metadata
+}
+
 // Metadata describes the entire immutable version, even for a partial response.
 // ExpiresAt is an admission hint, not a deadline for an admitted stream.
 type Metadata struct {
 	Size      ByteLength
 	ETag      ETag
 	ExpiresAt time.Time
+	// ContentType is optional original-object MIME metadata, carried separately
+	// from the wire body's application/octet-stream Content-Type.
+	ContentType string
 }
 
 // Validate rejects invalid size, absent tags, pre-epoch or overflowing expiry,
 // and sub-millisecond precision without silently rounding opaque metadata.
 func (m Metadata) Validate() error {
+	if err := validateContentType(m.ContentType); err != nil {
+		return err
+	}
+
 	if m.Size > math.MaxInt64 {
 		return failure(ErrorInvalidArgument, "metadata", nil)
 	}
@@ -204,6 +228,108 @@ func (m Metadata) Validate() error {
 	ms := int64(m.ExpiresAt.Nanosecond() / int(time.Millisecond))
 	if sec < 0 || sec > math.MaxInt64/1000 || m.ExpiresAt.Nanosecond()%int(time.Millisecond) != 0 || sec == math.MaxInt64/1000 && ms > math.MaxInt64%1000 {
 		return failure(ErrorInvalidArgument, "metadata", nil)
+	}
+
+	return nil
+}
+
+func validateContentType(s string) error {
+	if s == "" {
+		return nil
+	}
+
+	if len(s) > 256 || strings.TrimSpace(s) != s {
+		return failure(ErrorInvalidArgument, "content type", nil)
+	}
+
+	for i := range len(s) {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return failure(ErrorInvalidArgument, "content type", nil)
+		}
+	}
+
+	rest := s
+	token := func() string {
+		i := 0
+		for i < len(rest) && headerToken(rest[i]) {
+			i++
+		}
+
+		value := rest[:i]
+		rest = rest[i:]
+
+		return value
+	}
+	consume := func(b byte) bool {
+		if len(rest) == 0 || rest[0] != b {
+			return false
+		}
+
+		rest = rest[1:]
+
+		return true
+	}
+
+	bad := failure(ErrorInvalidArgument, "content type", nil)
+	if token() == "" || !consume('/') || token() == "" {
+		return bad
+	}
+
+	var parameters []string
+
+	for rest != "" {
+		rest = strings.TrimLeft(rest, " ")
+
+		if !consume(';') {
+			return bad
+		}
+
+		rest = strings.TrimLeft(rest, " ")
+
+		name := token()
+		if name == "" {
+			return bad
+		}
+
+		for _, old := range parameters {
+			if strings.EqualFold(old, name) {
+				return bad
+			}
+		}
+
+		parameters = append(parameters, name)
+		rest = strings.TrimLeft(rest, " ")
+
+		if !consume('=') {
+			return bad
+		}
+
+		rest = strings.TrimLeft(rest, " ")
+
+		if consume('"') {
+			for {
+				if rest == "" {
+					return bad
+				}
+
+				b := rest[0]
+				rest = rest[1:]
+
+				if b == '"' {
+					break
+				}
+
+				if b == '\\' {
+					if rest == "" {
+						return bad
+					}
+
+					rest = rest[1:]
+				}
+			}
+		} else if token() == "" {
+			return bad
+		}
 	}
 
 	return nil

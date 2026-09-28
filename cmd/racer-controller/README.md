@@ -25,7 +25,23 @@ both the test-only reference codec and the existing Rust runtime codec.
 - `internal/racer/wire`: shared contract declarations and bounded codec boundaries.
 - `deploy/racer`: controller/RBAC/config/admission templates.
 - `internal/operator/components/racer`: the sole controller Deployment and dataplane
-  DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet` builder.
+  DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet(WorkloadConfig)` builder.
+
+`WorkloadConfig` validates only dataplane deployment inputs: cluster UUID,
+namespace, peer port, DaemonSet/service account/keyring/trust names, HTTPS control
+URL, and image. The operator loads it with `WorkloadConfigFromLookup` from the
+preserved `racer-config` payload. Controller `Config` and `ConfigFromLookup` cover
+runtime settings independently; limits, rotation policy, serving TLS, and durable
+state settings are not prerequisites for building a DaemonSet. Invalid controller
+runtime settings are rejected by controller startup rather than workload planning.
+`RACER_DATAPLANE_IMAGE`, `RACER_CONTROL_URL`, and `RACER_BOOTSTRAP_TRUST_CONFIGMAP`
+remain deployment wiring in `racer-config`, but the controller does not read them.
+
+Topology lists Pods in the installation namespace using the assigned-node index
+and passes those grouped lists directly to the pure `ReconcileMembers` helper.
+Endpoint selection verifies node assignment and the current DaemonSet owner UID.
+Membership diagnostics follow Node UID order; candidate history owns its nested
+state and is installed only after the publication commits.
 
 There is no Kubernetes abstraction, custom queue/leader-election framework,
 per-node Secret, enrollment ledger, or goal-state checkpoint store. Only the
@@ -304,8 +320,10 @@ evict a working cache. Deleting a rejected object changes nothing; deleting an
 admitted object frees a slot for the next waiting UID. Recreation has a new UID
 and unrelated keys. Topology reads authoritative inputs and publishes additions
 only after their keys commit; a Secret watch drives that follow-up reconciliation.
-Catalog and keyring reconciliation share a leader-local gate to prevent a stale
-in-progress topology candidate from racing key pruning. Kubelet projection and
+Topology, keyring reconciliation, and issuance share a context-aware, leader-local
+`CatalogGate` to serialize authoritative catalog and credential operations and
+prevent an in-progress topology candidate from racing key pruning. Canceled
+admission preserves accepted trust and publications. Kubelet projection and
 snapshot delivery are still asynchronous, not an atomic dataplane transaction.
 
 Capacity rejection alone preserves usable admitted credentials, rotation, and

@@ -564,6 +564,7 @@ mod tests {
             key: CacheKey([0; 32]),
         };
         let metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: object.clone(),
                 etag: StrongEtag::test_value("new"),

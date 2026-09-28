@@ -125,7 +125,12 @@ fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
     crate::memory::page::PageResult {
         plaintext,
         ciphertext,
-        metadata: VersionMetadata { version, length: 3 }.for_pin(),
+        metadata: VersionMetadata {
+            version,
+            length: 3,
+            content_type: None,
+        }
+        .for_pin(),
     }
 }
 
@@ -659,6 +664,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         })
         .unwrap();
     let metadata = VersionMetadata {
+        content_type: None,
         version: ObjectVersion {
             object: ObjectId {
                 cache: keep.id.clone(),

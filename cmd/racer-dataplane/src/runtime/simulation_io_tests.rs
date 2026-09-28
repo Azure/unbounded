@@ -24,6 +24,7 @@ fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences
         let bundle = crate::memory::pool::tests::bundle_for(
             &r.admission,
             VersionMetadata {
+                content_type: None,
                 version: ObjectVersion {
                     object: ObjectId {
                         cache: CacheId("cache".into()),

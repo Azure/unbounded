@@ -45,7 +45,7 @@ The [control API](CONTROL_API.md) provisions caches and credentials separately.
 
 Header names are case-insensitive. Reject repeated `Host`, `Content-Length`,
 `Content-Type`, `Content-Range`, `ETag`, `If-Match`, `Range`, `Racer-Expires-At`,
-`Racer-Metadata`, or `Authorization`, even when identical. Reject list-valued
+`Racer-Metadata`, `Racer-Content-Type`, or `Authorization`, even when identical. Reject list-valued
 framing, folded lines, and duplicate framing before a library normalizes them.
 Unknown non-framing fields may be ignored but count toward the limit. Unsupported
 HTTP conditional fields (`If-None-Match`, date conditions, `If-Range`) are invalid.
@@ -73,6 +73,7 @@ Successful metadata consists of:
 | --- | --- |
 | `ETag` | One strong quoted tag, 2-8192 bytes including quotes. Interior bytes are ASCII `!` (0x21) or 0x23-0x7e. Empty `""` is valid. No escaping: backslash is literal, embedded quote is invalid. Reject `W/`, wildcard, and tag lists. A comma inside quotes is literal. |
 | `Racer-Expires-At` | Absolute Unix milliseconds in `0..9223372036854775807`, decimal digits, no sign, padding, whitespace, or leading zeros except `0`. |
+| `Racer-Content-Type` | Optional object MIME metadata, 1-256 ASCII bytes when present. Require `type/subtype` with optional MIME parameters. Reject controls (including tabs), DEL, non-ASCII, leading/trailing spaces, duplicate fields/parameter names, lists, and malformed token/quoted-string syntax. Preserve the value; absence is unknown. Go exposes `Metadata.ContentType string`, with empty string meaning absent. |
 | Object size | `0..9223372036854775807` bytes. HEAD carries total size in `Content-Length`; 206 carries it in `Content-Range`. |
 
 All range/length numbers use the same canonical decimal syntax and are bounded by
@@ -84,6 +85,30 @@ TTL; it must not authorize later unpinned cache hits. Explicit pins and admitted
 streams may continue after expiry. The metadata resolver implements this zero-TTL
 and retained-version behavior (`src/read/metadata.rs:321-360`), with production
 coverage in `tests/production_dataplane.rs`.
+
+Object content type travels from the origin's `Racer-Content-Type` response header
+through version metadata, retained pages, signed peer metadata, and client HEAD/GET
+responses. It never replaces transport `Content-Type: application/octet-stream`.
+Two present content types for the same version must agree; legacy absence is not
+a conflicting claim. HEAD remains metadata-only and does not retrieve a body.
+
+### Metadata compatibility
+
+The client/origin HTTP operations remain v1 with an optional response header.
+Peers use the existing signed response shape when content type is absent. A typed
+response additionally signs `racer-metadata-version: 2` and `racer-content-type`;
+new decoders reject unknown versions, a missing typed value, or an unversioned
+typed value. Old strict peer decoders reject this extension, so mixed-version peer
+paths carrying typed metadata can fail until all participating nodes are upgraded.
+There is no silent downgrade or capability negotiation.
+
+Disk records without content type retain their exact v1 bytes. Typed records use
+record version 2 and append a little-endian u32 byte count plus MIME bytes before
+the header digest. New checkpoints use version 2 with a counted MIME string after
+each descriptor's length (zero count means absent). Readers accept versions 1 and
+2; v1 descriptors recover with unknown content type. No existing record is rewritten
+or deleted by this extension. Old binaries cannot read v2 records/checkpoints;
+rollback requires retaining a compatible checkpoint or refetching cache data.
 
 ## Operations
 
@@ -118,9 +143,25 @@ the dataplane, not by the Go client.
 
 Pinned client ranges have no successful-page-count limit. The dataplane bounds
 acquisition attempts and forwarded links per page, and keeps a bounded page
-window under the original request deadline. Progress to a distinct page gets a
-new page allowance; retries and peer forwarding within that page do not. Deadline,
-overload, or acquisition failure can still terminate a stream after headers.
+window. Idle/request-head reception and initial metadata/first-page acquisition
+remain bounded by `RACER_REQUEST_TIMEOUT_MS` (default 30000). After success headers,
+each newly admitted distinct page gets a fixed child acquisition deadline of that
+duration and bounded attempts/links. Already admitted pages, retries, and peer
+forwarding never renew their deadline or credits. Explicit aggregate-budget APIs
+and peer operations retain their absolute deadlines.
+
+Client body writes instead use `RACER_READER_STALL_TIMEOUT_MS`: positive socket
+write progress resets the stall clock, allowing progressing multipage objects to
+outlive the old absolute request timeout. Pending prefetch is polled during writes
+without growing the window. Full caller disconnect cancels pending acquisition;
+half-closing request writes does not cancel response reads. Submitted I/O retains
+its buffers and admission until completion fences, including after cancellation.
+Deadline, overload, or acquisition failure can still truncate a started stream.
+
+The Go client bootstraps page zero, then requests the entire pinned remainder.
+`Get` context lifetime covers the returned body until completion or Close; the
+first-response-header timeout is separately bounded at 60 seconds. Callers must
+close abandoned values. Neither client nor dataplane buffers the entire object.
 
 Fresh HEAD/bootstrap missing objects return 404. A valid pin whose version no
 longer exists (including object deletion) returns 412. Credential rejection remains

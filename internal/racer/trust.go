@@ -63,7 +63,12 @@ func authorityReadFailure(err error) error {
 	return authorityReadError{err}
 }
 
-func observedAuthorityFailure(err error) bool {
+// shouldInvalidateTrust is a fail-closed policy, not proof of invalid authority.
+// Only an authorityReadError preserves accepted trust; every other non-nil error
+// invalidates it, including NotFound, validation, write, and unclassified failures.
+// Unwrapped cancellation also invalidates; callers that fail gate admission return
+// before applying this policy because they have not started observing authority.
+func shouldInvalidateTrust(err error) bool {
 	var unread authorityReadError
 	return err != nil && !errors.As(err, &unread)
 }

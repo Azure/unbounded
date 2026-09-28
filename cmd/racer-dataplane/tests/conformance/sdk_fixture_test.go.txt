@@ -58,7 +58,7 @@ func TestRustWireClientFixture(t *testing.T) {
 	defer value.Close()
 
 	snapshot := value.Metadata()
-	if int64(snapshot.Size) != size || snapshot.ETag.String() != `"v"` || snapshot.ExpiresAt.UnixMilli() != 0 {
+	if int64(snapshot.Size) != size || snapshot.ETag.String() != `"v"` || snapshot.ExpiresAt.UnixMilli() != 0 || snapshot.ContentType != "application/vnd.oci.image.manifest.v1+json" {
 		t.Fatal("wrong initial metadata")
 	}
 
@@ -93,6 +93,46 @@ func TestRustWireClientFixture(t *testing.T) {
 }
 
 type rustWireSink struct{ offset int64 }
+
+func TestRustWireRangeFixture(t *testing.T) {
+	size, err := strconv.ParseInt(os.Getenv("RACER_CONFORMANCE_SIZE"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := ParseCacheName("conformance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := newClient(ClientConfig{Cache: cache, MaxConnections: 1, MetadataConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	m, err := client.Stat(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(m.Size) != size || m.ETag.String() != `"v"` || m.ContentType != "text/plain" {
+		t.Fatal("HEAD metadata mismatch")
+	}
+	first := int64(0)
+	if size > 0 {
+		first = min(size-1, int64(PageSize)-3)
+	}
+	length := min(size-first, int64(PageSize)+9)
+	v, err := client.Get(ctx, Request{}, ReadOptions{Offset: ByteOffset(first), Length: ByteLength(length), Pin: m.ETag})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	sink := &rustWireSink{offset: first}
+	n, err := v.WriteTo(sink)
+	if err != nil || n != length || sink.offset != first+length || v.Metadata() != m {
+		t.Fatal("range stream mismatch", n, err)
+	}
+}
 
 func (w *rustWireSink) Write(p []byte) (int, error) {
 	for i, b := range p {
@@ -129,7 +169,7 @@ func TestRustWireOriginFixture(t *testing.T) {
 	}
 
 	err = serveOrigin(ctx, OriginConfig{Cache: cache}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-		m := Metadata{Size: 3, ETag: tag, ExpiresAt: time.UnixMilli(0)}
+		m := Metadata{Size: 3, ETag: tag, ExpiresAt: time.UnixMilli(0), ContentType: "text/plain"}
 		if r.Context().Metadata().ForOrigin() != "opaque,  bytes\xff" || r.Context().Authorization().ForOrigin() != "fixture credential\x80" {
 			return Metadata{}, nil, fmt.Errorf("changed context")
 		}

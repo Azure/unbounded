@@ -213,7 +213,11 @@ func TestFakeClientContinuationErrors(t *testing.T) {
 				t.Fatal("incorrect partial byte count", n)
 			}
 
-			assertKind(t, err, ErrorVersionUnavailable)
+			if failPage == 1 {
+				assertKind(t, err, ErrorVersionUnavailable)
+			} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatal("late multipage failure must truncate the committed frame", err)
+			}
 		})
 	}
 }
@@ -367,10 +371,8 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 				t.Fatal("changed immutable version was accepted", n, err)
 			}
 
-			if change == "pin" {
-				assertKind(t, err, ErrorBadGateway)
-			} else {
-				assertKind(t, err, ErrorProtocol)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatal("late immutable metadata failure must abort the committed frame", err)
 			}
 		})
 	}

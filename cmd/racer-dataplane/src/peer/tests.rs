@@ -1354,6 +1354,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         .unwrap();
     let response = PeerResponse::Page {
         metadata: ObjectMetadata {
+            content_type: None,
             version,
             length: 8192,
             expires_at: ExpiresAt(std::time::UNIX_EPOCH),

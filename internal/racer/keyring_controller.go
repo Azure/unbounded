@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,44 +20,36 @@ import (
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 )
 
-type RotationPolicy struct {
-	Interval   time.Duration
-	PrepareFor time.Duration
-	RetainFor  time.Duration
-}
-
-// RotationState lives beside bundle.json in the shared Secret. It is sufficient
-// to resume transitions after restart; no rotation-job or acknowledgment objects.
-type RotationState struct {
-	NextTransition time.Time            `json:"next_transition"`
-	NextRotation   time.Time            `json:"next_rotation"`
-	ActivateAt     time.Time            `json:"activate_at"`
-	ActiveIssuer   string               `json:"active_issuer"`
-	PreparedIssuer string               `json:"prepared_issuer"`
-	Retiring       map[string]time.Time `json:"retiring"`
-}
-
 type KeyringReconciler struct {
 	client.Client
-	APIReader client.Reader
-	Config    Config
-	Issuer    *Issuer
-	Trust     *Trust
-	Lifecycle *Lifecycle
-	Now       func() time.Time
-	CatalogMu *sync.Mutex
+	APIReader   client.Reader
+	Config      Config
+	Trust       *Trust
+	Lifecycle   *Lifecycle
+	Now         func() time.Time
+	CatalogGate *CatalogGate
 }
 
 // Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
 // stages trust before using a new issuer, and returns RequeueAfter for deadlines.
 // Enforce projected size bounds including overlapping keys before committing.
 func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if r.CatalogMu != nil {
-		r.CatalogMu.Lock()
-		defer r.CatalogMu.Unlock()
+	if r.CatalogGate != nil {
+		if err := r.CatalogGate.Acquire(ctx); err != nil {
+			return ctrl.Result{}, reconcile.TerminalError(err)
+		}
+		defer r.CatalogGate.Release()
 	}
 
 	result, err := r.reconcileKeys(ctx)
+
+	return r.finishKeyringReconcile(ctx, result, err)
+}
+
+// finishKeyringReconcile runs while the catalog gate is still held. It refreshes
+// committed trust, applies failure policy, updates readiness, then selects retry
+// behavior. Failed gate admission must not pass through this completion path.
+func (r *KeyringReconciler) finishKeyringReconcile(ctx context.Context, result ctrl.Result, err error) (ctrl.Result, error) {
 	// Install only after authoritative validation of the committed credentials,
 	// including installation binding, rotation consistency, and signing lifetime.
 	if err == nil {
@@ -70,11 +61,12 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		}
 	}
 
+	// Cancellation after admission overrides even an unavailable authority read.
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
 
-	if observedAuthorityFailure(err) {
+	if shouldInvalidateTrust(err) {
 		r.Trust.invalidate()
 	}
 

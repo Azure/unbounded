@@ -103,7 +103,7 @@ pub struct ConnectionLease {
     pub(crate) control_reservation: Option<Reservation>,
     pub(crate) fd: Rc<OwnedFd>,
     reusable: bool,
-    reservation: Option<ConnectionReservation>,
+    pub(crate) reservation: Option<Rc<ConnectionReservation>>,
     pool: Option<ReturnToPool>,
     pub(crate) read_ahead: Option<(OwnedBuffer, std::ops::Range<usize>)>,
     pub(crate) rx_remaining: Option<u64>,
@@ -132,7 +132,7 @@ impl ConnectionLease {
             session: None,
             control_reservation: None,
             reusable: false,
-            reservation: Some(reservation),
+            reservation: Some(Rc::new(reservation)),
             pool,
             read_ahead: None,
             rx_remaining: None,
@@ -209,7 +209,9 @@ impl Drop for ConnectionLease {
                 && self.reusable
                 && Rc::strong_count(&self.fd) == 1
             {
-                if let Some(reservation) = self.reservation.take() {
+                if let Some(reservation) =
+                    self.reservation.take().and_then(|r| Rc::try_unwrap(r).ok())
+                {
                     entry.idle.push(Idle {
                         session: self.session.take(),
                         fd: self.fd.clone(),

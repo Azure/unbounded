@@ -22,8 +22,17 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("topology and HTTP must share the single publication owner")
 	}
 
-	if a.Keyring.Issuer != a.Server.Bootstrap.Issuer {
-		t.Fatal("rotation and issuance must share the issuer")
+	issuer := a.Server.Bootstrap.Issuer
+	if issuer == nil {
+		t.Fatal("bootstrap must have an issuer")
+	}
+
+	if a.Server.Trust == nil || a.Keyring.Trust != a.Server.Trust || a.Topology.Trust != a.Server.Trust || issuer.Trust != a.Server.Trust {
+		t.Fatal("controllers, issuance, and serving must share trust")
+	}
+
+	if a.Keyring.CatalogGate == nil || a.Topology.CatalogGate != a.Keyring.CatalogGate || issuer.CatalogGate != a.Keyring.CatalogGate {
+		t.Fatal("controllers and issuance must share the catalog gate")
 	}
 
 	if a.Keyring.Lifecycle != a.Lifecycle || a.Server.Lifecycle != a.Lifecycle {
@@ -46,7 +55,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	operations := map[string]func() error{
 		"topology": func() error { _, err := a.Topology.Reconcile(ctx, ctrl.Request{}); return err },
 		"keyring":  func() error { _, err := a.Keyring.Reconcile(ctx, ctrl.Request{}); return err },
-		"workload": func() error { _, err := DesiredDaemonSet(Config{}); return err },
+		"workload": func() error { _, err := DesiredDaemonSet(WorkloadConfig{}); return err },
 		"server":   func() error { return a.Server.Start(ctx) },
 		"run":      func() error { return Run(ctx, Config{}) },
 	}

@@ -308,6 +308,10 @@ fn metadata(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<()> {
     version(head, &metadata.version)?;
     push(head, "racer-length", metadata.length);
     push(head, "racer-expires", millis(metadata.expires_at.0)?);
+    if let Some(content_type) = &metadata.content_type {
+        push(head, "racer-metadata-version", 2);
+        push(head, "racer-content-type", content_type.as_str());
+    }
     Ok(())
 }
 /// Encode all response outcomes against SHA-256 of the exact original signed

@@ -9,6 +9,9 @@ use super::{
 };
 use crate::error::{Error, Result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[path = "content_type.rs"]
+mod content_type;
+pub use content_type::{CONTENT_TYPE_HEADER, ContentType, MAX_CONTENT_TYPE_BYTES};
 
 /// Absolute Unix-millisecond deadline in 0..=i64::MAX, never a stream deadline.
 /// The public tuple field is retained for compatibility; validate before encoding.
@@ -51,6 +54,7 @@ impl ExpiresAt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectMetadata {
+    pub content_type: Option<ContentType>,
     pub version: ObjectVersion,
     pub length: u64,
     pub expires_at: ExpiresAt,
@@ -60,6 +64,7 @@ pub struct ObjectMetadata {
 /// Retained by page copies independently of the bounded page-zero metadata catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionMetadata {
+    pub content_type: Option<ContentType>,
     pub version: ObjectVersion,
     pub length: u64,
 }
@@ -84,6 +89,7 @@ impl ObjectMetadata {
 
     pub fn immutable(&self) -> VersionMetadata {
         VersionMetadata {
+            content_type: self.content_type.clone(),
             version: self.version.clone(),
             length: self.length,
         }
@@ -91,10 +97,19 @@ impl ObjectMetadata {
 }
 
 impl VersionMetadata {
+    /// Absence in legacy data is unknown, not a conflicting MIME claim.
+    pub fn compatible(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.length == other.length
+            && (self.content_type.is_none()
+                || other.content_type.is_none()
+                || self.content_type == other.content_type)
+    }
     /// A recovered or retained immutable descriptor can answer a pin, but carries
     /// no reusable freshness claim. Never infer total length from a page's bytes.
     pub fn for_pin(&self) -> ObjectMetadata {
         ObjectMetadata {
+            content_type: self.content_type.clone(),
             version: self.version.clone(),
             length: self.length,
             expires_at: ExpiresAt(UNIX_EPOCH),
@@ -139,6 +154,7 @@ impl CurrentVersion {
         }
         self.expires_at.to_unix_millis()?;
         Ok((now < self.expires_at.0).then(|| ObjectMetadata {
+            content_type: descriptor.content_type.clone(),
             version: descriptor.version.clone(),
             length: descriptor.length,
             expires_at: self.expires_at,
@@ -238,6 +254,7 @@ mod tests {
 
     pub(crate) fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),

@@ -152,14 +152,15 @@ func tokenExpiration(token string) (time.Time, error) {
 // Enroll validates CSR proof of possession and binds the issued identity to the
 // token, not caller-provided SANs. Every issuance uses a token, including renewal.
 // Retries correlate by enrollment ID; there is no persistent receipt ledger.
-func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) (wire.BootstrapResponse, error) {
+// The returned bytes are the issuer's bounded, validated JSON response.
+func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
 	identity, err := b.Authenticate(ctx, r)
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	if b.Issuer == nil {
-		return wire.BootstrapResponse{}, wire.Unavailable
+		return nil, wire.Unavailable
 	}
 
 	ctx, cancel := context.WithDeadline(ctx, identity.expires)
@@ -167,19 +168,19 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 
 	response, err := b.Issuer.Issue(ctx, identity, request)
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 	// Resolve the same live UID again before persisting an authenticated proposal.
 	// The annotation is a proposal only; explicit administrator shares win.
 	var live corev1.Node
 	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: identity.nodeName}, &live); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	node := &live
 	if wire.NodeID(node.UID) == identity.node {
 		if !authorizedNode(node) {
-			return wire.BootstrapResponse{}, wire.Forbidden
+			return nil, wire.Forbidden
 		}
 
 		shares := request.Shares
@@ -196,12 +197,12 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 
 			node.Annotations[enrolledSharesAnnotation] = value
 			if err := b.Client.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-				return wire.BootstrapResponse{}, err
+				return nil, err
 			}
 		}
 
 		return response, nil
 	}
 
-	return wire.BootstrapResponse{}, wire.Forbidden
+	return nil, wire.Forbidden
 }
