@@ -1243,6 +1243,7 @@ mod tests {
         };
         let ciphertext = CiphertextPage {
             inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
                     page,
                     key_id: KeyId([6; 16]),
@@ -1276,6 +1277,7 @@ mod tests {
             }
             let body = CiphertextPage {
                 inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
                     envelope,
                     bytes: vec![0; 23],
                     reservation: self::request(5).origin.reservation,
@@ -1337,6 +1339,7 @@ mod tests {
             };
             let ciphertext = CiphertextPage {
                 inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
                         page,
                         key_id: KeyId([3; 16]),
@@ -1617,6 +1620,7 @@ mod tests {
         // authenticate its body. Only the signed descriptor is consumed here.
         let ciphertext = CiphertextPage {
             inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
                 envelope: envelope.clone(),
                 bytes: vec![0; 19],
                 reservation,
@@ -1649,6 +1653,7 @@ mod tests {
             let reservation = request(3).origin.reservation;
             let bad = CiphertextPage {
                 inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
                     envelope: e,
                     bytes: vec![0; 19],
                     reservation,

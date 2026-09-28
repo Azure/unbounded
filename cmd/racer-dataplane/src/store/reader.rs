@@ -162,6 +162,9 @@ impl StoreReader {
                 decoded.header.envelope,
                 buffer.bytes()?[decoded.ciphertext].to_vec(),
             )?;
+            if let Some(checksum) = decoded.checksum {
+                ciphertext.expected_checksum(checksum)?;
+            }
             self.clock.mark_read(entry.location.segment)?;
             Ok(Some((
                 CiphertextCopy {

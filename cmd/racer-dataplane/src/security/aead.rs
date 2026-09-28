@@ -223,6 +223,7 @@ impl PageCryptoEngine {
                     plaintext,
                 } => {
                     let envelope = ciphertext.envelope();
+                    ciphertext.verify_checksum()?;
                     if key.cache() != &envelope.page.version.object.cache
                         || key.id() != envelope.key_id
                     {
@@ -277,6 +278,7 @@ impl PageCryptoEngine {
                     };
                     let encrypted = CiphertextPage {
                         inner: Arc::new(CiphertextBytes {
+                            checksum: std::sync::OnceLock::from(super::crc64::checksum(&bytes)),
                             envelope,
                             bytes: std::mem::take(&mut *bytes),
                             reservation: ciphertext,
@@ -895,6 +897,7 @@ mod tests {
             };
             let cipher = CiphertextPage {
                 inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
                     envelope: descriptor.clone(),
                     bytes: vec![0; 21],
                     reservation: admission

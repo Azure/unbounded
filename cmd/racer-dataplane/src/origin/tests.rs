@@ -887,10 +887,7 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
         ),
         Err(Error::BadGateway)
     ));
-    assert_eq!(
-        admission.used(ResourceClass::RequestContext),
-        infrastructure_bytes
-    );
+    assert_eq!(admission.used(ResourceClass::RequestContext), infrastructure_bytes + client.io.retained_buffer_bytes());
     assert_eq!(admission.used(ResourceClass::Connection), 0);
     server.join().unwrap();
 }
@@ -928,7 +925,7 @@ fn real_uds_cancelled_and_expired_reads_release_owned_resources() {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert_eq!(
             admission.used(ResourceClass::RequestContext),
-            infrastructure_bytes
+            infrastructure_bytes + client.io.retained_buffer_bytes()
         );
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }

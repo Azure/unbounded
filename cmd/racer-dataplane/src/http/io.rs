@@ -17,17 +17,33 @@ use crate::{
         reactor::{Completion, IoBuffer, Reactor, SendBuffer},
     },
 };
-use std::{ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    ops::Range,
+    rc::{Rc, Weak},
+};
 use zeroize::{Zeroize, Zeroizing};
 /// Bounded, address-stable staging storage. Constructor reserves quota before
 /// allocation; ownership includes that quota through reactor completion.
 pub struct OwnedBuffer {
     bytes: Box<[u8]>,
-    reservation: Reservation,
+    reservation: Option<Reservation>,
+    pool: Weak<RefCell<Option<OwnedBuffer>>>,
 }
 impl Drop for OwnedBuffer {
     fn drop(&mut self) {
         self.bytes.zeroize();
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut idle) = pool.try_borrow_mut() {
+                if idle.is_none() {
+                    *idle = Some(Self {
+                        bytes: std::mem::take(&mut self.bytes),
+                        reservation: self.reservation.take(),
+                        pool: Weak::new(),
+                    });
+                }
+            }
+        }
     }
 }
 impl OwnedBuffer {
@@ -40,7 +56,8 @@ impl OwnedBuffer {
         bytes.resize(length, 0);
         Ok(Self {
             bytes: bytes.into_boxed_slice(),
-            reservation,
+            reservation: Some(reservation),
+            pool: Weak::new(),
         })
     }
     pub fn copy_from(admission: &Admission, bytes: &[u8]) -> Result<Self> {
@@ -89,6 +106,7 @@ pub struct HttpIo {
     codec: super::codec::Codec,
     send_body_limit: u64,
     admission: Option<Rc<Admission>>,
+    idle_buffer: Rc<RefCell<Option<OwnedBuffer>>>,
 }
 
 /// Immutable subrange owner; cannot be submitted to a receive operation.
@@ -134,6 +152,7 @@ impl HttpIo {
             send_body_limit: codec.body_limit(),
             codec,
             admission: None,
+            idle_buffer: Rc::default(),
         }
     }
     /// Production constructor. The legacy constructor is retained for composition
@@ -148,6 +167,7 @@ impl HttpIo {
             send_body_limit: codec.body_limit(),
             codec,
             admission: Some(admission),
+            idle_buffer: Rc::default(),
         }
     }
     /// Local client responses stream an entire object range rather than one page.
@@ -170,12 +190,42 @@ impl HttpIo {
         io
     }
     pub fn buffer(&self, length: usize) -> Result<OwnedBuffer> {
-        OwnedBuffer::new(
-            self.admission
-                .as_deref()
-                .ok_or(Error::InvalidConfiguration)?,
-            length,
-        )
+        let admission = self
+            .admission
+            .as_deref()
+            .ok_or(Error::InvalidConfiguration)?;
+        if admission.is_stopped() {
+            return Err(Error::Unavailable);
+        }
+        let idle = self.idle_buffer.borrow_mut().take();
+        let mut buffer = match idle {
+            Some(buffer) if buffer.bytes.len() == length => buffer,
+            other => {
+                drop(other);
+                OwnedBuffer::new(
+                    self.admission
+                        .as_deref()
+                        .ok_or(Error::InvalidConfiguration)?,
+                    length,
+                )?
+            }
+        };
+        // Retain at most one ordinary head-sized allocation, never a maximum
+        // multi-hop envelope that could monopolize shared context admission.
+        if length <= 65536 {
+            buffer.pool = Rc::downgrade(&self.idle_buffer);
+        }
+        Ok(buffer)
+    }
+    pub fn retained_buffer_bytes(&self) -> usize {
+        self.idle_buffer
+            .borrow()
+            .as_ref()
+            .and_then(|b| b.reservation.as_ref())
+            .map_or(0, Reservation::amount)
+    }
+    pub fn reclaim_buffer(&self) {
+        self.idle_buffer.borrow_mut().take();
     }
     /// Share reactor/admission while applying a smaller endpoint-specific head cap.
     pub fn capped(&self, header_limit: usize) -> Self {
@@ -184,6 +234,7 @@ impl HttpIo {
             codec: self.codec.limited(header_limit),
             send_body_limit: self.send_body_limit,
             admission: self.admission.clone(),
+            idle_buffer: self.idle_buffer.clone(),
         }
     }
     pub fn receive_head<'a>(
@@ -684,6 +735,26 @@ fn rejected_head(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn staging_recycles_zeroed_backing_with_retained_admission() {
+        let (admission, _, io, _) = setup();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let mut buffer = io.buffer(4096).unwrap();
+        let pointer = buffer.bytes().unwrap().as_ptr();
+        buffer.bytes_mut().unwrap().fill(91);
+        drop(buffer);
+        assert_eq!(io.retained_buffer_bytes(), 4096);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + 4096
+        );
+        let buffer = io.buffer(4096).unwrap();
+        assert_eq!(buffer.bytes().unwrap().as_ptr(), pointer);
+        assert!(buffer.bytes().unwrap().iter().all(|b| *b == 0));
+        drop(buffer);
+        io.reclaim_buffer();
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+    }
+    #[test]
     fn decoded_field_storage_is_admitted_before_parser_allocations() {
         let (admission, reactor, io, scope) = setup();
         reactor.init().unwrap();
@@ -710,7 +781,10 @@ mod tests {
         assert_eq!(reactor.in_flight(), 0);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         drop(held);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
     }
     use super::*;
     use crate::{
@@ -860,7 +934,10 @@ mod tests {
         ));
         thread.join().unwrap();
         drain(&reactor);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
@@ -1000,7 +1077,10 @@ mod tests {
         drop(received._decoded);
         thread.join().unwrap();
         drain(&reactor);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
@@ -1137,7 +1217,10 @@ mod tests {
         drop(future);
         scope.cancel().unwrap();
         drain(&reactor);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
@@ -1340,7 +1423,10 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         assert!(matches!(drive(&reactor, future), Err(Error::Cancelled)));
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
     }
     #[test]
     fn raw_request_head_errors_return_fenced_socket_for_empty_400_and_431() {
@@ -1376,7 +1462,10 @@ mod tests {
             .unwrap();
             assert!(matches!(outcome.value, Err(error) if error == expected));
             assert_eq!(reactor.in_flight(), 0);
-            assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+            assert_eq!(
+                admission.used(ResourceClass::RequestContext),
+                baseline + io.retained_buffer_bytes()
+            );
             assert!(outcome.connection.read_ahead.is_none());
             assert!(!outcome.connection.is_reusable());
             assert_eq!(

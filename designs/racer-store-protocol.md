@@ -174,3 +174,12 @@ maintenance operation; it is not a nonblocking reactor metadata-I/O adapter.
 
 `invalidate_persisted_async` is an explicit reset utility, not a serving-loop key
 or cache retirement requirement. Its filesystem operations retain completion owners.
+# Phase 4 record v2
+
+New records write version 2 with an eight-byte little-endian CRC-64/ECMA-182
+ciphertext checksum after cache/ETag bytes and before the header SHA-256. Header
+and logical lengths include these bytes. Version 1 remains readable with no CRC
+field; unknown versions and malformed headers are safe misses. Crypto workers
+verify v2 payload CRC before AEAD plaintext publication. CRC is not authentication;
+AEAD is still mandatory and no unverified bytes reach clients. No destructive
+migration or slab rewrite is required.

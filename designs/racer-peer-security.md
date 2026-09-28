@@ -1,4 +1,18 @@
-# Racer peer security v3
+# Racer peer security v4
+
+V4 supersedes v3 below: profile `racer-peer-v4`, outer version `4`, and
+`/racer/peer/v4/exchange`. Every original request additionally carries
+`racer-mac-key` and `racer-request-mac` (canonical padded base64). The key ID
+selects a trusted OriginCredentials epoch. HMAC-SHA256 derives a request-only
+subkey over `racer/request-mac/key/v1\0`, u32-BE length-prefixed cache UID and
+16-byte key ID. Raw credential AEAD keys and page keys are never used as request
+MAC keys. MAC input begins `racer/request-mac/message/v1\0`, then length-prefixed
+method-space-target, then sorted length-prefixed header names and values,
+excluding Signature, Signature-Input and racer-request-mac. All identity,
+freshness and route fields are included; Ed25519 signs the MAC fields too.
+Existing certificate sessions, sequence checks, original/destination authority
+and forwarding proofs remain mandatory. Key retirement follows existing keyring
+admission. Mixed v3/v4 fails closed and requires coordinated upgrade.
 
 Phase 4 is a coordinated dataplane upgrade. The signed profile is
 `racer-peer-v3`, outer version is `3`, and exchange target is

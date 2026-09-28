@@ -773,6 +773,7 @@ mod tests {
                 };
                 let ciphertext = CiphertextPage {
                     inner: Arc::new(CiphertextBytes {
+                        checksum: std::sync::OnceLock::new(),
                         envelope: PageEnvelope {
                             page,
                             key_id: KeyId([1; 16]),

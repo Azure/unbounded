@@ -52,6 +52,7 @@ pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
 }
 pub(crate) struct CiphertextBytes {
+    pub checksum: std::sync::OnceLock<u64>,
     pub envelope: PageEnvelope,
     pub bytes: Vec<u8>,
     pub reservation: Reservation,
@@ -102,6 +103,7 @@ impl BufferPool {
         reservation.shrink(bytes.capacity())?;
         Ok(CiphertextPage {
             inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
                 envelope,
                 bytes,
                 reservation,
@@ -158,6 +160,31 @@ impl VerifiedPage {
     }
 }
 impl CiphertextPage {
+    pub fn checksum(&self) -> u64 {
+        *self
+            .inner
+            .checksum
+            .get_or_init(|| crate::security::crc64::checksum(self.bytes()))
+    }
+    pub(crate) fn verify_checksum(&self) -> Result<()> {
+        let actual = crate::security::crc64::checksum(self.bytes());
+        if self
+            .inner
+            .checksum
+            .get()
+            .is_some_and(|expected| *expected != actual)
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let _ = self.inner.checksum.set(actual);
+        Ok(())
+    }
+    pub(crate) fn expected_checksum(&self, checksum: u64) -> Result<()> {
+        self.inner
+            .checksum
+            .set(checksum)
+            .map_err(|_| Error::CorruptRecord)
+    }
     pub fn envelope(&self) -> &PageEnvelope {
         &self.inner.envelope
     }

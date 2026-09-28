@@ -1,4 +1,4 @@
-//! Version 1 little-endian encrypted records. Header SHA-256 is framing integrity;
+//! Version 2 little-endian encrypted records. Header SHA-256 is framing integrity;
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
 use super::{
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
@@ -16,7 +16,7 @@ use crate::{
     runtime::reactor::IoBuffer,
 };
 use sha2::{Digest, Sha256};
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
@@ -39,6 +39,7 @@ pub struct EncodedRecord {
 pub struct DecodedRecord {
     pub header: RecordHeader,
     pub ciphertext: std::ops::Range<usize>,
+    pub checksum: Option<u64>,
 }
 pub struct RecordCodec;
 struct RecordLayout {
@@ -72,6 +73,8 @@ impl RecordCodec {
             return Err(Error::CorruptRecord);
         }
         let header_bytes = HEADER_PREFIX_BYTES
+            .checked_add(8)
+            .ok_or(Error::CorruptRecord)?
             .checked_add(cache.len())
             .and_then(|len| len.checked_add(etag.len()))
             .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
@@ -110,6 +113,7 @@ impl RecordCodec {
         out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
         out.extend_from_slice(cache);
         out.extend_from_slice(etag);
+        out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
         debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
         let digest = Sha256::digest(&out);
         out.extend_from_slice(&digest);
@@ -164,7 +168,11 @@ impl RecordCodec {
             return Err(Error::CorruptRecord);
         }
         let mut r = Decoder { bytes, at: 0 };
-        if r.take(8)? != MAGIC || r.u32()? != FORMAT_VERSION {
+        if r.take(8)? != MAGIC {
+            return Err(Error::CorruptRecord);
+        }
+        let format_version = r.u32()?;
+        if !matches!(format_version, 1 | 2) {
             return Err(Error::CorruptRecord);
         }
         let header_len = r.u32()? as usize;
@@ -196,6 +204,11 @@ impl RecordCodec {
                 .to_owned(),
         );
         let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
+        let checksum = if format_version == 2 {
+            Some(r.u64()?)
+        } else {
+            None
+        };
         if r.at != r.bytes.len()
             || generation.0 == 0
             || plaintext_length == 0
@@ -228,7 +241,7 @@ impl RecordCodec {
         }
         Ok(DecodedRecord {
             header: RecordHeader {
-                format_version: FORMAT_VERSION,
+                format_version,
                 generation,
                 envelope,
                 metadata,
@@ -236,6 +249,7 @@ impl RecordCodec {
                 extent,
             },
             ciphertext: header_len..logical_bytes,
+            checksum,
         })
     }
     pub fn decode(&self, buffer: &AlignedBuffer, expected: &RecordHeader) -> Result<PageEnvelope> {
@@ -306,6 +320,7 @@ mod tests {
         CiphertextCopy {
             ciphertext: CiphertextPage {
                 inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
                         page: PageId {
                             version: metadata.version.clone(),
@@ -388,10 +403,10 @@ mod tests {
             let mut page = page(&admission, length, number, &cache, &etag);
             let alignment = DirectAlignment::validate(geometry.0, geometry.1, geometry.2).unwrap();
             let logical = RecordCodec.logical_length(&page).unwrap();
-            assert_eq!(logical, LegacyCodec.logical_length(&page).unwrap());
+            assert_eq!(logical, LegacyCodec.logical_length(&page).unwrap() + 8);
             assert_eq!(
                 logical,
-                128 + cache.len() + etag.len() + 2 + 32 + length + 16
+                128 + 8 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
             let extent = alignment.extent(offset, logical).unwrap();
             let mut staging = buffer(&admission, alignment, extent.length());
@@ -405,12 +420,24 @@ mod tests {
                     Generation(u64::MAX),
                     alignment,
                     offset,
-                    buffer(&admission, alignment, extent.length()),
+                    buffer(
+                        &admission,
+                        alignment,
+                        alignment.extent(offset, logical - 8).unwrap().length(),
+                    ),
                 )
                 .unwrap();
             assert_eq!(
-                encoded.buffer.bytes().unwrap(),
-                legacy.buffer.bytes().unwrap()
+                RecordCodec
+                    .parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .header
+                    .envelope,
+                RecordCodec
+                    .parse(&legacy.buffer, legacy.header.extent)
+                    .unwrap()
+                    .header
+                    .envelope
             );
             assert_eq!(encoded.header.extent, extent);
             assert_eq!(
@@ -424,6 +451,7 @@ mod tests {
             // Reuse an actual record, shortening ciphertext into the old payload
             // when possible. This catches stale bytes at the new padding boundary.
             let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+            inner.checksum.take();
             if length > 1 {
                 inner.envelope.plaintext_length -= 1;
                 inner.envelope.ciphertext_length -= 1;
@@ -567,10 +595,10 @@ mod tests {
             UNIX_EPOCH + std::time::Duration::from_nanos(1),
         ] {
             page.metadata.expires_at = ExpiresAt(expiry);
-            assert_eq!(RecordCodec.logical_length(&page), Ok(188));
+            assert_eq!(RecordCodec.logical_length(&page), Ok(196));
             assert_eq!(
                 RecordCodec.logical_length(&page),
-                LegacyCodec.logical_length(&page)
+                LegacyCodec.logical_length(&page).map(|length| length + 8)
             );
             let encoded = RecordCodec
                 .encode(
@@ -581,8 +609,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                &encoded.buffer.bytes().unwrap()[..188],
-                unhex(GOLDEN_LOGICAL)
+                RecordCodec
+                    .parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .header
+                    .metadata,
+                page.metadata.immutable()
+            );
+            assert_eq!(
+                RecordCodec
+                    .parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .checksum,
+                Some(page.ciphertext.checksum())
             );
             assert_eq!(
                 RecordCodec
@@ -759,16 +798,20 @@ mod tests {
         let admission = admission();
         let page = page(&admission, 3, 0, "cache", "v1");
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
-        let encoded = RecordCodec
-            .encode(
+        let encoded = LegacyCodec
+            .encode_at(
                 &page,
                 Generation(7),
                 alignment,
+                0,
                 buffer(&admission, alignment, 512),
             )
             .unwrap();
         let mut expected = unhex(GOLDEN_LOGICAL);
-        assert_eq!(RecordCodec.logical_length(&page).unwrap(), expected.len());
+        assert_eq!(
+            RecordCodec.logical_length(&page).unwrap(),
+            expected.len() + 8
+        );
         expected.resize(512, 0);
         assert_eq!(encoded.buffer.bytes().unwrap(), expected);
         assert_eq!(
@@ -814,7 +857,7 @@ mod tests {
             }
             let mut out = Vec::with_capacity(MAX_HEADER_BYTES);
             out.extend_from_slice(MAGIC);
-            out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&generation.0.to_le_bytes());
             out.extend_from_slice(&metadata.length.to_le_bytes());
@@ -861,7 +904,7 @@ mod tests {
             bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
             Ok(EncodedRecord {
                 header: RecordHeader {
-                    format_version: FORMAT_VERSION,
+                    format_version: 1,
                     generation,
                     envelope: page.ciphertext.envelope().clone(),
                     metadata: page.metadata.immutable(),

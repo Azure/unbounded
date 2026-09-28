@@ -1,5 +1,48 @@
 # Racer throughput architecture: Phase 4
 
+## Latest continued implementation (supersedes historical status below)
+
+CRC64 uses CRC-64/ECMA-182, initial/final XOR zero and non-reflected bytes.
+Runtime-detected x86 PCLMUL performs polynomial multiplication with ECMA table
+reduction; portable bitwise code is the independent reference. Golden and
+boundary equivalence tests pass. Encryption computes and retains the checksum on
+the crypto worker; decryption verifies any disk-provided checksum on that worker
+before AEAD and publication. Record v2 adds eight little-endian checksum bytes
+before the existing header SHA-256; frozen v1 records remain readable. Unknown
+versions are misses. CRC never replaces AEAD. Production origin-encrypted and
+verified requester pages reuse the computed checksum at record serialization;
+unverified copy serialization has a bounded fallback computation.
+
+Peer v4 makes a shared-key request MAC mandatory in addition to all existing
+certificate, session, Ed25519 original/destination and hop proofs. HMAC-SHA256
+derives a request-only key from the trusted rotating OriginCredentials epoch,
+cache UID and key ID, using a dedicated domain. Page keys cannot derive it.
+The canonical message MAC binds method/target and every non-signature header
+except its own tag, including identity, freshness, route credits and encrypted
+context. Ed25519 then binds the MAC itself. Retiring epochs reject new MAC
+admission using existing keyring semantics. Control Go purposes remain unchanged:
+this is a derived subkey, never raw-key reuse across AEAD/MAC purposes.
+RFC4231 and rotation/mutation/missing-tag tests pass. Coordinated upgrade is
+required; old v1/v2/v3 and unknown peer frames fail closed, without downgrade.
+
+HTTP staging now recycles one zeroized allocation of at most 64 KiB per shared
+HttpIo pool, retaining its original admission until reuse/reclaim/drop. Mutable
+kernel ownership remains sealed and address-stable through both completion
+fences. Oversized multi-hop envelope allocations are not retained. Pointer and
+zeroization tests prove actual reuse; lifecycle assertions distinguish bounded
+idle allocation charges from active I/O owners.
+
+Latest bounded commands (each preceded by
+`timeout --signal=TERM --kill-after=10s 300s`):
+
+- `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
+  750 passed, seven explicit ignores, 59.95 s.
+- `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet`:
+  14 passed, zero failures/ignores, 113.82 s.
+
+Still in progress: page allocation recycling and expanded Bootstrap-specific
+credential/version-mutation tests. No full Phase 4 completion is claimed yet.
+
 ## Authority and execution
 
 The approved Phase 4 scope and `/home/azureuser/design.md` govern this work on

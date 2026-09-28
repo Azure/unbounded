@@ -2,10 +2,12 @@
 pub mod aead;
 pub mod certificates;
 pub mod connection;
+pub mod crc64;
 pub mod credentials;
 pub mod forwarding;
 pub mod identity;
 pub mod keyring;
+mod mac;
 pub mod protocol;
 #[cfg(test)]
 mod replay;

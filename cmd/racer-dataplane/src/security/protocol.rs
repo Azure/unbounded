@@ -18,7 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const PROFILE: &str = "racer-peer-v3";
+pub const PROFILE: &str = "racer-peer-v4";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_HEAD: usize = 64 * 1024;
 

@@ -260,6 +260,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         }
     }
     drive(reactor, reactor.drain()).unwrap();
+    io.reclaim_buffer();
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     assert_eq!(admission.used(ResourceClass::Connection), 0);
 }
@@ -347,6 +348,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         Err(Error::HeaderTooLarge)
     ));
     writer.join().unwrap();
+    io.reclaim_buffer();
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     // No I/O or signing begins when receive staging or send scratch cannot fit.
     for (send, available) in [(false, 4096 - 1), (true, 2 * wire::MAX_ENVELOPE_HEAD - 1)] {
@@ -381,6 +383,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         };
         assert_eq!(result, Err(Error::Overloaded));
         assert_eq!(reactor.in_flight(), 0);
+        io.reclaim_buffer();
         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         drop(held);

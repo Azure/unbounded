@@ -1683,6 +1683,7 @@ mod tests {
                 };
                 let ciphertext = CiphertextPage {
                     inner: Arc::new(CiphertextBytes {
+                        checksum: std::sync::OnceLock::new(),
                         reservation: self.admission.reserve(
                             None,
                             ResourceClass::Ciphertext,

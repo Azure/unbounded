@@ -83,7 +83,7 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
             cluster: cluster.clone(),
             generation: BundleGeneration(1),
             peer_trust_roots: roots.clone(),
-            cache_keys: vec![],
+            cache_keys: crate::security::signing::tests::mac_test_key(CACHE),
         })
         .unwrap();
         keys.install_signing_identity(Arc::new(identity)).unwrap();
@@ -1274,7 +1274,10 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         drive(&reactor, reactor.drain()).unwrap();
         assert_eq!(reactor.in_flight(), 0);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + io.retained_buffer_bytes()
+        );
         let closed = peer.read(&mut [0; 1]);
         assert!(
             matches!(closed, Ok(0))
@@ -1752,7 +1755,10 @@ mod established_sessions {
             drop(sent);
             f.drive(f.reactor.drain()).unwrap();
             assert_eq!(f.admission.used(ResourceClass::Connection), 0);
-            assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+            assert_eq!(
+                f.admission.used(ResourceClass::RequestContext),
+                baseline + f.io.retained_buffer_bytes()
+            );
         }
     }
 
@@ -1812,11 +1818,17 @@ mod established_sessions {
         assert_eq!(f.calls.get(), 1);
         assert_eq!(f.reactor.in_flight(), 0);
         assert_eq!(f.admission.used(ResourceClass::Connection), 0);
-        assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            f.admission.used(ResourceClass::RequestContext),
+            baseline + f.io.retained_buffer_bytes()
+        );
         // A newly handshaken socket starts at sequence one and dispatches normally.
         drop(f.first());
         assert_eq!(f.calls.get(), 2);
         assert_eq!(f.admission.used(ResourceClass::Connection), 0);
-        assert_eq!(f.admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(
+            f.admission.used(ResourceClass::RequestContext),
+            baseline + f.io.retained_buffer_bytes()
+        );
     }
 }

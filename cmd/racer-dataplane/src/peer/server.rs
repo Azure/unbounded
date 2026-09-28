@@ -1035,7 +1035,10 @@ mod tests {
                 assert_eq!(reactor.in_flight(), 0);
                 assert_eq!(admission.used(ResourceClass::Connection), 0);
                 assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
-                assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+                assert_eq!(
+                    admission.used(ResourceClass::RequestContext),
+                    baseline + server.io.retained_buffer_bytes()
+                );
                 let (next, _peer) = UnixStream::pair().unwrap();
                 let admitted = ConnectionLease::from_accepted(next.into(), &admission).unwrap();
                 drop(admitted);

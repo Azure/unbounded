@@ -73,6 +73,15 @@ impl Signatures {
             "racer-timestamp",
             protocol::millis(crate::runtime::environment::wall_now())?,
         );
+        if head.unique("racer-kind")? == Some(b"request".as_slice()) {
+            let cache = crate::model::identity::CacheId(field(&head, "racer-cache")?);
+            let key = self
+                .keys
+                .active(&cache, super::keyring::KeyPurpose::OriginCredentials)?;
+            push_binary(&mut head, "racer-mac-key", &key.id().0);
+            let tag = super::mac::hmac(&*super::mac::request_key(&key)?, &mac_base(&head)?);
+            push_binary(&mut head, "racer-request-mac", &tag);
+        }
         let input = signature_input(&head)?;
         push(&mut head, "signature-input", format!("racer={input}"));
         let signature = identity.sign(&signature_base(&head)?)?;
@@ -107,6 +116,24 @@ impl Signatures {
             return Err(Error::Unauthorized);
         }
         protocol::uuid(&self.keys.cluster().0)?;
+        if head.unique("racer-kind")? == Some(b"request".as_slice()) {
+            let cache = crate::model::identity::CacheId(field(head, "racer-cache")?);
+            let id = protocol::decode_binary(field(head, "racer-mac-key")?.as_bytes())?
+                .try_into()
+                .map_err(|_| Error::Unauthorized)?;
+            let key = self.keys.lease(
+                Some(&cache),
+                crate::model::envelope::KeyId(id),
+                super::keyring::KeyPurpose::OriginCredentials,
+            )?;
+            let expected = super::mac::hmac(&*super::mac::request_key(&key)?, &mac_base(head)?);
+            if !super::mac::equal(
+                &protocol::decode_binary(field(head, "racer-request-mac")?.as_bytes())?,
+                &expected,
+            ) {
+                return Err(Error::Unauthorized);
+            }
+        }
         let base = signature_base(head)?;
         if signed.signature.len() != 64
             || field(head, "signature")?
@@ -150,7 +177,25 @@ pub(crate) fn is_auth_field(name: &str) -> bool {
             | "racer-direction"
             | "racer-sequence"
             | "racer-timestamp"
+            | "racer-mac-key"
+            | "racer-request-mac"
     )
+}
+fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
+    let mut out = b"racer/request-mac/message/v1\0".to_vec();
+    let start = match &head.start {
+        StartLine::Request { method, target } => format!("{method} {target}"),
+        _ => return Err(Error::Unauthorized),
+    };
+    super::aead::field(&mut out, start.as_bytes())?;
+    for name in components(head)? {
+        if name.starts_with('@') || name == "racer-request-mac" {
+            continue;
+        }
+        super::aead::field(&mut out, name.as_bytes())?;
+        super::aead::field(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+    }
+    Ok(out)
 }
 pub fn node_field(head: &MessageHead, name: &str) -> Result<NodeId> {
     let node = field(head, name)?;
@@ -326,7 +371,7 @@ pub(crate) mod tests {
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots.clone(),
-                cache_keys: Vec::new(),
+                cache_keys: mac_test_keys(),
             })
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
@@ -334,6 +379,28 @@ pub(crate) mod tests {
             network.push(Rc::new(Signatures::new(keys, certs)));
         }
         network
+    }
+    pub(crate) fn mac_test_keys() -> Vec<crate::control::wire::CacheEncryptionKey> {
+        use crate::control::wire::*;
+        [node(88).0, super::super::identity::tests::CACHE.into()]
+            .into_iter()
+            .enumerate()
+            .map(|(i, cache)| CacheEncryptionKey {
+                key: CacheKeyRef {
+                    cache: crate::model::identity::CacheId(cache),
+                    id: crate::model::envelope::KeyId([100 + i as u8; 16]),
+                    purpose: CacheKeyPurpose::OriginCredentials,
+                },
+                state: CacheKeyState::Active,
+                material: [100 + i as u8; 32],
+            })
+            .collect()
+    }
+    pub(crate) fn mac_test_key(cache: &str) -> Vec<crate::control::wire::CacheEncryptionKey> {
+        let mut keys = mac_test_keys();
+        keys.truncate(1);
+        keys[0].key.cache = crate::model::identity::CacheId(cache.into());
+        keys
     }
     pub(crate) fn clone_head(head: &SignedHead) -> SignedHead {
         let codec = Codec::new(protocol::MAX_HEAD, u64::MAX);
@@ -357,6 +424,68 @@ pub(crate) mod tests {
         head
     }
     #[test]
+    fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
+        use crate::control::wire::*;
+        let network = network(2);
+        let make = || {
+            let mut request = head(1);
+            request
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "racer-kind")
+                .unwrap()
+                .value = b"request".to_vec();
+            push(&mut request, "racer-cache", node(88).0);
+            request
+        };
+        let old = network[0].sign(make()).unwrap();
+        assert!(network[1].verify_proof(clone_head(&old)).is_ok());
+        let mut tampered = clone_head(&old);
+        tampered
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-request-mac")
+            .unwrap()
+            .value[0] ^= 1;
+        assert!(network[1].verify_proof(tampered).is_err());
+        let mut missing = clone_head(&old);
+        missing
+            .head
+            .headers
+            .retain(|h| h.name != "racer-request-mac");
+        assert!(network[1].verify_proof(missing).is_err());
+        for signer in &network {
+            let mut keys = mac_test_keys();
+            for key in &mut keys {
+                key.state = CacheKeyState::Retiring;
+            }
+            let mut active = mac_test_keys();
+            for key in &mut active {
+                key.key.id.0[0] ^= 1;
+                key.material[0] ^= 1;
+            }
+            keys.extend(active);
+            signer
+                .keys
+                .install(KeyringBundle {
+                    schema_version: SCHEMA_VERSION,
+                    cluster: signer.keys.cluster().clone(),
+                    generation: BundleGeneration(2),
+                    peer_trust_roots: (*signer.keys.peer_trust_roots().unwrap()).clone(),
+                    cache_keys: keys,
+                })
+                .unwrap();
+        }
+        assert!(
+            network[1].verify_proof(clone_head(&old)).is_err(),
+            "retiring epoch closes new admission"
+        );
+        let current = network[0].sign(make()).unwrap();
+        assert!(network[1].verify_proof(current).is_ok());
+    }
+
+    #[test]
     fn rfc9421_exact_request_and_response_signature_base_vectors() {
         let mut request = MessageHead {
             start: StartLine::Request {
@@ -369,14 +498,14 @@ pub(crate) mod tests {
         push(&mut request, "racer-timestamp", "1700000000123");
         push(&mut request, "racer-signer", node(0).0);
         push(&mut request, "content-length", "0");
-        let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v3\"";
+        let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v4\"";
         push(&mut request, "signature-input", format!("racer={params}"));
         assert_eq!(signature_base(&request).unwrap(), format!(
             "\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}"
         ).as_bytes());
         request.start = StartLine::Response { status: 200 };
         request.headers.retain(|h| h.name != "signature-input");
-        let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v3\"";
+        let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v4\"";
         push(&mut request, "signature-input", format!("racer={params}"));
         assert_eq!(signature_base(&request).unwrap(), format!(
             "\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}"
@@ -390,7 +519,7 @@ pub(crate) mod tests {
         assert!(base.starts_with(
             "\"@method\": POST\n\"@request-target\": /racer/peer/v1\n\"content-length\": 0\n"
         ));
-        assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v3\""));
+        assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v4\""));
         for h in &original.head.headers {
             let mut tamper = clone_head(&original);
             tamper

@@ -105,7 +105,7 @@ fn identities(nodes: &[NodeId]) -> Vec<Identity> {
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots.clone(),
-                cache_keys: vec![],
+                cache_keys: crate::security::signing::tests::mac_test_key(CACHE),
             })
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
