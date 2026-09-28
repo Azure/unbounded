@@ -98,16 +98,20 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 // SetIssuerReady must be reset on loss of usable signing material/trust.
 func (l *Lifecycle) SetIssuerReady(ready bool) {
 	l.mu.Lock()
-	l.issuer = ready
-	l.notifyLocked()
+	if l.issuer != ready {
+		l.issuer = ready
+		l.notifyLocked()
+	}
 	l.mu.Unlock()
 }
 
 // SetServingReady is set only after the authenticated listener is accepting.
 func (l *Lifecycle) SetServingReady(ready bool) {
 	l.mu.Lock()
-	l.serving = ready
-	l.notifyLocked()
+	if l.serving != ready {
+		l.serving = ready
+		l.notifyLocked()
+	}
 	l.mu.Unlock()
 }
 
