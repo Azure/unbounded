@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package wire declares Racer's HTTPS/JSON and projected-keyring contracts.
+// Package wire declares Racer's HTTPS/JSON contracts.
 // Codecs validate bounded inputs before returning usable protocol state.
 package wire
 
@@ -11,6 +11,7 @@ const (
 	SchemaVersion       = 1
 	BootstrapPath       = "/v1/bootstrap"
 	SnapshotPath        = "/v1/snapshot"
+	KeyringPath         = "/v1/keyring"
 	TokenAudience       = "racer-control"
 	MaxBootstrapBytes   = 64 * 1024
 	MaxBundleBytes      = 512 * 1024

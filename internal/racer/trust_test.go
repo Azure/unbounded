@@ -222,6 +222,11 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 					t.Fatal(err)
 				}
 
+				acceptedBundle, _, err := r.Trust.keyring()
+				if err != nil || acceptedBundle.generation != 1 {
+					t.Fatalf("initial delivery state: %v", err)
+				}
+
 				reads := 0
 				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					if key.Name == resource {
@@ -265,6 +270,15 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 					t.Fatal("observed invalid authority retained or installed trust")
 				}
 
+				currentBundle, _, bundleErr := r.Trust.keyring()
+				if failure == "outage" {
+					if bundleErr != nil || currentBundle != acceptedBundle {
+						t.Fatalf("read outage exposed candidate delivery state: %v", bundleErr)
+					}
+				} else if bundleErr == nil {
+					t.Fatal("observed invalid authority retained delivery state")
+				}
+
 				r.APIReader = r.Client
 
 				_, staged, _, _ := keyState(t, r)
@@ -277,6 +291,11 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 				current, err = r.Trust.pool()
 				if err != nil || current.Equal(accepted) {
 					t.Fatalf("fresh successful reconciliation did not install staged trust: %v", err)
+				}
+
+				currentBundle, _, bundleErr = r.Trust.keyring()
+				if bundleErr != nil || currentBundle.generation != 2 {
+					t.Fatalf("committed delivery not installed with trust: %v", bundleErr)
 				}
 			})
 		}
@@ -320,6 +339,10 @@ func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 
 			if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
 				t.Fatal("cancellation after admission retained trust or issuer readiness")
+			}
+
+			if _, _, err := r.Trust.keyring(); err == nil {
+				t.Fatal("cancellation after admission retained delivery")
 			}
 
 			r.APIReader = r.Client

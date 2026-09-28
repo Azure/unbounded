@@ -123,6 +123,7 @@ type signingState struct {
 	certificate *x509.Certificate
 	key         ed25519.PrivateKey
 	roots       *x509.CertPool
+	bundle      wire.KeyringBundle
 }
 
 func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time.Time) (signingState, error) {
@@ -170,7 +171,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, err
 	}
 
-	return signingState{certificate: cert, key: key, roots: roots}, nil
+	return signingState{certificate: cert, key: key, roots: roots, bundle: credentials.bundle}, nil
 }
 
 func (i *Issuer) now() time.Time {

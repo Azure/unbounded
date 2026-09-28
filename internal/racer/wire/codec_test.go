@@ -4,12 +4,50 @@
 package wire
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
+	bundle, err := DecodeBundle(bytes.NewReader(fixture(t, "bundle.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Delivery uses the existing full bundle, including lossless uint64 counters.
+	bundle.Generation = ^Generation(0)
+
+	encoded, err := EncodeBundle(bundle)
+	if err != nil || !bytes.Contains(encoded, []byte(`"generation":"18446744073709551615"`)) {
+		t.Fatalf("generation encoding: %v", err)
+	}
+
+	decoded, err := DecodeBundle(bytes.NewReader(encoded))
+	if err != nil || decoded.Generation != bundle.Generation || !decoded.CacheKeys[0].EqualMaterial(bundle.CacheKeys[0]) {
+		t.Fatalf("full delivery round trip: %v", err)
+	}
+
+	for n := uint64(1); n <= 4000; n++ {
+		ref := bundle.CacheKeys[0].Key
+		ref.ID = make([]byte, 16)
+		binary.BigEndian.PutUint64(ref.ID, n)
+
+		key, err := NewCacheKey(ref, RetiringKey, [32]byte{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bundle.CacheKeys = append(bundle.CacheKeys, key)
+	}
+
+	if encoded, err := EncodeBundle(bundle); !errors.Is(err, TooLarge) || encoded != nil {
+		t.Fatalf("oversize delivery encoding not rejected: %v", err)
+	}
+}
 
 func TestBundleEncodingCannotBypassCodec(t *testing.T) {
 	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, UnsupportedVersion) {

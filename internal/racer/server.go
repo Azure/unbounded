@@ -30,6 +30,7 @@ type Server struct {
 	once           sync.Once
 	admission      sync.Mutex
 	polls          map[wire.NodeID]struct{}
+	keyringPolls   map[wire.NodeID]struct{}
 	authSlots      chan struct{}
 	bootstrapSlots chan struct{}
 	writes         chan struct{}
@@ -226,9 +227,10 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.polls = make(map[wire.NodeID]struct{})
+		s.keyringPolls = make(map[wire.NodeID]struct{})
 		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
-		// API-backed enrollment must not starve local TLS/snapshot authentication.
-		// Both pools remain bounded, but only bootstrap owns slots across API waits.
+		// API-backed bearer authentication must not starve local TLS authentication.
+		// Enrollment and keyring bearer checks share this bounded API work pool.
 		s.bootstrapSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
 		s.writes = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentWrites))
 	})
@@ -310,6 +312,8 @@ func (s *Server) Handler() http.Handler {
 			handler = s.serveBootstrap
 		case r.Method == http.MethodGet && r.URL.Path == wire.SnapshotPath:
 			handler = s.serveSnapshot
+		case r.Method == http.MethodGet && r.URL.Path == wire.KeyringPath:
+			handler = s.serveKeyring
 		default:
 			writeFailure(w, wire.InvalidRequest)
 			return

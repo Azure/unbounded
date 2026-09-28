@@ -4,32 +4,146 @@
 package racer
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"errors"
 	"sync"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// Trust holds only controller-validated public roots. Requests never refresh it
-// or fall back to Kubernetes. A failed observation cannot restore withdrawn trust.
+// Trust atomically holds controller-validated public roots and the matching
+// delivery bundle. Requests never refresh this state or fall back to Kubernetes.
+// A failed observation cannot restore withdrawn trust.
 type Trust struct {
-	mu    sync.RWMutex
-	roots *x509.CertPool
+	mu      sync.RWMutex
+	roots   *x509.CertPool
+	bundle  *acceptedKeyring
+	changed chan struct{}
+	// Retain only non-secret replay protection when serving state is withdrawn.
+	// Otherwise a rejected rollback could be accepted on the next reconcile.
+	highWater wire.Generation
+	digest    [sha256.Size]byte
 }
 
-func (t *Trust) install(roots *x509.CertPool) {
+// acceptedKeyring owns an immutable, bounded wire encoding, never issuer material.
+// Polls share it without copying secret bytes per waiting request.
+type acceptedKeyring struct {
+	generation wire.Generation
+	encoded    string
+}
+
+func (*acceptedKeyring) String() string   { return "<redacted keyring>" }
+func (*acceptedKeyring) GoString() string { return "<redacted keyring>" }
+
+func (t *Trust) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
+	encoded, err := wire.EncodeBundle(bundle)
+	if err != nil {
+		return err
+	}
+
+	accepted := &acceptedKeyring{generation: bundle.Generation, encoded: string(encoded)}
+	digest := sha256.Sum256(encoded)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if roots == nil {
+		return wire.Unavailable
+	}
+
+	if accepted.generation < t.highWater || accepted.generation == t.highWater && digest != t.digest {
+		return wire.Conflict
+	}
+
+	if t.bundle != nil && accepted.generation == t.highWater {
+		accepted = t.bundle
+	}
+
+	t.highWater, t.digest = accepted.generation, digest
 	t.roots = roots
+	t.bundle = accepted
+	t.notifyLocked()
+
+	return nil
+}
+
+func (t *Trust) notifyLocked() {
+	if t.changed != nil {
+		close(t.changed)
+	}
+
+	t.changed = make(chan struct{})
 }
 
 func (t *Trust) invalidate() {
 	if t != nil {
-		t.install(nil)
+		t.mu.Lock()
+		defer t.mu.Unlock()
+
+		t.roots, t.bundle = nil, nil
+		t.notifyLocked()
+	}
+}
+
+func (t *Trust) keyring() (*acceptedKeyring, <-chan struct{}, error) {
+	if t == nil {
+		return nil, nil, wire.Unavailable
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.roots == nil || t.bundle == nil {
+		return nil, nil, wire.Unavailable
+	}
+
+	return t.bundle, t.changed, nil
+}
+
+func (t *Trust) waitKeyring(ctx context.Context, after *wire.Generation) (*acceptedKeyring, error) {
+	timer := time.NewTimer(wire.PollWait)
+	defer timer.Stop()
+
+	expired := false
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		current, changed, err := t.keyring()
+		if err != nil {
+			return nil, err
+		}
+
+		if after == nil || *after < current.generation && *after != 0 {
+			return current, nil
+		}
+
+		if *after == 0 || *after > current.generation {
+			return nil, wire.Conflict
+		}
+
+		if expired {
+			return nil, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		case <-timer.C:
+			expired = true
+		}
 	}
 }
 

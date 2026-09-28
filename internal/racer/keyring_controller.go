@@ -57,7 +57,7 @@ func (r *KeyringReconciler) finishKeyringReconcile(ctx context.Context, result c
 
 		state, err = loadSigning(ctx, r.APIReader, r.Config, r.now())
 		if err == nil && r.Trust != nil {
-			r.Trust.install(state.roots)
+			err = r.Trust.install(ctx, state.roots, state.bundle)
 		}
 	}
 
