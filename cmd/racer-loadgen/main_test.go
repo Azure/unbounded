@@ -29,7 +29,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, output.String())
 	require.Equal(t, options{
-		listen: ":8080", metricsListen: ":9090", startDelay: 10 * time.Second,
+		listen: ":8080", metricsListen: ":9090", startDelay: 10 * time.Second, catalogImages: 1,
 		image: imageOptions{
 			Repository: "benchmark/image", Layers: 8, LayerBytes: 64 << 20,
 			Jitter: 0.2, Seed: "benchmark-v1",
@@ -49,10 +49,11 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--target=https://mirror.example/base", "--namespace=registry.example:5000",
 		"--concurrency=0", "--layer-concurrency=3", "--pull-timeout=9s",
 		"--retry-delay=20ms", "--interval=30ms", "--verify=false", "--start-delay=0", "--duration=1m",
+		"--catalog-images=512", "--startup-timeout=4m",
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
-		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute,
+		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute, catalogImages: 512, startupTimeout: 4 * time.Minute,
 		image: imageOptions{Repository: "custom/image", Layers: 2, LayerBytes: 4096, Seed: "custom"},
 		pull: pullOptions{
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
@@ -77,6 +78,10 @@ func TestParseOptionsInvalid(t *testing.T) {
 		{"bad float", []string{"--jitter=some"}, "invalid value"},
 		{"negative start delay", []string{"--start-delay=-1ns"}, "must be nonnegative"},
 		{"negative duration", []string{"--duration=-1ns"}, "must be nonnegative"},
+		{"empty catalog", []string{"--catalog-images=0"}, "catalog-images must be"},
+		{"negative catalog", []string{"--catalog-images=-1"}, "catalog-images must be"},
+		{"oversized catalog", []string{"--catalog-images=513"}, "catalog-images must be"},
+		{"negative startup deadline", []string{"--startup-timeout=-1s"}, "must be nonnegative"},
 		{"positional", []string{"image"}, "unexpected positional arguments"},
 		{"after separator", []string{"--", "image"}, "unexpected positional arguments"},
 	} {
@@ -100,6 +105,7 @@ func TestParseOptionsHelp(t *testing.T) {
 				"-layers", "-layer-bytes", "-jitter", "-seed", "-target", "-namespace",
 				"-concurrency", "zero serves only the origin", "-layer-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
+				"-catalog-images", "-startup-timeout",
 			} {
 				require.Contains(t, output.String(), text)
 			}
@@ -269,7 +275,7 @@ func TestRunBaselineSelfPull(t *testing.T) {
 			}, time.Second, 5*time.Millisecond)
 
 			families := loadgenTestScrape(t, client, opts.metricsListen)
-			for _, name := range []string{"received_bytes_total", "origin_bytes_total"} {
+			for _, name := range []string{"received_bytes_total", "origin_bytes_total", "verified_bytes_total"} {
 				require.Equal(t, float64(wantBytes), metricWithLabels(t, families["racer_loadgen_"+name], nil).GetCounter().GetValue())
 			}
 

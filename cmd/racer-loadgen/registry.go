@@ -16,6 +16,10 @@ import (
 )
 
 func (img *syntheticImage) handler() http.Handler {
+	return catalogFromImages([]*syntheticImage{img}).handler()
+}
+
+func (c *imageCatalog) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 
@@ -40,7 +44,7 @@ func (img *syntheticImage) handler() http.Handler {
 			return
 		}
 
-		prefix := "/v2/" + img.repository + "/"
+		prefix := "/v2/" + c.repository + "/"
 		if !strings.HasPrefix(r.URL.Path, prefix) {
 			registryError(w, r, http.StatusNotFound, "NAME_UNKNOWN", "repository unknown")
 
@@ -49,7 +53,8 @@ func (img *syntheticImage) handler() http.Handler {
 
 		path := strings.TrimPrefix(r.URL.Path, prefix)
 		if ref, ok := strings.CutPrefix(path, "manifests/"); ok {
-			if ref != "latest" && ref != img.Manifest.Digest.String() {
+			img, found := c.manifests[ref]
+			if !found {
 				registryError(w, r, http.StatusNotFound, "MANIFEST_UNKNOWN", "manifest unknown")
 
 				return
@@ -61,7 +66,7 @@ func (img *syntheticImage) handler() http.Handler {
 		}
 
 		if ref, ok := strings.CutPrefix(path, "blobs/"); ok {
-			blob, found := img.blobs[digest.Digest(ref)]
+			blob, found := c.blobs[digest.Digest(ref)]
 			if !found {
 				registryError(w, r, http.StatusNotFound, "BLOB_UNKNOWN", "blob unknown")
 

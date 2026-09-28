@@ -51,6 +51,7 @@ func pullTestMetrics() *loadMetrics {
 		}, []string{"result"}),
 		inFlight:      prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_in_flight"}),
 		receivedBytes: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_received_bytes_total"}),
+		verifiedBytes: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_verified_bytes_total"}),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "test_requests_total",
 		}, []string{"kind", "result"}),
@@ -145,6 +146,7 @@ func TestPullCompleteImage(t *testing.T) {
 	require.Equal(t, append(expected, expected...), actualPaths)
 	require.Equal(t, int64(1), connections.Load(), "fully drained responses should reuse a connection")
 	require.Equal(t, float64(2*bytes), testutil.ToFloat64(metrics.receivedBytes))
+	require.Equal(t, float64(2*bytes), testutil.ToFloat64(metrics.verifiedBytes))
 	require.Equal(t, float64(2), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 	require.Zero(t, testutil.ToFloat64(metrics.inFlight))
 	require.Equal(t, uint64(2), pullTestHistogramCount(t, metrics.pullDuration, "success"))
@@ -233,6 +235,7 @@ func TestPullResponseFailures(t *testing.T) {
 				}
 
 				require.Equal(t, float64(expectedBytes), testutil.ToFloat64(metrics.receivedBytes))
+				require.Zero(t, testutil.ToFloat64(metrics.verifiedBytes), "failed or unverified pulls must not earn verified bytes")
 				require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues(result)))
 				require.Equal(t, uint64(1), pullTestHistogramCount(t, metrics.pullDuration, result))
 
@@ -322,6 +325,7 @@ func TestPullTimeoutAndCancellation(t *testing.T) {
 
 				require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues(result)))
 				require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues(kind, result)))
+				require.Zero(t, testutil.ToFloat64(metrics.verifiedBytes))
 				require.Zero(t, testutil.ToFloat64(metrics.inFlight))
 			})
 		}

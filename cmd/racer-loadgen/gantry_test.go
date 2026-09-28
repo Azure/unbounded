@@ -32,14 +32,16 @@ func TestGantryIntegration(t *testing.T) {
 	// this does not test Racer processes, cache hits, or peer distribution.
 	const page = int64(racersdk.PageSize)
 
-	img, err := newImage(t.Context(), imageOptions{
+	catalog, err := newCatalog(t.Context(), imageOptions{
 		Layers: 1, LayerBytes: 2*page + 4099, Seed: "gantry-integration", Repository: "benchmark/nested-image",
-	})
+	}, 3)
 	require.NoError(t, err)
+
+	img := catalog.images[0]
 
 	layer := img.Layers[0]
 	layerPath := "/v2/" + img.repository + "/blobs/" + layer.Digest.String()
-	registry := img.handler()
+	registry := catalog.handler()
 
 	var (
 		rejectContinuation atomic.Bool
@@ -203,6 +205,20 @@ func TestGantryIntegration(t *testing.T) {
 		// the two requested pages, never page zero.
 		require.Equal(t, int64(3), callbacks.Load())
 		assertRanges(t, 0, 1, 1)
+	})
+
+	t.Run("verified catalog through mirror", func(t *testing.T) {
+		p, metrics := newPull(t)
+
+		var want int64
+
+		for _, image := range catalog.images {
+			require.NoError(t, p.pullImage(t.Context(), image))
+			want += image.Manifest.Size + image.Config.Size + image.Layers[0].Size
+		}
+
+		require.Equal(t, float64(want), testutil.ToFloat64(metrics.verifiedBytes))
+		require.Equal(t, float64(3), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 	})
 
 	t.Run("body-free HEAD", func(t *testing.T) {

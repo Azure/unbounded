@@ -33,6 +33,7 @@ type pullOptions struct {
 
 type puller struct {
 	img       *syntheticImage
+	images    []*syntheticImage
 	opts      pullOptions
 	target    *url.URL
 	metrics   *loadMetrics
@@ -74,7 +75,7 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 	transport.MaxIdleConnsPerHost = max(2, opts.Concurrency*opts.LayerConcurrency)
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
-		img: img, opts: opts, target: target, metrics: metrics, transport: transport,
+		img: img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
 		client: &http.Client{
 			Transport: transport,
 			// Read redirect responses as failures so every received body is accounted for.
@@ -96,9 +97,11 @@ func (p *puller) run(ctx context.Context) {
 	var workers sync.WaitGroup
 	for range p.opts.Concurrency {
 		workers.Go(func() {
+			var traversal catalogTraversal
+
 			for ctx.Err() == nil {
 				delay := p.opts.Interval
-				if err := p.pull(ctx); err != nil {
+				if err := p.pullImage(ctx, traversal.nextImage(p.images)); err != nil {
 					delay = p.opts.RetryDelay
 				}
 
@@ -130,7 +133,11 @@ func waitPullDelay(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (p *puller) pull(ctx context.Context) (err error) {
+func (p *puller) pull(ctx context.Context) error {
+	return p.pullImage(ctx, p.img)
+}
+
+func (p *puller) pullImage(ctx context.Context, img *syntheticImage) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
 	defer cancel()
 
@@ -144,31 +151,40 @@ func (p *puller) pull(ctx context.Context) (err error) {
 		}
 
 		result := pullResult(err)
+		if err == nil && p.opts.Verify {
+			// Credit only a complete verified image, including manifest and config.
+			bytes := float64(img.Manifest.Size) + float64(img.Config.Size)
+			for _, layer := range img.Layers {
+				bytes += float64(layer.Size)
+			}
+
+			p.metrics.verifiedBytes.Add(bytes)
+		}
 
 		p.metrics.inFlight.Dec()
 		p.metrics.pulls.WithLabelValues(result).Inc()
 		p.metrics.pullDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
 	}()
 
-	if err := p.fetch(ctx, "manifest", p.img.Manifest); err != nil {
+	if err := p.fetch(ctx, "manifest", img.Manifest); err != nil {
 		return err
 	}
 
-	if err := p.fetch(ctx, "config", p.img.Config); err != nil {
+	if err := p.fetch(ctx, "config", img.Config); err != nil {
 		return err
 	}
 
 	group, layerCtx := errgroup.WithContext(ctx)
-	count := min(p.opts.LayerConcurrency, len(p.img.Layers))
+	count := min(p.opts.LayerConcurrency, len(img.Layers))
 	// A fixed worker pool avoids allocating a goroutine or queued job per layer.
 	for worker := range count {
 		group.Go(func() error {
-			for index := worker; index < len(p.img.Layers); index += count {
+			for index := worker; index < len(img.Layers); index += count {
 				if err := layerCtx.Err(); err != nil {
 					return err
 				}
 
-				if err := p.fetch(layerCtx, "layer", p.img.Layers[index]); err != nil {
+				if err := p.fetch(layerCtx, "layer", img.Layers[index]); err != nil {
 					return err
 				}
 			}

@@ -274,6 +274,7 @@ func performanceMixed(t *testing.T, name string, p *puller, client *racersdk.Cli
 	}
 
 	sampled := make(chan struct{})
+
 	go func() {
 		defer close(sampled)
 
@@ -699,6 +700,7 @@ func performanceProcess(t *testing.T, root string) (int, string) {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 
 		done := make(chan error, 1)
+
 		go func() { done <- cmd.Wait() }()
 
 		select {

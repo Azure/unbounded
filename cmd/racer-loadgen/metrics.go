@@ -17,6 +17,7 @@ type loadMetrics struct {
 	pullDuration    *prometheus.HistogramVec
 	inFlight        prometheus.Gauge
 	receivedBytes   prometheus.Counter
+	verifiedBytes   prometheus.Counter
 	requests        *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
 	originRequests  *prometheus.CounterVec
@@ -33,13 +34,14 @@ func newMetrics(reg *prometheus.Registry) *loadMetrics {
 		pullDuration:    prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "pull_duration_seconds", Help: "Full image pull latency including failures.", Buckets: buckets}, []string{"result"}),
 		inFlight:        prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "in_flight", Help: "Image pulls currently in progress."}),
 		receivedBytes:   prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "received_bytes_total", Help: "Response body bytes received, including failed pulls."}),
+		verifiedBytes:   prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "verified_bytes_total", Help: "Response body bytes in successful fully SHA-256-verified image pulls, including manifest and config."}),
 		requests:        prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "requests_total", Help: "Completed pull HTTP requests."}, []string{"kind", "result"}),
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "request_duration_seconds", Help: "Pull HTTP request latency through body consumption.", Buckets: buckets}, []string{"kind", "result"}),
 		originRequests:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "origin_requests_total", Help: "Synthetic origin HTTP requests."}, []string{"method", "code"}),
 		originBytes:     prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "origin_bytes_total", Help: "Response body bytes written by the synthetic origin."}),
 		originDuration:  prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "origin_request_duration_seconds", Help: "Synthetic origin HTTP request latency.", Buckets: buckets}),
 	}
-	reg.MustRegister(m.pulls, m.pullDuration, m.inFlight, m.receivedBytes, m.requests, m.requestDuration,
+	reg.MustRegister(m.pulls, m.pullDuration, m.inFlight, m.receivedBytes, m.verifiedBytes, m.requests, m.requestDuration,
 		m.originRequests, m.originBytes, m.originDuration, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	return m

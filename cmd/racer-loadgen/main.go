@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// racer-loadgen serves a deterministic synthetic OCI image and repeatedly pulls
-// that image through a registry mirror without a local content cache.
+// racer-loadgen serves deterministic synthetic OCI images and repeatedly pulls
+// them through a registry mirror without a local content cache.
 package main
 
 import (
@@ -26,12 +26,14 @@ import (
 )
 
 type options struct {
-	image         imageOptions
-	pull          pullOptions
-	listen        string
-	metricsListen string
-	startDelay    time.Duration
-	duration      time.Duration
+	image          imageOptions
+	pull           pullOptions
+	listen         string
+	metricsListen  string
+	startDelay     time.Duration
+	duration       time.Duration
+	catalogImages  int
+	startupTimeout time.Duration
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -46,6 +48,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.Int64Var(&opts.image.LayerBytes, "layer-bytes", 64<<20, "Payload bytes per layer, before jitter and tar overhead")
 	f.Float64Var(&opts.image.Jitter, "jitter", 0.2, "Deterministic per-layer size jitter fraction in [0,1)")
 	f.StringVar(&opts.image.Seed, "seed", "benchmark-v1", "Content seed; keep identical on all nodes")
+	f.IntVar(&opts.catalogImages, "catalog-images", 1, "Number of deterministic images, 1-512; keep identical on all origins")
+	f.DurationVar(&opts.startupTimeout, "startup-timeout", 0, "Deadline for serial catalog generation and hashing; zero disables the deadline")
 	f.StringVar(&opts.pull.Target, "target", "http://127.0.0.1:5000", "Gantry mirror URL (or origin URL for baseline)")
 	f.StringVar(&opts.pull.Namespace, "namespace", "loadgen.invalid", "Gantry upstream registry name sent as ns query parameter")
 	f.IntVar(&opts.pull.Concurrency, "concurrency", 64, "Concurrent image pulls; zero serves only the origin")
@@ -67,6 +71,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if opts.startDelay < 0 || opts.duration < 0 {
 		return opts, errors.New("start-delay and duration must be nonnegative")
+	}
+
+	if opts.catalogImages < 1 || opts.catalogImages > maxCatalogImages {
+		return opts, fmt.Errorf("catalog-images must be in [1, %d]", maxCatalogImages)
+	}
+
+	if opts.startupTimeout < 0 {
+		return opts, errors.New("startup-timeout must be nonnegative")
 	}
 
 	return opts, nil
@@ -104,7 +116,7 @@ func run(parent context.Context, opts options) error {
 	}
 	defer p.transport.CloseIdleConnections()
 
-	var ready atomic.Pointer[syntheticImage]
+	var ready atomic.Pointer[imageCatalog]
 
 	ops := http.NewServeMux()
 	ops.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -118,13 +130,13 @@ func run(parent context.Context, opts options) error {
 		w.WriteHeader(http.StatusOK)
 	})
 	origin := metrics.instrument(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		img := ready.Load()
-		if img == nil {
-			http.Error(w, "image initializing", http.StatusServiceUnavailable)
+		catalog := ready.Load()
+		if catalog == nil {
+			http.Error(w, "catalog initializing", http.StatusServiceUnavailable)
 			return
 		}
 
-		img.handler().ServeHTTP(w, r)
+		catalog.handler().ServeHTTP(w, r)
 	}))
 	servers := []*http.Server{
 		{Addr: opts.listen, Handler: origin, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute},
@@ -171,13 +183,24 @@ func run(parent context.Context, opts options) error {
 		})
 	}
 
-	slog.Info("generating synthetic image", "layers", opts.image.Layers, "layer_bytes", opts.image.LayerBytes, "seed", opts.image.Seed)
+	slog.Info("generating synthetic catalog", "images", opts.catalogImages, "layers", opts.image.Layers, "layer_bytes", opts.image.LayerBytes, "seed", opts.image.Seed)
 
-	img, err := newImage(ctx, opts.image)
+	startupCtx := ctx
+
+	stopStartup := func() {}
+	if opts.startupTimeout > 0 {
+		startupCtx, stopStartup = context.WithTimeout(ctx, opts.startupTimeout)
+	}
+
+	catalog, err := newCatalog(startupCtx, opts.image, opts.catalogImages)
+
+	stopStartup()
+
 	if err == nil {
-		p.img = img
-		ready.Store(img)
-		slog.Info("origin ready", "digest", img.Manifest.Digest, "repository", opts.image.Repository, "target", opts.pull.Target, "concurrency", opts.pull.Concurrency)
+		p.img = catalog.images[0]
+		p.images = catalog.images
+		ready.Store(catalog)
+		slog.Info("origin ready", "images", len(catalog.images), "digest", p.img.Manifest.Digest, "repository", opts.image.Repository, "target", opts.pull.Target, "concurrency", opts.pull.Concurrency)
 
 		if waitPullDelay(ctx, opts.startDelay) {
 			loadCtx := ctx
