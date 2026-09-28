@@ -100,6 +100,7 @@ func newRacerSDKCollector(stats func() racersdk.Stats) *racerSDKCollector {
 	add("queue_timeouts_total", "SDK queue admission timeouts.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.QueueTimeouts) })
 	add("dials_total", "SDK dial attempts, including failures.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.Dials) })
 	add("connection_reuses_total", "SDK idle connection leases.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.ConnectionReuses) })
+	add("connection_rotations_total", "SDK reusable connections retired at their jittered maximum age across all three pools, excluding failures, aborts, and stale retries.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.ConnectionRotations) })
 	add("retries_total", "SDK stale pooled connection retries.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.Retries) })
 	add("bytes_read_total", "SDK body bytes consumed, including partial transfers.", prometheus.CounterValue, func(s racersdk.Stats) float64 { return float64(s.BytesRead) })
 

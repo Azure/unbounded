@@ -187,6 +187,7 @@ func TestOriginHeadReservedFromFullBodyAdmission(t *testing.T) {
 
 		return originMeta(1), &blockedBody{done: make(chan struct{}), first: true}, nil
 	})
+
 	defer func() { cancel(); <-done }()
 
 	c := testClient(t, path, 2)

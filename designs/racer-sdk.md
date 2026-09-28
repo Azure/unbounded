@@ -250,6 +250,7 @@ No root/socket override, custom transport, or global singleton:
 | `ClientConfig.DialTimeout` | 5 seconds per Unix dial |
 | `ClientConfig.ResponseHeaderTimeout` | 60 seconds for blocked request writes, then a fresh 60 seconds for response headers after writing the request |
 | `ClientConfig.IdleConnTimeout` | 90 seconds for idle pooled connections |
+| `ClientConfig.MaxConnAge` | 5 minutes maximum reuse age; each successful dial samples a lifetime uniformly from [75%, 100%], or 3m45s..5m by default |
 | `OriginConfig.MaxConnections` | 128 accepted connections, including idle; cap before spawning handlers |
 | `OriginConfig.MaxConcurrentRequests` | 64 GET callbacks/bodies; no waiting callback queue, return empty 503 on saturation |
 | `OriginConfig.MaxConcurrentHeadRequests` | 4 separately reserved HEAD callbacks; the accepted-connection cap is still shared |
@@ -260,7 +261,7 @@ No root/socket override, custom transport, or global singleton:
 | `OriginConfig.SocketMode` | 0600; allow only permission bits, apply to the newly created socket, fail and clean up on chmod failure |
 | `OriginConfig.RecoverStaleSocket` | false; opt into exclusive ownership and recovery of witnessed sockets; enabled by Gantry |
 
-Defaults and allocation are in `pkg/racersdk/client.go:68-129` and
+Defaults and allocation are in `pkg/racersdk/client.go:82-155` and
 `pkg/racersdk/origin.go:59-100,144-156`. Admission queues are independent: full
 queues return ErrorUnavailable immediately; expired queue waits return ErrorDeadline.
 Waiters are counted before allocating Value/context state. With defaults, one
@@ -282,14 +283,37 @@ Client uses private sequential Unix connection pools with a connection-owned
 bufio.Reader, bounded raw-head parsing, and fixed-length bodies, not http.Transport.
 Only completely consumed, reusable frames with no buffered surplus return to
 their own pool. Aborted bodies close without draining. Idle timers close unused
-connections (`pkg/racersdk/response_conn.go:40-120,123-182`). No proxy, redirect,
+connections (`pkg/racersdk/response_conn.go:71-169,171-230`). No proxy, redirect,
 compression, HTTP/2, or total HTTP client timeout is involved.
+
+`ClientConfig.MaxConnAge` applies to all three pools: bulk, metadata/HEAD, and
+small objects. Zero selects the 5-minute default; negative values are invalid.
+Each successful dial samples its jittered lifetime once, uniformly over whole
+nanoseconds from ceil(75% of MaxConnAge) through MaxConnAge, inclusive. The
+resulting monotonic deadline is fixed; reuse does not renew it
+(`pkg/racersdk/client.go:91-155`, `pkg/racersdk/response_conn.go:23-43,100-112`).
+
+Age rotation occurs only at response boundaries. An active response may continue
+past the deadline without interruption; this is a reuse limit, not a body timeout.
+Expired reusable connections are retired on pool checkout, on recycle after a
+fully consumed response, or by an idle timer. The idle timer uses
+`min(IdleConnTimeout, remaining connection lifetime)`, so frequent reuse cannot
+keep a connection alive indefinitely. Replacement is lazy: retiring a connection
+does not dial or reserve additional capacity. A later exchange dials only when
+needed under the existing pool admission bounds. Rotation does not replay an
+exchange or restart a pinned continuation
+(`pkg/racersdk/response_conn.go:71-155,215-257`; lifecycle and active-response
+assertions in `pkg/racersdk/connection_age_test.go:151-221,313-376`).
+
+Rotation creates opportunities for worker reassignment, not a guarantee of equal
+worker utilization. See the [real Racer connection-age validation](racer-sdk-connection-age-validation.md)
+for the bounded workload results and measurement limitations.
 
 One fresh-connection retry is allowed only after EOF, reset, or broken pipe on
 a reused connection **before any response byte**. Timeouts, partial heads,
 protocol errors, HTTP errors, and body failures are not retried. There is no
 version restart or body resume. Callbacks must tolerate replay; network delivery
-is not exactly once (`pkg/racersdk/response_conn.go:184-215`).
+is not exactly once (`pkg/racersdk/response_conn.go:232-263`).
 
 ServeOrigin's ctx is the server lifetime. Each request inherits its cancellation
 and the local request timeout; peer disconnect cancels it too. There is no new
@@ -428,9 +452,20 @@ disposable cache contents, not an assumption of bidirectional disk compatibility
 Client.Stats is a fixed-size, credential-free snapshot, sampled independently
 during concurrent I/O. It reports aggregate and per-pool queue depth, queue waits
 and duration, rejections/timeouts, occupied bulk/HEAD/small-object slots, open/idle
-connections, dial/reuse/retry counters, and consumed body bytes. BytesRead includes
+connections, dial/reuse/rotation/retry counters, and consumed body bytes. BytesRead includes
 bytes consumed before a later source or destination failure, not just successfully
-delivered objects (`pkg/racersdk/stats.go:8-70`).
+delivered objects (`pkg/racersdk/stats.go:8-76`).
+
+`Stats.ConnectionRotations` counts reusable connections retired because their
+jittered maximum age was reached, including idle-timer age retirement, across all
+three pools. It excludes failures, aborted responses, stale-connection retries,
+and ordinary idle-timeout retirement before the age deadline. Gantry exports it
+as the cumulative, unlabeled Prometheus counter
+`gantry_racer_sdk_connection_rotations_total`, alongside
+`gantry_racer_sdk_dials_total` and `gantry_racer_sdk_connection_reuses_total`.
+The collector samples Stats once per scrape rather than incrementing counters
+again when scraped (`pkg/racersdk/response_conn.go:45-69,115-155,215-257`,
+`cmd/gantry/agent_racer_metrics.go:101-105,116-121`).
 
 Gantry exports these through `gantry_racer_sdk_*` metrics. Mirror metrics report
 method/status/completion, actual accepted downstream bytes, and handler duration;

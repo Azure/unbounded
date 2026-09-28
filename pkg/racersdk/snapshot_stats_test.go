@@ -388,6 +388,7 @@ func TestClientStaleIdlePinnedRetryPreservesRequest(t *testing.T) {
 	}
 
 	closed, done := make(chan struct{}), make(chan struct{})
+
 	go func() {
 		defer close(done)
 

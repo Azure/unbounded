@@ -79,7 +79,13 @@
 // must be bounded. Client defaults are 64 bulk connections/live Values, 4 reserved
 // metadata connections, 4 small-object connections, independently bounded queues
 // of 128 bulk, 16 metadata and 128 small-object calls, a 5-second queue and
-// dial timeout, a 60-second response-header timeout, and a 90-second idle timeout.
+// dial timeout, a 60-second response-header timeout, a 90-second idle timeout,
+// and a 5-minute MaxConnAge. Each successful dial selects a fixed lifetime
+// uniformly from 75% through 100% of MaxConnAge (whole nanoseconds rounded up).
+// Expired reusable connections retire at checkout, after a response completes,
+// or while idle. Active responses are never interrupted by connection age;
+// retirement does not dial in the background or restart a pinned stream.
+// Stats.ConnectionRotations counts age retirements separately from stale retries.
 // Admission happens before allocating active stream state. A full queue returns
 // ErrorUnavailable; queue timeout returns ErrorDeadline. There is no total client
 // stream timeout. Zero numeric config fields select defaults; negatives are invalid.

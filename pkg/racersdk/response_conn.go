@@ -23,16 +23,47 @@ type connectionPool struct {
 type pooledConn struct {
 	net.Conn
 	reader     *bufio.Reader
-	timer      *time.Timer
+	timer      connectionTimer
+	expiresAt  time.Time // fixed at dial success; retains the monotonic clock
 	generation uint64
 	client     *Client
 	once       sync.Once
 }
 
+type connectionTimer interface {
+	Stop() bool
+}
+
+// Integer nanoseconds in [ceil(3*maxAge/4), maxAge], without multiplication
+// overflow or a zero random bound, even for a one-nanosecond lifetime.
+func jitteredConnAge(maxAge time.Duration, int64N func(int64) int64) time.Duration {
+	spread := maxAge / 4
+
+	return maxAge - spread + time.Duration(int64N(int64(spread)+1))
+}
+
 func (conn *pooledConn) Close() error {
+	return conn.close(false)
+}
+
+func (conn *pooledConn) retire() {
+	// Retirement releases accounting even if closing the socket reports an error.
+	if err := conn.close(true); err != nil {
+		return
+	}
+}
+
+func (conn *pooledConn) close(rotation bool) error {
 	var err error
 
-	conn.once.Do(func() { err = conn.Conn.Close(); conn.client.stats.connections.Add(-1) })
+	conn.once.Do(func() {
+		err = conn.Conn.Close()
+		conn.client.stats.connections.Add(-1)
+
+		if rotation {
+			conn.client.stats.connectionRotations.Add(1)
+		}
+	})
 
 	return err
 }
@@ -44,13 +75,20 @@ func (c *Client) connection(ctx context.Context, pool *connectionPool, fresh boo
 		return nil, false, failure(ErrorClosed, "connection", nil)
 	}
 
-	if n := len(pool.idle); n != 0 && !fresh {
+	for !fresh && len(pool.idle) != 0 {
+		n := len(pool.idle)
 		conn := pool.idle[n-1]
 		pool.idle = pool.idle[:n-1]
 
 		conn.timer.Stop()
 		conn.timer = nil
+
 		conn.generation++
+		if !c.connNow().Before(conn.expiresAt) {
+			conn.retire()
+			continue
+		}
+
 		c.mu.Unlock()
 		c.stats.connectionReuses.Add(1)
 
@@ -71,7 +109,7 @@ func (c *Client) connection(ctx context.Context, pool *connectionPool, fresh boo
 
 	c.stats.connections.Add(1)
 
-	return &pooledConn{Conn: conn, reader: bufio.NewReader(conn), client: c}, false, nil
+	return &pooledConn{Conn: conn, reader: bufio.NewReader(conn), client: c, expiresAt: c.connNow().Add(c.connAge())}, false, nil
 }
 
 func (c *Client) recycle(pool *connectionPool, conn *pooledConn) {
@@ -83,10 +121,16 @@ func (c *Client) recycle(pool *connectionPool, conn *pooledConn) {
 		return
 	}
 
+	remaining := conn.expiresAt.Sub(c.connNow())
+	if remaining <= 0 {
+		conn.retire()
+		return
+	}
+
 	pool.idle = append(pool.idle, conn)
 	conn.generation++
 	generation := conn.generation
-	conn.timer = time.AfterFunc(c.config.IdleConnTimeout, func() {
+	conn.timer = c.connAfterFunc(min(c.config.IdleConnTimeout, remaining), func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
@@ -98,7 +142,11 @@ func (c *Client) recycle(pool *connectionPool, conn *pooledConn) {
 			if candidate == conn {
 				pool.idle = append(pool.idle[:i], pool.idle[i+1:]...)
 
-				closeBody(conn)
+				if !c.connNow().Before(conn.expiresAt) {
+					conn.retire()
+				} else {
+					closeBody(conn)
+				}
 
 				return
 			}

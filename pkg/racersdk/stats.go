@@ -36,6 +36,9 @@ type Stats struct {
 	Dials uint64
 	// ConnectionReuses counts leases taken from any idle pool.
 	ConnectionReuses uint64
+	// ConnectionRotations counts reusable connections retired at their jittered
+	// MaxConnAge, including idle timer expiry. It does not count retries or aborts.
+	ConnectionRotations uint64
 	// Retries counts single fresh-connection retries after stale pooled failures.
 	Retries uint64
 	// BytesRead counts body bytes consumed by Values, excluding headers and Stat.
@@ -46,6 +49,7 @@ type Stats struct {
 type clientStats struct {
 	queueWaits, queueWaitNanoseconds, queueRejections, queueTimeouts atomic.Uint64
 	dials, connectionReuses, retries, bytesRead                      atomic.Uint64
+	connectionRotations                                              atomic.Uint64
 	connections                                                      atomic.Int64
 }
 
@@ -66,6 +70,7 @@ func (c *Client) Stats() Stats {
 		ActiveSmallObjects: len(c.smallPool.slots),
 		Connections:        c.stats.connections.Load(), IdleConnections: idle,
 		Dials: c.stats.dials.Load(), ConnectionReuses: c.stats.connectionReuses.Load(),
-		Retries: c.stats.retries.Load(), BytesRead: c.stats.bytesRead.Load(),
+		ConnectionRotations: c.stats.connectionRotations.Load(),
+		Retries:             c.stats.retries.Load(), BytesRead: c.stats.bytesRead.Load(),
 	}
 }

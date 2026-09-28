@@ -63,6 +63,7 @@ func (v *Value) advance() (int64, error) {
 			v.client.pages <- struct{}{}
 
 			v.workers.Add(1)
+
 			go func() {
 				defer v.workers.Done()
 

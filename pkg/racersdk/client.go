@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -40,6 +41,10 @@ type ClientConfig struct {
 	ResponseHeaderTimeout time.Duration
 	// IdleConnTimeout bounds pooled idle connections (default 90 seconds).
 	IdleConnTimeout time.Duration
+	// MaxConnAge bounds connection reuse (default 5 minutes). Each successful dial
+	// selects a fixed lifetime uniformly from [75%, 100%] of this value, rounded
+	// up to whole nanoseconds. Expiry never interrupts an active response.
+	MaxConnAge time.Duration
 }
 
 // Client streams immutable objects over the cache's canonical Unix socket.
@@ -57,11 +62,15 @@ type Client struct {
 	ctx                           context.Context
 	cancel                        context.CancelFunc
 	dial                          func(context.Context, string, string) (net.Conn, error)
-	stats                         clientStats
-	copySlots                     chan struct{}
-	copyBuffers                   chan *[copyBufferSize]byte
-	smallCopySlots                chan struct{}
-	smallCopyBuffers              chan *[copyBufferSize]byte
+	// Connection lifecycle seams are immutable after construction.
+	connNow          func() time.Time
+	connAge          func() time.Duration
+	connAfterFunc    func(time.Duration, func()) connectionTimer
+	stats            clientStats
+	copySlots        chan struct{}
+	copyBuffers      chan *[copyBufferSize]byte
+	smallCopySlots   chan struct{}
+	smallCopyBuffers chan *[copyBufferSize]byte
 }
 
 // NewClient validates config without dialing. Contexts bound stream lifetimes;
@@ -79,7 +88,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		return nil, err
 	}
 
-	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 {
+	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 || config.MaxConnAge < 0 {
 		return nil, failure(ErrorInvalidArgument, "client config", nil)
 	}
 
@@ -123,6 +132,10 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		config.IdleConnTimeout = 90 * time.Second
 	}
 
+	if config.MaxConnAge == 0 {
+		config.MaxConnAge = 5 * time.Minute
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), queued: make(chan struct{}, config.MaxQueuedRequests), config: config, path: path, ctx: ctx, cancel: cancel}
 	c.bulk.slots = c.slots
@@ -137,6 +150,9 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	c.smallCopySlots = make(chan struct{}, config.SmallObjectConnections)
 	c.smallCopyBuffers = make(chan *[copyBufferSize]byte, config.SmallObjectConnections)
 	c.dial = (&net.Dialer{Timeout: config.DialTimeout}).DialContext
+	c.connNow = time.Now
+	c.connAge = func() time.Duration { return jitteredConnAge(config.MaxConnAge, rand.Int64N) }
+	c.connAfterFunc = func(d time.Duration, f func()) connectionTimer { return time.AfterFunc(d, f) }
 
 	return c, nil
 }
