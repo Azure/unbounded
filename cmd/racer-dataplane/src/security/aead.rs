@@ -169,8 +169,9 @@ impl PageCryptoEngine {
     /// All fallible work borrows input. Ownership transfers only after the final
     /// cancellation check, so failures retain the exact input and quota owners.
     pub fn process(job: CryptoJob) -> CryptoCompletion {
+        let measurement_start = crate::runtime::environment::now();
         let CryptoJob {
-            permit,
+            mut permit,
             input,
             key,
             scope,
@@ -306,6 +307,7 @@ impl PageCryptoEngine {
                 }
             },
         };
+        permit.executed(measurement_start);
         CryptoCompletion {
             permit,
             outcome,

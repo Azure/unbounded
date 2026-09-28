@@ -509,6 +509,7 @@ impl WorkerApplication {
             .find(|(id, _)| *id == worker)
             .map(|(_, metrics)| metrics.clone())
             .ok_or(Error::InvalidConfiguration)?;
+        runtime.crypto.set_metrics(metrics.clone());
         let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();

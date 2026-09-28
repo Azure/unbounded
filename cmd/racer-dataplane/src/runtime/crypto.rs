@@ -101,6 +101,79 @@ struct Handoff {
 pub struct CryptoPermit {
     handoff: Arc<Handoff>,
     id: CryptoId,
+    measurement: Measurement,
+}
+
+#[derive(Default)]
+struct Measurement {
+    decrypt: bool,
+    bytes: u64,
+    submitted: Option<std::time::Instant>,
+    queue_ns: Option<u64>,
+    execution_ns: Option<u64>,
+}
+
+fn elapsed_ns(start: std::time::Instant) -> u64 {
+    super::environment::now()
+        .saturating_duration_since(start)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+impl CryptoPermit {
+    pub(crate) fn executed(&mut self, start: std::time::Instant) {
+        self.measurement.execution_ns = Some(elapsed_ns(start));
+    }
+}
+
+impl CryptoCompletion {
+    /// I/O is the only counter writer. Aggregate once on dequeue, even when the
+    /// waiter is abandoned. Started means execution observed through completion;
+    /// in-flight work and engine loss without a completion are not yet counted.
+    fn record(&self, metrics: &crate::telemetry::metrics::Metrics) {
+        use crate::telemetry::metrics::Event::*;
+        let m = &self.permit.measurement;
+        let Some(execution) = m.execution_ns else {
+            return;
+        };
+        let events = if m.decrypt {
+            [
+                CryptoDecryptStarted,
+                CryptoDecryptSuccess,
+                CryptoDecryptFailure,
+                CryptoDecryptBytes,
+                CryptoDecryptExecutionCount,
+                CryptoDecryptExecutionNs,
+                CryptoDecryptQueueCount,
+                CryptoDecryptQueueNs,
+            ]
+        } else {
+            [
+                CryptoEncryptStarted,
+                CryptoEncryptSuccess,
+                CryptoEncryptFailure,
+                CryptoEncryptBytes,
+                CryptoEncryptExecutionCount,
+                CryptoEncryptExecutionNs,
+                CryptoEncryptQueueCount,
+                CryptoEncryptQueueNs,
+            ]
+        };
+        let success = matches!(self.outcome, CryptoOutcome::Completed(_));
+        let amounts = [
+            1,
+            u64::from(success),
+            u64::from(!success),
+            if success { m.bytes } else { 0 },
+            1,
+            execution,
+            u64::from(m.queue_ns.is_some()),
+            m.queue_ns.unwrap_or(0),
+        ];
+        for (event, amount) in events.into_iter().zip(amounts) {
+            let _ = metrics.record(event, amount);
+        }
+    }
 }
 impl Drop for CryptoPermit {
     fn drop(&mut self) {
@@ -117,7 +190,17 @@ pub struct CryptoJob {
 }
 
 impl CryptoPermit {
-    pub fn job(self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
+    pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
+        use super::reactor::IoBuffer;
+        self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
+        self.measurement.bytes = match &input {
+            CryptoInput::Encrypt { plaintext, .. } => {
+                plaintext.bytes().map_or(0, |b| b.len() as u64)
+            }
+            CryptoInput::Decrypt { ciphertext, .. } => {
+                u64::from(ciphertext.envelope().plaintext_length)
+            }
+        };
         CryptoJob {
             permit: self,
             input,
@@ -242,12 +325,16 @@ impl IoCryptoPort {
         Poll::Ready(Ok(CryptoPermit {
             handoff: self.handoff.clone(),
             id,
+            measurement: Measurement::default(),
         }))
     }
 
     /// Validate the permit belongs to this pair. Closed or rejected submission
     /// returns all ownership; an accepted job lives independently of its waiter.
-    pub fn try_submit(&self, job: CryptoJob) -> std::result::Result<(), SendFailure<CryptoJob>> {
+    pub fn try_submit(
+        &self,
+        mut job: CryptoJob,
+    ) -> std::result::Result<(), SendFailure<CryptoJob>> {
         if !Arc::ptr_eq(&self.handoff, &job.permit.handoff)
             || self.handoff.closed.load(Ordering::Acquire)
         {
@@ -256,6 +343,9 @@ impl IoCryptoPort {
                 error: Error::Unavailable,
             });
         }
+        // Capture at publication attempt, not permit reservation/admission. A
+        // rejected attempt never reaches dequeue and is overwritten on retry.
+        job.permit.measurement.submitted = Some(super::environment::now());
         self.jobs.try_send(job)?;
         self.handoff.engine_waker.wake();
         Ok(())
@@ -283,10 +373,18 @@ impl CryptoPort {
     }
     /// None means closed and all accepted jobs consumed, not temporarily empty.
     pub fn poll_job(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<CryptoJob>>> {
-        self.jobs
+        let result = self
+            .jobs
             .as_mut()
             .expect("live engine endpoint")
-            .poll_receive(cx)
+            .poll_receive(cx);
+        match result {
+            Poll::Ready(Ok(Some(mut job))) => {
+                job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
+                Poll::Ready(Ok(Some(job)))
+            }
+            other => other,
+        }
     }
 
     /// Uses the job's reserved completion slot, including during drain. A backend
@@ -328,6 +426,7 @@ impl Drop for CryptoPort {
 /// I/O checks generation/sequence before delivery and never publishes stale work.
 pub struct CryptoClient {
     port: IoCryptoPort,
+    metrics: RefCell<Option<crate::telemetry::metrics::Metrics>>,
     waiters: RefCell<BTreeMap<CryptoId, Waiter>>,
     sequence: Cell<u64>,
     pending: RefCell<VecDeque<(CryptoId, Waker, RequestScope)>>,
@@ -378,6 +477,7 @@ impl CryptoClient {
     pub fn new(port: IoCryptoPort) -> Self {
         Self {
             port,
+            metrics: RefCell::new(None),
             waiters: RefCell::new(BTreeMap::new()),
             sequence: Cell::new(0),
             pending: RefCell::new(VecDeque::new()),
@@ -385,6 +485,11 @@ impl CryptoClient {
             pending_cursor: Cell::new(0),
             drain_waiter: RefCell::new(None),
         }
+    }
+
+    /// Install the I/O writer before admitting work; crypto never writes this shard.
+    pub(crate) fn set_metrics(&self, metrics: crate::telemetry::metrics::Metrics) {
+        *self.metrics.borrow_mut() = Some(metrics);
     }
 
     /// Allocate a unique ID in this pair's generation, reserve both queue slots,
@@ -501,6 +606,9 @@ impl CryptoClient {
             let Some(completion) = completion else {
                 break;
             };
+            if let Some(metrics) = self.metrics.borrow().as_ref() {
+                completion.record(metrics);
+            }
             let id = completion.id();
             let wake = {
                 let mut waiters = self.waiters.borrow_mut();
@@ -649,6 +757,165 @@ impl CryptoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
+        use crate::{
+            runtime::environment::{self, SimulationClock},
+            telemetry::metrics::{Event::*, Metrics},
+        };
+        use std::time::Duration;
+        let clock = SimulationClock::new(42);
+        let env = clock.environment(0);
+        let _env = env.enter();
+        let _strict = environment::require_simulated();
+        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let keys = keyring();
+        for decrypt in [false, true] {
+            for mode in ["success", "failure", "cancel", "abandon"] {
+                let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+                let client = CryptoClient::new(io);
+                let metrics = Metrics::default();
+                client.set_metrics(metrics.clone());
+                let scope = RequestScope::new(
+                    crate::model::identity::RequestId([0; 16]),
+                    environment::now() + Duration::from_secs(10),
+                )
+                .unwrap();
+                let cache =
+                    crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into());
+                let lease = || {
+                    keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
+                        .unwrap()
+                };
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                let mut data = input(&admission);
+                if decrypt {
+                    let (setup, _setup_engine) =
+                        pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+                    let Poll::Ready(Ok(permit)) = setup.poll_reserve(
+                        &mut cx,
+                        CryptoId {
+                            worker: WorkerId(0),
+                            generation: 0,
+                            sequence: 0,
+                        },
+                    ) else {
+                        panic!("permit")
+                    };
+                    let result = crate::security::aead::PageCryptoEngine::process(permit.job(
+                        data,
+                        lease(),
+                        scope.clone(),
+                    ));
+                    let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
+                        result.outcome
+                    else {
+                        panic!("encrypted")
+                    };
+                    drop(plain);
+                    if mode == "failure" {
+                        Arc::get_mut(&mut ciphertext.inner).unwrap().bytes[0] ^= 1;
+                    }
+                    data = CryptoInput::Decrypt {
+                        ciphertext,
+                        plaintext: admission
+                            .reserve(
+                                Some(&cache),
+                                crate::model::limits::ResourceClass::Plaintext,
+                                1,
+                            )
+                            .unwrap(),
+                    };
+                } else if mode == "failure" {
+                    if let CryptoInput::Encrypt { page, .. } = &mut data {
+                        page.version.object.cache.0 = "wrong".into();
+                    }
+                }
+                // Admission delay must not leak into residence.
+                clock.advance(Duration::from_millis(100));
+                let mut future = client.execute(data, lease(), &scope);
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+                if mode == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                clock.advance(Duration::from_millis(3));
+                let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
+                    panic!("job")
+                };
+                let mut completion = crate::security::aead::PageCryptoEngine::process(job);
+                // The engine uses virtual time (zero cost in DST). Explicitly
+                // advance a measured interval to exercise the exact sum separately.
+                assert_eq!(completion.permit.measurement.execution_ns, Some(0));
+                let start = environment::now();
+                clock.advance(Duration::from_millis(2));
+                completion.permit.executed(start);
+                let (_, mut wrong) = pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
+                completion = wrong.complete(completion).err().unwrap().command;
+                assert!(engine.complete(completion).is_ok());
+                let events = if decrypt {
+                    [
+                        CryptoDecryptStarted,
+                        CryptoDecryptSuccess,
+                        CryptoDecryptFailure,
+                        CryptoDecryptBytes,
+                        CryptoDecryptExecutionCount,
+                        CryptoDecryptExecutionNs,
+                        CryptoDecryptQueueCount,
+                        CryptoDecryptQueueNs,
+                    ]
+                } else {
+                    [
+                        CryptoEncryptStarted,
+                        CryptoEncryptSuccess,
+                        CryptoEncryptFailure,
+                        CryptoEncryptBytes,
+                        CryptoEncryptExecutionCount,
+                        CryptoEncryptExecutionNs,
+                        CryptoEncryptQueueCount,
+                        CryptoEncryptQueueNs,
+                    ]
+                };
+                assert_eq!(metrics.count(events[0]), 0);
+                if mode == "abandon" {
+                    drop(future);
+                } else {
+                    client.poll_budgeted(1).unwrap();
+                    assert!(future.as_mut().poll(&mut cx).is_ready());
+                }
+                client.poll_budgeted(1).unwrap();
+                client.poll_budgeted(1).unwrap();
+                let success = u64::from(mode == "success" || mode == "abandon");
+                for (event, expected) in events.into_iter().zip([
+                    1,
+                    success,
+                    1 - success,
+                    success,
+                    1,
+                    2_000_000,
+                    1,
+                    3_000_000,
+                ]) {
+                    assert_eq!(metrics.count(event), expected, "{mode} {event:?}");
+                }
+                assert_eq!(client.outstanding(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn duration_saturates_without_host_time_in_dst() {
+        use crate::runtime::environment::{self, SimulationClock};
+        let clock = SimulationClock::new(19);
+        let env = clock.environment(0);
+        let _env = env.enter();
+        let _strict = environment::require_simulated();
+        let start = environment::now();
+        clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
+        assert_eq!(elapsed_ns(start), u64::MAX);
+    }
 
     fn input(admission: &std::rc::Rc<crate::runtime::admission::Admission>) -> CryptoInput {
         use crate::{
@@ -1033,12 +1300,21 @@ mod tests {
         ));
     }
 
-    fn key() -> KeyLease {
+    pub(super) fn key() -> KeyLease {
+        keyring()
+            .active(
+                &crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                crate::security::keyring::KeyPurpose::Page,
+            )
+            .unwrap()
+    }
+
+    pub(super) fn keyring() -> crate::security::keyring::Keyring {
         use crate::{
             control::wire::*,
             model::envelope::KeyId,
             model::identity::{CacheId, ClusterId, NodeId},
-            security::keyring::{KeyEpochs, KeyPurpose, Keyring},
+            security::keyring::{KeyEpochs, Keyring},
         };
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let mut params = rcgen::CertificateParams::default();
@@ -1066,7 +1342,7 @@ mod tests {
             }],
         })
         .unwrap();
-        keys.active(&cache, KeyPurpose::Page).unwrap()
+        keys
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 22;
+pub const EVENT_COUNT: usize = 38;
 pub const GAUGE_COUNT: usize = 11;
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
@@ -21,9 +21,15 @@ struct Registry {
 // Match the runtime's 64-byte cache-line policy. Padding the entire writer block
 // avoids false sharing between workers without padding every event separately.
 #[repr(align(64))]
-#[derive(Default)]
 struct Counters {
     events: [AtomicU64; EVENT_COUNT],
+}
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            events: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 // Gauges retain exact node-wide lease overflow checks and replacement semantics.
 // Separate lines prevent unrelated resource classes from invalidating each other.
@@ -64,6 +70,22 @@ pub enum Event {
     DiagnosticFailures,
     DeliveryPipeDrain,
     DeliveryDirectBytes,
+    CryptoEncryptStarted,
+    CryptoEncryptSuccess,
+    CryptoEncryptFailure,
+    CryptoEncryptBytes,
+    CryptoEncryptExecutionCount,
+    CryptoEncryptExecutionNs,
+    CryptoEncryptQueueCount,
+    CryptoEncryptQueueNs,
+    CryptoDecryptStarted,
+    CryptoDecryptSuccess,
+    CryptoDecryptFailure,
+    CryptoDecryptBytes,
+    CryptoDecryptExecutionCount,
+    CryptoDecryptExecutionNs,
+    CryptoDecryptQueueCount,
+    CryptoDecryptQueueNs,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::Request,
@@ -88,6 +110,22 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::DiagnosticFailures,
     Event::DeliveryPipeDrain,
     Event::DeliveryDirectBytes,
+    Event::CryptoEncryptStarted,
+    Event::CryptoEncryptSuccess,
+    Event::CryptoEncryptFailure,
+    Event::CryptoEncryptBytes,
+    Event::CryptoEncryptExecutionCount,
+    Event::CryptoEncryptExecutionNs,
+    Event::CryptoEncryptQueueCount,
+    Event::CryptoEncryptQueueNs,
+    Event::CryptoDecryptStarted,
+    Event::CryptoDecryptSuccess,
+    Event::CryptoDecryptFailure,
+    Event::CryptoDecryptBytes,
+    Event::CryptoDecryptExecutionCount,
+    Event::CryptoDecryptExecutionNs,
+    Event::CryptoDecryptQueueCount,
+    Event::CryptoDecryptQueueNs,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -114,6 +152,22 @@ impl Event {
             Self::DiagnosticFailures => "racer_diagnostic_failures_total",
             Self::DeliveryPipeDrain => "racer_delivery_pipe_drains_total",
             Self::DeliveryDirectBytes => "racer_delivery_direct_bytes_total",
+            Self::CryptoEncryptStarted => "racer_crypto_encrypt_started_total",
+            Self::CryptoEncryptSuccess => "racer_crypto_encrypt_success_total",
+            Self::CryptoEncryptFailure => "racer_crypto_encrypt_failure_total",
+            Self::CryptoEncryptBytes => "racer_crypto_encrypt_success_bytes_total",
+            Self::CryptoEncryptExecutionCount => "racer_crypto_encrypt_execution_nanoseconds_count",
+            Self::CryptoEncryptExecutionNs => "racer_crypto_encrypt_execution_nanoseconds_sum",
+            Self::CryptoEncryptQueueCount => "racer_crypto_encrypt_queue_nanoseconds_count",
+            Self::CryptoEncryptQueueNs => "racer_crypto_encrypt_queue_nanoseconds_sum",
+            Self::CryptoDecryptStarted => "racer_crypto_decrypt_started_total",
+            Self::CryptoDecryptSuccess => "racer_crypto_decrypt_success_total",
+            Self::CryptoDecryptFailure => "racer_crypto_decrypt_failure_total",
+            Self::CryptoDecryptBytes => "racer_crypto_decrypt_success_bytes_total",
+            Self::CryptoDecryptExecutionCount => "racer_crypto_decrypt_execution_nanoseconds_count",
+            Self::CryptoDecryptExecutionNs => "racer_crypto_decrypt_execution_nanoseconds_sum",
+            Self::CryptoDecryptQueueCount => "racer_crypto_decrypt_queue_nanoseconds_count",
+            Self::CryptoDecryptQueueNs => "racer_crypto_decrypt_queue_nanoseconds_sum",
         }
     }
 }
@@ -337,7 +391,7 @@ mod tests {
             EVENT_COUNT + GAUGE_COUNT
         );
         assert!(!output.contains('{'));
-        assert!(output.len() < 4096);
+        assert!(output.len() < 8192);
     }
 
     #[test]
