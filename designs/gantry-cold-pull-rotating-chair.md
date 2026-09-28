@@ -169,27 +169,24 @@ than for the cluster.
 
 **Dead-Holder Replacement**
 
-Replacement is lazy and demand-driven:
+Replacement can be demand-driven or found by sampled background observation:
 
 ```text
-claimable = chair empty OR
-            (holder unresponsive AND Lease expired)
+claimable = chair empty OR Lease expired
 ```
 
-- Unresponsive but Lease fresh: use a backup; do not claim.
-- Responsive but Lease expired: continue using it; do not claim.
-- Unresponsive and Lease expired: a non-chair requester may claim it.
-- No demand: the dead chair remains untouched.
+- Lease fresh: use a backup after a request failure; do not claim.
+- Lease expired: a non-chair requester or sampled observer may claim it.
+- With no demand, a sampled non-chair observer may claim an expired chair.
 - Claimers jitter, re-read the Lease, then use a resource-version update.
 - One claimant wins and increments the generation.
 - Losers refresh and use the winner.
 - A requester already holding another chair does not claim it.
 
-Demand-driven reclamation cannot recover a cluster whose holders all left at
-once, as after a node-pool replacement: every Lease still records a holder, so
-no chair looks free and nothing is ever claimed. Startup therefore treats a
-chair unrenewed for five lease durations as abandoned and claimable, but only
-once no genuinely free chair remains, so a briefly slow holder keeps its seat.
+Kubernetes leaves the last holder identity on an expired Lease. Sampled
+background reconciliation therefore treats an expired occupied chair as
+claimable after one Lease duration. The sampling budget is approximately one
+Lease list per second across a 100,000-node fleet, independent of pull demand.
 
 Readiness requires one selectable chair, not the complete holder target.
 The target continues converging after agents become ready, so small clusters
@@ -215,7 +212,7 @@ and rolling upgrades do not require every node to become a chair.
 - Assignment epoch: `floor(unix_time / 6h)`.
 - During a distributed epoch rollover, a holder and requester accept the
     immediately previous epoch until that chair's Lease renews or rotates.
-- Lease duration: `60s`; heartbeat renewal: `20s`.
+- Lease duration: `5m`; heartbeat renewal: `1m`.
 - Each Kubernetes chair API operation is bounded by `5s`.
 - Successor selection starts `5m` before the next epoch.
 - Startup snapshot jitter: deterministic over `30s`.
