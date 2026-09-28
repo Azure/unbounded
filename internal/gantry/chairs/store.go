@@ -51,7 +51,7 @@ func (s *Store) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("list chairs: %w", err)
 	}
 
-	snapshot := Snapshot{Epoch: epoch, FetchedAt: time.Now(), Chairs: make([]Chair, 0, Count)}
+	snapshot := Snapshot{Epoch: epoch, FetchedAt: time.Now(), Chairs: make([]Chair, 0, DefaultCount)}
 
 	for index := range list.Items {
 		chair, err := DecodeLease(&list.Items[index])

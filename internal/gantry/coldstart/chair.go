@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"sort"
 	"strings"
 	"sync"
@@ -49,7 +50,7 @@ type ChairOptions struct {
 	PollManifest          time.Duration
 	PollLayer             time.Duration
 	APITimeout            time.Duration
-	HolderCount           int
+	ChairCount            int
 	SeedCount             int
 	TrustedFailureClasses []ifaces.FailureClass
 	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
@@ -114,8 +115,8 @@ func NewChairResolver(opts ChairOptions) *ChairResolver {
 		opts.SeedCount = chairs.SeedCount
 	}
 
-	if opts.HolderCount <= 0 {
-		opts.HolderCount = chairs.Count
+	if opts.ChairCount <= 0 {
+		opts.ChairCount = chairs.DefaultCount
 	}
 
 	if opts.APITimeout <= 0 {
@@ -145,7 +146,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		return nil, err
 	}
 
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, r.opts.ChairCount)
 
 	seedCount := r.seedCount(len(ranked))
 	if seedCount == 0 {
@@ -421,7 +422,7 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 
 		seen[child.Digest] = struct{}{}
 
-		ranked := chairs.Rank(snapshot, child.Digest)
+		ranked := chairs.Rank(snapshot, child.Digest, r.opts.ChairCount)
 
 		seedCount := r.seedCount(len(ranked))
 		if seedCount == 0 {
@@ -498,10 +499,21 @@ func (r *ChairResolver) seedCount(selectable int) int {
 		return 0
 	}
 
-	seedCount := (selectable*r.opts.SeedCount + r.opts.HolderCount - 1) / r.opts.HolderCount
+	seedCount := proportionalSeedCount(selectable, r.opts.SeedCount, r.opts.ChairCount)
 	seedCount = min(seedCount, r.opts.SeedCount)
 
 	return min(seedCount, selectable)
+}
+
+func proportionalSeedCount(selectable, seedCount, chairCount int) int {
+	high, low := bits.Mul64(uint64(selectable), uint64(seedCount))
+
+	quotient, remainder := bits.Div64(high, low, uint64(chairCount))
+	if remainder > 0 {
+		quotient++
+	}
+
+	return int(quotient)
 }
 
 func allChairOutcomesAccepted(outcomes []ifaces.PleasePullOutcome) bool {
@@ -568,7 +580,7 @@ func (r *ChairResolver) pullChairOnce(ctx context.Context, chair chairs.Chair, r
 	}
 
 	assignment := ifaces.ChairAssignment{
-		ChairID:         uint32(chair.ID),
+		ChairID:         uint64(chair.ID),
 		Generation:      chair.Generation,
 		AssignmentEpoch: chair.AssignmentEpoch,
 	}

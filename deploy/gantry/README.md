@@ -48,6 +48,48 @@ helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
 
+## Chair sizing and upgrades
+
+`gantry.chairCount` controls the maximum active chair pool and
+`gantry.chairSeedCount` controls the per-digest seed cohort at a full pool.
+Both default to 64 chairs and 8 seeds. The counts have no configured maximum,
+but both must be positive and the seed count cannot exceed the chair count.
+The active pool is also bounded by the Gantry DaemonSet's desired scheduled
+pod count because one agent can hold at most one chair.
+The previous `chair_holder_count`, `GANTRY_CHAIR_HOLDER_COUNT`, and
+`--chair-holder-count` names remain accepted as deprecated aliases.
+
+For example:
+
+```sh
+helm upgrade gantry oci://ghcr.io/azure/charts/gantry \
+   --version <release-without-v> \
+   --namespace gantry-system \
+   --reuse-values \
+   --set gantry.chairCount=128 \
+   --set gantry.chairSeedCount=100
+```
+
+Increasing the chair count preserves every existing Lease and holder. Agents
+create and claim the additional numbered Leases through the normal election
+path until the new target is reached. Decreasing it makes holders at IDs above
+the new count vacate; the empty Lease objects may remain and are ignored.
+Chair Leases carry Helm's `keep` resource policy so a reduction does not delete
+coordination state during a rolling update. This also leaves the Leases behind
+on uninstall; delete them explicitly only after every Gantry pod has stopped.
+
+Releases that only understand the original 64-chair set reject higher-numbered
+Lease names. Upgrading from such a release therefore requires two stages:
+
+1. Upgrade every Gantry pod to the count-aware image while keeping
+   `gantry.chairCount=64`.
+2. After that rollout completes, raise `gantry.chairCount` and
+   `gantry.chairSeedCount`.
+
+Do not combine these stages in one Helm upgrade. A new pod can create a
+higher-numbered Lease while old pods are still running, which makes the old
+pods reject their next chair snapshot.
+
 ## Operator Profile
 
 ```sh
@@ -181,7 +223,7 @@ to production:
 | Kubelet probe source | `examples/networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR - `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
 | Mirror port 5000 source | `examples/networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 - the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
 | containerd socket access | `daemonset.yaml` | The pod mounts `/run/containerd`, rather than the socket file, so reconnects observe the replacement socket after containerd restarts. It runs with non-root UID 65532 and primary GID 0 because many nodes expose `containerd.sock` as `root:root` mode 0660. Validate this on your target node pool before production. If your runtime uses a dedicated socket group, patch `runAsGroup`/`fsGroup` to that group; if your policy forbids GID 0, adjust node socket ownership or run a site-specific privileged wrapper. **Clearing `containerd_socket` is no longer a valid escape hatch** - after plan-final-copilot-v2 §Phase 8 containerd is Gantry's sole storage backend; without socket access the agent has no content store to read from or write to. The `storage_mode` config value must remain `containerd`. |
-| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent's only Kubernetes access is `leases` (`get`, `list`, `create`, `update`) on the 64 chair Leases in its own namespace. It runs no informer and opens no watch, and it needs no access to Pods or Nodes. Review the `Role` to confirm scope hasn't drifted; a `ClusterRole` should not exist. |
+| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent's only Kubernetes access is `leases` (`get`, `list`, `create`, `update`) on the configured chair Leases in its own namespace and `get` on its own DaemonSet for capacity. It runs no informer and opens no watch, and it needs no access to Pods or Nodes. Review the `Role` to confirm scope hasn't drifted; a `ClusterRole` should not exist. |
 
 ### HEAD semantics on cache miss
 

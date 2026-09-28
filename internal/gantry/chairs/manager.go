@@ -38,7 +38,7 @@ type ManagerOptions struct {
 	ClaimInitialDivisor uint64
 	APITimeout          time.Duration
 	ClusterSizeEstimate int
-	HolderCount         int
+	ChairCount          int
 }
 
 type reservation struct {
@@ -80,12 +80,12 @@ func NewManager(opts ManagerOptions) *Manager {
 		panic("chairs.NewManager: Self is required")
 	}
 
-	if opts.HolderCount <= 0 {
-		opts.HolderCount = DefaultHolderCount
+	if opts.ChairCount <= 0 {
+		opts.ChairCount = DefaultCount
 	}
 
 	if opts.Cache == nil {
-		opts.Cache = NewCache(opts.Store, opts.HolderCount)
+		opts.Cache = NewCache(opts.Store, opts.ChairCount)
 	}
 
 	if opts.Now == nil {
@@ -173,7 +173,7 @@ func (m *Manager) Ready() bool {
 		return false
 	}
 
-	return snapshot.SelectableCount() > 0
+	return snapshot.SelectableCountWithin(m.opts.ChairCount) > 0
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -219,14 +219,14 @@ func (m *Manager) ValidateChair(_ context.Context, assignment ifaces.ChairAssign
 	epoch := m.CurrentEpoch()
 
 	return m.held != nil &&
-		uint32(m.held.ID) == assignment.ChairID &&
+		uint64(m.held.ID) == assignment.ChairID &&
 		m.held.Generation == assignment.Generation &&
 		m.held.AssignmentEpoch == assignment.AssignmentEpoch &&
 		(assignment.AssignmentEpoch == epoch || assignment.AssignmentEpoch == epoch-1)
 }
 
 func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
-	if assignment.ChairID >= Count || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
+	if assignment.ChairID >= uint64(m.opts.ChairCount) || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
 		return ifaces.PeerEndpoint{}, false
 	}
 
@@ -331,7 +331,7 @@ func (m *Manager) recover(ctx context.Context) error {
 		sort.Slice(successors, func(left, right int) bool { return successors[left].ID < successors[right].ID })
 		m.mu.Lock()
 		m.reserved = &reservation{assignment: ifaces.ChairAssignment{
-			ChairID:         uint32(successors[0].ID),
+			ChairID:         uint64(successors[0].ID),
 			Generation:      successors[0].Generation + 1,
 			AssignmentEpoch: successors[0].AssignmentEpoch + 1,
 		}}
@@ -445,7 +445,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		return
 	}
 
-	refreshHolderTarget := refreshingSatisfiedTarget && snapshot.SelectableCount() < m.opts.HolderCount
+	refreshHolderTarget := refreshingSatisfiedTarget && snapshot.SelectableCountWithin(m.opts.ChairCount) < m.opts.ChairCount
 
 	holderTarget, err := m.resolveHolderTarget(ctx, snapshot, refreshHolderTarget)
 	if err != nil {
@@ -454,7 +454,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		return
 	}
 
-	if snapshot.SelectableCount() >= holderTarget {
+	if snapshot.SelectableCountWithin(holderTarget) >= holderTarget {
 		return
 	}
 
@@ -583,7 +583,7 @@ func (m *Manager) maintain(ctx context.Context) {
 	}
 	m.mu.Unlock()
 
-	if cached.Epoch != epoch || cached.SelectableCount() < m.opts.HolderCount || !bootstrapReady {
+	if cached.Epoch != epoch || cached.SelectableCountWithin(m.opts.ChairCount) < m.opts.ChairCount || !bootstrapReady {
 		apiCtx, cancel := m.apiContext(ctx)
 		snapshot, snapshotErr := m.opts.Store.Snapshot(apiCtx, m.CurrentEpoch())
 
@@ -623,7 +623,7 @@ func (m *Manager) maintain(ctx context.Context) {
 
 func (m *Manager) resolveHolderTarget(ctx context.Context, snapshot Snapshot, refresh bool) (int, error) {
 	if m.opts.HolderTarget == nil {
-		return m.opts.HolderCount, nil
+		return m.opts.ChairCount, nil
 	}
 
 	m.mu.Lock()
@@ -634,8 +634,8 @@ func (m *Manager) resolveHolderTarget(ctx context.Context, snapshot Snapshot, re
 		return holderTarget, nil
 	}
 
-	if !refresh && snapshot.SelectableCount() >= m.opts.HolderCount {
-		return m.opts.HolderCount, nil
+	if !refresh && snapshot.SelectableCountWithin(m.opts.ChairCount) >= m.opts.ChairCount {
+		return m.opts.ChairCount, nil
 	}
 
 	apiCtx, cancel := m.apiContext(ctx)
@@ -651,13 +651,13 @@ func (m *Manager) resolveHolderTarget(ctx context.Context, snapshot Snapshot, re
 		target = 1
 	}
 
-	if target > m.opts.HolderCount {
-		target = m.opts.HolderCount
+	if target > m.opts.ChairCount {
+		target = m.opts.ChairCount
 	}
 
 	m.mu.Lock()
 	m.holderTarget = target
-	m.selectionReady = snapshot.SelectableCount() >= target
+	m.selectionReady = snapshot.SelectableCountWithin(target) >= target
 	m.opts.Cache.SetHolderCount(target)
 	m.mu.Unlock()
 
@@ -744,7 +744,7 @@ func (m *Manager) prepareRotation(ctx context.Context, held Chair) {
 	})
 
 	assignment := ifaces.ChairAssignment{
-		ChairID:         uint32(held.ID),
+		ChairID:         uint64(held.ID),
 		Generation:      held.Generation + 1,
 		AssignmentEpoch: nextEpoch,
 	}
@@ -838,15 +838,16 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	// claimable" rather than "every chair records a holder". Chairs abandoned by
 	// departed nodes stay occupied forever and are exactly what a replacement
 	// node needs to take over.
-	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot, Count)) == 0
+	m.knownFull = snapshot.OccupiedCountWithin(m.opts.ChairCount) == m.opts.ChairCount &&
+		len(m.reclaimableChairs(snapshot, m.opts.ChairCount)) == 0
 	m.initialized = true
 
 	holderTarget := m.holderTarget
 	if holderTarget == 0 {
-		holderTarget = m.opts.HolderCount
+		holderTarget = m.opts.ChairCount
 	}
 
-	m.selectionReady = snapshot.SelectableCount() >= holderTarget
+	m.selectionReady = snapshot.SelectableCountWithin(holderTarget) >= holderTarget
 
 	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
 	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {

@@ -4,9 +4,9 @@ New Lease based cold start design with deterministic puller selection and doesnt
 **Scope**
 
 - Target: `100,000` Gantry nodes.
-- `64` fixed Kubernetes Lease names are available chair slots.
+- A configurable set of fixed Kubernetes Lease names provides chair slots.
 - The active holder target is the Gantry DaemonSet's desired capacity, capped
-    at 64.
+    by `chair_count`.
 - Each chair has one current Gantry holder.
 - A holder is a final origin seed puller, not a coordinator that performs another DHT selection.
 - Each node may hold at most one chair.
@@ -16,7 +16,7 @@ New Lease based cold start design with deterministic puller selection and doesnt
 
 ```text
 ranking       = HRW(blob digest, active stable chair IDs)
-active cohort = ceil(selectable holders * 8 / 64), up to 8
+active cohort = ceil(selectable holders * chair_seed_count / chair_count)
 rest          = ordered backup chairs
 ```
 
@@ -52,7 +52,7 @@ Every image pull performs a local check:
 
 ```text
 if cachedSnapshot.epoch != currentAssignmentEpoch:
-    refresh complete 64-chair snapshot through singleflight
+    refresh complete chair snapshot through singleflight
 
 use cachedSnapshot
 ```
@@ -72,7 +72,7 @@ use cachedSnapshot
 
 **Initial Startup**
 
-When all 64 Leases are empty:
+When all configured Leases are empty:
 
 1. Empty chairs are immediately claimable.
 2. Nodes enter deterministic, jittered claim rounds.
@@ -98,7 +98,8 @@ When all 64 Leases are empty:
 11. Completed content is committed and advertised through DHT.
 12. Other nodes discover providers and peer-fetch normally.
 
-Nominal cold-origin seeding is one copy per selected seed chair, bounded by 8.
+Nominal cold-origin seeding is one copy per selected seed chair, bounded by
+`chair_seed_count`.
 
 The cohort is contacted in one pass and partial acceptance is sufficient. The
 requester moves to the next cohort only when the entire cohort accepts nothing;
@@ -220,10 +221,11 @@ and rolling upgrades do not require every node to become a chair.
 - Startup snapshot jitter: deterministic over `30s`.
 - Empty-chair claim rounds run every `1s` with up to `750ms` deterministic
     per-claim jitter.
-- Holder target: `DaemonSet.status.desiredNumberScheduled`, capped at the
-    configured maximum of 64.
-- Per-digest seed count: `ceil(selectable holders * 8 / 64)`, with a minimum
-    of one and a maximum of eight.
+- Holder target: `DaemonSet.status.desiredNumberScheduled`, capped by
+    `chair_count`.
+- Per-digest seed count:
+    `ceil(selectable holders * chair_seed_count / chair_count)`, with a minimum
+    of one and a maximum of `chair_seed_count`.
 - The initial claim lottery admits `1/2048` of peers. The divisor halves each
     stage, using one stable peer/epoch ticket so eligibility only widens until
     every node is eligible if the holder target has not been occupied.

@@ -370,7 +370,7 @@ type PleasePullOutcome struct {
 // seed pull. It is optional on the wire so membership-based agents can
 // interoperate with chair-aware agents during a rolling deployment.
 type ChairAssignment struct {
-	ChairID         uint32
+	ChairID         uint64
 	Generation      int64
 	AssignmentEpoch int64
 }

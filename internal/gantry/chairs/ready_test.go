@@ -90,7 +90,7 @@ func TestManagerReadyWithOneSelectableChairHeldByPeer(t *testing.T) {
 		Self:           chairs.Holder{PeerID: "non-seed"},
 		Now:            func() time.Time { return time.Unix(0, 0) },
 		RotationPeriod: time.Hour,
-		HolderCount:    50,
+		ChairCount:     50,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

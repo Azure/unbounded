@@ -182,6 +182,8 @@
       "required": [
         "config",
         "pprofListen",
+        "chairCount",
+        "chairSeedCount",
         "upstreamRegistries"
       ],
       "properties": {
@@ -190,6 +192,14 @@
         },
         "pprofListen": {
           "type": "string"
+        },
+        "chairCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "chairSeedCount": {
+          "type": "integer",
+          "minimum": 1
         },
         "upstreamRegistries": {
           "type": "array",
