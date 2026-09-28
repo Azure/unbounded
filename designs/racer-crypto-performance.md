@@ -1,11 +1,15 @@
-# Racer crypto measurement foundation
+# Racer integrated CRC and AEAD measurements
 
 ## Scope and reproduction
 
-This change measures the existing CRC and XChaCha20-Poly1305 implementation. It
-does not replace either algorithm or change the wire profile. The only AEAD
-production edits are two clock hooks and a mutable permit binding in
-`cmd/racer-dataplane/src/security/aead.rs:171-179,310-318`.
+The integrated implementation uses accelerated CRC-64/XZ and RustCrypto's
+detached immutable-input XChaCha20-Poly1305 API. Record v4 is the sole supported
+record format; old CRC variants and v1-v3 records are deliberately rejected,
+not migrated or tried as fallback (`cmd/racer-dataplane/src/store/format.rs:19-20`
+and `RecordCodec::parse`). Page AAD, 24-byte nonces, and ciphertext-plus-16-byte-tag
+remain unchanged (`cmd/racer-dataplane/src/security/aead.rs:44-68,201-229`).
+Production execution hooks still surround the full page-engine operation
+(`cmd/racer-dataplane/src/security/aead.rs:175,320`).
 
 From the repository root, run the explicitly ignored test:
 
@@ -26,15 +30,29 @@ page-engine lifecycle and real two-thread handoff at a maximum of eight admitted
 operations. Each output line prefixed `CRYPTO_MEASURE ` contains a JSON object.
 `CRYPTO_PROVENANCE ` includes architecture, CPU model/features, compiler, revision,
 dirty state, Cargo.lock hash, caller affinity, profile, and ambient RUSTFLAGS.
-Keep the wrapper's cgroup limit diagnostics with the output. No extra dependency
-or standalone observability framework is introduced.
+Keep the wrapper's cgroup limit diagnostics with the output. Measurement adds no
+dependency or standalone observability framework; crypto dependencies are listed
+below.
 
 Primitive buffers, cipher, AAD, and tags are prepared before the clock starts.
 Decryption includes copying ciphertext into preallocated scratch (named
 `decrypt_copy`); bad-tag also includes that copy. Both still perform the complete
 AEAD operation including authentication, not a stream-cipher proxy. Repeated
 encryption mutates the same preallocated input. Fixed primitive nonces are for
-measurement only; the page engine uses its real fresh-nonce path.
+measurement only; the page engine uses its real fresh-nonce path. Migration from
+`AeadInPlace` to `AeadInOut` preserves these original 80 cases: the primitive
+`encrypt` still aliases input/output, and `decrypt_copy` and `bad_tag` still copy
+before an aliased detached operation. They are not mislabeled as the new
+production out-of-place path.
+
+For the separate 24-case primitive supplement, use the same command with the
+exact test name `runtime::crypto::measurement::crypto_measurement_inout`.
+`encrypt_inout`, `decrypt_inout`, and `bad_tag_inout` borrow immutable input and
+write to one preallocated scratch buffer, with **no preliminary payload copy**.
+Input rotation and iteration counts match the original matrix, but the write
+working set differs from aliased encryption. Neither primitive matrix includes
+allocation, clearing, or final zeroization in its clock. Do not subtract these
+separately run timings to claim an isolated copy cost.
 
 Lifecycle timing includes input allocation/copy, admission, key leasing, permit
 reservation, real `PageCryptoEngine::process`, CRC, output destruction/recycling,
@@ -108,8 +126,155 @@ Inference: CRC is material compared with complete AEAD on this host; lifecycle
 cost is not explained by primitive AEAD alone. These observations do not isolate
 allocation, zeroization, CRC, scheduling, or copying from one another, and should
 not be subtracted to claim individual stage costs. No Grace/ARM numbers were
-collected or inferred. CRC/AEAD optimization agents must rerun this harness after
-integration to establish their own results.
+collected or inferred. The final integrated run is below.
+
+## Final integrated x86 run
+
+Captured 2026-09-28 at clean revision
+`151f88c2fd8310d40216a5c583a8fcbe2eb35ca1`, after integrating CRC and AEAD plus
+the harness API migration. Cargo.lock SHA-256:
+`434d4e320144aa9cf2d04d15c4bf652dfaac5b7269521c677d457758b90c1a33`.
+Same Rust 1.96.0/LLVM 22.1.2, AMD EPYC 9V74 x86_64 VM, release/default features,
+empty RUSTFLAGS, allowed CPUs 0-47 and memory node 0. The wrapper again verified
+16 GiB memory.max and zero swap; jobs/tests were two. All 80 cases passed in
+31.17 seconds, with bad-tag failure counts exactly equal to iterations and no
+unexpected failures. The supplement passed all 24 cases in 24.08 seconds.
+These are sequential single runs on a shared unpinned VM, not medians or a
+controlled statistical study. Compiler/CPU provenance matches the baseline;
+code, dependencies, checksum variant, and instrumentation differ.
+
+Exact paired observations for every row retained in the baseline table follow.
+All times are **total milliseconds**; iteration counts are unchanged from above.
+
+| Size | Input | Layer | Operation | Baseline elapsed | Optimized elapsed | Baseline CPU | Optimized CPU |
+|---|---|---|---|---:|---:|---:|---:|
+| 63 B | reused | primitive | CRC | 23.232613 | 12.262418 | 23.232023 | 12.262759 |
+| 63 B | reused | primitive | encrypt | 481.325828 | 517.370860 | 481.305302 | 517.302888 |
+| 4095 B | reused | primitive | CRC | 16.156909 | 1.411271 | 16.157192 | 1.410888 |
+| 4095 B | reused | primitive | encrypt | 20.569770 | 20.371971 | 20.570454 | 20.372281 |
+| 1 MiB | rotating | primitive | CRC | 128.863919 | 9.828897 | 128.839862 | 9.829938 |
+| 1 MiB | rotating | primitive | encrypt | 94.916533 | 96.977257 | 94.915454 | 96.976776 |
+| 1 MiB | rotating | primitive | decrypt_copy | 105.567962 | 102.396216 | 105.565597 | 102.393883 |
+| 1 MiB | rotating | engine | encrypt | 279.582454 | 157.328876 | 279.550304 | 157.324800 |
+| 1 MiB | rotating | engine | decrypt | 272.171141 | 156.297464 | 272.147408 | 156.135700 |
+| 1 MiB | rotating | paired | encrypt | 239.604745 | 177.247173 | 282.043899 | 287.209017 |
+| 1 MiB | rotating | paired | decrypt | 249.004419 | 126.100748 | 334.409638 | 210.127637 |
+| 16 MiB | reused | primitive | CRC | 134.684546 | 9.336654 | 134.658665 | 9.336568 |
+| 16 MiB | reused | primitive | encrypt | 107.492998 | 94.808773 | 107.492439 | 94.455715 |
+| 16 MiB | reused | primitive | decrypt_copy | 105.150597 | 100.155774 | 105.090997 | 100.141238 |
+| 16 MiB | reused | engine | encrypt | 289.669897 | 154.206554 | 289.614700 | 154.187408 |
+| 16 MiB | reused | engine | decrypt | 290.681624 | 151.247246 | 290.644414 | 151.242419 |
+| 16 MiB | reused | paired | encrypt | 280.694677 | 153.646108 | 334.704956 | 221.454470 |
+| 16 MiB | reused | paired | decrypt | 240.238357 | 114.211542 | 280.145569 | 156.765601 |
+| 16 MiB | rotating | primitive | CRC | 128.177403 | 9.279798 | 128.175280 | 9.279404 |
+| 16 MiB | rotating | primitive | encrypt | 97.148222 | 94.824838 | 97.139606 | 94.824280 |
+| 16 MiB | rotating | primitive | decrypt_copy | 102.385358 | 100.320262 | 102.383628 | 100.293504 |
+| 16 MiB | rotating | primitive | bad_tag | 51.198908 | 43.174932 | 51.197853 | 43.173867 |
+| 16 MiB | rotating | engine | encrypt | 281.829181 | 159.158919 | 281.801406 | 159.154168 |
+| 16 MiB | rotating | engine | decrypt | 345.262537 | 238.975201 | 345.245373 | 238.950908 |
+| 16 MiB | rotating | engine | bad_tag | 390.911228 | 254.463862 | 390.780050 | 254.420391 |
+| 16 MiB | rotating | paired | encrypt | 269.657166 | 151.131482 | 367.685707 | 253.090923 |
+| 16 MiB | rotating | paired | decrypt | 256.469964 | 154.815373 | 354.402010 | 261.504006 |
+| 16 MiB | rotating | paired | bad_tag | 242.902719 | 140.723851 | 287.784340 | 214.236400 |
+
+The 16 MiB rotating CRC elapsed ratio is about 13.8x; paired encrypt/decrypt
+elapsed ratios are about 1.78x/1.66x. Those are ratios of these observations, not
+guaranteed deployment speedups. This changes the CRC variant as explicitly
+approved, so it is not a bit-identical CRC implementation comparison. The large
+CRC reduction coexists with roughly unchanged primitive AEAD and substantial
+lifecycle gains. The 63-byte primitive encryption observation regressed, and
+1 MiB rotating paired encryption CPU increased despite lower wall time. There is
+no evidence here for an across-the-board primitive or CPU improvement, nor an
+isolated benefit attributable solely to eliminating the page copy.
+
+Selected exact **out-of-place supplement** results (same counts as primitives
+above, milliseconds):
+
+| Size | Input | Operation | Elapsed | CPU |
+|---|---|---|---:|---:|
+| 63 B | reused | encrypt_inout | 508.975562 | 508.850709 |
+| 63 B | reused | decrypt_inout | 507.093103 | 506.911992 |
+| 4095 B | reused | encrypt_inout | 21.489353 | 21.489635 |
+| 4095 B | reused | decrypt_inout | 21.397815 | 21.398750 |
+| 1 MiB | rotating | encrypt_inout | 96.851919 | 96.842106 |
+| 1 MiB | rotating | decrypt_inout | 109.673745 | 109.647438 |
+| 1 MiB | rotating | bad_tag_inout | 54.762535 | 54.761467 |
+| 16 MiB | reused | encrypt_inout | 128.952041 | 128.923277 |
+| 16 MiB | reused | decrypt_inout | 115.840879 | 115.838511 |
+| 16 MiB | rotating | encrypt_inout | 106.497702 | 106.495504 |
+| 16 MiB | rotating | decrypt_inout | 109.172247 | 109.169241 |
+| 16 MiB | rotating | bad_tag_inout | 50.663180 | 50.662541 |
+
+### Attribution overhead limitation
+
+The harness has no instrumentation-disable switch. Its paired lifecycle uses
+low-level ports, not `CryptoClient::poll_completions`, so it exercises clock and
+permit bookkeeping but **not** the eight I/O-side counter updates per completion
+(`cmd/racer-dataplane/src/runtime/crypto_measurement.rs:239-249,339-351` versus
+`cmd/racer-dataplane/src/runtime/crypto.rs:137-179,613-615`). Thus neither a minimum
+full-instrumentation overhead nor an instrumented/uninstrumented paired delta
+was established. Comparing the old baseline with this integrated version would
+confound CRC and AEAD changes with instrumentation; it is not an overhead result.
+The exact virtual-time accounting tests establish semantics, not performance.
+
+## Dependencies, dispatch, and security review
+
+The resolved manifest preserves **both** `crc64fast` and the AEAD feature
+additions (`cmd/racer-dataplane/Cargo.toml:15-28`). Cargo, not a hand edit,
+reconciled Cargo.lock by adding CRC to the AEAD lock; subsequent checks/tests use
+`--locked`. Relevant locked releases and `cargo metadata` license expressions:
+
+| Crate | Version | License choice |
+|---|---|---|
+| crc64fast | 1.1.0 | MIT OR Apache-2.0 |
+| chacha20poly1305 | 0.11.0 | Apache-2.0 OR MIT |
+| chacha20 | 0.10.2 | MIT OR Apache-2.0 |
+| poly1305 | 0.9.1 | Apache-2.0 OR MIT |
+| cipher | 0.5.2 | MIT OR Apache-2.0 |
+| aead | 0.6.1 | MIT OR Apache-2.0 |
+| inout | 0.2.2 | MIT OR Apache-2.0 |
+
+The dependency tree confirms `chacha20poly1305` enables `alloc` and `zeroize`
+without default features. Explicit `cipher/zeroize` and `poly1305/zeroize`
+feature unification is intentional: the released AEAD feature does not alone
+enable both buffered-keystream wiping and Poly1305 state wiping. Do not remove
+these apparently unused direct dependencies without rechecking the release
+feature graph. This review is not an independent cryptographic audit or a
+claim that every compiler register/temporary is scrubbed.
+
+Released source, not upstream main-branch promises, determines CPU support:
+
+- `crc64fast` 1.1.0 `src/pclmulqdq/mod.rs:72-98` selects SIMD after architecture
+  detection and otherwise uses tables. It folds aligned 128-byte blocks and
+  handles short prefixes/tails with tables. Its AArch64 implementation detects
+  PMULL and NEON; x86 requires PCLMULQDQ, SSE2, SSE4.1. The explicit x86 test
+  passed here. The PMULL test is a separate ignored hardware gate, not silently
+  passed on x86 (`cmd/racer-dataplane/src/security/crc64.rs:96-125`).
+- `chacha20` 0.10.2 `src/lib.rs:239-297` runtime-dispatches x86 AVX2/SSE2; AVX-512
+  is gated by an additional `chacha20_avx512` cfg and was **not enabled** here,
+  even though this VM advertises AVX-512. AArch64 NEON is selected at compile time
+  with `target_arch=aarch64,target_feature=neon`, not a new project runtime
+  dispatch. Without that feature the portable backend is used.
+- `poly1305` 0.9.1 `src/backend.rs:3-15` exposes the AVX2/autodetect backend only
+  on x86/x86_64 and the soft backend otherwise. There is **no released ARM NEON
+  Poly1305 backend** in this locked version. NEON ChaCha does not imply NEON for
+  the complete AEAD. No forced target-cpu or unstable feature is enabled.
+
+No ARM/Grace machine, GPU, ARM cross-build, or PMULL execution was measured in
+this integration. The repository delegates CPU dispatch to maintained crates;
+it adds no custom SIMD, GPU crypto, or changed cryptographic algorithm.
+
+Correctness review verified immutable input until the final scope check,
+initialized admitted output, exact plaintext-length decryption allocation, and
+retained original ciphertext on success/failure
+(`cmd/racer-dataplane/src/security/aead.rs:217-270,302-316`). In the locked AEAD,
+`src/cipher.rs:75-98` authenticates ciphertext/tag before writing plaintext.
+Independent libsodium boundary/full-page vectors and sentinel-output tamper
+tests exercise that contract (`aead.rs:494-681`). The allocator-observing
+integration test checks complete output wiping on authentication failure and
+cancellation injected at output allocation, with charges retained until the
+completion is dropped (`cmd/racer-dataplane/tests/payload_zeroization.rs:311-339`).
+CRC remains accidental-corruption detection, never a substitute for AEAD.
 
 ## Minimal production attribution
 
@@ -148,7 +313,7 @@ use `runtime::environment::now`, so DST never accesses host time for attribution
 Measurements stay inside the existing permit, preserving every input/key/quota
 and abandoned-completion ownership fence.
 
-## Validation
+## Measurement-foundation validation (before integration)
 
 - Focused release crypto tests: 16 passed, including real success, validation/CRC
   failure, cancellation, abandonment, completion-publication retry, exact virtual
@@ -165,7 +330,31 @@ and abandoned-completion ownership fence.
   golangci-lint refused because another agent held its global parallel-run lock.
   No Go changes are included.
 
-Remaining limitations: no full-node throughput claim, no pinned/NUMA study,
-no allocation count or hardware cycle/cache-miss counters, no sampled histograms,
-and no Grace hardware validation. Broad integration/doctest/all-feature validation
-belongs to parent integration with the independent CRC and AEAD changes.
+## Final integration validation
+
+All commands had external `timeout --signal=TERM --kill-after=10s 300s` bounds.
+Rust test commands used the fail-closed memory-safe wrapper, Cargo jobs two and
+test threads two. Broad validation ran once in bounded groups, with all features:
+
+- `cargo check --locked --all-features --all-targets`: passed without warnings.
+- Focused release security: 65 passed, two hardware gates ignored; crypto:
+  16 passed, two benchmark tests ignored; store: 64 passed, one benchmark ignored.
+- Explicit x86 CRC hardware gate: one passed.
+- Full release/all-feature library: **821 passed, 14 ignored**, no failures;
+  test execution 58.35 seconds. Ignored tests include benchmarks and native RDMA
+  hardware gates; the 80/24-case crypto matrices were run separately as above.
+- All integration targets: client/origin conformance 19 passed/one ignored;
+  payload zeroization one passed; process restart three passed/16 ignored;
+  production dataplane 16 passed/one ignored. The privileged restart/throughput,
+  Go SDK bridge, and brd benchmarks remained ignored, not claimed as executed.
+- Doctests: 32 passed, including 26 compile-fail contracts. Binary tests: two passed.
+- Changed Rust files formatted with rustfmt (edition 2024, child traversal
+  disabled when checking the complete changed-file set); no unrelated changes.
+- Required bounded `make fmt` attempted once in integration. gofumpt completed;
+  golangci-lint panicked because it was built with Go 1.26 while a source file
+  required Go 1.27. No Go changes resulted. This is an environment limitation,
+  not a passing root-format/lint result.
+
+Remaining limitations: no full-node throughput claim, controlled paired
+instrumentation-off study, pinned/NUMA study, allocation count, hardware
+cycle/cache-miss counters, sampled histograms, or Grace/GPU hardware validation.
