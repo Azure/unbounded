@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 20;
+pub const EVENT_COUNT: usize = 22;
 pub const GAUGE_COUNT: usize = 11;
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
@@ -62,6 +62,8 @@ pub enum Event {
     PageDecrypt,
     PeerBootstrap,
     DiagnosticFailures,
+    DeliveryPipeDrain,
+    DeliveryDirectBytes,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::Request,
@@ -84,6 +86,8 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::PageDecrypt,
     Event::PeerBootstrap,
     Event::DiagnosticFailures,
+    Event::DeliveryPipeDrain,
+    Event::DeliveryDirectBytes,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -108,6 +112,8 @@ impl Event {
             Self::PageDecrypt => "racer_page_decrypts_total",
             Self::PeerBootstrap => "racer_peer_bootstraps_total",
             Self::DiagnosticFailures => "racer_diagnostic_failures_total",
+            Self::DeliveryPipeDrain => "racer_delivery_pipe_drains_total",
+            Self::DeliveryDirectBytes => "racer_delivery_direct_bytes_total",
         }
     }
 }

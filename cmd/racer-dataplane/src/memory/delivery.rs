@@ -5,7 +5,8 @@
 //! Neither path lends userspace page pointers to the socket after return. Only
 //! raw-socket readiness is asynchronous. On HTTP backpressure, an accounted send
 //! transfers the entire connection/reader lease to the reactor, retaining admission
-//! through abandonment and the final completion fence. Subsequent chunks splice.
+//! through abandonment and the final completion fence. After backpressure, the
+//! rest of that page uses direct sends instead of repeating pipe drain round trips.
 use super::{
     pipe::{PipeLease, PipePool},
     pool::VerifiedPage,
@@ -214,7 +215,15 @@ impl Delivery {
                 };
                 send_scope.check()?;
                 let sent = match reader.try_send(&connection.socket(), copying) {
-                    Ok(sent) => sent,
+                    Ok(sent) => {
+                        if copying {
+                            let _ = self.metrics.record(
+                                crate::telemetry::metrics::Event::DeliveryDirectBytes,
+                                sent as u64,
+                            );
+                        }
+                        sent
+                    }
                     Err(error) if !copying && splice_unsupported(&error) => {
                         copying = true;
                         continue;
@@ -249,6 +258,9 @@ impl Delivery {
                                 }
                                 _ => return Err(Error::Io),
                             }
+                            let _ = self
+                                .metrics
+                                .record(crate::telemetry::metrics::Event::DeliveryPipeDrain, 1);
                         }
                         let completion = self
                             .pipes
@@ -264,6 +276,14 @@ impl Delivery {
                         if completion.bytes > count {
                             return Err(Error::Io);
                         }
+                        // The pipe is empty and the immutable page reconstructs
+                        // any unsent suffix. Avoid another write/splice/drain on
+                        // the next backpressured chunk; keep the owned-send fence.
+                        copying = true;
+                        let _ = self.metrics.record(
+                            crate::telemetry::metrics::Event::DeliveryDirectBytes,
+                            completion.bytes as u64,
+                        );
                         completion.bytes
                     }
                     Err(_) => return Err(Error::Io),
@@ -1068,6 +1088,19 @@ mod tests {
         }
         assert_eq!(received, bytes);
         assert_eq!(completed.as_ref().unwrap().tx_remaining, Some(0));
+        assert_eq!(
+            delivery
+                .metrics
+                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain),
+            1,
+            "a backpressured page drains its staging pipe only once"
+        );
+        assert!(
+            delivery
+                .metrics
+                .count(crate::telemetry::metrics::Event::DeliveryDirectBytes)
+                > 0
+        );
         assert!(weak.upgrade().is_none());
         assert_eq!(
             admission.used(ResourceClass::Pipe),
