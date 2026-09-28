@@ -294,7 +294,19 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 
-		if r.URL.EscapedPath() != r.URL.Path || (r.Method != http.MethodPost || r.URL.Path != wire.BootstrapPath) && (r.Method != http.MethodGet || r.URL.Path != wire.SnapshotPath) {
+		if r.URL.EscapedPath() != r.URL.Path {
+			writeFailure(w, wire.InvalidRequest)
+			return
+		}
+
+		var handler http.HandlerFunc
+
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == wire.BootstrapPath:
+			handler = s.serveBootstrap
+		case r.Method == http.MethodGet && r.URL.Path == wire.SnapshotPath:
+			handler = s.serveSnapshot
+		default:
 			writeFailure(w, wire.InvalidRequest)
 			return
 		}
@@ -319,12 +331,7 @@ func (s *Server) Handler() http.Handler {
 		})
 		defer stop()
 
-		r = r.WithContext(ctx)
-		if r.Method == http.MethodPost {
-			s.serveBootstrap(w, r)
-		} else {
-			s.serveSnapshot(w, r)
-		}
+		handler(w, r.WithContext(ctx))
 	})
 }
 
@@ -576,10 +583,24 @@ func writeFailure(w http.ResponseWriter, err error) {
 		code = protocol
 	}
 
-	statuses := map[wire.ErrorCode]int{wire.InvalidRequest: 400, wire.Unauthenticated: 401, wire.Forbidden: 403, wire.Conflict: 409, wire.TooLarge: 413, wire.UnsupportedVersion: 426, wire.Overloaded: 429, wire.Unavailable: 503}
+	var status int
 
-	status, ok := statuses[code]
-	if !ok {
+	switch code {
+	case wire.InvalidRequest:
+		status = http.StatusBadRequest
+	case wire.Unauthenticated:
+		status = http.StatusUnauthorized
+	case wire.Forbidden:
+		status = http.StatusForbidden
+	case wire.Conflict:
+		status = http.StatusConflict
+	case wire.TooLarge:
+		status = http.StatusRequestEntityTooLarge
+	case wire.UnsupportedVersion:
+		status = http.StatusUpgradeRequired
+	case wire.Overloaded:
+		status = http.StatusTooManyRequests
+	default:
 		code, status = wire.Unavailable, http.StatusServiceUnavailable
 	}
 
