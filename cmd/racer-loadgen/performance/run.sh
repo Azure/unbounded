@@ -55,7 +55,7 @@ case "${1:-}" in
     ) &
     monitor=$!
     trap 'kill "$monitor" 2>/dev/null || true; chown -R -- "'"$(stat -c %u "$root")"':'"$(stat -c %g "$root")"'" "$run"' EXIT
-    "$out/loadgen.test" -test.run '^TestRacerMixedPerformance$' -test.v -test.timeout 6m 2>&1 | tee "$run/test.log"
+    timeout --signal=TERM --kill-after=10s 300s "$out/loadgen.test" -test.run '^TestRacerMixedPerformance$' -test.v -test.timeout 5m 2>&1 | tee "$run/test.log"
     ;;
   *)
     printf 'Usage: bash cmd/racer-loadgen/performance/run.sh {build|run [bulk-concurrency] [start-spacing] [bulk-control:0|1]}\n' >&2
