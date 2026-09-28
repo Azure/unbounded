@@ -50,6 +50,19 @@ pub trait PeerClient {
 /// }
 /// ```
 pub trait PeerTransport {
+    fn exchange_relay<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        reservation: Rc<crate::runtime::admission::Reservation>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
+        Box::pin(async move {
+            let response = self.exchange(request, membership, scope).await;
+            drop(reservation);
+            response.map(super::transfer::RelayResponse::Complete)
+        })
+    }
     /// Use this exact lease for the signed route; never resolve its version again.
     fn exchange<'a>(
         &'a self,
@@ -129,12 +142,40 @@ impl PeerClient for Requester {
     }
 }
 impl PeerTransport for Requester {
+    fn exchange_relay<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        reservation: Rc<crate::runtime::admission::Reservation>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
+        self.exchange_inner(request, membership, Some(reservation), scope)
+    }
     fn exchange<'a>(
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
+        Box::pin(async move {
+            match self
+                .exchange_inner(request, membership, None, scope)
+                .await?
+            {
+                super::transfer::RelayResponse::Complete(response) => Ok(response),
+                _ => Err(Error::Internal),
+            }
+        })
+    }
+}
+impl Requester {
+    fn exchange_inner<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request.request, scope)?;
             super::check_membership(&request.request, &membership)?;
@@ -166,7 +207,7 @@ impl PeerTransport for Requester {
             let _probe = self.health.acquire(&next)?;
             let response = self
                 .transfers
-                .exchange_planned(endpoint, request, plan, &scope)
+                .exchange_inner(endpoint, request, plan, relay, &scope)
                 .await;
             // A signed application response (including miss, 401 or 403) proves
             // the immediate transport works. It is verified by the logical owner.

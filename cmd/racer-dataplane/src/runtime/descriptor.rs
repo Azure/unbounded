@@ -146,6 +146,22 @@ impl Descriptor {
         (unsafe { libc::poll(&mut fd, 1, 0) > 0 })
             && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
     }
+    /// Peer HTTP exchanges never write-half-close between requests. Unlike
+    /// POLLHUP, POLLRDHUP also notices a TCP FIN while our send side is open.
+    pub(crate) fn peer_read_closed(&self) -> bool {
+        #[cfg(test)]
+        if let Self::Sim(handle) = self {
+            return handle.peer_disconnected();
+        }
+        let mut fd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: poll only inspects one live descriptor and never waits.
+        (unsafe { libc::poll(&mut fd, 1, 0) > 0 })
+            && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    }
 
     pub fn validate_socket(&self) -> Result<()> {
         #[cfg(test)]

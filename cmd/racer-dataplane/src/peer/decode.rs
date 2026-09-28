@@ -284,6 +284,46 @@ fn present(head: &MessageHead, name: &str) -> Result<bool> {
         _ => Err(Error::InvalidRequest),
     }
 }
+/// Decode only the canonical signed metadata. The caller must authenticate the
+/// original and reverse proofs before exposing this head or any body bytes.
+pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<MessageHead> {
+    let outcome = p::field(head, "racer-outcome")?;
+    let binding = array(head, "racer-request-binding")?;
+    let path = p::decode_nodes(p::field(head, "racer-response-path")?.as_bytes())?;
+    if outcome == "page" || (outcome == "bootstrap" && present(head, "racer-page-present")?) {
+        let (metadata, envelope) = page_descriptor(head)?;
+        if length != envelope.ciphertext_length as usize {
+            return Err(Error::InvalidRequest);
+        }
+        return p::opaque_page_head(
+            &metadata,
+            &envelope,
+            outcome == "bootstrap",
+            &binding,
+            &path,
+        );
+    }
+    if length != 0 {
+        return Err(Error::InvalidRequest);
+    }
+    let response = match outcome.as_str() {
+        "bootstrap" => PeerResponse::Bootstrap {
+            metadata: metadata(head)?,
+            page_zero: None,
+        },
+        "metadata" => PeerResponse::Metadata(metadata(head)?),
+        "miss" => PeerResponse::Miss,
+        "not-found" => PeerResponse::NotFound,
+        "version-unavailable" => PeerResponse::VersionUnavailable,
+        "unavailable" => PeerResponse::Unavailable,
+        "overloaded" => PeerResponse::Overloaded,
+        "origin-rejected" => PeerResponse::OriginRejected,
+        "origin-forbidden" => PeerResponse::OriginForbidden,
+        "stale-membership" => PeerResponse::StaleMembership,
+        _ => return Err(Error::InvalidRequest),
+    };
+    p::response_head(&response, &binding, &path)
+}
 fn route(head: &MessageHead) -> Result<RouteBudget> {
     let remaining_links = p::number(head, "racer-route-links")?
         .try_into()

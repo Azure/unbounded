@@ -316,8 +316,35 @@ impl Forwarding {
         response: SignedResponse,
         request: &RequestBinding,
     ) -> Result<VerifiedResponse> {
+        let path = protocol::decode_nodes(
+            field(
+                &response.authentication.original.head,
+                "racer-response-path",
+            )?
+            .as_bytes(),
+        )?;
+        let expected = protocol::response_head(
+            &response.response,
+            &signed_digest(&request.original)?,
+            &path,
+        )?;
+        let (origin, forwarders) =
+            self.verify_response_head(&response.authentication, &expected, request)?;
+        Ok(VerifiedResponse {
+            signed: response,
+            binding: request.clone(),
+            origin,
+            forwarders,
+        })
+    }
+
+    fn verify_response_head(
+        &self,
+        auth: &ForwardedHead,
+        expected: &MessageHead,
+        request: &RequestBinding,
+    ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
         check_request_deadline(request)?;
-        let auth = &response.authentication;
         if auth.hops.len() >= protocol::MAX_HOPS {
             return Err(Error::HopBudgetExhausted);
         }
@@ -332,15 +359,12 @@ impl Forwarding {
         {
             return Err(Error::Unauthorized);
         }
-        protocol::agrees(
-            &auth.original.head,
-            &protocol::response_head(
-                &response.response,
-                &signed_digest(&request.original)?,
-                &path,
-            )?,
-            false,
-        )?;
+        protocol::agrees(&auth.original.head, expected, false)?;
+        if protocol::decode_binary(field(&auth.original.head, "racer-request-binding")?.as_bytes())?
+            != signed_digest(&request.original)?
+        {
+            return Err(Error::Unauthorized);
+        }
         response_matches(&auth.original.head, &request.original.head)?;
         response_authority(&auth.original.head, &request.original.head, origin.node())?;
         if receiver(&auth.original.head)? != path[path.len() - 2] {
@@ -379,12 +403,21 @@ impl Forwarding {
         if receiver(&previous.head)? != *self.signatures.node() {
             return Err(Error::Unauthorized);
         }
-        Ok(VerifiedResponse {
-            signed: response,
-            binding: request.clone(),
-            origin,
-            forwarders,
-        })
+        Ok((origin, forwarders))
+    }
+    /// Verify canonical metadata and the complete reverse chain before forwarding
+    /// an opaque fixed-length HTTP body. No ciphertext owner or decryptor is used.
+    pub(crate) fn forward_opaque(
+        &self,
+        mut auth: ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+        previous: &NodeId,
+    ) -> Result<ForwardedHead> {
+        let expected = crate::peer::decode::opaque_response_head(&auth.original.head, length)?;
+        self.verify_response_head(&auth, &expected, request)?;
+        self.append_response_head(&mut auth, request, previous)?;
+        Ok(auth)
     }
     /// Preserve the original and existing hops; append a separately signed header
     /// bound to that original signature, prior chain, next hop, and consumed route.
@@ -424,8 +457,20 @@ impl Forwarding {
         mut response: VerifiedResponse,
         previous_hop: &NodeId,
     ) -> Result<SignedResponse> {
-        check_request_deadline(&response.binding)?;
-        let auth = &mut response.signed.authentication;
+        self.append_response_head(
+            &mut response.signed.authentication,
+            &response.binding,
+            previous_hop,
+        )?;
+        Ok(response.signed)
+    }
+    fn append_response_head(
+        &self,
+        auth: &mut ForwardedHead,
+        binding: &RequestBinding,
+        previous_hop: &NodeId,
+    ) -> Result<()> {
+        check_request_deadline(binding)?;
         let path =
             protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
         let index = path
@@ -440,13 +485,13 @@ impl Forwarding {
         let mut head = response_hop_head(
             &auth.original,
             previous,
-            &response.binding.original,
+            &binding.original,
             &path,
             index - 1,
         )?;
         push(&mut head, "racer-receiver", &previous_hop.0);
         auth.hops.push(self.signatures.sign(head)?);
-        Ok(response.signed)
+        Ok(())
     }
 }
 #[derive(PartialEq, Eq)]

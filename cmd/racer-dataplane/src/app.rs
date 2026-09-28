@@ -585,7 +585,7 @@ impl WorkerApplication {
             Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(
-            Delivery::new(pipes, config.reader_stall_timeout).with_metrics(metrics.clone()),
+            Delivery::new(pipes.clone(), config.reader_stall_timeout).with_metrics(metrics.clone()),
         );
 
         let index = Rc::new(
@@ -802,6 +802,7 @@ impl WorkerApplication {
         .with_wire(wire)
         .with_handshake(handshake)
         .with_transfers(transfers)
+        .with_pipes(pipes.clone())
         .with_reactor(reactor.clone());
         #[cfg(not(test))]
         let distributed = true;

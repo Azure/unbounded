@@ -244,6 +244,52 @@ impl PipePool {
 }
 
 impl PipeLease {
+    /// Transit benefits from a full bounded chunk even when the UID's default
+    /// pipe size has shrunk. Failure to grow is harmless: use the actual capacity.
+    pub(crate) fn prepare_transit(&mut self) {
+        let pipe = self.resources.as_mut().unwrap();
+        #[cfg(test)]
+        if matches!(pipe.write, OwnedFd::Sim(_)) {
+            return;
+        }
+        if pipe.capacity < MAX_PIPE_BYTES && pipe.buffered == 0 {
+            // SAFETY: live, empty pipe, bounded integer capacity, no user pointer.
+            let capacity = unsafe {
+                libc::fcntl(
+                    pipe.write.as_raw_fd(),
+                    libc::F_SETPIPE_SZ,
+                    MAX_PIPE_BYTES as i32,
+                )
+            };
+            if capacity > 0 {
+                pipe.capacity = capacity as usize;
+            }
+        }
+    }
+    /// Receive opaque socket pages directly into an empty bounded pipe. No user
+    /// buffer is borrowed or retained by this synchronous nonblocking syscall.
+    pub(crate) fn try_splice_from(&mut self, socket: &OwnedFd, count: usize) -> io::Result<usize> {
+        #[cfg(test)]
+        if matches!(socket, OwnedFd::Sim(_)) {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        let pipe = self.resources.as_mut().unwrap();
+        let count = count.min(pipe.capacity - pipe.buffered);
+        // SAFETY: the caller owns a nonblocking ConnectionLease; this pipe owns
+        // both ends, offsets are null, and no userspace pointer enters the kernel.
+        let received = syscall_count(unsafe {
+            libc::splice(
+                socket.as_raw_fd(),
+                std::ptr::null_mut(),
+                pipe.write.as_raw_fd(),
+                std::ptr::null_mut(),
+                count,
+                libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+            )
+        })?;
+        pipe.buffered += received;
+        Ok(received)
+    }
     pub fn capacity(&self) -> usize {
         self.resources.as_ref().unwrap().capacity
     }
@@ -314,7 +360,6 @@ impl PipeLease {
     /// caller retains both owners through this synchronous syscall. Unsupported
     /// splice errors leave the bytes in the pipe for an independent copy fallback.
     pub fn try_splice_to(&mut self, socket: &impl AsFd, count: usize) -> io::Result<usize> {
-        let pipe = self.resources.as_mut().unwrap();
         let fd = socket.as_fd().as_raw_fd();
         // SPLICE_F_NONBLOCK controls the pipe side; the socket must also be
         // nonblocking. Never risk a blocking call for an arbitrary caller's FD.
@@ -345,6 +390,24 @@ impl PipeLease {
         if kind != libc::SOCK_STREAM {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
+        self.splice_to_fd(fd, count)
+    }
+
+    /// Crate-only fast path for a ConnectionLease, which already guarantees a
+    /// nonblocking stream socket. The public arbitrary-FD API still validates it.
+    pub(crate) fn try_splice_connection(
+        &mut self,
+        socket: &crate::http::pool::ConnectionLease,
+    ) -> io::Result<usize> {
+        #[cfg(test)]
+        if matches!(&*socket.fd, OwnedFd::Sim(_)) {
+            return self.try_splice_descriptor(&socket.fd, self.buffered());
+        }
+        self.splice_to_fd(socket.fd.as_raw_fd(), self.buffered())
+    }
+
+    fn splice_to_fd(&mut self, fd: libc::c_int, count: usize) -> io::Result<usize> {
+        let pipe = self.resources.as_mut().unwrap();
         if count == 0 || pipe.buffered == 0 {
             return Ok(0);
         }

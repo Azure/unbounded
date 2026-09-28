@@ -98,6 +98,16 @@ struct ReturnToPool {
 /// Exclusive connection ownership follows every submitted operation into the
 /// reactor. Drop is a pool return only after explicit successful finish_exchange.
 pub struct ConnectionLease {
+    #[cfg(test)]
+    pub(crate) relay_fallback: bool,
+    #[cfg(test)]
+    pub(crate) relay_fallback_at: Option<usize>,
+    // While a relay sends its verified head, retain the unfinished downstream
+    // connection through that send's completion and cancellation fences too.
+    pub(crate) relay_peer: Option<Box<ConnectionLease>>,
+    pub(crate) relay_pipe: Option<crate::memory::pipe::PipeLease>,
+    pub(crate) relay_context: Option<Reservation>,
+    pub(crate) relay_reservation: Option<Rc<Reservation>>,
     pub(crate) session: Option<crate::security::connection::Session>,
     // Ingress handshake admission follows socket I/O through cancellation fences.
     pub(crate) control_reservation: Option<Reservation>,
@@ -129,6 +139,14 @@ impl ConnectionLease {
     ) -> Self {
         Self {
             fd,
+            #[cfg(test)]
+            relay_fallback: false,
+            #[cfg(test)]
+            relay_fallback_at: None,
+            relay_peer: None,
+            relay_pipe: None,
+            relay_context: None,
+            relay_reservation: None,
             session: None,
             control_reservation: None,
             reusable: false,
@@ -286,9 +304,18 @@ impl HttpPool {
         endpoint: &'a Endpoint,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
+        self.checkout_relay(endpoint, None, scope)
+    }
+    pub(crate) fn checkout_relay<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        relay: Option<Rc<Reservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
-            let (connection, address) = self.prepare_connection(endpoint)?;
+            let (mut connection, address) = self.prepare_connection(endpoint)?;
+            connection.relay_reservation = relay;
             self.connect(connection, address, scope).await
         })
     }

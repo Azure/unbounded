@@ -32,7 +32,7 @@ impl WireBuffer {
             _reservation: reservation,
         })
     }
-    fn reserved(reservation: Reservation, length: usize) -> Result<Self> {
+    pub(crate) fn reserved(reservation: Reservation, length: usize) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, length)?;
         if length > crate::model::range::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
@@ -57,6 +57,17 @@ impl IoBuffer for WireBuffer {
 }
 
 type ReclaimCiphertext = dyn Fn(&crate::model::identity::CacheId, usize);
+
+/// Internal transport result: native delivery stays materialized; HTTP relay
+/// delivery owns an unfinished connection and its exact opaque body framing.
+pub enum RelayResponse {
+    Complete(SignedResponse),
+    Http {
+        authentication: crate::security::forwarding::ForwardedHead,
+        connection: Box<crate::http::pool::ConnectionLease>,
+        length: usize,
+    },
+}
 
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
@@ -218,6 +229,24 @@ impl Transfers {
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
+            match self
+                .exchange_inner(endpoint, request, plan, None, scope)
+                .await?
+            {
+                RelayResponse::Complete(response) => Ok(response),
+                RelayResponse::Http { .. } => Err(Error::Internal),
+            }
+        })
+    }
+    pub(crate) fn exchange_inner<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        request: SignedRequest,
+        plan: TransportPlan,
+        relay: Option<Rc<Reservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, RelayResponse> {
+        Box::pin(async move {
             scope.check()?;
             let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
             let head_size = std::iter::once(request.authentication.original.as_ref())
@@ -251,11 +280,14 @@ impl Transfers {
                     .head,
             )?;
             let observer = admission.observer();
-            let connection = observer.result(
+            let mut connection = observer.result(
                 Stage::PeerCheckout,
                 scope,
-                self.http.checkout(&endpoint, scope).await,
+                self.http
+                    .checkout_relay(&endpoint, relay.clone(), scope)
+                    .await,
             )?;
+            connection.relay_reservation = relay.clone();
             let connection = {
                 let _permit = connection
                     .session
@@ -286,6 +318,19 @@ impl Transfers {
                 self.io.receive_head(sent.connection, scope).await,
             )?;
             let control = super::native::detach(&mut received.value)?;
+            let relay_context = if relay.is_some() {
+                let size = received.value.headers.iter().try_fold(0usize, |n, h| {
+                    n.checked_add(h.value.len() + h.name.len())
+                        .ok_or(Error::InvalidRequest)
+                })?;
+                Some(admission.reserve(
+                    None,
+                    ResourceClass::RequestContext,
+                    size.checked_mul(3).ok_or(Error::InvalidRequest)?.max(1),
+                )?)
+            } else {
+                None
+            };
             let (authentication, length) = WireCodec::decode(received.value, true)?;
             if let Some(control) = control {
                 let (binding, accept, peer) = native.ok_or(Error::Unauthorized)?;
@@ -302,7 +347,16 @@ impl Transfers {
                         control,
                         scope,
                     )
-                    .await;
+                    .await
+                    .map(RelayResponse::Complete);
+            }
+            if relay.is_some() {
+                received.connection.relay_context = relay_context;
+                return Ok(RelayResponse::Http {
+                    authentication,
+                    connection: Box::new(received.connection),
+                    length,
+                });
             }
             let mut connection = received.connection;
             let (body, staging_reservation) = if length == 0 {
@@ -361,7 +415,7 @@ impl Transfers {
                 _ => return Err(Error::InvalidRequest),
             }
             connection.finish_exchange()?;
-            Ok(response)
+            Ok(RelayResponse::Complete(response))
         })
     }
     pub fn send<'a>(

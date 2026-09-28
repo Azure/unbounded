@@ -35,6 +35,9 @@ pub trait LocalPageService {
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
+    #[cfg(test)]
+    pub(super) materialize_relay: bool,
+    pipes: Rc<crate::memory::pipe::PipePool>,
     ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
     io: Rc<crate::http::io::HttpIo>,
     forwarding: Rc<Forwarding>,
@@ -155,6 +158,12 @@ impl PeerServer {
         relay: Rc<Relay>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            materialize_relay: false,
+            pipes: Rc::new(crate::memory::pipe::PipePool::new(
+                admission.clone(),
+                io.reactor().clone(),
+            )),
             ingress: None,
             io,
             forwarding,
@@ -177,6 +186,10 @@ impl PeerServer {
     }
     pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
         self.transfers = Some(transfers);
+        self
+    }
+    pub(crate) fn with_pipes(mut self, pipes: Rc<crate::memory::pipe::PipePool>) -> Self {
+        self.pipes = pipes;
         self
     }
     pub fn with_reactor(mut self, reactor: Rc<crate::runtime::reactor::Reactor>) -> Self {
@@ -283,6 +296,90 @@ impl PeerServer {
                 .ok_or(Error::InvalidConfiguration)?
                 .membership(request.request().route.membership);
             let response = match &membership {
+                Ok(membership)
+                    if admitted.is_none()
+                        && self.opaque_relay()
+                        && request.request().route.destination
+                            != self.network.as_ref().unwrap().local =>
+                {
+                    let network = self.network.as_ref().unwrap();
+                    let previous = request
+                        .forwarders()
+                        .last()
+                        .unwrap_or(request.origin())
+                        .node();
+                    network.endpoint(membership, previous)?;
+                    let binding = request.binding().clone();
+                    let result = match self.admission.reserve(None, ResourceClass::Relay, 1) {
+                        Ok(reservation) => {
+                            let reservation = Rc::new(reservation);
+                            received.connection.relay_reservation = Some(reservation.clone());
+                            self.relay
+                                .forward_inner(
+                                    request,
+                                    membership.clone(),
+                                    Some(reservation),
+                                    &request_scope,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    // Pipe pressure is a signed overload before any success head
+                    // is sent. No queue holds a downstream body waiting for quota.
+                    let result = result.and_then(|response| {
+                        if matches!(&response, super::transfer::RelayResponse::Http { length, .. } if *length != 0) {
+                            let mut pipe = self.pipes.acquire()?;
+                            pipe.prepare_transit();
+                            received.connection.relay_pipe = Some(pipe);
+                        }
+                        Ok(response)
+                    });
+                    let result = self.admission.observer().result(
+                        crate::telemetry::failures::Stage::PeerRelay,
+                        &request_scope,
+                        result,
+                    );
+                    match result {
+                        Ok(super::transfer::RelayResponse::Http {
+                            authentication,
+                            connection,
+                            length,
+                        }) => {
+                            let head = WireCodec::encode(&authentication, true, length)?;
+                            received.connection.relay_peer = Some(connection);
+                            let mut connection = self
+                                .io
+                                .send_head(received.connection, head, &request_scope)
+                                .await?
+                                .connection;
+                            let downstream =
+                                *connection.relay_peer.take().ok_or(Error::Internal)?;
+                            let pipe = connection.relay_pipe.take();
+                            // Once the success head is sent, any body failure closes
+                            // both dirty connections. Never append an error envelope.
+                            return self
+                                .io
+                                .relay_body(downstream, connection, pipe, &request_scope)
+                                .await;
+                        }
+                        Ok(super::transfer::RelayResponse::Complete(response)) => response,
+                        Err(Error::Overloaded) => self
+                            .forwarding
+                            .sign_response(&binding, PeerResponse::Overloaded)?,
+                        Err(
+                            Error::Unavailable
+                            | Error::Io
+                            | Error::HopBudgetExhausted
+                            | Error::IncompatibleMembership,
+                        ) => {
+                            request_scope.check()?;
+                            self.forwarding
+                                .sign_response(&binding, PeerResponse::Unavailable)?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 Ok(membership) => {
                     self.dispatch_verified(request, membership.clone(), &request_scope)
                         .await?
@@ -335,6 +432,7 @@ impl PeerServer {
                 connection = sent.lease;
             }
             connection.finish_exchange()?;
+            connection.relay_reservation = None;
             drop(membership);
             Ok(connection)
         })
@@ -441,6 +539,13 @@ impl PeerServer {
             scope.check()?;
             self.forwarding.sign_response(&binding, response)
         })
+    }
+    fn opaque_relay(&self) -> bool {
+        #[cfg(test)]
+        if self.materialize_relay {
+            return false;
+        }
+        true
     }
 }
 /// Drain completed connections without abandoning the outstanding accept, which

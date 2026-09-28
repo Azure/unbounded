@@ -1,4 +1,6 @@
 use super::*;
+#[path = "opaque_tests.rs"]
+mod opaque;
 use crate::{
     control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
     memory::pool::BufferPool,

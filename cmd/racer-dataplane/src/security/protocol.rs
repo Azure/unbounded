@@ -374,33 +374,10 @@ pub fn response_head(
             ciphertext,
         } => {
             let e = ciphertext.envelope();
-            m.immutable().validate_page(e)?;
-            if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length)
-                || ciphertext.bytes().len() != e.ciphertext_length as usize
-            {
+            if ciphertext.bytes().len() != e.ciphertext_length as usize {
                 return Err(Error::InvalidRequest);
             }
-            metadata(&mut head, m)?;
-            push(&mut head, "racer-page", e.page.number.0);
-            push_binary(&mut head, "racer-page-key", &e.key_id.0);
-            push_binary(&mut head, "racer-page-nonce", &e.nonce.0);
-            push(&mut head, "racer-plaintext-length", e.plaintext_length);
-            push(&mut head, "racer-ciphertext-length", e.ciphertext_length);
-            let start = e
-                .page
-                .number
-                .0
-                .checked_mul(PAGE_BYTES)
-                .ok_or(Error::InvalidRange)?;
-            let end = start
-                .checked_add(u64::from(e.plaintext_length))
-                .and_then(|n| n.checked_sub(1))
-                .ok_or(Error::InvalidRange)?;
-            push(
-                &mut head,
-                "content-range",
-                format!("bytes {start}-{end}/{}", m.length),
-            );
+            page_fields(&mut head, m, e)?;
             ("page", u64::from(e.ciphertext_length))
         }
         PeerResponse::Metadata(m) => {
@@ -426,6 +403,69 @@ pub fn response_head(
     };
     push(&mut head, "racer-outcome", outcome);
     push(&mut head, "content-length", length);
+    Ok(head)
+}
+fn page_fields(
+    head: &mut MessageHead,
+    m: &ObjectMetadata,
+    e: &crate::model::envelope::PageEnvelope,
+) -> Result<()> {
+    m.immutable().validate_page(e)?;
+    if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length) {
+        return Err(Error::InvalidRequest);
+    }
+    metadata(head, m)?;
+    push(head, "racer-page", e.page.number.0);
+    push_binary(head, "racer-page-key", &e.key_id.0);
+    push_binary(head, "racer-page-nonce", &e.nonce.0);
+    push(head, "racer-plaintext-length", e.plaintext_length);
+    push(head, "racer-ciphertext-length", e.ciphertext_length);
+    let start = e
+        .page
+        .number
+        .0
+        .checked_mul(PAGE_BYTES)
+        .ok_or(Error::InvalidRange)?;
+    let end = start
+        .checked_add(u64::from(e.plaintext_length))
+        .and_then(|n| n.checked_sub(1))
+        .ok_or(Error::InvalidRange)?;
+    push(
+        head,
+        "content-range",
+        format!("bytes {start}-{end}/{}", m.length),
+    );
+    Ok(())
+}
+
+/// Canonical page metadata without materializing an opaque transit body.
+pub(crate) fn opaque_page_head(
+    m: &ObjectMetadata,
+    e: &crate::model::envelope::PageEnvelope,
+    bootstrap: bool,
+    binding: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
+    if bootstrap && (m.length == 0 || e.page.number.0 != 0) {
+        return Err(Error::InvalidRequest);
+    }
+    let mut head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: Vec::new(),
+    };
+    push(&mut head, "racer-kind", "response");
+    push_binary(&mut head, "racer-request-binding", binding);
+    push(&mut head, "racer-response-path", nodes(path)?);
+    page_fields(&mut head, m, e)?;
+    if bootstrap {
+        push(&mut head, "racer-page-present", 1);
+    }
+    push(
+        &mut head,
+        "racer-outcome",
+        if bootstrap { "bootstrap" } else { "page" },
+    );
+    push(&mut head, "content-length", e.ciphertext_length);
     Ok(head)
 }
 /// Exact logical agreement, rejecting unknown application fields as well as

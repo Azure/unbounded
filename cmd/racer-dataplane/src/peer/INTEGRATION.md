@@ -127,6 +127,39 @@ without charging the same allocation twice. The decoder checks the admission own
 cache, resource class, capacity, and descriptor before accepting that charge.
 Fill reserves separate encryption output only after selecting local origin.
 
+### Opaque HTTP relay bodies
+
+The HTTP server uses `PeerTransport::exchange_relay` for transit requests without
+an admitted native offer. `Transfers` returns the unfinished downstream HTTP
+connection after its session-authenticated head. `Forwarding::forward_opaque`
+decodes/re-encodes canonical metadata and verifies the original signature, request
+digest, authority, length and every reverse proof before appending its signed hop.
+The response head can then precede body completion. AEAD remains requester-owned.
+Native offers/completions and ordinary endpoint receives retain their existing path.
+
+The body loop consumes HTTP read-ahead first, then uses nonblocking TCP-to-pipe and
+pipe-to-TCP splice, draining each chunk before receiving another. It holds one
+admitted pipe (at most 64 KiB) and, only when needed, one zeroizing 64 KiB read-ahead
+or fallback buffer. It never creates a transit `CiphertextPage`. Unsupported splice
+(`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) switches to bounded copy, including draining any
+already-buffered pipe suffix. No bytes beyond Content-Length are forwarded.
+
+The application shares its existing worker PipePool between client delivery and
+relay bodies. A relay retains its Relay reservation through head/body completion;
+outbound connection establishment also carries that reservation. Every readiness
+wait retains both connections, the pipe, staging and reservations through original
+and cancellation CQEs. Partial body failure closes both dirty connections without
+an appended error or pool return. Before success headers, pipe pressure returns a
+signed Overloaded response. Keepalive requires exact completion on both sides.
+
+This is automatic on Linux, with no wire version, dependency or configuration
+change. Existing `pipes` is now shared by clients and transit, so the concurrent
+relay-body ceiling can be lower than `relay_transfers`. Each live pipe uses two
+descriptors; pipe capacity is charged in existing pipe units. Growth to 64 KiB is
+best-effort and remains bounded if kernel/user pipe limits reject it. The request
+deadline never renews; a bounded readiness tick also observes TCP FIN during a
+silent downstream read. No sysctl or elevated container capability is required.
+
 `Requester::exchange` selects the route rail and automatically attempts native
 transfer when the local session provider is ready. The server validates the entire
 signed response path's rail mapping, then exchanges setup, grant, and completion

@@ -59,6 +59,20 @@ impl Relay {
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
+            match self.forward_inner(request, membership, None, scope).await? {
+                super::transfer::RelayResponse::Complete(response) => Ok(response),
+                _ => Err(Error::Internal),
+            }
+        })
+    }
+    pub(crate) fn forward_inner<'a>(
+        &'a self,
+        request: VerifiedRequest,
+        membership: MembershipLease,
+        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
+        Box::pin(async move {
             let scope = super::request_scope(request.request(), scope)?;
             super::check_membership(request.request(), &membership)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -66,7 +80,10 @@ impl Relay {
             if budget.destination == network.local || budget.visited.contains(&network.local) {
                 return Err(Error::InvalidRequest);
             }
-            let _reservation = self.admission.reserve(None, ResourceClass::Relay, 1)?;
+            let reservation = match relay.as_ref() {
+                Some(reservation) => reservation.clone(),
+                None => Rc::new(self.admission.reserve(None, ResourceClass::Relay, 1)?),
+            };
             let search_budget = super::search_budget(budget, &network.local)?;
             let route = self
                 .paths
@@ -99,15 +116,43 @@ impl Relay {
             let outbound = self
                 .forwarding
                 .append_request(request, next, outbound_budget)?;
-            let response = self
-                .transport
-                .exchange(outbound, membership, &scope)
-                .await?;
+            let response = if relay.is_some() {
+                self.transport
+                    .exchange_relay(outbound, membership, reservation, &scope)
+                    .await?
+            } else {
+                super::transfer::RelayResponse::Complete(
+                    self.transport
+                        .exchange(outbound, membership, &scope)
+                        .await?,
+                )
+            };
             scope.check()?;
-            let response = self.forwarding.verify_response(response, &binding)?;
-            // The caller owns the ingress connection. Return on that connection;
-            // never choose a new route for a reverse-link failure.
-            self.forwarding.append_response(response, &previous)
+            match response {
+                super::transfer::RelayResponse::Complete(response) => {
+                    let response = self.forwarding.verify_response(response, &binding)?;
+                    self.forwarding
+                        .append_response(response, &previous)
+                        .map(super::transfer::RelayResponse::Complete)
+                }
+                super::transfer::RelayResponse::Http {
+                    authentication,
+                    connection,
+                    length,
+                } => {
+                    let authentication = self.forwarding.forward_opaque(
+                        authentication,
+                        length,
+                        &binding,
+                        &previous,
+                    )?;
+                    Ok(super::transfer::RelayResponse::Http {
+                        authentication,
+                        connection,
+                        length,
+                    })
+                }
+            }
         })
     }
 }
