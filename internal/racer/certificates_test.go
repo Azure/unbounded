@@ -14,6 +14,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,16 +44,33 @@ func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.Boo
 	return NodeIdentity{cluster: r.Config.Cluster, node: wire.NodeID(testNodeUID), expires: r.now().Add(time.Hour)}, wire.BootstrapRequest{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}, pub
 }
 
+func decodeIssuedResponse(t *testing.T, encoded []byte) wire.BootstrapResponse {
+	t.Helper()
+
+	if len(encoded) == 0 || len(encoded) > wire.MaxBootstrapBytes {
+		t.Fatalf("issued response size: %d", len(encoded))
+	}
+
+	response, err := wire.DecodeBootstrapResponse(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return response
+}
+
 func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 	r, now := testKeyring(t)
 	issuer := testIssuer(r)
 	runKeys(t, r)
 	identity, request, pub := issuanceRequest(t, r)
 
-	response, err := issuer.Issue(context.Background(), identity, request)
+	encoded, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	response := decodeIssuedResponse(t, encoded)
 
 	cert, err := x509.ParseCertificate(response.CertificateChain[0])
 	if err != nil {
@@ -87,10 +105,12 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 
 	identity.expires = now.Add(time.Hour)
 
-	staged, err := issuer.Issue(context.Background(), identity, request)
+	encoded, err = issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	staged := decodeIssuedResponse(t, encoded)
 
 	if !bytes.Equal(staged.CertificateChain[1], response.CertificateChain[1]) {
 		t.Fatal("prepared issuer signed early")
@@ -103,10 +123,12 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 
 	identity.expires = now.Add(time.Hour)
 
-	active, err := issuer.Issue(context.Background(), identity, request)
+	encoded, err = issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	active := decodeIssuedResponse(t, encoded)
 
 	if bytes.Equal(active.CertificateChain[1], response.CertificateChain[1]) {
 		t.Fatal("new issuer not activated")
@@ -145,7 +167,7 @@ func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 	runKeys(t, r)
 
 	identity, request, _ := issuanceRequest(t, r)
-	for _, scenario := range []string{"zero identity", "expired identity", "wrong cluster", "bad enrollment", "bad proof", "wrong algorithm", "oversized", "canceled"} {
+	for _, scenario := range []string{"zero identity", "expired identity", "wrong cluster", "unsupported version", "bad enrollment", "malformed csr", "bad proof", "wrong algorithm", "oversized", "canceled"} {
 		t.Run(scenario, func(t *testing.T) {
 			id, req := identity, request
 
@@ -159,8 +181,12 @@ func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 				id.expires = r.now()
 			case "wrong cluster":
 				req.Cluster = wire.ClusterID(testNodeUID)
+			case "unsupported version":
+				req.SchemaVersion++
 			case "bad enrollment":
 				req.Enrollment = "bad"
+			case "malformed csr":
+				req.CSRDER = []byte("invalid DER")
 			case "bad proof":
 				req.CSRDER = bytes.Clone(req.CSRDER)
 				req.CSRDER[len(req.CSRDER)-1] ^= 1
@@ -181,7 +207,7 @@ func TestIssuerRejectsUntrustedRequests(t *testing.T) {
 			}
 
 			response, err := issuer.Issue(ctx, id, req)
-			if err == nil || len(response.CertificateChain) != 0 {
+			if err == nil || response != nil {
 				t.Fatal("untrusted issuance accepted")
 			}
 		})
@@ -196,10 +222,12 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 	runKeys(t, r)
 	identity, request, _ := issuanceRequest(t, r)
 
-	response, err := issuer.Issue(context.Background(), identity, request)
+	encoded, err := issuer.Issue(context.Background(), identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	response := decodeIssuedResponse(t, encoded)
 
 	leaf, err := x509.ParseCertificate(response.CertificateChain[0])
 	if err != nil || leaf.NotAfter.Sub(leaf.NotBefore) != 2*time.Minute {
@@ -215,8 +243,13 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 
 	runKeys(t, r)
 
-	renewed, err := issuer.Issue(context.Background(), identity, request)
-	if err != nil || bytes.Equal(response.CertificateChain[1], renewed.CertificateChain[1]) {
+	encoded, err = issuer.Issue(context.Background(), identity, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renewed := decodeIssuedResponse(t, encoded)
+	if bytes.Equal(response.CertificateChain[1], renewed.CertificateChain[1]) {
 		t.Fatalf("short rotation issuer activation: %v", err)
 	}
 
@@ -227,6 +260,47 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 	_, bundle, _, material := keyState(t, r)
 	if containsRoot(bundle, initial.ActiveIssuer) || len(material.Keys) != 1 {
 		t.Fatal("short rotation did not retire old public/private issuer")
+	}
+}
+
+func TestIssuerFullEncodedRequestBound(t *testing.T) {
+	r, _ := testKeyring(t)
+	issuer := testIssuer(r)
+	runKeys(t, r)
+	identity, request, _ := issuanceRequest(t, r)
+
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, size := range []int{47 * 1024, 49 * 1024} {
+		request.CSRDER, err = x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: strings.Repeat("x", size)}}, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(request.CSRDER) >= wire.MaxBootstrapBytes {
+			t.Fatal("fixture must fit the raw DER bound")
+		}
+
+		encoded, err := issuer.Issue(context.Background(), identity, request)
+		if size == 49*1024 {
+			if !errors.Is(err, wire.TooLarge) || encoded != nil {
+				t.Fatalf("encoded request overflow: %v, %d response bytes", err, len(encoded))
+			}
+
+			continue
+		}
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		response := decodeIssuedResponse(t, encoded)
+		if response.Enrollment != request.Enrollment || response.Node != identity.Node() {
+			t.Fatal("large valid request lost correlation")
+		}
 	}
 }
 

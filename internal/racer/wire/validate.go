@@ -6,6 +6,7 @@ package wire
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/base64"
 	"net/netip"
 	"strings"
 	"unicode/utf8"
@@ -52,7 +53,10 @@ func validateHeader(version uint32, cluster ClusterID) error {
 	return nil
 }
 
-func validateBootstrapRequest(v BootstrapRequest) error {
+// ValidateBootstrapRequest checks the wire fields, CSR syntax, and full encoded
+// size without serializing. Proof of possession and identity binding belong to
+// the issuer. Direct callers have the same size bound as EncodeBootstrapRequest.
+func ValidateBootstrapRequest(v BootstrapRequest) error {
 	if err := validateHeader(v.SchemaVersion, v.Cluster); err != nil {
 		return err
 	}
@@ -67,6 +71,13 @@ func validateBootstrapRequest(v BootstrapRequest) error {
 
 	if _, err := x509.ParseCertificateRequest(v.CSRDER); err != nil {
 		return InvalidRequest
+	}
+
+	// The validated version is 1 and UUIDs are unescaped ASCII. Only padded
+	// base64 contributes variable framing size; no encoder newline is on the wire.
+	const framing = len(`{"schema_version":1,"cluster":"","enrollment":"","csr_der":""}`)
+	if framing+len(v.Cluster)+len(v.Enrollment)+base64.StdEncoding.EncodedLen(len(v.CSRDER)) > MaxBootstrapBytes {
+		return TooLarge
 	}
 
 	return nil

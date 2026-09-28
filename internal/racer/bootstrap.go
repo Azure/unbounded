@@ -151,14 +151,15 @@ func tokenExpiration(token string) (time.Time, error) {
 // Enroll validates CSR proof of possession and binds the issued identity to the
 // token, not caller-provided SANs. Every issuance uses a token, including renewal.
 // Retries correlate by enrollment ID; there is no persistent receipt ledger.
-func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) (wire.BootstrapResponse, error) {
+// The returned bytes are the issuer's bounded, validated JSON response.
+func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
 	identity, err := b.Authenticate(ctx, r)
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	if b.Issuer == nil {
-		return wire.BootstrapResponse{}, wire.Unavailable
+		return nil, wire.Unavailable
 	}
 
 	ctx, cancel := context.WithDeadline(ctx, identity.expires)
