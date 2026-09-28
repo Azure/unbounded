@@ -490,8 +490,8 @@ func NewDefault() *Config {
 		MembersKubeconfig: "",
 
 		ChairNamespace:           "",
-		ChairLeaseDuration:       time.Minute,
-		ChairRenewPeriod:         20 * time.Second,
+		ChairLeaseDuration:       5 * time.Minute,
+		ChairRenewPeriod:         time.Minute,
 		ChairRotationPeriod:      6 * time.Hour,
 		ChairRotationLead:        5 * time.Minute,
 		ChairStartupJitter:       30 * time.Second,
@@ -787,7 +787,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ChairClaimRoundPeriod, "chair-claim-round-period", c.ChairClaimRoundPeriod, "interval between widening empty-chair claim rounds")
 	fs.DurationVar(&c.ChairClaimJitter, "chair-claim-jitter", c.ChairClaimJitter, "maximum deterministic delay before a chair claim")
 	fs.IntVar(&c.ChairClaimInitialDivisor, "chair-claim-initial-divisor", c.ChairClaimInitialDivisor, "initial hash-lottery divisor, halved each claim round")
-	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
+	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size chair observation and direct-origin fallback without pod watches")
 	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count bounds the holder pool")
 
 	var chairCountFlagName string

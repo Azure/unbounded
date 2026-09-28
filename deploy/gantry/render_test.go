@@ -178,6 +178,14 @@ func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 		t.Fatal("rendered config does not contain chair_seed_count: 100")
 	}
 
+	if !bytes.Contains(rawConfig, []byte(`chair_lease_duration: "5m"`)) {
+		t.Fatal("rendered config does not contain five-minute chair Lease duration")
+	}
+
+	if !bytes.Contains(rawConfig, []byte(`chair_renew_period: "1m"`)) {
+		t.Fatal("rendered config does not contain one-minute chair renewal period")
+	}
+
 	rawLeases, err := os.ReadFile(filepath.Join(outputDir, "rendezvous-leases.yaml"))
 	if err != nil {
 		t.Fatalf("read rendered chairs: %v", err)
