@@ -70,6 +70,11 @@ type Config struct {
 	RacerQueueTimeout                 time.Duration `yaml:"racer_queue_timeout"`
 	RacerResponseHeaderTimeout        time.Duration `yaml:"racer_response_header_timeout"`
 	RacerMaxConnAge                   time.Duration `yaml:"racer_max_conn_age"`
+	RacerIdleConnTimeout              time.Duration `yaml:"racer_idle_conn_timeout"`
+	RacerDialTimeout                  time.Duration `yaml:"racer_dial_timeout"`
+	RacerBodyReadTimeout              time.Duration `yaml:"racer_body_read_timeout"`
+	RacerPageWindow                   int           `yaml:"racer_page_window"`
+	RacerPrefetchBootstrap            bool          `yaml:"racer_prefetch_bootstrap"`
 	RacerOriginMaxConnections         int           `yaml:"racer_origin_max_connections"`
 	RacerOriginConcurrentRequests     int           `yaml:"racer_origin_concurrent_requests"`
 	RacerOriginConcurrentHeadRequests int           `yaml:"racer_origin_concurrent_head_requests"`
@@ -502,6 +507,9 @@ func NewDefault() *Config {
 		RacerQueueTimeout:                 5 * time.Second,
 		RacerResponseHeaderTimeout:        60 * time.Second,
 		RacerMaxConnAge:                   5 * time.Minute,
+		RacerIdleConnTimeout:              20 * time.Second,
+		RacerDialTimeout:                  5 * time.Second,
+		RacerBodyReadTimeout:              60 * time.Second,
 		RacerOriginMaxConnections:         128,
 		RacerOriginConcurrentRequests:     64,
 		RacerOriginConcurrentHeadRequests: 4,
@@ -664,6 +672,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("RACER_QUEUE_TIMEOUT", &c.RacerQueueTimeout)
 	setDur("RACER_RESPONSE_HEADER_TIMEOUT", &c.RacerResponseHeaderTimeout)
 	setDur("RACER_MAX_CONN_AGE", &c.RacerMaxConnAge)
+	setDur("RACER_IDLE_CONN_TIMEOUT", &c.RacerIdleConnTimeout)
+	setDur("RACER_DIAL_TIMEOUT", &c.RacerDialTimeout)
+	setDur("RACER_BODY_READ_TIMEOUT", &c.RacerBodyReadTimeout)
+	setInt("RACER_PAGE_WINDOW", &c.RacerPageWindow)
+	setBool("RACER_PREFETCH_BOOTSTRAP", &c.RacerPrefetchBootstrap)
 	setInt("RACER_ORIGIN_MAX_CONNECTIONS", &c.RacerOriginMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setInt("RACER_ORIGIN_CONCURRENT_HEAD_REQUESTS", &c.RacerOriginConcurrentHeadRequests)
@@ -762,6 +775,11 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.RacerQueueTimeout, "racer-queue-timeout", c.RacerQueueTimeout, "Racer admission wait timeout (0 uses 5s)")
 	fs.DurationVar(&c.RacerResponseHeaderTimeout, "racer-response-header-timeout", c.RacerResponseHeaderTimeout, "Racer response header timeout (0 uses 60s)")
 	fs.DurationVar(&c.RacerMaxConnAge, "racer-max-conn-age", c.RacerMaxConnAge, "Racer connection rotation age (0 uses 5m, jittered to avoid synchronized reconnects)")
+	fs.DurationVar(&c.RacerIdleConnTimeout, "racer-idle-conn-timeout", c.RacerIdleConnTimeout, "Racer idle connection retention (0 uses SDK default)")
+	fs.DurationVar(&c.RacerDialTimeout, "racer-dial-timeout", c.RacerDialTimeout, "Racer UDS dial timeout (0 uses SDK default)")
+	fs.DurationVar(&c.RacerBodyReadTimeout, "racer-body-read-timeout", c.RacerBodyReadTimeout, "Racer bounded body read timeout (0 uses SDK default)")
+	fs.IntVar(&c.RacerPageWindow, "racer-page-window", c.RacerPageWindow, "Racer SDK page window (0 or 1 uses a pinned remainder)")
+	fs.BoolVar(&c.RacerPrefetchBootstrap, "racer-prefetch-bootstrap", c.RacerPrefetchBootstrap, "Prefetch continuation with spare slots when page window exceeds one")
 	fs.IntVar(&c.RacerOriginMaxConnections, "racer-origin-max-connections", c.RacerOriginMaxConnections, "Racer origin accepted connection limit (0 uses 128)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.IntVar(&c.RacerOriginConcurrentHeadRequests, "racer-origin-concurrent-head-requests", c.RacerOriginConcurrentHeadRequests, "Racer origin reserved HEAD callback limit (0 uses 4)")
@@ -993,6 +1011,10 @@ func (c *Config) Validate() error {
 			"racer_queue_timeout":                   int64(c.RacerQueueTimeout),
 			"racer_response_header_timeout":         int64(c.RacerResponseHeaderTimeout),
 			"racer_max_conn_age":                    int64(c.RacerMaxConnAge),
+			"racer_idle_conn_timeout":               int64(c.RacerIdleConnTimeout),
+			"racer_dial_timeout":                    int64(c.RacerDialTimeout),
+			"racer_body_read_timeout":               int64(c.RacerBodyReadTimeout),
+			"racer_page_window":                     int64(c.RacerPageWindow),
 			"racer_origin_max_connections":          int64(c.RacerOriginMaxConnections),
 			"racer_origin_concurrent_requests":      int64(c.RacerOriginConcurrentRequests),
 			"racer_origin_concurrent_head_requests": int64(c.RacerOriginConcurrentHeadRequests),
