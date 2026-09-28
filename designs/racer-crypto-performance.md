@@ -469,3 +469,61 @@ test threads two. Broad validation ran once in bounded groups, with all features
 Remaining limitations: no full-node throughput claim, isolated-core/per-role
 pinned NUMA study, allocation count, hardware
 cycle/cache-miss counters, sampled histograms, or Grace/GPU hardware validation.
+
+## Final integration with concurrent HTTPS keyring delivery
+
+On 2026-09-28, a new `racer-crypto-final` worktree was created from original
+`racer-v2` HEAD `ad016a11708c6404baf76f8f01ebd1e3ab58e50b`. The ten ordered
+commits from `e130ae8a..be33f550` were cherry-picked, including the full-client
+attribution on/off harness. The combined code revision tested was `5eaedfc3`.
+
+There were **no textual conflicts and no resolution code fixes**. Git
+auto-merged `src/app.rs`, `README.md`, and `src/peer/opaque_tests.rs` under
+`cmd/racer-dataplane`. Semantic review confirmed:
+
+- Worker assembly still attaches the worker's crypto metrics at `src/app.rs:512`
+  and builds the HTTPS keyring `BundleInstaller`/control client at
+  `src/app.rs:540-559`; neither path replaces the other.
+- The concurrent relay opt-in setup and materialized-relay regression test
+  remain intact. The crypto patch only updates nonce construction for the
+  released AEAD API in `src/peer/opaque_tests.rs`.
+- Control client/codec/transport, configuration, control connection admission,
+  ingress accounting, keyring interop, and process fixtures are unchanged from
+  `ad016a11`. Concurrent Go/controller/deployment changes are also untouched.
+- `git range-diff e130ae8a..be33f550 ad016a11..5eaedfc3` reports all ten patches
+  equivalent. Cargo.toml, Cargo.lock, security implementations, and crypto
+  runtime/harness match `be33f550` exactly. The existing Cargo-generated lock
+  required no new reconciliation or manual edits; all Cargo validation was
+  locked.
+
+Final validation used external TERM/kill-after bounds of 300 seconds per
+command. All Rust tests used `hack/scripts/memory-safe-run.sh`, which verified
+16 GiB memory.max and zero swap, with Cargo jobs two and test threads two:
+
+| Validation group | Result |
+|---|---|
+| Cargo check, all features/all targets | Passed without warnings |
+| Focused release/all-feature control library | 41 passed |
+| Focused release/all-feature crypto library | 17 passed, three benchmarks ignored |
+| Full release/all-feature library, once | 829 passed, 15 ignored, zero failures; 79.51 seconds execution |
+| Client/origin conformance | 19 passed, one ignored |
+| Payload zeroization | One passed |
+| Keyring interoperability target | Compiled; one live Go-controller test ignored |
+| Process restart target | Three passed, 16 ignored |
+| Production dataplane target | 16 passed, one ignored |
+| Doctests | 32 passed, including 26 compile-fail contracts |
+| Binary tests | Two passed |
+| Changed Rust files, rustfmt check with child traversal disabled | Passed |
+
+The broad library run includes the concurrent HTTPS keyring/control tests and
+crypto/security/store regressions. Privileged restart tests, native hardware
+gates, the live Go-controller interop driver, and benchmarks were not newly
+executed. The prior 80/24-case measurements and full-client overhead samples
+remain attributed to their original revisions above; no benchmark was repeated
+or relabeled as measured on this combined branch.
+
+Only this Markdown addendum was added after validation. The known root
+`make fmt` golangci-lint Go 1.26/1.27 failure was not retried for a documentation-
+only commit; its earlier bounded attempts are recorded above. Original branch
+files and its untracked request-path design documents were not edited. All
+worktrees are retained for parent integration and cleanup.
