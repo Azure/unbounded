@@ -46,14 +46,14 @@ impl SegmentClock {
             return Ok(());
         }
         let count = self.segments.count();
-        for _ in 0..count.saturating_mul(2) {
+        for _ in 0..count.saturating_mul(2).min(64) {
             let hand = self.hand.get() % count;
             self.hand.set((hand + 1) % count);
             let id = SegmentId(hand as u64);
             if self.recent.borrow_mut().remove(&id) {
                 continue;
             }
-            for (victim, location) in self.index.segment_entries(id) {
+            for (victim, location) in self.index.segment_entries_bounded(id, 1) {
                 self.index.remove_if_matches(&victim, &location)?;
             }
             if self.index.preflight_capacity(page).is_ok() {
@@ -70,7 +70,8 @@ impl SegmentClock {
         }
         let target = self.free_reserve.max(1).min(count);
         let mut free = self.segments.free_count();
-        for _ in 0..count.saturating_mul(2) {
+        let mut entries_left = 256;
+        for _ in 0..count.saturating_mul(2).min(64) {
             if free >= target {
                 return Ok(());
             }
@@ -87,8 +88,12 @@ impl SegmentClock {
                 continue;
             }
             self.segments.begin_evict(id)?;
-            for (page, location) in self.index.segment_entries(id) {
+            for (page, location) in self.index.segment_entries_bounded(id, entries_left) {
                 self.index.remove_if_matches(&page, &location)?;
+                entries_left -= 1;
+            }
+            if !self.index.segment_empty(id) {
+                return Err(Error::Overloaded);
             }
             match self.segments.recycle(id) {
                 Ok(()) => free += 1,

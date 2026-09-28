@@ -176,3 +176,25 @@ timeout prefix:
 
 Remaining: actual 100k traffic/update latency gate, bounded warming beyond
 on-demand maintenance, full control/storage obligations, exit suites and merge.
+
+### Concurrent storage increment
+
+The application drives batches of up to eight persistence futures concurrently.
+Index PageTicket owns capacity before SQE submission; segment append/publication
+leases retain generation fencing. Individual oldest mappings are evicted under
+page-index pressure. Segment open/free indexes avoid slab-wide append/count scans;
+eviction visits at most 64 segments and 256 mappings per turn. A real-reactor test
+observes two outstanding writes before either mapping publishes, verifies disjoint
+extents and reads both records back. Full out-of-order injection and process-level
+pipeline/capacity/checkpoint acceptance remain to be added.
+
+All tests below used the mandatory external timeout prefix, from the crate:
+
+- `cargo test --locked --all-features --lib store:: -j 2 -- --test-threads=2 --quiet`:
+  initial 14 failures exposed Rust's disjoint async capture dropping DirtyCleanup
+  before submission. Explicitly capturing/dropping the complete guard after await
+  restored ownership. Final 57 passed, one ignore after adding concurrency coverage.
+- `cargo test --locked --all-features --lib concurrent_writes_reserve -j 2 -- --test-threads=1 --quiet`:
+  one passed with two actual pending disk operations.
+- `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
+  758 passed, zero failed, seven ignores (59.98 s). No timeout fired.

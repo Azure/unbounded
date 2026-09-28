@@ -14,7 +14,8 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    rc::Rc,
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordLocation {
@@ -30,6 +31,7 @@ pub struct Index {
     page_capacity: Cell<usize>,
     state: RefCell<State>,
     availability: Option<std::rc::Rc<crate::control::availability::Availability>>,
+    reserved: Cell<usize>,
 }
 #[derive(Default)]
 struct State {
@@ -39,6 +41,25 @@ struct State {
     metadata: HashMap<ObjectVersion, VersionMetadata>,
     order: VecDeque<ObjectVersion>,
     current: HashMap<ObjectId, CurrentVersion>,
+    page_order: BTreeMap<u64, PageId>,
+    page_age: HashMap<PageId, u64>,
+    next_age: u64,
+}
+/// Capacity ownership acquired before a disk SQE. Drop releases unused capacity.
+pub struct PageTicket {
+    index: Rc<Index>,
+}
+impl Drop for PageTicket {
+    fn drop(&mut self) {
+        self.index.reserved.set(self.index.reserved.get() - 1);
+    }
+}
+impl PageTicket {
+    pub fn publish(self, page: PageId, entry: IndexedPage) -> Result<()> {
+        let index = self.index.clone();
+        drop(self);
+        index.publish(page, entry)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct IndexedPage {
@@ -85,6 +106,7 @@ impl Index {
             page_capacity: Cell::new(65536),
             state: RefCell::new(State::default()),
             availability: None,
+            reserved: Cell::new(0),
         }
     }
     pub fn with_availability(
@@ -104,7 +126,7 @@ impl Index {
         self.metadata_capacity
     }
     pub fn set_page_capacity(&self, capacity: usize) -> Result<()> {
-        if capacity == 0 || capacity < self.state.borrow().pages.len() {
+        if capacity == 0 || capacity < self.state.borrow().pages.len() + self.reserved.get() {
             return Err(Error::InvalidConfiguration);
         }
         self.page_capacity.set(capacity);
@@ -127,11 +149,34 @@ impl Index {
     /// remain admissible at capacity; new pages require an existing free slot.
     pub fn preflight_capacity(&self, page: &PageId) -> Result<()> {
         let state = self.state.borrow();
-        if state.pages.contains_key(page) || state.pages.len() < self.page_capacity.get() {
+        if state.pages.contains_key(page)
+            || state.pages.len() + self.reserved.get() < self.page_capacity.get()
+        {
             Ok(())
         } else {
             Err(Error::Overloaded)
         }
+    }
+    /// Reserve one potential new mapping, optionally evicting one oldest mapping.
+    /// Replacement writes also reserve: concurrent invalidation may remove the old
+    /// mapping while the SQE is in flight. No segment bytes are recycled here.
+    pub fn reserve_page(self: &Rc<Self>, evict: bool) -> Result<PageTicket> {
+        let mut state = self.state.borrow_mut();
+        if state.pages.len() + self.reserved.get() >= self.page_capacity.get() {
+            if !evict {
+                return Err(Error::Overloaded);
+            }
+            let victim = state
+                .page_order
+                .first_key_value()
+                .map(|(_, p)| p.clone())
+                .ok_or(Error::Overloaded)?;
+            Self::remove_page(&mut state, &victim);
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(PageTicket {
+            index: self.clone(),
+        })
     }
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
@@ -147,7 +192,9 @@ impl Index {
         entry.metadata.page_length(&page)?;
         let mut state = self.state.borrow_mut();
         Self::check_length(&state, &entry.metadata)?;
-        if !state.pages.contains_key(&page) && state.pages.len() >= self.page_capacity.get() {
+        if !state.pages.contains_key(&page)
+            && state.pages.len() + self.reserved.get() >= self.page_capacity.get()
+        {
             return Err(Error::Overloaded);
         }
         Self::remove_page(&mut state, &page);
@@ -161,6 +208,10 @@ impl Index {
             .entry(entry.location.segment)
             .or_default()
             .insert(page.clone());
+        let age = state.next_age.checked_add(1).ok_or(Error::Unavailable)?;
+        state.next_age = age;
+        state.page_order.insert(age, page.clone());
+        state.page_age.insert(page.clone(), age);
         state.pages.insert(page, entry);
         Ok(())
     }
@@ -308,13 +359,24 @@ impl Index {
         Ok(())
     }
     pub fn segment_entries(&self, segment: SegmentId) -> Vec<(PageId, RecordLocation)> {
+        self.segment_entries_bounded(segment, usize::MAX)
+    }
+    pub fn segment_entries_bounded(
+        &self,
+        segment: SegmentId,
+        budget: usize,
+    ) -> Vec<(PageId, RecordLocation)> {
         let s = self.state.borrow();
         s.reverse
             .get(&segment)
             .into_iter()
             .flatten()
+            .take(budget)
             .filter_map(|p| s.pages.get(p).map(|e| (p.clone(), e.location.clone())))
             .collect()
+    }
+    pub fn segment_empty(&self, segment: SegmentId) -> bool {
+        !self.state.borrow().reverse.contains_key(&segment)
     }
     pub fn retire_key(&self, cache: &crate::model::identity::CacheId, key: KeyId) -> usize {
         let mut s = self.state.borrow_mut();
@@ -368,6 +430,9 @@ impl Index {
     }
     fn remove_page(s: &mut State, page: &PageId) {
         if let Some(old) = s.pages.remove(page) {
+            if let Some(age) = s.page_age.remove(page) {
+                s.page_order.remove(&age);
+            }
             if let Some(set) = s.reverse.get_mut(&old.location.segment) {
                 set.remove(page);
                 if set.is_empty() {

@@ -10,6 +10,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeSet,
     rc::Rc,
 };
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -67,6 +68,8 @@ pub struct Segments {
     alignment: Cell<Option<DirectAlignment>>,
     slots: RefCell<Vec<Slot>>,
     frozen: Cell<bool>,
+    open: Cell<Option<usize>>,
+    free: RefCell<BTreeSet<usize>>,
 }
 impl Segments {
     pub fn new(worker: WorkerId, segment_bytes: u64) -> Self {
@@ -77,6 +80,8 @@ impl Segments {
             alignment: Cell::new(None),
             slots: RefCell::new(Vec::new()),
             frozen: Cell::new(false),
+            open: Cell::new(None),
+            free: RefCell::new(BTreeSet::new()),
         }
     }
     pub fn worker(&self) -> WorkerId {
@@ -119,6 +124,7 @@ impl Segments {
                 leases: Rc::new(Cell::new(0)),
             })
             .collect();
+        *self.free.borrow_mut() = (0..segment_count).collect();
         Ok(())
     }
     pub fn append(&self, disk_bytes: usize) -> Result<AppendLease> {
@@ -133,22 +139,22 @@ impl Segments {
             return Err(Error::InvalidConfiguration);
         }
         let mut slots = self.slots.borrow_mut();
-        for slot in slots.iter_mut() {
-            if slot.image.state == SegmentState::Open
-                && self.segment_bytes - slot.image.used_bytes < disk_bytes as u64
-            {
+        if let Some(position) = self.open.get() {
+            let slot = &mut slots[position];
+            if self.segment_bytes - slot.image.used_bytes < disk_bytes as u64 {
                 slot.image.state = SegmentState::Sealed;
+                self.open.set(None);
             }
         }
-        let position = slots
-            .iter()
-            .position(|s| s.image.state == SegmentState::Open)
-            .or_else(|| {
-                slots
-                    .iter()
-                    .position(|s| s.image.state == SegmentState::Free)
-            })
-            .ok_or(Error::Overloaded)?;
+        let position = match self.open.get() {
+            Some(position) => position,
+            None => self
+                .free
+                .borrow_mut()
+                .pop_first()
+                .ok_or(Error::Overloaded)?,
+        };
+        self.open.set(Some(position));
         let slot = &mut slots[position];
         slot.image.state = SegmentState::Open;
         let offset = slot
@@ -161,6 +167,7 @@ impl Segments {
         slot.image.used_bytes += disk_bytes as u64;
         if slot.image.used_bytes == self.segment_bytes {
             slot.image.state = SegmentState::Sealed;
+            self.open.set(None);
         }
         let lease = self.take_lease(slot)?;
         Ok(AppendLease {
@@ -224,6 +231,7 @@ impl Segments {
         );
         slot.image.state = SegmentState::Free;
         slot.image.used_bytes = 0;
+        self.free.borrow_mut().insert(id.0 as usize);
         Ok(())
     }
     pub fn snapshot(&self) -> Result<Vec<SegmentSnapshot>> {
@@ -265,9 +273,14 @@ impl Segments {
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
         self.validate_restore(&images)?;
         let mut slots = self.slots.borrow_mut();
+        self.open.set(None);
+        self.free.borrow_mut().clear();
         for (slot, mut image) in slots.iter_mut().zip(images) {
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
+            }
+            if image.state == SegmentState::Free {
+                self.free.borrow_mut().insert(image.id.0 as usize);
             }
             slot.image = image;
         }
@@ -308,11 +321,7 @@ impl Segments {
         Ok(())
     }
     pub fn free_count(&self) -> usize {
-        self.slots
-            .borrow()
-            .iter()
-            .filter(|s| s.image.state == SegmentState::Free)
-            .count()
+        self.free.borrow().len()
     }
     pub fn count(&self) -> usize {
         self.slots.borrow().len()

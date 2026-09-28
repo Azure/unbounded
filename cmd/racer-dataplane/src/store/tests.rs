@@ -177,6 +177,39 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = Result<T>>) -> Resul
     }
 }
 #[test]
+fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
+    let f = Fixture::new();
+    drive(&f.reactor, f.store.open()).unwrap();
+    let a = f.copy(21, 4096);
+    let b = f.copy(22, 4096);
+    let aid = a.ciphertext.envelope().page.clone();
+    let bid = b.ciphertext.envelope().page.clone();
+    f.enqueue(a).unwrap();
+    f.enqueue(b).unwrap();
+    let scope = scope();
+    let mut writes = f.store.writer.progress(8, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 2);
+    assert!(f.store.writer.index().lookup(&aid).unwrap().is_none());
+    assert!(f.store.writer.index().lookup(&bid).unwrap().is_none());
+    assert_eq!(drive(&f.reactor, writes).unwrap(), 2);
+    let a = f.store.writer.index().lookup(&aid).unwrap().unwrap();
+    let b = f.store.writer.index().lookup(&bid).unwrap().unwrap();
+    assert_ne!(
+        a.location.location.extent.offset(),
+        b.location.location.extent.offset()
+    );
+    assert!(f.store.writer.is_idle());
+    for (id, expected) in [(&aid, 21), (&bid, 22)] {
+        let copy = drive(&f.reactor, f.store.reader.read(id, &scope))
+            .unwrap()
+            .unwrap();
+        assert_eq!(copy.ciphertext.bytes(), vec![expected; 4112]);
+    }
+}
+
+#[test]
 fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header() {
     let f = Fixture::new();
     let a = direct::DirectAlignment::validate(512, 512, 512).unwrap();

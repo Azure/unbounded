@@ -320,7 +320,8 @@ impl StoreWriter {
             }
             *self.active_scope.borrow_mut() = Some(scope.clone());
             let _busy = Busy(self);
-            let mut completed = 0;
+            use futures::{StreamExt, stream::FuturesUnordered};
+            let mut writes = FuturesUnordered::new();
             for _ in 0..budget {
                 if scope.check().is_err() {
                     self.discard_unsubmitted();
@@ -350,8 +351,16 @@ impl StoreWriter {
                         .ok_or(Error::Unavailable)?
                         .ticket,
                 };
-                let result = self.persist(&id, &page, scope).await;
-                cleanup.persisted = result.is_ok();
+                writes.push(async move {
+                    let result = self.persist(&id, &page, scope).await;
+                    cleanup.persisted = result.is_ok();
+                    drop(cleanup);
+                    result
+                });
+            }
+            let mut completed = 0;
+            let mut failure = None;
+            while let Some(result) = writes.next().await {
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
@@ -367,15 +376,14 @@ impl StoreWriter {
                             | Error::Cancelled
                             | Error::DeadlineExceeded
                     ) {
-                        return Err(error);
+                        failure = Some(error);
                     }
                     if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
                         self.discard_unsubmitted();
-                        break;
                     }
                 }
             }
-            Ok(completed)
+            failure.map_or(Ok(completed), Err)
         })
     }
     async fn persist(
@@ -384,14 +392,8 @@ impl StoreWriter {
         page: &CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<()> {
-        // Enqueue does not reserve slots: earlier queued pages may fill the index.
-        // Production has one writer per index, and progress holds Busy across this
-        // await through publication, so no other writer can consume a free slot.
-        if let Some(clock) = self.clock.borrow().as_ref() {
-            clock.reclaim_index_for(id)?;
-        } else {
-            self.index.preflight_capacity(id)?;
-        }
+        // Capacity is owned across the await, including invalidation/replacement.
+        let index_ticket = self.index.reserve_page(self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
         let disk_bytes = alignment
             .extent(0, RecordCodec.logical_length(page)?)?
@@ -441,7 +443,7 @@ impl StoreWriter {
                 .is_some_and(|d| d.ticket == ticket)
             && self.segments.validate_location(&location).is_ok()
         {
-            self.index.publish(
+            index_ticket.publish(
                 id.clone(),
                 IndexedPage {
                     location,
@@ -478,7 +480,7 @@ impl StoreWriter {
             })
             .await?;
             while self.pending_count() != 0 {
-                self.progress(1, scope).await?;
+                self.progress(8, scope).await?;
             }
             self.slabs.fence_writes().await?;
             self.slabs.reclaim_buffer();

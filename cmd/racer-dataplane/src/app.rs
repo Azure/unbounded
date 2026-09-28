@@ -1153,7 +1153,7 @@ impl WorkerApplication {
             let writer = self.store.writer.clone();
             let write_scope = scope(self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
-                writer.progress(1, &write_scope).await.map(|_| ())
+                writer.progress(8, &write_scope).await.map(|_| ())
             }));
         }
         if !self.stopping {
