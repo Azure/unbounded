@@ -311,6 +311,74 @@ mod tests {
     }
 
     #[test]
+    fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
+        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        for (allow_smt, expected) in [(false, 2), (true, 4)] {
+            let (mut config, _) = Config::from_lookup_with_fabric_ports(|name| {
+                Ok(match name {
+                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                    "RACER_ALLOW_SMT" => Some(allow_smt.to_string()),
+                    "RACER_PLAINTEXT_BYTES" | "RACER_CIPHERTEXT_BYTES" => Some("4294967296".into()),
+                    "RACER_RELAY_TRANSFERS" => Some("256".into()),
+                    "RACER_PIPES" => Some("128".into()),
+                    "RACER_CLIENT_CONNECTIONS" => Some("2048".into()),
+                    "RACER_CONNECTIONS_PER_NEIGHBOR" => Some("16".into()),
+                    "RACER_QUEUE_ENTRIES" => Some("1024".into()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+            let make_plan = |config: &Config| {
+                AffinityPlan::from_topology(
+                    config,
+                    EffectiveTopology {
+                        cpus: (0..8)
+                            .map(|cpu| CpuLocation {
+                                cpu,
+                                package: 0,
+                                core: cpu % 4,
+                                numa_node: Some(0),
+                            })
+                            .collect(),
+                        quota: None,
+                        nics: vec![],
+                    },
+                    &[],
+                )
+                .unwrap()
+            };
+            let mut plan = make_plan(&config);
+            let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
+            assert_eq!(plan.pairs.len(), expected);
+            for (partition, node) in [
+                (limits.plaintext_bytes, 4usize * 1024 * 1024 * 1024),
+                (limits.ciphertext_bytes, 4usize * 1024 * 1024 * 1024),
+                (limits.relay_transfers, 256),
+                (limits.pipes, 128),
+                (limits.client_connections, 2048),
+                (limits.queue_entries, 1024),
+            ] {
+                assert_eq!(partition.get(), node / expected);
+            }
+            assert_eq!(limits.connections_per_neighbor.get(), 16);
+            let floor = 3 * crate::model::range::PAGE_BYTES as usize;
+            config.limits.plaintext_bytes = NonZeroUsize::new(2 * floor).unwrap();
+            let mut plan = make_plan(&config);
+            let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+            assert_eq!(plan.pairs.len(), 2);
+            assert_eq!(limits.plaintext_bytes.get(), floor);
+            assert_eq!(limits.relay_transfers.get(), 128);
+            assert_eq!(
+                plan.pairs.iter().map(|p| p.worker).collect::<Vec<_>>(),
+                vec![WorkerId(0), WorkerId(1)]
+            );
+            config.limits.plaintext_bytes = NonZeroUsize::new(floor - 1).unwrap();
+            assert!(size_workers(&config.limits, &mut make_plan(&config), false).is_err());
+        }
+    }
+
+    #[test]
     fn default_worker_sizing_funds_native_slots_within_node_budgets() {
         let config = default_config(true);
         assert_eq!(config.limits.registered_bytes.get(), 128 * 1024 * 1024);

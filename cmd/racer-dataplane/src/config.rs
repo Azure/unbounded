@@ -43,6 +43,8 @@ pub struct Config {
     /// Total thread cap, minimum two; odd caps round down to complete worker pairs.
     /// Control and diagnostics run on I/O threads within this budget.
     pub max_threads: usize,
+    /// Opt into logical-CPU sizing and unique pinned roles, preferring SMT pairs.
+    pub allow_smt: bool,
     pub enable_rdma: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
@@ -157,6 +159,11 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
+        let allow_smt = match text("RACER_ALLOW_SMT", Some("false"))?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let peer_listen =
             parse_listener_address(&text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?)?;
         let diagnostics_listen =
@@ -230,6 +237,7 @@ impl Config {
             cluster,
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads,
+            allow_smt,
             enable_rdma,
             control_endpoint,
             peer_listen,
@@ -1131,6 +1139,7 @@ mod tests {
     fn defaults_are_bounded_and_identity_is_unresolved() {
         let config = parse(&[]).unwrap();
         assert_eq!(config.max_threads, 8);
+        assert!(!config.allow_smt);
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
         assert!(!config.enable_rdma);
         assert_eq!(config.slab_bytes / config.segment_bytes, 16);
@@ -1141,6 +1150,35 @@ mod tests {
         assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
+    }
+
+    #[test]
+    fn smt_requires_an_exact_explicit_boolean() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            assert_eq!(
+                parse(&[("RACER_ALLOW_SMT", value)]).unwrap().allow_smt,
+                expected
+            );
+        }
+        for value in [
+            "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
+        ] {
+            assert!(parse(&[("RACER_ALLOW_SMT", value)]).is_err(), "{value:?}");
+        }
+        assert!(
+            Config::from_lookup(|name| {
+                if name == "RACER_ALLOW_SMT" {
+                    Err(Error::InvalidConfiguration)
+                } else {
+                    Ok(match name {
+                        "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                        "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                        _ => None,
+                    })
+                }
+            })
+            .is_err()
+        );
     }
 
     #[test]

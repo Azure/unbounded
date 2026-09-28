@@ -108,9 +108,13 @@ subcommand or `--help`/`--version` handler (`src/main.rs:5-17`).
 ## CPU, threads, and memory
 
 `RACER_MAX_THREADS=8` means up to four I/O/crypto pairs, not eight workers.
-Allowed physical cores, affinity/cpuset, and effective CPU quota constrain pair
-count. Odd caps round down; one allowed CPU still supports a pair sharing that
-CPU (`src/runtime/affinity.rs:88-112`). Control and diagnostics use those I/O
+By default, allowed physical cores, affinity/cpuset, and effective CPU quota
+constrain pair count. `RACER_ALLOW_SMT=true` opts into logical-CPU sizing with
+unique pinned roles, preferring reactors on distinct cores and crypto on their
+SMT siblings. It requires at least two allowed logical CPUs. Odd caps round down;
+the default policy still supports a pair sharing one allowed CPU. See
+[SMT placement](CONFIGURATION.md#opt-in-smt-placement) for examples and budget
+effects. Control and diagnostics use those I/O
 roles. Kernel io_uring workers are separate from the userspace thread cap;
 account for them when setting container PID limits.
 

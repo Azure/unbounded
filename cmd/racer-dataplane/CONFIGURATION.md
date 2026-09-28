@@ -27,6 +27,7 @@ consumes host disk capacity and is not accounted as a pod ephemeral-storage quot
 | `RACER_CLUSTER_ID` | Required | Persistent non-nil, canonical lowercase hyphenated UUID |
 | `RACER_CONTROL_ENDPOINT` | Required | HTTPS authority, optional port and single trailing slash |
 | `RACER_MAX_THREADS` | `8` | Total userspace thread cap, 2 through 256; odd caps floor to complete pairs |
+| `RACER_ALLOW_SMT` | `false` | Opt into allowed logical-CPU sizing and unique pinned roles; reactors prefer distinct physical cores and crypto threads prefer their reactor's SMT sibling |
 | `RACER_ENABLE_RDMA` | `auto` in the executable | `auto`, `true`, or `false`; auto requires an RDMA build and trusted fabric associations. Hardware/capability failure retains HTTP fallback |
 | `RACER_SHARES` | `4` | Positive u32 proposed during authenticated enrollment; an explicit Node shares annotation takes precedence |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index capacity, partitioned independently of metadata capacity |
@@ -84,6 +85,41 @@ sentinel. Do not replace it with the node name, a random UUID, or an environment
 alignment take effect only through accepted controller membership. Other unrelated environment
 variables are ignored. CPU/cpuset/quota discovery belongs to runtime
 `AffinityPlan`; config neither reads CPU files nor overrides allowed CPUs.
+
+### Opt-in SMT placement
+
+Set `RACER_ALLOW_SMT=true` in the preserved `racer-dataplane-config` ConfigMap
+to enable the policy on restart. No manifest regeneration is needed: the operator
+passes that ConfigMap through `envFrom`. Absent or `false` preserves physical-core
+sizing and placement. The eight-thread default remains four complete pairs at
+most, with the caller serving as the first reactor.
+
+Both policies use only online CPUs intersected with process affinity and effective
+ancestor cpusets, and honor the tightest ancestor CPU-time quota. Odd/fractional
+capacity rounds down to complete pairs, with a minimum of one pair for a positive
+quota. SMT requires at least two allowed logical CPUs and assigns every role a
+different CPU; it fails startup on an empty or one-CPU intersection. The default
+policy retains its one-CPU shared-pair fallback. A quota limits execution time;
+it does not grant additional CPU affinity or guarantee full-speed logical CPUs.
+
+SMT placement reserves reactors first, preferring distinct `(package, core)`
+identities, then NIC locality and ascending CPU IDs. It reserves available crypto
+siblings before filling missing siblings from unused CPUs, preferring the
+reactor's NUMA node. NIC hints never add CPUs or change page-to-rail selection.
+On four physical cores with sibling pairs `(0,4)`, `(1,5)`, `(2,6)`, `(3,7)`,
+all eight CPUs allowed, no tighter quota, and sufficient memory, the default
+places two `(reactor, crypto)` pairs `(0,1)`, `(2,3)`. SMT places four pairs
+`(0,4)`, `(1,5)`, `(2,6)`, `(3,7)` (assuming uniform NIC locality).
+
+Startup still reduces pair count to fund all per-worker progress floors before
+creating the worker directory and threads. Aggregate budgets are divided by the
+**final** count. For example, with 4 GiB each plaintext/ciphertext, 256 relay
+transfers, 128 pipes, 2048 client connections, and 1024 queue entries node-wide,
+four workers receive 1 GiB each plaintext/ciphertext, 64 relay transfers, 32 pipes,
+512 client connections, and 256 queue entries each. This halves those per-worker
+budgets compared with two workers. `RACER_CONNECTIONS_PER_NEIGHBOR=16` stays 16 per
+worker because it is a per-neighbor cap. Increased reactor concurrency may consume
+all available CPU capacity; SMT siblings share physical execution resources.
 
 ## Trusted local native associations
 

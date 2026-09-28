@@ -7,6 +7,8 @@
 //! thread cap (eight by default). An odd spare CPU does not create a partial pair.
 //! Quotas limit execution time, not CPU affinity. Keep rail selection deterministic
 //! across nodes; local pair placement must not change the page's selected rail.
+//! Opt-in SMT counts allowed logical CPUs and never reuses a CPU. Reactors prefer
+//! distinct physical cores; crypto roles prefer their reactor's available sibling.
 
 use crate::{
     config::Config,
@@ -57,9 +59,9 @@ pub struct EffectiveTopology {
     pub nics: Vec<NicLocality>,
 }
 
-/// Exactly two roles by construction, even if io.cpu == crypto.cpu. Prefer
-/// distinct physical cores on the selected NIC's NUMA node, then allowed local
-/// fallback. NIC locality never overrides the deterministic end-to-end rail.
+/// Exactly two roles by construction. The default prefers distinct physical
+/// cores; SMT prefers siblings with unique logical CPUs. NIC locality never
+/// overrides the deterministic end-to-end rail.
 #[derive(Clone, Debug)]
 pub struct WorkerPair {
     pub worker: WorkerId,
@@ -89,15 +91,36 @@ pub struct AffinityPlan {
 /// Count physical cores rather than SMT siblings; floor odd/fractional capacity
 /// to complete pairs, except that any positive CPU budget supports one pair.
 pub fn pair_count(max_threads: usize, topology: &EffectiveTopology) -> Result<usize> {
+    pair_count_with_policy(max_threads, topology, false)
+}
+
+fn pair_count_with_policy(
+    max_threads: usize,
+    topology: &EffectiveTopology,
+    allow_smt: bool,
+) -> Result<usize> {
     if max_threads < 2 || topology.cpus.is_empty() {
         return Err(Error::InvalidConfiguration);
     }
-    let cores = topology
+    let logical = topology
         .cpus
         .iter()
-        .map(|cpu| (cpu.package, cpu.core))
+        .map(|cpu| cpu.cpu)
         .collect::<HashSet<_>>()
         .len();
+    if logical != topology.cpus.len() || (allow_smt && logical < 2) {
+        return Err(Error::InvalidConfiguration);
+    }
+    let cores = if allow_smt {
+        logical
+    } else {
+        topology
+            .cpus
+            .iter()
+            .map(|cpu| (cpu.package, cpu.core))
+            .collect::<HashSet<_>>()
+            .len()
+    };
     let quota_cores = topology
         .quota
         .map(|quota| {
@@ -127,7 +150,7 @@ impl AffinityPlan {
         topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
-        Self::place(config.max_threads, topology, rails)
+        Self::place_with_policy(config.max_threads, topology, rails, config.allow_smt)
     }
     pub fn pin_current_thread(&self, worker: WorkerId, role: Role) -> Result<()> {
         let pair = self
@@ -138,17 +161,24 @@ impl AffinityPlan {
         pin_cpu(pair.location(role).cpu)
     }
 
+    #[cfg(test)]
     fn place(
         max_threads: usize,
         topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
-        let count = pair_count(max_threads, &topology)?;
+        Self::place_with_policy(max_threads, topology, rails, false)
+    }
+
+    fn place_with_policy(
+        max_threads: usize,
+        topology: EffectiveTopology,
+        rails: &[RailMapping],
+        allow_smt: bool,
+    ) -> Result<Self> {
+        let count = pair_count_with_policy(max_threads, &topology, allow_smt)?;
         let mut cpus = topology.cpus;
         cpus.sort_by_key(|cpu| cpu.cpu);
-        if cpus.windows(2).any(|pair| pair[0].cpu == pair[1].cpu) {
-            return Err(Error::InvalidConfiguration);
-        }
         let mut nics = topology.nics;
         nics.sort_by(|a, b| a.device.cmp(&b.device));
         // RailMapping carries a fabric label, not a local device identifier. NUMA
@@ -157,6 +187,9 @@ impl AffinityPlan {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
+        if allow_smt {
+            return Self::place_smt(max_threads, count, &cpus, &nics);
+        }
         let mut used = HashSet::new();
         let mut pairs = Vec::with_capacity(count);
         for index in 0..count {
@@ -179,6 +212,82 @@ impl AffinityPlan {
             };
             let io = choose();
             let crypto = choose();
+            let nic = nic
+                .filter(|nic| io.numa_node == nic.numa_node && crypto.numa_node == nic.numa_node);
+            pairs.push(WorkerPair {
+                worker: WorkerId(index as u16),
+                io,
+                crypto,
+                nic,
+            });
+        }
+        Ok(Self { pairs, max_threads })
+    }
+
+    fn place_smt(
+        max_threads: usize,
+        count: usize,
+        cpus: &[CpuLocation],
+        nics: &[NicLocality],
+    ) -> Result<Self> {
+        let mut used_cpus = HashSet::new();
+        let mut reactor_cores = HashSet::new();
+        let mut reactors = Vec::with_capacity(count);
+        // Reserve all reactors before assigning crypto so an asymmetric cpuset
+        // cannot spend a reactor's only distinct core on an earlier crypto role.
+        for index in 0..count {
+            let nic = nics.get(index % nics.len().max(1)).cloned();
+            let node = nic.as_ref().and_then(|nic| nic.numa_node);
+            let io = cpus
+                .iter()
+                .filter(|cpu| !used_cpus.contains(&cpu.cpu))
+                .min_by_key(|cpu| {
+                    (
+                        reactor_cores.contains(&(cpu.package, cpu.core)),
+                        node.is_some() && cpu.numa_node != node,
+                        cpu.cpu,
+                    )
+                })
+                .ok_or(Error::InvalidConfiguration)?
+                .clone();
+            used_cpus.insert(io.cpu);
+            reactor_cores.insert((io.package, io.core));
+            reactors.push((io, nic));
+        }
+        // Reserve available siblings before fallback can consume another pair's
+        // sibling. Topology may expose unequal numbers of threads per core.
+        let siblings = reactors
+            .iter()
+            .map(|(io, _)| {
+                let sibling = cpus
+                    .iter()
+                    .find(|cpu| {
+                        !used_cpus.contains(&cpu.cpu)
+                            && (cpu.package, cpu.core) == (io.package, io.core)
+                    })
+                    .cloned();
+                if let Some(cpu) = &sibling {
+                    used_cpus.insert(cpu.cpu);
+                }
+                sibling
+            })
+            .collect::<Vec<_>>();
+        let mut pairs = Vec::with_capacity(count);
+        for (index, ((io, nic), sibling)) in reactors.into_iter().zip(siblings).enumerate() {
+            let crypto = sibling
+                .or_else(|| {
+                    cpus.iter()
+                        .filter(|cpu| !used_cpus.contains(&cpu.cpu))
+                        .min_by_key(|cpu| {
+                            (
+                                io.numa_node.is_some() && cpu.numa_node != io.numa_node,
+                                cpu.cpu,
+                            )
+                        })
+                        .cloned()
+                })
+                .ok_or(Error::InvalidConfiguration)?;
+            used_cpus.insert(crypto.cpu);
             let nic = nic
                 .filter(|nic| io.numa_node == nic.numa_node && crypto.numa_node == nic.numa_node);
             pairs.push(WorkerPair {
@@ -564,6 +673,177 @@ mod tests {
     }
 
     #[test]
+    fn smt_places_four_unique_pairs_and_preserves_default_physical_policy() {
+        let mut hardware = topology(8, None);
+        for cpu in &mut hardware.cpus {
+            cpu.core %= 4;
+        }
+        let physical = AffinityPlan::place(
+            8,
+            EffectiveTopology {
+                cpus: hardware.cpus.clone(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            physical
+                .pairs
+                .iter()
+                .map(|p| (p.io.cpu, p.crypto.cpu))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (2, 3)]
+        );
+        let plan = AffinityPlan::place_with_policy(8, hardware, &[], true).unwrap();
+        assert_eq!(
+            plan.pairs
+                .iter()
+                .map(|p| (p.io.cpu, p.crypto.cpu))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (1, 5), (2, 6), (3, 7)]
+        );
+        assert_eq!(plan.max_threads, DEFAULT_MAX_THREADS);
+    }
+
+    #[test]
+    fn smt_sizing_honors_quotas_caps_and_complete_unique_pairs() {
+        for (cap, logical, quota, expected) in [
+            (8, 8, None, 4),
+            (8, 64, None, 4),
+            (7, 8, None, 3),
+            (8, 7, None, 3),
+            (8, 3, None, 1),
+            (2, 8, None, 1),
+            (8, 8, Some((7, 2)), 1),
+            (8, 8, Some((4, 1)), 2),
+            (8, 8, Some((7, 1)), 3),
+            (8, 8, Some((1, 2)), 1),
+        ] {
+            let mut hardware = topology(logical, quota);
+            for cpu in &mut hardware.cpus {
+                cpu.core /= 2;
+            }
+            let plan = AffinityPlan::place_with_policy(cap, hardware, &[], true).unwrap();
+            assert_eq!(plan.pairs.len(), expected);
+            let assigned = plan
+                .pairs
+                .iter()
+                .flat_map(|p| [p.io.cpu, p.crypto.cpu])
+                .collect::<BTreeSet<_>>();
+            assert_eq!(assigned.len(), 2 * expected);
+            assert!(assigned.iter().all(|cpu| *cpu < logical));
+        }
+        for (cap, logical) in [(1, 8), (8, 0), (8, 1)] {
+            assert!(
+                AffinityPlan::place_with_policy(cap, topology(logical, None), &[], true).is_err()
+            );
+        }
+        let mut duplicate = topology(8, None);
+        duplicate.cpus[7].cpu = 0;
+        assert!(AffinityPlan::place_with_policy(8, duplicate, &[], true).is_err());
+    }
+
+    #[test]
+    fn smt_irregular_cpuset_reserves_reactors_and_siblings_before_fallback() {
+        // Sparse allowed IDs, package-local core IDs, missing siblings, and a
+        // four-way SMT core. Only the online/affinity/cpuset intersection is input.
+        let cpus = [
+            (2, 0, 0),
+            (8, 1, 0),
+            (10, 0, 2),
+            (14, 1, 2),
+            (18, 0, 2),
+            (22, 0, 2),
+            (26, 0, 2),
+            (30, 1, 2),
+        ]
+        .map(|(cpu, package, core)| CpuLocation {
+            cpu,
+            package,
+            core,
+            numa_node: Some(package),
+        });
+        for reverse in [false, true] {
+            let mut allowed = cpus.to_vec();
+            if reverse {
+                allowed.reverse();
+            }
+            let hardware = EffectiveTopology {
+                cpus: allowed,
+                quota: None,
+                nics: vec![
+                    NicLocality {
+                        device: "eth1".into(),
+                        numa_node: Some(1),
+                    },
+                    NicLocality {
+                        device: "eth0".into(),
+                        numa_node: Some(0),
+                    },
+                ],
+            };
+            let plan = AffinityPlan::place_with_policy(8, hardware, &[], true).unwrap();
+            assert_eq!(
+                plan.pairs
+                    .iter()
+                    .map(|p| (p.io.cpu, p.crypto.cpu))
+                    .collect::<Vec<_>>(),
+                vec![(2, 22), (8, 26), (10, 18), (14, 30)]
+            );
+            for (index, pair) in plan.pairs.iter().enumerate() {
+                assert_eq!(pair.worker, WorkerId(index as u16));
+                assert_eq!(pair.nic.is_some(), index != 1);
+            }
+        }
+        // All subsets model irregular allowed intersections, including SMT-only
+        // cpusets. No rejected/offline CPU may be introduced to complete a pair.
+        for mask in 0u16..256 {
+            let allowed = cpus
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, cpu)| cpu.clone())
+                .collect::<Vec<_>>();
+            let ids = allowed.iter().map(|cpu| cpu.cpu).collect::<BTreeSet<_>>();
+            let result = AffinityPlan::place_with_policy(
+                8,
+                EffectiveTopology {
+                    cpus: allowed,
+                    quota: None,
+                    nics: vec![],
+                },
+                &[],
+                true,
+            );
+            if ids.len() < 2 {
+                assert!(result.is_err());
+                continue;
+            }
+            let plan = result.unwrap();
+            let assigned = plan
+                .pairs
+                .iter()
+                .flat_map(|p| [p.io.cpu, p.crypto.cpu])
+                .collect::<BTreeSet<_>>();
+            assert_eq!(assigned.len(), 2 * (ids.len() / 2));
+            assert!(assigned.is_subset(&ids));
+            let reactor_cores = plan
+                .pairs
+                .iter()
+                .map(|p| (p.io.package, p.io.core))
+                .collect::<HashSet<_>>();
+            let cores = cpus
+                .iter()
+                .filter(|cpu| ids.contains(&cpu.cpu))
+                .map(|cpu| (cpu.package, cpu.core))
+                .collect::<HashSet<_>>();
+            assert_eq!(reactor_cores.len(), plan.pairs.len().min(cores.len()));
+        }
+    }
+
+    #[test]
     fn single_cpu_pair_retains_two_role_assignments() {
         let cpu = topology(1, None).cpus.remove(0);
         let pair = WorkerPair {
@@ -641,6 +921,7 @@ mod tests {
             let discovered = EffectiveTopology::discover().unwrap();
             assert_eq!(discovered.cpus.len(), 1);
             assert_eq!(discovered.cpus[0].cpu, cpu);
+            assert!(AffinityPlan::place_with_policy(8, discovered, &[], true).is_err());
             set_cpus(&allowed).unwrap();
         })
         .join()
