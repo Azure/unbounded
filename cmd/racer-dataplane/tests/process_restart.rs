@@ -8,6 +8,8 @@ mod control;
 mod measurement;
 #[path = "process/throughput.rs"]
 mod throughput;
+#[path = "process/sdk_connection_age.rs"]
+mod sdk_connection_age;
 
 use racer_dataplane::{model::range::PAGE_BYTES, store::checkpoint_format::CheckpointCodec};
 use std::{
