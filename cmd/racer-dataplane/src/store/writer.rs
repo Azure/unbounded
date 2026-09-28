@@ -512,6 +512,10 @@ impl StoreWriter {
     pub fn is_idle(&self) -> bool {
         !self.busy.get() && self.pending_count() == 0 && self.writes_in_flight() == 0
     }
+    /// Idle, zeroized staging remains charged until reuse, pressure, or drain.
+    pub fn retained_staging_bytes(&self) -> usize {
+        self.slabs.retained_staging_bytes()
+    }
     #[cfg(test)]
     pub(super) fn reclaim_idle_buffer(&self) -> usize {
         self.slabs.reclaim_buffer()

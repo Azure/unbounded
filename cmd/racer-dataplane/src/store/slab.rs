@@ -121,6 +121,12 @@ impl Slabs {
     pub fn writes_in_flight(&self) -> usize {
         self.writes.get()
     }
+    pub fn retained_staging_bytes(&self) -> usize {
+        self.idle_buffer
+            .borrow()
+            .as_ref()
+            .map_or(0, |buffer| buffer.len())
+    }
     #[cfg(test)]
     pub(super) fn replace_file_for_test(&self, file: File) {
         self.opened.borrow_mut().as_mut().unwrap().file = Rc::new(file.into());

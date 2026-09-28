@@ -267,6 +267,14 @@ credential retry, disk invalidation, version and cancellation regressions pass.
 
 ### Aligned staging recycling increment
 
+Committed as `15bbd902`. Follow-up production assertions now compare ciphertext
+charges to the explicit retained-staging byte count after active pages are freed;
+the full production target passes 13 tests/two ignores (5.99 s). Final doctests
+pass six ordinary plus 26 compile-fail contracts. An exploratory HTTP staging
+pool exposed six legacy release assertions in its focused group; that uncommitted
+experiment was removed and is not part of the delivered implementation. Network
+buffer recycling therefore remains outstanding.
+
 Slabs now owns one retained aligned staging allocation per worker. Its original
 reservation remains charged while idle; allocation reuses only matching geometry
 and rebinds to a newly admitted cache reservation. Last-owner Drop zeroizes bytes,

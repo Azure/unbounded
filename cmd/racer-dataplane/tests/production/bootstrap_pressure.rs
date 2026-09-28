@@ -60,7 +60,10 @@ fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget(
         }
         rig.memory.evict_idle(usize::MAX).unwrap();
         assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
-        assert_eq!(rig.admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Ciphertext),
+            rig.writer.retained_staging_bytes()
+        );
     }
 }
 
@@ -132,7 +135,10 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
     drop(held);
     rig.memory.evict_idle(usize::MAX).unwrap();
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
-    assert_eq!(rig.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        rig.writer.retained_staging_bytes()
+    );
 }
 
 #[test]
@@ -152,7 +158,10 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
             "failure must reach origin"
         );
         assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
-        assert_eq!(rig.admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Ciphertext),
+            rig.writer.retained_staging_bytes()
+        );
         assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
     }
     thread::sleep(Duration::from_secs(1));
@@ -166,7 +175,10 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
     assert_eq!(empty.status, 200);
     assert!(empty.body.is_empty());
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
-    assert_eq!(rig.admission.used(ResourceClass::Ciphertext), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        rig.writer.retained_staging_bytes()
+    );
     rig.adapter.state.lock().unwrap().length = 113;
     // Use another version because an immutable version's length cannot change.
     rig.adapter.state.lock().unwrap().version = 3;
