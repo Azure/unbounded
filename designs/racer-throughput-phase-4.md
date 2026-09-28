@@ -159,7 +159,7 @@ Implementation results will be recorded below as each tested increment lands.
   actual reuse. Production cancellation initially waited for idle charges to reach
   zero and hit its internal bounded stall assertion; it now checks zero active
   leases and verifies full original cancellation, bytes, and resource contracts.
-- FD delivery increment: WriteTo uses Linux splice for parsed fixed-length bodies
+- `d56a4cc9`: WriteTo uses Linux splice for parsed fixed-length bodies
   and portable bounded copying otherwise. FDSink counts actual spliced bytes;
   loopback ServeHTTP uses explicit net/http Hijack/flush/close ownership. Spliced
   source bodies close through Transport; its private counters are never bypassed
@@ -185,7 +185,39 @@ used the mandatory external `timeout --signal=TERM --kill-after=10s 300s` prefix
 | `cargo test --locked --all-features --test production_dataplane -j 2 -- --test-threads=2 --quiet` | 13 passed, two explicit ignores, 5.90 s. |
 | `cargo test --locked --all-features --test production_dataplane --test client_origin_conformance -j 2 -- --test-threads=2 --quiet` | Conformance 19 passed/one ignore; production initially found the idle-charge stall described above. |
 | `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk -count=1` | After FD delivery: passed, 20.754 s. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk -run 'TestValueWriteTo\|TestValueServeHTTP' -count=1` | Final cancellation error normalization: passed, 1.878 s. |
+| `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet` | All 13 strict actual-Application gates passed, zero ignored/failures, 112.34 s. |
+| `cargo test --locked --all-features --no-run -j 2` | All library, binary, and integration targets compiled. |
+| `cargo test --locked --all-features --doc -j 2 -- --test-threads=2` | Final: six ordinary and 26 compile-fail tests passed. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m ./internal/gantry/racer ./internal/gantry/mirror -count=1` | Mirror passed, 12.550 s. Racer exposed another sequential-arrival fixture assumption. |
+| `env GOTOOLCHAIN=go1.26.6 make fmt GO_PACKAGE_DIRS=./internal/gantry/racer GO_PACKAGE_PATTERNS=./internal/gantry/racer/...` | Passed, zero lint issues after adding the test's sync import. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./internal/gantry/racer -count=1` | Passed, 2.861 s. Fixture checks unique aligned offsets, exact bytes, credentials, pins, counts, and body closure independent of arrival order. |
 
 No external timeout fired in these increments. These results do not yet establish
 the full Phase 4 exit gates; acquisition/bootstrap, disk/page-buffer recycling,
 CRC64 and rotating request MAC remain to be delivered.
+
+### Current scope and compatibility
+
+This is a partial Phase 4 implementation, not full phase acceptance.
+
+| Goal | Delivered | Still required |
+| --- | --- | --- |
+| A | Existing AEAD and acquisition contracts preserved by regression tests. | Unified ciphertext-ready/lazy-plaintext lifecycle, serving/requester decrypt counters, shared-decrypt exit tests. |
+| B | Existing explicit v2 operation matching retained. | Versioned Bootstrap, Go/Rust/public protocol coordination, exact remote origin counts and mixed-profile tests. |
+| C | Bounded concurrent pinned pages, ordered Read/Close, Linux FD splice, portable copy branch, typed sink and loopback HTTP handler. | Broader multi-Value contention/deadline and splice-error edge coverage; spliced UDS connections deliberately close rather than pool. |
+| D | Actual recycled worker-local pipes and immutable ciphertext sends. | Aligned disk, network/page allocation recycling and their retained-capacity/zeroization tests; origin splice evaluation. |
+| E | Existing certificate sessions, purpose-separated keys and AEAD preserved. | Accelerated CRC64 on crypto workers, record versioning, rotating shared-key MAC and compatibility tests. |
+
+Peer wire remains v2 and records remain v1. No protocol negotiation, shared-key
+MAC, CRC64 format, or compatibility downgrade behavior has been introduced.
+Client/origin HTTP framing remains v1. SDK changes add optional config and methods;
+per-Value continuations may now reach origin out of order, while emitted bytes
+remain ordered. Parent merge has not been performed.
+
+Hardware evidence is local Linux TCP/UDS splice, io_uring and O_DIRECT process
+coverage. No RDMA/NIC/NUMA throughput or CRC hardware measurement is claimed.
+Process checks after the selected suite found other host workloads under
+containerd and the parent checkout's `tmp/racer-sdk-throughput`; those were not
+owned by this invocation and were left running. Fixture guards reaped this
+worktree's process-test children.

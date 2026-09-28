@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,8 +158,8 @@ func TestFakeClientPagesAndCredentials(t *testing.T) {
 			const auth = "Basic dXNlcjpzZWNyZXQ="
 
 			var (
-				closed         atomic.Int64
-				expectedOffset atomic.Int64
+				closed atomic.Int64
+				seen   sync.Map
 			)
 
 			upstream := &testUpstream{
@@ -170,11 +171,13 @@ func TestFakeClientPagesAndCredentials(t *testing.T) {
 					return int64(size), "application/octet-stream", nil
 				},
 				pull: func(ctx context.Context, got ifaces.OriginRef) (io.ReadCloser, int64, error) {
-					if got.Offset != expectedOffset.Load() || got.Digest != ref.Digest || registryauth.Authorization(ctx) != auth {
+					if got.Offset < 0 || got.Offset >= int64(size) || got.Offset%int64(racersdk.PageSize) != 0 || got.Digest != ref.Digest || registryauth.Authorization(ctx) != auth {
 						return nil, 0, errors.New("incorrect page offset or credential")
 					}
 
-					expectedOffset.Add(int64(racersdk.PageSize))
+					if _, duplicate := seen.LoadOrStore(got.Offset, true); duplicate {
+						return nil, 0, errors.New("duplicate page offset")
+					}
 
 					return &trackedBody{ReadCloser: io.NopCloser(bytes.NewReader(data[got.Offset:])), closed: &closed}, int64(size), nil
 				},
