@@ -135,14 +135,13 @@ struct Command {
 struct Receipt {
     reply: Arc<Reply>,
     scope: RequestScope,
+    cancellation: crate::runtime::deadline::CancellationRegistration,
     _permit: Arc<Permit>,
 }
 impl Future for Receipt {
     type Output = Result<Completion>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Err(error) = self.scope.cancellation.register(cx.waker()) {
-            return Poll::Ready(Err(error));
-        }
+        self.cancellation.register(cx.waker());
         if let Err(error) = self.scope.check() {
             return Poll::Ready(Err(error));
         }
@@ -330,6 +329,9 @@ impl WorkerDirectory {
         budget: Option<AcquisitionBudget>,
     ) -> Result<Receipt> {
         scope.check()?;
+        // A receipt has a task-specific waker, not the worker's stable waker.
+        // Release its notification slot when the receipt completes or detaches.
+        let cancellation = scope.cancellation.subscribe()?;
         let mailbox = self.mailbox(worker)?;
         let generation = self
             .sequence
@@ -369,6 +371,7 @@ impl WorkerDirectory {
         Ok(Receipt {
             reply,
             scope: scope.clone(),
+            cancellation,
             _permit: permit,
         })
     }

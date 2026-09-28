@@ -351,6 +351,7 @@ pub struct AcquisitionWaiter<'a> {
 
 struct Registration {
     flights: Rc<Flights>,
+    cancellation: crate::runtime::deadline::CancellationRegistration,
     // Waiters survive acquisition generations. Match owner/page/incarnation/id
     // for registration, then refresh this generation only on a new election.
     fence: Fence,
@@ -395,6 +396,7 @@ pub enum AcquisitionEvent {
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
+    pub(crate) cancellation: &'a crate::runtime::deadline::CancellationRegistration,
     pub membership: &'a MembershipLease,
     pub budget: &'a mut AcquisitionBudget,
 }
@@ -434,10 +436,7 @@ impl AcquisitionWaiter<'_> {
     /// for this cohort. Peer Unauthorized failures are terminal instead.
     pub fn wait(&mut self) -> Operation<'_, AcquisitionEvent> {
         Box::pin(poll_fn(move |cx| {
-            if let Err(error) = self.scope.cancellation.register(cx.waker()) {
-                self.registration.cancel(error);
-                return Poll::Ready(Err(error));
-            }
+            self.registration.cancellation.register(cx.waker());
             if let Err(error) = self.scope.check() {
                 self.registration.cancel(error);
                 return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
@@ -515,6 +514,7 @@ impl AcquisitionWaiter<'_> {
         Ok(AcquisitionContext {
             origin: self.context,
             scope: self.scope,
+            cancellation: &self.registration.cancellation,
             membership: &self.membership,
             budget: self.budget,
         })
@@ -532,10 +532,7 @@ impl CopyWaiter<'_> {
     /// the wait; it never creates a retry. Results include original ciphertext.
     pub fn wait(&mut self) -> Operation<'_, AcquiredPage> {
         Box::pin(poll_fn(move |cx| {
-            if let Err(error) = self.scope.cancellation.register(cx.waker()) {
-                self.registration.cancel(error);
-                return Poll::Ready(Err(error));
-            }
+            self.registration.cancellation.register(cx.waker());
             if let Err(error) = self.scope.check() {
                 self.registration.cancel(error);
                 return Poll::Ready(Err(error));
@@ -707,6 +704,7 @@ impl Flights {
             {
                 return Err(Error::Unavailable);
             }
+            let cancellation = scope.cancellation.subscribe()?;
             let reservation = self.admission.reserve(
                 Some(&page.version.object.cache),
                 ResourceClass::Waiter,
@@ -768,6 +766,7 @@ impl Flights {
             Ok(JoinedFlight::Waiter(AcquisitionWaiter {
                 registration: Registration {
                     flights: self.clone(),
+                    cancellation,
                     fence: entry.fence.clone(),
                     id,
                     attached: true,
@@ -811,6 +810,7 @@ impl Flights {
             if entry.waiters.len() >= self.limits.waiters_per_flight {
                 return Err(Error::Overloaded);
             }
+            let cancellation = scope.cancellation.subscribe()?;
             let reservation = self.admission.reserve(
                 Some(&page.version.object.cache),
                 ResourceClass::Waiter,
@@ -834,6 +834,7 @@ impl Flights {
             Ok(JoinedCopy::Waiter(CopyWaiter {
                 registration: Registration {
                     flights: self.clone(),
+                    cancellation,
                     fence: entry.fence.clone(),
                     id,
                     attached: true,
@@ -1498,6 +1499,65 @@ mod tests {
 
     fn page_result(flights: &Flights) -> PageResult {
         result(flights, fence().page)
+    }
+
+    #[test]
+    fn detached_copy_waiters_release_notifications_without_losing_live_wake() {
+        use futures::{Stream, stream::FuturesUnordered};
+        let flights = flights(FlightLimits::default());
+        let (context, supplier, readers) = (origin(), scope(), scope());
+        let mut budget = budget();
+        let mut supplier = join(&flights, &context, &supplier, &mut budget);
+        let leader = lead(&mut supplier);
+        let operation = flights.retain_operation(&leader, ()).unwrap();
+        for _ in 0..1100 {
+            let mut copy = match flights.join_copy(&fence().page, &readers).unwrap() {
+                JoinedCopy::Waiter(waiter) => waiter,
+                _ => panic!("expected live flight"),
+            };
+            let mut tasks = FuturesUnordered::new();
+            tasks.push(copy.wait());
+            assert!(
+                std::pin::Pin::new(&mut tasks)
+                    .poll_next(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_pending()
+            );
+            drop(tasks);
+            drop(copy);
+        }
+        let mut first = match flights.join_copy(&fence().page, &readers).unwrap() {
+            JoinedCopy::Waiter(waiter) => waiter,
+            _ => panic!("expected live flight"),
+        };
+        let mut second = match flights.join_copy(&fence().page, &readers).unwrap() {
+            JoinedCopy::Waiter(waiter) => waiter,
+            _ => panic!("expected live flight"),
+        };
+        let count = std::sync::Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(first.wait().as_mut().poll(&mut cx).is_pending());
+        assert!(second.wait().as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        readers.cancel().unwrap();
+        assert_eq!(
+            count.count(),
+            1,
+            "dropping a sibling must not remove the shared executor wake"
+        );
+        assert!(matches!(
+            second.wait().as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        drop(second);
+        assert_eq!(flights.admission.used(ResourceClass::ControlProgress), 1);
+        operation.complete().unwrap();
+        flights
+            .fail(leader, AcquisitionFailure::Terminal(Error::Io))
+            .unwrap();
+        drop(supplier);
+        assert_eq!(flights.admission.used(ResourceClass::Flight), 0);
+        assert_eq!(flights.admission.used(ResourceClass::Waiter), 0);
     }
 
     #[test]

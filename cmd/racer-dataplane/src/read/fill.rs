@@ -509,7 +509,7 @@ impl Fill {
                         use std::future::Future;
                         let remaining = std::future::poll_fn(|cx| {
                             super::drivers::poll(cx, 64);
-                            acquisition.scope.cancellation.register(cx.waker())?;
+                            acquisition.cancellation.register(cx.waker());
                             acquisition.scope.check()?;
                             match std::pin::Pin::new(&mut receive).poll(cx) {
                                 std::task::Poll::Ready(Ok(value)) => {

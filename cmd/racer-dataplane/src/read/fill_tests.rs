@@ -319,6 +319,63 @@ fn drive<T>(
 }
 
 #[test]
+fn completed_fill_waits_release_shared_cancellation_capacity() {
+    use futures::{StreamExt, stream::FuturesUnordered};
+    let mut f = fixture();
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _queue = queue.enter();
+    // Force a terminal fill failure without any accepted I/O. Every cohort must
+    // release its waiter and driver before the same long-lived scope is reused.
+    let admission = &f.fill.dependencies.admission;
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Plaintext,
+            admission.limit(ResourceClass::Plaintext),
+        )
+        .unwrap();
+    for round in 0..1100 {
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+        let mut pending = FuturesUnordered::new();
+        pending.push(f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ));
+        assert!(
+            matches!(
+                drive(pending.next(), &mut f.engine, &f.crypto),
+                Some(Err(Error::Overloaded))
+            ),
+            "pressure round {round}"
+        );
+        drop(pending);
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(admission.used(ResourceClass::Flight), 0);
+        assert_eq!(admission.used(ResourceClass::Waiter), 0);
+    }
+    drop(pressure);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut pending = FuturesUnordered::new();
+    pending.push(f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let result = drive(pending.next(), &mut f.engine, &f.crypto).unwrap();
+    assert!(
+        result.is_ok(),
+        "released pressure must recover without replacing scope: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+}
+
+#[test]
 fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);

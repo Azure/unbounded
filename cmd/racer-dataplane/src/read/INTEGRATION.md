@@ -93,6 +93,14 @@ mailbox round trip. Driver queue permits
 are acquired before retaining a FlightOperation; submission is infallible after
 reservation. No credential-bearing context enters a completed flight or cache.
 
+Flight waiters and directory receipts own cancellation subscriptions. Their
+task-specific wakers must not accumulate in the worker-lifetime cancellation
+scope inherited by peer ingress. Fill's driver-result wait reuses its acquisition
+waiter's subscription; detach releases notification capacity but not outstanding
+I/O/crypto fences. The assembled peer regression completes 1,100 authenticated
+cross-worker dispatches on one worker scope, and the fill regression recovers
+after 1,100 failed cohorts without recreating that scope or raising any limit.
+
 Fill::reserve_progress reclaims only the exhausted resource class's deficit,
 restricting fair-share reclamation to the requesting cache. Bounded passes stop
 after sufficient idle memory or unsubmitted write capacity is released. Busy

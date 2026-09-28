@@ -2455,6 +2455,129 @@ fn dst_coverage_policy_and_aggregation() {
 }
 
 #[test]
+fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
+    use crate::model::{context::OriginContext, metadata::MetadataSelector};
+    use crate::peer::wire::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
+    use crate::topology::paths::RouteBudget;
+    use futures::{Stream, stream::FuturesUnordered};
+
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(73);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(73, sim, clock, false);
+    harness.add(None);
+    harness.add(None);
+    let target = harness
+        .nodes
+        .iter()
+        .position(|n| n.workers.len() == 2)
+        .unwrap();
+    let source = 1 - target;
+    let app = &harness.nodes[target].workers[0].app;
+    let mut object = ObjectId {
+        cache: harness.definition(0).id,
+        key: CacheKey([0; 32]),
+    };
+    while app.directory.metadata_owner(&object).unwrap() != WorkerId(1) {
+        object.key.0[0] += 1;
+    }
+    let server = app.peers.clone();
+    // Exactly the long-lived scope used by WorkerApplication's ingress loop.
+    let worker_scope = app.task_scope.clone().unwrap();
+    let membership = app.snapshots.current().unwrap().membership.clone();
+    let destination = harness.nodes[target].config.node.clone();
+    let sender = &harness.nodes[source].workers[0].app;
+    let signatures = Rc::new(Signatures::new(
+        sender.keys.clone(),
+        Rc::new(Certificates::new(
+            harness.nodes[source].config.cluster.clone(),
+            sender.keys.clone(),
+        )),
+    ));
+    let forwarding = Forwarding::new(signatures);
+    let credentials = CredentialCrypto::new(sender.keys.clone(), sender.runtime.admission.clone());
+    let previous = harness.nodes[source].config.node.clone();
+    for round in 0u64..1100 {
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            crate::runtime::environment::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut attempt = [0; 16];
+        attempt[..8].copy_from_slice(&round.to_le_bytes());
+        let attempt = AttemptId(attempt);
+        let context = OriginContext {
+            object: object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let request = PeerRequest {
+            operation: PeerOperation::Metadata {
+                object: object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::CopyOnly,
+            },
+            origin: credentials.seal(&context, attempt, &scope).unwrap(),
+            route: RouteBudget {
+                membership: membership.version,
+                request: scope.request,
+                attempt,
+                destination: destination.clone(),
+                visited: vec![previous.clone()],
+                remaining_links: 4,
+                remaining_attempts: 0,
+                deadline: scope.deadline,
+            },
+        };
+        let (request, binding) = forwarding.sign_request_to(request, &destination).unwrap();
+        let mut effective = worker_scope.clone();
+        effective.request = scope.request;
+        effective.deadline = scope.deadline;
+        // FuturesUnordered gives each completed ingress its own task waker, just
+        // like the production ingress collection. No synthetic registrations.
+        let server = server.clone();
+        let mut pending = FuturesUnordered::new();
+        pending.push(Box::pin(async move {
+            server.dispatch(request, &effective).await
+        }));
+        let mut response = None;
+        for _ in 0..100 {
+            {
+                let app = &harness.nodes[target].workers[0].app;
+                let _local = app
+                    .directory
+                    .simulation_scope(Some((app.worker, app.coordinator.clone())));
+                let _drivers = app.drivers.enter();
+                if let Poll::Ready(Some(result)) = std::pin::Pin::new(&mut pending)
+                    .poll_next(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    response = Some(result.unwrap());
+                    break;
+                }
+            }
+            harness.tick();
+        }
+        let verified = forwarding
+            .verify_response(response.expect("bounded peer dispatch"), &binding)
+            .unwrap();
+        assert!(
+            matches!(verified.response(), PeerResponse::Miss),
+            "round {round}: expected Miss; overloaded={}",
+            matches!(verified.response(), PeerResponse::Overloaded)
+        );
+        for worker in &harness.nodes[target].workers {
+            assert_eq!(worker.runtime.admission.used(ResourceClass::Waiter), 0);
+            assert_eq!(worker.runtime.admission.used(ResourceClass::Flight), 0);
+            assert_eq!(worker.app.drivers.pending(), 0);
+        }
+    }
+    assert!(worker_scope.check().is_ok());
+}
+
+#[test]
 fn healthy_relayed_page_reads() {
     let sim = Simulation::new();
     let _os = sim.enter();
