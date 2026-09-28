@@ -31,6 +31,16 @@ func (w transferResponse) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func TestHTTPTransferKeepsConnectionsAndRanges(t *testing.T) {
+	testHTTPTransferKeepsConnectionsAndRanges(t, 0)
+}
+
+func TestHTTPTransferWindowKeepsConnectionsAndRanges(t *testing.T) {
+	testHTTPTransferKeepsConnectionsAndRanges(t, 2)
+}
+
+func testHTTPTransferKeepsConnectionsAndRanges(t *testing.T, window int) {
+	t.Helper()
+
 	const size = 2*int64(PageSize) + 173
 
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +60,7 @@ func TestHTTPTransferKeepsConnectionsAndRanges(t *testing.T) {
 		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
 	}))
 	c := testClient(t, path, 2)
+	c.config.PageWindow = window
 
 	var fast, connections atomic.Int64
 

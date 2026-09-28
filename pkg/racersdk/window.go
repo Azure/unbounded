@@ -60,7 +60,20 @@ func (v *Value) advance() (int64, error) {
 		}
 
 		v.pending = v.pending[1:]
+		// The consumed predecessor has closed, so this child can inherit the
+		// parent's slot. Release its extra slot before rolling the window forward.
+		result.value.mu.Lock()
+		if result.value.slot {
+			result.value.slot = false
+
+			<-v.pool.slots
+		}
+		result.value.mu.Unlock()
+
 		v.body = &windowBody{Value: result.value, pages: v.client.pages}
+		if result.err == nil {
+			v.startPages(v.nextPage, false)
+		}
 		v.mu.Unlock()
 
 		return result.value.remaining, result.err
@@ -72,8 +85,13 @@ func (v *Value) advance() (int64, error) {
 // startPages requires v.mu. Bootstrap prefetch uses only spare slots; it never
 // waits for capacity while holding the socket serving the first page.
 func (v *Value) startPages(next int64, borrow bool) {
+	limit := min(v.client.config.PageWindow, cap(v.pool.slots)) - len(v.pending)
+	if !borrow {
+		limit-- // The bootstrap or current window body retains the parent slot.
+	}
+
 batch:
-	for i := 0; next < v.end && i < min(v.client.config.PageWindow, cap(v.pool.slots)); i++ {
+	for i := 0; next < v.end && i < limit; i++ {
 		extra := i != 0 || !borrow
 		if extra {
 			select {
@@ -112,6 +130,8 @@ batch:
 
 		next = end
 	}
+
+	v.nextPage = next
 }
 
 type windowBody struct {

@@ -208,3 +208,64 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 		t.Fatal("Close retained permits")
 	}
 }
+
+func TestValueWindowRefillsBeforeLaterPagesFinish(t *testing.T) {
+	const size = 5 * int64(PageSize)
+
+	entered := make(chan int64, 8)
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		selected, _ := parseRange(r.Header.Get("Range"))
+
+		first, last, _ := selected.resolve(ByteLength(size))
+		entered <- int64(first)
+
+		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
+
+		if int64(first) >= 2*int64(PageSize) {
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+
+			return
+		}
+
+		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
+	}))
+	c := testClient(t, path, 3)
+	c.config.PageWindow = 3
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	if _, err := io.CopyN(io.Discard, v, 2*int64(PageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() { _, err := v.Read(make([]byte, 1)); done <- err }()
+
+	seen := make(map[int64]bool)
+	for !seen[4*int64(PageSize)] {
+		select {
+		case offset := <-entered:
+			seen[offset] = true
+		case <-time.After(3 * time.Second):
+			t.Fatal("window did not refill", seen)
+		}
+	}
+
+	closeBody(v)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader did not stop")
+	}
+
+	if len(c.pages) != 0 || len(c.slots) != 0 {
+		t.Fatal("retained permits")
+	}
+}

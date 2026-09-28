@@ -31,6 +31,7 @@ type Value struct {
 	offset    int64
 	end       int64
 	pending   []*pageJob
+	nextPage  int64
 	workers   sync.WaitGroup
 	window    bool
 }
@@ -277,22 +278,14 @@ func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
 				continue
 			}
 
-			v.mu.Lock()
-			body, ok := v.body.(*responseBody)
-			v.mu.Unlock()
-
-			if ok && body.conn.reader.Buffered() > 0 {
-				buffer = buffer[:min(len(buffer), body.conn.reader.Buffered())]
+			if buffered := v.bufferedBodyBytes(); buffered > 0 {
+				buffer = buffer[:min(len(buffer), buffered)]
 			}
 		}
 
 		if httpTransfer {
-			v.mu.Lock()
-			body, ok := v.body.(*responseBody)
-			v.mu.Unlock()
-
-			if ok && body.conn.reader.Buffered() > 0 {
-				buffer = buffer[:min(len(buffer), body.conn.reader.Buffered())]
+			if buffered := v.bufferedBodyBytes(); buffered > 0 {
+				buffer = buffer[:min(len(buffer), buffered)]
 			}
 		}
 

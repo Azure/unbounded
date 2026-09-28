@@ -29,11 +29,30 @@ func (v *Value) writeHTTPBody(w io.Writer) (int64, bool, error) {
 
 	v.mu.Lock()
 	body, ok := v.body.(*responseBody)
+	window, windowed := v.body.(*windowBody)
 	terminal := v.terminal
 	v.mu.Unlock()
 
 	if terminal != nil {
 		return 0, true, terminal
+	}
+
+	if windowed {
+		if window.remaining == 0 {
+			return 0, false, nil
+		}
+
+		before := window.remaining
+		n, used, err := window.writeHTTPBody(w)
+		consumed := before - window.remaining
+		v.offset += consumed
+
+		v.remaining -= consumed
+		if err != nil {
+			v.finish(err)
+		}
+
+		return n, used, err
 	}
 
 	if !ok || body.conn.reader.Buffered() != 0 {

@@ -97,11 +97,28 @@ func (v *Value) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (v *Value) spliceTo(sink *FDSink) (int64, bool, error) {
 	v.mu.Lock()
 	body, ok := v.body.(*responseBody)
+	window, windowed := v.body.(*windowBody)
 	terminal := v.terminal
 	v.mu.Unlock()
 
 	if terminal != nil {
 		return 0, false, terminal
+	}
+
+	if windowed {
+		if window.remaining == 0 {
+			return 0, false, nil
+		}
+
+		n, used, err := window.spliceTo(sink)
+		v.offset += n
+
+		v.remaining -= n
+		if err != nil {
+			v.finish(err)
+		}
+
+		return n, used, err
 	}
 
 	if !ok || body.conn.reader.Buffered() != 0 {
@@ -115,6 +132,10 @@ func (v *Value) spliceTo(sink *FDSink) (int64, bool, error) {
 	}
 
 	if err != nil {
+		if canceled := v.ctx.Err(); canceled != nil {
+			err = canceled
+		}
+
 		body.mu.Lock()
 		body.reusable = false
 		body.mu.Unlock()
@@ -124,4 +145,20 @@ func (v *Value) spliceTo(sink *FDSink) (int64, bool, error) {
 	}
 
 	return n, used, nil
+}
+
+// bufferedBodyBytes finds parser read-ahead through a window child.
+func (v *Value) bufferedBodyBytes() int {
+	v.mu.Lock()
+	body := v.body
+	v.mu.Unlock()
+
+	switch body := body.(type) {
+	case *responseBody:
+		return body.conn.reader.Buffered()
+	case *windowBody:
+		return body.bufferedBodyBytes()
+	default:
+		return 0
+	}
 }
