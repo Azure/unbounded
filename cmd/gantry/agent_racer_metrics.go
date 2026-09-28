@@ -86,6 +86,12 @@ func newRacerSDKCollector(stats func() racersdk.Stats) *racerSDKCollector {
 		c.metrics = append(c.metrics, racerSDKMetric{prometheus.NewDesc("gantry_racer_sdk_"+name, help, nil, nil), kind, value})
 	}
 	add("queue_depth", "Calls waiting for SDK admission.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.QueueDepth) })
+	add("bulk_limit", "Effective bulk admission limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.BulkLimit) })
+	add("metadata_limit", "Effective metadata admission limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.MetadataLimit) })
+	add("small_object_limit", "Effective small-object admission limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.SmallObjectLimit) })
+	add("bulk_queue_limit", "Effective bulk queue limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.BulkQueueLimit) })
+	add("metadata_queue_limit", "Effective metadata queue limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.MetadataQueueLimit) })
+	add("small_object_queue_limit", "Effective small-object queue limit.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.SmallObjectQueueLimit) })
 	add("bulk_queue_depth", "Calls waiting for SDK bulk admission.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.BulkQueueDepth) })
 	add("metadata_queue_depth", "Calls waiting for SDK metadata admission.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.MetadataQueueDepth) })
 	add("small_object_queue_depth", "Calls waiting for SDK small-object admission.", prometheus.GaugeValue, func(s racersdk.Stats) float64 { return float64(s.SmallObjectQueueDepth) })

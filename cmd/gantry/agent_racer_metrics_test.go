@@ -217,8 +217,8 @@ func TestRacerSDKIdlePoolMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(families) != 18 {
-		t.Fatalf("SDK metrics=%d, want all 18 even when idle", len(families))
+	if len(families) != 24 {
+		t.Fatalf("SDK metrics=%d, want all 24 even when idle", len(families))
 	}
 
 	for _, family := range families {

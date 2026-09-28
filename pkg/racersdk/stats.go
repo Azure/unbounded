@@ -9,6 +9,9 @@ import "sync/atomic"
 // cumulative since construction; gauges describe the sampling instant. Fields
 // are sampled independently and need not form a transaction during concurrent I/O.
 type Stats struct {
+	// Admission limits are effective defaults, not raw zero-valued configuration.
+	BulkLimit, MetadataLimit, SmallObjectLimit                int
+	BulkQueueLimit, MetadataQueueLimit, SmallObjectQueueLimit int
 	// QueueDepth sums calls waiting in all three independently bounded queues.
 	QueueDepth int
 	// Per-pool queue depths allow saturation to be diagnosed without request labels.
@@ -63,6 +66,8 @@ func (c *Client) Stats() Stats {
 	bulk, metadata, small := len(c.bulk.queued), len(c.metadataPool.queued), len(c.smallPool.queued)
 
 	return Stats{
+		BulkLimit: cap(c.bulk.slots), MetadataLimit: cap(c.metadataPool.slots), SmallObjectLimit: cap(c.smallPool.slots),
+		BulkQueueLimit: cap(c.bulk.queued), MetadataQueueLimit: cap(c.metadataPool.queued), SmallObjectQueueLimit: cap(c.smallPool.queued),
 		QueueDepth: bulk + metadata + small, BulkQueueDepth: bulk, MetadataQueueDepth: metadata, SmallObjectQueueDepth: small, QueueWaits: c.stats.queueWaits.Load(),
 		QueueWaitNanoseconds: c.stats.queueWaitNanoseconds.Load(),
 		QueueRejections:      c.stats.queueRejections.Load(), QueueTimeouts: c.stats.queueTimeouts.Load(),

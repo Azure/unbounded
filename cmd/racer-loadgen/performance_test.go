@@ -679,6 +679,19 @@ func performanceProcess(t *testing.T, root string) (int, string) {
 		"QUEUE_ENTRIES": "256", "CLIENT_CONNECTIONS": "128", "ORIGIN_CONNECTIONS_PER_CACHE": "8", "METADATA_ENTRIES": "128", "FLIGHTS": "64", "PIPES": "72", "RANGE_WINDOW_PAGES": "2",
 		"REQUEST_TIMEOUT_MS": "60000", "READER_STALL_TIMEOUT_MS": "30000", "SHUTDOWN_TIMEOUT_MS": "10000",
 	}
+	// Use production resource defaults unless a run explicitly records an override.
+	// In particular, do not hide pipe contention by budgeting one per SDK slot.
+	for name, fallback := range map[string]string{
+		"PIPES": "16", "CIPHERTEXT_BYTES": "268435456",
+		"REQUEST_TIMEOUT_MS": "30000", "READER_STALL_TIMEOUT_MS": "10000",
+		"MAX_THREADS": "2", "CLIENT_CONNECTIONS": "128",
+	} {
+		settings[name] = fallback
+		if value := os.Getenv("RACER_PERF_" + name); value != "" {
+			settings[name] = value
+		}
+	}
+
 	for name, path := range map[string]string{"TRUST_BUNDLE": "trust.pem", "SERVICE_ACCOUNT_TOKEN": "token", "SECRET_DIRECTORY": "secrets", "IDENTITY_DIRECTORY": "identity", "SLAB_DIRECTORY": "slabs"} {
 		settings[name] = filepath.Join(root, path)
 	}
