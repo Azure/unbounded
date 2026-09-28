@@ -239,6 +239,7 @@ func racerClientConfig(c *config.Config, cache racersdk.CacheName) racersdk.Clie
 		MetadataQueuedRequests: c.RacerMetadataQueuedRequests,
 		SmallObjectConnections: c.RacerSmallObjectConnections, SmallObjectQueuedRequests: c.RacerSmallObjectQueuedRequests,
 		QueueTimeout: c.RacerQueueTimeout, ResponseHeaderTimeout: c.RacerResponseHeaderTimeout,
+		MaxConnAge: c.RacerMaxConnAge,
 	}
 }
 

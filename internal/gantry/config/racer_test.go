@@ -64,6 +64,7 @@ func TestRacerTuning(t *testing.T) {
 		{"racer_max_queued_requests", "128", "20", "21", "22", func(c *Config) string { return strconv.Itoa(c.RacerMaxQueuedRequests) }},
 		{"racer_queue_timeout", "5s", "2s", "3s", "4s", func(c *Config) string { return c.RacerQueueTimeout.String() }},
 		{"racer_response_header_timeout", "1m0s", "2s", "3s", "4s", func(c *Config) string { return c.RacerResponseHeaderTimeout.String() }},
+		{"racer_max_conn_age", "5m0s", "2s", "3s", "4s", func(c *Config) string { return c.RacerMaxConnAge.String() }},
 		{"racer_origin_max_connections", "128", "12", "13", "14", func(c *Config) string { return strconv.Itoa(c.RacerOriginMaxConnections) }},
 		{"racer_origin_concurrent_requests", "64", "12", "13", "14", func(c *Config) string { return strconv.Itoa(c.RacerOriginConcurrentRequests) }},
 		{"racer_origin_concurrent_head_requests", "4", "2", "3", "6", func(c *Config) string { return strconv.Itoa(c.RacerOriginConcurrentHeadRequests) }},
@@ -128,7 +129,7 @@ func TestRacerTuning(t *testing.T) {
 			negative := "-1"
 			zero := "0"
 
-			if strings.HasSuffix(test.name, "timeout") {
+			if strings.HasSuffix(test.name, "timeout") || strings.HasSuffix(test.name, "age") {
 				negative = (-time.Second).String()
 				zero = "0s"
 			}

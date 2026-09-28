@@ -69,6 +69,7 @@ type Config struct {
 	RacerMaxQueuedRequests            int           `yaml:"racer_max_queued_requests"`
 	RacerQueueTimeout                 time.Duration `yaml:"racer_queue_timeout"`
 	RacerResponseHeaderTimeout        time.Duration `yaml:"racer_response_header_timeout"`
+	RacerMaxConnAge                   time.Duration `yaml:"racer_max_conn_age"`
 	RacerOriginMaxConnections         int           `yaml:"racer_origin_max_connections"`
 	RacerOriginConcurrentRequests     int           `yaml:"racer_origin_concurrent_requests"`
 	RacerOriginConcurrentHeadRequests int           `yaml:"racer_origin_concurrent_head_requests"`
@@ -500,6 +501,7 @@ func NewDefault() *Config {
 		RacerMaxQueuedRequests:            128,
 		RacerQueueTimeout:                 5 * time.Second,
 		RacerResponseHeaderTimeout:        60 * time.Second,
+		RacerMaxConnAge:                   5 * time.Minute,
 		RacerOriginMaxConnections:         128,
 		RacerOriginConcurrentRequests:     64,
 		RacerOriginConcurrentHeadRequests: 4,
@@ -661,6 +663,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("RACER_MAX_QUEUED_REQUESTS", &c.RacerMaxQueuedRequests)
 	setDur("RACER_QUEUE_TIMEOUT", &c.RacerQueueTimeout)
 	setDur("RACER_RESPONSE_HEADER_TIMEOUT", &c.RacerResponseHeaderTimeout)
+	setDur("RACER_MAX_CONN_AGE", &c.RacerMaxConnAge)
 	setInt("RACER_ORIGIN_MAX_CONNECTIONS", &c.RacerOriginMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setInt("RACER_ORIGIN_CONCURRENT_HEAD_REQUESTS", &c.RacerOriginConcurrentHeadRequests)
@@ -758,6 +761,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.RacerMaxQueuedRequests, "racer-max-queued-requests", c.RacerMaxQueuedRequests, "Racer bulk queued request limit (0 uses 128)")
 	fs.DurationVar(&c.RacerQueueTimeout, "racer-queue-timeout", c.RacerQueueTimeout, "Racer admission wait timeout (0 uses 5s)")
 	fs.DurationVar(&c.RacerResponseHeaderTimeout, "racer-response-header-timeout", c.RacerResponseHeaderTimeout, "Racer response header timeout (0 uses 60s)")
+	fs.DurationVar(&c.RacerMaxConnAge, "racer-max-conn-age", c.RacerMaxConnAge, "Racer connection rotation age (0 uses 5m, jittered to avoid synchronized reconnects)")
 	fs.IntVar(&c.RacerOriginMaxConnections, "racer-origin-max-connections", c.RacerOriginMaxConnections, "Racer origin accepted connection limit (0 uses 128)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.IntVar(&c.RacerOriginConcurrentHeadRequests, "racer-origin-concurrent-head-requests", c.RacerOriginConcurrentHeadRequests, "Racer origin reserved HEAD callback limit (0 uses 4)")
@@ -988,6 +992,7 @@ func (c *Config) Validate() error {
 			"racer_max_queued_requests":             int64(c.RacerMaxQueuedRequests),
 			"racer_queue_timeout":                   int64(c.RacerQueueTimeout),
 			"racer_response_header_timeout":         int64(c.RacerResponseHeaderTimeout),
+			"racer_max_conn_age":                    int64(c.RacerMaxConnAge),
 			"racer_origin_max_connections":          int64(c.RacerOriginMaxConnections),
 			"racer_origin_concurrent_requests":      int64(c.RacerOriginConcurrentRequests),
 			"racer_origin_concurrent_head_requests": int64(c.RacerOriginConcurrentHeadRequests),
