@@ -281,10 +281,12 @@ func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
 	}
 
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
-	reconcileTopology(t, r, ctx)
+	if restarted := reconcileTopology(t, r, ctx); restarted.Version() != member.Version() || restarted.Encoding() != member.Encoding() {
+		t.Fatal("cold restart changed admitted membership during workload gap")
+	}
 
-	if len(r.Accepted) != 0 {
-		t.Fatal("cold restart inherited endpoint without workload")
+	if len(r.Accepted) != 1 {
+		t.Fatal("cold restart lost persisted admitted identity")
 	}
 }
 

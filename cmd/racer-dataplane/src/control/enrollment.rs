@@ -17,6 +17,7 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 pub struct Enrollment {
+    shares: Cell<u32>,
     cluster: ClusterId,
     token_path: PathBuf,
     identity_directory: PathBuf,
@@ -83,6 +84,7 @@ fn token(b: &[u8]) -> Result<Zeroizing<String>> {
 impl Enrollment {
     pub fn new(cluster: ClusterId, token_path: PathBuf, identity_directory: PathBuf) -> Self {
         Self {
+            shares: Cell::new(4),
             cluster,
             token_path,
             identity_directory,
@@ -91,6 +93,9 @@ impl Enrollment {
             busy: Cell::new(false),
             previous: Cell::new(None),
         }
+    }
+    pub fn set_shares(&self, shares: std::num::NonZeroU32) {
+        self.shares.set(shares.get());
     }
     /// Persist a fresh private key and retry-stable request before submission.
     /// All issuance uses the projected token, including lifetime-based renewal.
@@ -364,6 +369,7 @@ impl Enrollment {
             return Err(Error::Unauthorized);
         }
         let r = EnrollmentRequest {
+            shares: self.shares.get(),
             schema_version: 1,
             cluster: self.cluster.clone(),
             enrollment: EnrollmentId(p.enrollment.clone()),

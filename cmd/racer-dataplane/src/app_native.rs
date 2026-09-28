@@ -144,7 +144,7 @@ mod tests {
             .filter(|(key, _)| key.starts_with("RACER_"))
             .map(|(key, value)| (key, value.trim_end_matches('"')))
             .collect();
-        assert_eq!(values.len(), 10);
+        assert_eq!(values.len(), 14);
         let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
             Ok(values
                 .get(name)

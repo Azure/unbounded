@@ -471,7 +471,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if _, err := publication.WriteTo(requestWriter{ctx: ctx, writer: w}); err != nil {
+	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).WriteTo(requestWriter{ctx: ctx, writer: w}); err != nil {
 		// A partial JSON response cannot be repaired with a protocol error.
 		panic(http.ErrAbortHandler)
 	}

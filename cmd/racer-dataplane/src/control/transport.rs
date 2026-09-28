@@ -161,6 +161,7 @@ pub struct ControlTransport {
     health: Rc<crate::topology::health::LinkHealth>,
     endpoint: ControlEndpoint,
     io: RefCell<Option<Rc<dyn ControlIo>>>,
+    idle: Rc<RefCell<Option<ControlConnection>>>,
 }
 pub struct ControlConnection {
     health: Rc<crate::topology::health::LinkHealth>,
@@ -172,6 +173,9 @@ pub struct ControlConnection {
     io: Rc<dyn ControlIo>,
     host: String,
     expires: Option<SystemTime>,
+    epoch: [u8; 32],
+    idle: std::rc::Weak<RefCell<Option<ControlConnection>>>,
+    idle_since: Instant,
 }
 enum ControlStream {
     Real(TcpStream),
@@ -262,13 +266,18 @@ impl ControlTransport {
             health: Rc::new(crate::topology::health::LinkHealth::new(1)),
             endpoint,
             io: RefCell::new(None),
+            idle: Rc::new(RefCell::new(None)),
         }
     }
     pub fn attach_io(&self, io: Rc<dyn ControlIo>) {
+        self.idle.borrow_mut().take();
         *self.io.borrow_mut() = Some(io);
     }
     pub fn io(&self) -> Result<Rc<dyn ControlIo>> {
         self.io.borrow().clone().ok_or(Error::InvalidConfiguration)
+    }
+    pub fn close_idle(&self) {
+        self.idle.borrow_mut().take();
     }
     pub fn bootstrap<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ControlConnection> {
         self.connect(None, scope)
@@ -309,6 +318,27 @@ impl ControlTransport {
             let trust = io
                 .read_file(&self.endpoint.trust_bundle, wire::MAX_BUNDLE_BYTES, scope)
                 .await?;
+            use sha2::Digest;
+            let mut epoch = sha2::Sha256::new();
+            epoch.update(&*trust);
+            if let Some(identity) = identity {
+                for certificate in identity.certificate_chain() {
+                    epoch.update((certificate.len() as u64).to_be_bytes());
+                    epoch.update(certificate);
+                }
+            }
+            let epoch: [u8; 32] = epoch.finalize().into();
+            if let Some(connection) = self.idle.borrow_mut().take() {
+                if identity.is_some()
+                    && connection.epoch == epoch
+                    && crate::runtime::environment::now()
+                        .saturating_duration_since(connection.idle_since)
+                        < Duration::from_secs(20)
+                    && connection.check(scope).is_ok()
+                {
+                    return Ok(connection);
+                }
+            }
             let mut roots = rustls::RootCertStore::empty();
             for cert in rustls_pemfile::certs(&mut trust.as_slice()) {
                 roots
@@ -396,6 +426,13 @@ impl ControlTransport {
                 io,
                 host: endpoint.authority,
                 expires: identity.map(|i| i.expires_at()),
+                epoch,
+                idle: if identity.is_some() {
+                    Rc::downgrade(&self.idle)
+                } else {
+                    std::rc::Weak::new()
+                },
+                idle_since: crate::runtime::environment::now(),
             };
             while connection.tls.is_handshaking() {
                 connection.step(scope).await?;
@@ -533,7 +570,7 @@ impl ControlConnection {
         }
         Ok(())
     }
-    /// One request per connection; no pooled session can cross identity rotation.
+    /// Successful framed requests recycle one connection within its trust/identity epoch.
     pub fn request<'a>(
         self,
         method: &'a str,
@@ -543,13 +580,25 @@ impl ControlConnection {
         limit: usize,
         scope: &'a RequestScope,
     ) -> Operation<'a, HttpResponse> {
+        self.request_delta(method, path, token, body, limit, None, scope)
+    }
+    pub fn request_delta<'a>(
+        self,
+        method: &'a str,
+        path: &'a str,
+        token: Option<&'a str>,
+        body: &'a [u8],
+        limit: usize,
+        base: Option<&'a str>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HttpResponse> {
         Box::pin(async move {
             let health = self.health.clone();
             let endpoint = self.endpoint.clone();
             health
                 .run(
                     &endpoint,
-                    self.request_inner(method, path, token, body, limit, scope),
+                    self.request_inner(method, path, token, body, limit, base, scope),
                 )
                 .await
         })
@@ -561,6 +610,7 @@ impl ControlConnection {
         token: Option<&'a str>,
         body: &'a [u8],
         limit: usize,
+        base: Option<&'a str>,
         scope: &'a RequestScope,
     ) -> Operation<'a, HttpResponse> {
         Box::pin(async move {
@@ -572,13 +622,21 @@ impl ControlConnection {
                 return Err(Error::InvalidRequest);
             }
             let mut request = zeroize::Zeroizing::new(format!(
-                "{method} {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
                 self.host,
                 body.len()
             ));
             if let Some(token) = token {
                 request.push_str("Authorization: Bearer ");
                 request.push_str(token);
+                request.push_str("\r\n");
+            }
+            if let Some(base) = base {
+                if base.len() != 64 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error::InvalidRequest);
+                }
+                request.push_str("X-Racer-Delta-Base: ");
+                request.push_str(base);
                 request.push_str("\r\n");
             }
             request.push_str("\r\n");
@@ -609,6 +667,15 @@ impl ControlConnection {
                 }
                 self.receive(&mut received, &mut scratch, scope).await?;
             };
+            let close = std::str::from_utf8(&received[..header_len])
+                .map_err(|_| Error::InvalidRequest)?
+                .lines()
+                .any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("connection")
+                            && value.trim().eq_ignore_ascii_case("close")
+                    })
+                });
             let body = match framing {
                 Framing::Length(length) => {
                     if received.len() > header_len + length {
@@ -683,6 +750,12 @@ impl ControlConnection {
                 }
             };
             self.check(scope)?;
+            if !close && matches!(status, 200 | 204) {
+                if let Some(idle) = self.idle.upgrade() {
+                    self.idle_since = crate::runtime::environment::now();
+                    *idle.borrow_mut() = Some(self);
+                }
+            }
             Ok(HttpResponse {
                 status,
                 body,

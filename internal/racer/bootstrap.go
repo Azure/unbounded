@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,7 +111,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unauthenticated
 	}
 
-	return NodeIdentity{cluster: b.Config.Cluster, node: wire.NodeID(node.UID), expires: expires}, nil
+	return NodeIdentity{cluster: b.Config.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
 }
 
 func singleExtra(user authv1.UserInfo, key string) string {
@@ -164,5 +165,43 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 	ctx, cancel := context.WithDeadline(ctx, identity.expires)
 	defer cancel()
 
-	return b.Issuer.Issue(ctx, identity, request)
+	response, err := b.Issuer.Issue(ctx, identity, request)
+	if err != nil {
+		return wire.BootstrapResponse{}, err
+	}
+	// Resolve the same live UID again before persisting an authenticated proposal.
+	// The annotation is a proposal only; explicit administrator shares win.
+	var live corev1.Node
+	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: identity.nodeName}, &live); err != nil {
+		return wire.BootstrapResponse{}, err
+	}
+
+	node := &live
+	if wire.NodeID(node.UID) == identity.node {
+		if !authorizedNode(node) {
+			return wire.BootstrapResponse{}, wire.Forbidden
+		}
+
+		shares := request.Shares
+		if shares == 0 {
+			shares = wire.DefaultShares
+		}
+
+		value := strconv.FormatUint(uint64(shares), 10)
+		if node.Annotations[enrolledSharesAnnotation] != value {
+			before := node.DeepCopy()
+			if node.Annotations == nil {
+				node.Annotations = map[string]string{}
+			}
+
+			node.Annotations[enrolledSharesAnnotation] = value
+			if err := b.Client.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+				return wire.BootstrapResponse{}, err
+			}
+		}
+
+		return response, nil
+	}
+
+	return wire.BootstrapResponse{}, wire.Forbidden
 }

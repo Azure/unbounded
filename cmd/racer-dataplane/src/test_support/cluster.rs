@@ -135,6 +135,9 @@ pub fn config(enable_rdma: bool) -> Config {
     let count = NonZeroUsize::new(16).unwrap();
     let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
     Config {
+        shares: std::num::NonZeroU32::new(4).unwrap(),
+        disk_page_entries: NonZeroUsize::new(65536).unwrap(),
+        checkpoint_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
         cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
         node: NodeId("00000000-0000-4000-8000-000000000002".into()),
         max_threads: 2,

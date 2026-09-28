@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,12 +33,16 @@ type PreparedPublication struct {
 	resourceVersion string
 	record          VersionRecord
 	encoded         string
+	delta           string
+	deltaBase       string
 }
 
 type CommittedPublication struct {
 	owner      *Publications
 	record     VersionRecord
 	encoded    string
+	delta      string
+	deltaBase  string
 	leadership context.Context
 }
 
@@ -137,7 +142,27 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 		return nil, err
 	}
 
-	return &PreparedPublication{owner: p, previous: previous, resourceVersion: resourceVersion, record: record, encoded: string(encoded)}, nil
+	prepared := &PreparedPublication{owner: p, previous: previous, resourceVersion: resourceVersion, record: record, encoded: string(encoded)}
+	// Capture immutable base under the lock, then diff/encode entirely outside it.
+	if current, err := p.Current(); err == nil && current.record == previous && record.Sequence > previous.Sequence {
+		if base, err := wire.DecodePublication(strings.NewReader(current.encoded)); err == nil {
+			if delta, err := wire.EncodeDelta(base, v); err == nil && len(delta) < len(encoded) {
+				prepared.delta, prepared.deltaBase = string(delta), previous.ContentHash
+			}
+		}
+	}
+
+	return prepared, nil
+}
+
+// ForBase returns a shared bounded delta only for the exact authenticated cursor.
+// Coalesced/skipped updates and controller restarts automatically use the full image.
+func (p *CommittedPublication) ForBase(hash string) *CommittedPublication {
+	if hash == "" || hash != p.deltaBase || p.delta == "" {
+		return p
+	}
+
+	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.delta, leadership: p.leadership}
 }
 
 func (p *Publications) Install(next *CommittedPublication) error {

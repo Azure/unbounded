@@ -5,6 +5,7 @@ package racer
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -19,7 +20,12 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// AcceptedMembers is process-local history, never a persisted checkpoint.
+const (
+	enrolledSharesAnnotation = "racer.unbounded-cloud.io/enrolled-shares"
+	admittedMemberAnnotation = "racer.unbounded-cloud.io/last-admitted-member"
+)
+
+// AcceptedMembers is backed by per-Node UID-bound last-admitted annotations.
 type AcceptedMembers map[wire.NodeID]wire.Member
 
 type MemberAttributes struct {
@@ -41,6 +47,17 @@ func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
 	}
 
 	attributes := MemberAttributes{Shares: wire.DefaultShares, Rails: []wire.Rail{}, AlignmentEnabled: true}
+
+	if _, explicit := node.Annotations[wire.SharesAnnotation]; !explicit {
+		if value := node.Annotations[enrolledSharesAnnotation]; value != "" {
+			shares, err := strconv.ParseUint(value, 10, 32)
+			if err != nil || shares == 0 {
+				return MemberAttributes{}, wire.InvalidRequest
+			}
+
+			attributes.Shares = uint32(shares)
+		}
+	}
 
 	if value, present := node.Annotations[wire.SharesAnnotation]; present {
 		shares, err := strconv.ParseUint(value, 10, 32)
@@ -136,9 +153,9 @@ func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, 
 	return netip.AddrPortFrom(address, port).String(), nil
 }
 
-// ReconcileMembers preserves accepted values across gaps/invalid updates only
-// while this process retains them. Cold-start nodes with unavailable or malformed
-// required inputs are omitted. Deletion and exclusion remove accepted history.
+// ReconcileMembers preserves admitted values across gaps using UID-bound Node
+// annotations on restart. Never-admitted nodes with unavailable or malformed
+// required inputs are omitted. Deletion and exclusion remove membership.
 // Annotations are accepted as one unit, independently of the endpoint. The caller
 // installs the returned history only after the candidate publication commits.
 // Inputs and nested accepted state are never mutated or aliased by the result.
@@ -172,7 +189,17 @@ func ReconcileMembers(nodes []corev1.Node, pods []corev1.Pod, daemonSetUID types
 		}
 
 		id := wire.NodeID(node.UID)
+
 		previous, known := accepted[id]
+		if !known {
+			var saved wire.Member
+			if raw := node.Annotations[admittedMemberAnnotation]; len(raw) <= 64*1024 && raw != "" && json.Unmarshal([]byte(raw), &saved) == nil && saved.Node == id {
+				probe := wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: wire.ClusterID(id), Sequence: 1, MembershipVersion: 1, Members: []wire.Member{saved}}
+				if _, err := wire.EncodePublication(probe); err == nil {
+					previous, known = saved, true
+				}
+			}
+		}
 
 		attributes, annotationErr := ParseAnnotations(node)
 		if annotationErr != nil {

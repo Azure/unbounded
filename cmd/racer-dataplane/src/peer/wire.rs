@@ -66,6 +66,8 @@ pub enum PeerResponse {
     Overloaded,
     OriginRejected,
     OriginForbidden,
+    /// Authenticated peer no longer retains the requested routing epoch.
+    StaleMembership,
 }
 
 /// Owned, unverified wire input/output. The original and all forwarding signatures

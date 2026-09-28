@@ -94,11 +94,11 @@ impl Fixture {
         let store = Store {
             reader,
             writer,
-            checkpoint: checkpoint::Checkpointer::new(
+            checkpoint: Rc::new(checkpoint::Checkpointer::new(
                 directory.0.clone(),
                 index.clone(),
                 segments.clone(),
-            ),
+            )),
             recovery: recovery::Recovery::new(directory.0.clone(), index, segments),
             eviction,
         };
@@ -207,6 +207,78 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
             .unwrap();
         assert_eq!(copy.ciphertext.bytes(), vec![expected; 4112]);
     }
+}
+
+#[test]
+fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
+    use crate::runtime::reactor::simulation::{Fault, Simulation};
+    for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        drive(&f.reactor, f.store.open()).unwrap();
+        let a = f.copy(21, 4096);
+        let b = f.copy(22, 4096);
+        let aid = a.ciphertext.envelope().page.clone();
+        let bid = b.ciphertext.envelope().page.clone();
+        f.enqueue(a).unwrap();
+        f.enqueue(b).unwrap();
+        simulation.inject("write", fault);
+        let scope = scope();
+        let mut writes = f.store.writer.progress(8, &scope);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(writes.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(f.store.writer.writes_in_flight(), 2);
+        let _ = drive(&f.reactor, writes);
+        assert!(f.store.writer.is_idle());
+        assert!(f.store.writer.index().lookup(&bid).unwrap().is_some());
+        if f.store.writer.index().lookup(&aid).unwrap().is_some() {
+            let copy = drive(&f.reactor, f.store.reader.read(&aid, &scope))
+                .unwrap()
+                .unwrap();
+            assert_eq!(copy.ciphertext.bytes(), vec![21; 4112]);
+        }
+        assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    }
+}
+
+#[test]
+fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
+    let f = Fixture::new();
+    drive(&f.reactor, f.store.open()).unwrap();
+    f.enqueue(f.copy(1, 4096)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+    assert!(matches!(
+        drive(&f.reactor, f.store.checkpoint.snapshot_incremental(1)),
+        Err(Error::Overloaded)
+    ));
+    let shard = drive(
+        &f.reactor,
+        f.store.checkpoint.snapshot_incremental(1024 * 1024),
+    )
+    .unwrap();
+    assert_eq!(shard.index.entries.len(), 1);
+    let task = f
+        .store
+        .checkpoint
+        .publish_async(vec![shard], f.reactor.clone(), scope(), 7, 1, 1024 * 1024)
+        .unwrap();
+    drive(&f.reactor, task).unwrap();
+    f.store.checkpoint.finish_snapshot();
+    let bytes = std::fs::read(f._directory.0.join("checkpoint.1")).unwrap();
+    let image = checkpoint_format::CheckpointCodec.decode(&bytes).unwrap();
+    assert_eq!(image.sequence, 7);
+    assert_eq!(image.shards[0].index.entries.len(), 1);
+    let geometry = checkpoint_format::CheckpointGeometry::new(
+        1024 * 1024 * 1024,
+        64 * 1024 * 1024,
+        16,
+        direct::DirectAlignment::validate(4096, 4096, 4096).unwrap(),
+    )
+    .unwrap();
+    let (payload, tail) = geometry.payload_capacity(2, 65536).unwrap();
+    assert_eq!(payload, 672 * 1024 * 1024);
+    assert!(tail > 200 * 1024 * 1024);
 }
 
 #[test]

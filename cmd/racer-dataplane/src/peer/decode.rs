@@ -297,6 +297,7 @@ impl LogicalCodec for SecurityCodec {
                     "overloaded" => PeerResponse::Overloaded,
                     "origin-rejected" => PeerResponse::OriginRejected,
                     "origin-forbidden" => PeerResponse::OriginForbidden,
+                    "stale-membership" => PeerResponse::StaleMembership,
                     _ => return Err(Error::InvalidRequest),
                 }
             }

@@ -49,6 +49,23 @@ pub struct CheckpointGeometry {
 }
 
 impl CheckpointGeometry {
+    /// Full-page capacity at actual direct-I/O alignment, conservatively allowing
+    /// the largest supported record header. Short records can use tail space.
+    pub fn payload_capacity(&self, reserve: usize, page_entries: usize) -> Result<(u64, u64)> {
+        let record = self
+            .alignment()?
+            .extent(
+                0,
+                crate::model::range::PAGE_BYTES as usize + 16 + super::format::MAX_HEADER_BYTES,
+            )?
+            .length() as u64;
+        let pages = self.segment_bytes / record;
+        let usable = self.segment_count.saturating_sub(reserve as u64);
+        Ok((
+            (usable * pages).min(page_entries as u64) * crate::model::range::PAGE_BYTES,
+            usable * (self.segment_bytes - pages * record),
+        ))
+    }
     pub fn new(
         slab_bytes: u64,
         segment_bytes: u64,
@@ -180,6 +197,17 @@ pub struct CheckpointImage {
 pub struct CheckpointCodec;
 impl CheckpointCodec {
     pub fn encode(&self, image: &CheckpointImage) -> Result<Vec<u8>> {
+        let mut encode = Box::pin(self.encode_incremental(image));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(result) =
+                std::future::Future::poll(encode.as_mut(), &mut cx)
+            {
+                return result;
+            }
+        }
+    }
+    pub async fn encode_incremental(&self, image: &CheckpointImage) -> Result<Vec<u8>> {
         validate_image(image)?;
         let mut out = Encoder(Vec::new());
         out.bytes(MAGIC)?;
@@ -206,7 +234,10 @@ impl CheckpointCodec {
             out.count(shard.segments.len())?;
             let mut segments: Vec<_> = shard.segments.iter().collect();
             segments.sort_by_key(|segment| segment.id.0);
-            for segment in segments {
+            for (i, segment) in segments.into_iter().enumerate() {
+                if i % 128 == 0 {
+                    super::checkpoint::cooperative_turn().await;
+                }
                 out.u64(segment.id.0)?;
                 out.u64(segment.generation.0)?;
                 out.bytes(&[match segment.state {
@@ -224,7 +255,10 @@ impl CheckpointCodec {
                     .cmp(&version_key(&b.version))
                     .then(a.number.0.cmp(&b.number.0))
             });
-            for (page, entry) in entries {
+            for (i, (page, entry)) in entries.into_iter().enumerate() {
+                if i % 128 == 0 {
+                    super::checkpoint::cooperative_turn().await;
+                }
                 out.descriptor(&entry.metadata)?;
                 out.u64(page.number.0)?;
                 out.bytes(&entry.key_id.0)?;
@@ -237,7 +271,10 @@ impl CheckpointCodec {
             out.count(shard.index.metadata.len())?;
             let mut metadata: Vec<_> = shard.index.metadata.iter().collect();
             metadata.sort_by(|a, b| version_key(&a.version).cmp(&version_key(&b.version)));
-            for metadata in metadata {
+            for (i, metadata) in metadata.into_iter().enumerate() {
+                if i % 128 == 0 {
+                    super::checkpoint::cooperative_turn().await;
+                }
                 out.descriptor(metadata)?;
             }
         }

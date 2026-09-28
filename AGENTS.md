@@ -83,6 +83,7 @@ unbounded-kube is organized into several directories:
 
 ## Testing Standards
 
+- Move quickly in larger coherent implementation batches. Use compile checks and focused tests for changed behavior during development; run broad suites once at phase completion and then parent integration. Repeat only when failures or new changes justify it. Do not revalidate unchanged phases or repeat benchmarks without a concrete unresolved question. This instruction applies to future agents and handoffs.
 - Every test command must use an external `timeout --signal=TERM --kill-after=10s 300s ...` (shorter bounds are allowed), with tool timeouts no greater than 320000 ms. Go tests must also use `-timeout=5m`. Split suites into bounded groups. A timeout is a failure to investigate, never a reason to retry unbounded. Ensure child process cleanup. This also applies to scripts, benchmarks, and `make fmt` if it invokes tests.
 - Add tests for new behavior. Cover success, failure, and edge cases.
 

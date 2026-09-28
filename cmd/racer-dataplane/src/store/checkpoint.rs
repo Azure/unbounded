@@ -77,6 +77,67 @@ impl Checkpointer {
         })
     }
 
+    /// Copy at most 128 retained mappings per reactor turn and reject budget
+    /// pressure before retaining the next batch. Frozen segment reuse makes
+    /// concurrent invalidations safe; no payload is read or fsynced.
+    pub fn snapshot_incremental(self: &Rc<Self>, budget: usize) -> Operation<'static, ShardImage> {
+        let owner = self.clone();
+        Box::pin(async move {
+            let geometry = owner.geometry.get().ok_or(Error::InvalidConfiguration)?;
+            if owner.frozen.get() {
+                return Err(Error::Overloaded);
+            }
+            owner.segments.freeze()?;
+            owner.frozen.set(true);
+            let result = async {
+                let segments = owner.segments.snapshot()?;
+                let metadata = owner.index.snapshot_metadata();
+                let mut charged = segments.len() * 128
+                    + metadata
+                        .iter()
+                        .map(|m| {
+                            2048 + m.version.object.cache.0.len() * 4
+                                + m.version.etag.as_bytes().len() * 4
+                        })
+                        .sum::<usize>();
+                if charged > budget {
+                    return Err(Error::Overloaded);
+                }
+                let mut entries = Vec::new();
+                let mut cursor = 0;
+                loop {
+                    let (next, batch) = owner.index.snapshot_pages(cursor, 128);
+                    let finished = batch.len() < 128;
+                    for (page, entry) in batch {
+                        charged += 2048
+                            + page.version.object.cache.0.len() * 4
+                            + page.version.etag.as_bytes().len() * 4;
+                        if charged > budget {
+                            return Err(Error::Overloaded);
+                        }
+                        entries.push((page, entry));
+                    }
+                    if finished {
+                        break;
+                    }
+                    cursor = next;
+                    cooperative_turn().await;
+                }
+                Ok(ShardImage {
+                    worker: owner.index.worker(),
+                    geometry,
+                    index: super::index::IndexSnapshot { entries, metadata },
+                    segments,
+                })
+            }
+            .await;
+            if result.is_err() {
+                owner.finish_snapshot();
+            }
+            result
+        })
+    }
+
     /// Required on every owning worker after success, failure, or coordinator abort.
     /// Images are Send values, deliberately containing no worker-local lease/Rc.
     pub fn finish_snapshot(&self) {
@@ -159,6 +220,121 @@ impl Checkpointer {
             publish_bytes(&self.directory, slot, &bytes)
         })
     }
+
+    /// Periodic disposable hints. The coordinator serializes generations and
+    /// keeps segment reuse frozen until rename completes. No fsync is issued.
+    pub fn publish_async(
+        &self,
+        shards: Vec<ShardImage>,
+        reactor: Rc<crate::runtime::reactor::Reactor>,
+        scope: crate::runtime::deadline::RequestScope,
+        sequence: u64,
+        slot: usize,
+        budget: usize,
+    ) -> Result<Operation<'static, ()>> {
+        // Bound simultaneous decoded image, encoding and submission scratch.
+        let estimated = shards
+            .iter()
+            .try_fold(0usize, |total, shard| {
+                shard
+                    .index
+                    .entries
+                    .iter()
+                    .try_fold(total, |n, (page, _)| {
+                        n.checked_add(
+                            2048 + page.version.object.cache.0.len() * 4
+                                + page.version.etag.as_bytes().len() * 4,
+                        )
+                    })
+                    .and_then(|n| {
+                        n.checked_add(
+                            shard.index.metadata.len() * 2048 + shard.segments.len() * 128,
+                        )
+                    })
+            })
+            .ok_or(Error::Overloaded)?;
+        if estimated > budget / 2 {
+            return Err(Error::Overloaded);
+        }
+        let directory = self.directory.clone();
+        Ok(Box::pin(async move {
+            let bytes = CheckpointCodec
+                .encode_incremental(&CheckpointImage {
+                    version: CHECKPOINT_VERSION,
+                    sequence,
+                    shards,
+                })
+                .await?;
+            if bytes.len() > budget / 2 {
+                return Err(Error::Overloaded);
+            }
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let dir = reactor
+                .file_open(
+                    None,
+                    CString::new(directory.as_os_str().as_bytes())
+                        .map_err(|_| Error::InvalidConfiguration)?,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                    &scope,
+                )
+                .await?;
+            let temporary = CString::new(".checkpoint.periodic.stage").unwrap();
+            match reactor
+                .file_unlink(dir.clone(), temporary.clone(), &scope)
+                .await
+            {
+                Ok(()) | Err(Error::MissingKey) => (),
+                Err(error) => return Err(error),
+            }
+            let fd = reactor
+                .file_open(
+                    Some(dir.clone()),
+                    temporary.clone(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0,
+                    &scope,
+                )
+                .await?;
+            let mut offset = 0usize;
+            for chunk in bytes.chunks(16384) {
+                let mut buffer = reactor.file_bytes(chunk)?;
+                while buffer.remaining() != 0 {
+                    let completion = reactor
+                        .write_at(fd.clone(), offset as u64, buffer, (), &scope)
+                        .await?;
+                    if completion.bytes == 0 {
+                        return Err(Error::Io);
+                    }
+                    offset += completion.bytes;
+                    buffer = completion.buffer;
+                    buffer.advance(completion.bytes)?;
+                }
+            }
+            reactor
+                .file_rename(
+                    dir,
+                    temporary,
+                    CString::new(CHECKPOINT_NAMES[slot]).unwrap(),
+                    &scope,
+                )
+                .await
+        }))
+    }
+}
+
+pub(crate) async fn cooperative_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 impl Drop for Checkpointer {

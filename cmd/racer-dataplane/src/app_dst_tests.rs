@@ -1017,6 +1017,10 @@ impl Harness {
                 .simulation_scope(Some((app.worker, app.coordinator.clone())));
             let drivers = app.drivers.clone();
             let directory = app.directory.clone();
+            // The simulated process is gone even though this oracle retains its
+            // admission counters. Prevent final payload owners from recycling
+            // into a dead process's idle pool while completion fences run.
+            runtime.admission.stop();
             drop(app);
             if crash {
                 drivers.simulation_crash();
@@ -1984,6 +1988,22 @@ impl Harness {
                 }
                 Action::ClientCancel => {
                     let mut client = self.request(1, false, false);
+                    // Send the request without consuming the response, ensuring
+                    // real socket backpressure regardless of the generated path.
+                    for _ in 0..MAX_TURNS {
+                        if client.sent == client.request.len() {
+                            break;
+                        }
+                        if let Ok(n) =
+                            handle(client.fd.as_ref().unwrap()).send(&client.request[client.sent..])
+                        {
+                            client.sent += n;
+                        }
+                        self.tick();
+                    }
+                    for _ in 0..256 {
+                        self.tick();
+                    }
                     for _ in 0..1 + self.rng.pick(32) {
                         self.tick();
                         if client.poll() {
@@ -2195,6 +2215,74 @@ fn setting(name: &str, default: usize, max: usize) -> usize {
 #[test]
 fn dst_generated_traffic_churn_oracle() {
     run_corpus(false);
+}
+
+#[test]
+fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(505);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let mut harness = Harness::new(505, sim, clock, false);
+    for object in 0..8 {
+        harness.update(object);
+    }
+    for _ in 0..4 {
+        harness.add(None);
+    }
+    // Replace only the store's admission policy, retaining each real node's
+    // registry and all production peer/read dependencies.
+    for node in &mut harness.nodes {
+        let published = node.app.node.as_ref().unwrap().publications.clone();
+        node.app.snapshots = Rc::new(SnapshotStore::new(
+            node.config.cluster.clone(),
+            published,
+            2,
+        ));
+    }
+    let old = harness.nodes[0]
+        .app
+        .snapshots
+        .current()
+        .unwrap()
+        .membership
+        .version;
+    let members = harness.members();
+    harness.generation += 1;
+    for i in 1..4 {
+        let node = &harness.nodes[i];
+        let mut p = integration_tests::publication(
+            &node.config,
+            harness.generation,
+            vec![harness.definition(node.id)],
+        );
+        p.membership_version = MembershipVersion(harness.generation);
+        p.members = members.clone();
+        node.app.snapshots.publish(p).unwrap();
+        assert!(
+            node.app
+                .node
+                .as_ref()
+                .unwrap()
+                .publications
+                .membership(old)
+                .is_ok()
+        );
+    }
+    let client = harness.request_on(2, false, false, 0);
+    harness.exchange(client, false);
+    harness.clock.advance(Duration::from_secs(6));
+    for _ in 0..500 {
+        harness.tick();
+    }
+    for node in &harness.nodes {
+        assert!(node.app.telemetry.metrics.gauge(Gauge::CheckpointSequence) > 0);
+    }
+    // A node cannot resolve a future membership it has not received. Complete
+    // propagation before requiring arbitrary new-to-old requests to succeed.
+    harness.publish();
+    harness.traffic(4, false);
 }
 
 #[test]

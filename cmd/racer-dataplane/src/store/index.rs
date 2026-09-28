@@ -125,6 +125,9 @@ impl Index {
     pub fn metadata_capacity(&self) -> usize {
         self.metadata_capacity
     }
+    pub fn page_capacity(&self) -> usize {
+        self.page_capacity.get()
+    }
     pub fn set_page_capacity(&self, capacity: usize) -> Result<()> {
         if capacity == 0 || capacity < self.state.borrow().pages.len() + self.reserved.get() {
             return Err(Error::InvalidConfiguration);
@@ -316,6 +319,26 @@ impl Index {
                 .collect(),
             metadata: s.metadata.values().cloned().collect(),
         })
+    }
+    /// Owner-local bounded cut. Appends are frozen by Checkpointer; removals are
+    /// safe omissions. The age tree avoids rescanning a growing hash table.
+    pub fn snapshot_pages(&self, after: u64, limit: usize) -> (u64, Vec<(PageId, IndexedPage)>) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let state = self.state.borrow();
+        let mut cursor = after;
+        let entries = state
+            .page_order
+            .range((Excluded(after), Unbounded))
+            .take(limit)
+            .map(|(age, page)| {
+                cursor = *age;
+                (page.clone(), state.pages[page].clone())
+            })
+            .collect();
+        (cursor, entries)
+    }
+    pub fn snapshot_metadata(&self) -> Vec<VersionMetadata> {
+        self.state.borrow().metadata.values().cloned().collect()
     }
     /// Install only with the matching recovered segment state before admission.
     /// Validate identity/length agreement and catalog bounds; clear all freshness.

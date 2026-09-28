@@ -160,16 +160,73 @@ impl ControlClient {
             }
             let identity = self.identity.borrow().clone().ok_or(Error::Unauthorized)?;
             let connection = self.transport.authenticated(&identity, scope).await?;
+            let snapshot = self
+                .pending
+                .borrow()
+                .as_ref()
+                .map(|p| p.snapshot.clone())
+                .or_else(|| self.snapshots.current().ok());
+            let snapshot = snapshot.filter(|s| Some(s.sequence) == request.after);
+            let hash = snapshot
+                .as_ref()
+                .map(|s| {
+                    self.pending
+                        .borrow()
+                        .as_ref()
+                        .filter(|p| p.snapshot.sequence == s.sequence)
+                        .map(|p| Ok(p.content_hash()))
+                        .unwrap_or_else(|| self.snapshots.content_hash(s.sequence))
+                })
+                .transpose()?;
             let path = match request.after {
                 Some(n) => format!("{}?after={}", wire::SNAPSHOT_PATH, n.0),
                 None => wire::SNAPSHOT_PATH.into(),
             };
             let response = connection
-                .request("GET", &path, None, &[], wire::MAX_PUBLICATION_BYTES, scope)
+                .request_delta(
+                    "GET",
+                    &path,
+                    None,
+                    &[],
+                    wire::MAX_PUBLICATION_BYTES,
+                    hash.as_deref(),
+                    scope,
+                )
                 .await?;
             if response.status == 204 {
                 return Ok(SnapshotResponse::Unchanged);
             }
+            let body = self.response(response, false)?;
+            if let Ok(full) = wire::decode_publication(&body) {
+                return Ok(SnapshotResponse::Updated(full));
+            }
+            if let Some(s) = snapshot {
+                let base = wire::Publication {
+                    schema_version: wire::SCHEMA_VERSION,
+                    cluster: s.cluster.clone(),
+                    sequence: s.sequence,
+                    membership_version: s.membership.version,
+                    members: s.membership.members().to_vec(),
+                    caches: s.caches.clone(),
+                };
+                if let Ok(next) = wire::apply_delta(&base, &body) {
+                    return Ok(SnapshotResponse::Updated(next));
+                }
+            }
+            // One full retry within the original scope, without advancing cursor.
+            let response = self
+                .transport
+                .authenticated(&identity, scope)
+                .await?
+                .request(
+                    "GET",
+                    wire::SNAPSHOT_PATH,
+                    None,
+                    &[],
+                    wire::MAX_PUBLICATION_BYTES,
+                    scope,
+                )
+                .await?;
             Ok(SnapshotResponse::Updated(wire::decode_publication(
                 &self.response(response, false)?,
             )?))
@@ -686,6 +743,7 @@ impl ControlClient {
     /// Cancels the current owner turn; dropping its future closes its TLS socket.
     pub fn shutdown(&self) -> Result<()> {
         self.stopped.set(true);
+        self.transport.close_idle();
         if let Some(scope) = self.active_scope.borrow().as_ref() {
             scope.cancel()?;
         }

@@ -26,6 +26,7 @@ pub struct Membership {
     pub version: MembershipVersion,
     members: Vec<Member>,
     placement_identity: [u8; 32],
+    retained_bytes: usize,
     pub(crate) placement_delta: Option<PlacementDelta>,
 }
 #[derive(Debug)]
@@ -77,11 +78,23 @@ impl Membership {
             super::hash::bytes(&mut hash, member.node.0.as_bytes());
             hash.update(member.shares.get().to_be_bytes());
         }
+        let retained_bytes = std::mem::size_of::<Self>()
+            + members.capacity() * std::mem::size_of::<Member>()
+            + members
+                .iter()
+                .map(|m| {
+                    m.node.0.capacity()
+                        + m.peer_endpoint.capacity()
+                        + m.rails.capacity() * std::mem::size_of::<RailMapping>()
+                        + m.rails.iter().map(|r| r.fabric.capacity()).sum::<usize>()
+                })
+                .sum::<usize>();
         Ok(Self {
             version,
             placement_identity: super::hash::finish(hash),
             members,
             placement_delta: None,
+            retained_bytes,
         })
     }
     /// Prepare bounded incremental ranking hints outside the publication lock.
@@ -129,6 +142,9 @@ impl Membership {
     /// Local cache identity only. Routing still uses the authenticated version.
     pub fn placement_identity(&self) -> [u8; 32] {
         self.placement_identity
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes + 64 * std::mem::size_of::<(Option<usize>, Option<usize>)>()
     }
     pub fn members(&self) -> &[Member] {
         &self.members

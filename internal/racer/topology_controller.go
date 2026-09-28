@@ -5,6 +5,7 @@ package racer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 
@@ -20,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 type TopologyReconciler struct {
@@ -162,6 +164,47 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	}
 
 	r.Accepted = candidate
+
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+
+		member, ok := candidate[wire.NodeID(node.UID)]
+		if !ok {
+			if _, excluded := node.Labels[wire.ExclusionLabel]; excluded && node.Annotations[admittedMemberAnnotation] != "" {
+				before := node.DeepCopy()
+				delete(node.Annotations, admittedMemberAnnotation)
+
+				if err := r.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+					return err
+				}
+			}
+
+			continue
+		}
+
+		encoded, err := json.Marshal(member)
+		if err != nil {
+			return err
+		}
+
+		if len(encoded) > 64*1024 {
+			return wire.TooLarge
+		}
+
+		if node.Annotations[admittedMemberAnnotation] == string(encoded) {
+			continue
+		}
+
+		before := node.DeepCopy()
+		if node.Annotations == nil {
+			node.Annotations = map[string]string{}
+		}
+
+		node.Annotations[admittedMemberAnnotation] = string(encoded)
+		if err := r.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }

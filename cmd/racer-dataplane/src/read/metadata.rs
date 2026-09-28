@@ -644,6 +644,7 @@ impl MetadataService {
                     return Err(Error::Unavailable.into());
                 }
                 PeerResponse::Page { .. } => return Err(Error::CorruptRecord.into()),
+                PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),
             },
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, PageNumber(0))?;

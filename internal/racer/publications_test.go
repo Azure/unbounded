@@ -24,6 +24,74 @@ func pollIdentity(cfg Config, node wire.NodeID) NodeIdentity {
 	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: time.Now().Add(time.Hour)}
 }
 
+func TestPublicationDeltaSelectionAndDisconnectedFallback(t *testing.T) {
+	r := initializedTopology(t)
+	ctx := context.Background()
+	reconcileTopology(t, r, ctx)
+
+	members := AcceptedMembers{}
+
+	for i := range 100 {
+		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
+		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", Rails: []wire.Rail{}}
+	}
+
+	install := func() *CommittedPublication {
+		t.Helper()
+
+		cm, previous, err := r.readVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, members, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		committed, err := r.CommitVersion(ctx, prepared)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := r.Publications.Install(committed); err != nil {
+			t.Fatal(err)
+		}
+
+		return committed
+	}
+	base := install()
+	id := wire.NodeID("22222222-2222-4222-8222-000000000000")
+	m := members[id]
+	m.Shares = 9
+	members[id] = m
+	next := install()
+
+	delta := next.ForBase(base.Version().ContentHash)
+	if len(delta.Encoding()) >= len(next.Encoding()) {
+		t.Fatal("delta was not selected")
+	}
+
+	decoded, err := wire.DecodePublication(strings.NewReader(base.Encoding()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := wire.ApplyDelta(decoded, strings.NewReader(delta.Encoding()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash, _, err := wire.ContentHashes(applied)
+	if err != nil || hash != next.Version().ContentHash {
+		t.Fatalf("target mismatch: %v", err)
+	}
+
+	if next.ForBase("missing") != next || next.ForBase("") != next {
+		t.Fatal("missing-base fallback failed")
+	}
+}
+
 func awaitPolls(t *testing.T, p *Publications, count int) {
 	t.Helper()
 

@@ -27,6 +27,14 @@ pub const RANKING_BYTES: usize = 512;
 pub struct Placement {
     capacity: usize,
     cache: RefCell<RankingCache>,
+    maintenance: RefCell<Maintenance>,
+}
+#[derive(Default)]
+struct Maintenance {
+    identity: Option<[u8; 32]>,
+    cursor: Option<CacheKey>,
+    active: Option<u32>,
+    finished: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Candidates {
@@ -185,6 +193,7 @@ impl Placement {
         Self {
             capacity,
             cache: RefCell::new(RankingCache::default()),
+            maintenance: RefCell::new(Maintenance::default()),
         }
     }
 
@@ -293,6 +302,51 @@ impl Placement {
 
     pub fn cached_rankings(&self) -> usize {
         self.cache.borrow().entries.len()
+    }
+    /// Warm only already-demanded predecessor slots. Each turn hashes at most
+    /// one cold quantum or visits one retained key, with no full-cache sweep.
+    pub fn maintain(&self, membership: &MembershipLease) -> Result<()> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut work = self.maintenance.borrow_mut();
+        let identity = membership.placement_identity();
+        if work.identity != Some(identity) {
+            *work = Maintenance {
+                identity: Some(identity),
+                ..Maintenance::default()
+            };
+        }
+        if work.finished {
+            return Ok(());
+        }
+        if let Some(slot) = work.active {
+            let ranking = self.ranking(membership, slot)?;
+            let mut ranking = ranking.borrow_mut();
+            ranking.advance(membership, slot, WORK_QUANTUM);
+            if ranking.cursor == membership.members().len() {
+                work.active = None;
+            }
+            return Ok(());
+        }
+        let Some(delta) = &membership.placement_delta else {
+            work.finished = true;
+            return Ok(());
+        };
+        let next = {
+            let cache = self.cache.borrow();
+            match work.cursor {
+                Some(key) => cache.entries.range((Excluded(key), Unbounded)).next(),
+                None => cache.entries.range((delta.base, 0)..).next(),
+            }
+            .map(|(key, _)| *key)
+        };
+        match next {
+            Some(key) if key.0 == delta.base => {
+                work.cursor = Some(key);
+                work.active = Some(key.1);
+            }
+            _ => work.finished = true,
+        }
+        Ok(())
     }
 }
 #[cfg(test)]

@@ -713,3 +713,46 @@ fn interrupted_process_restart_refetches_safely_after_partial_origin_body() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
+
+#[test]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT; see process/README.md"]
+fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
+    let scratch = Scratch::new();
+    let control = control::Control::start(&scratch.0);
+    let (mut first, origin) = Process::start(&scratch, &control, 0);
+    check(&first.request(None, 0, P), 0, P);
+    let deadline = Instant::now() + TIMEOUT;
+    while first.metric("racer_checkpoint_sequence") == 0 {
+        first.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "periodic checkpoint stalled: {}",
+            first.logs()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // A new completed page and a partial page are outside the recent cut.
+    check(&first.request(Some("\"restart-v1\""), P, 2 * P), P, 2 * P);
+    origin.pause.store(true, Ordering::Release);
+    let mut interrupted = first.connect();
+    write_request(&mut interrupted, Some("\"restart-v1\""), 2 * P, LENGTH);
+    assert_eq!(first.stop(libc::SIGKILL).signal(), Some(libc::SIGKILL));
+    drop(interrupted);
+    drop(origin);
+    let (mut second, origin) = Process::start(&scratch, &control, 1);
+    origin.offline.store(true, Ordering::Release);
+    check(&second.request(Some("\"restart-v1\""), 0, P), 0, P);
+    assert_eq!(second.metric("racer_disk_hits_total"), 1);
+    assert!(origin.calls().is_empty(), "checkpointed page refetched");
+    origin.offline.store(false, Ordering::Release);
+    check(
+        &second.request(Some("\"restart-v1\""), P, LENGTH),
+        P,
+        LENGTH,
+    );
+    assert!(
+        origin.calls().len() <= 2,
+        "loss exceeded post-checkpoint pages"
+    );
+    assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
+}

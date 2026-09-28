@@ -48,6 +48,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<dyn PeerClient>,
     credentials: RefCell<Option<Rc<CredentialCrypto>>>,
+    published: RefCell<Option<std::sync::Arc<crate::control::snapshot::PublishedState>>>,
 }
 impl CandidatePolicy {
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
@@ -56,12 +57,19 @@ impl CandidatePolicy {
             placement,
             peers,
             credentials: RefCell::new(None),
+            published: RefCell::new(None),
         }
     }
 
     /// Composition hook: shares the same admission and credential domain as Fill.
     pub fn set_credentials(&self, credentials: Rc<CredentialCrypto>) {
         *self.credentials.borrow_mut() = Some(credentials);
+    }
+    pub fn set_publications(
+        &self,
+        published: std::sync::Arc<crate::control::snapshot::PublishedState>,
+    ) {
+        *self.published.borrow_mut() = Some(published);
     }
 
     pub fn candidates(
@@ -79,6 +87,9 @@ impl CandidatePolicy {
             .iter()
             .take(3)
             .any(|node| node == &self.node)
+    }
+    pub fn maintain(&self, membership: &MembershipLease) -> Result<()> {
+        self.placement.maintain(membership)
     }
     pub fn candidates_async<'a>(
         &'a self,
@@ -136,7 +147,22 @@ impl CandidatePolicy {
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
+        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+    ) -> Operation<'a, CandidateResolution<T>> {
+        self.resolve_epoch(
+            candidates, context, operation, scope, budget, validate, false,
+        )
+    }
+
+    fn resolve_epoch<'a, T: 'a>(
+        &'a self,
+        candidates: Candidates,
+        context: &'a OriginContext,
+        operation: PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
         mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+        retried: bool,
     ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
             check_budget(scope, budget)?;
@@ -182,6 +208,30 @@ impl CandidatePolicy {
                     .await
                 {
                     Ok(response) => {
+                        if matches!(response.response(), PeerResponse::StaleMembership) {
+                            if retried {
+                                return Err(Error::IncompatibleMembership);
+                            }
+                            let latest = self
+                                .published
+                                .borrow()
+                                .as_ref()
+                                .ok_or(Error::IncompatibleMembership)?
+                                .current()?
+                                .membership
+                                .clone();
+                            if latest.version.0 <= candidates.membership.version.0 {
+                                return Err(Error::IncompatibleMembership);
+                            }
+                            let next = self.candidates_scoped(latest, object, page, scope).await?;
+                            // Preserve the original operation (including ETag),
+                            // cancellation/deadline and already spent link/attempt credits.
+                            return self
+                                .resolve_epoch(
+                                    next, context, operation, scope, budget, validate, true,
+                                )
+                                .await;
+                        }
                         match validated_copy(response, &operation, rank.is_none(), &mut validate)
                             .await?
                         {
@@ -518,6 +568,7 @@ fn classify(
         PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
         PeerResponse::OriginRejected => Err(Error::OriginRejected),
         PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
+        PeerResponse::StaleMembership => Err(Error::IncompatibleMembership),
         PeerResponse::Bootstrap {
             metadata,
             page_zero,

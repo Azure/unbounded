@@ -69,6 +69,7 @@ pub struct Publication {
 /// never embedded in a DTO or retained in diagnostics.
 #[derive(Clone)]
 pub struct EnrollmentRequest {
+    pub shares: u32,
     pub schema_version: u32,
     pub cluster: ClusterId,
     pub enrollment: EnrollmentId,

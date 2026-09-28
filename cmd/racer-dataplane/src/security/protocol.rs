@@ -410,6 +410,7 @@ pub fn response_head(
         PeerResponse::Overloaded => ("overloaded", 0),
         PeerResponse::OriginRejected => ("origin-rejected", 0),
         PeerResponse::OriginForbidden => ("origin-forbidden", 0),
+        PeerResponse::StaleMembership => ("stale-membership", 0),
     };
     head.start = StartLine::Response {
         status: match response {

@@ -230,6 +230,59 @@ func TestHTTPSBootstrapSnapshotAndStrictRoutes(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedSharesProposalAndExplicitNodePrecedence(t *testing.T) {
+	f := newServingFixture(t)
+	endpoint := f.start(t)
+	f.request.Shares = 9
+
+	body, err := wire.EncodeBootstrapRequest(f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequestWithContext(f.ctx, "POST", endpoint+wire.BootstrapPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	req.Header.Set("Content-Type", "application/json")
+	response, err := f.client(t, nil).Do(req)
+	responseBody(t, response, err, 200)
+
+	node := &corev1.Node{}
+	if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, node); err != nil {
+		t.Fatal(err)
+	}
+
+	if node.Annotations[enrolledSharesAnnotation] != "9" {
+		t.Fatal("authenticated proposal not persisted")
+	}
+
+	published := reconcileTopology(t, f.a.Topology, f.ctx)
+
+	publication, err := wire.DecodePublication(strings.NewReader(published.Encoding()))
+	if err != nil || publication.Members[0].Shares != 9 {
+		t.Fatalf("proposal not published: %+v %v", publication, err)
+	}
+
+	if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, node); err != nil {
+		t.Fatal(err)
+	}
+
+	node.Annotations[wire.SharesAnnotation] = "12"
+	if err := f.a.Topology.Update(f.ctx, node); err != nil {
+		t.Fatal(err)
+	}
+
+	published = reconcileTopology(t, f.a.Topology, f.ctx)
+
+	publication, err = wire.DecodePublication(strings.NewReader(published.Encoding()))
+	if err != nil || publication.Members[0].Shares != 12 {
+		t.Fatalf("explicit shares lost: %+v %v", publication, err)
+	}
+}
+
 func TestHTTPSBootstrapBoundsAndErrors(t *testing.T) {
 	f := newServingFixture(t)
 	endpoint := f.start(t)

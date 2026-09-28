@@ -18,6 +18,9 @@ pub struct SegmentClock {
     recent: RefCell<HashSet<SegmentId>>,
 }
 impl SegmentClock {
+    pub fn reserve(&self) -> usize {
+        self.free_reserve
+    }
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, free_reserve: usize) -> Self {
         Self {
             index,

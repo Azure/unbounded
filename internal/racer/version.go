@@ -217,5 +217,5 @@ func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPubli
 		return nil, err
 	}
 
-	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.encoded, leadership: ctx}, nil
+	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.encoded, delta: p.delta, deltaBase: p.deltaBase, leadership: ctx}, nil
 }

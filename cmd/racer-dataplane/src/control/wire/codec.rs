@@ -542,6 +542,7 @@ pub fn decode_enrollment_request(r: impl Read) -> Result<EnrollmentRequest> {
     let d: EnrollmentRequestDto = serde_json::from_value(bounded_json(r, MAX_ENROLLMENT_BYTES)?)
         .map_err(|_| ProtocolFailure::InvalidRequest)?;
     let v = EnrollmentRequest {
+        shares: 4,
         schema_version: d.schema_version,
         cluster: ClusterId(d.cluster),
         enrollment: EnrollmentId(d.enrollment),

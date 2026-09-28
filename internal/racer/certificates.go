@@ -23,9 +23,10 @@ import (
 
 // NodeIdentity is verified output, never populated from an untrusted request.
 type NodeIdentity struct {
-	cluster wire.ClusterID
-	node    wire.NodeID
-	expires time.Time
+	nodeName string
+	cluster  wire.ClusterID
+	node     wire.NodeID
+	expires  time.Time
 }
 
 func (i NodeIdentity) Node() wire.NodeID       { return i.node }

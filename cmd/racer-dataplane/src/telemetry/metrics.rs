@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 pub const EVENT_COUNT: usize = 19;
-pub const GAUGE_COUNT: usize = 7;
+pub const GAUGE_COUNT: usize = 11;
 #[derive(Clone, Default)]
 pub struct Metrics(Arc<Counters>);
 #[derive(Default)]
@@ -93,6 +93,10 @@ pub enum Gauge {
     IdentityExpiresAtSeconds,
     PendingDiskWrites,
     ActiveDeliveries,
+    EffectivePayloadBytes,
+    SegmentTailBytes,
+    DiskPageEntries,
+    CheckpointSequence,
 }
 pub const GAUGES: [Gauge; GAUGE_COUNT] = [
     Gauge::DiagnosticConnections,
@@ -102,6 +106,10 @@ pub const GAUGES: [Gauge; GAUGE_COUNT] = [
     Gauge::IdentityExpiresAtSeconds,
     Gauge::PendingDiskWrites,
     Gauge::ActiveDeliveries,
+    Gauge::EffectivePayloadBytes,
+    Gauge::SegmentTailBytes,
+    Gauge::DiskPageEntries,
+    Gauge::CheckpointSequence,
 ];
 impl Gauge {
     pub fn name(self) -> &'static str {
@@ -113,6 +121,10 @@ impl Gauge {
             Self::IdentityExpiresAtSeconds => "racer_identity_expires_at_seconds",
             Self::PendingDiskWrites => "racer_pending_disk_writes",
             Self::ActiveDeliveries => "racer_active_deliveries",
+            Self::EffectivePayloadBytes => "racer_effective_payload_bytes",
+            Self::SegmentTailBytes => "racer_segment_tail_bytes",
+            Self::DiskPageEntries => "racer_disk_page_index_capacity",
+            Self::CheckpointSequence => "racer_checkpoint_sequence",
         }
     }
 }
@@ -177,6 +189,9 @@ impl Metrics {
     }
     pub(crate) fn set_gauge(&self, gauge: Gauge, value: u64) {
         self.0.gauges[gauge as usize].store(value, Ordering::Relaxed);
+    }
+    pub(crate) fn add_gauge(&self, gauge: Gauge, value: u64) {
+        self.0.gauges[gauge as usize].fetch_add(value, Ordering::Relaxed);
     }
     pub fn lease(&self, gauge: Gauge) -> Result<GaugeLease> {
         self.0.gauges[gauge as usize]

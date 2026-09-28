@@ -22,6 +22,14 @@ pub struct PreparedPublication {
     content_hash: [u8; 32],
     membership_hash: [u8; 32],
 }
+impl PreparedPublication {
+    pub fn content_hash(&self) -> String {
+        self.content_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
 /// One node-wide publication cell. Its implementation publishes immutable leases
 /// atomically; worker handles never become independent authorities for membership.
 pub struct PublishedState {
@@ -32,6 +40,7 @@ struct State {
     memberships: Vec<(MembershipVersion, Weak<Membership>)>,
     content_hash: [u8; 32],
     membership_hash: [u8; 32],
+    grace: Vec<(std::time::Instant, MembershipLease)>,
 }
 #[allow(non_upper_case_globals)]
 pub const PublishedState: PublishedState = PublishedState {
@@ -40,6 +49,7 @@ pub const PublishedState: PublishedState = PublishedState {
         memberships: Vec::new(),
         content_hash: [0; 32],
         membership_hash: [0; 32],
+        grace: Vec::new(),
     }),
 };
 impl Default for PublishedState {
@@ -52,9 +62,10 @@ impl PublishedState {
     /// Weak entries never prolong a generation's lifetime and publication prunes
     /// dead entries before admission, bounding the registry as well as live state.
     pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
-        self.state
-            .lock()
-            .map_err(|_| Error::Unavailable)?
+        let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
+        let now = crate::runtime::environment::now();
+        state.grace.retain(|(until, _)| *until > now);
+        state
             .memberships
             .iter()
             .find(|(v, _)| *v == version)
@@ -75,6 +86,7 @@ impl PublishedState {
                 })),
                 content_hash: [0; 32],
                 membership_hash: [0; 32],
+                grace: Vec::new(),
             }),
         })
     }
@@ -115,6 +127,25 @@ impl SnapshotStore {
     }
     pub fn current(&self) -> Result<SnapshotLease> {
         self.published.current()
+    }
+    pub fn content_hash(&self, sequence: PublicationSequence) -> Result<String> {
+        let state = self
+            .published
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable)?;
+        if state
+            .current
+            .as_ref()
+            .is_none_or(|s| s.sequence != sequence)
+        {
+            return Err(Error::Replay);
+        }
+        Ok(state
+            .content_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
     /// Reject cluster mismatch, rollback, conflicting replay, or invalid members.
     /// Skipped sequences are legal; disconnected nodes retain the last good state.
@@ -219,6 +250,21 @@ impl SnapshotStore {
         {
             return Ok(old.clone());
         }
+        let now = crate::runtime::environment::now();
+        state.grace.retain(|(until, _)| *until > now);
+        // Grace-only owners are disposable under the configured generation bound.
+        // Externally pinned operations still block replacement rather than revoke.
+        while state.memberships.len() > self.retained_limit && !state.grace.is_empty() {
+            let Some(index) = state
+                .grace
+                .iter()
+                .position(|(_, m)| Arc::strong_count(m) == 1)
+            else {
+                break;
+            };
+            state.grace.remove(index);
+            state.memberships.retain(|(_, m)| m.strong_count() != 0);
+        }
         state.memberships.retain(|(_, m)| m.strong_count() != 0);
         let same_membership = state
             .current
@@ -239,18 +285,34 @@ impl SnapshotStore {
             }
             publication.membership.clone()
         };
-        let next = if Arc::ptr_eq(&membership, &publication.membership) {
-            publication.clone()
-        } else {
-            Arc::new(Snapshot {
-                cluster: publication.cluster.clone(),
-                sequence: publication.sequence,
-                membership,
-                caches: publication.caches.clone(),
-            })
-        };
+        // Preparation shares the current membership for cache-only updates. A
+        // concurrently replaced base must be prepared again, never cloned here.
+        if !Arc::ptr_eq(&membership, &publication.membership) {
+            return Err(Error::Replay);
+        }
+        let next = publication.clone();
         if let Some(transition) = transition {
             transition.commit();
+        }
+        if self.retained_limit >= 2 {
+            if let Some(old) = &state.current {
+                if old.membership.version != next.membership.version {
+                    let old = old.membership.clone();
+                    state
+                        .grace
+                        .push((now + std::time::Duration::from_secs(30), old));
+                    while state.grace.len() > self.retained_limit
+                        || state
+                            .grace
+                            .iter()
+                            .map(|(_, m)| m.retained_bytes())
+                            .sum::<usize>()
+                            > 128 * 1024 * 1024
+                    {
+                        state.grace.remove(0);
+                    }
+                }
+            }
         }
         state.current = Some(next.clone());
         state.memberships.retain(|(_, m)| m.strong_count() != 0);
@@ -271,6 +333,27 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_two_old_generations_resolve_without_local_request_pins() {
+        let published = Arc::new(PublishedState::default());
+        let store = SnapshotStore::new(publication(1).cluster, published.clone(), 2);
+        for version in 1..20 {
+            let mut next = publication(version);
+            next.membership_version.0 = version;
+            store.publish(next).unwrap();
+            for old in version.saturating_sub(2).max(1)..=version {
+                assert_eq!(
+                    published
+                        .membership(MembershipVersion(old))
+                        .unwrap()
+                        .version
+                        .0,
+                    old
+                );
+            }
+            assert!(published.state.lock().unwrap().memberships.len() <= 3);
+        }
+    }
     #[test]
     fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
         let published = Arc::new(PublishedState::default());

@@ -71,6 +71,7 @@ type Publication struct {
 // BootstrapRequest contains no bearer token. The transport reads the projected
 // token for each issuance attempt and supplies it in Authorization.
 type BootstrapRequest struct {
+	Shares        uint32       `json:"shares,omitempty"`
 	SchemaVersion uint32       `json:"schema_version"`
 	Cluster       ClusterID    `json:"cluster"`
 	Enrollment    EnrollmentID `json:"enrollment"`

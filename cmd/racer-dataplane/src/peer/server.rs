@@ -281,12 +281,21 @@ impl PeerServer {
                 .network
                 .as_ref()
                 .ok_or(Error::InvalidConfiguration)?
-                .membership(request.request().route.membership)?;
-            let response = self
-                .dispatch_verified(request, membership.clone(), &request_scope)
-                .await?;
+                .membership(request.request().route.membership);
+            let response = match &membership {
+                Ok(membership) => {
+                    self.dispatch_verified(request, membership.clone(), &request_scope)
+                        .await?
+                }
+                Err(Error::IncompatibleMembership) => self
+                    .forwarding
+                    .sign_response(request.binding(), PeerResponse::StaleMembership)?,
+                Err(error) => return Err(*error),
+            };
             let mut connection = received.connection;
-            if let (Some(admitted), Some(transfers)) = (admitted, &self.transfers) {
+            if let (Some(admitted), Some(transfers), Ok(membership)) =
+                (admitted, &self.transfers, &membership)
+            {
                 let (returned, sent) = transfers
                     .send_native(connection, &response, admitted, &membership, &request_scope)
                     .await?;
@@ -345,7 +354,16 @@ impl PeerServer {
                 .network
                 .as_ref()
                 .ok_or(Error::InvalidConfiguration)?
-                .membership(request.request().route.membership)?;
+                .membership(request.request().route.membership);
+            let membership = match membership {
+                Ok(membership) => membership,
+                Err(Error::IncompatibleMembership) => {
+                    return self
+                        .forwarding
+                        .sign_response(request.binding(), PeerResponse::StaleMembership);
+                }
+                Err(error) => return Err(error),
+            };
             self.dispatch_verified(request, membership, scope).await
         })
     }

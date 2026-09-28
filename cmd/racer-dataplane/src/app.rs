@@ -11,6 +11,7 @@
 //! Cache removal closes new admission; accepted resource owners drain independently.
 //! Startup failures roll back created resources. Constructors perform no operational I/O.
 
+use crate::telemetry::metrics::Gauge;
 use crate::{
     client::{listener::ClientListeners, request::RequestParser, response::Responses},
     config::Config,
@@ -124,6 +125,7 @@ pub struct NodeState {
     count: usize,
     prepared: AtomicUsize,
     checkpoint: Mutex<CheckpointCut>,
+    periodic_checkpoint: Mutex<CheckpointCut>,
     recovery: Mutex<recovery::RecoveryCut>,
     observations: health::Observations,
     native: native::NativePairs,
@@ -134,6 +136,9 @@ struct CheckpointCut {
     shards: Vec<ShardImage>,
     result: Option<Result<()>>,
     publishing: bool,
+    periodic_generation: u64,
+    periodic_started: Option<std::time::Instant>,
+    periodic_finished: usize,
 }
 impl Default for NodeState {
     fn default() -> Self {
@@ -154,6 +159,7 @@ impl NodeState {
             count,
             prepared: AtomicUsize::new(0),
             checkpoint: Mutex::new(CheckpointCut::default()),
+            periodic_checkpoint: Mutex::new(CheckpointCut::default()),
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: health::Observations::default(),
             native: native::NativePairs::default(),
@@ -290,6 +296,7 @@ fn bootstrap(
         config.service_account_token.clone(),
         config.identity_directory.clone(),
     ));
+    enrollment.set_shares(config.shares);
     let control = ControlClient::new(
         ControlEndpoint {
             url: config.control_endpoint.clone(),
@@ -446,6 +453,12 @@ pub struct WorkerApplication {
     control_task: Option<Operation<'static, ()>>,
     peer_task: Option<Operation<'static, ()>>,
     writer_task: Option<Operation<'static, ()>>,
+    checkpoint_task: Option<Operation<'static, ()>>,
+    checkpoint_snapshot: Option<Operation<'static, ShardImage>>,
+    checkpoint_generation: u64,
+    checkpoint_completed: u64,
+    checkpoint_budget: usize,
+    placement: Rc<Placement>,
     diagnostic_task: Option<Operation<'static, ()>>,
     diagnostic_scope: Option<RequestScope>,
     diagnostics_address: std::net::SocketAddr,
@@ -508,6 +521,7 @@ impl WorkerApplication {
                 config.service_account_token.clone(),
                 config.identity_directory.clone(),
             ));
+            enrollment.set_shares(config.shares);
             let secrets = SecretWatcher::new(config.secret_directory.clone(), keys.clone());
             let control = Rc::new(ControlClient::new(
                 ControlEndpoint {
@@ -591,16 +605,16 @@ impl WorkerApplication {
             admission.clone(),
             eviction.clone(),
             limits.queue_entries.get(),
-            limits.metadata_entries.get(),
+            (config.disk_page_entries.get() / node.count).max(1),
         )?;
         let store = Store {
             reader: disk.clone(),
             writer: writer.clone(),
-            checkpoint: Checkpointer::new(
+            checkpoint: Rc::new(Checkpointer::new(
                 config.slab_directory.clone(),
                 index.clone(),
                 segments.clone(),
-            ),
+            )),
             recovery: Recovery::new(config.slab_directory.clone(), index.clone(), segments),
             eviction,
         };
@@ -657,9 +671,10 @@ impl WorkerApplication {
         );
         let candidates = Rc::new(CandidatePolicy::new(
             config.node.clone(),
-            placement,
+            placement.clone(),
             requester.clone(),
         ));
+        candidates.set_publications(node.publications.clone());
         let origin: Rc<dyn Origin> = Rc::new(
             OriginClient::new(
                 snapshots.clone(),
@@ -803,6 +818,12 @@ impl WorkerApplication {
             control_task: None,
             peer_task: None,
             writer_task: None,
+            checkpoint_task: None,
+            checkpoint_snapshot: None,
+            checkpoint_generation: 0,
+            checkpoint_completed: 0,
+            checkpoint_budget: config.checkpoint_bytes.get(),
+            placement,
             diagnostic_task: None,
             diagnostic_scope: None,
             diagnostics_address: config.diagnostics_listen,
@@ -845,6 +866,20 @@ impl WorkerApplication {
             )?;
             self.store.recovery.configure_geometry(geometry)?;
             self.store.checkpoint.configure_geometry(geometry)?;
+            let (payload, tail) = geometry.payload_capacity(
+                self.store.eviction.reserve(),
+                self.store.writer.index().page_capacity(),
+            )?;
+            self.telemetry
+                .metrics
+                .add_gauge(Gauge::EffectivePayloadBytes, payload);
+            self.telemetry
+                .metrics
+                .add_gauge(Gauge::SegmentTailBytes, tail);
+            self.telemetry.metrics.add_gauge(
+                Gauge::DiskPageEntries,
+                self.store.writer.index().page_capacity() as u64,
+            );
             self.endpoint = Some(
                 self.directory
                     .install(self.worker, self.coordinator.clone())?,
@@ -1052,6 +1087,128 @@ impl WorkerApplication {
         result
     }
 
+    fn poll_checkpoint(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        let Some(node) = &self.node else {
+            return Ok(());
+        };
+        if !self.started {
+            return Ok(());
+        }
+        let now = crate::runtime::environment::now();
+        if let Some(task) = self.checkpoint_task.as_mut() {
+            if let Poll::Ready(result) = task.as_mut().poll(cx) {
+                self.checkpoint_task = None;
+                node.periodic_checkpoint
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?
+                    .result = Some(result);
+            }
+        }
+        let mut cut = node
+            .periodic_checkpoint
+            .lock()
+            .map_err(|_| Error::Unavailable)?;
+        if cut.periodic_started.is_none() {
+            cut.periodic_started = Some(now);
+        }
+        if cut.periodic_generation == 0 || cut.periodic_finished == node.count {
+            if self.stopping {
+                return Ok(());
+            }
+            if now.saturating_duration_since(cut.periodic_started.unwrap()) < Duration::from_secs(5)
+            {
+                return Ok(());
+            }
+            cut.periodic_generation += 1;
+            cut.periodic_started = Some(now);
+            cut.periodic_finished = 0;
+            cut.shards.clear();
+            cut.result = None;
+            cut.publishing = false;
+        }
+        let generation = cut.periodic_generation;
+        if self.stopping && !cut.publishing {
+            cut.result = Some(Err(Error::Cancelled));
+        }
+        if cut.result.is_some() {
+            self.checkpoint_snapshot.take();
+            if self.checkpoint_completed != generation {
+                self.store.checkpoint.finish_snapshot();
+                self.checkpoint_generation = 0;
+                self.checkpoint_completed = generation;
+                cut.periodic_finished += 1;
+            }
+            return Ok(());
+        }
+        if self.checkpoint_generation != generation {
+            // Stop starting batches while existing SQEs drain, then freeze only
+            // this shard. No queue-idle requirement can starve a busy checkpoint.
+            if self.writer_task.is_some() {
+                return Ok(());
+            }
+            self.checkpoint_generation = generation;
+            self.checkpoint_snapshot = Some(
+                self.store
+                    .checkpoint
+                    .snapshot_incremental(self.checkpoint_budget / (4 * node.count)),
+            );
+        }
+        if let Some(snapshot) = self.checkpoint_snapshot.as_mut() {
+            drop(cut);
+            if let Poll::Ready(result) = snapshot.as_mut().poll(cx) {
+                self.checkpoint_snapshot = None;
+                let mut cut = node
+                    .periodic_checkpoint
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?;
+                match result {
+                    Ok(shard) => {
+                        cut.shards.push(shard);
+                    }
+                    Err(error) => {
+                        cut.result = Some(Err(error));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if self.worker == node.control_worker && cut.shards.len() == node.count && !cut.publishing {
+            cut.publishing = true;
+            let shards = std::mem::take(&mut cut.shards);
+            drop(cut);
+            // Wall-clock sequence dominates prior ordinary process checkpoints.
+            let sequence = crate::runtime::environment::wall_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Error::Unavailable)?
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            match self.store.checkpoint.publish_async(
+                shards,
+                self.runtime.reactor.clone(),
+                scope(self.timeout)?,
+                sequence,
+                generation as usize % 2,
+                self.checkpoint_budget,
+            ) {
+                Ok(task) => {
+                    let metrics = self.telemetry.metrics.clone();
+                    self.checkpoint_task = Some(Box::pin(async move {
+                        task.await?;
+                        metrics.set_gauge(Gauge::CheckpointSequence, sequence);
+                        Ok(())
+                    }));
+                }
+                Err(error) => {
+                    node.periodic_checkpoint
+                        .lock()
+                        .map_err(|_| Error::Unavailable)?
+                        .result = Some(Err(error))
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
@@ -1059,6 +1216,15 @@ impl WorkerApplication {
             return Ok(());
         }
         let budget = work_budget.min(64);
+        if !self.stopping
+            && let Ok(snapshot) = self.snapshots.current()
+        {
+            match self.placement.maintain(&snapshot.membership) {
+                Ok(()) | Err(Error::Overloaded) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        self.poll_checkpoint(cx)?;
         if let Some(node) = &self.node {
             for _ in 0..budget {
                 let Some(accepted) = node.ingress.pop(self.worker, cx.waker())? else {
@@ -1149,7 +1315,15 @@ impl WorkerApplication {
         {
             result?;
         }
-        if self.writer_task.is_none() && self.store.writer.pending_count() != 0 {
+        let checkpoint_waiting = self.node.as_ref().is_some_and(|node| {
+            node.periodic_checkpoint
+                .lock()
+                .is_ok_and(|cut| cut.periodic_generation != 0 && cut.result.is_none())
+        });
+        if !checkpoint_waiting
+            && self.writer_task.is_none()
+            && self.store.writer.pending_count() != 0
+        {
             let writer = self.store.writer.clone();
             let write_scope = scope(self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
@@ -1341,6 +1515,9 @@ impl WorkerService for WorkerApplication {
                     && self.peer_task.is_none()
                     && self.ingress_peers.is_empty()
                     && self.writer_task.is_none()
+                    && self.checkpoint_task.is_none()
+                    && self.checkpoint_snapshot.is_none()
+                    && self.checkpoint_generation == 0
                     && self.store.writer.is_idle()
                 {
                     Poll::Ready(())

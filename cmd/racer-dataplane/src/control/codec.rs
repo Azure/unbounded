@@ -177,13 +177,24 @@ fn certificates(v: &[String]) -> Result<Vec<Vec<u8>>> {
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
+    #[serde(default = "default_shares", skip_serializing_if = "is_default_shares")]
+    shares: u32,
     schema_version: u32,
     cluster: String,
     enrollment: String,
     csr_der: String,
 }
+fn default_shares() -> u32 {
+    4
+}
+fn is_default_shares(shares: &u32) -> bool {
+    *shares == 4
+}
 pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
     let r: Request = decode(b, MAX_ENROLLMENT_BYTES)?;
+    if r.shares == 0 {
+        return Err(Error::InvalidRequest);
+    }
     header(r.schema_version, &r.cluster)?;
     uuid(&r.enrollment)?;
     let csr = bytes(&r.csr_der)?;
@@ -194,6 +205,7 @@ pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
         return Err(Error::InvalidRequest);
     }
     Ok(EnrollmentRequest {
+        shares: r.shares,
         schema_version: r.schema_version,
         cluster: ClusterId(r.cluster),
         enrollment: EnrollmentId(r.enrollment),
@@ -203,6 +215,7 @@ pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
 pub fn encode_enrollment_request(r: &EnrollmentRequest) -> Result<Vec<u8>> {
     let b = encode(
         &Request {
+            shares: r.shares,
             schema_version: r.schema_version,
             cluster: r.cluster.0.clone(),
             enrollment: r.enrollment.0.clone(),
@@ -461,6 +474,105 @@ pub fn canonical_content(p: &Publication) -> Result<(Vec<u8>, Vec<u8>)> {
             MAX_PUBLICATION_BYTES,
         )?,
     ))
+}
+
+#[derive(Deserialize)]
+struct DeltaDto {
+    delta_version: u32,
+    cluster: String,
+    base_sequence: String,
+    base_hash: String,
+    sequence: String,
+    membership_version: String,
+    content_hash: String,
+    upsert_members: Vec<MemberDto>,
+    remove_members: Vec<String>,
+    caches: Vec<Cache>,
+}
+
+pub fn content_hash(p: &Publication) -> Result<String> {
+    use sha2::Digest;
+    let (content, _) = canonical_content(p)?;
+    Ok(format!("{:x}", sha2::Sha256::digest(content)))
+}
+
+/// Apply only against the exact authenticated base. Caller requests a full image
+/// on any delta failure; no partially applied state is ever published.
+pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
+    let d: DeltaDto = decode(bytes, 4 * 1024 * 1024)?;
+    if d.delta_version != 1
+        || d.cluster != base.cluster.0
+        || counter(&d.base_sequence)? != base.sequence.0
+        || d.base_hash != content_hash(base)?
+        || counter(&d.sequence)? <= base.sequence.0
+        || counter(&d.membership_version)? < base.membership_version.0
+    {
+        return Err(Error::Replay);
+    }
+    let mut original = dto(base)?;
+    let mut members: BTreeMap<_, _> = original
+        .members
+        .into_iter()
+        .map(|m| (m.node.clone(), m))
+        .collect();
+    let mut seen = HashSet::default();
+    for id in d.remove_members {
+        if !seen.insert(id.clone()) || members.remove(&id).is_none() {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    for member in d.upsert_members {
+        if !seen.insert(member.node.clone()) {
+            return Err(Error::InvalidRequest);
+        }
+        members.insert(member.node.clone(), member);
+    }
+    if members.len() > MAX_MEMBERS {
+        return Err(Error::Overloaded);
+    }
+    original.members = members.into_values().collect();
+    original.caches = d.caches;
+    original.sequence = d.sequence;
+    original.membership_version = d.membership_version;
+    let next = decode_publication(&encode(&original, MAX_PUBLICATION_BYTES)?)?;
+    if content_hash(&next)? != d.content_hash {
+        return Err(Error::Replay);
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+    #[test]
+    fn delta_add_remove_update_hash_and_replay() {
+        let mut base = decode_publication(include_bytes!("testdata/publication.json")).unwrap();
+        base.sequence.0 = 1;
+        base.membership_version.0 = 1;
+        let mut next = base.clone();
+        next.sequence.0 += 1;
+        next.membership_version.0 += 1;
+        next.members[0].shares = NonZeroU32::new(9).unwrap();
+        let removed = next.members.pop().unwrap().node.0;
+        let mut added = next.members[0].clone();
+        added.node = NodeId("77777777-7777-4777-8777-777777777777".into());
+        next.members.push(added);
+        let dto = dto(&next).unwrap();
+        let mut delta = serde_json::json!({
+            "delta_version":1,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+            "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
+            "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
+            "upsert_members":dto.members,"remove_members":[removed],"caches":dto.caches
+        });
+        let bytes = serde_json::to_vec(&delta).unwrap();
+        assert_eq!(
+            content_hash(&apply_delta(&base, &bytes).unwrap()).unwrap(),
+            content_hash(&next).unwrap()
+        );
+        assert!(apply_delta(&next, &bytes).is_err());
+        delta["content_hash"] = "00".repeat(32).into();
+        assert!(apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).is_err());
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Bundle {

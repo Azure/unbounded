@@ -197,4 +197,42 @@ All tests below used the mandatory external timeout prefix, from the crate:
 - `cargo test --locked --all-features --lib concurrent_writes_reserve -j 2 -- --test-threads=1 --quiet`:
   one passed with two actual pending disk operations.
 - `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
-  758 passed, zero failed, seven ignores (59.98 s). No timeout fired.
+   758 passed, zero failed, seven ignores (59.98 s). No timeout fired.
+
+### Integrated control and periodic recovery increment
+
+Implemented optional authenticated delta v1 with an exact base hash, target hash,
+one shared previous-generation delta (4 MiB maximum), and full-image fallback.
+TLS connections recycle only after complete framing within the identity/trust
+epoch. Default old-membership retention now includes bounded 30-second grace;
+an authenticated stale response allows one fresh-epoch retry with original credits.
+Enrollment publishes RACER_SHARES proposals, with explicit Node annotations taking
+precedence. UID-bound last-admitted annotations preserve endpoint gaps on restart.
+
+Disk page-index and checkpoint budgets are independent. Periodic five-second
+checkpoint generations pause new disk batches, drain accepted writes, freeze
+segment reuse, incrementally snapshot/encode, then use completion-owned filesystem
+operations for write/rename. Payload reads continue. This is disposable recovery
+metadata without fsync, not a power-loss durability contract. Geometry metrics
+report conservative full-page payload capacity and tail waste.
+
+Direct parent review and verification (all tests externally bounded):
+
+- `cargo check --locked --all-features --all-targets -j 2`: passed.
+- `go test -timeout=5m ./internal/racer/...`: both packages passed.
+- `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
+  763 passed, seven explicit ignores. The new staggered test first exposed a
+  fixture assumption that future memberships could resolve before propagation;
+  it now checks old-version grace, then completes propagation before arbitrary
+  bidirectional traffic. No success assertion was removed.
+- Privileged `cargo test --locked --all-features --test process_restart
+  periodic_checkpoint_sigkill -j 2 -- --ignored --test-threads=1 --nocapture`:
+  passed, recovering checkpointed bytes with origin disabled after actual SIGKILL.
+- Scoped `make fmt`: the installed Go-1.26-built linter panicked on Go 1.27.
+  Re-running the same target with the repository-pinned v2.13.1 through `go run`
+  passed with zero issues; no global tool configuration was changed.
+
+Remaining integrated review includes control delta interoperability/transport
+failure gates, checkpoint CPU/memory bounds at large configured limits, all strict
+process tests, and the final documentation/compatibility pass. These are not
+claimed as covered by the focused SIGKILL or small simulated-cluster tests.

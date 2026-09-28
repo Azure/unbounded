@@ -50,7 +50,7 @@ impl WorkerApplication {
                         candidates.into_iter().map(|(_, image)| image).collect(),
                         &cut.geometry,
                         &node.workers,
-                        self.runtime.admission.limits().metadata_entries.get(),
+                        self.store.writer.index().page_capacity(),
                         &self.keys,
                         &self.snapshots.current()?.caches,
                     );

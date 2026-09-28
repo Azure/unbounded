@@ -32,6 +32,9 @@ const MAX_ENTRIES: usize = 1_048_576;
 const MAX_FABRIC_FILE_BYTES: usize = 65_536;
 
 pub struct Config {
+    pub shares: std::num::NonZeroU32,
+    pub disk_page_entries: NonZeroUsize,
+    pub checkpoint_bytes: NonZeroUsize,
     pub cluster: ClusterId,
     /// Resolved by verified bootstrap/local identity recovery before workers start,
     /// not from a caller-provided UID or the Downward API's node name.
@@ -115,7 +118,6 @@ impl Config {
         for name in [
             "RACER_NODE_UID",
             "RACER_NODE_ID",
-            "RACER_SHARES",
             "RACER_RAILS",
             "RACER_ALIGNED_RAILS",
         ] {
@@ -161,6 +163,10 @@ impl Config {
             value.parse().map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
+        let shares = std::num::NonZeroU32::new(
+            u32::try_from(number("RACER_SHARES", 4)?).map_err(|_| Error::InvalidConfiguration)?,
+        )
+        .ok_or(Error::InvalidConfiguration)?;
         let slab_bytes = number("RACER_SLAB_BYTES", 1024 * MIB)?;
         let segment_bytes = number("RACER_SEGMENT_BYTES", 64 * MIB)?;
         let free_segment_reserve = to_usize(number("RACER_FREE_SEGMENT_RESERVE", 2)?)?;
@@ -199,7 +205,12 @@ impl Config {
             relay_transfers: limit("RACER_RELAY_TRANSFERS", 16)?,
         };
         let origin_connections_per_cache = limit("RACER_ORIGIN_CONNECTIONS_PER_CACHE", 8)?;
+        let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
+        let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
         let config = Self {
+            shares,
+            disk_page_entries,
+            checkpoint_bytes,
             cluster,
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads,
@@ -228,6 +239,11 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked by store::slab at open, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        if self.disk_page_entries.get() > MAX_ENTRIES
+            || self.checkpoint_bytes.get() > 512 * MIB as usize
+        {
+            return Err(Error::InvalidConfiguration);
+        }
         if !valid_uuid(&self.cluster.0)
             || (self.node.0 != UNRESOLVED_NODE_ID && !valid_uuid(&self.node.0))
             || !(2..=256).contains(&self.max_threads)
@@ -1283,6 +1299,18 @@ mod tests {
 
     #[test]
     fn numeric_and_boolean_parsing_is_strict() {
+        assert_eq!(parse(&[]).unwrap().shares.get(), 4);
+        assert_eq!(parse(&[("RACER_SHARES", "9")]).unwrap().shares.get(), 9);
+        for value in ["0", "-1", "+4", "4294967296", "4.0"] {
+            assert!(parse(&[("RACER_SHARES", value)]).is_err());
+        }
+        let config = parse(&[
+            ("RACER_METADATA_ENTRIES", "32"),
+            ("RACER_DISK_PAGE_ENTRIES", "8192"),
+        ])
+        .unwrap();
+        assert_eq!(config.disk_page_entries.get(), 8192);
+        assert_eq!(config.limits.metadata_entries.get(), 32);
         for value in [
             "",
             " 8",

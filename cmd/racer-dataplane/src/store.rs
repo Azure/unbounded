@@ -15,7 +15,7 @@ use std::rc::Rc;
 pub struct Store {
     pub reader: Rc<reader::StoreReader>,
     pub writer: Rc<writer::StoreWriter>,
-    pub checkpoint: checkpoint::Checkpointer,
+    pub checkpoint: std::rc::Rc<checkpoint::Checkpointer>,
     pub recovery: recovery::Recovery,
     pub eviction: Rc<eviction::SegmentClock>,
 }
