@@ -177,6 +177,7 @@ pub(crate) mod tests {
         bundle_for(
             admission,
             VersionMetadata {
+                content_type: None,
                 version: ObjectVersion {
                     object: ObjectId {
                         cache: CacheId("cache".into()),

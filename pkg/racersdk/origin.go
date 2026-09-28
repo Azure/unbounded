@@ -33,8 +33,11 @@ type OriginConfig struct {
 	Cache CacheName
 	// MaxConnections includes idle accepted connections (default 128).
 	MaxConnections int
-	// MaxConcurrentRequests bounds callbacks and bodies, with empty 503 on overload (default 64).
+	// MaxConcurrentRequests bounds GET callbacks and bodies, with empty 503 on overload (default 64).
 	MaxConcurrentRequests int
+	// MaxConcurrentHeadRequests reserves HEAD callback lifetimes (default 4).
+	// Canceled callbacks that ignore context retain their slot until returning.
+	MaxConcurrentHeadRequests int
 	// ReadHeaderTimeout bounds each raw head (default 5 seconds).
 	ReadHeaderTimeout time.Duration
 	// RequestTimeout bounds callback, body, EOF probe, and final success write
@@ -58,7 +61,7 @@ func (c OriginConfig) defaults() (OriginConfig, error) {
 		return c, err
 	}
 
-	if c.MaxConnections < 0 || c.MaxConcurrentRequests < 0 || c.ReadHeaderTimeout < 0 || c.RequestTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 || c.SocketMode & ^os.FileMode(0o777) != 0 {
+	if c.MaxConnections < 0 || c.MaxConcurrentRequests < 0 || c.MaxConcurrentHeadRequests < 0 || c.ReadHeaderTimeout < 0 || c.RequestTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 || c.SocketMode & ^os.FileMode(0o777) != 0 {
 		return c, failure(ErrorInvalidArgument, "origin config", nil)
 	}
 
@@ -68,6 +71,10 @@ func (c OriginConfig) defaults() (OriginConfig, error) {
 
 	if c.MaxConcurrentRequests == 0 {
 		c.MaxConcurrentRequests = 64
+	}
+
+	if c.MaxConcurrentHeadRequests == 0 {
+		c.MaxConcurrentHeadRequests = 4
 	}
 
 	if c.ReadHeaderTimeout == 0 {
@@ -145,7 +152,8 @@ func serveOrigin(ctx context.Context, config OriginConfig, origin Origin, path s
 		},
 	}
 	slots := make(chan struct{}, config.MaxConcurrentRequests)
-	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, origin, slots) })
+	headSlots := make(chan struct{}, config.MaxConcurrentHeadRequests)
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, origin, slots, headSlots) })
 
 	stop := context.AfterFunc(lifetime, func() { closeBody(server) })
 	defer stop()
@@ -178,7 +186,7 @@ func callOrigin(ctx context.Context, origin Origin, request OriginRequest) (resu
 	return result
 }
 
-func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig, origin Origin, slots chan struct{}) {
+func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig, origin Origin, slots, headSlots chan struct{}) {
 	writeOriginError := func(w http.ResponseWriter, status int, metadata Metadata) {
 		// Once a request expires, only the empty error response gets a fresh,
 		// bounded write opportunity. Success writes never extend its deadline.
@@ -241,6 +249,10 @@ func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig,
 	deadline, _ := ctx.Deadline()
 	if err := controller.SetWriteDeadline(minTime(deadline, time.Now().Add(config.WriteTimeout))); err != nil {
 		panic(http.ErrAbortHandler)
+	}
+
+	if head.request.operation == OperationHead {
+		slots = headSlots
 	}
 
 	select {

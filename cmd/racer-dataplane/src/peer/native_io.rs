@@ -164,6 +164,7 @@ mod tests {
             .unwrap();
         let response = PeerResponse::Page {
             metadata: ObjectMetadata {
+                content_type: None,
                 version,
                 length: 19,
                 expires_at: ExpiresAt(std::time::UNIX_EPOCH),
@@ -522,6 +523,7 @@ mod tests {
             .unwrap();
         let response = PeerResponse::Page {
             metadata: ObjectMetadata {
+                content_type: None,
                 version,
                 length: 128,
                 expires_at: ExpiresAt(std::time::UNIX_EPOCH),

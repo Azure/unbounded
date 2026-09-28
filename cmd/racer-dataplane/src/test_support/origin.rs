@@ -212,6 +212,7 @@ mod tests {
     fn metadata(etag: &str) -> MetadataReply {
         MetadataReply {
             metadata: ObjectMetadata {
+                content_type: None,
                 version: ObjectVersion {
                     object: object(),
                     etag: StrongEtag::test_value(etag),

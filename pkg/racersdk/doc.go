@@ -16,16 +16,28 @@
 // Avoid io.ReadAll for large objects: it introduces caller-side object buffering.
 //
 // Get opens a fresh full-object stream with a page-zero bootstrap. After consuming
-// the first 16 MiB, reading lazily opens pinned continuations of at most 16 MiB
-// each, shortening the last range at EOF. Every request uses the original ETag,
+// the first 16 MiB, reading lazily opens one pinned remainder through EOF.
+// Racer's multipage window schedules the remainder. Every request uses the original ETag,
 // total size, and fetch context. Racer schedules the underlying origin fetches.
-// There is no HEAD preflight, client page cache, or object-sized SDK buffer.
-// Value.Metadata is the initial total size, strong ETag, and expiry snapshot;
+// Normal Get and empty ReadOptions have no HEAD preflight. Nonzero range/pin
+// options use HEAD followed by
+// the exact pinned range, without fetching a bootstrap body. Length zero means
+// through EOF; Pin optionally selects an existing version. Out-of-bounds ranges
+// are rejected. Stat uses HEAD to obtain metadata without fetching any body.
+// Pass a trusted Stat result as ReadOptions.Metadata to resume without repeating
+// HEAD. The snapshot is validated and copied, and a supplied Pin must match its
+// ETag. Invalid snapshots fail before I/O; they never fall back to a fresh read.
+// ReadOptions.SmallObject reserves separate admission for manifests and other
+// objects whose total size is at most PageSize. It adds no HEAD by itself. An
+// oversized object fails with ErrorInvalidArgument before any Value is returned,
+// even if its selected byte range is small. It never opens a multipage remainder.
+// There is no client page cache or object-sized SDK buffer.
+// Value.Metadata is the initial total size, strong ETag, expiry and content type snapshot;
 // it is not a remaining length and does not change if continuation expiry changes.
 // Empty objects have valid metadata and read as EOF.
 //
 // Client.Get and Client.Close are safe concurrently. A Value permits one consuming
-// goroutine using Read, directly or through io.Copy; Metadata and
+// goroutine using Read or WriteTo, directly or through io.Copy; Metadata and
 // Close may run concurrently with consumption. Do not copy Clients or Values.
 // Close is idempotent, cancels SDK I/O, and closes bodies without draining unread
 // bytes. Client.Close also cancels pending Gets and all active Values. Cancellation
@@ -37,8 +49,8 @@
 // including zero, is valid. ParseETag requires a strong quoted tag; a zero ETag
 // means an absent request pin and is invalid response metadata. ByteLength and
 // ByteOffset distinguish sizes from positions, with wire values bounded by MaxInt64.
-// ClosedRange and Range.Resolve serve whole-page origin adapters; Request deliberately
-// exposes no caller-selectable range or pin.
+// ClosedRange and Range.Resolve serve whole-page origin adapters; ReadOptions
+// selects arbitrary client byte ranges independently of origin page boundaries.
 //
 // A zero FetchContext omits both fields. ParseAdapterMetadata, ParseAuthorization,
 // and NewFetchContext validate immutable opaque origin context without trimming or
@@ -53,22 +65,34 @@
 // locally chosen expiry with t.Truncate(time.Millisecond); the SDK never silently
 // rounds metadata. Expiry is a cache admission hint, not a deadline that interrupts
 // an admitted stream. The SDK neither invents a TTL nor locally caches metadata.
+// Metadata.ContentType is optional ASCII MIME metadata, at most 256 bytes, with
+// no control characters or duplicate parameters. Racer-Content-Type carries it;
+// the transport Content-Type for object bytes remains application/octet-stream.
+// Legacy peers may omit Racer-Content-Type on either exchange. A continuation
+// rejects conflicting MIME values only when both are present; Value.Metadata
+// always retains the original snapshot, including an originally absent MIME type.
 //
 // # Cancellation, limits, and errors
 //
 // The context passed to Get governs capacity waits and the returned Value's entire
 // lifetime. Keep it alive until consumption ends; use a deadline when completion
-// must be bounded. Client defaults are 16 connections/live Values, a 5-second dial
-// timeout, a 10-second response-header timeout, and a 90-second idle timeout.
-// There is no total client stream timeout. Page-bounded continuations let the
-// total stream outlive the dataplane's absolute per-request deadline (30 seconds
-// by default). Each page must still complete within that budget; progress does
-// not renew it, and a failed page is terminal. Zero numeric config fields select
-// defaults, not unlimited operation; negative values are invalid. Bound caller
-// concurrency too: pending Get callers still consume application resources.
+// must be bounded. Client defaults are 64 bulk connections/live Values, 4 reserved
+// metadata connections, 4 small-object connections, independently bounded queues
+// of 128 bulk, 16 metadata and 128 small-object calls, a 5-second queue and
+// dial timeout, a 60-second response-header timeout, and a 90-second idle timeout.
+// Admission happens before allocating active stream state. A full queue returns
+// ErrorUnavailable; queue timeout returns ErrorDeadline. There is no total client
+// stream timeout. Zero numeric config fields select defaults; negatives are invalid.
 // Read uses the caller's buffer; each active origin stream uses a 32 KiB
 // scratch buffer. SDK buffering is independent of object size and page count;
 // connection/request limits bound active framing and copying resources.
+// WriteTo owns its 32 KiB loop and never delegates to destination ReaderFrom.
+// Each client lazily allocates at most MaxConnections bulk copy buffers and
+// SmallObjectConnections independently reserved small-object copy buffers, counting
+// both cached buffers and copies blocked inside caller-owned Write. Close drops
+// cached buffers; blocked writers retain theirs until they return. If canceled,
+// blocked writers exhaust this separate bound, a new WriteTo returns
+// ErrorUnavailable without consuming bytes; Read remains available.
 //
 // Use errors.As with *Error for Kind, Operation, and optional StatusCode (zero
 // without a received HTTP status). Use errors.Is for preserved causes such as
@@ -77,8 +101,13 @@
 // reads will succeed: process n bytes even when Read returns an error, and treat
 // io.Copy's count as partial on failure. A failed Value is terminal; the SDK never
 // splices in a newer version or restarts a failed stream. Publish a copied object
-// only after successful completion. There is no SDK retry loop, although Go's
-// HTTP transport may replay an eligible read on a failed reused connection.
+// only after successful completion. Direct HTTP/1.1 parsing preserves strict raw
+// framing and streams from the same connection reader. An EOF/reset/broken pipe
+// on a pooled connection is retried once on a fresh connection only before any
+// response bytes arrive. Timeouts, partial heads, invalid heads and body failures
+// are never retried. The original request and pin are preserved on retry.
+// Client.Stats provides fixed-size cumulative counters and current resource
+// gauges without credentials, per-object labels, or a metrics dependency.
 // Error diagnostics omit cause text; explicitly unwrapping an error can expose it.
 //
 // # Implementing an origin
@@ -115,7 +144,8 @@
 // parent directories without symlinks and protect them from untrusted writers.
 // Existing paths, including stale sockets, are refused; cleanup preserves a
 // replacement inode. Default socket permissions are 0600. Origin defaults are 128
-// accepted connections, 64 concurrent callbacks/bodies, a 5-second header timeout,
+// accepted connections, 64 concurrent GET callbacks/bodies, 4 independently
+// reserved HEAD callbacks, a 5-second header timeout,
 // a 60-second request timeout (including EOF probing and final writes), and
 // 30-second blocked-write and idle timeouts. Overload returns 503. See OriginConfig
 // for overrides. Server cancellation closes connections/bodies and returns
@@ -136,7 +166,7 @@
 // Racer caching, distributed scheduling, retries, or performance, and passing fake
 // tests does not establish real Racer compatibility. Callback failures before a
 // page response starts preserve their HTTP classification, including later
-// continuations; failures within a started body abort it. Both leave a partial
+// remainder headers; failures within a started multipage body abort it. Both leave a partial
 // full-object byte count and a terminal Value.
 //
 // Cleanup is idempotent and safe concurrently. It closes the Client and both

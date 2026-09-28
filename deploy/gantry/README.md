@@ -9,8 +9,8 @@ The Helm chart under `chart/` is the source of truth for resources shared by
 standalone and operator-managed installations. `make gantry-manifests` renders
 the internal operator profile into `deploy/gantry/rendered/`; the Unbounded
 operator embeds those files and applies its own image, ConfigMap, and Lease
-ownership semantics. The target also renders the standalone node configurator
-and examples used by development and benchmark tooling.
+ownership semantics. The target also renders examples used by development and
+benchmark tooling; the node configurator is rendered only by the standalone chart.
 
 | Source | Rendered to | Purpose |
 | --- | --- | --- |
@@ -100,10 +100,16 @@ on its own; no restart needed.
 
 ## Opt-in Racer backend
 
-Set `GANTRY_RACER_ENABLED=true` in the Gantry process environment to use Racer.
-The default is `false`; an invalid boolean fails startup. This switch is
-environment-only: `racer_enabled` is not a YAML field and there is no CLI flag.
-The Racer cache name is fixed to `gantry`.
+Set the chart value `racer.enabled=true`, or layer
+`chart/values-racer.yaml` over the chart defaults. The schema requires a boolean
+and rejects unknown Racer profile keys. This selects the deployment identity,
+socket mount, and `GANTRY_RACER_ENABLED=true` process environment together.
+The default remains the legacy backend with UID 65532. The Racer cache name is
+fixed to `gantry`. Runtime tuning belongs in the Gantry config YAML, supplied
+through the existing `gantry.config` string (`--set-file gantry.config=...`),
+using the YAML fields accepted by the deployed Gantry version; the chart does
+not interpret or duplicate those SDK settings. Supplying config alone does not
+select the deployment profile.
 
 Racer mode starts the SDK client, Gantry's registry origin callback, the OCI
 mirror, the operations endpoint, and optional existing loopback pprof endpoint.
@@ -123,51 +129,265 @@ canonical paths to the Gantry process:
 | `/run/racer/gantry/client/socket` | Racer serves this Unix socket; Gantry's SDK client connects to it. |
 | `/run/racer/gantry/origin/socket` | Gantry's SDK origin server creates this Unix socket; Racer connects to it for registry reads. |
 
-Mount an existing `/run/racer` directory before starting Gantry. Gantry creates
-missing `gantry` and `gantry/origin` directories with mode `0755` (subject to the
-process umask), so it can start before Racer creates the client endpoint. It
-preserves existing directory modes and never removes existing socket paths.
-The SDK itself neither creates nor changes parent directories. Directories and
-their ancestors must not be symlinks or writable by untrusted peers. Gantry needs
-write access to create missing directories and its origin socket, and permission
-to connect to the client socket. The origin socket uses SDK
-default mode `0600`, so arrange compatible process identities and mount
-visibility for Racer to connect. An existing origin path, including a stale
-socket, is refused; investigate and remove stale artifacts during provisioning
-before restarting. Shutdown removes only the socket created by that invocation.
+The Racer chart profile mounts the node directory `/run/racer/gantry` at the
+same path, writable, with `hostPath.type=DirectoryOrCreate`. It mounts a directory
+rather than individual sockets or a `subPath`, so replacement sockets remain
+visible. Only this cache is exposed to Gantry. Kubelet creates missing hostPath
+directories; Gantry creates `origin/` with mode `0755` and preserves existing
+directory modes. Gantry can start before Racer creates the client endpoint.
 
-This is a process-level opt-in; the chart and Unbounded operator do not provision
-Racer, add its socket mounts, or enable the switch. Supply those deployment
-details in your own provisioning. Keep containerd's mirror route pointing to
+**Identity model:** Gantry runs as UID/GID 0 to match the Rust dataplane. Both
+drop all Linux capabilities. Gantry retains a read-only root filesystem,
+`allowPrivilegeEscalation: false`, and `RuntimeDefault` seccomp. It is not a
+privileged container. The Rust workload runs as root
+(`internal/racer/workload.go:61,89`); the SDK origin socket defaults to `0600`
+(`pkg/racersdk/origin.go:96-97`). Matching UIDs permits the capability-stripped
+dataplane to connect to that private socket. The current Rust client listener
+explicitly permits mounted clients with mode `0666`
+(`cmd/racer-dataplane/src/client/listener.rs`, `allow_socket_access`), but that
+does not relax Gantry's origin ownership requirement.
+
+There is no socket-directory chown/chmod init container, shared writable group,
+or `fsGroup`. The profile omits the legacy libp2p hostPath, its chown init
+container, containerd runtime mount, and legacy peer ports. The origin directory
+must remain owned by Gantry's UID and must not be group/world writable
+(`pkg/racersdk/origin_owned.go:151-155`). Gantry explicitly enables the SDK's
+owned stale-socket recovery (`cmd/gantry/agent_racer_socket.go:26`): recovery uses
+exclusive ownership locks and socket witnesses, refuses foreign paths and
+symlinks, and preserves replacements at shutdown. Do not remove the ownership
+files or change a preexisting foreign-owned directory to bypass these checks.
+
+The chart does not install Racer or create `ClusterCache/gantry`. Provision those
+separately on the same selected nodes. Keep containerd's mirror route pointing to
 Gantry. Upstream configuration and registry credential negotiation remain with
 Gantry: the mirror uses its origin client for authentication probes, while
 content reads go through Racer and its Gantry origin callback. Racer errors
 never switch the Gantry agent back to its legacy backend or trigger direct
 content-origin fallback in the mirror.
 
-Digest-addressed GETs stream through Racer with bounded memory and SHA-256
-verification. The mirror withholds the final chunk until verification succeeds;
-stream failures abort the response. The SDK currently exposes full-object reads
-only: HEAD opens a stream, inspects up to 512 bytes for the OCI media type, then
-closes it; an open-ended blob resume reads and hashes the skipped prefix before
-returning the remainder. HEAD can therefore initiate a cache fill, and resumes
-can transfer extra bytes. Unsupported range forms are ignored as in the legacy
-mirror. Tags still return 503 for containerd to resolve through its existing
-registry host chain. Containerd's own origin fallback is unchanged.
+Digest-addressed GETs stream through Racer with bounded memory. Gantry validates
+metadata and transport framing; the OCI consumer verifies the complete object's
+SHA-256 digest, including resumed assembly. HEAD uses SDK metadata-only `Stat`;
+open-ended blob resumes use one Stat snapshot and a pinned offset read without
+rereading the skipped prefix in Go (`internal/gantry/mirror/racer.go:45-86,125-129`).
+The dataplane still fetches whole pages covering the requested range, including
+the starting page for an unaligned offset. Stream failures abort
+the response. Unsupported range forms are ignored as in the legacy mirror.
+Tags still return 503 for containerd to resolve through its existing registry
+host chain. Containerd's own origin fallback is unchanged.
 
 The origin callback identifies immutable versions by their quoted OCI digest
 and gives metadata a 24-hour admission TTL. It validates the configured registry,
-repository, pin, total size, and requested page. Registry HEAD must report a
-known size consistent with GET. Credentials travel separately from adapter
+repository, pin, total size, and requested page. Production GET callbacks use
+bounded registry Range requests, learning size and content type from GET without
+per-page HEAD. A registry must return an exact 206 with known total size, or a
+complete 200 at offset zero whose known Content-Length fits the requested page.
+Unknown-size, oversized, and nonzero-offset 200 responses are rejected without
+draining the object. Explicit HEAD still requires a known size. These rules avoid
+open-ended tail-download amplification while supporting small manifests from
+registries that ignore Range (`internal/gantry/racer/racer.go:212-294`,
+`internal/gantry/origin/range.go:16-73`). Credentials travel separately from adapter
 metadata and cache keys. On a Racer 401, Gantry can repeat the bounded registry
 challenge probe; the SDK does not transport a remote origin's repository-specific
 `WWW-Authenticate` challenge, so only locally known or registry-level challenges
 can be recovered.
 
-Integration tests use `racersdk.NewFakeClient`, which exercises the real SDK
-client and origin protocol with a sequential fake page scheduler. The fake does
-not model distributed caching and does not establish interoperability with the
-unfinished Rust dataplane.
+Object MIME metadata survives through Racer without Gantry parsing manifest
+bodies. Legacy absence is unknown; two present values must agree. Typed peer
+metadata uses a signed v2 extension that old strict peers reject, so mixed-version
+typed peer paths can fail until participating nodes are upgraded. Typed disk
+records and new checkpoints use v2; new readers also accept v1, but old binaries
+cannot read v2 data. See [SDK compatibility](../../designs/racer-sdk.md#content-type-and-compatibility)
+for the precise wire and rollback limits.
+
+SDK fake tests cover protocol behavior; `make e2e-racer` is the deployed Rust and
+containerd acceptance suite. The throughput rewrite is **VERIFIED, not yet
+merged**, as of 2026-09-28, including a full deployed E2E pass in 410.354s.
+See the [dated acceptance summary](../../designs/racer-sdk-verification.md) for
+the final gates, `e2e/racer/README.md` for builds and prerequisites, and
+[throughput performance](../../designs/racer-sdk-throughput-performance.md) for
+current measurement and verification status. Historical SDK reports are not
+evidence that this deployment has passed.
+
+### Workload tuning and capacity
+
+Supply these runtime fields in the complete Gantry YAML passed through
+`--set-file gantry.config=...` for Helm, or update `gantry-config` for the
+operator-managed workload. Each also has a `GANTRY_` environment override formed
+by uppercasing its YAML name, and a CLI flag formed by replacing underscores with
+hyphens. Zero selects the default; negative values are invalid. Backend selection
+remains `GANTRY_RACER_ENABLED=true`, set by the deployment profile, not a YAML
+`racer_enabled` field (`internal/gantry/config/config.go:59-78,655-668,753-765`,
+`cmd/gantry/agent_racer.go:235-250`).
+
+| YAML field | Default | Scope |
+| --- | --- | --- |
+| `racer_max_connections` | 64 | Bulk connections and live Values |
+| `racer_max_queued_requests` | 128 | Waiting bulk calls only |
+| `racer_metadata_connections` | 4 | Reserved HEAD connections/operations |
+| `racer_metadata_queued_requests` | 16 | Independent HEAD queue |
+| `racer_small_object_connections` | 4 | Reserved manifest/small-object connections and live Values |
+| `racer_small_object_queued_requests` | 128 | Independent small-object queue |
+| `racer_queue_timeout` | `5s` | Maximum wait for an admission slot |
+| `racer_response_header_timeout` | `60s` | SDK request-write bound, then response-head wait after request write |
+| `racer_origin_max_connections` | 128 | Accepted origin connections, including idle |
+| `racer_origin_concurrent_requests` | 64 | Active origin GET callbacks and bodies |
+| `racer_origin_concurrent_head_requests` | 4 | Separately reserved origin HEAD callbacks |
+| `racer_origin_request_timeout` | `60s` | Complete origin operation, including callback, body, EOF probe, final write |
+| `racer_write_timeout` | `30s` | Each downstream bounded write/flush, not total object duration |
+
+Defaults are wired in `internal/gantry/config/config.go:494-507`. For example,
+`GANTRY_RACER_SMALL_OBJECT_CONNECTIONS=8` or
+`--racer-small-object-connections=8` changes that pool; it does not resize the
+HEAD or bulk pool. Unsupported SDK-only settings, such as DialTimeout and
+IdleConnTimeout, retain SDK defaults (5s and 90s). The origin SDK's write/header/
+idle defaults remain 30s/5s/30s; `racer_write_timeout` is the mirror's downstream
+setting, not the origin write timeout (`cmd/gantry/agent_racer.go:129,235-250`,
+`pkg/racersdk/client.go:101-115`, `pkg/racersdk/origin.go:80-94`).
+
+Capacity interpretation:
+
+- The default client has 64 bulk, 4 HEAD, and 4 small-object slots, with separate
+  queues of 128, 16, and 128 (272 total waiting calls). Full queues fail immediately; queue timeouts fail
+  after the configured wait. Live Values hold capacity until EOF, error, or
+  Close, including while a consumer is slow. Reservations isolate SDK admission,
+  not all downstream resources. Origin HEAD slots are separate from GET slots,
+  but accepted connections remain a shared cap. The 128-entry small-object queue
+  accommodates a 64-request cold-manifest burst at SDK admission while keeping
+  active small-object work bounded at four. Queue deadlines and downstream
+  capacity still apply; this is not an E2E success guarantee.
+- SmallObject checks the total object size, at most 16 MiB. A tiny range of a
+  larger object does not qualify. Manifest GETs select this pool without a HEAD
+  preflight. Ordinary GETs use one bootstrap and at most one pinned remainder;
+  Go does not issue one request per page.
+- SDK copy scratch is capped independently at 32 KiB times bulk plus small-object
+  copy capacity: 2.125 MiB at defaults. Origin copy scratch is up to 2 MiB at the
+  default 64 GET callbacks. This is not a process memory estimate: add headers,
+  runtime, caller buffers, kernel sockets, and Rust's separately bounded pages.
+  Increasing queue depth permits more waiters, not more active throughput.
+- Tune against actual registry, Rust page/pipe, and node CPU/memory capacity.
+  Rust defaults include `RACER_CLIENT_CONNECTIONS=128`,
+  `RACER_ORIGIN_CONNECTIONS_PER_CACHE=8`, `RACER_PIPES=16`, and
+  `RACER_RANGE_WINDOW_PAGES=2`. These are dataplane environment settings, not
+  Gantry YAML or ClusterCache fields (`cmd/racer-dataplane/src/config.rs:174-194`,
+  `api/racer/v1alpha1/clustercache_types.go:18-21`).
+
+For long objects, distinguish timeouts rather than increasing every limit.
+SDK body lifetime follows the caller's context. Gantry refreshes the downstream
+write deadline for each bounded write and final flush. Rust bounds initial
+metadata/first-page work with `RACER_REQUEST_TIMEOUT_MS` (default 30000), then
+new distinct pages in normal pinned ranges receive fixed child acquisition
+deadlines; already admitted pages and retries do not renew their budgets.
+Client writes use `RACER_READER_STALL_TIMEOUT_MS` (default 10000), renewed only
+on positive socket progress. Explicit aggregate-budget and peer operations keep
+absolute deadlines. Origin RequestTimeout still caps each whole-page callback
+operation. A healthy long remainder may therefore exceed the initial request
+timeout, while a stalled page or consumer still fails
+(`internal/gantry/mirror/racer_io.go:25-54,99-126`,
+`cmd/racer-dataplane/src/read/range_stream.rs:30-65,223-315`,
+`cmd/racer-dataplane/src/memory/delivery.rs:153-205,261-265`).
+
+### Racer metrics
+
+The operations `/metrics` endpoint includes runtime/process collectors plus
+Racer-specific metrics (`cmd/gantry/agent_racer_metrics.go:25-37,83-104`):
+
+| Metric family | Interpretation |
+| --- | --- |
+| `gantry_racer_sdk_queue_depth`, `bulk_queue_depth`, `metadata_queue_depth`, `small_object_queue_depth` | Aggregate and per-pool queue gauges; all abbreviated names have the `gantry_racer_sdk_` prefix |
+| `gantry_racer_sdk_active_bulk`, `active_metadata`, `active_small_objects` | Occupied admission slots, including dials; same prefix convention |
+| `gantry_racer_sdk_connections`, `idle_connections` | Open and reusable connections across all three pools |
+| `gantry_racer_sdk_queue_waits_total`, `queue_wait_seconds_total`, `queue_rejections_total`, `queue_timeouts_total` | Cumulative admission waits, completed wait duration, full-queue failures, timeouts |
+| `gantry_racer_sdk_dials_total`, `connection_reuses_total`, `retries_total`, `bytes_read_total` | Dial attempts, idle leases, eligible stale-connection retries, body bytes consumed |
+| `gantry_racer_mirror_requests_total` | Method, status, and `complete`/`aborted` outcome |
+| `gantry_racer_mirror_bytes_total`, `gantry_racer_mirror_duration_seconds` | Actual bytes accepted downstream and full handler duration by method |
+| `gantry_racer_origin_requests_total` | Upstream round trips by method/status, including authentication; status 0 means transport failure |
+| `gantry_racer_origin_bytes_total` | Upstream GET body bytes consumed by kind, including partial transfers |
+
+SDK Stats is sampled once per scrape; individual fields are concurrent samples,
+not a transactional accounting record. Labels exclude keys, repositories, URLs,
+and credentials. Consumed SDK/origin bytes can include failed transfers; mirror
+completion is not OCI digest verification. Compare queue saturation, aborted
+responses, origin GET/HEAD counts, and actual body bytes for each workload. Do
+not infer cache-hit ratio or a universal amplification bound from aggregate
+byte counters alone; use Racer's own cache/peer/storage telemetry and a controlled
+cold/warm workload (`pkg/racersdk/stats.go:8-43`,
+`cmd/gantry/agent_racer_metrics.go:42-69`).
+
+### Production profile and E2E integration
+
+From the repository root, with the E2E image loaded into the kind nodes and
+Racer plus `ClusterCache/gantry` provisioned, first create
+`tmp/racer-gantry-config.yaml` containing the complete Gantry configuration for
+your registry. Then deploy the production chart profile:
+
+```sh
+make install-helm
+bin/helm upgrade --install gantry deploy/gantry/chart \
+  --namespace unbounded-system --create-namespace \
+  --values deploy/gantry/chart/values-racer.yaml \
+  --set-string image.repository=docker.io/library/gantry \
+  --set-string image.tag=e2e \
+  --set image.pullPolicy=IfNotPresent \
+  --set-file gantry.config=tmp/racer-gantry-config.yaml \
+  --wait --timeout 90s
+```
+
+The configuration you supply must include the actual registry endpoint, mirror listener on
+`0.0.0.0:5000`, `mirror_bind_allow_non_loopback: true` for the chart's hostPort
+routing, and operations listener on `0.0.0.0:9095`. The automated E2E fixture
+instead supplies registry values directly to Helm and mounts its test CA; it
+does not generate this example configuration file. For another image,
+replace `image.repository` with `<registry>/<repository>` and `image.tag` with
+the built tag, or use `image.digest`. The chart uses a full repository path,
+not a separate registry value. For manifest-based harnesses, replace
+`upgrade --install` with `template` and omit `--create-namespace`, `--wait`, and
+`--timeout 90s`, then apply the rendered output. Do not replace the rendered pod
+with a handwritten E2E DaemonSet.
+
+Keep operator-managed Gantry disabled on every Site before installing this Helm
+release; an already operator-owned installation must first be uninstalled through
+its existing ownership workflow. The operator may still manage Racer. Set
+`nodeConfig.enabled=false` if the fixture or unbounded-agent owns containerd's
+mirror configuration; otherwise the standalone chart manages it continuously.
+Validate an actual digest-pinned containerd pull, including byte integrity and
+restart recovery, rather than treating socket readiness as end-to-end success.
+
+### Explicit operator activation
+
+The default embedded operator profile remains legacy. There is no
+`Site.spec.components.gantry.racer` field. To activate an existing
+operator-managed Gantry workload, merge the `gantry-racer.yaml` data key from
+[`examples/racer-operator-overrides.yaml`](examples/racer-operator-overrides.yaml)
+into `ConfigMap/unbounded-component-overrides` in the operator namespace. On a
+cluster without that ConfigMap, the complete example can be applied directly:
+
+```sh
+kubectl apply -f deploy/gantry/examples/racer-operator-overrides.yaml
+kubectl -n unbounded-system rollout status daemonset/gantry --timeout=90s
+```
+
+This uses the existing workload override mechanism. Tests apply the example to
+the real operator plan and compare its socket access and security settings with
+the chart Racer profile. Overrides cannot delete operator-managed content, so
+this path retains the legacy volumes, port declarations, and libp2p-only chown
+init container. That init container does not mount or modify Racer directories.
+The operator keeps image version lockstep; update `gantry-config` for runtime
+tuning. Provision Racer and its cache separately. Removing this override data
+key restores the default legacy workload on reconciliation.
+
+For build-time render inspection, `values-racer.yaml` also layers over the
+internal operator values (whose ownership fields use the existing schema bypass):
+
+```sh
+bin/helm template gantry deploy/gantry/chart \
+  --namespace unbounded-system \
+  --values deploy/gantry/chart/values-operator.yaml \
+  --values deploy/gantry/chart/values-racer.yaml \
+  --skip-schema-validation \
+  --set-string image.repository=docker.io/library/gantry \
+  --set-string image.tag=e2e
+```
 
 ### Readiness and shutdown
 
@@ -187,9 +407,9 @@ and drains HTTP requests, then cancels the origin server and closes the SDK
 client. Cleanup uses a 10-second HTTP/origin shutdown budget and force-closes
 HTTP connections when draining times out. Pprof remains diagnostic and optional.
 
-Racer mode exposes runtime/process metrics on `/metrics`, not legacy Gantry
-P2P or containerd metrics. Use Racer's own observability for its cache and
-cluster. The rollout checks below describe the default legacy backend.
+Racer mode exposes the runtime/process and [Racer metrics](#racer-metrics) above,
+not legacy Gantry P2P or containerd metrics. Use Racer's own observability for its
+cache and cluster. The rollout checks below describe the default legacy backend.
 
 ## What to verify after rollout (legacy backend)
 

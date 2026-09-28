@@ -115,6 +115,7 @@ mod tests {
     #[test]
     fn shared_result_rejects_mixed_metadata_plaintext_and_ciphertext() {
         let metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),

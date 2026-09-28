@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 const lifecycleSocket = "/run/racer/gantry/client/socket"
@@ -206,6 +208,10 @@ func (h *harness) awaitLifecycle(signal <-chan struct{}, message string) {
 
 func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOrigin) {
 	h.t.Helper()
+	h.t.Cleanup(func() {
+		fixture.unblock()
+		fixture.allow(true)
+	})
 	oldUID := strings.TrimSpace(h.kubectl("get", "clustercache", "gantry", "-o", "jsonpath={.metadata.uid}"))
 	require.NotEmpty(h.t, oldUID)
 	// A process restart would trivially discard memory and evade live retirement.
@@ -275,15 +281,49 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	newUID := strings.TrimSpace(h.kubectl("get", "clustercache", "gantry", "-o", "jsonpath={.metadata.uid}"))
 	require.NotEmpty(h.t, newUID)
 	require.NotEqual(h.t, oldUID, newUID)
+	// Catalog publication and kubelet's Secret projection are independent. Wait
+	// for keys for the new UID, then nudge ordinary projection sync as rotation does.
+	var generation wire.Generation
+
+	require.Eventually(h.t, func() bool {
+		bundle, _, _ := h.rotationState()
+		for _, key := range bundle.CacheKeys {
+			if string(key.Key.Cache) == newUID && key.Key.Purpose == wire.PageKey && key.State == wire.ActiveKey {
+				generation = bundle.Generation
+				return true
+			}
+		}
+
+		return false
+	}, 10*time.Second, time.Second, "controller did not publish replacement cache keys")
 
 	for _, node := range nodes {
+		h.kubectl("annotate", "pod", node.pod, "-n", namespace, "e2e.racer/cache-generation="+fmt.Sprint(generation), "--overwrite")
+		h.awaitRotationGeneration(h.racerDiagnostics(node.pod), generation, "replacement-"+node.name)
+	}
+
+	for _, node := range nodes {
+		var last lifecycleResponse
+
+		observed := make(map[string]int)
+		// Persist only status/error summaries, never response bodies or credentials.
+		h.t.Cleanup(func() {
+			h.write("lifecycle-readiness-"+node.name+".log", fmt.Sprintf("oldUID=%s newUID=%s\nobservations=%v\nlast_status=%d last_error=%v\n", oldUID, newUID, observed, last.status, last.err))
+
+			probe, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stop()
+
+			output, err := exec.CommandContext(probe, "docker", "exec", node.name, "stat", "--format=%n %F %d:%i", lifecycleSocket, oldSocket, "/run/racer/gantry/origin/socket").CombinedOutput()
+			h.write("lifecycle-sockets-"+node.name+".log", fmt.Sprintf("error=%v\n%s", err, output))
+		})
 		require.Eventually(h.t, func() bool {
 			probe, stop := context.WithTimeout(h.ctx, 2*time.Second)
 			defer stop()
 
-			r := h.lifecycleRead(probe, node, lifecycleSocket, fixture.warm, http.MethodHead)
+			last = h.lifecycleRead(probe, node, lifecycleSocket, fixture.warm, http.MethodHead)
+			observed[fmt.Sprintf("status=%d error=%v", last.status, last.err)]++
 
-			return r.err == nil && r.status == http.StatusOK
+			return last.err == nil && last.status == http.StatusOK
 		}, 60*time.Second, 250*time.Millisecond, "replacement cache socket not ready on %s", node.name)
 		require.NotEqual(h.t,
 			h.run("docker", "exec", node.name, "stat", "--format=%d:%i", oldSocket),

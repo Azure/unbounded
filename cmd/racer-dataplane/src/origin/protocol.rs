@@ -24,6 +24,7 @@ pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a 
         if name.eq_ignore_ascii_case("Authorization")
             || name.eq_ignore_ascii_case("Racer-Metadata")
             || name.eq_ignore_ascii_case("Racer-Expires-At")
+            || name.eq_ignore_ascii_case("Racer-Content-Type")
             || name.eq_ignore_ascii_case("Content-Length")
             || name.eq_ignore_ascii_case("Content-Range")
         {
@@ -73,6 +74,7 @@ pub(super) fn response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
         "If-Match",
         "Range",
         "Racer-Expires-At",
+        "Racer-Content-Type",
         "Racer-Metadata",
         "Authorization",
     ] {
@@ -104,6 +106,9 @@ pub(super) fn response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
             "If-Range",
         ],
     )?;
+    if let Some(value) = field(head, "Racer-Content-Type")? {
+        crate::model::metadata::ContentType::parse(value).map_err(|_| Error::BadGateway)?;
+    }
     for connection in head.values("Connection") {
         if connection
             .split(|b| *b == b',')
@@ -123,7 +128,7 @@ pub(super) fn response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
     if length != 0 {
         return Err(Error::BadGateway);
     }
-    absent(head, &["ETag", "Racer-Expires-At"])?;
+    absent(head, &["ETag", "Racer-Expires-At", "Racer-Content-Type"])?;
     let unsatisfied_length = if status == 416 {
         let value = required(head, "Content-Range")?;
         Some(decimal(
@@ -161,6 +166,10 @@ pub(super) fn metadata(
     let expires_at =
         ExpiresAt::parse(required(head, "Racer-Expires-At")?).map_err(|_| Error::BadGateway)?;
     Ok(ObjectMetadata {
+        content_type: field(head, "Racer-Content-Type")?
+            .map(crate::model::metadata::ContentType::parse)
+            .transpose()
+            .map_err(|_| Error::BadGateway)?,
         version: ObjectVersion {
             object: object.clone(),
             etag,
@@ -196,6 +205,74 @@ pub(super) fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::http::codec::Header;
+
+    #[test]
+    fn optional_content_type_is_validated_without_transport_substitution() {
+        let object = ObjectId {
+            cache: crate::model::identity::CacheId("cache".into()),
+            key: crate::model::identity::CacheKey([0; 32]),
+        };
+        let base = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: [
+                ("ETag", "\"v1\""),
+                ("Content-Length", "3"),
+                ("Racer-Expires-At", "0"),
+                ("Content-Type", "application/octet-stream"),
+            ]
+            .into_iter()
+            .map(|(name, value)| Header {
+                name: name.into(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect(),
+        };
+        assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
+        for value in [
+            b"application/vnd.oci.image.manifest.v1+json".as_slice(),
+            b"",
+            b"text",
+            b"text/plain\t",
+            b"text/plain, text/html",
+            b"text/\xff",
+            b"text/plain\r\nx:y",
+        ] {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: base
+                    .headers
+                    .iter()
+                    .map(|h| Header {
+                        name: h.name.clone(),
+                        value: h.value.clone(),
+                    })
+                    .collect(),
+            };
+            head.headers.push(Header {
+                name: "Racer-Content-Type".into(),
+                value: value.to_vec(),
+            });
+            let valid = value.starts_with(b"application/");
+            assert_eq!(response(&head, false).is_ok(), valid, "{value:?}");
+            assert_eq!(metadata(&head, &object, 3).is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    metadata(&head, &object, 3)
+                        .unwrap()
+                        .content_type
+                        .unwrap()
+                        .as_bytes(),
+                    value
+                );
+            }
+            head.headers.push(Header {
+                name: "racer-content-type".into(),
+                value: value.to_vec(),
+            });
+            assert_eq!(response(&head, false), Err(Error::BadGateway));
+            assert!(metadata(&head, &object, 3).is_err());
+        }
+    }
 
     #[test]
     fn numeric_headers_reject_padding_before_any_normalization() {

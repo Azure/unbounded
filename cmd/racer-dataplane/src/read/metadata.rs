@@ -630,7 +630,7 @@ impl MetadataService {
                         .metadata(&authority, context, selector.clone(), scope)
                         .await
                 };
-                let reply = match acquisition {
+                let mut reply = match acquisition {
                     Ok(reply) => reply,
                     Err(Error::VersionUnavailable)
                         if matches!(selector, MetadataSelector::Pinned(_)) =>
@@ -665,6 +665,9 @@ impl MetadataService {
                 };
                 if let Some(page) = &reply.page_zero {
                     validate_bootstrap_metadata(&reply.metadata, &page.metadata)?;
+                    if reply.metadata.content_type.is_none() {
+                        reply.metadata.content_type = page.metadata.content_type.clone();
+                    }
                     if reply.metadata.length == 0 {
                         return Err(Error::CorruptRecord.into());
                     }
@@ -677,6 +680,9 @@ impl MetadataService {
                         .publish_bootstrap_with_context(page, membership, context, scope, budget)
                         .await?;
                     validate_bootstrap_metadata(&reply.metadata, &result.metadata)?;
+                    if reply.metadata.content_type.is_none() {
+                        reply.metadata.content_type = result.metadata.content_type.clone();
+                    }
                     result.validate_for(&PageId {
                         version: reply.metadata.version.clone(),
                         number: PageNumber(0),
@@ -800,7 +806,7 @@ impl MetadataService {
                     }
                     result => result?,
                 };
-                let metadata = resolved.metadata;
+                let mut metadata = resolved.metadata;
                 if metadata.length == 0 {
                     return Ok(BootstrapResult::Empty(metadata));
                 }
@@ -821,8 +827,11 @@ impl MetadataService {
                 let result = result.and_then(|mut result| {
                     validate_bootstrap_metadata(&metadata, &result.metadata)?;
                     result.validate_for(&page)?;
+                    if metadata.content_type.is_none() {
+                        metadata.content_type = result.metadata.content_type.clone();
+                    }
                     // Preserve the fresh admission's expiry, not a page copy's
-                    // historical expiry, alongside both full-page buffers.
+                    // historical expiry, and any known compatible content type.
                     result.metadata = metadata;
                     Ok(result)
                 });
@@ -864,7 +873,7 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
     if expected.version != actual.version {
         return Err(Error::VersionUnavailable);
     }
-    if expected.length != actual.length {
+    if !expected.immutable().compatible(&actual.immutable()) {
         return Err(Error::CorruptRecord);
     }
     Ok(())
@@ -881,6 +890,7 @@ pub(crate) mod tests {
 
     fn metadata(etag: &str, length: u64) -> ObjectMetadata {
         ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),

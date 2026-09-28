@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	ocidigest "github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -105,7 +112,7 @@ func racerServer(t *testing.T, cfg *config.Config, client mirror.RacerClient, tr
 		origin = racerChallengeOrigin{racerLegacyTrap: trap, AuthenticationChallenger: challengers[0]}
 	}
 
-	server := httptest.NewServer(mirror.New(cfg, trap, origin, mirror.WithRacer(client)).Handler())
+	server := httptest.NewServer(mirror.RacerHTTPHandler(mirror.New(cfg, trap, origin, mirror.WithRacer(client)).Handler(), 0, nil))
 	server.Client().Timeout = 10 * time.Second
 	t.Cleanup(server.Close)
 
@@ -157,7 +164,7 @@ func racerMetadata(t *testing.T, d digest.Digest, size int) racersdk.Metadata {
 		t.Fatal(err)
 	}
 
-	return racersdk.Metadata{Size: racersdk.ByteLength(size), ETag: tag, ExpiresAt: time.Unix(2000000000, 0)}
+	return racersdk.Metadata{Size: racersdk.ByteLength(size), ETag: tag, ContentType: "application/octet-stream", ExpiresAt: time.Unix(2000000000, 0)}
 }
 
 func racerPageOrigin(t *testing.T, d digest.Digest, data []byte) racersdk.Origin {
@@ -165,7 +172,7 @@ func racerPageOrigin(t *testing.T, d digest.Digest, data []byte) racersdk.Origin
 	metadata := racerMetadata(t, d, len(data))
 
 	return func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		if len(data) == 0 {
+		if req.Operation() == racersdk.OperationHead || len(data) == 0 {
 			return metadata, nil, nil
 		}
 
@@ -224,6 +231,8 @@ func (u *racerRegistry) Pull(ctx context.Context, ref ifaces.OriginRef) (io.Read
 }
 
 func TestRacerGETAndHEAD(t *testing.T) {
+	// Keep the historical final-chunk boundary cases even though the mirror no
+	// longer withholds a final chunk or examines manifest payloads.
 	for _, tc := range []struct {
 		name, route, mediaType string
 		data                   []byte
@@ -242,7 +251,22 @@ func TestRacerGETAndHEAD(t *testing.T) {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			t.Run(tc.name+"/"+method, func(t *testing.T) {
 				d := racerDigest(tc.data)
-				client := racerFakeClient(t, racerPageOrigin(t, d, tc.data))
+				origin := racerPageOrigin(t, d, tc.data)
+
+				var heads, gets atomic.Int32
+
+				client := racerFakeClient(t, func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+					if req.Operation() == racersdk.OperationHead {
+						heads.Add(1)
+					} else {
+						gets.Add(1)
+					}
+
+					metadata, body, err := origin(ctx, req)
+					metadata.ContentType = tc.mediaType
+
+					return metadata, body, err
+				})
 				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
 
 				resp := racerRequest(t, server, method, tc.route, d, "", "")
@@ -272,6 +296,10 @@ func TestRacerGETAndHEAD(t *testing.T) {
 
 				if !bytes.Equal(got, want) {
 					t.Fatalf("response differs: got %d bytes; want %d", len(got), len(want))
+				}
+
+				if method == http.MethodHead && (heads.Load() != 1 || gets.Load() != 0) {
+					t.Fatalf("HEAD fetched object bytes: heads=%d gets=%d", heads.Load(), gets.Load())
 				}
 			})
 		}
@@ -322,7 +350,26 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 func TestRacerResumeAcrossPages(t *testing.T) {
 	data := bytes.Repeat([]byte("0123456789abcdef"), int(racersdk.PageSize)/16+4096)
 	d := racerDigest(data)
-	client := racerFakeClient(t, racerPageOrigin(t, d, data))
+	origin := racerPageOrigin(t, d, data)
+
+	var heads, gets atomic.Int32
+
+	client := racerFakeClient(t, func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		if req.Operation() == racersdk.OperationHead {
+			heads.Add(1)
+		} else {
+			gets.Add(1)
+
+			page, _ := req.Range()
+
+			first, _, err := page.Resolve(racersdk.ByteLength(len(data)))
+			if err != nil || first != racersdk.ByteOffset(racersdk.PageSize) {
+				t.Errorf("resume fetched skipped page: first=%d err=%v", first, err)
+			}
+		}
+
+		return origin(ctx, req)
+	})
 	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
 	offset := int(racersdk.PageSize) + 7
 	resp := racerRequest(t, server, http.MethodGet, "blobs", d, fmt.Sprintf("bytes=%d-", offset), "")
@@ -335,6 +382,283 @@ func TestRacerResumeAcrossPages(t *testing.T) {
 	wantRange := fmt.Sprintf("bytes %d-%d/%d", offset, len(data)-1, len(data))
 	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != wantRange || !bytes.Equal(got, data[offset:]) {
 		t.Fatalf("cross-page resume failed: status=%d range=%q bytes=%d", resp.StatusCode, resp.Header.Get("Content-Range"), len(got))
+	}
+
+	if heads.Load() != 1 || gets.Load() != 1 {
+		t.Fatalf("resume transcript: heads=%d gets=%d; want 1/1", heads.Load(), gets.Load())
+	}
+}
+
+type racerMetadataClient struct {
+	*racersdk.Client
+	metadata racersdk.Metadata
+	returned *racersdk.Metadata
+}
+
+func (c racerMetadataClient) Get(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
+	if c.returned != nil && len(options) == 1 {
+		selected := options[0]
+		selected.Metadata = c.returned
+		options = []racersdk.ReadOptions{selected}
+	}
+
+	return c.Client.Get(ctx, req, options...)
+}
+
+type racerTranscriptClient struct {
+	*racersdk.Client
+	stats   atomic.Int32
+	gets    atomic.Int32
+	options chan []racersdk.ReadOptions
+}
+
+func (c *racerTranscriptClient) Stat(ctx context.Context, req racersdk.Request) (racersdk.Metadata, error) {
+	c.stats.Add(1)
+	return c.Client.Stat(ctx, req)
+}
+
+func (c *racerTranscriptClient) Get(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
+	c.gets.Add(1)
+
+	c.options <- options
+
+	return c.Client.Get(ctx, req, options...)
+}
+
+func TestRacerSDKRequestTranscript(t *testing.T) {
+	for _, mode := range []string{"GET", "HEAD", "resume", "unsatisfiable", "manifest"} {
+		t.Run(mode, func(t *testing.T) {
+			data := bytes.Repeat([]byte("x"), int(racersdk.PageSize)+99)
+			if mode == "manifest" {
+				data = []byte(`{"schemaVersion":2}`)
+			}
+
+			d := racerDigest(data)
+			client := &racerTranscriptClient{Client: racerFakeClient(t, racerPageOrigin(t, d, data)), options: make(chan []racersdk.ReadOptions, 1)}
+			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			method, rangeHeader, route := http.MethodGet, "", "blobs"
+			wantStats, wantGets := int32(0), int32(1)
+
+			switch mode {
+			case "manifest":
+				route = "manifests"
+			case "HEAD":
+				method, wantStats, wantGets = http.MethodHead, 1, 0
+			case "resume":
+				rangeHeader, wantStats = fmt.Sprintf("bytes=%d-", racersdk.PageSize+7), 1
+			case "unsatisfiable":
+				rangeHeader, wantStats, wantGets = fmt.Sprintf("bytes=%d-", len(data)), 1, 0
+			}
+
+			resp := racerRequest(t, server, method, route, d, rangeHeader, "")
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatal(err)
+			}
+
+			if client.stats.Load() != wantStats || client.gets.Load() != wantGets {
+				t.Fatalf("SDK transcript: Stat=%d Get=%d; want %d/%d", client.stats.Load(), client.gets.Load(), wantStats, wantGets)
+			}
+
+			if wantGets == 0 {
+				return
+			}
+
+			options := <-client.options
+			if mode == "manifest" {
+				if len(options) != 1 || !options[0].SmallObject || options[0].Metadata != nil || options[0].Offset != 0 || options[0].Length != 0 || options[0].Pin != (racersdk.ETag{}) {
+					t.Fatal("manifest must use the small-object bootstrap without metadata preflight")
+				}
+
+				return
+			}
+
+			if mode == "GET" {
+				if len(options) != 0 {
+					t.Fatal("full GET must use bootstrap, without a redundant metadata read")
+				}
+
+				return
+			}
+
+			if len(options) != 1 || options[0].Offset != racersdk.ByteOffset(racersdk.PageSize+7) || options[0].Length != 0 || options[0].Pin.String() != `"`+d.String()+`"` || options[0].Metadata == nil || options[0].Metadata.Size != racersdk.ByteLength(len(data)) {
+				t.Fatal("resume must use exact offset, through-EOF length, and selected digest pin")
+			}
+		})
+	}
+}
+
+func (c racerMetadataClient) Stat(context.Context, racersdk.Request) (racersdk.Metadata, error) {
+	return c.metadata, nil
+}
+
+func TestRacerRejectsMixedMetadata(t *testing.T) {
+	for _, mode := range []string{"size", "content type", "version", "overflow"} {
+		t.Run(mode, func(t *testing.T) {
+			data := []byte("0123456789")
+			d := racerDigest(data)
+			metadata := racerMetadata(t, d, len(data))
+
+			switch mode {
+			case "size":
+				metadata.Size++
+			case "content type":
+				metadata.ContentType = "application/vnd.oci.image.index.v1+json"
+			case "version":
+				metadata = racerMetadata(t, racerDigest(nil), len(data))
+			case "overflow":
+				metadata.Size = racersdk.ByteLength(1) << 63
+			}
+
+			client := racerMetadataClient{Client: racerFakeClient(t, racerPageOrigin(t, d, data)), metadata: metadata}
+			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+
+			resp := racerRequest(t, server, http.MethodGet, "blobs", d, "bytes=4-", "")
+			if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" {
+				t.Fatalf("mixed metadata accepted: status=%d headers=%v", resp.StatusCode, resp.Header)
+			}
+		})
+	}
+}
+
+func TestRacerOptionalContentTypeKeepsSnapshot(t *testing.T) {
+	for _, tc := range []struct{ name, initial, returned string }{
+		{"absent to present", "", "application/vnd.oci.image.index.v1+json"},
+		{"present to absent", "application/vnd.oci.image.index.v1+json", ""},
+		{"both absent", "", ""},
+		{"both present same", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json"},
+		{"both present different", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json"},
+	} {
+		for _, source := range []string{"SDK snapshot", "independent returned metadata"} {
+			t.Run(tc.name+"/"+source, func(t *testing.T) {
+				data := []byte("0123456789")
+				d := racerDigest(data)
+				initial, actual := racerMetadata(t, d, len(data)), racerMetadata(t, d, len(data))
+				initial.ContentType, actual.ContentType = tc.initial, tc.returned
+				origin := racerPageOrigin(t, d, data)
+
+				client := racerMetadataClient{metadata: initial, Client: racerFakeClient(t, func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+					_, body, err := origin(ctx, req)
+					return actual, body, err
+				})}
+				if source == "independent returned metadata" {
+					client.returned = &actual
+				}
+
+				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+
+				resp := racerRequest(t, server, http.MethodGet, "blobs", d, "bytes=4-", "")
+				if tc.initial != "" && tc.returned != "" && tc.initial != tc.returned {
+					if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" {
+						t.Fatal("conflicting present media types were accepted")
+					}
+
+					return
+				}
+
+				body, err := io.ReadAll(resp.Body)
+
+				wantType := tc.initial
+				if wantType == "" {
+					wantType = "application/octet-stream"
+				}
+
+				if err != nil || resp.StatusCode != http.StatusPartialContent || string(body) != "456789" || resp.Header.Get("Content-Type") != wantType {
+					t.Fatalf("snapshot changed: status=%d type=%q body=%q err=%v", resp.StatusCode, resp.Header.Get("Content-Type"), body, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRacerContainerdRejectsCorruptAssembly(t *testing.T) {
+	for _, mode := range []string{"full", "resumed corrupt prefix", "resumed corrupt suffix"} {
+		t.Run(mode, func(t *testing.T) {
+			data := bytes.Repeat([]byte("0123456789abcdef"), int(racersdk.PageSize)/16+4096)
+
+			d := racerDigest(data)
+			if mode == "resumed corrupt suffix" {
+				data[len(data)-1] ^= 0xff
+			} else {
+				data[0] ^= 0xff
+			}
+
+			server := racerServer(t, racerConfig(), racerFakeClient(t, racerPageOrigin(t, d, data)), &racerLegacyTrap{})
+
+			var resumes atomic.Int32
+
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				req, err := http.NewRequestWithContext(r.Context(), r.Method, server.URL+r.URL.RequestURI(), nil)
+				if err != nil {
+					panic(err)
+				}
+
+				req.Header = r.Header.Clone()
+
+				resp, err := server.Client().Do(req)
+				if err != nil {
+					panic(http.ErrAbortHandler)
+				}
+				defer resp.Body.Close()
+
+				for key, values := range resp.Header {
+					w.Header()[key] = values
+				}
+
+				w.WriteHeader(resp.StatusCode)
+
+				if r.Header.Get("Range") != "" {
+					resumes.Add(1)
+				}
+
+				if mode != "full" && r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+					if _, err := io.CopyN(w, resp.Body, int64(racersdk.PageSize)+7); err != nil {
+						panic(http.ErrAbortHandler)
+					}
+
+					return
+				}
+
+				if _, err := io.Copy(w, resp.Body); err != nil {
+					panic(http.ErrAbortHandler)
+				}
+			}))
+			t.Cleanup(proxy.Close)
+
+			resolver := docker.NewResolver(docker.ResolverOptions{Hosts: func(string) ([]docker.RegistryHost, error) {
+				return []docker.RegistryHost{containerdRegistryHost(t, proxy)}, nil
+			}})
+
+			fetcher, err := resolver.Fetcher(t.Context(), "registry.example/library/image:latest")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			desc := ocispec.Descriptor{Digest: ocidigest.Digest(d.String()), Size: int64(len(data)), MediaType: ocispec.MediaTypeImageLayer}
+
+			body, err := fetcher.Fetch(t.Context(), desc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+
+			store, err := local.NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = content.WriteBlob(t.Context(), store, "corrupt", body, desc)
+			if err == nil || !strings.Contains(err.Error(), "unexpected commit digest") {
+				t.Fatalf("containerd must reject at digest commit: %v", err)
+			}
+
+			if _, err := store.Info(t.Context(), desc.Digest); err == nil {
+				t.Fatal("corrupt content committed")
+			}
+
+			if mode != "full" && resumes.Load() != 1 {
+				t.Fatalf("containerd resume requests=%d; want one", resumes.Load())
+			}
+		})
 	}
 }
 
@@ -429,7 +753,7 @@ func TestRacerFailureBeforeContentHeaders(t *testing.T) {
 			data := bytes.Repeat([]byte("x"), 128*1024)
 			d := racerDigest(data)
 			metadata := racerMetadata(t, d, len(data))
-			available, status := 128, http.StatusServiceUnavailable
+			available, status := 128, http.StatusOK
 			method, rangeHeader := http.MethodGet, ""
 
 			switch mode {
@@ -443,10 +767,39 @@ func TestRacerFailureBeforeContentHeaders(t *testing.T) {
 				rangeHeader = "bytes=65536-"
 			}
 
-			client := racerFakeClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client := racerFakeClient(t, func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if req.Operation() == racersdk.OperationHead {
+					return metadata, nil, nil
+				}
+
 				return metadata, io.NopCloser(bytes.NewReader(data[:available])), nil
 			})
+
 			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			if mode == "prefix" || mode == "resume skip" {
+				// Superseded: the mirror no longer peeks or reads a skipped
+				// prefix before committing headers. Truncation aborts the stream.
+				req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/library/image/blobs/"+d.String(), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				req.Header.Set("Range", rangeHeader)
+
+				resp, err := server.Client().Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+
+					_, err = io.ReadAll(resp.Body)
+				}
+
+				if err == nil {
+					t.Fatal("truncated stream completed")
+				}
+
+				return
+			}
+
 			resp := racerRequest(t, server, method, "blobs", d, rangeHeader, "")
 
 			_, err := io.ReadAll(resp.Body)
@@ -454,7 +807,13 @@ func TestRacerFailureBeforeContentHeaders(t *testing.T) {
 				t.Fatalf("response = %d, %v; want complete %d", resp.StatusCode, err, status)
 			}
 
-			if resp.Header.Get("Docker-Content-Digest") != "" || resp.Header.Get("Gantry-Mirrored") != "" || resp.Header.Get("Content-Range") != "" {
+			if mode == "HEAD prefix" {
+				// Superseded: HEAD needs metadata only, so a broken body cannot
+				// affect it and is never opened.
+				if resp.Header.Get("Gantry-Mirrored") != "1" {
+					t.Fatal("metadata-only HEAD failed")
+				}
+			} else if resp.Header.Get("Docker-Content-Digest") != "" || resp.Header.Get("Gantry-Mirrored") != "" || resp.Header.Get("Content-Range") != "" {
 				t.Fatalf("failure committed content headers: %v", resp.Header)
 			}
 		})
@@ -466,7 +825,7 @@ type racerReadError struct{}
 func (racerReadError) Read([]byte) (int, error) { return 0, errors.New("injected stream failure") }
 
 func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
-	for _, mode := range []string{"read error", "truncation", "digest mismatch", "continuation", "resume read error", "resume truncation", "resume digest mismatch", "resume continuation"} {
+	for _, mode := range []string{"read error", "truncation", "digest mismatch", "continuation", "terminal framing", "resume read error", "resume truncation", "resume digest mismatch", "resume continuation", "resume terminal framing"} {
 		t.Run(mode, func(t *testing.T) {
 			failure := strings.TrimPrefix(mode, "resume ")
 
@@ -480,9 +839,10 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			rangeHeader, offset := "", 0
 
 			if failure == "digest mismatch" {
-				// Corrupt only skipped bytes on resume: a suffix-only verifier
-				// would incorrectly accept the returned bytes as valid.
+				// Superseded integrity expectation: the mirror transports bytes;
+				// the consumer verifies the final assembled OCI object.
 				data[0] ^= 0xff
+				data[len(data)-1] ^= 0xff
 			}
 
 			if strings.HasPrefix(mode, "resume ") {
@@ -492,15 +852,28 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			var calls atomic.Int32
 
 			client := racerFakeClient(t, func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if req.Operation() == racersdk.OperationHead {
+					return metadata, nil, nil
+				}
+
 				calls.Add(1)
 
-				if failure == "continuation" && req.Operation() == racersdk.OperationPinned {
+				page, _ := req.Range()
+
+				first, _, rangeErr := page.Resolve(metadata.Size)
+				if rangeErr != nil {
+					return metadata, nil, rangeErr
+				}
+
+				if failure == "continuation" && first != 0 {
 					return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorUnavailable, nil)
 				}
 
 				var reader io.Reader = bytes.NewReader(data)
 
 				switch failure {
+				case "terminal framing":
+					reader = io.MultiReader(bytes.NewReader(data), racerReadError{})
 				case "read error":
 					reader = io.MultiReader(bytes.NewReader(data[:128*1024]), racerReadError{})
 				case "truncation":
@@ -524,6 +897,14 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			}
 
 			got, err := io.ReadAll(resp.Body)
+			if failure == "digest mismatch" {
+				if err != nil || !bytes.Equal(got, data[offset:]) {
+					t.Fatalf("corrupt bytes must reach verifying consumer: bytes=%d err=%v", len(got), err)
+				}
+
+				return
+			}
+
 			if !errors.Is(err, io.ErrUnexpectedEOF) {
 				t.Fatalf("client read error = %v; want unexpected EOF", err)
 			}
@@ -649,12 +1030,9 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 			return
 		}
 
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.Header().Set("Content-Type", "application/octet-stream")
-
-		if r.Method == http.MethodGet {
-			w.Write(data)
-		}
+		w.Header().Set("Docker-Content-Digest", d.String())
+		http.ServeContent(w, r, "blob", time.Time{}, bytes.NewReader(data))
 	}))
 	t.Cleanup(registry.Close)
 
@@ -705,18 +1083,36 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 				}
 
 				resp := racerRequest(t, server, method, "blobs", d, rangeHeader, "Bearer expired")
-				if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("WWW-Authenticate") != challenge {
+				// HEAD never opens a body; full GET obtains metadata from its
+				// bounded response. Preserve both superseded rejection cases as
+				// proof that the unnecessary request no longer occurs.
+				rejectedRequest := mode == "resume" || rejected == method
+
+				wantStatus, wantChallenge := status, ""
+				if rejectedRequest {
+					wantStatus, wantChallenge = http.StatusUnauthorized, challenge
+				}
+
+				if resp.StatusCode != wantStatus || resp.Header.Get("WWW-Authenticate") != wantChallenge {
 					t.Fatalf("rejected credential: status=%d challenge=%q; want 401 with remembered repository challenge", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
 				}
 
 				resp.Body.Close()
 
-				wantGets := int32(0)
-				if rejected == http.MethodGet {
+				wantHeads, wantGets, wantProbes := int32(0), int32(0), int32(0)
+				if mode != "GET" {
+					wantHeads = 1
+				}
+
+				if mode == "GET" || (mode == "resume" && rejected == http.MethodGet) {
 					wantGets = 1
 				}
 
-				if calls.Load() != 1 || heads.Load() != 1 || gets.Load() != wantGets || probes.Load() != 1 || trap.probes.Load() != 1 {
+				if rejectedRequest {
+					wantProbes = 1
+				}
+
+				if calls.Load() != wantHeads+wantGets || heads.Load() != wantHeads || gets.Load() != wantGets || probes.Load() != 1 || trap.probes.Load() != wantProbes {
 					t.Fatalf("rejection retried content or lost cached challenge: sdk=%d heads=%d gets=%d v2=%d challenges=%d", calls.Load(), heads.Load(), gets.Load(), probes.Load(), trap.probes.Load())
 				}
 
@@ -727,7 +1123,15 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 					t.Fatalf("refreshed credential: status=%d body=%q err=%v", refreshed.StatusCode, got, err)
 				}
 
-				if calls.Load() != 2 || heads.Load() != 2 || gets.Load() != wantGets+1 || trap.probes.Load() != 1 {
+				if mode != "GET" {
+					wantHeads++
+				}
+
+				if mode != "HEAD" {
+					wantGets++
+				}
+
+				if calls.Load() != wantHeads+wantGets || heads.Load() != wantHeads || gets.Load() != wantGets || trap.probes.Load() != wantProbes {
 					t.Fatalf("refresh counts: sdk=%d heads=%d gets=%d challenges=%d", calls.Load(), heads.Load(), gets.Load(), trap.probes.Load())
 				}
 			})
@@ -809,7 +1213,216 @@ func (b *racerBlockingBody) Close() error {
 	return nil
 }
 
+func TestRacerHEADDuringBulkStream(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 256*1024)
+	d := racerDigest(data)
+	metadata := racerMetadata(t, d, len(data))
+	body := &racerBlockingBody{prefix: bytes.NewReader(data[:64*1024]), blocked: make(chan struct{}), closed: make(chan struct{})}
+
+	var heads, gets atomic.Int32
+
+	client := racerFakeClient(t, func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		if req.Operation() == racersdk.OperationHead {
+			heads.Add(1)
+			return metadata, nil, nil
+		}
+
+		gets.Add(1)
+
+		return metadata, body, nil
+	})
+	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+
+	bulk := racerRequest(t, server, http.MethodGet, "blobs", d, "", "")
+	defer bulk.Body.Close()
+
+	select {
+	case <-body.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bulk body never blocked")
+	}
+
+	head := racerRequest(t, server, http.MethodHead, "blobs", d, "", "")
+	if head.StatusCode != http.StatusOK || head.ContentLength != int64(len(data)) || heads.Load() != 1 || gets.Load() != 1 {
+		t.Fatalf("HEAD mixed metadata and bulk: status=%d length=%d heads=%d gets=%d", head.StatusCode, head.ContentLength, heads.Load(), gets.Load())
+	}
+}
+
+func TestRacerManifestGETWithSaturatedBulkPool(t *testing.T) {
+	data := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+	d := racerDigest(data)
+	origin := racerPageOrigin(t, d, data)
+
+	var heads, gets atomic.Int32
+
+	client := racerFakeClient(t, func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		if req.Operation() == racersdk.OperationHead {
+			heads.Add(1)
+		} else {
+			gets.Add(1)
+		}
+
+		metadata, body, err := origin(ctx, req)
+		metadata.ContentType = "application/vnd.oci.image.index.v1+json"
+
+		return metadata, body, err
+	})
+
+	request, err := gantryracer.Request(ifaces.OriginRef{Registry: "registry.example", Repository: "library/image", Digest: d, Kind: ifaces.KindBlob}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold actual SDK Values rather than a mock semaphore: all default bulk
+	// admission slots remain occupied until the returned bodies are consumed.
+	for range 64 {
+		value, err := client.Get(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer value.Close()
+	}
+
+	if stats := client.Stats(); stats.ActiveBulk != 64 {
+		t.Fatalf("bulk pool is not saturated: %+v", stats)
+	}
+
+	server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	queued, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/v2/library/image/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		resp, err := server.Client().Do(queued)
+		if err == nil {
+			resp.Body.Close()
+		}
+
+		done <- err
+	}()
+
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().QueueDepth == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	if client.Stats().QueueDepth != 1 {
+		t.Fatal("extra blob request did not queue behind saturated bulk pool")
+	}
+
+	manifestCtx, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+
+	req, err := http.NewRequestWithContext(manifestCtx, http.MethodGet, server.URL+"/v2/library/image/manifests/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("manifest waited for bulk capacity: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, data) || resp.Header.Get("Content-Type") != "application/vnd.oci.image.index.v1+json" {
+		t.Fatalf("isolated manifest: status=%d bytes=%d err=%v", resp.StatusCode, len(body), err)
+	}
+
+	if heads.Load() != 0 || gets.Load() != 65 || client.Stats().ActiveBulk != 64 {
+		t.Fatalf("manifest used HEAD or bulk capacity: heads=%d gets=%d stats=%+v", heads.Load(), gets.Load(), client.Stats())
+	}
+}
+
+func TestRacerManifestSizeLimitBeforeHeaders(t *testing.T) {
+	for _, size := range []int{int(racersdk.PageSize), int(racersdk.PageSize) + 1} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			data := bytes.Repeat([]byte("x"), size)
+			d := racerDigest(data)
+			client := racerFakeClient(t, racerPageOrigin(t, d, data))
+			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
+			resp := racerRequest(t, server, http.MethodGet, "manifests", d, "", "")
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if size == int(racersdk.PageSize) {
+				if resp.StatusCode != http.StatusOK || !bytes.Equal(body, data) {
+					t.Fatal("manifest at the size limit was rejected")
+				}
+
+				return
+			}
+
+			if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" || resp.Header.Get("Docker-Content-Digest") != "" || resp.ContentLength == int64(size) {
+				t.Fatalf("oversize manifest committed content headers: status=%d headers=%v", resp.StatusCode, resp.Header)
+			}
+		})
+	}
+}
+
+func TestRacerStalledDownstreamClosesSDKStream(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 8<<20)
+	d := racerDigest(data)
+	client := racerFakeClient(t, racerPageOrigin(t, d, data))
+	observed := make(chan mirror.RacerHTTPObservation, 1)
+	server := httptest.NewServer(mirror.RacerHTTPHandler(
+		mirror.New(racerConfig(), &racerLegacyTrap{}, &racerLegacyTrap{}, mirror.WithRacer(client)).Handler(),
+		100*time.Millisecond, func(observation mirror.RacerHTTPObservation) { observed <- observation }))
+	t.Cleanup(server.Close)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		if err := tcp.SetReadBuffer(1024); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := fmt.Fprintf(conn, "GET /v2/library/image/blobs/%s HTTP/1.1\r\nHost: registry.example\r\n\r\n", d); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-observed:
+		if !result.Aborted || result.Bytes == 0 || result.Bytes >= int64(len(data)) || result.Duration < 100*time.Millisecond || result.Duration > 5*time.Second {
+			t.Fatalf("stalled downstream observation: %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled downstream did not release the handler")
+	}
+
+	if stats := client.Stats(); stats.ActiveBulk != 0 {
+		t.Fatalf("stalled downstream retained SDK bulk capacity: %+v", stats)
+	}
+	// The aborted bulk stream must not prevent a new metadata request.
+	request, err := gantryracer.Request(ifaces.OriginRef{Registry: "registry.example", Repository: "library/image", Digest: d, Kind: ifaces.KindBlob}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.Stat(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRacerCancellationClosesStream(t *testing.T) {
+	// "resume skip" is retained as the historical case name. Cancellation now
+	// interrupts the requested suffix directly; the mirror never skips bytes.
 	for _, mode := range []string{"before headers", "streaming", "resume skip"} {
 		t.Run(mode, func(t *testing.T) {
 			data := bytes.Repeat([]byte("x"), 256*1024)
@@ -822,7 +1435,11 @@ func TestRacerCancellationClosesStream(t *testing.T) {
 			}
 
 			body := &racerBlockingBody{prefix: bytes.NewReader(data[:prefixSize]), blocked: make(chan struct{}), closed: make(chan struct{})}
-			client := racerFakeClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client := racerFakeClient(t, func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if req.Operation() == racersdk.OperationHead {
+					return metadata, nil, nil
+				}
+
 				return metadata, body, nil
 			})
 			server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})

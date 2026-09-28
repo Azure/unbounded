@@ -98,6 +98,14 @@ Client delivery calls `RangeStream::next_slice()` and
 `Delivery::finish_to(ReaderLease, ConnectionLease, &RequestScope)`; it checks the
 total transmitted length and closes on any post-header error.
 
+The listener's observed response path uses `Delivery::finish_progressing` after
+the bounded first-slice/header phase. Each later distinct client page has a fixed
+child acquisition deadline; writes renew only their stall deadline on positive
+socket progress. It polls the already admitted prefetch window while writing.
+Full peer close signals shared cancellation while preserving completion owners;
+request write-half shutdown alone does not cancel the response. The unobserved
+`Responses::send` and explicit aggregate-budget APIs retain absolute deadlines.
+
 `Responses::send` prepares the first slice before writing success headers. A
 first-slice acquisition/admission failure sends the mapped error head and returns
 a poisoned connection; callers must check `is_reusable()` before another request.

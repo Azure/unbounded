@@ -74,7 +74,21 @@ fn version(head: &MessageHead) -> Result<ObjectVersion> {
     })
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
+    let content_type = match head.unique("racer-metadata-version")? {
+        None => {
+            if head.unique("racer-content-type")?.is_some() {
+                return Err(Error::InvalidRequest);
+            }
+            None
+        }
+        Some(b"2") => Some(crate::model::metadata::ContentType::parse(
+            head.unique("racer-content-type")?
+                .ok_or(Error::InvalidRequest)?,
+        )?),
+        _ => return Err(Error::InvalidRequest),
+    };
     Ok(ObjectMetadata {
+        content_type,
         version: version(head)?,
         length: p::number(head, "racer-length")?,
         expires_at: ExpiresAt(
@@ -83,6 +97,63 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
                 .ok_or(Error::InvalidRequest)?,
         ),
     })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn explicit_metadata_version_round_trips_and_rejects_unknown_or_unsigned_shape() {
+        let mut m = ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length: 17,
+            expires_at: ExpiresAt(UNIX_EPOCH),
+        };
+        let path = [NodeId(crate::security::identity::tests::NODE.into())];
+        for typed in [false, true] {
+            if typed {
+                m.content_type = Some(
+                    crate::model::metadata::ContentType::parse(b"text/plain; charset=utf-8")
+                        .unwrap(),
+                );
+            }
+            let head =
+                p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+            assert_eq!(metadata(&head).unwrap(), m);
+            assert_eq!(
+                head.unique("content-length").unwrap(),
+                Some(b"0".as_slice())
+            );
+            if typed {
+                for value in [b"3".as_slice(), b"1", b""] {
+                    let mut bad =
+                        p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path)
+                            .unwrap();
+                    bad.headers
+                        .iter_mut()
+                        .find(|h| h.name == "racer-metadata-version")
+                        .unwrap()
+                        .value = value.to_vec();
+                    assert!(metadata(&bad).is_err());
+                }
+                let mut bad =
+                    p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                bad.headers.retain(|h| h.name != "racer-metadata-version");
+                assert!(metadata(&bad).is_err());
+                let mut bad =
+                    p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                p::push(&mut bad, "racer-content-type", "text/plain");
+                assert!(metadata(&bad).is_err());
+            }
+        }
+    }
 }
 pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, PageEnvelope)> {
     let metadata = metadata(head)?;

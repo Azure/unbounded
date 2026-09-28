@@ -1,4 +1,4 @@
-//! Version 1 little-endian encrypted records. Header SHA-256 is framing integrity;
+//! Versioned little-endian encrypted records. Header SHA-256 is framing integrity;
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
 use super::{
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
@@ -16,7 +16,7 @@ use crate::{
     runtime::reactor::IoBuffer,
 };
 use sha2::{Digest, Sha256};
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
@@ -74,6 +74,14 @@ impl RecordCodec {
         let header_bytes = HEADER_PREFIX_BYTES
             .checked_add(cache.len())
             .and_then(|len| len.checked_add(etag.len()))
+            .and_then(|len| {
+                len.checked_add(
+                    metadata
+                        .content_type
+                        .as_ref()
+                        .map_or(0, |v| 4 + v.as_bytes().len()),
+                )
+            })
             .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
             .filter(|&len| len <= MAX_HEADER_BYTES)
             .ok_or(Error::CorruptRecord)?;
@@ -96,7 +104,7 @@ impl RecordCodec {
         let etag = envelope.page.version.etag.as_bytes();
         let mut out = Vec::with_capacity(layout.header_bytes);
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&record_version(&page.metadata).to_le_bytes());
         out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
         out.extend_from_slice(&generation.0.to_le_bytes());
         out.extend_from_slice(&page.metadata.length.to_le_bytes());
@@ -110,6 +118,10 @@ impl RecordCodec {
         out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
         out.extend_from_slice(cache);
         out.extend_from_slice(etag);
+        if let Some(content_type) = &page.metadata.content_type {
+            out.extend_from_slice(&(content_type.as_bytes().len() as u32).to_le_bytes());
+            out.extend_from_slice(content_type.as_bytes());
+        }
         debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
         let digest = Sha256::digest(&out);
         out.extend_from_slice(&digest);
@@ -146,7 +158,7 @@ impl RecordCodec {
         bytes[logical_bytes..].fill(0);
         Ok(EncodedRecord {
             header: RecordHeader {
-                format_version: FORMAT_VERSION,
+                format_version: record_version(&page.metadata),
                 generation,
                 envelope: page.ciphertext.envelope().clone(),
                 metadata: page.metadata.immutable(),
@@ -164,7 +176,11 @@ impl RecordCodec {
             return Err(Error::CorruptRecord);
         }
         let mut r = Decoder { bytes, at: 0 };
-        if r.take(8)? != MAGIC || r.u32()? != FORMAT_VERSION {
+        if r.take(8)? != MAGIC {
+            return Err(Error::CorruptRecord);
+        }
+        let format_version = r.u32()?;
+        if !matches!(format_version, 1 | 2) {
             return Err(Error::CorruptRecord);
         }
         let header_len = r.u32()? as usize;
@@ -196,6 +212,19 @@ impl RecordCodec {
                 .to_owned(),
         );
         let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
+        let content_type = if format_version >= 2 {
+            let length = r.u32()? as usize;
+            if length == 0 {
+                None
+            } else {
+                Some(
+                    crate::model::metadata::ContentType::parse(r.take(length)?)
+                        .map_err(|_| Error::CorruptRecord)?,
+                )
+            }
+        } else {
+            None
+        };
         if r.at != r.bytes.len()
             || generation.0 == 0
             || plaintext_length == 0
@@ -209,6 +238,7 @@ impl RecordCodec {
             etag,
         };
         let metadata = VersionMetadata {
+            content_type,
             version: version.clone(),
             length,
         };
@@ -228,7 +258,7 @@ impl RecordCodec {
         }
         Ok(DecodedRecord {
             header: RecordHeader {
-                format_version: FORMAT_VERSION,
+                format_version,
                 generation,
                 envelope,
                 metadata,
@@ -254,6 +284,13 @@ impl RecordCodec {
 struct Decoder<'a> {
     bytes: &'a [u8],
     at: usize,
+}
+fn record_version(metadata: &crate::model::metadata::ObjectMetadata) -> u32 {
+    if metadata.content_type.is_some() {
+        FORMAT_VERSION
+    } else {
+        1
+    }
 }
 impl<'a> Decoder<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -294,6 +331,7 @@ mod tests {
         etag: &str,
     ) -> CiphertextCopy {
         let metadata = VersionMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId(cache.into()),
@@ -783,6 +821,42 @@ mod tests {
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
     }
 
+    #[test]
+    fn version_two_records_preserve_bounded_content_type_and_reject_malformed_values() {
+        let admission = admission();
+        let mut page = page(&admission, 3, 0, "cache", "v1");
+        page.metadata.content_type =
+            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let encoded = RecordCodec
+            .encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, 512),
+            )
+            .unwrap();
+        let parsed = RecordCodec
+            .parse(&encoded.buffer, encoded.header.extent)
+            .unwrap();
+        assert_eq!(parsed.header.format_version, 2);
+        assert_eq!(parsed.header.metadata, page.metadata.immutable());
+        let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
+        let start = corrupted
+            .windows(10)
+            .position(|w| w == b"text/plain")
+            .unwrap();
+        corrupted[start] = b'\r';
+        let end = u32::from_le_bytes(corrupted[12..16].try_into().unwrap()) as usize;
+        let digest = Sha256::digest(&corrupted[..end - 32]);
+        corrupted[end - 32..end].copy_from_slice(&digest);
+        assert!(
+            RecordCodec
+                .parse_bytes(&corrupted, encoded.header.extent)
+                .is_err()
+        );
+    }
+
     // Frozen pre-optimization implementation. Keep independent of the new layout
     // and serializer: both regression comparisons and the memory benchmark use it.
     struct LegacyCodec;
@@ -814,7 +888,7 @@ mod tests {
             }
             let mut out = Vec::with_capacity(MAX_HEADER_BYTES);
             out.extend_from_slice(MAGIC);
-            out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&generation.0.to_le_bytes());
             out.extend_from_slice(&metadata.length.to_le_bytes());
@@ -861,7 +935,7 @@ mod tests {
             bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
             Ok(EncodedRecord {
                 header: RecordHeader {
-                    format_version: FORMAT_VERSION,
+                    format_version: 1,
                     generation,
                     envelope: page.ciphertext.envelope().clone(),
                     metadata: page.metadata.immutable(),

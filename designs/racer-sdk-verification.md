@@ -1,6 +1,60 @@
 # Racer SDK verification and measurements
 
-## Gantry-focused simplification
+## Acceptance: VERIFIED, not yet merged (2026-09-28)
+
+All final gates passed for the approved high-throughput rewrite in the
+`tmp/racer-sdk-throughput` worktree. This records acceptance of the tested
+worktree, not a merge or a universal performance guarantee. The current contract
+is [Racer Go SDK](racer-sdk.md); detailed measurements and limitations are in
+[Racer SDK throughput performance](racer-sdk-throughput-performance.md).
+
+Final gate results supplied by the verification owners:
+
+- Full `make fmt` and full `make lint` passed; lint reported zero issues.
+- Aggregate Go race tests passed:
+  `go test -race ./pkg/racersdk ./internal/gantry/... ./cmd/gantry ./cmd/racer-loadgen ./deploy/gantry ./internal/operator/components/gantry`.
+- Rust: 803 passed, 12 opt-in tests ignored. The separate Go/Rust UDS conformance
+  run passed; this does not claim that all ignored tests were run.
+- Actual Kubernetes 1.33 CRD admission: all 28 vectors passed with race testing.
+- The earlier SDK copy benchmark's 90% acceptance threshold passed at all tested
+  sizes. This is separate from mixed-load throughput evidence.
+
+The full `make e2e-racer` gate passed in **410.354s** with current-source images.
+The inspected report is
+`tmp/e2e-final-20260927/merge-gate/REPORT.md:44-97` (completed 2026-09-28 UTC).
+It records production Gantry chart deployment with operator-provisioned Racer,
+containerd pull/unpack and exact object accounting; consumer rejection of full
+and resumed corruption (resume offset **16,777,223**); peer recovery with one
+rejected packet and one origin fallback page; live key rotation, certificate
+renewal, pruning, post-expiry peer use and post-prune disk reuse; and cache UID
+recreation with fresh reusable pages on both nodes without dataplane restart.
+Application and E2E source hashes remained unchanged during that run
+(`REPORT.md:39-42`).
+
+Final unpaced local process-integration runs had zero mixed-load errors,
+admission rejections, or queue timeouts in both cold and warm phases:
+
+| Bulk workers | Warm useful MiB/s | Warm manifest p99 | Warm HEAD p99 |
+| --- | ---: | ---: | ---: |
+| 32 | 2,951.1 | 8.482 ms | 7.781 ms |
+| 64 | 2,653.2 | 25.244 ms | 21.760 ms |
+
+Source: [final unpaced measurements](racer-sdk-throughput-performance.md#final-unpaced-measurements).
+These are workload-specific single-node measurements on a shared host, separate
+from deployed E2E. Deliberate pressure-test rejections are excluded from the
+zero-error mixed phases. The 64-worker warm throughput was lower than the
+historical baseline; no universal speedup, unchanged throughput, or production
+capacity guarantee is implied.
+
+## Historical reports
+
+All results in the remaining sections describe earlier SDK revisions. Their API, transport,
+digest-verification, and Rust implementation statements are historical, including
+the removal of WriteTo and the later statement that Rust was unimplemented.
+They are not current implementation claims or acceptance of the approved
+high-throughput rewrite.
+
+## Historical Gantry-focused simplification
 
 Follow-up on 2026-09-25, based on `e03013e3`:
 

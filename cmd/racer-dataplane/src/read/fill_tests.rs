@@ -223,6 +223,7 @@ fn fixture_with_availability(
         .unwrap(),
     );
     let metadata = ObjectMetadata {
+        content_type: None,
         version: ObjectVersion {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -629,6 +630,166 @@ impl Origin for GatedMetadataOrigin {
         _: &'a RequestScope,
     ) -> Operation<'a, OriginPage> {
         Box::pin(async { panic!("metadata-only refresh") })
+    }
+}
+
+#[test]
+fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
+    use crate::{
+        model::metadata::{ContentType, MetadataSelector},
+        read::metadata::{BootstrapResult, MetadataDependencies, MetadataService},
+    };
+    for with_origin_page in [false, true] {
+        for (cached_type, fresh_type, conflict) in [
+            (Some("text/plain"), Some("text/html"), true),
+            (Some("text/html"), Some("text/plain"), true),
+            (Some("text/plain"), None, false),
+            (None, Some("text/plain"), false),
+            (Some("text/plain"), Some("text/plain"), false),
+            (None, None, false),
+        ] {
+            let mut f = fixture();
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+            let mut cached = drive(
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut budget,
+                ),
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap();
+            // Retain real authenticated buffers with a historical descriptor in
+            // memory, independently of the evictable page-zero catalog.
+            cached.metadata.content_type =
+                cached_type.map(|v| ContentType::parse(v.as_bytes()).unwrap());
+            f.fill
+                .dependencies
+                .memory
+                .remove_cache(&f.context.object.cache)
+                .unwrap();
+            f.fill.dependencies.memory.publish(cached.clone()).unwrap();
+            let index = Rc::new(Index::new(WorkerId(0), 4));
+            index.publish_version(cached.metadata.immutable()).unwrap();
+            assert_eq!(index.evict_metadata(1).unwrap(), 1);
+            assert!(index.version(&f.page.version).unwrap().is_none());
+            assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_some());
+
+            let mut fresh = cached.metadata.clone();
+            fresh.content_type = fresh_type.map(|v| ContentType::parse(v.as_bytes()).unwrap());
+            fresh.expires_at = ExpiresAt::from_unix_millis(1_900_000_000_000).unwrap();
+            let page_zero = if with_origin_page {
+                let reservation = f
+                    .fill
+                    .dependencies
+                    .admission
+                    .reserve(Some(&f.context.object.cache), ResourceClass::Plaintext, 3)
+                    .unwrap();
+                let mut plaintext = f.origin.buffers.plaintext(reservation, 3).unwrap();
+                plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
+                Some(OriginPage {
+                    metadata: fresh.clone(),
+                    plaintext,
+                })
+            } else {
+                None
+            };
+            let (send, receive) = futures::channel::oneshot::channel();
+            let origin = Rc::new(GatedMetadataOrigin {
+                receive: RefCell::new(Some(receive)),
+                calls: Cell::new(0),
+            });
+            let service = MetadataService::new(
+                f.fill.dependencies.candidates.clone(),
+                origin.clone(),
+                f.fill.dependencies.peers.clone(),
+                f.fill.dependencies.credentials.clone(),
+                4,
+                MetadataDependencies {
+                    index: index.clone(),
+                    owners: f.fill.dependencies.metadata_owner.clone(),
+                    fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+                },
+            );
+            send.send(MetadataReply {
+                metadata: fresh.clone(),
+                page_zero,
+            })
+            .ok()
+            .unwrap();
+            let result = drive(
+                service.bootstrap(
+                    MetadataSelector::Fresh,
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                ),
+                &mut f.engine,
+                &f.crypto,
+            );
+            if conflict {
+                assert!(
+                    matches!(result, Err(Error::CorruptRecord)),
+                    "{cached_type:?} -> {fresh_type:?}, origin page={with_origin_page}"
+                );
+                if with_origin_page {
+                    assert!(
+                        index.version(&f.page.version).unwrap().is_none(),
+                        "conflicting bootstrap must fail before catalog publication"
+                    );
+                }
+            } else {
+                let BootstrapResult::Page(result) = result.unwrap() else {
+                    panic!("nonempty bootstrap")
+                };
+                let expected = fresh
+                    .content_type
+                    .clone()
+                    .or_else(|| cached.metadata.content_type.clone());
+                assert_eq!(result.metadata.content_type, expected);
+                assert_eq!(result.metadata.expires_at, fresh.expires_at);
+                assert!(Arc::ptr_eq(
+                    &result.plaintext.inner,
+                    &cached.plaintext.inner
+                ));
+                assert!(Arc::ptr_eq(
+                    &result.ciphertext.inner,
+                    &cached.ciphertext.inner
+                ));
+                assert_eq!(result.plaintext.bytes(), b"abc");
+                if with_origin_page {
+                    assert_eq!(
+                        index
+                            .version(&f.page.version)
+                            .unwrap()
+                            .unwrap()
+                            .content_type,
+                        expected
+                    );
+                }
+            }
+            assert_eq!(origin.calls.get(), 1);
+            assert_eq!(
+                f.origin.calls.get(),
+                1,
+                "cached page must not be reacquired"
+            );
+            assert_eq!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .get(&f.page)
+                    .unwrap()
+                    .unwrap()
+                    .metadata,
+                cached.metadata,
+                "refresh must not rewrite historical page metadata"
+            );
+            assert_eq!(super::super::drivers::pending(), 0);
+        }
     }
 }
 

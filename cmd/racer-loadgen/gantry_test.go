@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -40,7 +41,10 @@ func TestGantryIntegration(t *testing.T) {
 	layerPath := "/v2/" + img.repository + "/blobs/" + layer.Digest.String()
 	registry := img.handler()
 
-	var rejectContinuation atomic.Bool
+	var (
+		rejectContinuation atomic.Bool
+		corrupt            atomic.Bool
+	)
 
 	var mu sync.Mutex
 
@@ -53,7 +57,7 @@ func TestGantryIntegration(t *testing.T) {
 			ranges[rangeHeader]++
 			mu.Unlock()
 
-			if rejectContinuation.Load() && rangeHeader != "" {
+			if rejectContinuation.Load() && rangeHeader != fmt.Sprintf("bytes=0-%d", page-1) {
 				http.Error(w, "injected origin failure", http.StatusServiceUnavailable)
 				return
 			}
@@ -81,7 +85,19 @@ func TestGantryIntegration(t *testing.T) {
 
 	client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		callbacks.Add(1)
-		return callback(ctx, req)
+
+		metadata, body, err := callback(ctx, req)
+		if err == nil && body != nil && corrupt.Load() {
+			var first [1]byte
+			if _, readErr := io.ReadFull(body, first[:]); readErr != nil {
+				return metadata, body, readErr
+			}
+
+			first[0] ^= 0xff
+			body = &corruptBody{Reader: io.MultiReader(bytes.NewReader(first[:]), body), Closer: body}
+		}
+
+		return metadata, body, err
 	})
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
@@ -99,6 +115,7 @@ func TestGantryIntegration(t *testing.T) {
 		mu.Unlock()
 		callbacks.Store(0)
 		rejectContinuation.Store(false)
+		corrupt.Store(false)
 
 		return pullTestNew(t, img, opts)
 	}
@@ -113,10 +130,7 @@ func TestGantryIntegration(t *testing.T) {
 				continue
 			}
 
-			header := ""
-			if i != 0 {
-				header = fmt.Sprintf("bytes=%d-", int64(i)*page)
-			}
+			header := fmt.Sprintf("bytes=%d-%d", int64(i)*page, int64(i+1)*page-1)
 
 			want[header] = count
 		}
@@ -172,19 +186,53 @@ func TestGantryIntegration(t *testing.T) {
 		require.Equal(t, layer.Size-offset, resp.ContentLength)
 
 		before := testutil.ToFloat64(metrics.receivedBytes)
-		n, actual, err := p.readBody(resp.Body)
+		assembled := sha256.New()
+		_, err = io.Copy(assembled, io.NewSectionReader(img.blobs[layer.Digest].data, 0, offset))
+		require.NoError(t, err)
+		n, actual, err := p.readBody(io.TeeReader(resp.Body, assembled))
 		require.NoError(t, err)
 		require.Equal(t, layer.Size-offset, n)
+		require.Equal(t, layer.Digest.String(), fmt.Sprintf("sha256:%x", assembled.Sum(nil)), "consumer must verify the complete resumed object")
 
 		want := sha256.New()
 		_, err = io.Copy(want, io.NewSectionReader(img.blobs[layer.Digest].data, offset, n))
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("sha256:%x", want.Sum(nil)), actual)
 		require.Equal(t, float64(n), testutil.ToFloat64(metrics.receivedBytes)-before)
-		// Gantry verifies the skipped prefix too, so resume still fetches all
-		// three pages through the adapter instead of bypassing Racer.
+		// Stat selects metadata once; Get reuses its snapshot and fetches only
+		// the two requested pages, never page zero.
 		require.Equal(t, int64(3), callbacks.Load())
-		assertRanges(t, 1, 1, 1)
+		assertRanges(t, 0, 1, 1)
+	})
+
+	t.Run("body-free HEAD", func(t *testing.T) {
+		p, _ := newPull(t)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodHead, server.URL+layerPath+"?ns="+opts.Namespace, nil)
+		require.NoError(t, err)
+		resp, err := p.client.Do(req)
+		require.NoError(t, err)
+
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Empty(t, body)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, layer.Size, resp.ContentLength)
+		require.Equal(t, int64(1), callbacks.Load())
+		assertRanges(t, 0, 0, 0)
+	})
+
+	t.Run("consumer rejects transported corruption", func(t *testing.T) {
+		p, metrics := newPull(t)
+		require.True(t, p.opts.Verify, "consumer verification must remain enabled")
+		corrupt.Store(true)
+
+		err := p.pull(t.Context())
+		require.ErrorContains(t, err, "digest mismatch")
+		require.Equal(t, float64(img.Manifest.Size), testutil.ToFloat64(metrics.receivedBytes), "mirror must deliver the complete corrupt object")
+		require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
+		require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues("error")))
 	})
 
 	t.Run("origin continuation failure reaches puller", func(t *testing.T) {
@@ -204,4 +252,9 @@ func TestGantryIntegration(t *testing.T) {
 		require.Equal(t, int64(4), callbacks.Load(), "failed page must not be retried or bypassed")
 		assertRanges(t, 1, 1, 0)
 	})
+}
+
+type corruptBody struct {
+	io.Reader
+	io.Closer
 }

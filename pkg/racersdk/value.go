@@ -11,12 +11,13 @@ import (
 
 const copyBufferSize = 32 * 1024
 
-// Value is a full immutable object stream. One goroutine may consume it using
-// Read (including through io.Copy); Metadata and Close may be called
+// Value is an immutable full-object or selected-range stream. One goroutine may
+// consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
 // concurrently. A Value must not be copied. Construct it with Client.Get.
 type Value struct {
 	mu        sync.Mutex
 	client    *Client
+	pool      *connectionPool
 	ctx       context.Context
 	cancel    context.CancelFunc
 	stop      func() bool
@@ -28,6 +29,7 @@ type Value struct {
 	request   OriginRequest
 	remaining int64
 	offset    int64
+	end       int64
 }
 
 // Metadata returns the initial total-size/tag/expiry snapshot, never a remaining
@@ -84,7 +86,7 @@ func (v *Value) finish(err error) {
 
 	if v.client != nil {
 		if slot {
-			<-v.client.slots
+			<-v.pool.slots
 		}
 
 		v.client.mu.Lock()
@@ -94,7 +96,7 @@ func (v *Value) finish(err error) {
 }
 
 // Read copies directly from the current HTTP body into p. Once bootstrap is
-// consumed, it lazily opens pinned ranges of at most one page each.
+// consumed, it lazily opens one pinned range through the selected end.
 // A terminal error preserves partial byte counts and never restarts the version.
 func (v *Value) Read(p []byte) (int, error) {
 	if err := v.err(); err != nil {
@@ -121,7 +123,7 @@ func (v *Value) Read(p []byte) (int, error) {
 		v.mu.Unlock()
 		closeBody(body)
 
-		if v.offset == int64(v.metadata.Size) {
+		if v.offset == v.end {
 			v.finish(io.EOF)
 			return 0, v.err()
 		}
@@ -130,7 +132,7 @@ func (v *Value) Read(p []byte) (int, error) {
 		r := v.request
 		v.mu.Unlock()
 		r.operation, r.pin = OperationPinned, v.metadata.ETag
-		length := min(int64(PageSize), int64(v.metadata.Size)-v.offset)
+		length := v.end - v.offset
 		r.byteRange = Range{present: true, first: uint64(v.offset), last: uint64(v.offset + length - 1)}
 
 		_, length, err := v.open(r, &v.metadata)
@@ -186,4 +188,93 @@ func (v *Value) Read(p []byte) (int, error) {
 func (v *Value) Close() error {
 	v.finish(failure(ErrorClosed, "value", nil))
 	return nil
+}
+
+// WriteTo streams into w using 32 KiB scratch without invoking w.ReadFrom.
+// The returned count includes only bytes accepted by w. The caller must still
+// Close, including on writer failure. Copy buffers are bounded independently to
+// MaxConnections for bulk and SmallObjectConnections for small objects per client,
+// including canceled copies still blocked in caller-owned Write.
+// If those blocked writers exhaust scratch admission, WriteTo returns
+// ErrorUnavailable. Cancellation cannot interrupt an arbitrary destination Write.
+func (v *Value) WriteTo(w io.Writer) (int64, error) {
+	if _, err := v.Read(nil); err != nil {
+		if err == io.EOF {
+			return 0, nil
+		}
+
+		return 0, err
+	}
+
+	c := v.client
+
+	slots, buffers := c.copySlots, c.copyBuffers
+	if v.pool == &c.smallPool {
+		slots, buffers = c.smallCopySlots, c.smallCopyBuffers
+	}
+
+	select {
+	case slots <- struct{}{}:
+	default:
+		return 0, failure(ErrorUnavailable, "copy capacity", nil)
+	}
+
+	var buf *[copyBufferSize]byte
+	select {
+	case buf = <-buffers:
+	default:
+		buf = new([copyBufferSize]byte)
+	}
+
+	defer func() {
+		c.mu.Lock()
+		if !c.closed {
+			buffers <- buf
+		}
+		c.mu.Unlock()
+		<-slots
+	}()
+
+	var written int64
+
+	empty := 0
+
+	for {
+		n, readErr := v.Read(buf[:])
+		if n > 0 {
+			empty = 0
+
+			nw, writeErr := w.Write(buf[:n])
+			if nw < 0 || nw > n {
+				nw = 0
+
+				if writeErr == nil {
+					writeErr = io.ErrShortWrite
+				}
+			}
+
+			written += int64(nw)
+			if writeErr != nil {
+				return written, writeErr
+			}
+
+			if nw != n {
+				return written, io.ErrShortWrite
+			}
+		} else if readErr == nil {
+			empty++
+			if empty == 100 {
+				v.finish(ioFailure("copy", io.ErrNoProgress))
+				return written, v.err()
+			}
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				return written, nil
+			}
+
+			return written, readErr
+		}
+	}
 }

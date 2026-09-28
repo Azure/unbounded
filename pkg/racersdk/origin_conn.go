@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -75,7 +74,7 @@ func (c *originConn) Read(p []byte) (int, error) {
 			}
 		}
 
-		raw, err := readRawHead(c.reader, false)
+		raw, err := readHeadBytes(c.reader, false)
 		at := time.Now()
 
 		var request OriginRequest
@@ -90,17 +89,7 @@ func (c *originConn) Read(p []byte) (int, error) {
 				return 0, err
 			}
 
-			closeRequested := false
-
-			for _, value := range headHeaders(raw).Values("Connection") {
-				for _, token := range strings.Split(value, ",") {
-					if strings.EqualFold(strings.TrimSpace(token), "close") {
-						closeRequested = true
-					}
-				}
-			}
-
-			if closeRequested {
+			if connectionClose(headHeaders(raw)) {
 				c.head = append(c.head[:len(c.head)-2], []byte("Connection: close\r\n\r\n")...)
 			}
 		} else {

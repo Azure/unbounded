@@ -132,7 +132,7 @@ func TestClientStreamingTranscript(t *testing.T) {
 				} else {
 					first = int64(call-1) * int64(PageSize)
 
-					length = min(int64(PageSize), size-first)
+					length = size - first
 					if r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes="+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10) {
 						t.Error("continuation")
 					}
@@ -165,7 +165,10 @@ func TestClientStreamingTranscript(t *testing.T) {
 				t.Fatal("EOF lost", err)
 			}
 
-			want := int32(max(1, (size+int64(PageSize)-1)/int64(PageSize)))
+			want := int32(1)
+			if size > int64(PageSize) {
+				want = 2
+			}
 
 			if calls.Load() != want {
 				t.Fatal("request count", calls.Load())
@@ -384,23 +387,24 @@ func TestClientContinuationFailures(t *testing.T) {
 				t.Run(mode, func(t *testing.T) {
 					var calls atomic.Int32
 
-					first := prefixPages * int64(PageSize)
-					size := first + 2
+					first := int64(PageSize)
+					size := prefixPages*int64(PageSize) + 2
+					remainder := size - first
 
 					path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 						call := calls.Add(1)
-						if int64(call) <= prefixPages {
-							streamResponse(w, int64(call-1)*int64(PageSize), int64(PageSize), size, `"v"`)
+						if call == 1 {
+							streamResponse(w, 0, int64(PageSize), size, `"v"`)
 							return
 						}
 
 						switch mode {
 						case "pin":
-							streamResponse(w, first, 2, size, `"other"`)
+							streamResponse(w, first, remainder, size, `"other"`)
 						case "size":
-							streamResponse(w, first, 2, size+1, `"v"`)
+							streamResponse(w, first, remainder, size+1, `"v"`)
 						case "range":
-							streamResponse(w, first-1, 2, size, `"v"`)
+							streamResponse(w, first-1, remainder, size, `"v"`)
 						case "length":
 							w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(size-1, 10)+"/"+strconv.FormatInt(size, 10))
 							w.Header().Set("Content-Length", "1")
@@ -415,7 +419,7 @@ func TestClientContinuationFailures(t *testing.T) {
 							w.Header().Set("Content-Length", "0")
 							w.WriteHeader(status)
 						case "short", "empty":
-							streamResponseHead(w, first, 2, size, `"v"`)
+							streamResponseHead(w, first, remainder, size, `"v"`)
 
 							if mode == "short" {
 								_, _ = w.Write([]byte("x"))
@@ -430,7 +434,7 @@ func TestClientContinuationFailures(t *testing.T) {
 					}
 
 					n, err := io.Copy(io.Discard, v)
-					if err == nil || n < first || int64(calls.Load()) != prefixPages+1 {
+					if err == nil || n < first || calls.Load() != 2 {
 						t.Fatalf("failure %d %v", n, err)
 					}
 
@@ -455,7 +459,7 @@ func TestClientContinuationFailures(t *testing.T) {
 						t.Fatal("invalid response bytes exposed", n)
 					}
 
-					if next, terminal := v.Read(make([]byte, 1)); next != 0 || terminal != err || int64(calls.Load()) != prefixPages+1 {
+					if next, terminal := v.Read(make([]byte, 1)); next != 0 || terminal != err || calls.Load() != 2 {
 						t.Fatal("failure was not terminal", next, terminal)
 					}
 
@@ -524,6 +528,11 @@ func TestClientContinuationCloseAndContext(t *testing.T) {
 }
 
 func TestClientConfigAndValidation(t *testing.T) {
+	for _, config := range []ClientConfig{{Cache: CacheName{value: "test"}, MetadataConnections: -1}, {Cache: CacheName{value: "test"}, MaxQueuedRequests: -1}, {Cache: CacheName{value: "test"}, QueueTimeout: -1}} {
+		_, err := NewClient(config)
+		assertKind(t, err, ErrorInvalidArgument)
+	}
+
 	for _, config := range []ClientConfig{{}, {Cache: CacheName{value: "test"}, MaxConnections: -1}, {Cache: CacheName{value: "test"}, DialTimeout: -1}, {Cache: CacheName{value: "test"}, ResponseHeaderTimeout: -1}, {Cache: CacheName{value: "test"}, IdleConnTimeout: -1}} {
 		_, err := NewClient(config)
 		assertKind(t, err, ErrorInvalidArgument)

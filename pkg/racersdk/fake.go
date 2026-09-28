@@ -117,9 +117,10 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 	}
 
 	slots := make(chan struct{}, config.MaxConcurrentRequests)
+	headSlots := make(chan struct{}, config.MaxConcurrentHeadRequests)
 
 	originAddress, err := start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveOperation(w, r, config, origin, slots)
+		serveOperation(w, r, config, origin, slots, headSlots)
 	}), true)
 	if err != nil {
 		cleanup()
@@ -154,13 +155,18 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 
 // fakePage uses the wire validators as well as the actual origin server. The
 // response head is reconstructed from net/http only on this private fake hop;
-// Client still validates raw bytes on its ordinary responseConn path.
+// Client still validates raw bytes on its ordinary direct streaming path.
 func fakePage(ctx context.Context, transport *http.Transport, request OriginRequest, snapshot *Metadata) (*http.Response, wireResponse, error) {
 	if err := validateRequest(request); err != nil {
 		return nil, wireResponse{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://racer"+objectPrefix+request.key.String(), nil)
+	method := http.MethodGet
+	if request.operation == OperationHead {
+		method = http.MethodHead
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, "http://racer"+objectPrefix+request.key.String(), nil)
 	if err != nil {
 		return nil, wireResponse{}, err
 	}
@@ -200,14 +206,15 @@ func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Tran
 	raw.WriteString("\r\n")
 
 	request, err := parseRequestHead(raw.Bytes(), false)
-	if err != nil || request.operation == OperationHead {
+	if err != nil {
 		writeOriginErrorResponse(w, 400, Metadata{})
 		return
 	}
 
 	page := request
 	if page.operation == OperationPinned {
-		page.byteRange.last = min(page.byteRange.last, nominalPageEnd(page.byteRange.first))
+		page.byteRange.first = page.byteRange.first / uint64(PageSize) * uint64(PageSize)
+		page.byteRange.last = nominalPageEnd(page.byteRange.first)
 	}
 
 	var snapshot *Metadata
@@ -275,7 +282,26 @@ func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Tran
 			snapshot = &response.metadata
 		}
 
-		_, err = io.CopyBuffer(w, res.Body, buffer)
+		if request.operation == OperationHead {
+			closeBody(res.Body)
+			return
+		}
+
+		if request.operation == OperationPinned {
+			first, last := max(uint64(response.first), request.byteRange.first), min(uint64(response.last), request.byteRange.last)
+
+			_, err = io.CopyN(io.Discard, res.Body, int64(first-uint64(response.first)))
+			if err == nil {
+				_, err = io.CopyBuffer(w, io.LimitReader(res.Body, int64(last-first+1)), buffer)
+			}
+
+			if err == nil {
+				_, err = io.CopyBuffer(io.Discard, res.Body, buffer)
+			}
+		} else {
+			_, err = io.CopyBuffer(w, res.Body, buffer)
+		}
+
 		closeBody(res.Body)
 
 		if err != nil {
@@ -291,6 +317,6 @@ func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Tran
 		}
 
 		page.byteRange.first = uint64(response.last) + 1
-		page.byteRange.last = min(request.byteRange.last, nominalPageEnd(page.byteRange.first))
+		page.byteRange.last = nominalPageEnd(page.byteRange.first)
 	}
 }

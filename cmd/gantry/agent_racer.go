@@ -26,7 +26,7 @@ import (
 const racerShutdownBudget = 10 * time.Second
 
 type racerAgentClient interface {
-	Get(context.Context, racersdk.Request) (*racersdk.Value, error)
+	mirror.RacerClient
 	Close() error
 }
 
@@ -46,7 +46,7 @@ func runRacerAgent(c *config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("racer cache: %w", err)
 	}
 
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: cache})
+	client, err := racersdk.NewClient(racerClientConfig(c, cache))
 	if err != nil {
 		return fmt.Errorf("racer client: %w", err)
 	}
@@ -61,7 +61,12 @@ func runRacerAgent(c *config.Config, logger *slog.Logger) error {
 func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger, cache racersdk.CacheName, deps racerAgentDeps) (retErr error) {
 	defer func() { retErr = errors.Join(retErr, deps.client.Close()) }()
 
-	originClient, err := origin.New(c, origin.WithLogger(logger))
+	reg := metrics.New()
+	reg.RegisterDefaultCollectors()
+	telemetry := newRacerMetrics(reg, deps.client)
+
+	originClient, err := origin.New(c, origin.WithLogger(logger),
+		origin.WithRequestMetrics(telemetry.originRequest), origin.WithByteMetrics(telemetry.originBytes))
 	if err != nil {
 		return fmt.Errorf("racer origin client: %w", err)
 	}
@@ -75,7 +80,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	go func() {
 		defer close(originDone)
 
-		originErr = deps.serveOrigin(originCtx, racersdk.OriginConfig{Cache: cache}, racer.Origin(c, originClient))
+		originErr = deps.serveOrigin(originCtx, racerOriginConfig(c, cache), racer.Origin(c, originClient))
 	}()
 
 	mirrorSrv := mirror.New(c, nil, originClient,
@@ -121,14 +126,11 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	}
 	// Own the HTTP server so serve failures propagate and timed-out drains can
 	// force-close connections, including requests blocked in the SDK.
-	mirrorHTTP := &http.Server{Handler: mirrorSrv.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	mirrorHTTP := &http.Server{Handler: mirror.RacerHTTPHandler(mirrorSrv.Handler(), c.RacerWriteTimeout, telemetry.mirrorResponse), ReadHeaderTimeout: 5 * time.Second}
 	servers = append(servers, mirrorHTTP)
 	mirrorErrors := make(chan error, 1)
 
 	go func() { mirrorErrors <- mirrorHTTP.Serve(listener) }()
-
-	reg := metrics.New()
-	reg.RegisterDefaultCollectors()
 
 	readyCheck := func() (string, bool) {
 		select {
@@ -228,4 +230,22 @@ func probeRacerSocket(ctx context.Context, path string) error {
 	}
 
 	return conn.Close()
+}
+
+func racerClientConfig(c *config.Config, cache racersdk.CacheName) racersdk.ClientConfig {
+	return racersdk.ClientConfig{
+		Cache: cache, MaxConnections: c.RacerMaxConnections,
+		MetadataConnections: c.RacerMetadataConnections, MaxQueuedRequests: c.RacerMaxQueuedRequests,
+		MetadataQueuedRequests: c.RacerMetadataQueuedRequests,
+		SmallObjectConnections: c.RacerSmallObjectConnections, SmallObjectQueuedRequests: c.RacerSmallObjectQueuedRequests,
+		QueueTimeout: c.RacerQueueTimeout, ResponseHeaderTimeout: c.RacerResponseHeaderTimeout,
+	}
+}
+
+func racerOriginConfig(c *config.Config, cache racersdk.CacheName) racersdk.OriginConfig {
+	return racersdk.OriginConfig{
+		Cache: cache, MaxConnections: c.RacerOriginMaxConnections,
+		MaxConcurrentRequests: c.RacerOriginConcurrentRequests, RequestTimeout: c.RacerOriginRequestTimeout,
+		MaxConcurrentHeadRequests: c.RacerOriginConcurrentHeadRequests,
+	}
 }

@@ -453,6 +453,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     );
     let calls = Rc::new(Cell::new(0));
     let metadata = ObjectMetadata {
+        content_type: Some(
+            crate::model::metadata::ContentType::parse(
+                b"application/vnd.oci.image.manifest.v1+json",
+            )
+            .unwrap(),
+        ),
         version: ObjectVersion {
             object: object.clone(),
             etag: StrongEtag::parse(b"\"remote\"").unwrap(),
