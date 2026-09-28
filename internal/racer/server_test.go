@@ -271,6 +271,95 @@ func TestHTTPSBootstrapBoundsAndErrors(t *testing.T) {
 	}
 }
 
+func TestHTTPRoutesBeforeReadinessAndTLS(t *testing.T) {
+	f := newServingFixture(t)
+	handler := f.a.Server.Handler()
+
+	for _, ready := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ready=%t", ready), func(t *testing.T) {
+			f.a.Lifecycle.SetServingReady(ready)
+
+			for _, tc := range []struct {
+				method, path string
+				valid        bool
+			}{
+				{http.MethodPost, wire.BootstrapPath, true},
+				{http.MethodGet, wire.SnapshotPath, true},
+				{http.MethodGet, wire.BootstrapPath, false},
+				{http.MethodPost, wire.SnapshotPath, false},
+				{http.MethodHead, wire.BootstrapPath, false},
+				{http.MethodHead, wire.SnapshotPath, false},
+				{http.MethodOptions, wire.BootstrapPath, false},
+				{http.MethodOptions, wire.SnapshotPath, false},
+				{http.MethodPost, "/unknown", false},
+				{http.MethodGet, "/unknown", false},
+				{http.MethodPost, "/v1/%62ootstrap", false},
+				{http.MethodGet, "/v1/%73napshot", false},
+			} {
+				t.Run(tc.method+tc.path, func(t *testing.T) {
+					r := httptest.NewRequest(tc.method, tc.path, nil)
+					w := httptest.NewRecorder()
+					handler.ServeHTTP(w, r)
+
+					wantStatus, wantCode := http.StatusBadRequest, wire.InvalidRequest
+					if tc.valid {
+						wantStatus, wantCode = http.StatusServiceUnavailable, wire.Unavailable
+						if ready {
+							wantStatus, wantCode = http.StatusUnauthorized, wire.Unauthenticated
+						}
+					}
+
+					body := responseBody(t, w.Result(), nil, wantStatus)
+					if string(body) != fmt.Sprintf(`{"code":%q}`, wantCode) {
+						t.Fatalf("response %s, want code %s", body, wantCode)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestHTTPFailureResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		status     int
+		code       wire.ErrorCode
+		retryAfter string
+	}{
+		{"invalid request", wire.InvalidRequest, http.StatusBadRequest, wire.InvalidRequest, ""},
+		{"unauthenticated", wire.Unauthenticated, http.StatusUnauthorized, wire.Unauthenticated, ""},
+		{"forbidden", wire.Forbidden, http.StatusForbidden, wire.Forbidden, ""},
+		{"conflict", wire.Conflict, http.StatusConflict, wire.Conflict, ""},
+		{"too large", wire.TooLarge, http.StatusRequestEntityTooLarge, wire.TooLarge, ""},
+		{"unsupported version", wire.UnsupportedVersion, http.StatusUpgradeRequired, wire.UnsupportedVersion, ""},
+		{"overloaded", wire.Overloaded, http.StatusTooManyRequests, wire.Overloaded, "1"},
+		{"unavailable", wire.Unavailable, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"wrapped protocol error", fmt.Errorf("internal detail: %w", wire.Forbidden), http.StatusForbidden, wire.Forbidden, ""},
+		{"unknown protocol error", wire.ErrorCode("unknown"), http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"nonprotocol error", io.ErrUnexpectedEOF, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+		{"nil error", nil, http.StatusServiceUnavailable, wire.Unavailable, "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeFailure(w, tc.err)
+
+			body := responseBody(t, w.Result(), nil, tc.status)
+			if string(body) != fmt.Sprintf(`{"code":%q}`, tc.code) {
+				t.Fatalf("response %s, want code %s", body, tc.code)
+			}
+
+			if got := w.Header().Get("Retry-After"); got != tc.retryAfter {
+				t.Fatalf("Retry-After %q, want %q", got, tc.retryAfter)
+			}
+
+			if w.Header().Get("Content-Type") != "application/json" || w.Header().Get("Cache-Control") != "no-store" || !w.Flushed {
+				t.Fatal("failure response headers or flush missing")
+			}
+		})
+	}
+}
+
 func (f *servingFixture) signLeaf(t *testing.T, mutate func(*x509.Certificate)) tls.Certificate {
 	t.Helper()
 	_, _, rotation, material := keyState(t, f.a.Keyring)
