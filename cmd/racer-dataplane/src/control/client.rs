@@ -750,13 +750,10 @@ impl ControlClient {
             .map(|p| p.snapshot.sequence)
             .or(self.snapshots.cursor()?);
         let polled = self.poll(SnapshotRequest { after }, scope).await;
-        // A deleted UID may disappear from the controller's informer index and
-        // yield 503 indefinitely. Recheck via token enrollment on the next bounded
-        // retry rather than waiting for the old certificate's renewal deadline.
-        if matches!(polled, Err(Error::Unavailable | Error::Unauthorized)) {
-            self.binding_check.set(true);
-        }
+        // A lagging replica's 503 does not invalidate the accepted Node binding.
+        // Explicit authentication rejection still triggers bounded enrollment.
         if matches!(polled, Err(Error::Unauthorized)) {
+            self.binding_check.set(true);
             return Err(Error::Unavailable);
         }
         match polled? {
@@ -925,6 +922,118 @@ mod tests {
             Rc::new(SnapshotStore::new(cluster, Arc::new(PublishedState), 2)),
             Rc::new(CacheRegistry),
         )
+    }
+    #[test]
+    fn lagging_replica_retries_preserve_state_without_enrollment() {
+        use super::super::transport::tests::{FixtureIo, scripted_server};
+        use futures::executor::block_on;
+        for pending in [false, true] {
+            let d = testing::Directory::new();
+            let mut client = client(&d);
+            let (ca, key) = testing::ca();
+            client
+                .enrollment
+                .set_peer_trust_roots(vec![ca.der().to_vec()])
+                .unwrap();
+            let request = client.enrollment.prepare_now().unwrap();
+            let identity = client
+                .enrollment
+                .accept_response(testing::issue(
+                    &request,
+                    &ca,
+                    &key,
+                    "22222222-2222-4222-8222-222222222222",
+                ))
+                .unwrap();
+            assert!(!identity.renewal_due());
+            *client.identity.borrow_mut() = Some(identity.clone());
+            client.started.set(true);
+            let mut publication =
+                wire::decode_publication(include_bytes!("testdata/publication.json")).unwrap();
+            publication.sequence = wire::PublicationSequence(10);
+            let accepted = client.snapshots.publish(publication.clone()).unwrap();
+            let cursor = if pending {
+                publication.sequence = wire::PublicationSequence(11);
+                *client.pending.borrow_mut() = Some(Rc::new(
+                    client.snapshots.prepare(publication.clone()).unwrap(),
+                ));
+                11
+            } else {
+                10
+            };
+            let prepared = client.pending.borrow().clone();
+            let path = format!("{}?after={cursor}", wire::SNAPSHOT_PATH);
+            publication.sequence = wire::PublicationSequence(12);
+            let mut rollback = publication.clone();
+            rollback.sequence = wire::PublicationSequence(9);
+            let (endpoint, server) = scripted_server(
+                &d,
+                &ca,
+                &key,
+                vec![
+                    vec![(path.clone(), 503, br#"{"code":"unavailable"}"#.to_vec())],
+                    vec![(path.clone(), 429, br#"{"code":"overloaded"}"#.to_vec())],
+                    vec![
+                        (path.clone(), 204, vec![]),
+                        (path, 200, wire::encode_publication(&publication).unwrap()),
+                        (
+                            format!("{}?after=12", wire::SNAPSHOT_PATH),
+                            200,
+                            wire::encode_publication(&rollback).unwrap(),
+                        ),
+                    ],
+                ],
+            );
+            client.transport = ControlTransport::new(endpoint);
+            client.attach_io(Rc::new(FixtureIo));
+            let scope = testing::scope();
+            for error in [Error::Unavailable, Error::Overloaded] {
+                assert_eq!(block_on(client.poll_publication(&scope)), Err(error));
+                assert_eq!(
+                    client.snapshots.cursor().unwrap(),
+                    Some(wire::PublicationSequence(10))
+                );
+                assert!(Arc::ptr_eq(&accepted, &client.snapshots.current().unwrap()));
+                if let Some(prepared) = &prepared {
+                    assert!(Rc::ptr_eq(
+                        prepared,
+                        client.pending.borrow().as_ref().unwrap()
+                    ));
+                } else {
+                    assert!(client.pending.borrow().is_none());
+                }
+                let before = Instant::now();
+                assert!(client.backoff().unwrap() >= before + Duration::from_secs(1));
+                // No token or async enrollment adapter exists in this fixture.
+                // A spurious binding recheck would fail instead of returning Ok.
+                assert_eq!(block_on(client.renew_if_due(&scope)), Ok(()));
+                assert_eq!(client.renewal_error(), None);
+                assert!(!d.0.join("identity/pending.json").exists());
+                assert_eq!(
+                    client.identity().unwrap().certificate_chain(),
+                    identity.certificate_chain()
+                );
+            }
+            assert_eq!(block_on(client.poll_publication(&scope)), Ok(()));
+            assert!(Arc::ptr_eq(&accepted, &client.snapshots.current().unwrap()));
+            assert_eq!(block_on(client.poll_publication(&scope)), Ok(()));
+            assert_eq!(
+                client.snapshots.cursor().unwrap(),
+                Some(wire::PublicationSequence(12))
+            );
+            assert!(client.pending.borrow().is_none());
+            assert_eq!(
+                block_on(client.poll_publication(&scope)),
+                Err(Error::Replay)
+            );
+            assert!(!transient(Error::Replay));
+            assert_eq!(
+                client.snapshots.cursor().unwrap(),
+                Some(wire::PublicationSequence(12))
+            );
+            client.transport.close_idle();
+            server.join().unwrap();
+        }
     }
     #[test]
     fn changed_binding_latches_restart_across_abandoned_or_failed_persistence() {
