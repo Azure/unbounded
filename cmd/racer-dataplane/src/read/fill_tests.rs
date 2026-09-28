@@ -1,4 +1,6 @@
 use super::*;
+#[path = "hot_read_tests.rs"]
+mod hot_reads;
 #[path = "fill_peer_tests.rs"]
 mod peer_copies;
 use crate::{
@@ -376,6 +378,171 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 }
 
 #[test]
+fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
+    use crate::model::range::PAGE_BYTES;
+    use std::num::NonZeroUsize;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = NonZeroUsize::new(3 * (PAGE_BYTES as usize + 16)).unwrap();
+    let mut source = fixture_with(8 * PAGE_BYTES, Some(limits.clone()));
+    let mut target = fixture_with(8 * PAGE_BYTES, Some(limits));
+    for number in 0..8 {
+        let page = PageId {
+            version: source.page.version.clone(),
+            number: PageNumber(number),
+        };
+        let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
+        let received = drive(
+            source.fill.acquire(
+                page.clone(),
+                source.membership.clone(),
+                &source.context,
+                &source.scope,
+                &mut budget,
+            ),
+            &mut source.engine,
+            &source.crypto,
+        )
+        .unwrap();
+        // Hold an alias to model a transport completion owner. Rehoming must not
+        // revoke its bytes/charge, even when a copy is necessary.
+        let canceled = RequestScope::new(target.scope.request, target.scope.deadline.0).unwrap();
+        canceled.cancel().unwrap();
+        assert!(matches!(
+            drive(
+                target.fill.accept_selected(received.copy(), &canceled),
+                &mut target.engine,
+                &target.crypto
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(target.fill.metrics.count(Event::PeerHit), number);
+        let copy = received.copy();
+        let result = drive(
+            target.fill.accept_selected(copy, &target.scope),
+            &mut target.engine,
+            &target.crypto,
+        )
+        .unwrap();
+        assert!(
+            target
+                .fill
+                .dependencies
+                .admission
+                .owns(&result.plaintext.inner.reservation)
+        );
+        assert!(
+            target
+                .fill
+                .dependencies
+                .admission
+                .owns(&result.ciphertext.inner.reservation)
+        );
+        assert_eq!(result.ciphertext.bytes(), received.ciphertext.bytes());
+        assert_eq!(result.plaintext.bytes()[0], number as u8);
+        assert_eq!(target.fill.metrics.count(Event::PeerHit), number + 1);
+        assert_eq!(target.fill.metrics.count(Event::OriginFill), 0);
+        drop((received, result));
+        source.fill.dependencies.flights.poll_budgeted(128).unwrap();
+        source.fill.dependencies.writer.discard_unsubmitted();
+        source
+            .fill
+            .dependencies
+            .memory
+            .remove_cache(&source.context.object.cache)
+            .unwrap();
+        source.fill.dependencies.admission.reclaim_buffers();
+        assert_eq!(
+            source
+                .fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext),
+            0
+        );
+        // Previously this source reservation failed while the remote owner held
+        // an idle page. No target eviction should be required to free the source.
+        assert!(
+            source
+                .fill
+                .reserve_bootstrap(&source.context.object.cache)
+                .is_ok()
+        );
+        assert!(
+            target
+                .fill
+                .dependencies
+                .memory
+                .get(&page)
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert_eq!(source.origin.calls.get(), 8);
+    assert_eq!(target.origin.calls.get(), 0);
+}
+
+#[test]
+fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
+    let mut source = fixture();
+    let target = fixture();
+    let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
+    let page = drive(
+        source.fill.acquire(
+            source.page.clone(),
+            source.membership.clone(),
+            &source.context,
+            &source.scope,
+            &mut budget,
+        ),
+        &mut source.engine,
+        &source.crypto,
+    )
+    .unwrap();
+    assert!(matches!(
+        target.fill.dependencies.memory.publish(page.clone()),
+        Err(Error::InvalidConfiguration)
+    ));
+    target
+        .fill
+        .dependencies
+        .memory
+        .publish_handoff(page.clone())
+        .unwrap();
+    let retained = target
+        .fill
+        .dependencies
+        .memory
+        .get(&source.page)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &page.plaintext.inner,
+        &retained.plaintext.inner
+    ));
+    assert!(Arc::ptr_eq(
+        &page.ciphertext.inner,
+        &retained.ciphertext.inner
+    ));
+    assert_eq!(
+        target
+            .fill
+            .dependencies
+            .admission
+            .used(ResourceClass::Plaintext),
+        0
+    );
+    assert!(
+        source
+            .fill
+            .dependencies
+            .admission
+            .used(ResourceClass::Plaintext)
+            >= 3
+    );
+}
+
+#[test]
 fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -718,37 +885,48 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.dependencies.credentials.clone(),
         ));
         let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
-        let mut response = drive(
-            coordinator.read(
-                ClientRequest {
-                    kind: ReadKind::Pinned {
-                        etag: f.page.version.etag.clone(),
-                        range: ByteRange::Closed { first: 0, last: 2 },
+        for kind in [
+            ReadKind::Pinned {
+                etag: f.page.version.etag.clone(),
+                range: ByteRange::Closed { first: 0, last: 2 },
+            },
+            ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: Some(ByteRange::Closed { first: 0, last: 2 }),
+                page_credits: 1,
+                byte_credits: crate::model::range::PAGE_BYTES,
+                ordered: false,
+            },
+        ] {
+            let mut response = drive(
+                coordinator.read(
+                    ClientRequest {
+                        kind,
+                        origin: OriginContext {
+                            object: f.context.object.clone(),
+                            metadata: None,
+                            authorization: None,
+                        },
                     },
-                    origin: OriginContext {
-                        object: f.context.object.clone(),
-                        metadata: None,
-                        authorization: None,
-                    },
-                },
-                &f.scope,
-            ),
-            &mut f.engine,
-            &f.crypto,
-        )
-        .unwrap();
-        let mut slice = response.body.as_mut().unwrap().next_slice();
-        assert!(matches!(
-            drive(
-                std::future::poll_fn(|cx| {
-                    endpoint.poll(cx, 64).unwrap();
-                    slice.as_mut().poll(cx)
-                }),
+                    &f.scope,
+                ),
                 &mut f.engine,
-                &f.crypto
-            ),
-            Err(Error::MissingKey)
-        ));
+                &f.crypto,
+            )
+            .unwrap();
+            let mut slice = response.body.as_mut().unwrap().next_slice();
+            assert!(matches!(
+                drive(
+                    std::future::poll_fn(|cx| {
+                        endpoint.poll(cx, 64).unwrap();
+                        slice.as_mut().poll(cx)
+                    }),
+                    &mut f.engine,
+                    &f.crypto
+                ),
+                Err(Error::MissingKey)
+            ));
+        }
     }
     let AcquisitionEvent::Complete(admitted) = futures::executor::block_on(held.wait()).unwrap()
     else {
@@ -1458,6 +1636,311 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
             .used(ResourceClass::DirtyCiphertext)
             > 0
     );
+}
+
+#[test]
+fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
+    let mut f = fixture();
+    f.context.authorization = Some(
+        crate::model::context::Authorization::from_header(b"test-supplier-credential").unwrap(),
+    );
+    let flights = f.fill.dependencies.flights.clone();
+    let mut holder_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let JoinedFlight::Waiter(holder) = flights
+        .join_for(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut holder_budget,
+            false,
+        )
+        .unwrap()
+    else {
+        panic!("ciphertext registration")
+    };
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let copy = drive(
+        f.fill.acquire_ciphertext(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let retained = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert_eq!(retained.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(
+        &retained.ciphertext.inner,
+        &copy.ciphertext.inner
+    ));
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.fill.local_copies.borrow().is_empty());
+    assert!(matches!(
+        flights.join_copy(&f.page, &f.scope).unwrap(),
+        JoinedCopy::Complete(_)
+    ));
+    drop(holder);
+    // A different credential context can consume verified bytes, never the
+    // supplier's authorization. No additional origin call or decrypt is needed.
+    let context = OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 0, 0);
+    let result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &retained.plaintext.inner,
+        &result.plaintext.inner
+    ));
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::RequestContext),
+        0
+    );
+}
+
+fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    loop {
+        f.scope.check().unwrap();
+        super::super::drivers::poll(&mut cx, 64);
+        if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+            return result;
+        }
+        f.reactor.poll_budgeted(64).unwrap();
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+fn cold_disk_fixture() -> Fixture {
+    let mut f = fixture();
+    f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
+    f.reactor.init().unwrap();
+    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let original = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(
+        drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap(),
+        1
+    );
+    drop(original);
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    f.origin.calls.set(0);
+    f
+}
+
+#[test]
+fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
+    let mut f = cold_disk_fixture();
+    let context_baseline = f
+        .fill
+        .dependencies
+        .admission
+        .used(ResourceClass::RequestContext);
+    let mut first = f.fill.copy_only(&f.page, &f.scope);
+    let mut second = f.fill.copy_only(&f.page, &f.scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.reactor.in_flight(), 1, "one cold disk submission");
+    assert_eq!(f.fill.local_copies.borrow().len(), 1);
+    let (first, second) = drive_disk(&f, futures::future::join(first, second));
+    let (first, second) = (first.unwrap().unwrap(), second.unwrap().unwrap());
+    assert!(Arc::ptr_eq(&first.1.inner, &second.1.inner));
+    let retained = f
+        .fill
+        .dependencies
+        .memory
+        .unverified(&f.page)
+        .unwrap()
+        .unwrap();
+    assert!(retained.disk_token.is_some());
+    assert!(Arc::ptr_eq(&first.1.inner, &retained.copy.ciphertext.inner));
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    let hot = drive_disk(&f, f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&first.1.inner, &hot.1.inner));
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 1);
+    assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
+    assert_eq!(f.origin.calls.get(), 0);
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert!(f.fill.local_copies.borrow().is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .admission
+            .used(ResourceClass::RequestContext),
+        context_baseline
+    );
+    // The retained disk token and original ciphertext also support a single
+    // verified promotion, rather than another disk read or origin acquisition.
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let promoted = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(promoted.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(&first.1.inner, &promoted.ciphertext.inner));
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 1);
+    assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 1);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
+    let f = cold_disk_fixture();
+    let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
+    let mut first = f.fill.copy_only(&f.page, &caller);
+    let mut second = f.fill.copy_only(&f.page, &f.scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    caller.cancel().unwrap();
+    assert!(matches!(
+        first.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    drop((first, second));
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 1);
+    assert_eq!(f.fill.local_copies.borrow().len(), 1);
+    assert_eq!(f.reactor.in_flight(), 1);
+    // A replacement joins the still-owned read, not a second disk submission.
+    let mut replacement = f.fill.copy_only(&f.page, &f.scope);
+    assert!(replacement.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.reactor.in_flight(), 1);
+    assert!(drive_disk(&f, replacement).unwrap().is_some());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert!(f.fill.local_copies.borrow().is_empty());
+    assert_eq!(f.reactor.in_flight(), 0);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
+    use futures::{StreamExt, stream::FuturesUnordered};
+    let mut f = fixture();
+    for _ in 0..1100 {
+        let mut requests = FuturesUnordered::new();
+        requests.push(f.fill.copy_only(&f.page, &f.scope));
+        assert!(
+            drive(requests.next(), &mut f.engine, &f.crypto)
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        drop(requests);
+        assert!(f.fill.local_copies.borrow().is_empty());
+        assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+        assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+        assert_eq!(super::super::drivers::pending(), 0);
+    }
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn copy_only_local_state_admission_failure_releases_all_reservations() {
+    let mut f = fixture();
+    let admission = &f.fill.dependencies.admission;
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Flight,
+            admission.limit(ResourceClass::Flight),
+        )
+        .unwrap();
+    assert!(matches!(
+        drive(
+            f.fill.copy_only(&f.page, &f.scope),
+            &mut f.engine,
+            &f.crypto
+        ),
+        Err(Error::Overloaded)
+    ));
+    assert!(f.fill.local_copies.borrow().is_empty());
+    assert_eq!(admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(super::super::drivers::pending(), 0);
+    drop(pressure);
+    assert!(
+        drive(
+            f.fill.copy_only(&f.page, &f.scope),
+            &mut f.engine,
+            &f.crypto
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(admission.used(ResourceClass::Flight), 0);
+    assert_eq!(admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(f.origin.calls.get(), 0);
 }
 
 #[test]

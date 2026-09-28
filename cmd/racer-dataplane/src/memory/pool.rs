@@ -182,6 +182,29 @@ impl VerifiedPage {
     }
 }
 impl CiphertextPage {
+    /// Rehome a completed receive before retaining it in another worker's cache.
+    /// Admit the new charge first. Shared transport owners keep their original
+    /// allocation and charge until fenced; only exclusive bytes can move in place.
+    pub(crate) fn rehome(mut self, reservation: Reservation) -> Result<Self> {
+        reservation.validate(ResourceClass::Ciphertext, self.inner.bytes.capacity())?;
+        if reservation.cache() != Some(&self.envelope().page.version.object.cache) {
+            return Err(Error::InvalidConfiguration);
+        }
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.reservation = reservation;
+            return Ok(self);
+        }
+        let mut bytes = reservation.buffer(self.bytes().len())?;
+        bytes.copy_from_slice(self.bytes());
+        Ok(Self {
+            inner: Arc::new(CiphertextBytes {
+                checksum: self.inner.checksum.clone(),
+                envelope: self.envelope().clone(),
+                bytes,
+                reservation,
+            }),
+        })
+    }
     pub fn checksum(&self) -> u64 {
         *self
             .inner
@@ -296,6 +319,62 @@ pub(crate) mod tests {
             ciphertext,
         }
     }
+    #[test]
+    fn rehome_moves_exclusive_bytes_but_preserves_shared_transport_owners() {
+        for shared in [false, true] {
+            let source = admission(8);
+            let target = admission(8);
+            let page = bundle(&source, "rehome");
+            let checksum = page.ciphertext.checksum();
+            let pointer = page.ciphertext.bytes().as_ptr();
+            let retained = shared.then(|| page.ciphertext.clone());
+            let reservation = target
+                .reserve(
+                    Some(&page.metadata.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    19,
+                )
+                .unwrap();
+            let moved = page.ciphertext.rehome(reservation).unwrap();
+            assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
+            assert_eq!(moved.checksum(), checksum);
+            assert!(target.owns(&moved.inner.reservation));
+            assert_eq!(
+                source.used(ResourceClass::Ciphertext),
+                if shared { 19 } else { 0 }
+            );
+            assert_eq!(target.used(ResourceClass::Ciphertext), 19);
+            drop(retained);
+            assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+            drop(moved);
+            assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    #[test]
+    fn rehome_rejects_wrong_cache_class_and_insufficient_charge() {
+        let source = admission(8);
+        let target = admission(8);
+        let page = bundle(&source, "rehome");
+        let cache = &page.metadata.version.object.cache;
+        let wrong = CacheId("wrong".into());
+        for (cache, class, amount) in [
+            (&wrong, ResourceClass::Ciphertext, 19),
+            (cache, ResourceClass::Plaintext, 19),
+            (cache, ResourceClass::Ciphertext, 18),
+        ] {
+            assert!(matches!(
+                page.ciphertext
+                    .clone()
+                    .rehome(target.reserve(Some(cache), class, amount).unwrap(),),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        assert_eq!(source.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(target.used(ResourceClass::Plaintext), 0);
+    }
+
     #[test]
     fn persisted_crc_rejects_payload_corruption_independently_of_structural_validation() {
         let admission = admission(8);

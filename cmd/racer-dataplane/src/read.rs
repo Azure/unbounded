@@ -9,3 +9,4 @@ pub mod range_stream;
 #[cfg(test)]
 mod remote_tests;
 pub mod serve;
+pub mod subscription;

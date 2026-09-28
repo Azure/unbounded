@@ -23,6 +23,8 @@ pub struct Responses {
     io: Rc<HttpIo>,
     delivery: Rc<Delivery>,
 }
+#[path = "subscription.rs"]
+mod subscription;
 impl Responses {
     pub fn new(io: Rc<HttpIo>, delivery: Rc<Delivery>) -> Self {
         Self {
@@ -77,6 +79,23 @@ impl Responses {
             return Err(Error::BadGateway);
         }
         match kind {
+            ReadKind::Subscription { range, .. } => {
+                let expected = if response.metadata.length == 0 && range.is_none() {
+                    None
+                } else {
+                    Some(
+                        range
+                            .unwrap_or(crate::model::range::ByteRange::From(0))
+                            .resolve(response.metadata.length)
+                            .map_err(|_| Error::BadGateway)?,
+                    )
+                };
+                if response.range != expected || response.body.is_some() != expected.is_some() {
+                    return Err(Error::BadGateway);
+                }
+                subscription::success_head(&response.metadata, response.range)?;
+                return Ok(());
+            }
             ReadKind::Head | ReadKind::HeadPinned { .. } => {
                 if response.range.is_some() || response.body.is_some() {
                     return Err(Error::BadGateway);
@@ -268,7 +287,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
     };
     let mut headers = vec![header("Content-Length", "0")];
     if status == 405 {
-        headers.push(header("Allow", "HEAD, GET"));
+        headers.push(header("Allow", "HEAD, POST"));
     }
     if status == 416 {
         let Error::UnsatisfiableRangeWithLength(length) = error else {
@@ -435,7 +454,7 @@ mod tests {
                 assert!(head.unique("Content-Range").unwrap().is_none());
             }
             if status == 405 {
-                assert_eq!(head.unique("Allow").unwrap().unwrap(), b"HEAD, GET");
+                assert_eq!(head.unique("Allow").unwrap().unwrap(), b"HEAD, POST");
             }
         }
     }

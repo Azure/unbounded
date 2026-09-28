@@ -688,7 +688,9 @@ impl Transfers {
         let Some(rdma) = &self.rdma else {
             return Ok((connection, false));
         };
-        let PeerResponse::Page { ciphertext, .. } = &response.response else {
+        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
+            &response.response
+        else {
             return Ok((connection, false));
         };
         let (mut binding, accept) = admitted;
@@ -898,7 +900,9 @@ impl Transfers {
         self.native_fallbacks.set(self.native_fallbacks.get() + 1);
         scope.check()?;
         let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let PeerResponse::Page { ciphertext, .. } = &response.response else {
+        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
+            &response.response
+        else {
             return Err(Error::InvalidRequest);
         };
         let finish = binding.sign(
@@ -1223,10 +1227,21 @@ impl Transfers {
         )?;
         // The original envelope is verified by the requester/relay's outstanding
         // binding after this transport returns. No plaintext is published here.
-        let response = PeerResponse::Page {
-            metadata,
-            ciphertext: page,
-        };
+        let response =
+            if crate::security::protocol::field(&authentication.original.head, "racer-outcome")?
+                == "selected"
+            {
+                PeerResponse::Selected {
+                    metadata,
+                    ciphertext: page,
+                    grant: super::decode::grant(&authentication.original.head)?,
+                }
+            } else {
+                PeerResponse::Page {
+                    metadata,
+                    ciphertext: page,
+                }
+            };
         let original = &authentication.original.head;
         let request_digest = crate::security::protocol::decode_binary(
             crate::security::protocol::field(original, "racer-request-binding")?.as_bytes(),

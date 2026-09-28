@@ -53,6 +53,90 @@ pub struct CandidatePolicy {
     published: RefCell<Option<std::sync::Arc<crate::control::snapshot::PublishedState>>>,
 }
 impl CandidatePolicy {
+    /// One admitted selection, one transfer grant. Routing chooses the primary of
+    /// the oldest demanded page; the provider can choose any demanded page for
+    /// which it is also primary. Backups are not speculatively contacted.
+    pub(crate) async fn subscribe(
+        &self,
+        version: crate::model::identity::ObjectVersion,
+        demand: crate::peer::subscriptions::Demand,
+        scheduler: &super::subscription::Scheduler,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<Option<VerifiedResponse>> {
+        let first = demand
+            .intervals()
+            .first()
+            .ok_or(Error::InvalidRequest)?
+            .start;
+        let rank = self
+            .candidates_scoped(
+                membership.clone(),
+                &version.object,
+                PageNumber(first),
+                scope,
+            )
+            .await?;
+        let destination = rank.ordered.first().ok_or(Error::Unavailable)?;
+        if destination == &self.node {
+            return Ok(None);
+        }
+        let (subscription, deadline) = scheduler.contract(
+            version,
+            membership.version,
+            destination.clone(),
+            demand,
+            scope.deadline.0.min(budget.deadline()),
+        )?;
+        let mut selected_scope = scope.clone();
+        selected_scope.deadline.0 = deadline;
+        let operation = PeerOperation::Subscribe {
+            subscription,
+            mode: FetchMode::Acquire,
+        };
+        let response = match self
+            .request(
+                &membership,
+                destination,
+                context,
+                &operation,
+                FetchMode::Acquire,
+                &selected_scope,
+                budget,
+                2,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(Error::Unavailable | Error::Io | Error::Overloaded) => {
+                budget.note_route_failure();
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match classify(response.response(), &operation, true)? {
+            None => {
+                let PeerResponse::Selected { grant, .. } = response.response() else {
+                    return Err(Error::CorruptRecord);
+                };
+                let actual = self
+                    .candidates_scoped(
+                        membership,
+                        &grant.page.version.object,
+                        grant.page.number,
+                        scope,
+                    )
+                    .await?;
+                if actual.ordered.first() != Some(destination) {
+                    return Err(Error::Unauthorized);
+                }
+                Ok(Some(response))
+            }
+            Some(_) => Ok(None),
+        }
+    }
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
         Self {
             observer: Observer::default(),
@@ -396,6 +480,13 @@ impl CandidatePolicy {
         // Share the remaining time among later candidates and, for predecessor
         // probes, local origin. Fast failures leave their unused time available.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
+        // The local exchange may time out before the signed contract. Shortening
+        // the latter per attempt would make a later update renew provider authority.
+        let signed_deadline = if matches!(operation, PeerOperation::Subscribe { .. }) {
+            overall
+        } else {
+            deadline
+        };
         // A clone shares cancellation: timing it out would cancel the caller too.
         let attempt_scope = RequestScope::new(scope.request, deadline)?;
         let attempts = if matches!(mode, FetchMode::Acquire) {
@@ -413,7 +504,9 @@ impl CandidatePolicy {
         let attempt = AttemptId(bytes);
         let credentials = self.credentials.borrow().clone().ok_or(Error::MissingKey)?;
         // Sealing is synchronous, but can still use up a very short time share.
-        let origin = credentials.seal(context, attempt, &attempt_scope);
+        let mut signed_scope = attempt_scope.clone();
+        signed_scope.deadline.0 = signed_deadline;
+        let origin = credentials.seal(context, attempt, &signed_scope);
         check_budget(scope, budget)?;
         let origin = origin.map_err(|error| match error {
             Error::DeadlineExceeded => Error::Unavailable,
@@ -430,7 +523,7 @@ impl CandidatePolicy {
                 visited: vec![self.node.clone()],
                 remaining_links: links,
                 remaining_attempts: attempts,
-                deadline: Deadline(deadline),
+                deadline: Deadline(signed_deadline),
             },
         };
         let registration = scope.cancellation.subscribe()?;
@@ -568,6 +661,16 @@ impl OriginAuthority {
 
 fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
     match operation {
+        PeerOperation::Subscribe { subscription, .. } => (
+            &subscription.version.object,
+            PageNumber(
+                subscription
+                    .demand
+                    .intervals()
+                    .first()
+                    .map_or(0, |i| i.start),
+            ),
+        ),
         PeerOperation::Page { page, .. } => (&page.version.object, page.number),
         PeerOperation::Metadata { object, .. } => (object, PageNumber(0)),
         PeerOperation::Bootstrap { object, .. } => (object, PageNumber(0)),
@@ -575,6 +678,10 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
 }
 fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
     match operation {
+        PeerOperation::Subscribe { subscription, .. } => PeerOperation::Subscribe {
+            subscription: subscription.clone(),
+            mode,
+        },
         PeerOperation::Bootstrap { object, .. } => PeerOperation::Bootstrap {
             object: object.clone(),
             mode,
@@ -600,6 +707,22 @@ fn classify(
     acquire: bool,
 ) -> Result<Option<ProbeOutcome>> {
     match response {
+        PeerResponse::Selected {
+            metadata,
+            ciphertext,
+            grant,
+        } => match operation {
+            PeerOperation::Subscribe { subscription, .. }
+                if grant.page.version == subscription.version
+                    && subscription.demand.contains(grant.page.number.0)
+                    && ciphertext.envelope().page == grant.page
+                    && metadata.version == subscription.version =>
+            {
+                metadata.immutable().validate_page(ciphertext.envelope())?;
+                Ok(None)
+            }
+            _ => Err(Error::CorruptRecord),
+        },
         PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
         PeerResponse::NotFound => match operation {
             PeerOperation::Bootstrap { .. } if acquire => Err(Error::NotFound),
@@ -1004,7 +1127,8 @@ mod tests {
         ) -> Operation<'a, VerifiedResponse> {
             Box::pin(async move {
                 let copy = match request.operation {
-                    PeerOperation::Bootstrap { mode, .. }
+                    PeerOperation::Subscribe { mode, .. }
+                    | PeerOperation::Bootstrap { mode, .. }
                     | PeerOperation::Page { mode, .. }
                     | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)

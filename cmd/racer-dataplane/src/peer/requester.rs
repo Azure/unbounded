@@ -190,8 +190,22 @@ impl Requester {
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(&membership, &next)?;
-            let plan = if let super::wire::Operation::Page { page, .. } = &request.request.operation
-            {
+            // The hint chooses a candidate rail, never the provider's page order.
+            // The sender validates the actual selected page against that rail and
+            // falls back to HTTP before exporting a window when they disagree.
+            let rail_hint = match &request.request.operation {
+                super::wire::Operation::Page { page, .. } => Some(page.clone()),
+                super::wire::Operation::Subscribe { subscription, .. } => {
+                    subscription.demand.intervals().first().map(|interval| {
+                        crate::model::identity::PageId {
+                            version: subscription.version.clone(),
+                            number: crate::model::identity::PageNumber(interval.start),
+                        }
+                    })
+                }
+                _ => None,
+            };
+            let plan = if let Some(page) = rail_hint {
                 let search = super::search_budget(budget, &network.local)?;
                 let route = self
                     .paths
@@ -200,7 +214,7 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                self.rails.select(&route, page)?
+                self.rails.select(&route, &page)?
             } else {
                 crate::topology::rails::TransportPlan::Http
             };

@@ -18,7 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const PROFILE: &str = "racer-peer-v4";
+pub const PROFILE: &str = "racer-peer-v5";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_HEAD: usize = 64 * 1024;
 
@@ -224,6 +224,30 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     push(&mut head, "racer-kind", "request");
     push(&mut head, "content-length", 0);
     let (op_object, mode) = match &request.operation {
+        Operation::Subscribe { subscription, mode } => {
+            version(&mut head, &subscription.version)?;
+            push(&mut head, "racer-operation", "subscribe");
+            push_binary(&mut head, "racer-subscription", &subscription.id);
+            push(
+                &mut head,
+                "racer-subscription-sequence",
+                subscription.sequence,
+            );
+            push(&mut head, "racer-page-budget", subscription.page_budget);
+            push(&mut head, "racer-byte-budget", subscription.byte_budget);
+            let mut intervals = Vec::new();
+            for interval in subscription.demand.intervals() {
+                intervals.extend_from_slice(&interval.start.to_be_bytes());
+                intervals.extend_from_slice(&interval.end.to_be_bytes());
+            }
+            push_binary(&mut head, "racer-demand", &intervals);
+            if matches!(mode, FetchMode::CopyOnly)
+                && (request.origin.authorization.is_some() || request.origin.metadata.is_some())
+            {
+                return Err(Error::Unauthorized);
+            }
+            (&subscription.version.object, mode)
+        }
         Operation::Bootstrap { object: id, mode } => {
             object(&mut head, id)?;
             push(&mut head, "racer-operation", "bootstrap");
@@ -329,6 +353,23 @@ pub fn response_head(
     push_binary(&mut head, "racer-request-binding", request_digest);
     push(&mut head, "racer-response-path", nodes(path)?);
     let (outcome, length) = match response {
+        PeerResponse::Selected {
+            metadata: m,
+            ciphertext,
+            grant,
+        } => {
+            if &grant.page != &ciphertext.envelope().page
+                || ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize
+            {
+                return Err(Error::InvalidRequest);
+            }
+            page_fields(&mut head, m, ciphertext.envelope())?;
+            grant_fields(&mut head, grant)?;
+            (
+                "selected",
+                u64::from(ciphertext.envelope().ciphertext_length),
+            )
+        }
         PeerResponse::Bootstrap {
             metadata: m,
             page_zero,
@@ -404,6 +445,23 @@ pub fn response_head(
     push(&mut head, "racer-outcome", outcome);
     push(&mut head, "content-length", length);
     Ok(head)
+}
+pub(crate) fn grant_fields(
+    head: &mut MessageHead,
+    grant: &crate::peer::subscriptions::TransferGrant,
+) -> Result<()> {
+    uuid(&grant.receiver.0)?;
+    if grant.membership.0 == 0 {
+        return Err(Error::InvalidRequest);
+    }
+    push_binary(head, "racer-subscription", &grant.subscription_id);
+    push(head, "racer-subscription-sequence", grant.sequence);
+    push(head, "racer-grant-membership", grant.membership.0);
+    push(head, "racer-grant-receiver", &grant.receiver.0);
+    push(head, "racer-grant-deadline", grant.deadline);
+    push(head, "racer-page-budget", grant.remaining_page_budget);
+    push(head, "racer-byte-budget", grant.remaining_byte_budget);
+    Ok(())
 }
 fn page_fields(
     head: &mut MessageHead,

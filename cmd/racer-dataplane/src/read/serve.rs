@@ -73,6 +73,33 @@ pub(crate) fn inherited_budget(
     Ok(budget)
 }
 impl Coordinator {
+    pub(crate) fn cached_page(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<super::fill::PageResult>> {
+        self.fill.cached_page(page, scope)
+    }
+    pub(crate) async fn select_subscription(
+        &self,
+        version: ObjectVersion,
+        demand: crate::peer::subscriptions::Demand,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<super::fill::PageResult> {
+        self.fill
+            .select_subscription(version, demand, membership, context, scope, budget)
+            .await
+    }
+    pub(crate) async fn accept_selected(
+        &self,
+        copy: crate::memory::page::CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<super::fill::PageResult> {
+        self.fill.accept_selected(copy, scope).await
+    }
     pub fn new(
         snapshots: Rc<SnapshotStore>,
         metadata: Rc<MetadataService>,
@@ -193,6 +220,59 @@ impl Coordinator {
             let directory = self.streams.directory();
             let ClientRequest { kind, origin } = request;
             match kind {
+                ReadKind::Subscription {
+                    pin,
+                    range,
+                    page_credits,
+                    byte_credits,
+                    ordered,
+                } => {
+                    let selector = pin.map_or(MetadataSelector::Fresh, MetadataSelector::Pinned);
+                    let metadata = directory
+                        .resolve_with_budget(
+                            selector.clone(),
+                            membership.clone(),
+                            &origin,
+                            scope,
+                            &mut budget,
+                        )
+                        .await?;
+                    validate_metadata(&metadata, &origin.object, &selector)?;
+                    if metadata.length == 0 && range.is_none() {
+                        return Ok(ReadResponse {
+                            metadata,
+                            range: None,
+                            body: None,
+                        });
+                    }
+                    let range =
+                        resolve_range(range.unwrap_or(ByteRange::From(0)), metadata.length)?;
+                    let mut body = if client_pages {
+                        self.streams.open(
+                            metadata.clone(),
+                            range,
+                            origin,
+                            membership,
+                            scope.clone(),
+                        )?
+                    } else {
+                        self.streams.open_with_budget(
+                            metadata.clone(),
+                            range,
+                            origin,
+                            membership,
+                            scope.clone(),
+                            budget,
+                            None,
+                        )?
+                    };
+                    body.configure_subscription(page_credits, byte_credits, ordered)?;
+                    Ok(ReadResponse {
+                        metadata,
+                        range: Some(range),
+                        body: Some(body),
+                    })
+                }
                 ReadKind::Head | ReadKind::HeadPinned { .. } => {
                     let selector = match kind {
                         ReadKind::HeadPinned { etag } => MetadataSelector::Pinned(etag),
@@ -336,6 +416,7 @@ impl LocalPageService for Coordinator {
                 return Err(Error::Unauthorized);
             }
             let object = match &request.operation {
+                PeerOperation::Subscribe { .. } => return Err(Error::InvalidRequest),
                 PeerOperation::Bootstrap { object, .. } => object,
                 PeerOperation::Page { page, .. } => &page.version.object,
                 PeerOperation::Metadata { object, .. } => object,

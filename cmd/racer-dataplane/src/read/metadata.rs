@@ -643,7 +643,9 @@ impl MetadataService {
                 PeerResponse::Miss | PeerResponse::Unavailable => {
                     return Err(Error::Unavailable.into());
                 }
-                PeerResponse::Page { .. } => return Err(Error::CorruptRecord.into()),
+                PeerResponse::Page { .. } | PeerResponse::Selected { .. } => {
+                    return Err(Error::CorruptRecord.into());
+                }
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),
             },
             CandidateResolution::Origin(authority) => {

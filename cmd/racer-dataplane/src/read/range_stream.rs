@@ -1,4 +1,4 @@
-//! Bounded sliding whole-page window with ordered, independently leased slices.
+//! Shared compact subscription demand with independently leased page slices.
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
 use super::{
@@ -88,6 +88,10 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    selected_ready: Option<PageResult>,
+    selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
+    retained: std::collections::BTreeMap<PageNumber, crate::memory::pool::VerifiedPage>,
+    subscription: Option<super::subscription::DemandLease>,
     observer: Observer,
     metadata: ObjectMetadata,
     range: ResolvedRange,
@@ -201,6 +205,10 @@ impl RangeStreams {
         }
         let first = range.first_page();
         let mut stream = RangeStream {
+            selected_ready: None,
+            selection: None,
+            retained: std::collections::BTreeMap::new(),
+            subscription: None,
             observer: self.observer.clone(),
             metadata,
             range,
@@ -224,6 +232,42 @@ impl RangeStreams {
     }
 }
 impl RangeStream {
+    pub fn configure_subscription(
+        &mut self,
+        pages: usize,
+        bytes: u64,
+        ordered: bool,
+    ) -> Result<()> {
+        if self.subscription.is_some() {
+            return Err(Error::InvalidRequest);
+        }
+        let mut demand = self.directory.subscriptions.register(
+            self.metadata.version.clone(),
+            self.range,
+            pages,
+            bytes,
+            ordered,
+        )?;
+        // Seeded streams are used by fixtures; production resolves metadata without bootstrap.
+        for (number, _) in &self.ready {
+            if demand.select() != Some(*number) {
+                return Err(Error::InvalidRequest);
+            }
+        }
+        // Credits are the only subscription scheduling bound; the legacy window
+        // remains only for internal ordered/bootstrap callers.
+        self.window_pages = pages;
+        self.subscription = Some(demand);
+        Ok(())
+    }
+    pub fn release_page(&mut self, number: PageNumber, length: u32) -> Result<()> {
+        self.subscription
+            .as_mut()
+            .ok_or(Error::InvalidRequest)?
+            .release(number, length)?;
+        self.retained.remove(&number);
+        Ok(())
+    }
     /// Drive admitted acquisitions while the current slice encounters client
     /// backpressure. Completed pages leave their acquisition scopes promptly;
     /// this never admits more than the existing bounded window.
@@ -264,6 +308,9 @@ impl RangeStream {
             if self.terminated {
                 return Ok(None);
             }
+            if self.subscription.is_some() && self.ready.is_empty() {
+                return self.next_subscription_slice().await;
+            }
             if self.ready.is_empty() && self.next_page.is_none() {
                 self.terminated = true;
                 return Ok(None);
@@ -272,9 +319,22 @@ impl RangeStream {
             if let Err(error) = operation_scope.check() {
                 self.observer
                     .record(Failure::new(Stage::RangeScope, error).request(&operation_scope));
-                self.terminated = true;
-                self.ready.clear();
+                self.terminate();
                 return Err(error);
+            }
+            if self.ready.is_empty() {
+                if let Some(demand) = &self.subscription {
+                    if demand.exhausted() {
+                        self.terminated = true;
+                        self.next_page = None;
+                        return Ok(None);
+                    }
+                    if !demand.ready_to_select() {
+                        // A credit-starved subscriber must not hold the shared
+                        // delivery pipe while waiting for its own release frame.
+                        std::future::pending::<()>().await;
+                    }
+                }
             }
             // Schedule delivery before starting more page work. Waiting requests
             // cannot pin newly acquired pages merely to discover pipe exhaustion.
@@ -283,33 +343,52 @@ impl RangeStream {
                 Err(error) => {
                     self.observer
                         .record(Failure::new(Stage::RangePipe, error).request(&operation_scope));
-                    self.terminated = true;
-                    self.next_page = None;
-                    self.ready.clear();
+                    self.terminate();
                     return Err(error);
                 }
             };
             while self.ready.len() < self.window_pages {
-                let Some(number) = self.next_page else {
+                if self
+                    .subscription
+                    .as_ref()
+                    .is_some_and(|demand| demand.exhausted())
+                {
+                    self.next_page = None;
                     break;
-                };
-                let page = PageId {
-                    version: self.metadata.version.clone(),
-                    number,
-                };
+                }
+                if self.subscription.is_none() && self.next_page.is_none() {
+                    break;
+                }
                 let child = match self.budget.next_page(!self.ready.is_empty()) {
                     Ok(Some(child)) => child,
                     Ok(None) => break,
                     Err(error) => {
                         self.observer.record(
-                            Failure::new(Stage::RangeBudget, error)
-                                .request(&operation_scope)
-                                .detail(Detail::Page(number.0)),
+                            Failure::new(Stage::RangeBudget, error).request(&operation_scope),
                         );
-                        self.terminated = true;
-                        self.ready.clear();
+                        self.terminate();
                         return Err(error);
                     }
+                };
+                let number = if let Some(demand) = self.subscription.as_mut() {
+                    let Some(number) = demand.select() else {
+                        if demand.exhausted() {
+                            self.next_page = None;
+                        }
+                        self.budget.complete(child)?;
+                        break;
+                    };
+                    number
+                } else {
+                    let Some(number) = self.next_page else {
+                        self.budget.complete(child)?;
+                        break;
+                    };
+                    number
+                };
+                let page = PageId {
+                    version: self.metadata.version.clone(),
+                    number,
                 };
                 let mut page_scope = operation_scope.clone();
                 page_scope.deadline.0 = child.deadline();
@@ -334,15 +413,37 @@ impl RangeStream {
                 };
                 if failed {
                     self.next_page = None;
-                } else {
+                } else if self.subscription.is_none() {
                     self.advance(number);
                 }
                 self.ready.push_back((number, entry));
             }
-            poll_fn(|cx| poll_window(&mut self.ready, &mut self.budget, cx)).await;
+            if self.ready.is_empty() && self.next_page.is_some() {
+                // Only an exact client release can make credit available again.
+                std::future::pending::<()>().await;
+            }
+            let unordered = self
+                .subscription
+                .as_ref()
+                .is_some_and(|demand| !demand.ordered());
+            poll_fn(|cx| {
+                let result = poll_window(&mut self.ready, &mut self.budget, cx);
+                if unordered {
+                    if let Some(index) = self
+                        .ready
+                        .iter()
+                        .position(|(_, page)| matches!(page, WindowPage::Ready(_)))
+                    {
+                        let page = self.ready.remove(index).unwrap();
+                        self.ready.push_front(page);
+                        return Poll::Ready(());
+                    }
+                }
+                result
+            })
+            .await;
             if let Err(error) = operation_scope.check() {
-                self.terminated = true;
-                self.ready.clear();
+                self.terminate();
                 return Err(error);
             }
             let Some((number, WindowPage::Ready(result))) = self.ready.pop_front() else {
@@ -359,6 +460,11 @@ impl RangeStream {
             let lease = result.and_then(|result| {
                 let attach = (|| {
                     self.validate(&result, number)?;
+                    if let Some(demand) = self.subscription.as_mut() {
+                        demand.completed(number);
+                        demand.issued(number)?;
+                        self.retained.insert(number, result.plaintext.clone());
+                    }
                     let slice = self
                         .range
                         .slice_at(result.plaintext.page().number)?
@@ -371,9 +477,7 @@ impl RangeStream {
             match lease {
                 Ok(lease) => Ok(Some(lease)),
                 Err(error) => {
-                    self.terminated = true;
-                    self.next_page = None;
-                    self.ready.clear();
+                    self.terminate();
                     Err(error)
                 }
             }
@@ -381,11 +485,85 @@ impl RangeStream {
     }
     pub fn cancel(&mut self) -> Operation<'_, ()> {
         Box::pin(async move {
-            self.terminated = true;
-            self.next_page = None;
-            self.ready.clear();
+            self.terminate();
             self.scope.cancel()
         })
+    }
+    fn terminate(&mut self) {
+        self.terminated = true;
+        self.next_page = None;
+        self.ready.clear();
+        self.retained.clear();
+        self.subscription = None;
+        self.selection = None;
+        self.selected_ready = None;
+    }
+
+    async fn next_subscription_slice(&mut self) -> Result<Option<ReaderLease>> {
+        use super::subscription::Next;
+        let scope = self.operation_scope();
+        let cancellation = scope.cancellation.subscribe()?;
+        let result = async {
+            loop {
+                scope.check()?;
+                if let Some(result) = self.selected_ready.as_ref() {
+                    let number = result.plaintext.page().number;
+                    self.validate(result, number)?;
+                    let pipe = self.delivery.admit(&scope).await?;
+                    let result = self.selected_ready.take().ok_or(Error::StaleFlight)?;
+                    self.subscription.as_mut().unwrap().issued(number)?;
+                    self.retained.insert(number, result.plaintext.clone());
+                    let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
+                    return self
+                        .delivery
+                        .attach_reserved(result.plaintext, slice, pipe)
+                        .map(Some);
+                }
+                if let Some(future) = self.selection.as_mut() {
+                    let (result, remaining) = future.await?;
+                    self.budget.complete(remaining)?;
+                    self.selection = None;
+                    result?;
+                }
+                let next = poll_fn(|cx| {
+                    cancellation.register(cx.waker());
+                    if let Err(error) = scope.check() {
+                        return Poll::Ready(Err(error));
+                    }
+                    self.subscription.as_mut().unwrap().poll_next(cx)
+                })
+                .await?;
+                match next {
+                    Next::End => {
+                        self.terminated = true;
+                        self.next_page = None;
+                        return Ok(None);
+                    }
+                    Next::Select(selection) => {
+                        let child = self.budget.next_page(false)?.ok_or(Error::Overloaded)?;
+                        let mut child_scope = scope.clone();
+                        child_scope.deadline.0 = child.deadline();
+                        let future = self.directory.start_selection(
+                            self.metadata.version.clone(),
+                            selection,
+                            self.membership.clone(),
+                            &self.context,
+                            &child_scope,
+                            child,
+                        )?;
+                        self.selection = Some(future);
+                    }
+                    Next::Page(result) => {
+                        self.selected_ready = Some(result);
+                    }
+                }
+            }
+        }
+        .await;
+        if result.is_err() {
+            self.terminate();
+        }
+        result
     }
     pub fn buffered_pages(&self) -> usize {
         self.ready.len()
@@ -448,6 +626,75 @@ mod tests {
             panic!("expected aggregate budget")
         };
         (budget.remaining_attempts(), budget.remaining_links())
+    }
+    #[test]
+    fn credit_starved_stream_never_holds_pipe_and_cancel_detaches_demand() {
+        use crate::{
+            memory::pipe::PipePool,
+            model::identity::{MembershipVersion, RequestId, WorkerId},
+            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+            topology::membership::Membership,
+        };
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let pipes = Rc::new(PipePool::new(admission, reactor));
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                vec![WorkerId(0)],
+                1,
+            )
+            .unwrap(),
+        );
+        let streams = RangeStreams::from_directory(
+            directory.clone(),
+            Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
+            1,
+        );
+        let metadata = metadata();
+        let range = ByteRange::From(0).resolve(metadata.length).unwrap();
+        let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let mut stream = streams
+            .open(
+                metadata.clone(),
+                range,
+                OriginContext {
+                    object: metadata.version.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+                Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
+                scope.clone(),
+            )
+            .unwrap();
+        stream.configure_subscription(1, PAGE_BYTES, false).unwrap();
+        // Model a delivered page still owned by a slow caller.
+        let demand = stream.subscription.as_mut().unwrap();
+        assert_eq!(demand.select(), Some(PageNumber(0)));
+        demand.completed(PageNumber(0));
+        demand.issued(PageNumber(0)).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert_eq!(pipes.idle_count(), 0, "no pipe was even allocated");
+        assert!(
+            directory
+                .subscriptions
+                .register(metadata.version.clone(), range, 1, PAGE_BYTES, false)
+                .is_err()
+        );
+        futures::executor::block_on(stream.cancel()).unwrap();
+        assert!(scope.cancellation.is_cancelled());
+        assert!(stream.subscription.is_none());
+        assert!(stream.retained.is_empty());
+        assert!(
+            directory
+                .subscriptions
+                .register(metadata.version, range, 1, PAGE_BYTES, false)
+                .is_ok()
+        );
     }
     #[test]
     fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
@@ -788,7 +1035,12 @@ mod tests {
         };
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
-        for (capped, progressing) in [(true, false), (false, false), (false, true)] {
+        for (capped, progressing, subscription) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
             let clock = crate::runtime::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
@@ -884,7 +1136,11 @@ mod tests {
                     })),
                 ));
             }
-            let stream = RangeStream {
+            let mut stream = RangeStream {
+                selected_ready: None,
+                selection: None,
+                retained: std::collections::BTreeMap::new(),
+                subscription: None,
                 observer: Observer::default(),
                 metadata: metadata.clone(),
                 range,
@@ -909,6 +1165,11 @@ mod tests {
                 ready,
                 terminated: false,
             };
+            if subscription {
+                stream
+                    .configure_subscription(4, 4 * PAGE_BYTES, false)
+                    .unwrap();
+            }
             let response = ReadResponse {
                 metadata,
                 range: Some(range),
@@ -935,11 +1196,35 @@ mod tests {
                 }
                 assert!(!capped);
                 let head = String::from_utf8(head).unwrap();
-                assert!(head.starts_with("HTTP/1.1 206"));
-                assert!(head.contains(&format!("Content-Length: {}\r\n", 3 * PAGE_BYTES + 17)));
+                assert!(head.starts_with(if subscription {
+                    "HTTP/1.1 200"
+                } else {
+                    "HTTP/1.1 206"
+                }));
+                assert!(head.contains(&format!(
+                    "Content-Length: {}\r\n",
+                    3 * PAGE_BYTES + 17 + if subscription { 5 * 21 } else { 0 }
+                )));
                 let mut scratch = [0; 65536];
                 for number in 1..=4 {
                     let mut left = if number == 4 { 17 } else { PAGE_BYTES as usize };
+                    if subscription {
+                        let mut frame = [0; 21];
+                        client.read_exact(&mut frame).unwrap();
+                        assert_eq!(frame[0], 1);
+                        assert_eq!(
+                            u64::from_be_bytes(frame[1..9].try_into().unwrap()),
+                            number as u64
+                        );
+                        assert_eq!(
+                            u64::from_be_bytes(frame[9..17].try_into().unwrap()),
+                            number as u64 * PAGE_BYTES
+                        );
+                        assert_eq!(
+                            u32::from_be_bytes(frame[17..].try_into().unwrap()),
+                            left as u32
+                        );
+                    }
                     while left != 0 {
                         let count = left.min(scratch.len());
                         client.read_exact(&mut scratch[..count]).unwrap();
@@ -947,11 +1232,37 @@ mod tests {
                         left -= count;
                     }
                 }
+                if subscription {
+                    let mut frame = [0; 21];
+                    client.read_exact(&mut frame).unwrap();
+                    assert_eq!(frame[0], 2);
+                    assert_eq!(u64::from_be_bytes(frame[1..9].try_into().unwrap()), 4);
+                    assert_eq!(
+                        u64::from_be_bytes(frame[9..17].try_into().unwrap()),
+                        3 * PAGE_BYTES + 17
+                    );
+                    assert_eq!(&frame[17..], &[0; 4]);
+                    // No final release is required before the terminal frame.
+                    assert_eq!(client.read(&mut frame).unwrap(), 0);
+                }
             });
             let work = async {
                 let connection = ConnectionLease::from_accepted(server.into(), &admission)?;
                 let head = io.receive_head(connection, &scope).await?;
-                if progressing {
+                if subscription {
+                    let metrics = crate::telemetry::metrics::Metrics::default();
+                    let mut observation = metrics.request()?;
+                    responses
+                        .send_subscription(
+                            head.connection,
+                            response,
+                            &scope,
+                            &mut observation,
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        .map(drop)
+                } else if progressing {
                     let metrics = crate::telemetry::metrics::Metrics::default();
                     let mut observation = metrics.request()?;
                     responses

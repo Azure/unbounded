@@ -73,6 +73,39 @@ fn version(head: &MessageHead) -> Result<ObjectVersion> {
         etag: etag(head)?,
     })
 }
+pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand> {
+    use super::subscriptions::{Demand, MAX_DEMAND_INTERVALS, PageInterval};
+    let encoded = bytes(head, "racer-demand")?;
+    if encoded.len() % 16 != 0 || encoded.len() / 16 > MAX_DEMAND_INTERVALS {
+        return Err(Error::InvalidRequest);
+    }
+    Demand::new(
+        encoded
+            .chunks_exact(16)
+            .map(|chunk| PageInterval {
+                start: u64::from_be_bytes(chunk[..8].try_into().unwrap()),
+                end: u64::from_be_bytes(chunk[8..].try_into().unwrap()),
+            })
+            .collect(),
+    )
+}
+pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::TransferGrant> {
+    Ok(super::subscriptions::TransferGrant {
+        subscription_id: array(head, "racer-subscription")?,
+        sequence: p::number(head, "racer-subscription-sequence")?,
+        page: PageId {
+            version: version(head)?,
+            number: PageNumber(p::number(head, "racer-page")?),
+        },
+        membership: MembershipVersion(p::number(head, "racer-grant-membership")?),
+        receiver: node(head, "racer-grant-receiver")?,
+        deadline: p::number(head, "racer-grant-deadline")?,
+        remaining_page_budget: p::number(head, "racer-page-budget")?
+            .try_into()
+            .map_err(|_| Error::InvalidRequest)?,
+        remaining_byte_budget: p::number(head, "racer-byte-budget")?,
+    })
+}
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     let content_type = match head.unique("racer-metadata-version")? {
         None => {
@@ -290,18 +323,30 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
     let outcome = p::field(head, "racer-outcome")?;
     let binding = array(head, "racer-request-binding")?;
     let path = p::decode_nodes(p::field(head, "racer-response-path")?.as_bytes())?;
-    if outcome == "page" || (outcome == "bootstrap" && present(head, "racer-page-present")?) {
+    if matches!(outcome.as_str(), "page" | "selected")
+        || (outcome == "bootstrap" && present(head, "racer-page-present")?)
+    {
         let (metadata, envelope) = page_descriptor(head)?;
         if length != envelope.ciphertext_length as usize {
             return Err(Error::InvalidRequest);
         }
-        return p::opaque_page_head(
+        let mut canonical = p::opaque_page_head(
             &metadata,
             &envelope,
             outcome == "bootstrap",
             &binding,
             &path,
-        );
+        )?;
+        if outcome == "selected" {
+            canonical
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "racer-outcome")
+                .unwrap()
+                .value = b"selected".to_vec();
+            p::grant_fields(&mut canonical, &grant(head)?)?;
+        }
+        return Ok(canonical);
     }
     if length != 0 {
         return Err(Error::InvalidRequest);
@@ -375,6 +420,19 @@ impl LogicalCodec for SecurityCodec {
             length.checked_add(512).ok_or(Error::InvalidRequest)?,
         )?;
         let operation = match p::field(head, "racer-operation")?.as_str() {
+            "subscribe" => Operation::Subscribe {
+                subscription: super::subscriptions::Subscription {
+                    id: array(head, "racer-subscription")?,
+                    version: version(head)?,
+                    demand: demand(head)?,
+                    sequence: p::number(head, "racer-subscription-sequence")?,
+                    page_budget: p::number(head, "racer-page-budget")?
+                        .try_into()
+                        .map_err(|_| Error::InvalidRequest)?,
+                    byte_budget: p::number(head, "racer-byte-budget")?,
+                },
+                mode,
+            },
             "bootstrap" => Operation::Bootstrap {
                 object: object.clone(),
                 mode,
@@ -457,7 +515,9 @@ impl LogicalCodec for SecurityCodec {
         let head = &authentication.original.head;
         let outcome = p::field(head, "racer-outcome")?;
         let response = match outcome.as_str() {
-            "page" | "bootstrap" if outcome == "page" || present(head, "racer-page-present")? => {
+            "page" | "selected" | "bootstrap"
+                if outcome != "bootstrap" || present(head, "racer-page-present")? =>
+            {
                 let metadata = metadata(head)?;
                 let envelope = PageEnvelope {
                     page: PageId {
@@ -496,7 +556,13 @@ impl LogicalCodec for SecurityCodec {
                     )?,
                 };
                 let ciphertext = self.buffers.ciphertext(reservation, envelope, body)?;
-                if outcome == "bootstrap" {
+                if outcome == "selected" {
+                    PeerResponse::Selected {
+                        metadata,
+                        ciphertext,
+                        grant: grant(head)?,
+                    }
+                } else if outcome == "bootstrap" {
                     if ciphertext.envelope().page.number.0 != 0 {
                         return Err(Error::InvalidRequest);
                     }

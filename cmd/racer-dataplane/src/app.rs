@@ -116,6 +116,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::runtime::ingress::Ingress>,
     metrics: Vec<(WorkerId, crate::telemetry::metrics::Metrics)>,
     failures: crate::telemetry::failures::Failures,
@@ -154,6 +155,9 @@ impl NodeState {
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         Ok(Self {
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
+            subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
+                Default::default(),
+            )?),
             publications: Arc::new(PublishedState::default()),
             metrics: workers
                 .iter()
@@ -804,6 +808,7 @@ impl WorkerApplication {
             dispatcher.clone(),
             relay,
         )
+        .with_subscriptions(node.subscriptions.clone())
         .with_request_timeout(config.request_timeout)
         .with_network(network.clone())
         .with_opaque_relay(config.opaque_relay)

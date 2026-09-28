@@ -729,8 +729,11 @@ async fn serve_connection(
             return Ok(());
         }
         drop(read);
-        let mut send =
-            responses.send_observed(connection, response, scope, &mut observation, timeout);
+        let mut send = if matches!(kind, super::request::ReadKind::Subscription { .. }) {
+            responses.send_subscription(connection, response, scope, &mut observation, timeout)
+        } else {
+            responses.send_observed(connection, response, scope, &mut observation, timeout)
+        };
         let result = std::future::poll_fn(|cx| {
             if socket.peer_disconnected() {
                 let _ = scope.cancel();
@@ -1200,8 +1203,13 @@ mod tests {
         }
     }
     fn request(method: &str, fields: &str) -> Vec<u8> {
+        let body = if method == "POST" {
+            "Content-Length: 0\r\n"
+        } else {
+            ""
+        };
         format!(
-            "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{fields}\r\n",
+            "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\n{body}{fields}\r\n",
             "0".repeat(64)
         )
         .into_bytes()
@@ -1430,7 +1438,16 @@ mod tests {
         let directory = File::open(directory).unwrap();
         let witness =
             anchored(&directory).join(".racer-owned-.racer-00000000000000000000000000000000");
-        drop(UnixListener::bind(&witness).unwrap());
+        let stale = UnixListener::bind(&witness).unwrap();
+        // Parallel crash-owner tests spawn children. A concurrent fork can hold
+        // this CLOEXEC descriptor until exec, so dropping our alias alone does
+        // not guarantee a refused connection yet. Shut down the shared listener
+        // before dropping it to establish the stale-witness precondition.
+        assert_eq!(
+            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        drop(stale);
         let socket = anchored(&directory).join("socket");
         drop(UnixListener::bind(&socket).unwrap());
         let inode = fs::metadata(&socket).unwrap().ino();
@@ -1728,8 +1745,11 @@ mod tests {
                     length,
                     expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
                 };
-                let requested = match request.kind {
-                    super::super::request::ReadKind::Pinned { range, .. } => range,
+                let requested = match &request.kind {
+                    super::super::request::ReadKind::Subscription { range, .. } => {
+                        range.unwrap_or(ByteRange::From(0))
+                    }
+                    super::super::request::ReadKind::Pinned { range, .. } => *range,
                     _ => ByteRange::Closed {
                         first: 0,
                         last: PAGE_BYTES - 1,
@@ -1780,7 +1800,7 @@ mod tests {
                     plaintext,
                     ciphertext,
                 };
-                let stream = self.streams.open_with_budget(
+                let mut stream = self.streams.open_with_budget(
                     metadata.clone(),
                     range,
                     request.origin,
@@ -1789,6 +1809,15 @@ mod tests {
                     crate::read::flight::AcquisitionBudget::new(scope.deadline.0, 4, 4),
                     if self.unseeded { None } else { Some(seed) },
                 )?;
+                if let super::super::request::ReadKind::Subscription {
+                    page_credits,
+                    byte_credits,
+                    ordered,
+                    ..
+                } = request.kind
+                {
+                    stream.configure_subscription(page_credits, byte_credits, ordered)?;
+                }
                 Ok(ReadResponse {
                     metadata,
                     range: Some(range),
@@ -1875,7 +1904,7 @@ mod tests {
             fixture.reconcile(&[definition()]).unwrap();
             let mut socket = fixture.connect();
             socket
-                .write_all(&request("GET", &format!("{fields}Connection: close\r\n")))
+                .write_all(&request("POST", &format!("{fields}Connection: close\r\n")))
                 .unwrap();
             let output = fixture.receive(&mut socket, true);
             let end = output
@@ -1886,11 +1915,37 @@ mod tests {
             let head = std::str::from_utf8(&output[..end])
                 .unwrap()
                 .to_ascii_lowercase();
-            assert!(head.starts_with("http/1.1 206"), "{head}");
+            assert!(head.starts_with("http/1.1 200"), "{head}");
             assert!(head.contains("content-type: application/octet-stream\r\n"));
-            assert!(head.contains(&format!("content-length: {expected_length}\r\n")));
-            assert!(head.contains(&format!("content-range: {expected_range}\r\n")));
-            assert_eq!(&output[end..], expected_body);
+            let overhead = if late_failure { 63 } else { 42 };
+            assert!(head.contains(&format!(
+                "content-length: {}\r\n",
+                expected_length + overhead
+            )));
+            let start: u64 = expected_range
+                .strip_prefix("bytes ")
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(head.contains(&format!("racer-range-start: {start}\r\n")));
+            assert_eq!(output[end], 1);
+            assert_eq!(
+                u64::from_be_bytes(output[end + 9..end + 17].try_into().unwrap()),
+                start
+            );
+            assert_eq!(
+                &output[end + 21..end + 21 + expected_body.len()],
+                expected_body
+            );
+            if late_failure {
+                assert_eq!(output.len(), end + 21 + expected_body.len());
+            } else {
+                assert_eq!(output.len(), end + 42 + expected_body.len());
+                assert_eq!(output[end + 21 + expected_body.len()], 2);
+            }
             let mut diagnostics = String::new();
             failures.write(&mut diagnostics).unwrap();
             if late_failure {
@@ -1909,6 +1964,66 @@ mod tests {
             } else {
                 assert!(diagnostics.starts_with("total=0 "), "{diagnostics}");
             }
+        }
+    }
+
+    #[test]
+    fn subscription_retains_delivered_page_until_release_and_rejects_invalid_releases() {
+        use crate::model::limits::ResourceClass;
+        for release in [Some((0u64, 2u32)), Some((0, 1)), Some((1, 2)), None] {
+            let (fixture, pipes) = body_fixture_with_large_page(4, false, true);
+            let mut socket = fixture.connect();
+            socket
+                .write_all(&request(
+                    "POST",
+                    "Range: bytes=16777214-16777216\r\nRacer-Page-Credits: 1\r\n",
+                ))
+                .unwrap();
+            let mut output = fixture.receive(&mut socket, false);
+            let end = output.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while output.len() < end + 23 {
+                fixture.pump(16);
+                let mut bytes = [0; 4096];
+                match socket.read(&mut bytes) {
+                    Ok(0) => panic!("subscription closed before release"),
+                    Ok(n) => output.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(e) => panic!("{e}"),
+                }
+                assert!(Instant::now() < deadline);
+            }
+            assert_eq!(&output[end + 21..], b"xx");
+            for _ in 0..32 {
+                fixture.pump(16);
+            }
+            assert_eq!(fixture.listeners.active_connections(), 1);
+            assert_eq!(
+                fixture.listeners.admission.used(ResourceClass::Plaintext),
+                crate::model::range::PAGE_BYTES as usize
+            );
+            let Some(release) = release else {
+                drop(socket);
+                for _ in 0..64 {
+                    fixture.pump(16);
+                }
+                assert_only_idle_pipes(&fixture, &pipes);
+                continue;
+            };
+            let mut bytes = [0; 12];
+            bytes[..8].copy_from_slice(&release.0.to_be_bytes());
+            bytes[8..].copy_from_slice(&release.1.to_be_bytes());
+            // Exercise fragmented release reception and retention of its prefix.
+            socket.write_all(&bytes[..5]).unwrap();
+            for _ in 0..16 {
+                fixture.pump(16);
+            }
+            assert_eq!(fixture.listeners.active_connections(), 1);
+            socket.write_all(&bytes[5..]).unwrap();
+            assert!(fixture.receive(&mut socket, true).is_empty());
+            // A valid release admits the unavailable next page; invalid releases
+            // close immediately. Neither path can emit Complete or leak the lease.
+            assert_only_idle_pipes(&fixture, &pipes);
         }
     }
 
@@ -1960,7 +2075,7 @@ mod tests {
         let mut socket = fixture.connect();
         socket
             .write_all(&request(
-                "GET",
+                "POST",
                 "If-Match: \"v1\"\r\nRange: bytes=0-4\r\nConnection: close\r\n",
             ))
             .unwrap();
@@ -2022,7 +2137,7 @@ mod tests {
         let mut socket = fixture.connect();
         socket
             .write_all(&request(
-                "GET",
+                "POST",
                 "If-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n",
             ))
             .unwrap();
@@ -2037,7 +2152,7 @@ mod tests {
             waker.wake_by_ref();
         }
         let mut output = fixture.receive(&mut socket, false);
-        assert!(output.starts_with(b"HTTP/1.1 206 "));
+        assert!(output.starts_with(b"HTTP/1.1 200 "));
         let head_end = output
             .windows(4)
             .position(|part| part == b"\r\n\r\n")
@@ -2072,9 +2187,13 @@ mod tests {
         output.extend(fixture.receive(&mut socket, true));
         assert_eq!(
             output.len() - head_end,
-            crate::model::range::PAGE_BYTES as usize
+            crate::model::range::PAGE_BYTES as usize + 42
         );
-        assert!(output[head_end..].iter().all(|byte| *byte == b'x'));
+        assert!(
+            output[head_end + 21..output.len() - 21]
+                .iter()
+                .all(|byte| *byte == b'x')
+        );
         assert_only_idle_pipes(&fixture, &_pipes);
     }
 
@@ -2107,21 +2226,41 @@ mod tests {
 
     #[test]
     fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
-        let (fixture, pipes) = body_fixture(2, false);
+        // Duplex completion frames and the next response head may be in flight
+        // together, in addition to listener readiness. Keep reactor headroom
+        // while independently exercising the bounded FIFO pipe queue.
+        let (mut fixture, pipes) = body_fixture(4, false);
+        let failures = crate::telemetry::failures::Failures::default();
+        fixture.listeners.responses = Rc::new(
+            Responses::new(
+                fixture.listeners.io.clone(),
+                Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2))),
+            )
+            .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
+        );
         let held = pipes.acquire().unwrap();
         let mut first = start_body(&fixture);
         let mut second = start_body(&fixture);
+        let mut third = start_body(&fixture);
+        let mut fourth = start_body(&fixture);
         assert_no_head(&mut first);
         assert_no_head(&mut second);
+        assert_no_head(&mut third);
+        assert_no_head(&mut fourth);
         let mut overflow = start_body(&fixture);
         let output = fixture.receive(&mut overflow, true);
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
         assert!(output.ends_with(b"\r\n\r\n"));
         drop(held);
-        for socket in [&mut first, &mut second] {
+        for socket in [&mut first, &mut second, &mut third, &mut fourth] {
             let output = fixture.receive(socket, true);
-            assert!(output.starts_with(b"HTTP/1.1 206 "));
-            assert!(output.ends_with(b"\r\n\r\nhello"));
+            let mut diagnostics = String::new();
+            failures.write(&mut diagnostics).unwrap();
+            assert!(
+                output.starts_with(b"HTTP/1.1 200 "),
+                "{output:?} {diagnostics}"
+            );
+            assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
         }
         assert_only_idle_pipes(&fixture, &pipes);
     }
@@ -2212,18 +2351,28 @@ mod tests {
             fixture.listeners.reads = Rc::new(Empty(cancelled));
             let mut socket = fixture.connect();
             socket
-                .write_all(&request(
-                    "GET",
-                    "Range: bytes=0-16777215\r\nConnection: close\r\n",
-                ))
+                .write_all(&request("POST", "Connection: close\r\n"))
                 .unwrap();
             let output = fixture.receive(&mut socket, true);
             let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
             let status = if cancelled { 503 } else { 200 };
             assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-            assert!(text.contains("content-length: 0\r\n"));
+            assert!(text.contains(if cancelled {
+                "content-length: 0\r\n"
+            } else {
+                "content-length: 21\r\n"
+            }));
             assert!(!text.contains("content-range:"));
-            assert!(text.ends_with("\r\n\r\n"));
+            if cancelled {
+                assert!(text.ends_with("\r\n\r\n"));
+            } else {
+                assert_eq!(
+                    &output[output.len() - 21..],
+                    &[
+                        2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                    ]
+                );
+            }
             if !cancelled {
                 assert!(text.contains("etag: \"\"\r\n"));
                 assert!(text.contains("racer-expires-at: 0\r\n"));
@@ -2275,10 +2424,10 @@ mod tests {
         let fixture = Fixture::new();
         fixture.reconcile(&[definition()]).unwrap();
         for (method, fields, status, extra) in [
-            ("POST", "", "405", "allow: head, get\r\n"),
+            ("GET", "", "405", "allow: head, post\r\n"),
             (
-                "GET",
-                "Range: bytes=1-2\r\n",
+                "POST",
+                "Range: bytes=2-1\r\n",
                 "400",
                 "content-length: 0\r\n",
             ),

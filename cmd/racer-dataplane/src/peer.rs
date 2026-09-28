@@ -6,6 +6,7 @@ mod native_io;
 pub mod relay;
 pub mod requester;
 pub mod server;
+pub mod subscriptions;
 #[cfg(test)]
 mod tests;
 pub mod transfer;

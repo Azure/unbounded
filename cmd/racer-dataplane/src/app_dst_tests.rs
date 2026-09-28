@@ -1148,6 +1148,9 @@ impl Harness {
             Sha256::digest(&request)
         ));
         Client {
+            frame_cursor: None,
+            releases: Vec::new(),
+            released: 0,
             fd: Some(fd),
             request,
             sent: 0,
@@ -1576,12 +1579,12 @@ impl Harness {
     fn malformed_client(&mut self) {
         let mut client = self.request(2, false, false);
         let (method, fields, status) = match self.rng.pick(3) {
-            0 => ("GET", "Host: racer\r\nHost: racer\r\n", 400),
-            1 => ("POST", "Host: racer\r\n", 405),
-            _ => ("GET", "Host: racer\r\nContent-Length: 1\r\n", 400),
+            0 => ("POST", "Host: racer\r\nHost: racer\r\n", 400),
+            1 => ("GET", "Host: racer\r\n", 405),
+            _ => ("POST", "Host: racer\r\nContent-Length: 1\r\n", 400),
         };
         client.request =
-            format!("{method} /v1/objects/{} HTTP/1.1\r\n{fields}\r\n", key(2)).into_bytes();
+            format!("{method} /v2/objects/{} HTTP/1.1\r\n{fields}\r\n", key(2)).into_bytes();
         client.expected_status = Some(status);
         self.exchange(client, false);
         self.coverage.action("malformed-client");
@@ -1877,7 +1880,7 @@ impl Harness {
             assert_eq!(client.response.len(), end);
             assert!(!headers.contains_key("etag") && !headers.contains_key("racer-expires-at"));
             if status == 416 {
-                assert!(client.pinned && client.size == 0 && !client.head);
+                assert!(client.size == 0 && !client.head);
                 assert_eq!(headers["content-range"], "bytes */0");
                 self.coverage.action("empty-range");
             } else {
@@ -1901,25 +1904,44 @@ impl Harness {
         let expected = &self.oracle[&(client.object, headers["etag"].clone())];
         assert_eq!(expected.len(), client.size);
         let body = &client.response[end..];
-        if client.head || client.size == 0 {
+        if client.head {
             assert_eq!(status, 200);
             assert_eq!(length, client.size);
             assert!(body.is_empty());
             assert!(!headers.contains_key("content-range"));
         } else {
-            assert_eq!(status, 206);
+            assert_eq!(status, 200);
             assert_eq!(headers["content-type"], "application/octet-stream");
-            assert_eq!(
-                headers["content-range"],
-                format!("bytes {}-{}/{}", client.first, client.end - 1, client.size)
-            );
-            assert_eq!(length, client.end - client.first);
+            assert_eq!(headers["racer-range-start"], client.first.to_string());
             assert!(body.len() <= length);
-            assert_eq!(
-                body,
-                &expected[client.first..client.first + body.len()],
-                "oracle byte mismatch"
-            );
+            let mut cursor = 0;
+            let mut offset = client.first;
+            while cursor + 21 <= body.len() {
+                let kind = body[cursor];
+                let start =
+                    u64::from_be_bytes(body[cursor + 9..cursor + 17].try_into().unwrap()) as usize;
+                let count =
+                    u32::from_be_bytes(body[cursor + 17..cursor + 21].try_into().unwrap()) as usize;
+                cursor += 21;
+                if kind == 2 {
+                    assert_eq!(offset, client.end);
+                    assert_eq!(count, 0);
+                    break;
+                }
+                assert_eq!(kind, 1);
+                assert_eq!(start, offset);
+                let available = count.min(body.len() - cursor);
+                assert_eq!(
+                    &body[cursor..cursor + available],
+                    &expected[offset..offset + available],
+                    "oracle byte mismatch"
+                );
+                cursor += available;
+                offset += available;
+                if available != count {
+                    break;
+                }
+            }
             if body.len() != length {
                 assert!(faulted && client.disconnected, "healthy response truncated");
                 self.coverage.failures += 1;
@@ -1927,7 +1949,11 @@ impl Harness {
             }
         }
         self.coverage.success += 1;
-        self.coverage.bytes += body.len();
+        self.coverage.bytes += if client.head {
+            0
+        } else {
+            client.end - client.first
+        };
     }
 
     fn generated(&mut self, steps: usize) {
@@ -2171,6 +2197,9 @@ impl Harness {
 }
 
 struct Client {
+    frame_cursor: Option<usize>,
+    releases: Vec<u8>,
+    released: usize,
     fd: Option<Descriptor>,
     request: Vec<u8>,
     sent: usize,
@@ -2188,7 +2217,26 @@ struct Client {
 }
 impl Client {
     fn poll(&mut self) -> bool {
+        if self.sent == 0
+            && !self.head
+            && self.expected_status.is_none()
+            && self.request.starts_with(b"GET ")
+        {
+            let request = String::from_utf8(self.request.clone()).unwrap();
+            self.request = request.replacen("GET /v1/", "POST /v2/", 1)
+                .replacen("Host: racer\r\n", "Host: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n", 1).into_bytes();
+        }
         let fd = handle(self.fd.as_ref().unwrap());
+        if self.released < self.releases.len() {
+            match fd.send(&self.releases[self.released..]) {
+                Ok(n) => self.released += n,
+                Err(e) if would_block(&e) => (),
+                Err(_) => {
+                    self.disconnected = true;
+                    return true;
+                }
+            }
+        }
         if self.sent < self.request.len() {
             match fd.send(&self.request[self.sent..]) {
                 Ok(n) => self.sent += n,
@@ -2219,6 +2267,25 @@ impl Client {
         if self.response.windows(4).any(|w| w == b"\r\n\r\n") {
             let (_, h, end) = headers(&self.response);
             let length: usize = h["content-length"].parse().unwrap();
+            if !self.head && h.contains_key("racer-range-start") {
+                let mut cursor = self.frame_cursor.unwrap_or(end);
+                while cursor + 21 <= self.response.len() {
+                    let count = u32::from_be_bytes(
+                        self.response[cursor + 17..cursor + 21].try_into().unwrap(),
+                    ) as usize;
+                    if cursor + 21 + count > self.response.len() {
+                        break;
+                    }
+                    if self.response[cursor] == 1 {
+                        self.releases
+                            .extend_from_slice(&self.response[cursor + 1..cursor + 9]);
+                        self.releases
+                            .extend_from_slice(&(count as u32).to_be_bytes());
+                    }
+                    cursor += 21 + count;
+                }
+                self.frame_cursor = Some(cursor);
+            }
             self.response.len() >= end + if self.head { 0 } else { length }
         } else {
             false

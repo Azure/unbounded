@@ -1,4 +1,6 @@
 use super::*;
+#[path = "subscription_tests.rs"]
+mod hot_subscriptions;
 #[path = "opaque_tests.rs"]
 mod opaque;
 use crate::{

@@ -35,6 +35,7 @@ pub trait LocalPageService {
     ) -> Operation<'a, PeerResponse>;
 }
 pub struct PeerServer {
+    subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     opaque_relay: bool,
     pipes: Rc<crate::memory::pipe::PipePool>,
     ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
@@ -51,6 +52,12 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    #[cfg(test)]
+    pub(crate) fn subscription_owner(
+        &self,
+    ) -> &std::sync::Arc<super::subscriptions::Subscriptions> {
+        &self.subscriptions
+    }
     pub(crate) fn with_ingress(
         mut self,
         ingress: std::sync::Arc<crate::runtime::ingress::Ingress>,
@@ -162,6 +169,10 @@ impl PeerServer {
         relay: Rc<Relay>,
     ) -> Self {
         Self {
+            subscriptions: std::sync::Arc::new(
+                super::subscriptions::Subscriptions::new(Default::default())
+                    .expect("valid subscription limits"),
+            ),
             opaque_relay: false,
             pipes: Rc::new(crate::memory::pipe::PipePool::new(
                 admission.clone(),
@@ -189,6 +200,14 @@ impl PeerServer {
     }
     pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
         self.transfers = Some(transfers);
+        self
+    }
+    /// Assembly shares one bounded scheduler across every worker on this node.
+    pub fn with_subscriptions(
+        mut self,
+        subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
+    ) -> Self {
+        self.subscriptions = subscriptions;
         self
     }
     pub(crate) fn with_pipes(mut self, pipes: Rc<crate::memory::pipe::PipePool>) -> Self {
@@ -406,7 +425,8 @@ impl PeerServer {
                 }
             }
             let body = match &response.response {
-                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes(),
+                PeerResponse::Page { ciphertext, .. }
+                | PeerResponse::Selected { ciphertext, .. } => ciphertext.bytes(),
                 PeerResponse::Bootstrap {
                     page_zero: Some(ciphertext),
                     ..
@@ -419,6 +439,7 @@ impl PeerServer {
             if !body.is_empty() {
                 let ciphertext = match &response.response {
                     PeerResponse::Page { ciphertext, .. }
+                    | PeerResponse::Selected { ciphertext, .. }
                     | PeerResponse::Bootstrap {
                         page_zero: Some(ciphertext),
                         ..
@@ -521,7 +542,7 @@ impl PeerServer {
                 }
                 Err(error) => return Err(error),
             };
-            let result = self.local.serve_peer(request, membership, &scope).await;
+            let result = self.serve_selected(request, membership, &scope).await;
             let result = self.admission.observer().result(
                 crate::telemetry::failures::Stage::PeerLocal,
                 &scope,
@@ -541,6 +562,115 @@ impl PeerServer {
             };
             scope.check()?;
             self.forwarding.sign_response(&binding, response)
+        })
+    }
+    fn serve_selected<'a>(
+        &'a self,
+        request: VerifiedRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PeerResponse> {
+        Box::pin(async move {
+            use super::subscriptions::Selection;
+            use crate::security::protocol::{encode_deadline, millis};
+            let super::wire::Operation::Subscribe { subscription, mode } =
+                &request.request().operation
+            else {
+                return self.local.serve_peer(request, membership, scope).await;
+            };
+            membership.member(request.origin().node())?;
+            let placement = crate::topology::placement::Placement::new(64);
+            let local = &self
+                .network
+                .as_ref()
+                .ok_or(Error::InvalidConfiguration)?
+                .local;
+            let selection = self.subscriptions.schedule_eligible(
+                subscription.clone(),
+                membership.version,
+                request.origin().node().clone(),
+                encode_deadline(scope.deadline)?,
+                millis(crate::runtime::environment::wall_now())?,
+                |number| {
+                    if matches!(mode, super::wire::FetchMode::CopyOnly) {
+                        return true;
+                    }
+                    placement
+                        .rank(
+                            membership.clone(),
+                            &subscription.version.object,
+                            crate::model::identity::PageNumber(number),
+                        )
+                        .is_ok_and(|rank| rank.ordered.first() == Some(local))
+                },
+            )?;
+            let (mut work, mut waiter) = match selection {
+                Selection::Leader { work, waiter } => (Some(work), waiter),
+                Selection::Follower(waiter) => (None, waiter),
+            };
+            let mut request = Some(request);
+            let cancellation = scope.cancellation.subscribe()?;
+            loop {
+                if let Some(owner) = work.take() {
+                    let selected = request
+                        .take()
+                        .ok_or(Error::StaleFlight)?
+                        .select_page(owner.page().clone())?;
+                    match self
+                        .local
+                        .serve_peer(selected, membership.clone(), scope)
+                        .await
+                    {
+                        Ok(PeerResponse::Page {
+                            metadata,
+                            ciphertext,
+                        }) => {
+                            owner.complete(
+                                crate::memory::page::CiphertextCopy {
+                                    metadata,
+                                    ciphertext,
+                                },
+                                millis(crate::runtime::environment::wall_now())?,
+                            )?;
+                        }
+                        Ok(other) => {
+                            owner.fail(match other {
+                                PeerResponse::OriginRejected => Error::OriginRejected,
+                                PeerResponse::OriginForbidden => Error::OriginForbidden,
+                                _ => Error::Unavailable,
+                            });
+                            return Ok(other);
+                        }
+                        Err(error) => {
+                            owner.fail(error);
+                            return Err(error);
+                        }
+                    }
+                }
+                let completion = std::future::poll_fn(|cx| {
+                    cancellation.register(cx.waker());
+                    if let Err(error) = scope.check() {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    let now = match millis(crate::runtime::environment::wall_now()) {
+                        Ok(now) => now,
+                        Err(error) => return std::task::Poll::Ready(Err(error)),
+                    };
+                    if let Some(promoted) = waiter.take_work(now) {
+                        work = Some(promoted);
+                        return std::task::Poll::Ready(Ok(None));
+                    }
+                    waiter.poll_result(cx, now).map(|result| result.map(Some))
+                })
+                .await?;
+                if let Some(completion) = completion {
+                    return Ok(PeerResponse::Selected {
+                        metadata: completion.metadata,
+                        ciphertext: completion.ciphertext,
+                        grant: completion.grant,
+                    });
+                }
+            }
         })
     }
     /// Enable experimental opaque HTTP transit without changing endpoint/native paths.

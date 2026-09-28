@@ -27,6 +27,10 @@ pub enum FetchMode {
     Acquire,
 }
 pub enum Operation {
+    Subscribe {
+        subscription: super::subscriptions::Subscription,
+        mode: FetchMode,
+    },
     Bootstrap {
         object: ObjectId,
         mode: FetchMode,
@@ -49,6 +53,11 @@ pub struct PeerRequest {
 }
 /// Unsigned local result. Transport must sign it against the admitted request.
 pub enum PeerResponse {
+    Selected {
+        metadata: ObjectMetadata,
+        ciphertext: CiphertextPage,
+        grant: super::subscriptions::TransferGrant,
+    },
     Bootstrap {
         metadata: ObjectMetadata,
         page_zero: Option<CiphertextPage>,
@@ -88,8 +97,8 @@ pub struct SignedResponse {
     pub response: PeerResponse,
 }
 
-pub const VERSION: &str = "4";
-pub const REQUEST_TARGET: &str = "/racer/peer/v4/exchange";
+pub const VERSION: &str = "5";
+pub const REQUEST_TARGET: &str = "/racer/peer/v5/exchange";
 pub const MAX_HOPS: usize = 8;
 pub const MAX_SIGNED_HEAD: usize = crate::security::protocol::MAX_HEAD;
 pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
@@ -313,7 +322,7 @@ mod tests {
     }
     #[test]
     fn rejects_versions_duplicates_holes_and_request_bodies() {
-        for version in ["1", "2", "3", "5"] {
+        for version in ["1", "2", "3", "4", "6"] {
             let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
             head.headers[0].value = version.as_bytes().to_vec();
             assert!(WireCodec::decode(head, false).is_err());

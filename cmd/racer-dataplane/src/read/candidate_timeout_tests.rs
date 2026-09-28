@@ -20,6 +20,8 @@ use std::{
 
 struct Call {
     scope: RequestScope,
+    signed_deadline: Instant,
+    subscription: Option<crate::peer::subscriptions::Subscription>,
     destination: NodeId,
     copy: bool,
     attempts: u32,
@@ -59,10 +61,13 @@ impl Peers {
             length: 17,
             expires_at: ExpiresAt(std::time::SystemTime::now() + Duration::from_secs(60)),
         };
+        let response = match &request.operation {
+            PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,
+            _ => PeerResponse::Metadata(metadata),
+        };
         let (signed, binding) = sender.sign_request(request)?;
         let admitted = receiver.verify_request(signed)?;
-        let signed =
-            receiver.sign_response(admitted.binding(), PeerResponse::Metadata(metadata))?;
+        let signed = receiver.sign_response(admitted.binding(), response)?;
         sender.verify_response(signed, &binding)
     }
 }
@@ -74,11 +79,12 @@ impl PeerClient for Peers {
         membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
-        assert_eq!(scope.deadline.0, request.route.deadline.0);
-        assert_eq!(scope.deadline.0, request.origin.scope().deadline.0);
+        assert!(scope.deadline.0 <= request.route.deadline.0);
+        assert_eq!(request.route.deadline.0, request.origin.scope().deadline.0);
         assert_eq!(scope.request, request.route.request);
         let copy = match &request.operation {
-            PeerOperation::Bootstrap { mode, .. }
+            PeerOperation::Subscribe { mode, .. }
+            | PeerOperation::Bootstrap { mode, .. }
             | PeerOperation::Metadata { mode, .. }
             | PeerOperation::Page { mode, .. } => {
                 matches!(mode, FetchMode::CopyOnly)
@@ -87,6 +93,11 @@ impl PeerClient for Peers {
         let stalled = self.calls.borrow().len() < self.stalled;
         self.calls.borrow_mut().push(Call {
             scope: scope.clone(),
+            signed_deadline: request.route.deadline.0,
+            subscription: match &request.operation {
+                PeerOperation::Subscribe { subscription, .. } => Some(subscription.clone()),
+                _ => None,
+            },
             destination: request.route.destination.clone(),
             copy,
             attempts: request.route.remaining_attempts,
@@ -194,6 +205,162 @@ fn expire(deadline: Instant) {
     std::thread::sleep(
         deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
     );
+}
+
+#[test]
+fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
+    let mut f = Fixture::new(Some(1), 1, false);
+    f.peers.fenced.set(false);
+    let scheduler = super::super::subscription::Scheduler::new(1);
+    let demand =
+        crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
+            start: 0,
+            end: 1,
+        }])
+        .unwrap();
+    let version = ObjectVersion {
+        object: f.context.object.clone(),
+        etag: StrongEtag::test_value("v1"),
+    };
+    let mut subscribe = Box::pin(f.policy.subscribe(
+        version.clone(),
+        demand.clone(),
+        &scheduler,
+        f.candidates.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut f.budget,
+    ));
+    assert!(poll(subscribe.as_mut()).is_pending());
+    let deadline = f.peers.calls.borrow()[0].scope.deadline.0;
+    assert!(deadline < f.scope.deadline.0);
+    assert_eq!(
+        f.peers.calls.borrow()[0].signed_deadline,
+        f.scope.deadline.0
+    );
+    expire(deadline);
+    assert!(
+        poll(subscribe.as_mut()).is_pending(),
+        "accepted exchange is not fenced"
+    );
+    assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+    assert!(f.scope.check().is_ok());
+    f.peers.fenced.set(true);
+    assert!(matches!(poll(subscribe.as_mut()), Poll::Ready(Ok(None))));
+    drop(subscribe);
+    let operation = PeerOperation::Page {
+        page: crate::model::identity::PageId {
+            version: version.clone(),
+            number: PageNumber(0),
+        },
+        mode: FetchMode::Acquire,
+    };
+    let result = futures::executor::block_on(f.policy.resolve_with_budget(
+        f.candidates.clone(),
+        &f.context,
+        operation,
+        &f.scope,
+        &mut f.budget,
+    ))
+    .unwrap();
+    let CandidateResolution::Origin(authority) = result else {
+        panic!("fallback authority")
+    };
+    authority
+        .validate(&f.context.object, PageNumber(0))
+        .unwrap();
+    // Another selection keeps the original signed deadline and spent ceilings,
+    // even though its local attempt starts later.
+    assert!(
+        futures::executor::block_on(f.policy.subscribe(
+            version,
+            demand,
+            &scheduler,
+            f.candidates.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut f.budget,
+        ))
+        .unwrap()
+        .is_none()
+    );
+    let calls = f.peers.calls.borrow();
+    let first = calls[0].subscription.as_ref().unwrap();
+    let next = calls[2].subscription.as_ref().unwrap();
+    assert_eq!(first.id, next.id);
+    assert_eq!(first.sequence + 1, next.sequence);
+    assert_eq!(first.page_budget - 1, next.page_budget);
+    assert_eq!(
+        first.byte_budget - crate::model::range::PAGE_BYTES - 16,
+        next.byte_budget
+    );
+    assert_eq!(calls[0].signed_deadline, calls[2].signed_deadline);
+    let provider = std::sync::Arc::new(
+        crate::peer::subscriptions::Subscriptions::new(Default::default()).unwrap(),
+    );
+    for (subscription, call) in [(first, &calls[0]), (next, &calls[2])] {
+        let selected = provider
+            .schedule(
+                subscription.clone(),
+                f.candidates.membership.version,
+                f.policy.node.clone(),
+                crate::security::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
+                crate::security::protocol::millis(crate::runtime::environment::wall_now()).unwrap(),
+            )
+            .expect("later exchange must not renew the provider contract");
+        let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {
+            panic!("independent completed attempts")
+        };
+        work.fail(Error::Unavailable);
+        drop(waiter);
+    }
+    assert_eq!(
+        calls.iter().map(|call| call.attempts + 1).sum::<u32>() + f.budget.remaining_attempts(),
+        16
+    );
+    assert_eq!(
+        calls.iter().map(|call| u32::from(call.links)).sum::<u32>()
+            + u32::from(f.budget.remaining_links()),
+        24
+    );
+}
+
+#[test]
+fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
+    let mut f = Fixture::new(Some(1), 1, false);
+    f.peers.fenced.set(false);
+    let scheduler = super::super::subscription::Scheduler::new(1);
+    let demand =
+        crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
+            start: 0,
+            end: 1,
+        }])
+        .unwrap();
+    let mut subscribe = Box::pin(f.policy.subscribe(
+        ObjectVersion {
+            object: f.context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        },
+        demand,
+        &scheduler,
+        f.candidates.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut f.budget,
+    ));
+    assert!(poll(subscribe.as_mut()).is_pending());
+    f.scope.cancel().unwrap();
+    assert!(poll(subscribe.as_mut()).is_pending());
+    assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+    f.peers.fenced.set(true);
+    assert!(matches!(
+        poll(subscribe.as_mut()),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    drop(subscribe);
+    assert_eq!(f.peers.calls.borrow().len(), 1);
+    assert_eq!(f.budget.remaining_links(), 20);
+    assert_eq!(f.budget.remaining_attempts(), 7);
 }
 
 #[test]

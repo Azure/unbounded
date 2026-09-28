@@ -58,6 +58,7 @@ struct MailboxState {
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
 pub struct WorkerDirectory {
+    pub(crate) subscriptions: Arc<super::subscription::Scheduler>,
     map: Arc<WorkerMap>,
     mailboxes: Vec<Arc<Mailbox>>,
     capacity: usize,
@@ -65,6 +66,14 @@ pub struct WorkerDirectory {
 }
 
 enum Work {
+    Select(
+        ObjectVersion,
+        super::subscription::Selection,
+        MembershipLease,
+        PeerOriginContext,
+    ),
+    Selected(crate::memory::page::CiphertextCopy),
+    Cached(PageId),
     Resolve(MetadataSelector, MembershipLease, PeerOriginContext),
     Bootstrap(MetadataSelector, MembershipLease, PeerOriginContext),
     Acquire(PageId, MembershipLease, PeerOriginContext),
@@ -76,6 +85,7 @@ enum Value {
     Metadata(ObjectMetadata),
     Bootstrap(BootstrapResult),
     Page(PageResult),
+    Cached(Option<PageResult>),
     Published,
     Retained(Option<VersionMetadata>),
     Peer(PeerResponse),
@@ -184,6 +194,80 @@ pub struct WorkerEndpoint {
 }
 
 impl WorkerDirectory {
+    pub(crate) async fn cached_page(
+        &self,
+        page: PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        let owner = self.page_owner(&page)?;
+        if self.is_local(owner) {
+            return self.local()?.cached_page(&page, scope);
+        }
+        match self
+            .submit(owner, Work::Cached(page), scope, None)?
+            .await?
+            .value?
+        {
+            Value::Cached(result) => Ok(result),
+            _ => Err(Error::StaleFlight),
+        }
+    }
+    pub(crate) fn start_selection(
+        &self,
+        version: ObjectVersion,
+        selection: super::subscription::Selection,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: AcquisitionBudget,
+    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+        // Always use the owned worker driver, even for local ingress. Detaching the
+        // stream must not release receiving exclusivity before accepted I/O fences.
+        let owner = self.metadata_owner(&version.object)?;
+        let receipt = self.submit(
+            owner,
+            Work::Select(version, selection, membership, self.seal(context, scope)?),
+            scope,
+            Some(budget),
+        )?;
+        Ok(Box::pin(async move {
+            let completion = receipt.await?;
+            let budget = completion.budget.ok_or(Error::StaleFlight)?;
+            let result = completion.value.and_then(|value| match value {
+                Value::Page(result) => Ok(result),
+                _ => Err(Error::StaleFlight),
+            });
+            Ok((result, budget))
+        }))
+    }
+    pub(crate) async fn accept_selected(
+        &self,
+        copy: crate::memory::page::CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        let owner = self.page_owner(&copy.ciphertext.envelope().page)?;
+        if self.is_local(owner) {
+            return self.local()?.accept_selected(copy, scope).await;
+        }
+        let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
+        // Cancellation notifies the owner, but selection exclusivity must survive
+        // until its accepted crypto and publication work actually completes.
+        let completion = std::future::poll_fn(|cx| {
+            receipt.cancellation.register(cx.waker());
+            let mut state = receipt.reply.state.lock().unwrap();
+            if let Some(completion) = state.completion.take() {
+                return Poll::Ready(completion);
+            }
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
+        scope.check()?;
+        match completion.value? {
+            Value::Page(result) => Ok(result),
+            _ => Err(Error::StaleFlight),
+        }
+    }
     /// A simulated process loss discards queued messages, including the permit
     /// whose Arc otherwise forms a mailbox -> command -> mailbox ownership cycle.
     /// Do not execute commands or mark kernel/NIC operations complete here.
@@ -227,6 +311,9 @@ impl WorkerDirectory {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
+            subscriptions: super::subscription::Scheduler::new(
+                capacity.saturating_mul(workers.len()),
+            ),
             map,
             mailboxes: workers
                 .into_iter()
@@ -598,6 +685,10 @@ impl WorkerDirectory {
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             let owner = match &request.request().operation {
+                // PeerServer must authenticate and project a provider selection.
+                crate::peer::wire::Operation::Subscribe { .. } => {
+                    return Err(Error::InvalidRequest);
+                }
                 crate::peer::wire::Operation::Bootstrap { object, .. } => {
                     self.metadata_owner(object)?
                 }
@@ -812,6 +903,23 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
+        Work::Select(version, selection, membership, envelope) => {
+            let context = local.open_context(envelope)?;
+            let page = local
+                .select_subscription(
+                    version,
+                    selection.demand.clone(),
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                )
+                .await?;
+            selection.complete(page.clone())?;
+            Ok(Value::Page(page))
+        }
+        Work::Selected(copy) => local.accept_selected(copy, scope).await.map(Value::Page),
+        Work::Cached(page) => local.cached_page(&page, scope).map(Value::Cached),
         Work::Resolve(selector, membership, envelope) => {
             let context = local.open_context(envelope)?;
             local
@@ -932,6 +1040,129 @@ mod tests {
                 key: CacheKey([7; 32]),
             },
             etag: StrongEtag::test_value("v1"),
+        }
+    }
+
+    #[test]
+    fn selected_owner_cancellation_waits_for_actual_completion() {
+        let directory = directory(1);
+        let scope = scope();
+        let admission = Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let page = crate::memory::pool::tests::bundle_for(
+            &admission,
+            VersionMetadata {
+                version: version(),
+                length: 3,
+                content_type: None,
+            },
+        );
+        let owner = directory.page_owner(page.plaintext.page()).unwrap();
+        let mut selected = Box::pin(directory.accept_selected(page.copy(), &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(selected.as_mut().poll(&mut cx).is_pending());
+        let command = directory
+            .mailbox(owner)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .unwrap();
+        assert!(
+            matches!(&command.work, Work::Selected(copy) if copy.metadata.version == version())
+        );
+        scope.cancel().unwrap();
+        assert!(selected.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            directory
+                .mailbox(owner)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .outstanding,
+            1
+        );
+        command
+            .reply
+            .complete(
+                command.generation,
+                Completion {
+                    value: Err(Error::Cancelled),
+                    budget: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            selected.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        drop((selected, command));
+        assert_eq!(
+            directory
+                .mailbox(owner)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .outstanding,
+            0
+        );
+    }
+
+    #[test]
+    fn cached_page_handoff_is_lookup_only_and_propagates_misses_and_errors() {
+        for error in [None, Some(Error::Cancelled), Some(Error::CorruptRecord)] {
+            let directory = directory(1);
+            let scope = scope();
+            let page = PageId {
+                version: version(),
+                number: crate::model::identity::PageNumber(9),
+            };
+            let owner = directory.page_owner(&page).unwrap();
+            let mut lookup = Box::pin(directory.cached_page(page.clone(), &scope));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(lookup.as_mut().poll(&mut cx).is_pending());
+            let command = directory
+                .mailbox(owner)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .pop_front()
+                .unwrap();
+            assert!(matches!(&command.work, Work::Cached(requested) if requested == &page));
+            assert!(command.budget.is_none(), "cache lookup cannot acquire");
+            command
+                .reply
+                .complete(
+                    command.generation,
+                    Completion {
+                        value: error.map_or(Ok(Value::Cached(None)), Err),
+                        budget: None,
+                    },
+                )
+                .unwrap();
+            match lookup.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(None)) => assert!(error.is_none()),
+                Poll::Ready(Err(actual)) => assert_eq!(Some(actual), error),
+                _ => panic!("unexpected lookup completion"),
+            }
+            drop((lookup, command));
+            assert_eq!(
+                directory
+                    .mailbox(owner)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .outstanding,
+                0
+            );
         }
     }
 

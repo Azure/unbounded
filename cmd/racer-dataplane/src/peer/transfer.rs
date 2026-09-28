@@ -409,8 +409,12 @@ impl Transfers {
                 PeerResponse::Bootstrap {
                     page_zero: Some(_), ..
                 } => return Err(Error::InvalidRequest),
-                PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == length => {}
-                PeerResponse::Page { .. } => return Err(Error::InvalidRequest),
+                PeerResponse::Page { ciphertext, .. }
+                | PeerResponse::Selected { ciphertext, .. }
+                    if ciphertext.bytes().len() == length => {}
+                PeerResponse::Page { .. } | PeerResponse::Selected { .. } => {
+                    return Err(Error::InvalidRequest);
+                }
                 _ if length == 0 => {}
                 _ => return Err(Error::InvalidRequest),
             }

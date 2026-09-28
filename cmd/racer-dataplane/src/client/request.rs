@@ -1,4 +1,4 @@
-//! Validate HEAD/bootstrap/pinned GET and preserve opaque adapter fields.
+//! Validate v2 subscriptions and HEAD metadata while preserving opaque fields.
 //!
 //! Wire values follow pkg/racersdk: canonical lowercase keys, quoted strong pins,
 //! signed-63-bit decimal ranges, and byte-preserving opaque context.
@@ -19,9 +19,21 @@ pub const MAX_FIELD_BYTES: usize = 8192;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadKind {
     Head,
-    HeadPinned { etag: StrongEtag },
+    HeadPinned {
+        etag: StrongEtag,
+    },
     Bootstrap,
-    Pinned { etag: StrongEtag, range: ByteRange },
+    Pinned {
+        etag: StrongEtag,
+        range: ByteRange,
+    },
+    Subscription {
+        pin: Option<StrongEtag>,
+        range: Option<ByteRange>,
+        page_credits: usize,
+        byte_credits: u64,
+        ordered: bool,
+    },
 }
 
 impl ReadKind {
@@ -32,6 +44,7 @@ impl ReadKind {
     pub fn pin(&self) -> Option<&StrongEtag> {
         match self {
             Self::HeadPinned { etag } | Self::Pinned { etag, .. } => Some(etag),
+            Self::Subscription { pin, .. } => pin.as_ref(),
             _ => None,
         }
     }
@@ -100,6 +113,10 @@ impl RequestParser {
         let mut range = None;
         let mut metadata = None;
         let mut authorization = None;
+        let mut content_length = false;
+        let mut page_credits = 2;
+        let mut byte_credits = 2 * PAGE_BYTES;
+        let mut ordered = false;
         for header in head.headers {
             decoded_bytes = decoded_bytes
                 .saturating_add(header.name.len())
@@ -131,13 +148,16 @@ impl RequestParser {
                     | "racer-content-type"
                     | "racer-metadata"
                     | "authorization"
+                    | "racer-page-credits"
+                    | "racer-byte-credits"
+                    | "racer-ordered"
             ) && !seen.insert(name.clone())
             {
                 return Err(Error::InvalidRequest.into());
             }
             match name.as_str() {
                 "host" => host = Some(value == b"racer"),
-                "content-length" if value == b"0" => {}
+                "content-length" if value == b"0" => content_length = true,
                 "content-length"
                 | "content-range"
                 | "etag"
@@ -166,6 +186,17 @@ impl RequestParser {
                     pin = Some(StrongEtag::parse(value)?);
                 }
                 "range" => range = Some(ByteRange::parse(value)?),
+                "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
+                "racer-byte-credits" => {
+                    byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?;
+                }
+                "racer-ordered" => {
+                    ordered = match value {
+                        b"0" => false,
+                        b"1" => true,
+                        _ => return Err(Error::InvalidRequest.into()),
+                    }
+                }
                 "racer-metadata" => {
                     validate_opaque(value)?;
                     metadata = Some(OpaqueMetadata::from_header(value)?);
@@ -183,20 +214,26 @@ impl RequestParser {
         if host != Some(true) {
             return Err(Error::InvalidRequest.into());
         }
-        let key = parse_key(&target)?;
+        // HEAD remains available for internal metadata users on the old endpoint.
+        let key = if method == "HEAD" {
+            parse_key(&target, "/v1/objects/").or_else(|_| parse_key(&target, "/v2/objects/"))?
+        } else {
+            parse_key(&target, "/v2/objects/")?
+        };
         let kind = match method.as_str() {
             "HEAD" if range.is_none() => match pin {
                 Some(etag) => ReadKind::HeadPinned { etag },
                 None => ReadKind::Head,
             },
             "HEAD" => return Err(Error::InvalidRequest.into()),
-            "GET" => match (pin, range) {
-                (Some(etag), Some(range)) => ReadKind::Pinned { etag, range },
-                (None, Some(ByteRange::Closed { first: 0, last })) if last == PAGE_BYTES - 1 => {
-                    ReadKind::Bootstrap
-                }
-                _ => return Err(Error::InvalidRequest.into()),
+            "POST" if content_length => ReadKind::Subscription {
+                pin,
+                range,
+                page_credits,
+                byte_credits,
+                ordered,
             },
+            "POST" => return Err(Error::InvalidRequest.into()),
             _ => return Err(RequestError::MethodNotAllowed),
         };
         Ok(ClientRequest {
@@ -213,13 +250,29 @@ impl RequestParser {
     }
 }
 
-fn parse_key(target: &str) -> Result<CacheKey> {
+fn parse_key(target: &str, prefix: &str) -> Result<CacheKey> {
     CacheKey::parse_hex(
         target
-            .strip_prefix("/v1/objects/")
+            .strip_prefix(prefix)
             .ok_or(Error::InvalidRequest)?
             .as_bytes(),
     )
+}
+
+fn decimal(value: &[u8], minimum: u64, maximum: u64) -> Result<u64> {
+    if value.is_empty() || value[0] == b'0' || !value.iter().all(u8::is_ascii_digit) {
+        return Err(Error::InvalidRequest);
+    }
+    let number = value
+        .iter()
+        .try_fold(0u64, |n, digit| {
+            n.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+        })
+        .ok_or(Error::InvalidRequest)?;
+    if !(minimum..=maximum).contains(&number) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(number)
 }
 
 fn validate_opaque(value: &[u8]) -> std::result::Result<(), RequestError> {
@@ -259,7 +312,7 @@ mod tests {
         MessageHead {
             start: StartLine::Request {
                 method: method.into(),
-                target: format!("/v1/objects/{}", "01".repeat(32)),
+                target: format!("/v2/objects/{}", "01".repeat(32)),
             },
             headers: std::iter::once(Header {
                 name: "Host".into(),
@@ -268,6 +321,10 @@ mod tests {
             .chain(fields.iter().map(|(name, value)| Header {
                 name: (*name).into(),
                 value: value.to_vec(),
+            }))
+            .chain((method == "POST").then(|| Header {
+                name: "Content-Length".into(),
+                value: b"0".to_vec(),
             }))
             .collect(),
         }
@@ -289,30 +346,45 @@ mod tests {
                 },
             ),
             (
-                "GET",
+                "POST",
                 vec![("Range", b"bytes=0-16777215".as_slice())],
-                ReadKind::Bootstrap,
+                ReadKind::Subscription {
+                    pin: None,
+                    range: Some(ByteRange::Closed {
+                        first: 0,
+                        last: PAGE_BYTES - 1,
+                    }),
+                    page_credits: 2,
+                    byte_credits: 2 * PAGE_BYTES,
+                    ordered: false,
+                },
             ),
             (
-                "GET",
+                "POST",
                 vec![
                     ("Range", b"bytes=-0".as_slice()),
                     ("If-Match", b"\"a,b\\c\"".as_slice()),
                 ],
-                ReadKind::Pinned {
-                    etag: StrongEtag::parse(b"\"a,b\\c\"").unwrap(),
-                    range: ByteRange::Suffix(0),
+                ReadKind::Subscription {
+                    pin: Some(StrongEtag::parse(b"\"a,b\\c\"").unwrap()),
+                    range: Some(ByteRange::Suffix(0)),
+                    page_credits: 2,
+                    byte_credits: 2 * PAGE_BYTES,
+                    ordered: false,
                 },
             ),
             (
-                "GET",
+                "POST",
                 vec![
                     ("Range", b"bytes=16777216-".as_slice()),
                     ("If-Match", b"\"v\"".as_slice()),
                 ],
-                ReadKind::Pinned {
-                    etag: StrongEtag::parse(b"\"v\"").unwrap(),
-                    range: ByteRange::From(PAGE_BYTES),
+                ReadKind::Subscription {
+                    pin: Some(StrongEtag::parse(b"\"v\"").unwrap()),
+                    range: Some(ByteRange::From(PAGE_BYTES)),
+                    page_credits: 2,
+                    byte_credits: 2 * PAGE_BYTES,
+                    ordered: false,
                 },
             ),
         ] {
@@ -372,7 +444,7 @@ mod tests {
             assert!(parse(head("HEAD", &[(name, value)])).is_err());
         }
         assert!(matches!(
-            parse(head("POST", &[])),
+            parse(head("GET", &[])),
             Err(RequestError::MethodNotAllowed)
         ));
         let mut request = head("HEAD", &[]);
@@ -400,12 +472,92 @@ mod tests {
             b"bytes=+1-2",
             b"bytes=0--1",
         ] {
-            assert!(parse(head("GET", &[("Range", range), ("If-Match", b"\"v\"")])).is_err());
+            assert!(parse(head("POST", &[("Range", range), ("If-Match", b"\"v\"")])).is_err());
         }
         for range in [b"bytes=0-1".as_slice(), b"bytes=0-", b"bytes=-1"] {
-            assert!(parse(head("GET", &[("Range", range)])).is_err());
+            assert!(parse(head("POST", &[("Range", range)])).is_ok());
         }
         assert!(parse(head("GET", &[])).is_err());
+    }
+
+    #[test]
+    fn subscription_credit_limits_defaults_and_required_zero_body() {
+        assert_eq!(
+            parse(head("POST", &[])).unwrap().kind,
+            ReadKind::Subscription {
+                pin: None,
+                range: None,
+                page_credits: 2,
+                byte_credits: 2 * PAGE_BYTES,
+                ordered: false,
+            }
+        );
+        for name in ["Racer-Page-Credits", "Racer-Byte-Credits"] {
+            for value in [
+                b"".as_slice(),
+                b"0",
+                b"00",
+                b"01",
+                b"+1",
+                b"-1",
+                b" 1",
+                b"1 ",
+                b"1.0",
+                b"18446744073709551616",
+            ] {
+                assert!(
+                    parse(head("POST", &[(name, value)])).is_err(),
+                    "{name} {value:?}"
+                );
+            }
+            assert!(parse(head("POST", &[(name, b"2"), (name, b"2")])).is_err());
+        }
+        for pages in [1, 64] {
+            for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
+                for ordered in ["0", "1"] {
+                    let parsed = parse(head(
+                        "POST",
+                        &[
+                            ("Racer-Page-Credits", pages.to_string().as_bytes()),
+                            ("Racer-Byte-Credits", bytes.to_string().as_bytes()),
+                            ("Racer-Ordered", ordered.as_bytes()),
+                        ],
+                    ))
+                    .unwrap();
+                    assert!(
+                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, ordered: actual, .. }
+                        if page_credits == pages && byte_credits == bytes && actual == (ordered == "1"))
+                    );
+                }
+            }
+        }
+        for (name, value) in [
+            ("Racer-Page-Credits", "65".into()),
+            ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
+            ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
+            ("Racer-Ordered", "2".into()),
+            ("Racer-Ordered", "01".into()),
+        ] {
+            assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
+        }
+        assert!(
+            parse(head(
+                "POST",
+                &[("Racer-Ordered", b"0"), ("racer-ordered", b"1")]
+            ))
+            .is_err()
+        );
+        let mut missing = head("POST", &[]);
+        missing.headers.retain(|h| h.name != "Content-Length");
+        assert!(parse(missing).is_err());
+        for value in [b"0".as_slice(), b"00", b"1"] {
+            assert!(parse(head("POST", &[("Content-Length", value)])).is_err());
+        }
+        let mut legacy = head("POST", &[]);
+        if let StartLine::Request { target, .. } = &mut legacy.start {
+            *target = target.replace("/v2/", "/v1/");
+        }
+        assert!(parse(legacy).is_err());
     }
 
     #[test]

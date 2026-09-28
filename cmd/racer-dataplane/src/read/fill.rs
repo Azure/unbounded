@@ -38,7 +38,7 @@ use crate::{
     telemetry::metrics::{Event, Gauge, Metrics},
     topology::membership::MembershipLease,
 };
-use std::{rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 pub use crate::memory::page::PageResult;
 #[derive(Clone)]
@@ -58,15 +58,137 @@ pub struct FillDependencies {
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
+type LocalCopy = futures::future::Shared<
+    futures::future::LocalBoxFuture<'static, Result<Option<UnverifiedPage>>>,
+>;
+#[derive(Clone)]
 pub struct Fill {
     dependencies: FillDependencies,
     metrics: Metrics,
+    local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
 }
 enum Prefetch {
     Origin(crate::origin::page::OriginPage),
     Ciphertext(UnverifiedPage),
 }
 impl Fill {
+    pub(crate) fn cached_page(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        scope.check()?;
+        let result = self.dependencies.memory.get(page)?;
+        if let Some(result) = &result {
+            result.validate_for(page)?;
+            self.metrics.record(Event::MemoryHit, 1)?;
+        }
+        Ok(result)
+    }
+    pub(crate) async fn select_subscription(
+        &self,
+        version: crate::model::identity::ObjectVersion,
+        demand: crate::peer::subscriptions::Demand,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PageResult> {
+        let first = crate::model::identity::PageNumber(
+            demand
+                .intervals()
+                .first()
+                .ok_or(Error::InvalidRequest)?
+                .start,
+        );
+        let head = PageId {
+            version: version.clone(),
+            number: first,
+        };
+        if version.object != context.object {
+            return Err(Error::InvalidRequest);
+        }
+        // A new or credit-starved subscriber can lag behind provider completion.
+        // Reuse its verified local head before asking for another node transfer.
+        // The stable page owner rechecks current cache/key admission.
+        if let Some(result) = self
+            .dependencies
+            .metadata_owner
+            .cached_page(head, scope)
+            .await?
+        {
+            return Ok(result);
+        }
+        if let Some(response) = self
+            .dependencies
+            .candidates
+            .subscribe(
+                version.clone(),
+                demand,
+                &self.dependencies.metadata_owner.subscriptions,
+                membership.clone(),
+                context,
+                scope,
+                budget,
+            )
+            .await?
+        {
+            let PeerResponse::Selected { grant, .. } = response.response() else {
+                return Err(Error::CorruptRecord);
+            };
+            let copy = response_copy(response.response(), &grant.page)?;
+            drop(response);
+            // Allocate and authenticate on the stable owner, which can reclaim
+            // every payload charge retained by its page cache.
+            return self
+                .dependencies
+                .metadata_owner
+                .accept_selected(copy, scope)
+                .await;
+        }
+        self.dependencies
+            .metadata_owner
+            .acquire(
+                crate::model::identity::PageId {
+                    version,
+                    number: first,
+                },
+                membership,
+                context,
+                scope,
+                budget,
+            )
+            .await
+    }
+
+    pub(crate) async fn accept_selected(
+        &self,
+        mut copy: crate::memory::page::CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        scope.check()?;
+        copy.validate_metadata()?;
+        let page = copy.ciphertext.envelope().page.clone();
+        if !self
+            .dependencies
+            .admission
+            .owns(&copy.ciphertext.inner.reservation)
+        {
+            let reservation = self.reserve_with_reclamation(
+                &page.version.object.cache,
+                ResourceClass::Ciphertext,
+                copy.ciphertext.inner.bytes.capacity(),
+            )?;
+            copy.ciphertext = copy.ciphertext.rehome(reservation)?;
+        }
+        let reservation = self.reserve_bootstrap(&page.version.object.cache)?;
+        let result = self.decrypt(&page, copy, reservation, scope).await?;
+        self.publish(result.clone(), None, scope).await?;
+        // Selected subscription pages bypass acquire_inner's source accounting.
+        // Count only authenticated, published reception on the stable owner.
+        self.metrics.record(Event::PeerHit, 1)?;
+        Ok(result)
+    }
     pub(crate) fn observe_peer_error(
         &self,
         scope: &RequestScope,
@@ -187,6 +309,7 @@ impl Fill {
         Self {
             dependencies,
             metrics: Metrics::default(),
+            local_copies: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
@@ -388,8 +511,7 @@ impl Fill {
                         let owned_membership = acquisition.membership.clone();
                         let owned_page = page.clone();
                         let prefetched = prefetch.take();
-                        let fill =
-                            Fill::new(self.dependencies.clone()).with_metrics(self.metrics.clone());
+                        let fill = self.clone();
                         let flights = self.dependencies.flights.clone();
                         let (send, mut receive) = futures::channel::oneshot::channel();
                         driver_permit.submit(Box::pin(async move {
@@ -462,17 +584,6 @@ impl Fill {
                             operation.complete()?;
                             match result {
                                 Ok(result) => {
-                                    let result = if matches!(&result, AcquiredPage::Plaintext(_))
-                                        && !plaintext
-                                        && !flights.has_plaintext_reader(&leader)?
-                                    {
-                                        AcquiredPage::Ciphertext(UnverifiedPage {
-                                            copy: result.copy(),
-                                            disk_token: None,
-                                        })
-                                    } else {
-                                        result
-                                    };
                                     if let AcquiredPage::Ciphertext(copy) = &result {
                                         match fill
                                             .dependencies
@@ -608,23 +719,11 @@ impl Fill {
             }
             // Copy-only forbids new acquisition, not reclamation of idle local
             // buffers. Disk staging needs the same headroom as an acquire read.
-            match self
-                .dependencies
-                .disk
-                .read_with_token_reclaim(page, scope, |amount| {
-                    self.reserve_with_reclamation(
-                        &page.version.object.cache,
-                        ResourceClass::Ciphertext,
-                        amount,
-                    )
-                })
-                .await
-            {
-                Ok(Some((copy, _))) if validate_copy(&copy, page).is_ok() => {
-                    self.metrics.record(Event::DiskHit, 1)?;
+            match self.local_disk_copy(page, scope).await {
+                Ok(Some(UnverifiedPage { copy, .. })) => {
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }
-                Ok(Some(_)) | Err(Error::CorruptRecord) => {
+                Err(Error::CorruptRecord) => {
                     self.metrics.record(Event::CorruptMiss, 1)?;
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io) => {}
@@ -647,6 +746,90 @@ impl Fill {
                 }
             }
         })
+    }
+
+    /// Coalesce only local disk work, with no origin context or election rights.
+    /// The worker driver owns the entry and its charge until the disk completion
+    /// fence, even if every caller detaches. Each caller owns a bounded waiter and
+    /// cancellation subscription; one caller cannot cancel another caller's read.
+    async fn local_disk_copy(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<UnverifiedPage>> {
+        use futures::FutureExt;
+        use std::future::Future;
+        scope.check()?;
+        let _waiter = self.dependencies.admission.reserve(
+            Some(&page.version.object.cache),
+            ResourceClass::Waiter,
+            1,
+        )?;
+        let cancellation = scope.cancellation.subscribe()?;
+        let existing = self.local_copies.borrow().get(page).cloned();
+        let mut receive = if let Some(existing) = existing {
+            existing
+        } else {
+            let permit = super::drivers::reserve()?;
+            let flight = self.dependencies.admission.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Flight,
+                1,
+            )?;
+            let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+            let (send, receive) = futures::channel::oneshot::channel();
+            let receive = async move { receive.await.map_err(|_| Error::Unavailable)? }
+                .boxed_local()
+                .shared();
+            self.local_copies
+                .borrow_mut()
+                .insert(page.clone(), receive.clone());
+            let fill = self.clone();
+            let page = page.clone();
+            permit.submit(Box::pin(async move {
+                let _flight = flight;
+                let result = async {
+                    let Some((copy, token)) = fill
+                        .dependencies
+                        .disk
+                        .read_with_token_reclaim(&page, &owned_scope, |amount| {
+                            fill.reserve_with_reclamation(
+                                &page.version.object.cache,
+                                ResourceClass::Ciphertext,
+                                amount,
+                            )
+                        })
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    validate_copy(&copy, &page)?;
+                    let copy = UnverifiedPage {
+                        copy,
+                        disk_token: Some(token),
+                    };
+                    match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
+                        Ok(())
+                        | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
+                        Err(error) => return Err(error),
+                    }
+                    fill.metrics.record(Event::DiskHit, 1)?;
+                    Ok(Some(copy))
+                }
+                .await;
+                fill.local_copies.borrow_mut().remove(&page);
+                let _ = send.send(result);
+                Ok(())
+            }));
+            receive
+        };
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            super::drivers::poll(cx, 64);
+            std::pin::Pin::new(&mut receive).poll(cx)
+        })
+        .await
     }
 
     async fn acquire_once(
@@ -879,16 +1062,9 @@ impl Fill {
         result.validate_for(page)?;
         scope.check()?;
         if let AcquiredPage::Plaintext(page) = &result {
-            if want_plaintext {
-                self.publish(page.clone(), dirty, scope).await?;
-            } else if let Some(dirty) = dirty {
-                match self.dependencies.writer.enqueue(page.copy(), dirty) {
-                    Ok(_)
-                    | Err(Error::Overloaded | Error::Io | Error::Unavailable | Error::MissingKey) =>
-                        {}
-                    Err(error) => return Err(error),
-                }
-            }
+            // Origin encryption already produced a verified whole page. Preserve
+            // that evidence even when the supplier requested only ciphertext.
+            self.publish(page.clone(), dirty, scope).await?;
         }
         self.metrics.record(source, 1)?;
         Ok(result)
@@ -963,6 +1139,10 @@ impl Fill {
             Ok(()) | Err(Error::Overloaded | Error::Unavailable | Error::MissingKey) => {}
             Err(error) => return Err(error),
         }
+        self.dependencies
+            .metadata_owner
+            .subscriptions
+            .resident(result.plaintext.page().clone());
         // A descriptor catalog is an optimization. Every retained page owns its
         // immutable descriptor even when the catalog mailbox/capacity is saturated.
         match self
@@ -1004,6 +1184,11 @@ fn response_copy(
         PeerResponse::Page {
             metadata,
             ciphertext,
+        }
+        | PeerResponse::Selected {
+            metadata,
+            ciphertext,
+            ..
         } => {
             let copy = crate::memory::page::CiphertextCopy {
                 metadata: metadata.clone(),
@@ -1419,7 +1604,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(disk_result.plaintext.bytes(), b"abc");
-        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 2);
+        // CopyOnly retains the disk ciphertext, so plaintext acquisition promotes
+        // that same allocation instead of reading the disk again.
+        assert_eq!(rig.fill.metrics.count(Event::DiskHit), 1);
+        assert!(Arc::ptr_eq(
+            &disk_copy.1.inner,
+            &disk_result.ciphertext.inner
+        ));
         assert_eq!(rig.fill.metrics.count(Event::OriginFill), 1);
         assert_eq!(rig.fill.metrics.count(Event::MemoryHit), 2);
     }

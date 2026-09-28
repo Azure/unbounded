@@ -105,6 +105,24 @@ pub struct VerifiedRequest {
     forwarders: Vec<VerifiedPeer>,
 }
 impl VerifiedRequest {
+    /// A provider may project its authenticated compact demand onto one selected
+    /// page for the existing Fill implementation. This value must never be relayed
+    /// or reverified: its immutable binding still names the full subscription.
+    pub(crate) fn select_page(mut self, page: crate::model::identity::PageId) -> Result<Self> {
+        use crate::peer::wire::{FetchMode, Operation};
+        let Operation::Subscribe { subscription, mode } = &self.signed.request.operation else {
+            return Err(Error::InvalidRequest);
+        };
+        if page.version != subscription.version || !subscription.demand.contains(page.number.0) {
+            return Err(Error::Unauthorized);
+        }
+        let mode = match mode {
+            FetchMode::Acquire => FetchMode::Acquire,
+            FetchMode::CopyOnly => FetchMode::CopyOnly,
+        };
+        self.signed.request.operation = Operation::Page { page, mode };
+        Ok(self)
+    }
     pub fn request(&self) -> &PeerRequest {
         &self.signed.request
     }
@@ -279,11 +297,14 @@ impl Forwarding {
         response: PeerResponse,
     ) -> Result<SignedResponse> {
         check_request_deadline(request)?;
+        // A retained subscription must not outlive retired request keys/trust.
+        self.signatures.verify_historical(&request.original)?;
         if request.path.last() != Some(self.signatures.node()) || request.path.len() < 2 {
             return Err(Error::Unauthorized);
         }
         let mut head =
             protocol::response_head(&response, &signed_digest(&request.original)?, &request.path)?;
+        check_grant_deadline(&head, request)?;
         response_matches(&head, &request.original.head)?;
         response_authority(&head, &request.original.head, self.signatures.node())?;
         push(
@@ -345,6 +366,8 @@ impl Forwarding {
         request: &RequestBinding,
     ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
         check_request_deadline(request)?;
+        self.signatures.verify_historical(&request.original)?;
+        check_grant_deadline(&auth.original.head, request)?;
         if auth.hops.len() >= protocol::MAX_HOPS {
             return Err(Error::HopBudgetExhausted);
         }
@@ -618,6 +641,39 @@ fn response_hop_head(
 }
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
+    if outcome == "selected" {
+        if field(request, "racer-operation")? != "subscribe" {
+            return Err(Error::Unauthorized);
+        }
+        for name in [
+            "racer-cache",
+            "racer-key",
+            "racer-etag",
+            "racer-subscription",
+            "racer-subscription-sequence",
+        ] {
+            if field(response, name)? != field(request, name)? {
+                return Err(Error::Unauthorized);
+            }
+        }
+        let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
+        if !crate::peer::decode::demand(request)?.contains(number(response, "racer-page")?)
+            || number(response, "racer-grant-membership")?
+                != number(request, "racer-route-membership")?
+            || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
+            || number(response, "racer-grant-deadline")? > number(request, "racer-route-deadline")?
+            || number(response, "racer-grant-deadline")?
+                <= protocol::millis(crate::runtime::environment::wall_now())?
+            || number(response, "racer-page-budget")?.checked_add(1)
+                != Some(number(request, "racer-page-budget")?)
+            || number(response, "racer-byte-budget")?
+                .checked_add(number(response, "racer-ciphertext-length")?)
+                != Some(number(request, "racer-byte-budget")?)
+        {
+            return Err(Error::Unauthorized);
+        }
+        return Ok(());
+    }
     if outcome == "not-found"
         && (!matches!(
             field(request, "racer-operation")?.as_str(),
@@ -666,7 +722,7 @@ fn response_authority(
 ) -> Result<()> {
     if matches!(
         field(response, "racer-outcome")?.as_str(),
-        "page" | "metadata" | "bootstrap" | "not-found"
+        "page" | "metadata" | "bootstrap" | "selected" | "not-found"
     ) && signer != &node_field(request, "racer-route-destination")?
     {
         return Err(Error::Unauthorized);
@@ -676,6 +732,14 @@ fn response_authority(
 fn check_request_deadline(request: &RequestBinding) -> Result<()> {
     if request.deadline <= protocol::millis(crate::runtime::environment::wall_now())? {
         return Err(Error::DeadlineExceeded);
+    }
+    Ok(())
+}
+fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<()> {
+    if field(head, "racer-outcome")? == "selected"
+        && number(head, "racer-grant-deadline")? > request.deadline
+    {
+        return Err(Error::Unauthorized);
     }
     Ok(())
 }
