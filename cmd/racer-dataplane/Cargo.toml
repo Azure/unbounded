@@ -13,6 +13,7 @@ rdma = []
 [dependencies]
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+crc64fast = "1.1.0"
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 futures = "0.3"
 getrandom = "0.2"

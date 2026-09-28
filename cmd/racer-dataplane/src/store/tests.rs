@@ -644,6 +644,73 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
 }
 
 #[test]
+fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
+    let f = Fixture::new();
+    futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let page = f.copy(3, 23);
+    let id = page.ciphertext.envelope().page.clone();
+    let request = scope();
+    for corrupt_tag in [false, true] {
+        f.enqueue(page.clone()).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
+        let location = f
+            .store
+            .writer
+            .index()
+            .lookup(&id)
+            .unwrap()
+            .unwrap()
+            .location;
+        let staging = f
+            .store
+            .writer
+            .slabs()
+            .allocate(location.location.extent.length(), None)
+            .unwrap();
+        let lease = f.store.writer.lease(&location).unwrap();
+        let mut stored = drive(
+            &f.reactor,
+            f.store
+                .writer
+                .slabs()
+                .read(location.location, staging, lease, &request),
+        )
+        .unwrap();
+        let parsed = super::format::RecordCodec
+            .parse(&stored, location.location.extent)
+            .unwrap();
+        assert_eq!(parsed.header.format_version, super::format::FORMAT_VERSION);
+        assert_eq!(parsed.checksum, page.ciphertext.checksum());
+        let offset = if corrupt_tag {
+            parsed.ciphertext.end - 1
+        } else {
+            parsed.ciphertext.start
+        };
+        stored.bytes_mut().unwrap()[offset] ^= 1;
+        let lease = f.store.writer.lease(&location).unwrap();
+        drive(
+            &f.reactor,
+            f.store
+                .writer
+                .slabs()
+                .write(location.location, stored, lease, &request),
+        )
+        .unwrap();
+        let (read, token) = drive(&f.reactor, f.store.reader.read_with_token(&id, &request))
+            .unwrap()
+            .unwrap();
+        // The I/O worker carries the stored expectation; crypto-worker validation
+        // rejects corruption before AEAD can publish plaintext.
+        assert_eq!(read.ciphertext.checksum(), page.ciphertext.checksum());
+        assert_eq!(read.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
+        f.store.reader.invalidate(&token).unwrap();
+        assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    }
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
+
+#[test]
 fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();

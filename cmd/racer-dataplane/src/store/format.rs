@@ -16,7 +16,8 @@ use crate::{
     runtime::reactor::IoBuffer,
 };
 use sha2::{Digest, Sha256};
-pub const FORMAT_VERSION: u32 = 3;
+// Version 4 is the sole format: mandatory CRC-64/XZ plus optional content type.
+pub const FORMAT_VERSION: u32 = 4;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 pub const MAX_HEADER_BYTES: usize = 16384;
@@ -39,7 +40,7 @@ pub struct EncodedRecord {
 pub struct DecodedRecord {
     pub header: RecordHeader,
     pub ciphertext: std::ops::Range<usize>,
-    pub checksum: Option<u64>,
+    pub checksum: u64,
 }
 pub struct RecordCodec;
 struct RecordLayout {
@@ -107,7 +108,7 @@ impl RecordCodec {
         let etag = envelope.page.version.etag.as_bytes();
         let mut out = Vec::with_capacity(layout.header_bytes);
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&record_version(&page.metadata).to_le_bytes());
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
         out.extend_from_slice(&generation.0.to_le_bytes());
         out.extend_from_slice(&page.metadata.length.to_le_bytes());
@@ -169,7 +170,7 @@ impl RecordCodec {
         bytes[logical_bytes..].fill(0);
         Ok(EncodedRecord {
             header: RecordHeader {
-                format_version: record_version(&page.metadata),
+                format_version: FORMAT_VERSION,
                 generation,
                 envelope: page.ciphertext.envelope().clone(),
                 metadata: page.metadata.immutable(),
@@ -191,7 +192,7 @@ impl RecordCodec {
             return Err(Error::CorruptRecord);
         }
         let format_version = r.u32()?;
-        if !matches!(format_version, 1 | 2 | 3) {
+        if format_version != FORMAT_VERSION {
             return Err(Error::CorruptRecord);
         }
         let header_len = r.u32()? as usize;
@@ -223,23 +224,15 @@ impl RecordCodec {
                 .to_owned(),
         );
         let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
-        let checksum = if format_version == 3 {
-            Some(r.u64()?)
-        } else {
+        let checksum = r.u64()?;
+        let content_type_length = r.u32()? as usize;
+        let content_type = if content_type_length == 0 {
             None
-        };
-        let content_type = if format_version >= 2 {
-            let length = r.u32()? as usize;
-            if length == 0 {
-                None
-            } else {
-                Some(
-                    crate::model::metadata::ContentType::parse(r.take(length)?)
-                        .map_err(|_| Error::CorruptRecord)?,
-                )
-            }
         } else {
-            None
+            Some(
+                crate::model::metadata::ContentType::parse(r.take(content_type_length)?)
+                    .map_err(|_| Error::CorruptRecord)?,
+            )
         };
         if r.at != r.bytes.len()
             || generation.0 == 0
@@ -301,9 +294,6 @@ impl RecordCodec {
 struct Decoder<'a> {
     bytes: &'a [u8],
     at: usize,
-}
-fn record_version(_metadata: &crate::model::metadata::ObjectMetadata) -> u32 {
-    FORMAT_VERSION
 }
 impl<'a> Decoder<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -413,15 +403,15 @@ mod tests {
     #[test]
     fn legacy_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
         let admission = admission();
-        // Normal header is 169 bytes, plus a 16-byte tag. Straddle both units.
+        // Normal v4 header is 181 bytes, plus a 16-byte tag. Straddle both units.
         for (length, number, maximum, geometry, offset) in [
             (1, 0, false, (512, 512, 512), 0),
-            (326, 0, false, (512, 512, 512), 512),
-            (327, 0, false, (512, 512, 512), 1024),
-            (328, 0, false, (512, 512, 512), 512),
-            (3910, 0, false, (4096, 4096, 4096), 4096),
-            (3911, 0, false, (4096, 4096, 4096), 8192),
-            (3912, 0, false, (4096, 4096, 4096), 4096),
+            (314, 0, false, (512, 512, 512), 512),
+            (315, 0, false, (512, 512, 512), 1024),
+            (316, 0, false, (512, 512, 512), 512),
+            (3898, 0, false, (4096, 4096, 4096), 4096),
+            (3899, 0, false, (4096, 4096, 4096), 8192),
+            (3900, 0, false, (4096, 4096, 4096), 4096),
             (PAGE_BYTES as usize, 0, false, (4096, 512, 4096), 512),
             (PAGE_BYTES as usize, 1, true, (512, 4096, 512), 4096),
             (3, 2, true, (4096, 512, 4096), 1536),
@@ -470,12 +460,12 @@ mod tests {
                     .unwrap()
                     .header
                     .envelope,
-                RecordCodec
-                    .parse(&legacy.buffer, legacy.header.extent)
-                    .unwrap()
-                    .header
-                    .envelope
+                *page.ciphertext.envelope()
             );
+            assert!(matches!(
+                RecordCodec.parse(&legacy.buffer, legacy.header.extent),
+                Err(Error::CorruptRecord)
+            ));
             assert_eq!(encoded.header.extent, extent);
             assert_eq!(
                 RecordCodec
@@ -659,7 +649,7 @@ mod tests {
                     .parse(&encoded.buffer, encoded.header.extent)
                     .unwrap()
                     .checksum,
-                Some(page.ciphertext.checksum())
+                page.ciphertext.checksum()
             );
             assert_eq!(
                 RecordCodec
@@ -856,12 +846,10 @@ mod tests {
             Sha256::digest(&expected).as_slice(),
             unhex(GOLDEN_RECORD_SHA256)
         );
-        let parsed = RecordCodec
-            .parse(&encoded.buffer, encoded.header.extent)
-            .unwrap();
-        assert_eq!(parsed.header.generation, Generation(7));
-        assert_eq!(parsed.ciphertext, 169..188);
-        assert_eq!(parsed.header.metadata, page.metadata.immutable());
+        assert!(matches!(
+            RecordCodec.parse(&encoded.buffer, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
     }
 
     #[test]
@@ -884,9 +872,9 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
-        assert_eq!(parsed.checksum, Some(page.ciphertext.checksum()));
+        assert_eq!(parsed.checksum, page.ciphertext.checksum());
 
-        // Reconstruct the released v2 layout: content type, without the v3 CRC.
+        // Reconstruct the obsolete v2 layout: content type, without a CRC.
         let mut version_two = encoded.buffer.bytes().unwrap().to_vec();
         let old_header = u32::from_le_bytes(version_two[12..16].try_into().unwrap()) as usize;
         let crc_offset = 128 + "cache".len() + "\"v1\"".len();
@@ -897,13 +885,10 @@ mod tests {
         version_two[12..16].copy_from_slice(&(header as u32).to_le_bytes());
         let digest = Sha256::digest(&version_two[..header - 32]);
         version_two[header - 32..header].copy_from_slice(&digest);
-        let legacy = RecordCodec
-            .parse_bytes(&version_two, encoded.header.extent)
-            .unwrap();
-        assert_eq!(legacy.header.format_version, 2);
-        assert_eq!(legacy.header.metadata, page.metadata.immutable());
-        assert_eq!(legacy.checksum, None);
-        assert_eq!(&version_two[legacy.ciphertext], page.ciphertext.bytes());
+        assert!(matches!(
+            RecordCodec.parse_bytes(&version_two, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
         let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
         let start = corrupted
             .windows(10)
@@ -918,6 +903,82 @@ mod tests {
                 .parse_bytes(&corrupted, encoded.header.extent)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_current_version_is_accepted_even_with_valid_header_digest() {
+        let admission = admission();
+        let page = page(&admission, 3, 0, "cache", "v1");
+        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let encoded = RecordCodec
+            .encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, 512),
+            )
+            .unwrap();
+        let original = encoded.buffer.bytes().unwrap();
+        assert_eq!(&original[8..12], &4u32.to_le_bytes());
+        let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
+        assert_eq!(
+            &original[crc_offset..crc_offset + 8],
+            &page.ciphertext.checksum().to_le_bytes()
+        );
+        for version in [0u32, 1, 2, 3, 4, 5, u32::MAX] {
+            let mut bytes = original.to_vec();
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            if version == 3 {
+                // Reconstruct an actual v3 checksum, not just its version label.
+                let mut ecma = 0u64;
+                for byte in page.ciphertext.bytes() {
+                    ecma ^= u64::from(*byte) << 56;
+                    for _ in 0..8 {
+                        ecma = (ecma << 1)
+                            ^ if ecma >> 63 != 0 {
+                                0x42f0_e1eb_a9ea_3693
+                            } else {
+                                0
+                            };
+                    }
+                }
+                assert_ne!(ecma, page.ciphertext.checksum());
+                bytes[crc_offset..crc_offset + 8].copy_from_slice(&ecma.to_le_bytes());
+            }
+            let digest = Sha256::digest(&bytes[..header_len - 32]);
+            bytes[header_len - 32..header_len].copy_from_slice(&digest);
+            let parsed = RecordCodec.parse_bytes(&bytes, encoded.header.extent);
+            if version == FORMAT_VERSION {
+                assert_eq!(parsed.unwrap().checksum, page.ciphertext.checksum());
+            } else {
+                assert!(
+                    matches!(parsed, Err(Error::CorruptRecord)),
+                    "version {version}"
+                );
+            }
+        }
+
+        // A current-version header cannot omit the mandatory checksum even if
+        // the framing hash and lengths have been recomputed by the producer.
+        let mut missing_crc = original.to_vec();
+        missing_crc.drain(crc_offset..crc_offset + 8);
+        missing_crc.resize(original.len(), 0);
+        let shorter_header = header_len - 8;
+        missing_crc[12..16].copy_from_slice(&(shorter_header as u32).to_le_bytes());
+        let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
+        missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
+        assert!(matches!(
+            RecordCodec.parse_bytes(&missing_crc, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
+
+        let mut damaged_crc = original.to_vec();
+        damaged_crc[crc_offset] ^= 1;
+        assert!(matches!(
+            RecordCodec.parse_bytes(&damaged_crc, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
     }
 
     // Frozen pre-optimization implementation. Keep independent of the new layout
@@ -1021,7 +1082,7 @@ mod tests {
         }
         let mut bytes = vec![0; 512];
         bytes[..8].copy_from_slice(MAGIC);
-        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(
             RecordCodec

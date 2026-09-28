@@ -151,6 +151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc64fast"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26bb92ecea20291efcf0009e2713d64b7e327dedb8ce780545250f24075429e2"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -579,6 +585,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
+ "crc64fast",
  "ed25519-dalek",
  "futures",
  "getrandom",
