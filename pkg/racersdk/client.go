@@ -16,7 +16,10 @@ import (
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
 // fields select defaults; negative values and a zero Cache are invalid.
 type ClientConfig struct {
-	Cache CacheName
+	// PrefetchBootstrap starts pinned pages using spare admission while the first
+	// page is consumed. Requires PageWindow > 1; default false preserves lazy IO.
+	PrefetchBootstrap bool
+	Cache             CacheName
 	// MaxConnections bounds bulk connections and live Values (default 64).
 	MaxConnections int
 	// PageWindow enables ordered concurrent page continuations when greater than one.
@@ -343,6 +346,14 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 	v.metadata, v.remaining, v.offset, v.end = meta, length, first, int64(meta.Size)
 	if snapshot != nil {
 		v.metadata, v.end = *snapshot, end
+	}
+
+	if snapshot == nil && c.config.PrefetchBootstrap && c.config.PageWindow > 1 && pool == &c.bulk {
+		v.mu.Lock()
+		if v.terminal == nil {
+			v.startPages(first+length, false)
+		}
+		v.mu.Unlock()
 	}
 
 	if err := v.err(); err != nil {

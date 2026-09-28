@@ -107,6 +107,47 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 	}
 }
 
+func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Match") == "" {
+			streamResponseHead(w, 0, int64(PageSize), 4*int64(PageSize), `"v"`)
+			w.(http.Flusher).Flush()
+		} else {
+			entered <- struct{}{}
+		}
+
+		<-r.Context().Done()
+	}))
+	c := testClient(t, path, 3)
+	c.config.PageWindow = 3
+	c.config.PrefetchBootstrap = true
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("prefetch waited for bootstrap body")
+		}
+	}
+
+	if len(c.slots) != 3 || len(c.pages) != 2 {
+		t.Fatal("prefetch admission incorrect")
+	}
+
+	closeBody(v)
+
+	if len(c.slots) != 0 || len(c.pages) != 0 {
+		t.Fatal("prefetch retained admission")
+	}
+}
+
 func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 	entered := make(chan struct{}, 3)
 	stopped := make(chan struct{}, 3)

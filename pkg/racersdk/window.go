@@ -40,46 +40,7 @@ func (v *Value) advance() (int64, error) {
 	}
 
 	if len(v.pending) == 0 {
-	batch:
-		for next, i := v.offset, 0; next < v.end && i < min(v.client.config.PageWindow, cap(v.pool.slots)); i++ {
-			extra := i != 0
-			if extra {
-				select {
-				case v.pool.slots <- struct{}{}:
-				default:
-					break batch
-				}
-			}
-
-			end := min(v.end, next+int64(PageSize))
-			ctx, cancel := context.WithCancel(v.ctx)
-			child := &Value{client: v.client, pool: v.pool, ctx: ctx, cancel: cancel, slot: extra, finished: make(chan struct{}), window: true, metadata: v.metadata, offset: next, end: end}
-			r := v.request
-			r.operation, r.pin = OperationPinned, v.metadata.ETag
-			r.byteRange = Range{present: true, first: uint64(next), last: uint64(end - 1)}
-			job := &pageJob{result: make(chan pageResult, 1)}
-
-			v.pending = append(v.pending, job)
-			v.client.pages <- struct{}{}
-
-			v.workers.Add(1)
-
-			go func() {
-				defer v.workers.Done()
-
-				stopPending(child, context.AfterFunc(ctx, func() { child.finish(ioFailure("page", ctx.Err())) }))
-				_, length, err := child.open(r, &v.metadata)
-
-				child.remaining = length
-				if err != nil {
-					child.finish(err)
-				}
-
-				job.result <- pageResult{child, err}
-			}()
-
-			next = end
-		}
+		v.startPages(v.offset, true)
 	}
 
 	job := v.pending[0]
@@ -105,6 +66,51 @@ func (v *Value) advance() (int64, error) {
 		return result.value.remaining, result.err
 	case <-v.ctx.Done():
 		return 0, ioFailure("page", v.ctx.Err())
+	}
+}
+
+// startPages requires v.mu. Bootstrap prefetch uses only spare slots; it never
+// waits for capacity while holding the socket serving the first page.
+func (v *Value) startPages(next int64, borrow bool) {
+batch:
+	for i := 0; next < v.end && i < min(v.client.config.PageWindow, cap(v.pool.slots)); i++ {
+		extra := i != 0 || !borrow
+		if extra {
+			select {
+			case v.pool.slots <- struct{}{}:
+			default:
+				break batch
+			}
+		}
+
+		end := min(v.end, next+int64(PageSize))
+		ctx, cancel := context.WithCancel(v.ctx)
+		child := &Value{client: v.client, pool: v.pool, ctx: ctx, cancel: cancel, slot: extra, finished: make(chan struct{}), window: true, metadata: v.metadata, offset: next, end: end}
+		r := v.request
+		r.operation, r.pin = OperationPinned, v.metadata.ETag
+		r.byteRange = Range{present: true, first: uint64(next), last: uint64(end - 1)}
+		job := &pageJob{result: make(chan pageResult, 1)}
+
+		v.pending = append(v.pending, job)
+		v.client.pages <- struct{}{}
+
+		v.workers.Add(1)
+
+		go func() {
+			defer v.workers.Done()
+
+			stopPending(child, context.AfterFunc(ctx, func() { child.finish(ioFailure("page", ctx.Err())) }))
+			_, length, err := child.open(r, &v.metadata)
+
+			child.remaining = length
+			if err != nil {
+				child.finish(err)
+			}
+
+			job.result <- pageResult{child, err}
+		}()
+
+		next = end
 	}
 }
 
