@@ -11,6 +11,10 @@
 //! close wakes both sides. Neither side spins or blocks awaiting the other. This
 //! is required even when both OS threads share one allowed CPU.
 
+#[cfg(test)]
+#[path = "crypto_measurement.rs"]
+mod measurement;
+
 use super::{
     admission::Reservation,
     channel::{self, Receiver, SendFailure, Sender},
