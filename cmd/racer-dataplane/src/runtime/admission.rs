@@ -84,6 +84,11 @@ impl Reservation {
     /// accounts for idle capacity; at most two buffers survive per worker.
     pub(crate) fn recycle(&mut self, mut bytes: Vec<u8>) {
         use zeroize::Zeroize;
+        // Vec::zeroize wipes initialized elements, then the entire capacity.
+        // u8 has no destructor: clear the length first to avoid wiping the live
+        // prefix twice. The full capacity (including truncated tails) is still
+        // securely zeroized before either pooling or deallocation.
+        bytes.clear();
         bytes.zeroize();
         if self.stopped.load(Ordering::Acquire) {
             return;
@@ -591,6 +596,84 @@ impl Admission {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let first = CacheId("first".into());
+        let second = CacheId("second".into());
+        let capacity = 1024 * 1024;
+        for length in [0, 1, capacity - 16, capacity] {
+            let mut reservation = admission
+                .reserve(Some(&first), ResourceClass::Ciphertext, capacity)
+                .unwrap();
+            let mut bytes = reservation.buffer(capacity).unwrap();
+            bytes.fill(0xa7);
+            bytes.truncate(length);
+            let pointer = bytes.as_ptr();
+            reservation.recycle(bytes);
+            drop(reservation);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+            {
+                let pool = admission.buffers.lock().unwrap();
+                let bytes = &pool[0].0;
+                // SAFETY: buffer() initialized the entire allocation; truncation
+                // and recycling cannot deallocate it while the pool lock is held.
+                let idle = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), capacity) };
+                assert!(idle.iter().all(|byte| *byte == 0));
+            }
+            let mut reservation = admission
+                .reserve(Some(&second), ResourceClass::Plaintext, capacity)
+                .unwrap();
+            let bytes = reservation.buffer(capacity).unwrap();
+            assert_eq!(bytes.as_ptr(), pointer);
+            assert!(bytes.iter().all(|byte| *byte == 0));
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(admission.used(ResourceClass::Plaintext), capacity);
+            reservation.recycle(bytes);
+            drop(reservation);
+            admission.reclaim_buffers();
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        }
+    }
+    #[test]
+    #[ignore = "opt-in same-workload payload recycle benchmark"]
+    fn payload_recycle_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        const ITERATIONS: usize = 128;
+        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
+            for retain in [true, false] {
+                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+                // Keep geometry, allocation, writes, admission, and destructor work
+                // identical between revisions. Stop forces the non-pooling path.
+                if !retain {
+                    admission.stop();
+                }
+                for sample in 0..6 {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        let mut reservation = admission
+                            .reserve_completion(None, ResourceClass::Ciphertext, length)
+                            .unwrap();
+                        let mut bytes = reservation.buffer(length).unwrap();
+                        bytes.fill(black_box(0xa7));
+                        black_box(&bytes);
+                        reservation.recycle(bytes);
+                        drop(reservation);
+                    }
+                    let elapsed = start.elapsed();
+                    // First sample warms allocator and retained buffers.
+                    if sample != 0 {
+                        println!(
+                            "payload_recycle length={length} retain={retain} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
+                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
+                        );
+                    }
+                }
+                admission.reclaim_buffers();
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            }
+        }
+    }
     #[test]
     fn recycled_payload_capacity_stays_admitted_zeroed_and_reclaimable() {
         use super::*;
