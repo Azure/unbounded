@@ -316,6 +316,75 @@ fn drive<T>(
 }
 
 #[test]
+fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let mut bytes = result.ciphertext.bytes().to_vec();
+    bytes[0] ^= 1;
+    let copy = crate::memory::page::CiphertextCopy {
+        metadata: result.metadata.clone(),
+        ciphertext: f
+            .fill
+            .dependencies
+            .buffers
+            .ciphertext(
+                f.fill
+                    .dependencies
+                    .admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Ciphertext,
+                        bytes.len(),
+                    )
+                    .unwrap(),
+                result.ciphertext.envelope().clone(),
+                bytes,
+            )
+            .unwrap(),
+    };
+    f.fill
+        .dependencies
+        .memory
+        .remove_cache(&f.context.object.cache)
+        .unwrap();
+    drop(result);
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = drive(
+        f.fill.accept_ciphertext(
+            copy,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        2,
+        "bad prefetch then retained original"
+    );
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+#[test]
 fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
     let mut f = fixture();
     let metrics = Metrics::default();

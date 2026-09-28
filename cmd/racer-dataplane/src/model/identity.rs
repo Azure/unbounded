@@ -11,7 +11,7 @@ pub struct ClusterId(pub String);
 /// Kubernetes ClusterCache UID, not its reusable resource name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheId(pub String);
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey(pub [u8; 32]);
 
 impl CacheKey {
@@ -46,7 +46,7 @@ impl CacheKey {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Kubernetes Node UID, not its reusable resource name.
 pub struct NodeId(pub String);
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StrongEtag(String);
 
 impl StrongEtag {
@@ -83,7 +83,7 @@ impl StrongEtag {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageNumber(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MembershipVersion(pub u64);
@@ -96,19 +96,19 @@ pub struct TransferId(pub [u8; 16]);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WorkerId(pub u16);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId {
     pub cache: CacheId,
     pub key: CacheKey,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectVersion {
     pub object: ObjectId,
     pub etag: StrongEtag,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageId {
     pub version: ObjectVersion,
     pub number: PageNumber,

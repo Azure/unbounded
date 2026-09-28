@@ -72,7 +72,8 @@ impl Entries {
 pub struct MemoryCache {
     pool: Rc<BufferPool>,
     entries: RefCell<Entries>,
-    ciphertext_entries: RefCell<HashMap<PageId, super::page::UnverifiedPage>>,
+    ciphertext_entries: RefCell<BTreeMap<PageId, super::page::UnverifiedPage>>,
+    ciphertext_cursor: RefCell<Option<PageId>>,
     availability: Option<Rc<crate::control::availability::Availability>>,
 }
 impl MemoryCache {
@@ -80,7 +81,8 @@ impl MemoryCache {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
-            ciphertext_entries: RefCell::new(HashMap::default()),
+            ciphertext_entries: RefCell::new(BTreeMap::new()),
+            ciphertext_cursor: RefCell::new(None),
             availability: None,
         }
     }
@@ -349,19 +351,34 @@ impl MemoryCache {
     }
     fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
         let mut entries = self.ciphertext_entries.borrow_mut();
+        let cursor = self.ciphertext_cursor.borrow().clone();
         let selected: Vec<_> = entries
-            .iter()
+            .range((
+                cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(
+                entries
+                    .iter()
+                    .take_while(|(id, _)| cursor.as_ref().is_some_and(|cursor| *id <= cursor)),
+            )
             .take(256)
-            .filter(|(id, entry)| {
-                cache.is_none_or(|c| c == &id.version.object.cache)
-                    && Arc::strong_count(&entry.copy.ciphertext.inner) == 1
-            })
             .map(|(id, _)| id.clone())
             .collect();
+        if let Some(last) = selected.last() {
+            *self.ciphertext_cursor.borrow_mut() = Some(last.clone());
+        }
         let mut released = 0;
         for id in selected {
             if released >= bytes {
                 break;
+            }
+            if cache.is_some_and(|c| c != &id.version.object.cache)
+                || Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1
+            {
+                continue;
             }
             if let Some(entry) = entries.remove(&id) {
                 released += entry.copy.ciphertext.inner.reservation.amount();

@@ -1110,6 +1110,19 @@ fn production_remote_bootstrap_one_get_and_empty() {
             counters(&processes[receiver])["racer_page_decrypts_total"],
             u64::from(length != 0)
         );
+        // HEAD on a distinct cold key must issue HEAD only and no page request.
+        let mut head_socket = connect(&socket_path(&processes[receiver], 0)).unwrap();
+        write!(head_socket, "HEAD /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 1).unwrap();
+        let head = read_head(&mut head_socket).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 "));
+        assert_eq!(fields(&head)["content-length"], length.to_string());
+        let mut rest = Vec::new();
+        head_socket.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        let calls: Vec<_> = origins.iter().flatten().flat_map(|o| o.calls()).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.iter().filter(|c| c.method == "GET").count(), 1);
+        assert_eq!(calls.iter().filter(|c| c.method == "HEAD").count(), 1);
         for process in &mut processes {
             assert!(process.stop(libc::SIGTERM).success());
         }

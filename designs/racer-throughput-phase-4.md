@@ -201,6 +201,17 @@ CRC64 and rotating request MAC remain to be delivered.
 
 ### Continued acquisition/bootstrap increment
 
+Commits: `8b2b4dc7` implements the unified flight and v3 Bootstrap;
+`a8ba9bd6` adds ciphertext-only memory residency, admitted provenance validation,
+conditional allocation-identity invalidation, and the v3 RFC 9421 tag/vector update.
+The latter full library run passed 744 tests with seven ignores (56.27 s).
+Follow-up tests prove corrupted prefetched ciphertext is never exposed and falls
+back to the retained original (two decrypt attempts, one ingest), and the actual
+four-process test now issues a distinct HEAD and requires exactly one HEAD and
+one GET across the entire bootstrap-plus-HEAD scenario (2.99 s). Ciphertext
+reclamation uses a bounded ordered cursor so busy entries cannot starve later
+idle entries; focused memory-cache verification passes nine tests.
+
 The page flight now has ciphertext-ready state and a single elected plaintext
 promotion in the same table. `UnverifiedPage` cannot enter client delivery;
 `AcquiredPage` explicitly separates it from PageResult. CopyOnly and peer Acquire
