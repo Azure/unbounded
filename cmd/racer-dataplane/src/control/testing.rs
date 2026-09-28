@@ -96,8 +96,10 @@ pub(super) fn drive<T>(
             std::time::Instant::now() < deadline,
             "control reactor stalled"
         );
-        r.poll_budgeted(8)?;
-        r.wait(std::time::Duration::from_millis(1))?;
+        // Give completed work back to the future before waiting for more I/O.
+        if r.poll_budgeted(8)? == 0 {
+            r.wait(std::time::Duration::from_millis(1))?;
+        }
     }
 }
 pub(super) fn issue(

@@ -1105,8 +1105,11 @@ impl Harness {
         self.request_on(object, pinned, head, node)
     }
     fn request_on(&mut self, object: usize, pinned: bool, head: bool, node: usize) -> Client {
-        let version = self.catalog.borrow().current[&object].clone();
-        let size = version.bytes.len();
+        let (tag, size) = {
+            let catalog = self.catalog.borrow();
+            let version = &catalog.current[&object];
+            (version.tag.clone(), version.bytes.len())
+        };
         let (first, end) = if !pinned {
             (0, size.min(PAGE_BYTES as usize))
         } else if size == 0 {
@@ -1125,7 +1128,7 @@ impl Harness {
             format!("Range: bytes={first}-{}\r\n", end - 1)
         };
         let pin = if pinned {
-            format!("If-Match: {}\r\n", version.tag)
+            format!("If-Match: {tag}\r\n")
         } else {
             String::new()
         };
@@ -1147,7 +1150,7 @@ impl Harness {
             sent: 0,
             response: vec![],
             object,
-            tag: version.tag,
+            tag,
             first,
             end,
             size,

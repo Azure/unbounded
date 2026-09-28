@@ -19,13 +19,13 @@ use crate::{
         transfer::RdmaTransfer,
         verbs::Verbs,
     },
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::{admission::Admission, deadline::RequestScope, environment},
     security::signing::tests::network,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[test]
@@ -64,6 +64,8 @@ fn successful_invalidation_cancel_and_expiry_leave_failed_terminal_fence_quarant
 }
 
 fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
+    let clock = environment::SimulationClock::new(61);
+    let _time = clock.environment(0).enter();
     let (io, port) = pair(1).unwrap();
     let io = Rc::new(io);
     let mut native = NativeService::new(port);
@@ -98,8 +100,11 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         plaintext_length: 16,
         ciphertext_length: 32,
     };
-    let mut scope =
-        RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(10)).unwrap();
+    let mut scope = RequestScope::new(
+        RequestId([3; 16]),
+        environment::now() + Duration::from_secs(10),
+    )
+    .unwrap();
     let id = TransferId([4; 16]);
     native.resources[0]
         .as_ref()
@@ -138,7 +143,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     // Expire only the finish scope; the grant remains valid so admission/binding
     // cannot be mistaken for the receive-completion deadline check.
     if terminal == Some(Error::DeadlineExceeded) {
-        scope.deadline.0 = Instant::now() + Duration::from_secs(1);
+        scope.deadline.0 = environment::now() + Duration::from_secs(1);
     }
     let quota = (terminal == Some(Error::Overloaded)).then(|| {
         admission
@@ -182,7 +187,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         scope.cancel().unwrap();
     }
     if terminal == Some(Error::DeadlineExceeded) {
-        std::thread::sleep(scope.deadline.0.saturating_duration_since(Instant::now()));
+        clock.advance(Duration::from_secs(1));
     }
     if let Some(error) = terminal {
         assert!(matches!(finish.as_mut().poll(&mut cx), Poll::Ready(Err(e)) if e == error));

@@ -21,16 +21,20 @@ use crate::{
         transfer::RdmaTransfer,
         verbs::{QueuePairHandle, Region},
     },
-    runtime::admission::Admission,
+    runtime::{admission::Admission, environment},
     security::signing::{Signatures, VerifiedHead, tests::network},
 };
 use std::{
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10)).unwrap()
+    RequestScope::new(
+        RequestId([1; 16]),
+        environment::now() + Duration::from_secs(10),
+    )
+    .unwrap()
 }
 fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
     operation
@@ -163,6 +167,8 @@ fn successful_write_cancel_and_expiry_leave_failed_terminal_fence_quarantined() 
 }
 
 fn sender_case(terminal: Option<Error>) {
+    let clock = environment::SimulationClock::new(62);
+    let _time = clock.environment(0).enter();
     let signers = network(2);
     let (io, port) = pair(2).unwrap();
     let io = Rc::new(io);
@@ -187,7 +193,7 @@ fn sender_case(terminal: Option<Error>) {
     );
     let mut scope = scope();
     if terminal == Some(Error::DeadlineExceeded) {
-        scope.deadline.0 = Instant::now() + Duration::from_secs(1);
+        scope.deadline.0 = environment::now() + Duration::from_secs(1);
     }
     let envelope = envelope();
     let id = TransferId([9; 16]);
@@ -237,7 +243,7 @@ fn sender_case(terminal: Option<Error>) {
         if error == Error::Cancelled {
             scope.cancel().unwrap();
         } else {
-            std::thread::sleep(scope.deadline.0.saturating_duration_since(Instant::now()));
+            clock.advance(Duration::from_secs(1));
         }
         assert!(matches!(poll(&mut sending), Poll::Ready(Err(e)) if e == error));
         drop(sending);
@@ -332,6 +338,8 @@ fn command_poll_distinguishes_contended_completion_from_full_queue() {
 #[test]
 fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
     for mode in 0..3 {
+        let clock = environment::SimulationClock::new(63);
+        let _time = clock.environment(0).enter();
         let (io, port) = pair(1).unwrap();
         let io = Rc::new(io);
         let mut native = NativeService::new(port);
@@ -350,7 +358,7 @@ fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
         ));
         let buffer = done(&mut buffers.acquire_for(&session, 32, &scope));
         if mode == 1 {
-            scope.deadline.0 = Instant::now() + Duration::from_secs(1);
+            scope.deadline.0 = environment::now() + Duration::from_secs(1);
         }
         let permissions = Permissions;
         let mut bind = permissions.grant(&session, buffer, TransferId([1; 16]), &scope);
@@ -365,7 +373,7 @@ fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
                 ));
             }
             1 => {
-                std::thread::sleep(scope.deadline.0.saturating_duration_since(Instant::now()));
+                clock.advance(Duration::from_secs(1));
                 assert!(matches!(
                     poll(&mut bind),
                     Poll::Ready(Err(Error::DeadlineExceeded))
