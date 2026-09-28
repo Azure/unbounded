@@ -186,7 +186,7 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *TopologyReconciler) suspendInvalidAuthority(err error) {
-	if observedAuthorityFailure(err) {
+	if shouldInvalidateTrust(err) {
 		r.Publications.Suspend()
 		r.Trust.invalidate()
 	}
