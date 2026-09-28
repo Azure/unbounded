@@ -1,4 +1,4 @@
-//! Independent v1 wire checks. Expectations come from CLIENT_ORIGIN_API.md.
+//! Independent client v2 and origin v1 wire checks against CLIENT_ORIGIN_API.md.
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
 use racer_dataplane::{
@@ -121,8 +121,10 @@ fn object() -> ObjectId {
     }
 }
 fn request(method: &str, fields: &[u8]) -> Vec<u8> {
+    // GET here is used only for unchanged origin framing checks.
+    let version = if method == "POST" { "v2" } else { "v1" };
     let mut raw = format!(
-        "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n",
+        "{method} /{version}/objects/{} HTTP/1.1\r\nHost: racer\r\n",
         "ab".repeat(32)
     )
     .into_bytes();
@@ -167,8 +169,44 @@ fn raw_uds_exact_targets_methods_and_bodyless_framing() {
             Error::InvalidRequest,
         );
     }
-    reject(request("POST", b""), Error::MethodNotAllowed);
+    reject(request("POST", b""), Error::InvalidRequest);
     reject(request("GET", b""), Error::InvalidRequest);
+    let canonical_v2 = canonical.replacen("v1", "v2", 1);
+    reject(
+        format!("GET {canonical_v2} HTTP/1.1\r\nHost: racer\r\n\r\n").into_bytes(),
+        Error::MethodNotAllowed,
+    );
+    reject(
+        format!("POST {canonical} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")
+            .into_bytes(),
+        Error::InvalidRequest,
+    );
+    for target in [
+        format!("{canonical_v2}?"),
+        format!("{canonical_v2}#x"),
+        format!("{canonical_v2}/"),
+        canonical_v2.replace("ab", "AB"),
+        canonical_v2.replace("ab", "%61b"),
+        format!("http://racer{canonical_v2}"),
+        canonical_v2.replace("objects/", "objects//"),
+    ] {
+        reject(
+            format!("POST {target} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")
+                .into_bytes(),
+            Error::InvalidRequest,
+        );
+    }
+    let parsed = raw_request(request("POST", b"Content-Length: 0\r\n")).unwrap();
+    assert_eq!(
+        parsed.kind,
+        ReadKind::Subscription {
+            pin: None,
+            range: None,
+            page_credits: 2,
+            byte_credits: 2 * P,
+            ordered: false
+        }
+    );
     reject(
         request("HEAD", b"Range: bytes=0-1\r\n"),
         Error::InvalidRequest,
@@ -192,6 +230,13 @@ fn raw_uds_exact_targets_methods_and_bodyless_framing() {
             request("HEAD", format!("{field}\r\n").as_bytes()),
             Error::InvalidRequest,
         );
+        reject(
+            request(
+                "POST",
+                format!("Content-Length: 0\r\n{field}\r\n").as_bytes(),
+            ),
+            Error::InvalidRequest,
+        );
     }
     assert!(raw_request(request("HEAD", b"Content-Length: 0\r\n")).is_ok());
     reject(
@@ -213,12 +258,19 @@ fn raw_uds_all_singletons_reject_identical_case_insensitive_repeats() {
         ("Racer-Expires-At", "0"),
         ("Racer-Metadata", "opaque"),
         ("Authorization", "opaque"),
+        ("Racer-Page-Credits", "1"),
+        ("Racer-Byte-Credits", "16777216"),
+        ("Racer-Ordered", "1"),
     ] {
         let fields = format!(
             "{name}: {value}\r\n{}: {value}\r\n",
             name.to_ascii_lowercase()
         );
         reject(request("HEAD", fields.as_bytes()), Error::InvalidRequest);
+        reject(
+            request("POST", format!("Content-Length: 0\r\n{fields}").as_bytes()),
+            Error::InvalidRequest,
+        );
     }
 }
 
@@ -332,8 +384,8 @@ fn raw_uds_pinned_head_tags_and_maxint64_ranges() {
     ] {
         assert!(
             raw_request(request(
-                "GET",
-                format!("If-Match: \"v\"\r\nRange: {range}\r\n").as_bytes()
+                "POST",
+                format!("Content-Length: 0\r\nIf-Match: \"v\"\r\nRange: {range}\r\n").as_bytes()
             ))
             .is_ok()
         );
@@ -349,8 +401,8 @@ fn raw_uds_pinned_head_tags_and_maxint64_ranges() {
     ] {
         assert!(
             raw_request(request(
-                "GET",
-                format!("If-Match: \"v\"\r\nRange: {range}\r\n").as_bytes()
+                "POST",
+                format!("Content-Length: 0\r\nIf-Match: \"v\"\r\nRange: {range}\r\n").as_bytes()
             ))
             .is_err()
         );
@@ -628,7 +680,7 @@ fn raw_uds_client_error_writer_is_empty_with_required_416_and_405_fields() {
         (Error::OriginRejected, 401, ""),
         (Error::OriginForbidden, 403, ""),
         (Error::NotFound, 404, ""),
-        (Error::MethodNotAllowed, 405, "allow: head, get\r\n"),
+        (Error::MethodNotAllowed, 405, "allow: head, post\r\n"),
         (Error::VersionUnavailable, 412, ""),
         (
             Error::UnsatisfiableRangeWithLength(17),
@@ -665,7 +717,16 @@ fn raw_uds_client_error_writer_is_empty_with_required_416_and_405_fields() {
 #[test]
 fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
     for (kind, length) in [
-        (ReadKind::Bootstrap, 0),
+        (
+            ReadKind::Subscription {
+                pin: None,
+                range: None,
+                page_credits: 1,
+                byte_credits: P,
+                ordered: true,
+            },
+            0,
+        ),
         (ReadKind::Head, MAX),
         (
             ReadKind::HeadPinned {
@@ -677,13 +738,16 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
         let rig = Rig::new();
         let (local, mut peer) = UnixStream::pair().unwrap();
         let is_head = kind.is_head();
+        let pinned = kind.pin().is_some();
         let reader = thread::spawn(move || {
             peer.write_all(&request(
-                if is_head { "HEAD" } else { "GET" },
-                if is_head {
+                if is_head { "HEAD" } else { "POST" },
+                if pinned {
+                    b"If-Match: \"v\"\r\n"
+                } else if is_head {
                     b""
                 } else {
-                    b"Range: bytes=0-16777215\r\n"
+                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n"
                 },
             ))
             .unwrap();
@@ -692,6 +756,10 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
         rig.drive(async {
             let scope = scope();
             let received = rig.io.receive_head(rig.lease(local), &scope).await.unwrap();
+            let parsed = RequestParser::new(LIMIT)
+                .parse(&object().cache, received.value)
+                .unwrap();
+            assert_eq!(parsed.kind, kind);
             let response = ReadResponse {
                 metadata: ObjectMetadata {
                     content_type: None,
@@ -707,19 +775,49 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
             };
             let responses = rig.responses();
             responses.validate(&kind, &response).unwrap();
-            drop(
-                responses
-                    .send(received.connection, response, &scope)
-                    .await
-                    .unwrap(),
-            );
+            if is_head {
+                drop(
+                    responses
+                        .send(received.connection, response, &scope)
+                        .await
+                        .unwrap(),
+                );
+            } else {
+                drop(
+                    responses
+                        .send_subscription_unobserved(
+                            received.connection,
+                            response,
+                            &scope,
+                            Duration::from_secs(5),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
         });
         let raw = reader.join().unwrap();
-        let text = String::from_utf8(raw).unwrap().to_ascii_lowercase();
+        let head_end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
+        let text = String::from_utf8(raw[..head_end].to_vec())
+            .unwrap()
+            .to_ascii_lowercase();
         assert!(text.starts_with("http/1.1 200 "));
-        assert!(text.contains(&format!("content-length: {length}\r\n")));
+        assert!(text.contains(&format!(
+            "content-length: {}\r\n",
+            if is_head { length } else { 21 }
+        )));
         assert!(!text.contains("content-range:"));
-        assert_eq!(text.find("\r\n\r\n").unwrap() + 4, text.len());
+        if is_head {
+            assert_eq!(raw.len(), head_end);
+        } else {
+            assert!(text.contains("racer-object-length: 0\r\n"));
+            assert!(text.contains("racer-range-start: 0\r\n"));
+            assert!(text.contains("racer-range-end: 0\r\n"));
+            assert!(text.contains("connection: close\r\n"));
+            let mut complete = [0; 21];
+            complete[0] = 2;
+            assert_eq!(&raw[head_end..], &complete);
+        }
     }
 }
 
@@ -839,13 +937,20 @@ fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
     let head = std::str::from_utf8(&raw[..end])
         .unwrap()
         .to_ascii_lowercase();
-    assert!(head.starts_with("http/1.1 206 "));
-    assert!(head.contains("content-length: 50331661\r\n"));
-    assert!(head.contains("content-range: bytes 0-50331660/50331661\r\n"));
+    assert!(head.starts_with("http/1.1 200 "));
+    assert!(head.contains("content-length: 50331766\r\n"));
+    assert!(head.contains("racer-object-length: 50331661\r\n"));
+    assert!(head.contains("racer-range-start: 0\r\n"));
+    assert!(head.contains("racer-range-end: 50331661\r\n"));
+    assert!(!head.contains("content-range:"));
     // The first authenticated page escaped, then page one's real acquisition
     // failed. The exact partial body also rules out an appended error response.
-    assert_eq!(raw.len() - end, P as usize);
-    assert!(raw[end..].iter().all(|byte| *byte == b'x'));
+    assert_eq!(raw.len() - end, P as usize + 21);
+    let mut frame = [0; 21];
+    frame[0] = 1;
+    frame[17..].copy_from_slice(&(P as u32).to_be_bytes());
+    assert_eq!(&raw[end..end + 21], &frame);
+    assert!(raw[end + 21..].iter().all(|byte| *byte == b'x'));
     assert_eq!(
         raw.windows(8).filter(|part| *part == b"HTTP/1.1").count(),
         1
@@ -877,9 +982,29 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
     let rig = Rig::new();
     let (local, mut peer) = UnixStream::pair().unwrap();
     let reader = thread::spawn(move || {
-        peer.write_all(&request("GET", b"If-Match: \"v\"\r\nRange: bytes=0-\r\n"))
+        peer.write_all(&request("POST", b"Content-Length: 0\r\nIf-Match: \"v\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n"))
             .unwrap();
-        receive_all(peer)
+        if seed_first {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut raw = Vec::new();
+            while !raw.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                peer.read_exact(&mut byte).unwrap();
+                raw.push(byte[0]);
+            }
+            let mut page = vec![0; P as usize + 21];
+            peer.read_exact(&mut page).unwrap();
+            raw.extend_from_slice(&page);
+            let mut release = [0; 12];
+            release[8..].copy_from_slice(&(P as u32).to_be_bytes());
+            peer.write_all(&release).unwrap();
+            raw.extend_from_slice(&receive_all(peer));
+            raw
+        } else {
+            receive_all(peer)
+        }
     });
     rig.drive(async {
         let scope = scope();
@@ -916,7 +1041,7 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
         ));
         let streams = RangeStreams::from_directory(directory, delivery, 1);
         let seed = seed_first.then(|| authenticated_first_page(&rig, metadata.clone(), &scope));
-        let stream = streams
+        let mut stream = streams
             .open_with_budget(
                 metadata.clone(),
                 range,
@@ -927,6 +1052,7 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
                 seed,
             )
             .unwrap();
+        stream.configure_subscription(1, P, true).unwrap();
         assert_eq!(stream.buffered_pages(), usize::from(seed_first));
         let response = ReadResponse {
             metadata,
@@ -935,7 +1061,14 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
         };
         let responses = rig.responses();
         responses.validate(&parsed.kind, &response).unwrap();
-        let sent = responses.send(received.connection, response, &scope).await;
+        let sent = responses
+            .send_subscription_unobserved(
+                received.connection,
+                response,
+                &scope,
+                Duration::from_secs(5),
+            )
+            .await;
         if seed_first {
             assert!(matches!(sent, Err(Error::Unavailable)));
         } else {
@@ -944,6 +1077,18 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
             drop(connection);
         }
     });
+    // Dropped release-readiness operations retain their socket until the reactor
+    // acknowledges cancellation. Production keeps polling after request failure;
+    // this component fixture must do the same before waiting for peer EOF.
+    let until = Instant::now() + Duration::from_secs(2);
+    while rig.reactor.in_flight() != 0 {
+        assert!(
+            Instant::now() < until,
+            "canceled subscription IO did not drain"
+        );
+        rig.reactor.poll_budgeted(128).unwrap();
+        rig.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
     let raw = reader.join().unwrap();
     assert_eq!(rig.reactor.in_flight(), 0);
     rig.admission.reclaim_buffers();

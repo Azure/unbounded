@@ -13,6 +13,7 @@ use std::{num::NonZeroU32, time::SystemTime};
 
 pub struct Control {
     pub endpoint: String,
+    pub bundle: Vec<u8>,
     pub enrollments: Arc<AtomicUsize>,
     pub polls: Arc<AtomicUsize>,
     pub blocked: Arc<AtomicBool>,
@@ -67,6 +68,7 @@ impl Control {
             serde_json::json!({"cache": cache, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
         })).collect();
         let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
+        let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
         let publication = Arc::new(Mutex::new(wire::Publication {
             schema_version: 1,
             cluster: ClusterId(CLUSTER.into()),
@@ -243,6 +245,7 @@ impl Control {
             }
         });
         Self {
+            bundle: bundle_bytes,
             endpoint,
             enrollments,
             polls,

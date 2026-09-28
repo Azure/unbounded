@@ -51,7 +51,7 @@ func TestRustWireClientFixture(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	value, err := client.Get(ctx, Request{Context: fetch})
+	value, err := client.Get(ctx, Request{Context: fetch}, ReadOptions{PageCredits: 1, ByteCredits: PageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestRustWireClientFixture(t *testing.T) {
 	}
 
 	if value.Metadata() != snapshot {
-		t.Fatal("continuation changed initial metadata")
+		t.Fatal("subscription changed initial metadata")
 	}
 
 	var one [1]byte
@@ -122,7 +122,7 @@ func TestRustWireRangeFixture(t *testing.T) {
 		first = min(size-1, int64(PageSize)-3)
 	}
 	length := min(size-first, int64(PageSize)+9)
-	v, err := client.Get(ctx, Request{}, ReadOptions{Offset: ByteOffset(first), Length: ByteLength(length), Pin: m.ETag})
+	v, err := client.Get(ctx, Request{}, ReadOptions{Offset: ByteOffset(first), Length: ByteLength(length), Pin: m.ETag, PageCredits: 1, ByteCredits: PageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +131,10 @@ func TestRustWireRangeFixture(t *testing.T) {
 	n, err := v.WriteTo(sink)
 	if err != nil || n != length || sink.offset != first+length || v.Metadata() != m {
 		t.Fatal("range stream mismatch", n, err)
+	}
+	var one [1]byte
+	if n, err := v.Read(one[:]); n != 0 || err != io.EOF {
+		t.Fatal("range missing terminal EOF", n, err)
 	}
 }
 

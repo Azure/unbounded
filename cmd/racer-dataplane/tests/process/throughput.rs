@@ -51,7 +51,7 @@ fn request(path: &Path, key: u64, range: &Expected, slow: bool) -> Result<u64, F
     let mut socket = connect(path)?;
     write!(
         socket,
-        "GET /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"restart-v1\"\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
+        "POST /v2/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"restart-v1\"\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
         range.start,
         range.end - 1
     )?;
@@ -140,6 +140,28 @@ fn observe(pid: u32) -> Observation {
         );
     }
     result
+}
+
+// Count only connected server-side client sockets owned by this process. Control
+// polling and pooled origin sockets can appear/disappear during ingress admission,
+// so a process-wide FD delta cannot establish the number of accepted clients.
+fn accepted_clients(pid: u32, bound_path: &Path) -> usize {
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let owned: std::collections::BTreeSet<_> = fs::read_dir(root.join("fd"))
+        .unwrap()
+        .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+        .collect();
+    fs::read_to_string(root.join("net/unix"))
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.len() == 8
+                && fields[5] == "03"
+                && Path::new(fields[7]) == bound_path
+                && owned.contains(&PathBuf::from(format!("socket:[{}]", fields[6])))
+        })
+        .count()
 }
 
 fn measure(
@@ -482,10 +504,12 @@ fn production_ingress_baseline() {
         let before = observe(process.child.id());
         let mut held = Vec::new();
         // Partial heads retain accepted leases without issuing data requests.
-        let ingress = 128 - 32 - 2 * pairs;
+        // Admission::limit reserves one quarter for outbound plus three control
+        // connections per worker (snapshot, renewal, and keyring delivery).
+        let ingress = 128 - 32 - 3 * pairs;
         for index in 0..ingress {
             let mut socket = connect(&path).unwrap();
-            socket.write_all(b"GET /v1/objects/").unwrap();
+            socket.write_all(b"POST /v2/objects/").unwrap();
             held.push(socket);
             if index == 21 {
                 assert_eq!(
@@ -504,21 +528,27 @@ fn production_ingress_baseline() {
                 );
             }
         }
+        // getsockname retains the listener's anchored staging name after its
+        // atomic publication as client/socket. Query the actual bound name.
+        let address = held[0].peer_addr().unwrap();
+        let bound_path = address.as_pathname().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while observe(process.child.id()).socket_fds < before.socket_fds + ingress {
+        while accepted_clients(process.child.id(), bound_path) < ingress {
             assert!(
                 Instant::now() < deadline,
-                "accepted connections never saturated"
+                "accepted connections never saturated: expected {ingress}, actual {}",
+                accepted_clients(process.child.id(), bound_path)
             );
             thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(accepted_clients(process.child.id(), bound_path), ingress);
         let mut excess = connect(&path).unwrap();
         excess
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         write!(
             excess,
-            "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nRange: bytes=0-112\r\n\r\n",
+            "POST /v2/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-112\r\n\r\n",
             0
         )
         .unwrap();
@@ -527,6 +557,11 @@ fn production_ingress_baseline() {
         assert!(
             matches!(&outcome, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
             "expected ingress stall: {outcome:?}"
+        );
+        assert_eq!(
+            accepted_clients(process.child.id(), bound_path),
+            ingress,
+            "excess connection must remain outside the accepted ingress budget"
         );
         assert_eq!(process.diagnostic("/readyz").unwrap().status, 200);
         println!(
@@ -571,7 +606,7 @@ fn production_aggregate_delivery_capacity() {
         let mut readers = Vec::new();
         for _ in 0..16 {
             let mut socket = connect(&path).unwrap();
-            write!(socket, "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nIf-Match: \"restart-v1\"\r\nRange: bytes=0-{}\r\nConnection: close\r\n\r\n", 0, PAGE_BYTES - 1).unwrap();
+            write!(socket, "POST /v2/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nIf-Match: \"restart-v1\"\r\nRange: bytes=0-{}\r\nConnection: close\r\n\r\n", 0, PAGE_BYTES - 1).unwrap();
             readers.push(socket);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -629,7 +664,7 @@ fn production_idle_cache_acceptance_fairness() {
     let mut held = Vec::new();
     for cache in 0..64 {
         let mut socket = connect(&socket_path(&process, cache)).unwrap();
-        socket.write_all(b"GET /v1/objects/").unwrap();
+        socket.write_all(b"POST /v2/objects/").unwrap();
         held.push(socket);
     }
     for cache in [127, 65, 96, 0] {
@@ -869,13 +904,7 @@ fn production_peer_and_failed_neighbor_progress() {
             format!("fixture.token.{OTHER}"),
         )
         .unwrap();
-        fs::create_dir_all(second_root.0.join("secrets/epoch")).unwrap();
-        fs::copy(
-            first_root.0.join("secrets/epoch/bundle.json"),
-            second_root.0.join("secrets/epoch/bundle.json"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("epoch", second_root.0.join("secrets/..data")).unwrap();
+        // Both nodes receive the same key domain over controller HTTPS.
         let sockets = [
             TcpListener::bind("127.0.0.1:0").unwrap(),
             TcpListener::bind("127.0.0.1:0").unwrap(),
@@ -986,7 +1015,7 @@ fn production_peer_and_failed_neighbor_progress() {
 }
 
 #[test]
-#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate bootstrap"]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate subscription"]
 fn production_remote_bootstrap_one_get_and_empty() {
     use racer_dataplane::{
         model::identity::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
@@ -1054,13 +1083,7 @@ fn production_remote_bootstrap_one_get_and_empty() {
                     format!("fixture.token.{}", ids[i]),
                 )
                 .unwrap();
-                fs::create_dir_all(roots[i].0.join("secrets/epoch")).unwrap();
-                fs::copy(
-                    roots[0].0.join("secrets/epoch/bundle.json"),
-                    roots[i].0.join("secrets/epoch/bundle.json"),
-                )
-                .unwrap();
-                std::os::unix::fs::symlink("epoch", roots[i].0.join("secrets/..data")).unwrap();
+                // Key material is delivered by the shared HTTPS controller.
             }
             let mut configured = profile.clone();
             configured.peer = Some(addresses[i]);
@@ -1070,40 +1093,36 @@ fn production_remote_bootstrap_one_get_and_empty() {
             origins.push(origin);
         }
         let mut socket = connect(&socket_path(&processes[receiver], 0)).unwrap();
-        write!(socket, "GET /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n", 0).unwrap();
-        if length == 0 {
-            let head = read_head(&mut socket).unwrap();
-            assert!(head.starts_with("HTTP/1.1 200 "));
-            let fields = fields(&head);
-            assert_eq!(fields["content-length"], "0");
-            assert_eq!(fields["etag"], "\"restart-v1\"");
-            assert!(!fields.contains_key("content-range"));
-            let mut rest = Vec::new();
-            socket.read_to_end(&mut rest).unwrap();
-            assert!(rest.is_empty());
-        } else {
-            assert_eq!(
-                measurement::response(
-                    &mut BufReader::new(socket),
-                    &Expected {
-                        start: 0,
-                        end: length,
-                        length
-                    },
-                    |offset| object_byte(0, offset),
-                    Duration::ZERO
-                ),
-                Ok(length)
-            );
-        }
+        write!(socket, "POST /v2/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 0).unwrap();
+        assert_eq!(
+            measurement::response(
+                &mut BufReader::new(socket),
+                &Expected {
+                    start: 0,
+                    end: length,
+                    length
+                },
+                |offset| object_byte(0, offset),
+                Duration::ZERO
+            ),
+            Ok(length)
+        );
         let calls: Vec<_> = origins.iter().flatten().flat_map(|o| o.calls()).collect();
-        assert_eq!(calls.len(), 1, "one origin request for remote bootstrap");
-        assert_eq!(calls[0].method, "GET");
+        assert_eq!(
+            calls.len(),
+            if length == 0 { 1 } else { 2 },
+            "metadata HEAD and at most one page GET: {calls:?}"
+        );
+        assert_eq!(calls[0].method, "HEAD");
         assert_eq!(calls[0].pin, None);
-        assert_eq!(calls[0].range.as_deref(), Some("bytes=0-16777215"));
+        if length != 0 {
+            assert_eq!(calls[1].method, "GET");
+            assert_eq!(calls[1].pin.as_deref(), Some("\"restart-v1\""));
+            assert_eq!(calls[1].range.as_deref(), Some("bytes=0-16777215"));
+        }
         assert_eq!(
             counters(&processes[source])["racer_peer_bootstraps_total"],
-            1
+            0
         );
         assert_eq!(counters(&processes[source])["racer_page_decrypts_total"], 0);
         assert_eq!(
@@ -1120,9 +1139,12 @@ fn production_remote_bootstrap_one_get_and_empty() {
         head_socket.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
         let calls: Vec<_> = origins.iter().flatten().flat_map(|o| o.calls()).collect();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls.iter().filter(|c| c.method == "GET").count(), 1);
-        assert_eq!(calls.iter().filter(|c| c.method == "HEAD").count(), 1);
+        assert_eq!(calls.len(), if length == 0 { 2 } else { 3 });
+        assert_eq!(
+            calls.iter().filter(|c| c.method == "GET").count(),
+            usize::from(length != 0)
+        );
+        assert_eq!(calls.iter().filter(|c| c.method == "HEAD").count(), 2);
         for process in &mut processes {
             assert!(process.stop(libc::SIGTERM).success());
         }

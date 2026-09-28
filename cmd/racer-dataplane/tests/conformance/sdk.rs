@@ -39,9 +39,17 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
     let overlay = output.join("overlay.json");
     fs::write(&overlay, serde_json::to_vec(&serde_json::json!({"Replace": {root.join("pkg/racersdk/rust_conformance_fixture_test.go").to_str().unwrap(): fixture}})).unwrap()).unwrap();
     let binary = output.join("sdk.test");
-    let build = Command::new("go")
+    let build = Command::new("timeout")
         .current_dir(&root)
-        .args(["test", "-overlay"])
+        .args([
+            "--signal=TERM",
+            "--kill-after=10s",
+            "300s",
+            "go",
+            "test",
+            "-timeout=5m",
+            "-overlay",
+        ])
         .arg(&overlay)
         .args(["-c", "-o"])
         .arg(&binary)
@@ -90,111 +98,56 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
         let rig = Rig::new();
         rig.reactor.init().unwrap();
         let context_baseline = rig.admission.used(ResourceClass::RequestContext);
+        let mut releases = accepted.try_clone().unwrap();
         rig.drive(async {
-            let mut connection = rig.lease(accepted);
-            // One bootstrap and at most one pinned multipage remainder.
-            for index in 0..if size > P { 2 } else { 1 } {
-                let first = index * P;
-                let length = if index == 0 {
-                    size.min(P)
-                } else {
-                    size - first
-                };
-                let scope = scope();
-                let received = rig.io.receive_head(connection, &scope).await.unwrap();
-                let parsed = RequestParser::new(LIMIT)
-                    .parse(&object().cache, received.value)
-                    .unwrap();
-                assert_eq!(parsed.origin.object.key, CacheKey([0; 32]));
-                assert_eq!(
-                    parsed
-                        .origin
-                        .metadata
-                        .as_ref()
-                        .unwrap()
-                        .as_header()
-                        .unwrap(),
-                    b"opaque,  bytes\xff"
-                );
-                assert_eq!(
-                    parsed
-                        .origin
-                        .authorization
-                        .as_ref()
-                        .unwrap()
-                        .expose_for_origin()
-                        .unwrap(),
-                    b"fixture credential\x80"
-                );
-                if index == 0 {
-                    assert_eq!(parsed.kind, ReadKind::Bootstrap);
-                } else {
-                    assert_eq!(
-                        parsed.kind,
-                        ReadKind::Pinned {
-                            etag: StrongEtag::parse(b"\"v\"").unwrap(),
-                            range: ByteRange::Closed {
-                                first,
-                                last: first + length - 1
-                            }
-                        }
-                    );
-                }
-                drop(parsed);
-                // This is a scripted HTTP peer, not a substitute Coordinator. It
-                // checks SDK's multipage requests and real Rust framing with
-                // bounded chunks. Page acquisition is a separate acceptance gate.
-                let mut fields = vec![
-                    ("Content-Length", length.to_string()),
-                    ("Content-Type", "application/octet-stream".into()),
-                    ("ETag", "\"v\"".into()),
-                    ("Racer-Expires-At", index.to_string()),
-                    (
-                        "Racer-Content-Type",
-                        "application/vnd.oci.image.manifest.v1+json".into(),
-                    ),
-                ];
-                if length != 0 {
-                    fields.push((
-                        "Content-Range",
-                        format!("bytes {first}-{}/{size}", first + length - 1),
-                    ));
-                }
-                let head = MessageHead {
-                    start: StartLine::Response {
-                        status: if length == 0 { 200 } else { 206 },
-                    },
-                    headers: fields
-                        .into_iter()
-                        .map(|(name, value)| Header {
-                            name: name.into(),
-                            value: value.into_bytes(),
-                        })
-                        .collect(),
-                };
-                connection = rig
-                    .io
-                    .send_head(received.connection, head, &scope)
-                    .await
+            let connection = rig.lease(accepted);
+            let scope = scope();
+            let received = rig.io.receive_head(connection, &scope).await.unwrap();
+            let parsed = RequestParser::new(LIMIT)
+                .parse(&object().cache, received.value)
+                .unwrap();
+            assert_eq!(parsed.origin.object.key, CacheKey([0; 32]));
+            assert_eq!(
+                parsed
+                    .origin
+                    .metadata
+                    .as_ref()
                     .unwrap()
-                    .connection;
-                let mut offset = first;
-                while offset < first + length {
-                    let n = (first + length - offset).min(32768) as usize;
-                    let mut buffer = rig.io.buffer(n).unwrap();
-                    for (i, b) in buffer.bytes_mut().unwrap().iter_mut().enumerate() {
-                        *b = ((offset + i as u64) % 251) as u8;
-                    }
-                    connection = rig
-                        .io
-                        .write_body(connection, buffer, &scope)
-                        .await
-                        .unwrap()
-                        .lease;
-                    offset += n as u64;
+                    .as_header()
+                    .unwrap(),
+                b"opaque,  bytes\xff"
+            );
+            assert_eq!(
+                parsed
+                    .origin
+                    .authorization
+                    .as_ref()
+                    .unwrap()
+                    .expose_for_origin()
+                    .unwrap(),
+                b"fixture credential\x80"
+            );
+            assert_eq!(
+                parsed.kind,
+                ReadKind::Subscription {
+                    pin: None,
+                    range: None,
+                    page_credits: 1,
+                    byte_credits: P,
+                    ordered: true,
                 }
-                connection.finish_exchange().unwrap();
-            }
+            );
+            drop(parsed);
+            send_subscription(
+                &rig,
+                received.connection,
+                &mut releases,
+                size,
+                0,
+                size,
+                "application/vnd.oci.image.manifest.v1+json",
+            )
+            .await;
         });
         assert_eq!(rig.admission.used(ResourceClass::Connection), 0);
         // The HTTP owner retains one admitted idle staging buffer for reuse.
@@ -262,7 +215,7 @@ fn sdk_range(
     rig.reactor.init().unwrap();
     rig.drive(async {
         let mut connection = rig.lease(accepted);
-        for pinned in [false, true] {
+        for pinned in [false] {
             let scope = scope();
             let received = rig.io.receive_head(connection, &scope).await.unwrap();
             let request = RequestParser::new(LIMIT)
@@ -311,10 +264,11 @@ fn sdk_range(
             connection.finish_exchange().unwrap();
         }
     });
-    if size != 0 {
-        let first = (size - 1).min(P - 3);
+    {
+        let first = size.saturating_sub(1).min(P - 3);
         let length = (size - first).min(P + 9);
         let accepted = accept();
+        let mut releases = accepted.try_clone().unwrap();
         rig.drive(async {
             let scope = scope();
             let received = rig
@@ -327,69 +281,31 @@ fn sdk_range(
                 .unwrap();
             assert_eq!(
                 request.kind,
-                ReadKind::Pinned {
-                    etag: StrongEtag::parse(b"\"v\"").unwrap(),
-                    range: ByteRange::Closed {
-                        first,
-                        last: first + length - 1
+                ReadKind::Subscription {
+                    pin: Some(StrongEtag::parse(b"\"v\"").unwrap()),
+                    range: if length == 0 {
+                        None
+                    } else {
+                        Some(ByteRange::Closed {
+                            first,
+                            last: first + length - 1,
+                        })
                     },
+                    page_credits: 1,
+                    byte_credits: P,
+                    ordered: true,
                 }
             );
-            let mut connection = rig
-                .io
-                .send_head(
-                    received.connection,
-                    MessageHead {
-                        start: StartLine::Response { status: 206 },
-                        headers: vec![
-                            Header {
-                                name: "Content-Length".into(),
-                                value: length.to_string().into_bytes(),
-                            },
-                            Header {
-                                name: "Content-Range".into(),
-                                value: format!("bytes {first}-{}/{size}", first + length - 1)
-                                    .into_bytes(),
-                            },
-                            Header {
-                                name: "Content-Type".into(),
-                                value: b"application/octet-stream".to_vec(),
-                            },
-                            Header {
-                                name: "ETag".into(),
-                                value: b"\"v\"".to_vec(),
-                            },
-                            Header {
-                                name: "Racer-Expires-At".into(),
-                                value: b"0".to_vec(),
-                            },
-                            Header {
-                                name: "Racer-Content-Type".into(),
-                                value: b"text/plain".to_vec(),
-                            },
-                        ],
-                    },
-                    &scope,
-                )
-                .await
-                .unwrap()
-                .connection;
-            let mut offset = first;
-            while offset < first + length {
-                let n = (first + length - offset).min(32768) as usize;
-                let mut buffer = rig.io.buffer(n).unwrap();
-                for (i, b) in buffer.bytes_mut().unwrap().iter_mut().enumerate() {
-                    *b = ((offset + i as u64) % 251) as u8;
-                }
-                connection = rig
-                    .io
-                    .write_body(connection, buffer, &scope)
-                    .await
-                    .unwrap()
-                    .lease;
-                offset += n as u64;
-            }
-            connection.finish_exchange().unwrap();
+            send_subscription(
+                &rig,
+                received.connection,
+                &mut releases,
+                size,
+                first,
+                first + length,
+                "text/plain",
+            )
+            .await;
         });
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -402,6 +318,127 @@ fn sdk_range(
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(rig.admission.used(ResourceClass::Connection), 0);
+}
+
+// A scripted peer exercises the real Rust HTTP writer and production Go SDK.
+// One credit forces exact releases before the next page, including clipped pages.
+async fn send_subscription(
+    rig: &Rig,
+    connection: racer_dataplane::http::pool::ConnectionLease,
+    releases: &mut UnixStream,
+    size: u64,
+    first: u64,
+    end: u64,
+    content_type: &str,
+) {
+    let scope = scope();
+    let pages = if first == end {
+        0
+    } else {
+        (end - 1) / P - first / P + 1
+    };
+    let fields = [
+        (
+            "Content-Length",
+            (end - first + 21 * (pages + 1)).to_string(),
+        ),
+        ("Content-Type", "application/octet-stream".into()),
+        ("Connection", "close".into()),
+        ("ETag", "\"v\"".into()),
+        ("Racer-Expires-At", "0".into()),
+        ("Racer-Object-Length", size.to_string()),
+        ("Racer-Range-Start", first.to_string()),
+        ("Racer-Range-End", end.to_string()),
+        ("Racer-Content-Type", content_type.into()),
+    ];
+    let head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: fields
+            .into_iter()
+            .map(|(name, value)| Header {
+                name: name.into(),
+                value: value.into_bytes(),
+            })
+            .collect(),
+    };
+    let mut connection = rig
+        .io
+        .send_head(connection, head, &scope)
+        .await
+        .unwrap()
+        .connection;
+    let mut offset = first;
+    while offset < end {
+        let number = offset / P;
+        let page_end = end.min((number + 1) * P);
+        let length = (page_end - offset) as u32;
+        let mut frame = rig.io.buffer(21).unwrap();
+        frame
+            .bytes_mut()
+            .unwrap()
+            .copy_from_slice(&subscription_frame(1, number, offset, length));
+        connection = rig
+            .io
+            .write_body(connection, frame, &scope)
+            .await
+            .unwrap()
+            .lease;
+        while offset < page_end {
+            let n = (page_end - offset).min(32768) as usize;
+            let mut buffer = rig.io.buffer(n).unwrap();
+            for (i, b) in buffer.bytes_mut().unwrap().iter_mut().enumerate() {
+                *b = ((offset + i as u64) % 251) as u8;
+            }
+            connection = rig
+                .io
+                .write_body(connection, buffer, &scope)
+                .await
+                .unwrap()
+                .lease;
+            offset += n as u64;
+        }
+        if offset < end {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut release = [0; 12];
+            let mut used = 0;
+            while used < release.len() {
+                match releases.read(&mut release[used..]) {
+                    Ok(0) => panic!("SDK closed before releasing page"),
+                    Ok(n) => used += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "SDK did not release page");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("SDK release: {e}"),
+                }
+            }
+            assert_eq!(&release[..8], &number.to_be_bytes());
+            assert_eq!(&release[8..], &length.to_be_bytes());
+        }
+    }
+    let mut frame = rig.io.buffer(21).unwrap();
+    frame
+        .bytes_mut()
+        .unwrap()
+        .copy_from_slice(&subscription_frame(2, pages, end - first, 0));
+    connection = rig
+        .io
+        .write_body(connection, frame, &scope)
+        .await
+        .unwrap()
+        .lease;
+    connection.finish_exchange().unwrap();
+    // Close both descriptors, including the release observer, at completion.
+    releases.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+fn subscription_frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; 21] {
+    let mut frame = [0; 21];
+    frame[0] = kind;
+    frame[1..9].copy_from_slice(&number.to_be_bytes());
+    frame[9..17].copy_from_slice(&offset.to_be_bytes());
+    frame[17..].copy_from_slice(&length.to_be_bytes());
+    frame
 }
 
 fn sdk_origin(binary: &std::path::Path, socket: &std::path::Path) {

@@ -9,6 +9,13 @@ description = "Racer node-local read-through cache dataplane"
 default = []
 # Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
 rdma = []
+# Opt-in standalone client interoperability fixture with crate-private test hooks.
+subscription-interop = []
+
+[[test]]
+name = "subscription_interop"
+path = "tests/subscription_interop.rs"
+required-features = ["subscription-interop"]
 
 [dependencies]
 base64 = "0.22"

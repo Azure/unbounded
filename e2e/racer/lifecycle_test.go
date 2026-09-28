@@ -153,11 +153,12 @@ func (h *harness) lifecycleRead(ctx context.Context, node peerNode, socket, id, 
 	}
 	if method == http.MethodHead {
 		args = append(args, "--head")
+		args = append(args, "http://racer/v1/objects/"+strings.TrimPrefix(id, "sha256:"))
 	} else {
-		args = append(args, "-H", "Range: bytes=0-16777215")
+		method = http.MethodPost
+		args = append(args, "-X", method, "-H", "Content-Length: 0", "-H", "Racer-Page-Credits: 1", "-H", "Racer-Byte-Credits: 16777216", "-H", "Racer-Ordered: 1")
+		args = append(args, "http://racer/v2/objects/"+strings.TrimPrefix(id, "sha256:"))
 	}
-
-	args = append(args, "http://racer/v1/objects/"+strings.TrimPrefix(id, "sha256:"))
 
 	var stderr bytes.Buffer
 
@@ -175,7 +176,12 @@ func (h *harness) lifecycleRead(ctx context.Context, node peerNode, socket, id, 
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(response.Body)
+	var body []byte
+	if method == http.MethodPost && response.StatusCode == http.StatusOK {
+		body, err = singlePageSubscription(response)
+	} else {
+		body, err = io.ReadAll(response.Body)
+	}
 
 	return lifecycleResponse{status: response.StatusCode, header: response.Header, body: body, err: err}
 }
@@ -186,11 +192,13 @@ func (h *harness) lifecycleBytes(node peerNode, socket, id string, fixture *life
 	ctx, cancel := context.WithTimeout(h.ctx, 25*time.Second)
 	defer cancel()
 
-	r := h.lifecycleRead(ctx, node, socket, id, http.MethodGet)
+	r := h.lifecycleRead(ctx, node, socket, id, http.MethodPost)
 	require.NoError(h.t, r.err)
-	require.Equal(h.t, http.StatusPartialContent, r.status)
+	require.Equal(h.t, http.StatusOK, r.status)
 	require.Equal(h.t, "\""+id+"\"", r.header.Get("ETag"))
-	require.Equal(h.t, fmt.Sprintf("bytes 0-%d/%d", len(fixture.blobs[id])-1, len(fixture.blobs[id])), r.header.Get("Content-Range"))
+	require.Equal(h.t, fmt.Sprint(len(fixture.blobs[id])), r.header.Get("Racer-Object-Length"))
+	require.Equal(h.t, "0", r.header.Get("Racer-Range-Start"))
+	require.Equal(h.t, fmt.Sprint(len(fixture.blobs[id])), r.header.Get("Racer-Range-End"))
 	require.Equal(h.t, fixture.blobs[id], r.body)
 }
 
@@ -241,7 +249,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 
 	result := make(chan lifecycleResponse, 1)
 
-	go func() { result <- h.lifecycleRead(ctx, nodes[0], lifecycleSocket, fixture.cold, http.MethodGet) }()
+	go func() { result <- h.lifecycleRead(ctx, nodes[0], lifecycleSocket, fixture.cold, http.MethodPost) }()
 
 	h.awaitLifecycle(fixture.started, "cold fill never reached held origin body")
 
@@ -268,7 +276,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 			return exec.CommandContext(probe, "docker", "exec", node.name, "test", "!", "-S", lifecycleSocket).Run() == nil
 		}, 20*time.Second, 200*time.Millisecond, "controller removal never retired %s socket", node.name)
 		probe, stop := context.WithTimeout(h.ctx, 2*time.Second)
-		r := h.lifecycleRead(probe, node, oldSocket, fixture.warm, http.MethodGet)
+		r := h.lifecycleRead(probe, node, oldSocket, fixture.warm, http.MethodPost)
 		probeErr := probe.Err()
 
 		stop()
@@ -329,7 +337,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 			h.run("docker", "exec", node.name, "stat", "--format=%d:%i", lifecycleSocket),
 			"same-name replacement must own a new socket inode")
 		probe, stop := context.WithTimeout(h.ctx, 5*time.Second)
-		r := h.lifecycleRead(probe, node, oldSocket, fixture.warm, http.MethodGet)
+		r := h.lifecycleRead(probe, node, oldSocket, fixture.warm, http.MethodPost)
 		probeErr := probe.Err()
 
 		stop()
@@ -344,7 +352,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	select {
 	case r := <-result:
 		if r.err == nil && r.status < 400 {
-			require.Equal(h.t, http.StatusPartialContent, r.status)
+			require.Equal(h.t, http.StatusOK, r.status)
 			require.Equal(h.t, fixture.blobs[fixture.cold], r.body)
 		}
 	case <-ctx.Done():
@@ -358,7 +366,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 		for _, id := range []string{fixture.warm, fixture.cold} {
 			before := fixture.count(id)
 			probe, stop := context.WithTimeout(h.ctx, 25*time.Second)
-			r := h.lifecycleRead(probe, node, lifecycleSocket, id, http.MethodGet)
+			r := h.lifecycleRead(probe, node, lifecycleSocket, id, http.MethodPost)
 
 			stop()
 			require.NoError(h.t, r.err, "replacement must return a framed origin failure")

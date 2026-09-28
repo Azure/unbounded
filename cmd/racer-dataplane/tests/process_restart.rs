@@ -273,7 +273,27 @@ impl Process {
     fn request(&self, pin: Option<&str>, start: u64, end: u64) -> Reply {
         let mut socket = self.connect();
         write_request(&mut socket, pin, start, end);
-        read_reply(&mut socket).expect("complete client response before deadline")
+        let mut body = Vec::new();
+        let (_, fields) = measurement::response_fields(
+            &mut io::BufReader::new(socket),
+            &measurement::Expected {
+                start,
+                end,
+                length: LENGTH,
+            },
+            |offset| {
+                let value = byte(offset);
+                body.push(value);
+                value
+            },
+            Duration::ZERO,
+        )
+        .expect("complete client subscription before deadline");
+        Reply {
+            status: 200,
+            fields,
+            body,
+        }
     }
     fn diagnostic(&self, path: &str) -> io::Result<Reply> {
         let mut socket = TcpStream::connect_timeout(&self.diagnostics, Duration::from_millis(200))?;
@@ -361,18 +381,17 @@ fn read_reply(stream: &mut impl Read) -> io::Result<Reply> {
 }
 fn write_request(socket: &mut UnixStream, pin: Option<&str>, start: u64, end: u64) {
     let pin = pin.map_or(String::new(), |pin| format!("If-Match: {pin}\r\n"));
-    write!(socket, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{pin}Range: bytes={start}-{}\r\nConnection: close\r\n\r\n", "ab".repeat(32), end - 1).unwrap();
+    write!(socket, "POST /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{pin}Range: bytes={start}-{}\r\nConnection: close\r\n\r\n", "ab".repeat(32), end - 1).unwrap();
 }
 fn byte(offset: u64) -> u8 {
     ((offset * 31 + offset / P * 17) % 251) as u8
 }
 fn check(reply: &Reply, start: u64, end: u64) {
-    assert_eq!(reply.status, 206);
+    assert_eq!(reply.status, 200);
     assert_eq!(reply.fields["etag"], "\"restart-v1\"");
-    assert_eq!(
-        reply.fields["content-range"],
-        format!("bytes {start}-{}/{LENGTH}", end - 1)
-    );
+    assert_eq!(reply.fields["racer-object-length"], LENGTH.to_string());
+    assert_eq!(reply.fields["racer-range-start"], start.to_string());
+    assert_eq!(reply.fields["racer-range-end"], end.to_string());
     assert_eq!(reply.body.len() as u64, end - start);
     for (i, actual) in reply.body.iter().enumerate() {
         assert_eq!(
@@ -407,9 +426,7 @@ fn enrolled_identity(
         scratch.0.join("token"),
         scratch.0.join("identity"),
     );
-    let bundle =
-        wire::decode_bundle(&fs::read(scratch.0.join("secrets/epoch/bundle.json")).unwrap())
-            .unwrap();
+    let bundle = wire::decode_bundle(&control.bundle).unwrap();
     enrollment
         .set_peer_trust_roots(bundle.peer_trust_roots)
         .unwrap();
@@ -563,17 +580,20 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
     check(&first.request(None, 0, P), 0, P);
     check(&first.request(Some("\"restart-v1\""), P, LENGTH), P, LENGTH);
     let calls = origin.calls();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls.len(),
+        4,
+        "metadata HEAD plus three page GETs: {calls:?}"
+    );
+    assert_eq!(calls[0].method, "HEAD");
     assert_eq!(calls[0].pin, None);
-    for (i, call) in calls.iter().enumerate() {
+    for (i, call) in calls.iter().skip(1).enumerate() {
         assert_eq!(call.method, "GET");
         assert_eq!(
             call.range.as_deref(),
             Some(format!("bytes={}-{}", i as u64 * P, (i as u64 + 1) * P - 1).as_str())
         );
-        if i != 0 {
-            assert_eq!(call.pin.as_deref(), Some("\"restart-v1\""));
-        }
+        assert_eq!(call.pin.as_deref(), Some("\"restart-v1\""));
     }
     let identity = enrolled_identity(&scratch, &control, 1);
     assert!(

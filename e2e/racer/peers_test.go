@@ -328,23 +328,26 @@ func (h *harness) readPeerPage(node peerNode, fixture *peerOrigin, page int) {
 	ctx, cancel := context.WithTimeout(h.ctx, 30*time.Second)
 	defer cancel()
 	// kind's node image includes curl. Use the actual client UDS, same UID as
-	// Gantry, and explicit pins to distinguish metadata HEADs from data GETs.
-	args := []string{"exec", node.name, "curl", "--include", "--silent", "--show-error", "--fail", "--max-time", "25", "--noproxy", "*", "--unix-socket", "/run/racer/gantry/client/socket", "-H", "Host: racer", "-H", "If-Match: \"" + fixture.id + "\"", "-H", "Range: bytes=" + strconv.Itoa(first) + "-" + strconv.Itoa(last), "-H", "Racer-Metadata: " + metadata}
+	// Gantry, and explicit pins. These single-page subscriptions finish without
+	// waiting for the final lease release, so curl need not implement duplex IO.
+	args := []string{"exec", node.name, "curl", "--include", "--silent", "--show-error", "--fail", "--max-time", "25", "--noproxy", "*", "--unix-socket", "/run/racer/gantry/client/socket", "-X", "POST", "-H", "Content-Length: 0", "-H", "Racer-Page-Credits: 1", "-H", "Racer-Byte-Credits: 16777216", "-H", "Racer-Ordered: 1", "-H", "Host: racer", "-H", "If-Match: \"" + fixture.id + "\"", "-H", "Range: bytes=" + strconv.Itoa(first) + "-" + strconv.Itoa(last), "-H", "Racer-Metadata: " + metadata}
 	if fixture.authorization != "" {
 		args = append(args, "-H", "Authorization: "+fixture.authorization)
 	}
 
-	args = append(args, "http://racer/v1/objects/"+strings.TrimPrefix(fixture.id, "sha256:"))
+	args = append(args, "http://racer/v2/objects/"+strings.TrimPrefix(fixture.id, "sha256:"))
 	raw := h.command(ctx, "docker", args...)
 	response, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), nil)
 	require.NoError(h.t, err)
 
 	defer response.Body.Close()
 
-	require.Equal(h.t, http.StatusPartialContent, response.StatusCode)
+	require.Equal(h.t, http.StatusOK, response.StatusCode)
 	require.Equal(h.t, "\""+fixture.id+"\"", response.Header.Get("ETag"))
-	require.Equal(h.t, "bytes "+strconv.Itoa(first)+"-"+strconv.Itoa(last)+"/"+strconv.Itoa(len(fixture.body)), response.Header.Get("Content-Range"))
-	body, err := io.ReadAll(response.Body)
+	require.Equal(h.t, strconv.Itoa(len(fixture.body)), response.Header.Get("Racer-Object-Length"))
+	require.Equal(h.t, strconv.Itoa(first), response.Header.Get("Racer-Range-Start"))
+	require.Equal(h.t, strconv.Itoa(last+1), response.Header.Get("Racer-Range-End"))
+	body, err := singlePageSubscription(response)
 	require.NoError(h.t, err)
 	require.Len(h.t, body, last-first+1)
 	require.True(h.t, bytes.Equal(fixture.body[first:last+1], body), "node %s page %d returned incorrect bytes (digest %s)", node.name, page, digest(body))
