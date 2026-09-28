@@ -205,17 +205,128 @@ above, milliseconds):
 | 16 MiB | rotating | decrypt_inout | 109.172247 | 109.169241 |
 | 16 MiB | rotating | bad_tag_inout | 50.663180 | 50.662541 |
 
-### Attribution overhead limitation
+### Paired full-client attribution overhead
 
-The harness has no instrumentation-disable switch. Its paired lifecycle uses
-low-level ports, not `CryptoClient::poll_completions`, so it exercises clock and
-permit bookkeeping but **not** the eight I/O-side counter updates per completion
-(`cmd/racer-dataplane/src/runtime/crypto_measurement.rs:239-249,339-351` versus
-`cmd/racer-dataplane/src/runtime/crypto.rs:137-179,613-615`). Thus neither a minimum
-full-instrumentation overhead nor an instrumented/uninstrumented paired delta
-was established. Comparing the old baseline with this integrated version would
-confound CRC and AEAD changes with instrumentation; it is not an overhead result.
-The exact virtual-time accounting tests establish semantics, not performance.
+The original 80-case matrix uses low-level ports and does not aggregate counters.
+It is still not an overhead comparison. A separate test now closes that gap:
+`runtime::crypto::measurement::crypto_attribution_overhead`. It runs the same
+optimized CRC/AEAD in both modes through **actual `CryptoClient::execute` and
+`CryptoClient::poll_budgeted` completion reap**, including all eight counter
+updates, not a surrogate atomic loop
+(`cmd/racer-dataplane/src/runtime/crypto_measurement.rs:429-578`,
+`cmd/racer-dataplane/src/runtime/crypto.rs:642-646`).
+
+The disable flag exists only under `cfg(test)`, is set on the I/O port before
+constructing the client, and follows each permit across threads. It skips input
+direction/byte bookkeeping, submission/dequeue/execution attribution clocks,
+duration conversion/storage, and the metrics borrow/aggregation at reap. Production
+`measurement_enabled()` is unconditionally true with no disable field or runtime
+configuration (`runtime/crypto.rs:111-145,213-224,376-378,413-415`). Both modes retain
+the same message sizes/default field initialization and test-only branches; this
+is an incremental **active attribution** cost measurement, not an ABI-size or
+compile-out/code-layout experiment. Deadline checks, nonce generation, crypto,
+admission, waiter handling, and ownership fences are unchanged. The clock hook
+still selects `runtime::environment::now`, preserving virtual-time attribution.
+
+Workload: reused source, batches of up to eight operations, 32,768 operations per
+63-byte sample or 16 operations (256 MiB) per 16 MiB sample, success paths in both
+directions. Input admission/allocation/copy, key leasing, queue handoff, crypto,
+real client completion reap and result delivery, sampled output checks, output
+destruction/recycling, thread join, and recycler reclamation are timed. Fixture
+construction, thread spawn, final quota/counter assertions, and fixture destruction
+are outside timing. Each sample asserts exact success/bytes/execution-count/queue-
+count counters when enabled, all eight counters zero when disabled, no waiters or
+permits remaining, and zero payload quota. One warmup per mode precedes eight
+paired samples; order is off/on for even pairs and on/off for odd pairs
+(`runtime/crypto_measurement.rs:596-639`). This is the full crypto-client lifecycle,
+not the complete production worker scheduler, a scrape-concurrency benchmark, or
+an error-path performance study.
+
+Reproduction (select CPUs from the current allowed set on other machines):
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s env \
+  CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 \
+  bash hack/scripts/memory-safe-run.sh -- taskset -c 2,4 \
+  cargo test --locked --release \
+    --manifest-path cmd/racer-dataplane/Cargo.toml --lib \
+    runtime::crypto::measurement::crypto_attribution_overhead -- \
+    --ignored --exact --nocapture --test-threads=2
+```
+
+Captured 2026-09-28 on base `2688f3e0bc5fc8d65c57b46978cdfd398fcdd3a5`
+plus the test-hook/harness patch committed as `fdf13ce6` (dirty=true during the
+measurement). Same optimized Cargo.lock hash,
+Rust 1.96.0/LLVM 22.1.2, empty RUSTFLAGS, default features, and EPYC 9V74 VM as the
+integrated run. The wrapper verified 16 GiB memory.max and zero swap. Process
+affinity was restricted to **2,4**, distinct physical cores 1 and 2, NUMA node 0,
+within the actual allowed 0-47 set. Both threads inherit this two-CPU mask; roles
+are not individually pinned and CPUs are not isolated from other host work.
+All 64 measured samples passed in 17.41 seconds including warmups/setup.
+`CRYPTO_ATTRIBUTION` emits raw elapsed/process-CPU nanoseconds and workload fields;
+`CRYPTO_ATTRIBUTION_RATIOS` emits each paired on/off ratio. Process CPU sums both
+threads. The retained raw samples below are total **milliseconds** (six decimals).
+
+| Size/op | Pair | Off elapsed | On elapsed | Off CPU | On CPU |
+|---|---:|---:|---:|---:|---:|
+| 63 B encrypt | 0 | 213.423745 | 220.203797 | 307.714514 | 318.277823 |
+| 63 B encrypt | 1 | 213.548913 | 217.643093 | 308.425609 | 316.091927 |
+| 63 B encrypt | 2 | 213.361311 | 216.052723 | 307.118876 | 312.348504 |
+| 63 B encrypt | 3 | 209.376127 | 218.355297 | 306.348552 | 316.029142 |
+| 63 B encrypt | 4 | 212.283384 | 218.738326 | 308.961875 | 316.931059 |
+| 63 B encrypt | 5 | 213.489544 | 217.443050 | 307.491389 | 315.433552 |
+| 63 B encrypt | 6 | 213.672771 | 215.542292 | 308.534988 | 311.041618 |
+| 63 B encrypt | 7 | 206.334206 | 217.695882 | 297.806607 | 312.306584 |
+| 63 B decrypt | 0 | 179.246537 | 177.297747 | 259.156922 | 264.276599 |
+| 63 B decrypt | 1 | 178.172246 | 179.672821 | 262.298831 | 264.727383 |
+| 63 B decrypt | 2 | 178.588665 | 179.640713 | 262.443534 | 265.992693 |
+| 63 B decrypt | 3 | 179.232468 | 180.382794 | 262.540571 | 267.848707 |
+| 63 B decrypt | 4 | 179.307050 | 180.155120 | 261.745317 | 264.712550 |
+| 63 B decrypt | 5 | 184.584065 | 186.207215 | 270.214869 | 271.909008 |
+| 63 B decrypt | 6 | 182.341079 | 185.025611 | 267.859216 | 273.956681 |
+| 63 B decrypt | 7 | 179.503246 | 180.734465 | 263.465608 | 267.794528 |
+| 16 MiB encrypt | 0 | 297.039271 | 288.762118 | 462.313298 | 456.608030 |
+| 16 MiB encrypt | 1 | 299.007702 | 299.224780 | 462.756810 | 485.067444 |
+| 16 MiB encrypt | 2 | 288.002111 | 298.532034 | 454.783915 | 483.464483 |
+| 16 MiB encrypt | 3 | 299.422653 | 296.043628 | 485.375469 | 459.252791 |
+| 16 MiB encrypt | 4 | 296.583649 | 299.224970 | 459.371221 | 483.805057 |
+| 16 MiB encrypt | 5 | 299.307315 | 294.947013 | 484.090840 | 457.483859 |
+| 16 MiB encrypt | 6 | 295.840086 | 281.561779 | 459.775191 | 444.305730 |
+| 16 MiB encrypt | 7 | 295.001365 | 299.052560 | 458.624567 | 486.369201 |
+| 16 MiB decrypt | 0 | 296.324907 | 297.074244 | 463.407052 | 463.854791 |
+| 16 MiB decrypt | 1 | 295.752954 | 296.153704 | 459.189986 | 462.873153 |
+| 16 MiB decrypt | 2 | 295.906090 | 294.929792 | 459.139175 | 457.207195 |
+| 16 MiB decrypt | 3 | 295.614895 | 295.455525 | 457.767629 | 458.169607 |
+| 16 MiB decrypt | 4 | 295.396091 | 295.603633 | 459.353859 | 457.757171 |
+| 16 MiB decrypt | 5 | 296.078395 | 298.195125 | 459.758855 | 460.555973 |
+| 16 MiB decrypt | 6 | 297.280615 | 297.543791 | 458.961860 | 461.850006 |
+| 16 MiB decrypt | 7 | 267.160276 | 270.421653 | 393.156377 | 412.986942 |
+
+Summary of **paired on/off ratios**, not ratios of pooled means:
+
+| Size/op | Median elapsed ratio | Elapsed min-max | Median CPU ratio | CPU min-max |
+|---|---:|---:|---:|---:|
+| 63 B encrypt | 1.024790 | 1.008749-1.055064 | 1.025811 | 1.008124-1.048689 |
+| 63 B decrypt | 1.006639 | 0.989128-1.014723 | 1.014977 | 1.006270-1.022764 |
+| 16 MiB encrypt | 0.994720 | 0.951736-1.036562 | 1.017936 | 0.945037-1.063064 |
+| 16 MiB decrypt | 1.001120 | 0.996701-1.012208 | 1.001350 | 0.995792-1.050439 |
+
+Small-page median deltas here are +2.48%/+0.66% elapsed and +2.58%/+1.50% CPU
+for encrypt/decrypt. Large-page deltas are dominated by run variation at this
+sample count; in particular the apparent encryption elapsed reduction is **not
+evidence of a speedup**. Eight pairs on a shared VM do not establish significance,
+an upper bound, or deployment-wide overhead. This does establish a reproducible
+same-crypto comparison including real aggregation, unlike subtracting the old
+baseline from the optimized implementation. No Grace numbers are implied.
+
+Focused acceptance checks: crypto tests 17 passed/three benchmarks ignored,
+AEAD tests nine passed, release non-test `cargo check --lib` passed. The new
+toggle/cleanup test runs both modes and directions under a simulated environment;
+existing exact virtual-duration/cancellation/abandonment tests still pass. No
+blanket broad suite was repeated. Changed Rust files and `crc64.rs` passed rustfmt;
+`crc64.rs` already matched the formatter and required no edit. Bounded scoped
+`make fmt` ran gofumpt, then reproduced the existing golangci-lint Go 1.26 versus
+source Go 1.27 panic; no Go changes resulted.
 
 ## Dependencies, dispatch, and security review
 
@@ -355,6 +466,6 @@ test threads two. Broad validation ran once in bounded groups, with all features
   required Go 1.27. No Go changes resulted. This is an environment limitation,
   not a passing root-format/lint result.
 
-Remaining limitations: no full-node throughput claim, controlled paired
-instrumentation-off study, pinned/NUMA study, allocation count, hardware
+Remaining limitations: no full-node throughput claim, isolated-core/per-role
+pinned NUMA study, allocation count, hardware
 cycle/cache-miss counters, sampled histograms, or Grace/GPU hardware validation.
