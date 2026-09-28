@@ -139,15 +139,14 @@ for native slots. This is additional to the activation prerequisites below.
 
 Set `RACER_CLUSTER_ID` to the deployed non-nil lowercase cluster UUID and
 `RACER_CONTROL_ENDPOINT` to its HTTPS authority, for example
-`https://racer-controller.unbounded-system.svc:7443`. The endpoint certificate
-must match that name/IP. All five configured credential/state paths must be
-absolute and mutually non-nested (`src/config.rs:91-113,199-218`).
+`https://racer-controller.unbounded-system.svc:8443`. The endpoint certificate
+must match that name/IP. All four configured credential/state paths must be
+absolute and mutually non-nested.
 
 | Container path (default) | Mount and ownership |
 | --- | --- |
 | `/etc/racer/trust/ca.crt` | Read-only deployment server-trust PEM CA bundle, readable by the runtime UID. `RACER_TRUST_BUNDLE` selects this file. |
 | `/var/run/secrets/racer-control/token` | Read-only rotating projected ServiceAccount token for audience `racer-control`; `RACER_SERVICE_ACCOUNT_TOKEN` selects this file. |
-| `/etc/racer/keys` | Read-only **whole** shared SecretBundle projection directory containing `..data/bundle.json` via a relative generation link; selected by `RACER_SECRET_DIRECTORY`. |
 | `/var/lib/racer/identity` | Writable node-private persistent directory, `0700`; selected by `RACER_IDENTITY_DIRECTORY`. Contains locally generated `pending.json` and `identity.json`. |
 | `/var/lib/racer/slabs` | Writable dedicated direct-I/O-capable persistent storage; selected by `RACER_SLAB_DIRECTORY`. Keep separate from identity and projections. |
 | `/run/racer` | Writable shared UDS directory tree for accepted caches. This path is fixed, not an environment override. |
@@ -155,26 +154,45 @@ absolute and mutually non-nested (`src/config.rs:91-113,199-218`).
 The server-trust file authenticates the controller's HTTPS server; the transport
 loads only that configured trust store (`src/control/transport.rs:223-242`).
 Installing system CA certificates does not supply it. Peer trust roots and
-cache encryption keys come from the distinct shared `bundle.json`. The common
+cache encryption keys come from `GET /v1/keyring` over control HTTPS. The common
 bundle does not contain node signing private keys. The process generates those
 locally and persists enrollment/identity records
 (`src/control/enrollment.rs:107-123,216-231`). Preserve identity across restarts
 of the same node; do not clone it to another node or place it in the common
 SecretBundle.
 
-Mount the entire Kubernetes Secret volume at `/etc/racer/keys`, not a `subPath`
-mount of `bundle.json`. The reader opens `..data` once and reads that generation
-coherently (`src/control/async_files.rs:163-182`). A non-Kubernetes deployment
-must implement the same directory layout and atomic generation switch. Trust
-and token readers support ordinary projection symlinks. Keep projected files
-readable by UID 65532 without exposing them through client/origin mounts.
+Do not mount shared keyring Secrets or configure `RACER_SECRET_DIRECTORY`.
+The only projected cryptographic trust material is the controller CA; the
+projected `racer-control` service token remains required. Trust and token readers
+support ordinary projection symlinks. Keep those mounts readable by the runtime
+UID without exposing them through client/origin mounts. The managed DaemonSet
+uses `/etc/racer/bootstrap/ca.crt`, `/var/run/racer-token/token`, and the private
+subdirectory `/var/lib/racer/identity/private` beneath its identity hostPath.
+
+### Upgrade from filesystem keyring delivery
+
+Upgrade the controller first and verify the ready leader serves `/v1/keyring`
+before rolling out the new dataplane and mount changes. An old controller cannot
+bootstrap the new dataplane. Keep controller issuer/keyring durable Secrets and
+`RACER_KEYRING_SECRET_NAME`; this changes delivery, not durable authority or key
+generation. Controller TLS certificate/private-key mounts are unchanged.
+Remove custom keyring volume/mount and obsolete environment overrides, but retain
+projected service tokens, controller CA trust, node-local identities, slabs, and
+sockets. Rollback to an old dataplane also requires restoring its old keyring
+projection; do not delete or recreate durable credential state to roll back.
+
+Bootstrap/recovery fetches the 512 KiB-bounded bundle using a live-authorized bearer
+token. Steady-state mTLS keyring and topology long polls run independently; a
+control outage retains accepted state but cannot deliver new keys or peer roots.
+Lagging nodes can fail operations requiring missing keys during rotation.
 
 The control protocol requires a live bound Pod token from the authorized
 dataplane ServiceAccount/workload on its assigned Node. Keep token projection
 rotation working for enrollment and renewal; do not bake a token into the
 image. Node UID, shares, and rails come from authenticated enrollment/membership.
-`RACER_NODE_UID`, `RACER_NODE_ID`, `RACER_SHARES`, `RACER_RAILS`, and
-`RACER_ALIGNED_RAILS` are rejected even when empty (`src/config.rs:70-80`).
+`RACER_NODE_UID`, `RACER_NODE_ID`, `RACER_RAILS`, and `RACER_ALIGNED_RAILS`
+are rejected even when empty. `RACER_SHARES` is an authenticated enrollment
+proposal, not an independent membership override.
 
 ### Client and origin sockets
 

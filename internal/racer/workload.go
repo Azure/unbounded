@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// DesiredDaemonSet declares the token audience, common keyring/trust projection,
+// DesiredDaemonSet declares the token audience, controller trust projection,
 // node-private identity and slab storage, socket mounts, and exclusion affinity.
 // It must never introduce a per-node Secret or trust a node-name as a Node UID.
 // This pure builder is consumed by the operator, never by controller startup.
@@ -64,19 +64,6 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 							ExpirationSeconds: ptr.To(int64(3600)),
 							Path:              "token",
 						},
-					}},
-				},
-			},
-		},
-		{
-			Name: "keyring",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  c.KeyringSecretName,
-					DefaultMode: ptr.To(int32(0o400)),
-					Items: []corev1.KeyToPath{{
-						Key:  "bundle.json",
-						Path: "bundle.json",
 					}},
 				},
 			},
@@ -172,10 +159,6 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 								Name:  "RACER_SERVICE_ACCOUNT_TOKEN",
 								Value: "/var/run/racer-token/token",
 							},
-							{
-								Name:  "RACER_SECRET_DIRECTORY",
-								Value: "/etc/racer/keyring",
-							},
 							// Kubelet creates the hostPath mount with mode 0755. Let the
 							// dataplane create its private 0700 directory beneath it.
 							{
@@ -223,11 +206,6 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 							{
 								Name:      "token",
 								MountPath: "/var/run/racer-token",
-								ReadOnly:  true,
-							},
-							{
-								Name:      "keyring",
-								MountPath: "/etc/racer/keyring",
 								ReadOnly:  true,
 							},
 							{

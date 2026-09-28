@@ -43,17 +43,19 @@ Authenticated enrollment proposes `RACER_SHARES` (default four). The controller
 records the proposal; an explicit Node shares annotation wins. Local configuration
 never independently changes the topology used for placement.
 
-## Two HTTPS operations
+## Three HTTPS operations
 
 | Operation | Authentication and result |
 | --- | --- |
 | `POST /v1/bootstrap` | Server-authenticated TLS plus bearer service-account token; returns 200 with the node certificate chain and resolved Node UID |
 | `GET /v1/snapshot?after=<sequence>` | mTLS; returns 200 with the newest publication or negotiated delta, or 204 after a 30-second wait |
+| `GET /v1/keyring?after=<generation>` | mTLS in steady state; server-authenticated TLS plus a live-authorized `racer-control` bearer token for bootstrap/recovery; returns the current bounded JSON bundle |
 
 JSON uses snake_case fields, decimal strings for u64 counters, and padded standard
 base64 for bytes. UUIDs use canonical lowercase hyphenated text. DER encodes CSRs
 and certificates. Missing `after` requests the current snapshot immediately.
-Only one poll is outstanding per node. Enrollment bodies, publications, and bundles
+Only one poll per route is outstanding per node. Snapshot and keyring polls have
+independent cursors, admission, and progress loops. Enrollment bodies, publications, and bundles
 carry `schema_version: 1`. Reject unknown versions, duplicate JSON fields/identities,
 invalid values, and unknown enum variants; ignore unknown object fields.
 Limits: bootstrap request/response 64 KiB, shared keyring bundle 512 KiB, publication
@@ -115,7 +117,7 @@ sequence/hash, member upserts/removals, and cache definitions. A missing base,
 restart, or skipped generation falls back to a full snapshot. Receivers validate
 the reconstructed canonical hash before installation. The 4 MiB delta cap does not
 replace the full publication cap. TLS connections are reused within an unchanged
-trust/identity epoch. Credential renewal and secret reload remain independent of
+trust/identity epoch. Credential renewal and keyring delivery remain independent of
 pending publication installation.
 
 Canonical content uses compact UTF-8 JSON, with no whitespace or trailing newline.
@@ -171,7 +173,9 @@ controller-installed validated trust. Both TLS handshakes and snapshot requests
 use local trust with zero Kubernetes calls. Recheck the chain, identity, and
 validity before and after every poll, including pooled connections, and bound
 polls and writes by certificate expiration. Kubernetes Node/Pod/DaemonSet/ServiceAccount
-authorization is required only at enrollment and renewal. Deletion, recreation,
+authorization is required at enrollment, renewal, and bearer-authenticated keyring
+bootstrap/recovery. Steady-state keyring mTLS uses the same local authorization
+as snapshot polling. Deletion, recreation,
 exclusion, and membership removal do not revoke an issued certificate: membership
 is routing, not authorization. Any authenticated same-cluster node may connect.
 Controller reconciliation installs trust updates and withdraws trust after observed
@@ -183,16 +187,35 @@ TLS authenticates responses. Peer HTTP uses separate certificate-authenticated v
 connection sessions with signed, strictly ordered immediate-hop heads. It adds no
 payload TLS encryption; see `designs/racer-peer-security.md`.
 
-## Shared projected keyring
+## Shared keyring over control HTTPS
 
-One common Secret carries bundle.json for all dataplanes. It contains schema/cluster
+The controller retains one durable common Secret containing `bundle.json`; it is
+not mounted into dataplane Pods. `GET /v1/keyring` returns that existing JSON wire
+bundle, bounded to 512 KiB, never issuer private material or rotation metadata.
+Without `after`, return the current bundle immediately with 200. An optional
+`after` is a positive canonical decimal generation (no zero, sign, whitespace,
+leading zero, or duplicate/unknown query parameters). A lower generation returns
+the newest bundle with 200; equal waits up to 30 seconds and returns 204 if unchanged;
+a future generation returns 409. This is a full replacement, not a delta.
+
+Before enrollment and during expired-identity recovery, fetch using the projected
+`racer-control` bearer token over server-authenticated HTTPS without a client
+certificate. TokenReview and live bound Pod, ServiceAccount, DaemonSet, and Node
+checks authorize access; a raw JWT claim is not authority. Install validated peer
+trust from the fetched bundle before accepting a newly issued identity. Once a
+valid identity is active, use mTLS for keyring polling. Keep topology polling,
+keyring polling, and renewal independent so an unchanged topology cannot block
+rotation. Retry delivery failures with bounded jittered backoff while retaining
+the last accepted bundle; never fall back to a keyring file or log response bodies.
+
+The bundle contains schema/cluster
 identity, increasing generation, peer trust roots, and
 cache-scoped keys (`prepared`, `active`, `retiring`). Keys carry IDs, purposes
 (`page`, `origin_credentials`), and 32-byte material. Exactly one active key per
 cache/purpose is allowed. Node certificates and private keys are never in this
 bundle; local signing identity rotates independently. Prepared keys can
 decrypt received ciphertext but cannot encrypt new fills. Peer trust updates do
-not replace deployment bootstrap trust. Read one coherent projected generation;
+not replace deployment bootstrap trust. Accept one complete validated response;
 malformed updates retain the last valid bundle. Reject generation rollback or
 conflicting replay; equal generation with identical content is idempotent.
 

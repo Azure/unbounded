@@ -37,7 +37,6 @@ consumes host disk capacity and is not accounted as a pod ephemeral-storage quot
 | `RACER_DIAGNOSTICS_LISTEN` | `127.0.0.1:9090` | Numeric local IP:port, loopback by default; brackets accepted for either IP family |
 | `RACER_TRUST_BUNDLE` | `/etc/racer/trust/ca.crt` | Deployment bootstrap/server CA file |
 | `RACER_SERVICE_ACCOUNT_TOKEN` | `/var/run/secrets/racer-control/token` | Projected token file with audience `racer-control` |
-| `RACER_SECRET_DIRECTORY` | `/etc/racer/keys` | Projected common keyring directory containing `bundle.json` |
 | `RACER_IDENTITY_DIRECTORY` | `/var/lib/racer/identity` | Node-private persistent signing identity directory |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Persistent encrypted slab/checkpoint directory |
 
@@ -64,15 +63,20 @@ templates; ordinary IPv4 and bracketed IPv6 retain
 their existing syntax and validation. The dataplane does not expand environment
 references itself. `RACER_POD_IP` supplies only the bind address, never Node identity.
 
-All five paths must be absolute, non-root, canonical lexical paths: no empty,
+All four paths must be absolute, non-root, canonical lexical paths: no empty,
 `.` or `..` components, repeated/trailing slashes, controls, components exceeding
 255 bytes, or paths exceeding 4095 bytes. None may equal, contain, or be contained
 by another configured path. Shared parents are fine. Validation does not resolve
 symlinks, inspect mounts, read trust/tokens, check permissions, or create paths.
 Filesystem owners must enforce file type, ownership, permissions, and actual
 separation at open time while supporting Kubernetes projection symlinks for
-read-only trust/token/keyring inputs. Private identities must stay separate from
-projected Secrets and slabs.
+read-only trust/token inputs. Private identities must stay separate from
+projected trust/tokens and slabs. Shared cache keys and peer trust roots are fetched
+from `GET /v1/keyring` over control HTTPS, not a mounted Secret or local directory.
+Remove obsolete `RACER_SECRET_DIRECTORY` settings and keyring volume overrides.
+Keep the projected service token, controller CA trust, and node-local identity,
+slab, and socket mounts. The controller's `RACER_KEYRING_SECRET_NAME` still names
+its durable Secret and is not a dataplane setting.
 
 There is no Node identity override. `from_env` sets `config.node` to
 `NodeId(UNRESOLVED_NODE_ID.into())`, where `UNRESOLVED_NODE_ID` is the empty string.

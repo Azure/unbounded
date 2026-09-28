@@ -421,9 +421,11 @@ in the implementation test environment.
    consume a segment lease alongside the aligned buffer. Cancellation requests do
    not release those resources before the corresponding completion fences.
 - `control` publishes immutable accepted snapshots and coherent key bundles.
-  Bootstrap returns the local node certificate directly; common Secret bundles
-  contain only peer trust and cache keys. Token-authenticated bootstrap also renews
-  certificates; subsequent snapshot polls use mTLS, not control HTTP signatures.
+  Bootstrap returns the local node certificate directly; `/v1/keyring` delivers
+  peer trust and cache keys over HTTPS, without a dataplane Secret mount.
+  Token-authenticated bootstrap also renews certificates; keyring bootstrap/recovery
+  uses a live-authorized bearer token. Independent steady-state snapshot and keyring
+  polls use mTLS, not control HTTP signatures.
   One selected worker owns control enrollment; worker handles share node-wide
    snapshot and key-epoch roots. Bounded dispatch routes work to page owners.
 - Live retirement closes new admission for the affected cache/key. Accepted work

@@ -25,7 +25,6 @@ type WorkloadConfig struct {
 	PeerPort                uint16
 	DataplaneServiceAccount string
 	DaemonSetName           string
-	KeyringSecretName       string
 }
 
 // WorkloadConfigFromLookup reads operator deployment wiring without loading or
@@ -53,7 +52,6 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 		PeerPort:                uint16(port),
 		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
-		KeyringSecretName:       env("RACER_KEYRING_SECRET_NAME", "racer-keyring"),
 	}
 
 	return cfg, cfg.Validate()
@@ -64,7 +62,7 @@ func (c WorkloadConfig) Validate() error {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}
 
-	for _, name := range []string{c.DaemonSetName, c.KeyringSecretName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {
+	for _, name := range []string{c.DaemonSetName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {
 		if len(validation.IsDNS1123Subdomain(name)) != 0 {
 			return fmt.Errorf("resource name: %w", wire.InvalidRequest)
 		}

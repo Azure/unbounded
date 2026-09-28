@@ -41,7 +41,7 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
   active, prepared, and all retiring generations. No acknowledgments.
 - The operator Racer component owns the Deployment and DaemonSet, configuration,
   and deployment wiring. The pure `DesiredDaemonSet` builder retains projected
-  racer-control tokens, common keyring/bootstrap trust, private identity storage,
+   racer-control tokens, controller bootstrap trust, private identity storage,
   slabs, sockets, and exclusion affinity. No workload reconciler is registered by
   the Racer manager; startup does not build a DaemonSet. ClusterCache activates
   provisioning independently of Sites; zero caches retain the installation.
@@ -55,7 +55,8 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
   issuer/keyring Secrets. Named RBAC restricts updates; fail-closed admission
   restricts creates. Policy and binding are explicit prerequisites of workload
   enablement. Enrollment retains live Node/Pod/SA/DaemonSet reads; snapshot
-  authentication uses local validated trust. Existing selectors are retained for
+  and steady-state keyring authentication use local validated trust. Bearer keyring
+  bootstrap/recovery retains live authorization. Existing selectors are retained for
   in-place adoption, despite the legacy managed-by label.
 
 The server is a leader-election runnable. Readiness requires synchronized inputs,
@@ -205,7 +206,7 @@ their keys commit.
 
 ## Authentication
 
-Two HTTPS endpoints only:
+Three HTTPS endpoints only:
 
 1. POST /v1/bootstrap: projected bearer token, audience racer-control, CSR proof
    of possession, TokenReview plus live bound Pod/ServiceAccount/workload/Node
@@ -213,7 +214,15 @@ Two HTTPS endpoints only:
    Return a public leaf-first certificate chain directly. Retry correlation IDs
    do not create persistent enrollment records.
 2. GET /v1/snapshot: mTLS with node identity in its URI SAN. Verify chain, cluster,
-   usage, validity, and authorization on every request. Limit each node to one poll.
+    usage, validity, and authorization on every request. Limit each node to one poll.
+3. GET /v1/keyring: the existing bounded 512 KiB JSON bundle over HTTPS, using
+   bearer TokenReview plus live workload/Node authorization for bootstrap/recovery
+   and mTLS for steady state. No `after` returns immediate 200; a canonical positive
+   generation cursor returns newer state with 200, waits up to 30 seconds then
+   returns 204 when unchanged, and returns 409 for a future generation. Keyring and
+   topology have independent per-node poll admission, cursors, and client loops.
+   The controller serves only validated committed bundle state; issuer private
+   material and rotation metadata never enter this response.
 
 The listener verifies client certificates when provided; the snapshot handler
 requires them. Renewal at 16 hours and recovery both reuse bootstrap with a fresh
@@ -450,7 +459,7 @@ deployment integration check and is not exercised by envtest.
   verifies the presented chain against controller-installed local trust on every
   request. It checks current chain validity, Ed25519/digital-signature/client-auth
   usage, and one exact cluster/Node URI. Kubernetes authorization is confined to
-  enrollment and renewal. Issued identities remain valid after Node/workload
+   enrollment, renewal, and bearer keyring bootstrap/recovery. Issued identities remain valid after Node/workload
   deletion, recreation, or exclusion until certificate expiration or trust removal.
   Membership is routing, not authorization. The Rust client
   reauthenticates its projected token on every startup before constructing or
@@ -473,13 +482,14 @@ deployment integration check and is not exercised by envtest.
   disables session tickets. Bootstrap recovery omits an expired certificate.
   HTTPS server certificate files are loaded at startup; deployment certificate
   replacement requires a controller restart. Peer root rotation remains live.
-- Only exact POST `/v1/bootstrap` and GET `/v1/snapshot` routes are admitted.
+- Only exact POST `/v1/bootstrap`, GET `/v1/snapshot`, and GET `/v1/keyring` routes are admitted.
   Alternate methods/paths, encoded path aliases, unknown/duplicate/noncanonical
   query parameters, snapshot bodies, and bootstrap media/encoding mismatches fail
   with protocol errors. No ServeMux redirects or implicit HEAD endpoint exists.
   Errors contain only bounded wire codes; 429/503 include `Retry-After: 1`.
-- `Server` is the sole poll admission owner, holding one slot per Node and a global
-  poll bound through response write and flush, including errors and cancellation.
+- `Server` is the sole poll admission owner, holding one slot per Node per route
+  and bounded global route admission through response write and flush, including
+  errors and cancellation. Keyring delivery cannot occupy a node's topology slot.
   `Publications.Wait` validates identities/cursors and shares the current immutable
   publication and broadcast notification without tracking admission. Handshake trust
   selection and local certificate verification share bounded authentication slots.
@@ -541,8 +551,8 @@ Projection requires a kubelet and remains deployment verification.
   workload write path or mutation grant.
 - The managed service account has no API RBAC binding and automatic token mounting
   is disabled. A dedicated projected token has audience `racer-control`, one-hour
-  requested lifetime, and mode 0400. The common Secret exposes only `bundle.json`
-  at `/etc/racer/keyring`; the issuer Secret is never mounted. Deployment server
+   requested lifetime, and mode 0400. Neither common keyring nor issuer Secret is
+   mounted into the dataplane. Shared keys and peer roots arrive over control HTTPS. Deployment server
   trust is a distinct ConfigMap mounted at `/etc/racer/bootstrap/ca.crt`.
   Projection mounts use directories without subPath so kubelet rotation is visible.
 - Node-local host directories are `/var/lib/racer/identity` (identity persistence),
@@ -554,7 +564,7 @@ Projection requires a kubelet and remains deployment verification.
   its value. The pod uses the supplied image's default entrypoint; no unsupported
   `control` subcommand is injected. The generated environment uses the existing
   client's `RACER_CONTROL_ENDPOINT`, `RACER_PEER_LISTEN`, `RACER_TRUST_BUNDLE`,
-  `RACER_SERVICE_ACCOUNT_TOKEN`, and `RACER_SECRET_DIRECTORY` settings, with
+   and `RACER_SERVICE_ACCOUNT_TOKEN` settings, with
   explicit identity/slab directories. The deployment's `RACER_CONTROL_URL` and
   shared `RACER_PEER_PORT` settings are translated when building the DaemonSet.
 - Existing manifests provide three controller replicas, leader-readiness Service
@@ -581,6 +591,14 @@ Projection requires a kubelet and remains deployment verification.
   same namespace, cluster UUID, and image settings used by `make racer-manifests`.
   ConfigMap environment changes and serving certificate replacement require a
   controller rollout; bootstrap trust remains a live projected directory.
+
+Upgrade the controller first and verify the ready leader supports `/v1/keyring`
+before rolling out the new dataplane/mount contract. Preserve durable issuer and
+keyring Secrets, controller `RACER_KEYRING_SECRET_NAME`, and controller serving
+certificate/private-key mounts. Remove dataplane keyring volumes and
+`RACER_SECRET_DIRECTORY`, including custom overrides; retain tokens, controller
+CA trust, identities, slabs, and sockets. An old controller cannot bootstrap the
+new dataplane. An old-dataplane rollback also needs its old projection restored.
 
 Phase 6 retains direct builder/projection/storage/affinity tests. Workload repair,
 API defaults, ownership, conflicts, and cancellation are tested through the

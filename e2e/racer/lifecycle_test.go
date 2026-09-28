@@ -281,8 +281,8 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	newUID := strings.TrimSpace(h.kubectl("get", "clustercache", "gantry", "-o", "jsonpath={.metadata.uid}"))
 	require.NotEmpty(h.t, newUID)
 	require.NotEqual(h.t, oldUID, newUID)
-	// Catalog publication and kubelet's Secret projection are independent. Wait
-	// for keys for the new UID, then nudge ordinary projection sync as rotation does.
+	// Catalog and keyring HTTPS delivery are independent. Wait for the controller
+	// to commit keys for the new UID and for both live keyring loops to install them.
 	var generation wire.Generation
 
 	require.Eventually(h.t, func() bool {
@@ -298,7 +298,6 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	}, 10*time.Second, time.Second, "controller did not publish replacement cache keys")
 
 	for _, node := range nodes {
-		h.kubectl("annotate", "pod", node.pod, "-n", namespace, "e2e.racer/cache-generation="+fmt.Sprint(generation), "--overwrite")
 		h.awaitRotationGeneration(h.racerDiagnostics(node.pod), generation, "replacement-"+node.name)
 	}
 

@@ -29,13 +29,13 @@ func TestWorkloadConfigIdentityAndNames(t *testing.T) {
 		})
 	}
 
-	for _, name := range []string{"daemonset", "keyring", "trust", "serviceaccount"} {
+	for _, name := range []string{"daemonset", "trust", "serviceaccount"} {
 		t.Run(name, func(t *testing.T) {
 			for _, value := range []string{"", "../name", "Uppercase", strings.Repeat("a", 254)} {
 				cfg := workloadConfig(t)
 				fields := map[string]*string{
-					"daemonset": &cfg.DaemonSetName, "keyring": &cfg.KeyringSecretName,
-					"trust": &cfg.BootstrapTrustConfigMap, "serviceaccount": &cfg.DataplaneServiceAccount,
+					"daemonset": &cfg.DaemonSetName,
+					"trust":     &cfg.BootstrapTrustConfigMap, "serviceaccount": &cfg.DataplaneServiceAccount,
 				}
 
 				*fields[name] = value
@@ -64,13 +64,13 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if cfg.Namespace != runtime.Namespace || cfg.PeerPort != runtime.PeerPort || cfg.DaemonSetName != runtime.DaemonSetName || cfg.DataplaneServiceAccount != runtime.DataplaneServiceAccount || cfg.KeyringSecretName != runtime.KeyringSecretName || cfg.BootstrapTrustConfigMap != "racer-bootstrap-trust" {
+	if cfg.Namespace != runtime.Namespace || cfg.PeerPort != runtime.PeerPort || cfg.DaemonSetName != runtime.DaemonSetName || cfg.DataplaneServiceAccount != runtime.DataplaneServiceAccount || cfg.BootstrapTrustConfigMap != "racer-bootstrap-trust" {
 		t.Fatalf("workload defaults disagree with runtime: %+v", cfg)
 	}
 
 	for key, value := range map[string]string{
 		"POD_NAMESPACE": "custom", "RACER_PEER_PORT": "65535", "RACER_DAEMONSET_NAME": "custom.dataplane",
-		"RACER_DATAPLANE_SERVICE_ACCOUNT": "custom.account", "RACER_KEYRING_SECRET_NAME": "custom.keyring",
+		"RACER_DATAPLANE_SERVICE_ACCOUNT": "custom.account",
 		"RACER_BOOTSTRAP_TRUST_CONFIGMAP": "custom.trust",
 	} {
 		values[key] = value
@@ -85,7 +85,7 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 	want := WorkloadConfig{
 		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "custom", PeerPort: 65535,
 		ControlURL: "https://controller:8443", DataplaneImage: "racer:test", DaemonSetName: "custom.dataplane",
-		DataplaneServiceAccount: "custom.account", KeyringSecretName: "custom.keyring", BootstrapTrustConfigMap: "custom.trust",
+		DataplaneServiceAccount: "custom.account", BootstrapTrustConfigMap: "custom.trust",
 	}
 	if err != nil || cfg != want {
 		t.Fatalf("custom lookup: %+v, %v", cfg, err)
@@ -129,7 +129,7 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 		}
 
 		switch key {
-		case "RACER_PEER_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_KEYRING_SECRET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
+		case "RACER_PEER_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
 			return "", false
 		default:
 			t.Errorf("workload parser requested runtime setting %s", key)
@@ -142,5 +142,33 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 
 	if _, err := DesiredDaemonSet(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
+	want := workloadConfig(t)
+	values := map[string]string{
+		"RACER_CLUSTER_ID": string(want.Cluster), "POD_NAMESPACE": want.Namespace,
+		"RACER_CONTROL_URL": want.ControlURL, "RACER_DATAPLANE_IMAGE": want.DataplaneImage,
+		"RACER_KEYRING_SECRET_NAME": "../obsolete",
+	}
+
+	cfg, err := WorkloadConfigFromLookup(func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
+	})
+	if err != nil || cfg != want {
+		t.Fatalf("legacy environment changed workload configuration: %+v, %v", cfg, err)
+	}
+
+	ds, err := DesiredDaemonSet(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		if volume.Secret != nil || volume.Name == "keyring" {
+			t.Fatal("legacy environment must not restore shared key mounts")
+		}
 	}
 }

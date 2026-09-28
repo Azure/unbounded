@@ -28,7 +28,6 @@ func workloadConfig(t *testing.T) WorkloadConfig {
 		ControlURL: "https://racer-controller.racer.svc:8443", DataplaneImage: "racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: 8082,
 		DataplaneServiceAccount: "racer-dataplane", DaemonSetName: "racer-dataplane",
-		KeyringSecretName: "racer-keyring",
 	}
 }
 
@@ -46,7 +45,20 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 	}
 
 	volumes := map[string]corev1.Volume{}
+
 	for _, v := range pod.Volumes {
+		if v.Secret != nil {
+			t.Fatal("dataplane must fetch shared keys over control HTTPS, not mount Secrets")
+		}
+
+		if v.Projected != nil {
+			for _, source := range v.Projected.Sources {
+				if source.Secret != nil {
+					t.Fatal("dataplane must not project Secrets")
+				}
+			}
+		}
+
 		volumes[v.Name] = v
 	}
 
@@ -55,12 +67,16 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 		t.Fatal("wrong token projection")
 	}
 
-	if volumes["keyring"].Secret.SecretName != cfg.KeyringSecretName || len(volumes["keyring"].Secret.Items) != 1 || volumes["keyring"].Secret.Items[0].Key != "bundle.json" {
-		t.Fatal("not a common bounded keyring projection")
+	if _, exists := volumes["keyring"]; exists {
+		t.Fatal("shared keyring volume must not exist")
 	}
 
 	if volumes["bootstrap"].ConfigMap.Name != cfg.BootstrapTrustConfigMap {
 		t.Fatal("bootstrap trust not independent")
+	}
+
+	if !reflect.DeepEqual(volumes["bootstrap"].ConfigMap.Items, []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}}) {
+		t.Fatal("only controller CA trust may be projected as cryptographic material")
 	}
 
 	for _, name := range []string{"identity", "slabs", "sockets"} {
@@ -84,14 +100,27 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 		}
 	}
 
+	mounts := map[string]corev1.VolumeMount{}
 	for _, mount := range pod.Containers[0].VolumeMounts {
+		mounts[mount.Name] = mount
 		if mount.SubPath != "" {
 			t.Fatal("subPath prevents projection rotation")
 		}
 
-		if (mount.Name == "token" || mount.Name == "keyring" || mount.Name == "bootstrap") && !mount.ReadOnly {
+		if (mount.Name == "token" || mount.Name == "bootstrap") && !mount.ReadOnly {
 			t.Fatal("writable credential projection")
 		}
+	}
+
+	wantMounts := map[string]corev1.VolumeMount{
+		"token":     {Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
+		"bootstrap": {Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
+		"identity":  {Name: "identity", MountPath: "/var/lib/racer/identity"},
+		"slabs":     {Name: "slabs", MountPath: "/var/lib/racer/slabs"},
+		"sockets":   {Name: "sockets", MountPath: "/run/racer"},
+	}
+	if !reflect.DeepEqual(mounts, wantMounts) {
+		t.Fatal("mounts must retain token, controller trust, private identity, slabs and sockets only")
 	}
 
 	if len(pod.Containers[0].Args) != 0 || len(pod.Containers[0].Command) != 0 {
@@ -135,7 +164,6 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				"RACER_DIAGNOSTICS_LISTEN":    "[$(RACER_POD_IP)]:" + diagnosticsPort,
 				"RACER_TRUST_BUNDLE":          "/etc/racer/bootstrap/ca.crt",
 				"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
-				"RACER_SECRET_DIRECTORY":      "/etc/racer/keyring",
 				"RACER_IDENTITY_DIRECTORY":    "/var/lib/racer/identity/private",
 				"RACER_SLAB_DIRECTORY":        "/var/lib/racer/slabs",
 			}
@@ -164,7 +192,6 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 			for name, location := range map[string]string{
 				"RACER_TRUST_BUNDLE":          path.Join(mounts["bootstrap"], "ca.crt"),
 				"RACER_SERVICE_ACCOUNT_TOKEN": path.Join(mounts["token"], "token"),
-				"RACER_SECRET_DIRECTORY":      mounts["keyring"],
 				"RACER_IDENTITY_DIRECTORY":    path.Join(mounts["identity"], "private"),
 				"RACER_SLAB_DIRECTORY":        mounts["slabs"],
 			} {

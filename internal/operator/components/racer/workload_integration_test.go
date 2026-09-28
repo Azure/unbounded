@@ -53,6 +53,23 @@ func TestEnvtestDataplaneApply(t *testing.T) {
 	require.True(t, slices.ContainsFunc(ds.ManagedFields, func(entry metav1.ManagedFieldsEntry) bool {
 		return entry.Manager == component.FieldOwner && entry.Operation == metav1.ManagedFieldsOperationApply
 	}))
+	t.Run("remove-legacy-keyring-projection", func(t *testing.T) {
+		legacy := ds.DeepCopy()
+		legacy.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
+		legacy.ResourceVersion, legacy.UID, legacy.ManagedFields = "", "", nil
+		container := &legacy.Spec.Template.Spec.Containers[0]
+		container.Env = append(container.Env, corev1.EnvVar{Name: "RACER_SECRET_DIRECTORY", Value: "/etc/racer/keyring"})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "keyring", MountPath: "/etc/racer/keyring", ReadOnly: true})
+		legacy.Spec.Template.Spec.Volumes = append(legacy.Spec.Template.Spec.Volumes, corev1.Volume{Name: "keyring", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "racer-keyring"}}})
+		// Simulate the previous operator owning these fields, so real SSA must
+		// remove them rather than preserve administrator-owned additions.
+		require.NoError(t, env.ApplyObject(t.Context(), legacy))
+		persist(t, env, planPass(t, env))
+		require.NoError(t, env.Client.Get(t.Context(), key, ds))
+		require.Equal(t, uid, ds.UID)
+		require.Equal(t, selector, ds.Spec.Selector)
+		require.Equal(t, want.Template.Spec, ds.Spec.Template.Spec)
+	})
 
 	for _, scenario := range []string{"upgrade", "repair", "missing-label"} {
 		t.Run(scenario, func(t *testing.T) {

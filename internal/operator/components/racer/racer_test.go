@@ -187,6 +187,31 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	require.Equal(t, env.Config.Image("racer-dataplane"), ds.Spec.Template.Spec.Containers[0].Image)
 	require.Contains(t, ds.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "RACER_CONTROL_ENDPOINT", Value: "https://racer-controller.custom-system.svc:8443"})
 
+	for _, variable := range ds.Spec.Template.Spec.Containers[0].Env {
+		require.NotEqual(t, "RACER_SECRET_DIRECTORY", variable.Name)
+	}
+
+	volumes := map[string]corev1.Volume{}
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		require.Nil(t, volume.Secret, "dataplane must not mount shared keys")
+
+		volumes[volume.Name] = volume
+		if volume.Projected != nil {
+			for _, source := range volume.Projected.Sources {
+				require.Nil(t, source.Secret)
+			}
+		}
+	}
+
+	require.NotContains(t, volumes, "keyring")
+	require.Equal(t, "racer-control", volumes["token"].Projected.Sources[0].ServiceAccountToken.Audience)
+	require.Equal(t, trustName, volumes["bootstrap"].ConfigMap.Name)
+
+	for _, name := range []string{"identity", "slabs", "sockets"} {
+		require.NotNil(t, volumes[name].HostPath)
+	}
+
 	for _, name := range []string{"racer-issuer", "racer-keyring"} {
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, name), &corev1.Secret{}))
 	}

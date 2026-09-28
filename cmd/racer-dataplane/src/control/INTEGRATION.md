@@ -6,7 +6,8 @@ The worker must poll both the control future and `Reactor::poll_budgeted`.
 No production executor, thread, blocking DNS lookup, or synchronous socket wait is
 created by control. Serving file opens, metadata, reads, writes, fsync, rename, and
 unlink use completion-owned io_uring SQEs with `IOSQE_ASYNC`. `attach_io` propagates
-`ControlIo::reactor()` to enrollment and SecretWatcher. Legacy synchronous methods
+`ControlIo::reactor()` to enrollment. Shared keyrings are network responses, not
+filesystem projections. Legacy synchronous methods
 are for explicit pre-worker provisioning/tests only and reject use after reactor
 attachment. The serving `start/progress` path uses only async filesystem methods.
 
@@ -26,19 +27,21 @@ previous transaction before reusing staging names, including a late rename after
 future abandonment. Activation follows write completion, file fsync, rename,
 directory fsync, pending unlink, and directory fsync. Recovery validates committed
 state and reestablishes the directory durability fence before reuse. Failure never
-advances the publication cursor. Projection reads pin `..data` using one `openat2`
-with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`, then read only relative to that FD.
+advances the publication cursor. Controller trust and service-account tokens still
+use bounded projected-file readers; node-private persistence is unchanged.
 
 Direct application startup must attach the reactor to `Enrollment` and use
 `prepare(scope)`, `read_token_async(scope)`, `load_identity_async(scope)`, and
-`accept_response_async(response, scope)`. SecretWatcher provides
-`attach_reactor`, `read_bundle_async(scope)`, and `reload_async(scope)`.
+`accept_response_async(response, scope)`. `BundleInstaller` validates complete
+network bundles and installs key epochs without a filesystem reader.
 `bind_keyring/activate_identity` perform no filesystem work, consuming the bundle
-staged by async startup. These APIs preserve authenticated NodeId resolution.
+staged by the initial HTTPS fetch. These APIs preserve authenticated NodeId resolution.
 
 ## Identity and lifecycle
 
-1. `ControlClient::start(scope)` reads the coherent projected trust bundle, recovers
+1. `ControlClient::start(scope)` fetches `/v1/keyring` over controller-authenticated
+   HTTPS using a freshly read projected bearer token, validates the bounded bundle
+   and stages its peer roots. It recovers
    interrupted identity persistence, and always performs server-authenticated token
    enrollment before returning `LocalSigningIdentity`. A valid disk certificate
    does not prove the current Kubernetes Node binding. Startup requires the control
@@ -50,12 +53,19 @@ staged by async startup. These APIs preserve authenticated NodeId resolution.
    `bind_keyring(keys)` installs the bundle and signing identity into a node-bound
    view of the shared epochs. If the original keyring already has the authenticated
    node, `activate_identity()` performs the installation instead.
-3. Drive `progress(scope)` serially. It returns immutable snapshot leases and
-   cache events, polls with mTLS, renews with token authentication, reloads bundles,
-   and applies bounded jittered retries. Inspect `projection_error()` and
-   `renewal_error()` for last reload/renewal failure. Call `next_attempt()` after
+3. Drive `progress(scope)` serially alongside the independent
+   `keyring_progress(scope)` loop. The topology loop returns immutable snapshot
+   leases and cache events, polls with mTLS, and renews with token authentication.
+   The keyring loop uses its own connection, generation cursor, and bounded
+   jittered retry state; an unchanged topology long poll or pending local snapshot
+   installation must not block key rotation. Keyring steady state uses mTLS;
+   bootstrap/expired-identity recovery uses a live-authorized bearer token without
+   presenting an expired certificate. Inspect `projection_error()` (the retained
+   accessor name now reports keyring delivery/installation failures) and
+   `renewal_error()` for last keyring/renewal failure. Call `next_attempt()` after
    an error. `run(scope)` is an optional loop for an already bound graph with a
-   cache lifecycle adapter; it does not create an executor.
+   cache lifecycle adapter; it does not create an executor. An embedding owner
+   must also drive independent keyring progress.
    During worker startup, poll local cache preparation alongside `progress` and
    check the committed snapshot after each poll of that future. A prepared first
    snapshot can commit while `progress` is still awaiting the next long-poll
@@ -144,13 +154,21 @@ in-flight state.
 ## Transport boundaries
 
 Production uses rustls server-name/chain validation, optional client identity,
-disabled resumption, and one HTTP request per TLS connection. Header/body limits,
+disabled resumption, and independent topology/keyring transports. Header/body limits,
 strict framing, duplicate header rejection, chunked decoding, deadline/cancellation,
 and certificate expiry bound connections. Retry-After accepts decimal seconds and
 IMF-fixdate. The DNS adapter honors nameservers/search/ndots in resolv.conf and
 performs bounded A/AAAA UDP queries. Truncated responses fail closed; TCP DNS,
 NSS/hosts-file policy, HTTP proxies, HTTP/2, chunk extensions/trailers, and legacy
 HTTP-date variants are not implemented.
+
+`GET /v1/keyring` has a 512 KiB body cap and returns the existing JSON bundle.
+No cursor returns immediate 200; a canonical positive `after` generation returns
+200 if newer, waits up to 30 seconds then returns 204 if unchanged, and returns
+409 if ahead of the controller. Validate cluster, schema, roots, key scopes,
+generation and replay consistency before advancing the accepted cursor. Malformed
+or failed delivery retains the prior accepted keyring; there is no filesystem
+fallback. Response bodies, bearer tokens and key material must never enter logs.
 
 ## Verification and cross-owner constraints
 

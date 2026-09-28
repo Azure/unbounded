@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -105,8 +106,7 @@ const rotationAuthorization = "Bearer racer-e2e-public-rotation-fixture"
 func (h *harness) rotationState() (wire.KeyringBundle, racer.RotationState, corev1.Secret) {
 	h.t.Helper()
 
-	var secret corev1.Secret
-	require.NoError(h.t, json.Unmarshal([]byte(h.kubectl("get", "secret/racer-keyring", "-n", namespace, "-o", "json")), &secret))
+	secret := h.rotationSecret("racer-keyring")
 	bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	require.NoError(h.t, err)
 
@@ -114,6 +114,22 @@ func (h *harness) rotationState() (wire.KeyringBundle, racer.RotationState, core
 	require.NoError(h.t, json.Unmarshal(secret.Data["rotation.json"], &state))
 
 	return bundle, state, secret
+}
+
+// Never pass Secret JSON through command(), which logs stdout on failure.
+func (h *harness) rotationSecret(name string) corev1.Secret {
+	h.t.Helper()
+
+	ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+	defer cancel()
+
+	raw, err := exec.CommandContext(ctx, "kubectl", "--kubeconfig", h.kubeconfig, "--request-timeout=10s", "get", "secret/"+name, "-n", namespace, "-o", "json").Output()
+	require.NoError(h.t, err, "read rotation state without logging secret material")
+
+	var secret corev1.Secret
+	require.NoError(h.t, json.Unmarshal(raw, &secret))
+
+	return secret
 }
 
 func (h *harness) awaitRotationGeneration(endpoint string, generation wire.Generation, phase string) {
@@ -126,10 +142,10 @@ func (h *harness) awaitRotationGeneration(endpoint string, generation wire.Gener
 	}, 45*time.Second, time.Second, "%s: Rust did not install generation %d", phase, generation)
 }
 
-// Pin a copy of a genuine kubelet projection in only this pod's mount namespace.
-// Kubelet, token refresh, control polling, and the underlying Secret volume keep
-// progressing. Unmount exposes the newest real Kubernetes projection again.
-func (h *harness) holdKeyringProjection(node peerNode, expected wire.KeyringBundle) func() {
+// Interrupt control HTTPS only in the delayed reader's network namespace. Block
+// replies too, so a previously established long poll cannot deliver activation.
+// Peer traffic, diagnostics, token projection, identity and storage stay intact.
+func (h *harness) holdControlDelivery(node peerNode) func() {
 	h.t.Helper()
 	id := strings.TrimPrefix(strings.TrimSpace(h.kubectl("get", "pod", node.pod, "-n", namespace, "-o", "jsonpath={.status.containerStatuses[0].containerID}")), "containerd://")
 
@@ -140,69 +156,125 @@ func (h *harness) holdKeyringProjection(node peerNode, expected wire.KeyringBund
 	}
 	require.NoError(h.t, json.Unmarshal([]byte(h.run("docker", "exec", node.name, "crictl", "inspect", id)), &inspected))
 	require.Positive(h.t, inspected.Info.PID)
-	base := []string{"exec", node.name, "nsenter", "-t", fmt.Sprint(inspected.Info.PID), "-m", "--root", "--"}
-	held := false
+	base := []string{"exec", node.name, "nsenter", "-t", fmt.Sprint(inspected.Info.PID), "-n", "--", "iptables"}
+	port := strings.TrimSpace(h.kubectl("get", "service/racer-controller", "-n", namespace, "-o", "jsonpath={.spec.ports[0].port}"))
+	require.Equal(h.t, "8443", port, "outage rules assume the deployed control HTTPS port")
 
-	const copyRoot = "/var/lib/racer/identity/e2e-projection"
+	rules := controlDeliveryRules()
 
+	var installed [][]string
+
+	command := func(operation string, rule []string) []string {
+		return append(append(append([]string{}, base...), operation), rule...)
+	}
 	release := func() {
-		if held {
-			h.command(context.Background(), "docker", append(base, "umount", "/etc/racer/keyring")...)
+		var err error
 
-			held = false
+		installed, err = removeControlDeliveryRules(installed, func(rule []string) ([]byte, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			return exec.CommandContext(ctx, "docker", command("-D", rule)...).CombinedOutput()
+		})
+		if err != nil {
+			h.t.Errorf("release control delivery interruption: %v", err)
 		}
-
-		h.command(context.Background(), "docker", append(base, "rm", "-rf", copyRoot)...)
 	}
 	h.t.Cleanup(release)
-	// Output contains key material and must never pass through harness.command,
-	// whose failure diagnostics include stdout. Decode/compare only in memory.
-	readBundle := func(path string) (wire.KeyringBundle, bool) {
-		ctx, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-		defer cancel()
 
-		raw, err := exec.CommandContext(ctx, "docker", append(base, "cat", path+"/bundle.json")...).Output()
-		if err != nil {
-			return wire.KeyringBundle{}, false
-		}
-
-		bundle, err := wire.DecodeBundle(bytes.NewReader(raw))
-
-		return bundle, err == nil
+	for _, rule := range rules {
+		h.run("docker", command("-I", rule)...)
+		installed = append(installed, rule)
+		h.run("docker", command("-C", rule)...)
 	}
-	equal := func(bundle wire.KeyringBundle) bool {
-		got, err := wire.EncodeBundle(bundle)
-		want, wantErr := wire.EncodeBundle(expected)
-
-		return err == nil && wantErr == nil && bytes.Equal(got, want)
-	}
-
-	require.Eventually(h.t, func() bool {
-		before, ok := readBundle("/etc/racer/keyring")
-		if !ok || !equal(before) {
-			return false
-		}
-
-		ctx, cancel := context.WithTimeout(h.ctx, 3*time.Second)
-		defer cancel()
-		// Keep a private parent: cp -a may restore the source directory's mode.
-		script := "umask 077; rm -rf " + copyRoot + "; mkdir -m 700 " + copyRoot + "; mkdir " + copyRoot + "/bundle; cp -a /etc/racer/keyring/. " + copyRoot + "/bundle/"
-		if exec.CommandContext(ctx, "docker", append(base, "sh", "-ec", script)...).Run() != nil {
-			return false
-		}
-
-		copied, ok := readBundle(copyRoot + "/bundle")
-		after, afterOK := readBundle("/etc/racer/keyring")
-
-		return ok && afterOK && equal(copied) && equal(after)
-	}, 8*time.Second, 200*time.Millisecond, "could not capture coherent prepared projection")
-	h.run("docker", append(base, "mount", "--bind", copyRoot+"/bundle", "/etc/racer/keyring")...)
-
-	held = true
-	installed, ok := readBundle("/etc/racer/keyring")
-	require.True(h.t, ok && equal(installed), "mounted projection differs from validated prepared bundle")
 
 	return release
+}
+
+// Try every installed rule even after a failure. Retain failures so the registered
+// cleanup can retry them after an explicit release, without re-removing successes.
+func removeControlDeliveryRules(installed [][]string, remove func([]string) ([]byte, error)) ([][]string, error) {
+	var (
+		remaining [][]string
+		failures  []error
+	)
+
+	for i := len(installed) - 1; i >= 0; i-- {
+		rule := installed[i]
+
+		output, err := remove(rule)
+		if err == nil || strings.Contains(string(output), "Bad rule (does a matching rule exist in that chain?).") {
+			continue
+		}
+
+		remaining = append(remaining, rule)
+		failures = append(failures, fmt.Errorf("remove %s rule: %w: %s", rule[0], err, output))
+	}
+
+	return remaining, errors.Join(failures...)
+}
+
+func TestRemoveControlDeliveryRules(t *testing.T) {
+	for _, scenario := range []string{"success", "output-failure", "both-fail", "already-absent"} {
+		t.Run(scenario, func(t *testing.T) {
+			var attempted []string
+
+			failure := errors.New("delete failed")
+			remaining, err := removeControlDeliveryRules(controlDeliveryRules(), func(rule []string) ([]byte, error) {
+				attempted = append(attempted, rule[0])
+				switch {
+				case scenario == "already-absent":
+					return []byte("iptables: Bad rule (does a matching rule exist in that chain?)."), failure
+				case scenario == "both-fail", scenario == "output-failure" && rule[0] == "OUTPUT":
+					return []byte("permission denied"), failure
+				default:
+					return nil, nil
+				}
+			})
+
+			require.Equal(t, []string{"OUTPUT", "INPUT"}, attempted, "a failed OUTPUT deletion must not suppress INPUT cleanup")
+
+			if scenario == "output-failure" || scenario == "both-fail" {
+				require.ErrorIs(t, err, failure)
+				require.Contains(t, err.Error(), "OUTPUT")
+
+				if scenario == "both-fail" {
+					require.Len(t, remaining, 2)
+					require.Contains(t, err.Error(), "INPUT")
+				} else {
+					require.Equal(t, [][]string{controlDeliveryRules()[1]}, remaining)
+				}
+			} else {
+				require.NoError(t, err)
+				require.Empty(t, remaining)
+			}
+
+			retried := 0
+			left, err := removeControlDeliveryRules(remaining, func([]string) ([]byte, error) {
+				retried++
+				return nil, nil
+			})
+			require.NoError(t, err)
+			require.Empty(t, left)
+			require.Equal(t, len(remaining), retried)
+		})
+	}
+}
+
+func controlDeliveryRules() [][]string {
+	return [][]string{
+		{"INPUT", "-p", "tcp", "--sport", "8443", "-m", "comment", "--comment", "racer-e2e-control-outage", "-j", "DROP"},
+		{"OUTPUT", "-p", "tcp", "--dport", "8443", "-m", "comment", "--comment", "racer-e2e-control-outage", "-j", "REJECT", "--reject-with", "tcp-reset"},
+	}
+}
+
+func TestControlDeliveryRules(t *testing.T) {
+	rules := controlDeliveryRules()
+	require.Len(t, rules, 2)
+	require.Equal(t, []string{"INPUT", "-p", "tcp", "--sport", "8443"}, rules[0][:5])
+	require.Equal(t, "DROP", rules[0][len(rules[0])-1], "in-flight long-poll replies must be blocked")
+	require.Equal(t, []string{"OUTPUT", "-p", "tcp", "--dport", "8443"}, rules[1][:5])
+	require.Equal(t, "tcp-reset", rules[1][len(rules[1])-1])
 }
 
 func (h *harness) rotationIdentity(node peerNode) wire.BootstrapResponse {
@@ -294,17 +366,13 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 	require.Equal(h.t, len(initial.CacheKeys), preparedKeys)
 
-	for _, node := range nodes {
-		h.kubectl("annotate", "pod", node.pod, "-n", namespace, "e2e.racer/rotation=prepared", "--overwrite")
-	}
-
 	for i := range nodes {
 		h.awaitRotationGeneration(urls[i], prepared.Generation, fmt.Sprintf("prepared-%d", i))
 	}
 
-	require.True(h.t, time.Now().Before(preparedState.ActivateAt), "preparation window exhausted before projection pin")
-	release := h.holdKeyringProjection(nodes[1], prepared)
-	require.True(h.t, time.Now().Before(preparedState.ActivateAt), "projection pin missed preparation window")
+	require.True(h.t, time.Now().Before(preparedState.ActivateAt), "preparation window exhausted before delivery interruption")
+	release := h.holdControlDelivery(nodes[1])
+	require.True(h.t, time.Now().Before(preparedState.ActivateAt), "delivery interruption missed preparation window")
 
 	var (
 		active      wire.KeyringBundle
@@ -335,10 +403,9 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 		require.True(h.t, found, "old opaque key reference lost before retention deadline")
 	}
-	// Nudge kubelet's ordinary projection sync, without touching credential data.
-	h.kubectl("annotate", "pod", nodes[0].pod, "-n", namespace, "e2e.racer/rotation=active", "--overwrite")
+
 	h.awaitRotationGeneration(urls[0], active.Generation, "active-server")
-	require.Equal(h.t, uint64(prepared.Generation), h.peerMetrics(urls[1], "staggered-reader")["racer_keyring_generation"], "delayed projection must actually remain behind")
+	require.Equal(h.t, uint64(prepared.Generation), h.peerMetrics(urls[1], "staggered-reader")["racer_keyring_generation"], "interrupted reader must actually remain behind")
 
 	// Retired-key admission closes immediately. The previously warm server must
 	// refill, rather than misreport an old-key cache hit as rotation success.
@@ -370,9 +437,9 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 	gets, _ = fixture.counts()
 	beforeGets["bytes=16777216-33554431"]++
-	require.Equal(h.t, beforeGets, gets, "staggered projection must fetch only the requested origin page")
+	require.Equal(h.t, beforeGets, gets, "staggered delivery must fetch only the requested origin page")
+	require.Equal(h.t, uint64(prepared.Generation), after["racer_keyring_generation"], "reader must stay delayed throughout the read")
 	release()
-	h.kubectl("annotate", "pod", nodes[1].pod, "-n", namespace, "e2e.racer/rotation=active", "--overwrite")
 	h.awaitRotationGeneration(urls[1], active.Generation, "active-reader")
 
 	// Observe a new public leaf on each unchanged live process, verify its signer,
@@ -434,7 +501,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	var issuer corev1.Secret
 
 	require.Eventually(h.t, func() bool {
-		require.NoError(h.t, json.Unmarshal([]byte(h.kubectl("get", "secret/racer-issuer", "-n", namespace, "-o", "json")), &issuer))
+		issuer = h.rotationSecret("racer-issuer")
 
 		var material struct {
 			Keys map[string]json.RawMessage `json:"keys"`
@@ -445,8 +512,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 		return !retained && len(material.Keys) == 1
 	}, 10*time.Second, time.Second, "old issuer private material not pruned")
 
-	for i, node := range nodes {
-		h.kubectl("annotate", "pod", node.pod, "-n", namespace, "e2e.racer/rotation=pruned", "--overwrite")
+	for i := range nodes {
 		h.awaitRotationGeneration(urls[i], pruned.Generation, fmt.Sprintf("pruned-%d", i))
 		require.True(h.t, time.Now().After(oldLeaves[i].NotAfter), "old certificate must really have expired")
 		h.waitHTTP(urls[i] + "/readyz")
@@ -468,7 +534,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.Equal(h.t, gets, finalGets, "refilled page not reusable after old-key prune")
 	h.verifyRotationDisk(nodes[0], urls[0], fixture, pressure, "after-prune")
 	require.Equal(h.t, beforePods, podState(), "restart cannot substitute for live rotation")
-	h.t.Logf("live rotation, staggered projection, renewal and prune completed in %s", time.Since(started))
+	h.t.Logf("live rotation, staggered delivery, renewal and prune completed in %s", time.Since(started))
 }
 
 func (h *harness) verifyRotationDisk(node peerNode, endpoint string, fixture *peerOrigin, pressure []*peerOrigin, phase string) {

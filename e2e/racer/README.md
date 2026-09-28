@@ -123,8 +123,8 @@ The test:
    original deadline.
 3. Recreates the cache and polls pinned HEAD requests for replacement socket
    readiness. First it observes the controller's active page key for the new UID,
-   nudges kubelet's ordinary Secret projection with a pod annotation, and verifies
-   that both live dataplanes install that generation. Hard links retained to the
+   and verifies that both live dataplanes install that generation through control
+   HTTPS. Hard links retained to the
    old sockets must reject promptly, and
    the replacement sockets must have different inodes.
 4. Releases the old origin handler only after replacement readiness, attempting
@@ -159,14 +159,15 @@ No credential bundle is constructed by the test.
 
 The phase checks:
 
-- Both Rust processes install the prepared Secret projection before activation.
-  One pod's mount namespace temporarily pins a copy of that genuine projection;
-  kubelet, token projection, and control polling continue normally. The other
+- Both Rust processes install the prepared HTTPS keyring bundle before activation.
+  Rules in one pod's network namespace interrupt control HTTPS delivery, including
+  replies to existing long polls. Token projection, peer traffic, diagnostics,
+  identity persistence, and storage stay intact. The other
   node installs activation while the delayed node demonstrably remains prepared.
 - Warm data stays byte-correct. After activation, fresh admission to retired
   keys closes and the previously warm server must refill from origin. The delayed
-  reader must return correct bytes through bounded origin fallback. Unmounting
-  the pin exposes the newest real projection, and both nodes converge.
+  reader must return correct bytes through bounded origin fallback. Removing the
+  network rules restores delivery, and both nodes converge without restart.
 - Each live node persists a distinct controller-issued leaf signed by the newly
   activated root, with the two-minute TTL. Its running identity-expiry gauge must
   match that leaf. After the original certificates have actually expired, a
@@ -200,17 +201,20 @@ The fixed, unlabeled `racer_keyring_generation` and
 `racer_identity_expires_at_seconds` gauges describe installed local credentials;
 they are observations, not controller acknowledgments. Public certificate chains
 are decoded in memory; private keys and bundles are not written to diagnostic
-artifacts. Metrics snapshots are retained. The projection pin is removed during
+artifacts. Metrics snapshots are retained. The network interruption is removed during
 failure cleanup as well as on success.
 
-The pin uses a mode-0700 parent, validates the complete decoded bundle against the
-expected controller bundle before/after copying and after mounting, and retries
-copy races for at most eight seconds. Release removes both the bind mount and the
-private copied material. Bundles never enter diagnostic artifacts. The fixed
+The interruption uses pod-local INPUT drops from control TCP port 8443 and OUTPUT
+TCP resets to that port. It affects both topology and keyring control traffic on
+the delayed node, not the controller or other nodes. It is installed before
+activation, and the reader's generation must remain prepared through its read.
+Release removes both rules; cleanup also releases partially installed rules.
+There is no copied key material or kubelet mount manipulation. Secret JSON reads
+bypass command failure logging. Bundles never enter diagnostic artifacts. The fixed
 `racer_pending_disk_writes` gauge counts accepted pending writes, and
 `racer_disk_publications_total` counts completed index publications across workers.
 
-Polling is one second, with 45-second projection bounds, 100-second renewal
+Polling is one second, with 45-second keyring delivery bounds, 100-second renewal
 bounds, and pruning bounded by the actual retirement deadline plus 15 seconds.
 The existing 25-second curl / 30-second request bounds apply. Cached reads also
 run while awaiting pruning. There are no fixed expiry sleeps, new clusters, or

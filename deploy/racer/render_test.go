@@ -92,6 +92,36 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("workload config not wired")
 			}
 
+			volumes := map[string]corev1.Volume{}
+
+			for _, volume := range ds.Spec.Template.Spec.Volumes {
+				if volume.Secret != nil || volume.Name == "keyring" {
+					t.Fatal("dataplane shared keys must be delivered through control HTTPS")
+				}
+
+				volumes[volume.Name] = volume
+			}
+
+			if volumes["token"].Projected.Sources[0].ServiceAccountToken.Audience != "racer-control" || volumes["bootstrap"].ConfigMap.Name != workloadCfg.BootstrapTrustConfigMap {
+				t.Fatal("bootstrap token and controller trust must be retained")
+			}
+
+			for _, name := range []string{"identity", "slabs", "sockets"} {
+				if volumes[name].HostPath == nil {
+					t.Fatalf("node-local %s mount missing", name)
+				}
+			}
+
+			for _, variable := range ds.Spec.Template.Spec.Containers[0].Env {
+				if variable.Name == "RACER_SECRET_DIRECTORY" {
+					t.Fatal("obsolete keyring directory must not be configured")
+				}
+			}
+
+			if cfg.KeyringSecretName != "racer-keyring" {
+				t.Fatal("controller durable keyring Secret configuration must remain")
+			}
+
 			if trust.Namespace != namespace || trust.Name != workloadCfg.BootstrapTrustConfigMap || trust.Data["ca.crt"] != data["BootstrapCA"] {
 				t.Fatal("deployment trust not wired")
 			}

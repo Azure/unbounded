@@ -28,7 +28,7 @@ both the test-only reference codec and the existing Rust runtime codec.
   DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet(WorkloadConfig)` builder.
 
 `WorkloadConfig` validates only dataplane deployment inputs: cluster UUID,
-namespace, peer port, DaemonSet/service account/keyring/trust names, HTTPS control
+namespace, peer port, DaemonSet/service account/trust names, HTTPS control
 URL, and image. The operator loads it with `WorkloadConfigFromLookup` from the
 preserved `racer-config` payload. Controller `Config` and `ConfigFromLookup` cover
 runtime settings independently; limits, rotation policy, serving TLS, and durable
@@ -36,6 +36,21 @@ state settings are not prerequisites for building a DaemonSet. Invalid controlle
 runtime settings are rejected by controller startup rather than workload planning.
 `RACER_DATAPLANE_IMAGE`, `RACER_CONTROL_URL`, and `RACER_BOOTSTRAP_TRUST_CONFIGMAP`
 remain deployment wiring in `racer-config`, but the controller does not read them.
+
+Shared cache keys and peer trust roots are delivered through `GET /v1/keyring`,
+not a dataplane Secret mount. The existing bounded 512 KiB JSON bundle is served
+with an independent generation long poll (no cursor: immediate 200; newer: 200;
+equal: up to 30 seconds then 204; future: 409). Bootstrap/recovery uses a live
+TokenReview-authorized `racer-control` bearer token; steady state uses mTLS with
+local validated trust. The controller's durable `RACER_KEYRING_SECRET_NAME`
+setting and issuer/keyring Secrets remain unchanged.
+
+Upgrade the controller first and verify `/v1/keyring` on the ready leader before
+rolling out the new dataplane and removing its keyring volume/mount and
+`RACER_SECRET_DIRECTORY`. Keep the projected service token, controller CA trust,
+and node-local identity/slab/socket mounts. Controller TLS certificate/private-key
+mounts are unchanged. Rollback to an older dataplane requires restoring its
+keyring projection; never reset durable credential state as part of an upgrade.
 
 Topology lists Pods in the installation namespace using the assigned-node index
 and passes those grouped lists directly to the pure `ReconcileMembers` helper.
@@ -323,8 +338,8 @@ only after their keys commit; a Secret watch drives that follow-up reconciliatio
 Topology, keyring reconciliation, and issuance share a context-aware, leader-local
 `CatalogGate` to serialize authoritative catalog and credential operations and
 prevent an in-progress topology candidate from racing key pruning. Canceled
-admission preserves accepted trust and publications. Kubelet projection and
-snapshot delivery are still asynchronous, not an atomic dataplane transaction.
+admission preserves accepted trust and publications. Keyring and snapshot HTTPS
+delivery are asynchronous independent loops, not an atomic dataplane transaction.
 
 Capacity rejection alone preserves usable admitted credentials, rotation, and
 issuer readiness. Retiring material is never evicted early to accept growth.
@@ -347,7 +362,7 @@ There is no per-request fallback to Kubernetes. The envtest request-budget test
 asserts zero requests and API-body bytes at both 1 and 1,001 live Nodes.
 
 Live TokenReview and Pod/ServiceAccount/DaemonSet/Node authorization remain required
-for enrollment and renewal. An issued certificate remains usable after workload
+for enrollment, renewal, and bearer keyring bootstrap/recovery. An issued certificate remains usable after workload
 deletion, Node recreation, or exclusion until expiration or trust retirement.
 Membership controls routing, not authorization. Startup re-enrollment and renewal
 still resolve recreated Node identities; a changed UID fences and restarts the
@@ -373,5 +388,5 @@ standalone 5-QPS/10-burst defaults. Envtest uses QPS=1000/burst=2000; its timing
 do not establish production capacity. Authentication is bounded to 32 concurrent
 operations and snapshot writes to 128; overload returns 429. API priority/fairness,
 credential size, informer memory, full snapshot bandwidth, and cache convergence
-remain operational limits. Envtest cannot verify kubelet Secret/token projection,
+remain operational limits. Envtest cannot verify kubelet trust/token projection,
 host-directory permissions, scheduling, or client runtime behavior.

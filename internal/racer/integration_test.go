@@ -539,7 +539,6 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		ControlURL: "https://127.0.0.1:8443", DataplaneImage: "example.invalid/racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: cfg.PeerPort,
 		DataplaneServiceAccount: cfg.DataplaneServiceAccount, DaemonSetName: cfg.DaemonSetName,
-		KeyringSecretName: cfg.KeyringSecretName,
 	})
 	if err != nil {
 		t.Fatal(err)
