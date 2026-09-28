@@ -96,20 +96,43 @@ retirement tokens; each installed connection stays on its target reactor.
 listeners and idle keepalive connections; `drain(&RequestScope)` bounds active
 response completion. Removed cache generations cannot begin another request.
 
-Read requests use `Head`, `HeadPinned { etag }`, `Bootstrap`, and
-`Pinned { etag, range }`. `ReadService::read` receives the original opaque
-context. Return the complete immutable object identity in metadata. A successful
-nonempty GET must include the exact resolved range and its `RangeStream`.
+Wire reads use `POST /v2/objects/{canonical key}` with `Host: racer` and mandatory
+`Content-Length: 0`. GET is not accepted. HEAD remains available for metadata on
+both v1 and v2 paths. `ReadKind::Subscription` carries optional strong `pin`,
+optional `range`, `page_credits`, `byte_credits`, and `ordered`. The legacy enum
+variants remain internal only. `ReadService::read` receives the original opaque
+context. Return the complete immutable object identity and exact resolved range
+with its `RangeStream`; only an empty, un-ranged object has no stream.
+
+`Racer-Page-Credits` is a canonical decimal in 1..=64 (default 2),
+`Racer-Byte-Credits` is in PAGE_BYTES..=64*PAGE_BYTES (default 2*PAGE_BYTES),
+and `Racer-Ordered` is 0 or 1 (default 0). The coordinator calls
+`RangeStream::configure_subscription(page_credits, byte_credits, ordered)` before
+returning. The stream reserves pending and issued credits before page acquisition.
+
+Subscription responses are 200 with ETag, Racer-Object-Length, Racer-Range-Start,
+exclusive Racer-Range-End, Racer-Expires-At, optional Racer-Content-Type,
+Content-Length equal to range bytes plus 21*(page count+1), and Connection: close.
+Each Page frame has a 21-byte network-order header: kind 1, u64 page number,
+u64 absolute offset, u32 slice length, followed by the slice. Complete is kind 2,
+u64 delivered page count, u64 delivered byte count, and zero u32 length.
+
 Client delivery calls `RangeStream::next_slice()` and
-`Delivery::finish_to(ReaderLease, ConnectionLease, &RequestScope)`; it checks the
-total transmitted length and closes on any post-header error.
+`Delivery::finish_progressing(ReaderLease, ConnectionLease, &RequestScope)`.
+RangeStream retains plaintext ownership independently of the consumed delivery
+reader until receiving a matching 12-byte
+release (u64 page number and u32 slice length) on the same socket. Releases must
+match an outstanding page exactly once and invoke `RangeStream::release_page`.
+They release credits, not cancellation. Socket close cancels; Complete does not
+wait for final releases. Post-header errors truncate and close the response.
 
 The listener's observed response path uses `Delivery::finish_progressing` after
 the bounded first-slice/header phase. Each later distinct client page has a fixed
 child acquisition deadline; writes renew only their stall deadline on positive
 socket progress. It polls the already admitted prefetch window while writing.
 Full peer close signals shared cancellation while preserving completion owners;
-request write-half shutdown alone does not cancel the response. The unobserved
+request write-half shutdown cannot return credits and is not a supported substitute
+for release frames on a progressing subscription. The unobserved
 `Responses::send` and explicit aggregate-budget APIs retain absolute deadlines.
 
 `Responses::send` prepares the first slice before writing success headers. A

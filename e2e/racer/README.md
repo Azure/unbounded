@@ -85,12 +85,24 @@ The test warms all three pages on that worker, then reads through the second:
 3. Remove the rule and read the still-cold short final page. Require a new peer
    hit with no new origin GET or fill, proving peer service resumes after healing.
 
-Every warm/read validates HTTP 206, the pinned ETag, the exact Content-Range,
-length, and every returned byte. The peer phases use kind's `curl` against Racer's
-real client Unix socket, with Gantry's deployed Go origin adapter still serving
-origin requests. They use explicit `If-Match` pins rather than SDK bootstrap reads:
-unpinned admission can legitimately fetch fresh metadata and page zero. Fixture
-HEAD requests are counted separately and allowed; they cannot mask an origin
+The peer/lifecycle probes use v2 POST subscriptions against the client socket;
+origin v1 and Gantry's public registry HTTP GET API are unchanged. Every warm/read
+validates HTTP 200, the pinned ETag, object length and half-open range metadata,
+page number/offset/length, terminal page/byte counts, body EOF, and every payload
+byte. The probes request at most one page with one page credit: completion retires
+the final lease without a release, so kind's `curl` can serve as the client without
+duplex release support. Multipage release behavior is covered by the Rust process
+and SDK conformance fixtures, not these single-page probes. The request and payload
+assertions are in `e2e/racer/peers_test.go:321-353` and
+`e2e/racer/lifecycle_test.go:149-202`; shared frame/Complete validation is in
+`e2e/racer/subscription_test.go:22-70` (repository-relative). The separate
+[live Go SDK/Rust harness](../../designs/racer-hot-subscriptions.md#live-go-sdk-rust-interoperability)
+also checks actual socket credit stalls and fragmented releases, without claiming
+deployed or distributed coverage from its single-node fixture.
+
+The peer phases use Racer's real client Unix socket, with Gantry's deployed Go
+origin adapter still serving origin requests. They use explicit `If-Match` pins.
+Fixture HEAD requests are counted separately and allowed; they cannot mask an origin
 data GET. No request retries hide a failed read; curl has a 25-second limit and
 its process has a 30-second context deadline.
 
@@ -133,7 +145,7 @@ The test:
    but HEAD still available, reads of both the warmed and held objects must fail
    on both nodes and must attempt origin. Old cached bytes cannot satisfy the
    replacement UID.
-5. Enables origin data again, checks exact bytes, ETag, and Content-Range, and
+5. Enables origin data again, checks exact bytes, ETag, subscription range metadata, and
    verifies the replacement pages become reusable without additional GETs.
 
 Pod UIDs and restart counts must remain unchanged throughout this phase, so a
@@ -178,8 +190,9 @@ The phase checks:
 - Twenty full-page pressure objects exceed the default 256 MiB node plaintext
   budget, distributed across worker buckets. Before rotation and after prune,
   reading the evicted target must increment the disk-hit counter exactly once
-  without an origin GET/fill. Every page read checks exact bytes, HTTP 206, ETag,
-  and Content-Range. Pod UIDs and restart counts must remain unchanged.
+   without an origin GET/fill. Every page read checks exact bytes, HTTP 200, ETag,
+   subscription range metadata, and completion frames. Pod UIDs and restart counts
+   must remain unchanged.
 
 Before warming the target, the test waits for zero pending disk writes and records
 the disk-publication counter. The isolated cold target fill must produce exactly

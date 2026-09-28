@@ -93,9 +93,12 @@ agreement by re-encoding through `security::protocol`. It does not authenticate.
 exact request/response provenance before dispatch. `Signatures::verify_proof` alone
 is not replay admission. `security::connection::{connect,accept}` establishes the
 session once per socket using reciprocal signed fresh challenges. No challenge map
-or per-request capability negotiation remains. The outer wire version is 2 and
-the exchange target is `/racer/peer/v4/exchange`; mixed v1/v2/v3/v4 paths fail closed.
-V4 requires the rotating request MAC plus the existing certificate/session proofs.
+or per-request capability negotiation remains. The outer wire version is 5 and
+the exchange target is `/racer/peer/v5/exchange`; older profiles fail closed.
+V5 retains the rotating request MAC and certificate/session proofs, and adds
+compact subscriptions with signed selected-page grants. See
+[replacement subscriptions](../../../../designs/racer-hot-subscriptions.md)
+for node-wide assembly, receiving aggregation, and the one-page-per-exchange limit.
 The explicit Bootstrap operation returns metadata with optional ciphertext page zero. Empty
 objects carry no page. HEAD remains Metadata. Bootstrap uses HTTP until its
 version is known; subsequent pinned pages retain native transport eligibility.

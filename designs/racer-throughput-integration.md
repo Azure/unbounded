@@ -1,5 +1,12 @@
 # Racer throughput integration
 
+Historical integration report: the client GET continuation/window and SDK splice
+decisions below are superseded by [replacement subscriptions](racer-hot-subscriptions.md).
+Current PageWindow config sets default lease credits, zero selects two, and each
+subscription uses one POST connection. Peers now require v5. The results below
+do not validate the replacement wire protocol or its performance. Origin v1 is
+unchanged; the historical measurements are preserved rather than relabeled.
+
 The throughput branch incorporates concurrent `racer-v2` work through
 `6499e8e4`. The integration preserves the newer controller reconciliation,
 content-type metadata, SDK reserved connection pools, range APIs, and Gantry

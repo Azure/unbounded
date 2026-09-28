@@ -2,31 +2,40 @@
 
 ## Current scope and historical status
 
+The client v1 contract reviewed here has been replaced by v2 POST subscriptions.
+The historical review and results below refer to earlier revisions. Origin v1 is
+unchanged. Client fixtures have now migrated to subscriptions; the current
+source-level coverage section distinguishes scripted wire checks from the live
+Rust read graph. See [replacement subscriptions](racer-hot-subscriptions.md) for
+the complete evidence scope, including ownership and fallback regressions.
+
 The report below records an earlier conformance review, including its then-open
 handoffs, line numbers, and pass/fail counts. It is historical evidence, not a
 current failure list or acceptance of the approved high-throughput rewrite.
-Use [Racer Go SDK](racer-sdk.md) for the current contract and
-[Racer SDK throughput performance](racer-sdk-throughput-performance.md) for new
-verification results. The rewrite is **VERIFIED**, as of
-2026-09-28: separate UDS conformance and deployed E2E both passed. See the
-[dated acceptance summary](racer-sdk-verification.md) for all final gates and
-the distinction between the Rust suite's 12 ignored tests and the separately
-executed conformance run.
+Use [Racer Go SDK](racer-sdk.md) for the current contract. The
+[throughput report](racer-sdk-throughput-performance.md) and
+[dated acceptance summary](racer-sdk-verification.md) retain earlier measurements
+and passing gates; they are not newly executed subscription results.
 
 Current source-level coverage includes the following. These are inspected test
 assertions, not newly executed results:
 
-- The opt-in Go/Rust UDS fixture now checks sizes 0, 3, P, 2P, and 3P+13,
-  with one bootstrap and at most one full pinned remainder, opaque context
-  forwarding, and content type. It also invokes a range fixture for each size
-  (`cmd/racer-dataplane/tests/conformance/sdk.rs:63-218`). Its responses are
-  scripted through production HTTP/request parsing, not a full Coordinator.
-- SDK tests check exact options-based ranges and HEAD/GET counts, trusted
-  snapshot copying and HEAD bypass, independent admission queues, SmallObject
-  size checks, and legacy/present content-type compatibility
-  (`pkg/racersdk/read_options_test.go:21-102`,
-  `pkg/racersdk/snapshot_stats_test.go:34-115`,
-  `pkg/racersdk/reserved_admission_test.go:18-208,303-335`).
+- The opt-in scripted Go/Rust UDS fixture asserts an ordered Subscription with
+  one page credit, preserves opaque context, and sends v2 page frames. Between
+  pages it checks the exact release number/length before proceeding to Complete
+  (`cmd/racer-dataplane/tests/conformance/sdk.rs:101-159,325-432`). This exercises
+  production HTTP/request parsing, not a full Coordinator.
+- The separate live `TestRustSubscriptionInterop` starts production Rust
+  ClientListeners, Coordinator, RangeStream, Fill, and crypto. Its 12 subtests
+  cover ordered Get, OpenPages credit/release/Complete behavior, cancellation,
+  DownloadTo, and writer failure. The large download asserts 512 MiB + 13 bytes
+  across 33 offsets with two SDK page credits; Rust asserts a 64 MiB charged
+  plaintext limit and zero plaintext/flight/waiter charges after cleanup
+  (`pkg/racersdk/rust_subscription_interop_test.go:105-316`,
+  `cmd/racer-dataplane/src/subscription_interop.rs:157-162,307-354`). Generated
+  origin and initial publication are fixture supplied, peer traffic is absent,
+  and unsubmitted persistence is discarded. These bounds are not process RSS or
+  Go heap measurements.
 - Registry tests check bounded 206 responses and complete 200 responses that
   fit at offset zero, with rejection of unknown/oversized/nonzero-offset 200
   without body reads (`internal/gantry/origin/range_test.go:26-95,139-265`).
@@ -38,9 +47,17 @@ To reproduce current cross-language coverage from `cmd/racer-dataplane` in the
 target worktree:
 
 ```sh
-cargo test --test client_origin_conformance
+timeout --signal=TERM --kill-after=10s 300s cargo test --test client_origin_conformance
 RACER_SDK_ROOT="$(git rev-parse --show-toplevel)" \
-  cargo test --test client_origin_conformance -- --include-ignored
+  timeout --signal=TERM --kill-after=10s 300s cargo test --test client_origin_conformance -- --include-ignored
+```
+
+For the live single-node SDK/Rust graph, run from the worktree root:
+
+```sh
+RACER_SUBSCRIPTION_INTEROP=1 \
+  timeout --signal=TERM --kill-after=10s 300s go test ./pkg/racersdk \
+  -run '^TestRustSubscriptionInterop$' -timeout=5m
 ```
 
 The SDK root must identify the same revision under test. Passing this target

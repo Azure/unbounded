@@ -4,6 +4,16 @@ One Rust package containing the node dataplane. `app.rs` composes worker-local
 services; the binary enters through configuration and the application lifecycle.
 The Go control plane is outside this package.
 
+Client body reads use the breaking v2 POST subscription protocol with bounded
+page/byte credits and explicit releases. The SDK offers unordered OpenPages,
+absolute-offset DownloadTo, and ordered Get/io.Reader delivery over one
+subscription. The old client GET bootstrap/window contract is not supported;
+origin v1 HEAD and whole-page GET remain unchanged. See the
+[client/origin API](CLIENT_ORIGIN_API.md) and
+[subscription design](../../designs/racer-hot-subscriptions.md). Process,
+conformance, and E2E client fixtures now use subscriptions. Historical GET-based
+results are not new subscription measurements.
+
 [Control API](CONTROL_API.md) defines the controller/dataplane contract, Kubernetes
 membership inputs, enrollment, and projected credential rotation.
 
@@ -55,6 +65,24 @@ The target creates the fixture scratch directories and sets `RACER_SDK_ROOT` to
 the repository root. `RACER_CARGO_TARGET_DIR` can isolate concurrent builds.
 Full deployed-image coverage runs separately in the
 [operator-installed kind suite](../../e2e/racer/README.md).
+
+The separate live `TestRustSubscriptionInterop` Go test starts a Rust fixture with
+production ClientListeners, Coordinator, RangeStream, Fill, and crypto over a real
+Unix socket. Its subtests cover Get, OpenPages, DownloadTo, credit stalls, fragmented
+releases, Complete, cancellation, and writer failure. The large case checks
+512 MiB + 13 bytes across 33 offsets with two SDK page credits; the Rust fixture
+asserts at most 64 MiB charged plaintext and zero plaintext/flight/waiter charges
+after cleanup (`pkg/racersdk/rust_subscription_interop_test.go:105-316`,
+`cmd/racer-dataplane/src/subscription_interop.rs:157-162,307-354`, repository-relative).
+It uses generated origin content and a single-node publication, with no peer
+traffic and no persistence acceptance claim. These are code assertions, not RSS
+measurements or a new execution report. From the repository root:
+
+```sh
+RACER_SUBSCRIPTION_INTEROP=1 \
+  timeout --signal=TERM --kill-after=10s 300s go test ./pkg/racersdk \
+  -run '^TestRustSubscriptionInterop$' -timeout=5m
+```
 
 ## Metadata contention simulation
 

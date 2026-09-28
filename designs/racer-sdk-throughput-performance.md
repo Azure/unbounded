@@ -1,5 +1,11 @@
 # Racer SDK mixed-load performance integration
 
+Historical measurements: these runs predate the breaking v2 client subscription
+replacement. References below to the current SDK, bootstrap/remainder GETs, pool
+reuse, or page-free Go delivery describe the measured revision, not today's
+contract. No throughput or memory result here is transferred to subscriptions.
+See [Racer Go SDK](racer-sdk.md) and [replacement subscriptions](racer-hot-subscriptions.md).
+
 ## Scope and conclusion
 
 This is a repeatable **local, single-node process integration**, using the actual

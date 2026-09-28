@@ -8,10 +8,20 @@ never retry unbounded. Historical commands in Phase 1 records are not current
 execution instructions.
 
 `process_restart.rs` executes Cargo's actual `racer-dataplane` binary, including
-environment parsing, CPU discovery, TLS enrollment, projected key loading,
+environment parsing, CPU discovery, TLS enrollment, HTTPS key delivery,
 application startup, readiness, UDS listeners, encrypted O_DIRECT storage, signal
 handling, and shutdown. It supplies a TLS controller fixture and a raw HTTP/UDS
-origin adapter. Client requests use the production UDS wire protocol.
+origin adapter. Client helpers use v2 POST subscriptions with one page credit,
+validate metadata and every page/completion frame, return exact page/byte releases
+between pages, and require transport EOF. Empty subscriptions still require a
+completion frame. Origin v1 and metadata HEAD are unchanged. See
+[the current contract](../../CLIENT_ORIGIN_API.md). Historical throughput results
+below are not new performance measurements of the subscription protocol.
+The request builders are `tests/process_restart.rs:382-384` and
+`tests/process/throughput.rs:50-67`; exact metadata, payload, release, Complete,
+and EOF validation is in `tests/process/measurement.rs:79-157` (paths relative
+to the dataplane package). Live Go SDK credit/cancellation coverage is separate;
+see [subscription evidence](../../../../designs/racer-hot-subscriptions.md#live-go-sdk-rust-interoperability).
 
 Run from the repository root on Linux with io_uring, O_DIRECT/STATX_DIOALIGN, at
 least one usable CPU, and permission to create a private mount namespace. The
@@ -61,10 +71,10 @@ crash with stale hostPath sockets.
 
 ## Assertions
 
-- **Graceful SIGTERM:** bootstrap page zero, fetch a pinned remainder spanning
+- **Graceful SIGTERM:** subscribe to page zero, fetch a pinned remainder spanning
   another full page and a short tail, verify every byte, and require successful
   process exit and client socket cleanup. Decode the resulting checkpoint and
-  require all three page mappings under the projected page key. Launch a new PID
+  require all three page mappings under the HTTPS-delivered page key. Launch a new PID
   with the same identity/slabs, reject origin requests, and verify the complete
   pinned object, exactly three disk hits, and zero origin calls/fills. The
   persisted certificate is freshly issued after token reauthentication; its
@@ -121,10 +131,12 @@ excluded from the exact userspace worker-pair count.
   authenticated TCP peer copy followed by memory reuse, then SIGKILL of the
   preferred peer with unchanged membership and verified origin fallback. Runs
   at 1/2/4 pairs. This is a two-node HTTP path, not RDMA or a multi-hop cluster.
-- `production_remote_bootstrap_one_get_and_empty`: four actual Applications;
-  a cold noncandidate receives one explicit peer Bootstrap and exactly one origin
-  GET, for both empty and nonempty objects. Checks candidate/requester decrypt
-  counters and a distinct HEAD with no body-fetch side effects. Peer v4 MACs,
+- `production_remote_bootstrap_one_get_and_empty` retains its historical test
+  name: four actual Applications serve a cold noncandidate subscription using
+  metadata HEAD and exactly one pinned origin GET for a nonempty object, or no
+  data GET for an empty object. Checks that no peer Bootstrap occurs,
+  candidate/requester decrypt counters, and a distinct HEAD with no body-fetch
+  side effects. Peer v5 retains request MACs,
   certificate-bound sessions and original/destination signatures are active.
 - `production_blocked_control_progress` holds a real mTLS snapshot response
   while client traffic completes. `production_blocked_listener_publication`
@@ -134,7 +146,7 @@ excluded from the exact userspace worker-pair count.
   full-page disk hit with two active caches at four pairs, no overload and no
   origin refetch. A small tail remains readable. Phase 2 fixes the Phase 1 failure.
 - `production_ingress_baseline` holds the full aggregate ingress partition at
-  1/2/4 pairs (94/92/88 partial heads), verifies traffic beyond the historical
+  1/2/4 pairs (93/90/84 partial heads), verifies traffic beyond the historical
   worker-zero ceiling, proves excess ingress stalls, checks readiness, releases
   clients, and verifies recovery. The 200 ms probe is a diagnostic bound. At four
   pairs each existing 32-socket worker partition retains eight outbound and two

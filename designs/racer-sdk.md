@@ -2,24 +2,30 @@
 
 ## Scope and evidence
 
-The approved high-throughput rewrite is **VERIFIED**, as of
-2026-09-28. This document describes the current implementation contract, including
-the Go SDK, its Gantry integration, and Rust range delivery. It supersedes the
-original design's page-by-page continuation, Transport, and digest-holdback claims.
+This document describes the replacement subscription implementation, including
+the Go SDK, its Gantry integration, and Rust page delivery. It supersedes client
+bootstrap/remainder GETs, concurrent continuation windows, and SDK splice claims.
+The client change is breaking, with no dual body-read protocol. Origin v1 is unchanged.
 Implementation citations are repository-relative unless noted otherwise.
 
 `pkg/racersdk` is a standard-library-only concurrent streaming client and
 single-callback origin server. See the normative
-[client/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md),
+[client v2/origin v1 contract](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md),
 [package guide](../pkg/racersdk/doc.go), and
 [examples](../pkg/racersdk/example_test.go). SDK packages must not import `cmd/`.
 
-The [verification summary](racer-sdk-verification.md) records the final passing
-gates, including deployed E2E. Older sections there and in the
-[independent conformance report](racer-sdk-conformance.md) remain historical.
-Detailed measurements are in [throughput performance](racer-sdk-throughput-performance.md).
-Source inspection and scripted Go/Rust interoperability remain distinct from the
-separately passed deployed gate and workload-specific performance measurements.
+The [verification summary](racer-sdk-verification.md) records earlier passing
+gates, including deployed E2E, for the previous client contract. It and the
+[independent conformance report](racer-sdk-conformance.md) are historical evidence,
+not acceptance of the replacement wire protocol. Current process, scripted
+conformance, and E2E client fixtures use v2 subscriptions. The separate live
+Go/Rust harness exercises production ClientListeners and the read graph, including
+a 512 MiB + 13 download under bounded payload admission. The
+[subscription design](racer-hot-subscriptions.md#evidence-and-validation-scope)
+records the actual assertions and limits, without assigning new pass totals.
+Historical measurements remain in [throughput performance](racer-sdk-throughput-performance.md).
+Scripted wire checks, live single-node interoperability, deployed coverage, and
+workload-specific performance measurements are distinct evidence.
 
 ## Minimal public surface
 
@@ -43,6 +49,9 @@ type Request struct {
 }
 
 type ReadOptions struct {
+    PageCredits int
+    ByteCredits ByteLength
+    Ordered     bool
     SmallObject bool
     Offset      ByteOffset
     Length      ByteLength
@@ -51,6 +60,8 @@ type ReadOptions struct {
 }
 
 func NewClient(config ClientConfig) (*Client, error)
+func (c *Client) OpenPages(ctx context.Context, request Request, options ...ReadOptions) (*PageStream, error)
+func (c *Client) DownloadTo(ctx context.Context, request Request, w io.WriterAt, options ...ReadOptions) (int64, error)
 func (c *Client) Get(ctx context.Context, request Request, options ...ReadOptions) (*Value, error)
 func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error)
 func (c *Client) Stats() Stats
@@ -60,14 +71,26 @@ func (v *Value) Read(p []byte) (int, error)
 func (v *Value) WriteTo(w io.Writer) (int64, error)
 func (v *Value) Close() error
 
+func (s *PageStream) Metadata() Metadata
+func (s *PageStream) Range() (ByteOffset, ByteOffset) // start, exclusive end
+func (s *PageStream) Next() (*PageLease, error)
+func (s *PageStream) Close() error
+type PageLease struct {
+    Number uint64
+    Offset ByteOffset // absolute object offset
+    Data   []byte
+    // Private ownership and release state omitted.
+}
+func (p *PageLease) Release() error
+
 type Origin func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error)
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
 ```
 
-- `ParseKey(string) (Key, error)` accepts only v1 lowercase hex; `Key.String()`
+- `ParseKey(string) (Key, error)` accepts only canonical lowercase hex; `Key.String()`
   emits it. All 32-byte values, including zero, are valid.
 - `CacheName`, `ETag`, `AdapterMetadata`, and `Authorization` have private storage
-  and validating `Parse<Type>(string) (<Type>, error)` constructors following v1.
+  and validating `Parse<Type>(string) (<Type>, error)` constructors using the unchanged value grammar.
   Never normalize opaque fields. ETag's zero value means absent only in a request
   pin; it is invalid in Metadata. Zero CacheName is invalid. Opaque zero values
   mean absent, while parsing an explicitly empty field fails.
@@ -86,8 +109,8 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
   Zero Range means unspecified. ClosedRange, Bounds, and Resolve support origin
   callbacks. Client byte selection instead uses ReadOptions; Length zero means
   through EOF, so callers need no open-ended or suffix Range constructor.
-  Client.Get validates its request before I/O. Per-field bounds ensure the fixed
-  outgoing head fits the aggregate limit without serializing it for validation.
+  Client.Get validates its request before I/O. The subscription path also validates
+  the serialized outgoing head against the aggregate limit.
 - `OriginRequest` has private fields and value accessors `Key()`, `Context()`,
   `Operation()`, `Pin() (ETag, bool)`, and `Range() (Range, bool)`. `Operation` is a
   typed enum `OperationHead`, `OperationBootstrap`, `OperationPinned`; zero is
@@ -102,76 +125,81 @@ func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error
   deadline for a pinned stream. No synthetic TTL default or SDK metadata cache.
 
 These types and constraints are implemented in `pkg/racersdk/types.go:20-234`,
-`pkg/racersdk/range.go:18-75`, `pkg/racersdk/client.go:209-355`, and
-`pkg/racersdk/value.go:193-280`.
+`pkg/racersdk/range.go:18-75`, `pkg/racersdk/client.go:241-291`, and
+`pkg/racersdk/subscription.go:21-170`.
 
-Get accepts zero or one ReadOptions value. Empty options, including SmallObject
-alone, preserve fresh bootstrap. Nonzero Offset/Length/Pin or a supplied Metadata
-snapshot select the exact pinned range. Without a snapshot, Get first uses the
-reserved HEAD pool; with one, it validates and copies the trusted snapshot and
-skips HEAD. A nonzero Pin must match the snapshot. The caller must associate the
-snapshot with the correct Request and must not mutate it during Get: Metadata
-does not contain a key. Length/offset overflow fails before I/O. Bounds beyond
-the selected object fail rather than silently shortening; offset equal to size
-with zero length yields an empty Value without a GET when options select a pinned
-read. Empty options still bootstrap even an empty object. Stat is a fresh metadata-only
-HEAD (`pkg/racersdk/client.go:240-301,322-355`).
+Get and OpenPages accept zero or one ReadOptions value. With no Pin or Metadata,
+the POST resolves fresh metadata and selects the requested range in that exchange.
+Neither method issues a HEAD preflight. A snapshot is validated and copied and
+pins the subscription to its ETag; a nonzero Pin must match. Associate the snapshot
+with the correct Request and do not mutate it during opening: Metadata has no key.
+Length zero means through EOF. Overflow fails before I/O; an explicit Length past
+EOF fails rather than silently shortening. An explicit range starting at EOF is
+unsatisfiable, not a locally synthesized empty Value. An un-ranged empty object
+still opens a subscription and validates Complete. Stat remains fresh metadata-only
+HEAD on its reserved pool (`pkg/racersdk/subscription.go:72-170`,
+`pkg/racersdk/client.go:258-291`).
 
 SmallObject reserves a separate pool for objects whose **total** size is at most
 PageSize (16 MiB), not for short ranges of larger objects. Oversized snapshots or
-HEAD metadata fail before GET; oversized bootstrap metadata fails before exposing
-a Value or consuming its body. There is no fallback into the bulk pool
-(`pkg/racersdk/client.go:235-276`, `pkg/racersdk/response_conn.go:268-275`).
+subscription response metadata fail before exposing a Value or PageStream. There
+is no fallback into the bulk pool (`pkg/racersdk/subscription.go:82-98,163-169`).
 
-No object `[]byte` result, SDK page cache/scheduler, public HTTP client injection,
+There is no whole-object `[]byte` result, SDK page cache, public HTTP client injection,
 retry policy, adapter registry, separate metadata callback, or caller-owned server
-listener is needed. Internal transport/listener seams support tests.
+listener. Internal transport/listener seams support tests.
 
 ## Streaming algorithm and lifetimes
 
-For a fresh full-object Get:
+For OpenPages or Get:
 
-1. Acquire bounded request capacity under ctx, issue unpinned bootstrap GET, and
-   validate status and all metadata/framing before returning Value. Do not consume
-   a page to obtain metadata. Empty bootstrap returns a valid immediately-EOF Value.
-2. Read page zero directly from its HTTP body into the caller's buffer. Pin its
-   ETag and total size in Value. Expose no later version, even after expiry.
-3. After page zero is consumed, if more bytes remain, lazily issue **one** pinned
-   GET for `Range: bytes=16777216-<size-1>` with the bootstrap If-Match and identical
-   context. Validate 206, ETag, unchanged total size, compatible content type, and
-   exact boundaries before reading the body. Retain the initial Metadata snapshot
-   if expiry is refreshed. Racer schedules underlying whole-page fetches.
-4. End with EOF only after the full expected count. Do not open a continuation
-   for a one-page object. Closing before page zero ends never fetches the remainder.
+1. Acquire one bounded bulk or small-object slot under ctx and send one
+   `POST /v2/objects/<key>` with zero HTTP request-body length, optional pin/range,
+   and page/byte credits. Validate metadata and response framing before returning.
+2. Next reads a complete page slice before exposing a PageLease. Each slice has a
+   page number and absolute object offset. Unordered is the OpenPages default;
+   Ordered selects ascending delivery. Get always sets Ordered and presents the
+   same slices through Read, releasing each once consumed.
+3. Hold each lease only while using Data, then call Release. It is idempotent and
+   invalidates Data. Never copy a lease or access its Data concurrently with Release.
+   Release writes the exact page number and slice length back on the same socket,
+   returning local credit. Next waits when outstanding leases exhaust credits.
+4. Require Complete with exact page/byte counts before clean EOF. The final slice
+   is not exposed until its trailing Complete validates. An empty object validates
+   Complete without a page. Close on every path, including consumer failure.
 
-Thus a successful full read uses one bootstrap and at most one remainder GET,
-regardless of page count, with no SDK HEAD preflight. An options-selected pinned read uses
-one exact pinned GET (or none for an empty selection), without a bootstrap body.
-These are logical exchange counts; the narrowly permitted stale-connection retry
-below can replay an exchange (`pkg/racersdk/client.go:240-319`,
-`pkg/racersdk/value.go:119-144`).
+The selected page membership and version do not change with delivery order. Credit
+defaults are ClientConfig.PageWindow, or two when zero, and PageCredits*PageSize
+bytes. Limits are 1..64 pages and PageSize..64*PageSize bytes. Outstanding payload
+allocations are credit-bounded; duplicate tracking uses merged intervals with a
+hard limit of 4096. Excessive fragmentation fails rather than allocating state
+proportional to object size. There is no whole-object buffer, reconnect/resume,
+GET fallback, or continuation request (`pkg/racersdk/subscription.go:72-99,180-246`).
 
-Continuation pin errors never fall back to a fresh version. Get's context bounds
-the full stream; SDK socket header/write deadlines are removed before exposing
-the body (`pkg/racersdk/response_conn.go:235-284`). Rust client delivery uses
-bounded page acquisition and progress-based writes, detailed below, so an entire
-pinned remainder is not forced into the old absolute response deadline.
-Errors received before any continuation's body starts retain their HTTP error
-classification, even after earlier pages succeeded. Truncated bodies remain I/O
-errors with partial counts. Both are terminal for the Value.
-The client holds at most one response body per Value, and no SDK-owned page buffer.
-`Read` reads directly into `p`; small stdlib framing buffers still exist.
+DownloadTo accepts an io.WriterAt, writes at absolute object offsets (including
+for a selected range), releases each lease after WriteAt returns, and closes on
+all exit paths. It preserves partial counts and reports short writes. It does
+not truncate, size, or verify the destination object. Cancellation cannot interrupt
+an arbitrary caller-owned WriteAt (`pkg/racersdk/subscription.go:298-318`).
+
+Initial HTTP errors retain their typed classification. Malformed frames are
+protocol errors; short payloads or a missing Complete are terminal I/O errors.
+No failure selects a newer version. The context bounds the entire subscription.
+SDK page allocations are now intentional, unlike the old direct-body reader.
 `Value.WriteTo`, also selected by `io.Copy` and `io.CopyBuffer`, uses bounded
 32 KiB scratch and does not invoke the destination's ReadFrom. It counts only
 bytes accepted by the writer and preserves short-write errors. Copy scratch has
 independent bulk and small-object caps, including copies canceled while blocked
 inside caller-owned Write. Exhausted scratch returns ErrorUnavailable. Cancellation
 cannot interrupt an arbitrary writer; callers must still Close on writer failure
-(`pkg/racersdk/value.go:193-280`). No array of page descriptors scales with object size.
+(`pkg/racersdk/value.go:199-298`). WriteToHTTP uses this validated copy path without
+hijacking the downstream connection. SDK subscription delivery does not splice
+framed page data directly to a destination (`pkg/racersdk/http_transfer.go:8-14`).
 
-Client is safe for concurrent Get, Stat, Stats, and Close. Value has one consuming
+Client is safe for concurrent opening calls, Stat, Stats, and Close. PageStream
+has one Next consumer; Release and Close may run concurrently. Value has one consuming
 goroutine (Read or WriteTo, directly or through io.Copy); Close may run concurrently and
-must cancel a blocked read or continuation acquisition. Metadata access is safe
+must cancel a blocked read or credit wait. Metadata access is safe
 concurrently. Get's ctx governs the entire Value, not only response headers.
 Each Value has a derived cancel function registered atomically with the client;
 Client.Close rejects new work, cancels pending Get calls and all active Values,
@@ -248,7 +276,9 @@ No root/socket override, custom transport, or global singleton:
 | `ClientConfig.SmallObjectQueuedRequests` | 128 waiting small-object calls, independent of bulk and HEAD |
 | `ClientConfig.QueueTimeout` | 5 seconds per admission wait |
 | `ClientConfig.DialTimeout` | 5 seconds per Unix dial |
-| `ClientConfig.ResponseHeaderTimeout` | 60 seconds for blocked request writes, then a fresh 60 seconds for response headers after writing the request |
+| `ClientConfig.ResponseHeaderTimeout` | 60 seconds; subscription POST write and response head share one deadline; HEAD retains separate write/head bounds |
+| `ClientConfig.BodyReadTimeout` | 60 seconds per blocked subscription read/release write, not total lifetime or caller think time |
+| `ClientConfig.PageWindow` | Zero selects two default page credits; 1..64 explicitly selects credits, not parallel GET connections |
 | `ClientConfig.IdleConnTimeout` | 90 seconds for idle pooled connections |
 | `ClientConfig.MaxConnAge` | 5 minutes maximum reuse age; each successful dial samples a lifetime uniformly from [75%, 100%], or 3m45s..5m by default |
 | `OriginConfig.MaxConnections` | 128 accepted connections, including idle; cap before spawning handlers |
@@ -273,21 +303,24 @@ Wire header limits are fixed constants, not configurable. Copy scratch is bounde
 by 32 KiB times bulk plus small-object copy capacity (2.125 MiB at defaults),
 allocated lazily and retained for reuse. Origin GET scratch is 32 KiB per active
 copy (up to 2 MiB at the default GET cap). These exclude framing buffers, caller
-memory, kernel sockets, and Rust pages. Connection and concurrency limits bound
+memory, kernel sockets, Rust pages, and SDK PageLease payload allocations. Each
+subscription can retain up to its negotiated byte credits in live SDK payloads;
+default credits are 32 MiB, allocated as slices arrive. Connection and concurrency limits bound
 the parser buffers, goroutines, and body scratch. At the connection cap, stop
 accepting until capacity frees (the OS backlog is finite); an already accepted
 well-formed request at the callback cap gets empty 503. A stuck callback continues
 to occupy its slot even after its client disconnects, preventing unlimited leaks.
 
-Client uses private sequential Unix connection pools with a connection-owned
-bufio.Reader, bounded raw-head parsing, and fixed-length bodies, not http.Transport.
-Only completely consumed, reusable frames with no buffered surplus return to
-their own pool. Aborted bodies close without draining. Idle timers close unused
-connections (`pkg/racersdk/response_conn.go:71-169,171-230`). No proxy, redirect,
+Client uses private Unix connections with a connection-owned bufio.Reader and
+bounded raw-head parsing, not http.Transport. Subscriptions use a fresh connection
+and `Connection: close`; neither completed nor aborted subscriptions recycle it.
+Sequential HEAD exchanges can return clean reusable connections to the metadata
+pool. Idle timers close unused pooled connections
+(`pkg/racersdk/subscription.go:114-126,151`, `pkg/racersdk/response_conn.go:71-230`). No proxy, redirect,
 compression, HTTP/2, or total HTTP client timeout is involved.
 
-`ClientConfig.MaxConnAge` applies to all three pools: bulk, metadata/HEAD, and
-small objects. Zero selects the 5-minute default; negative values are invalid.
+`ClientConfig.MaxConnAge` governs reusable pooled connections; subscription
+connections are not reused. Zero selects the 5-minute default; negative values are invalid.
 Each successful dial samples its jittered lifetime once, uniformly over whole
 nanoseconds from ceil(75% of MaxConnAge) through MaxConnAge, inclusive. The
 resulting monotonic deadline is fixed; reuse does not renew it
@@ -301,7 +334,7 @@ fully consumed response, or by an idle timer. The idle timer uses
 keep a connection alive indefinitely. Replacement is lazy: retiring a connection
 does not dial or reserve additional capacity. A later exchange dials only when
 needed under the existing pool admission bounds. Rotation does not replay an
-exchange or restart a pinned continuation
+exchange or restart a subscription
 (`pkg/racersdk/response_conn.go:71-155,215-257`; lifecycle and active-response
 assertions in `pkg/racersdk/connection_age_test.go:151-221,313-376`).
 
@@ -309,11 +342,12 @@ Rotation creates opportunities for worker reassignment, not a guarantee of equal
 worker utilization. See the [real Racer connection-age validation](racer-sdk-connection-age-validation.md)
 for the bounded workload results and measurement limitations.
 
-One fresh-connection retry is allowed only after EOF, reset, or broken pipe on
+For the sequential HEAD path, one fresh-connection retry is allowed only after EOF, reset, or broken pipe on
 a reused connection **before any response byte**. Timeouts, partial heads,
 protocol errors, HTTP errors, and body failures are not retried. There is no
 version restart or body resume. Callbacks must tolerate replay; network delivery
-is not exactly once (`pkg/racersdk/response_conn.go:232-263`).
+is not exactly once (`pkg/racersdk/response_conn.go:232-263`). OpenPages does not
+use that exchange retry path (`pkg/racersdk/subscription.go:102-127`).
 
 ServeOrigin's ctx is the server lifetime. Each request inherits its cancellation
 and the local request timeout; peer disconnect cancels it too. There is no new
@@ -326,38 +360,47 @@ Other ServeOrigin errors preserve their bind/serve causes. No grace-period API.
 
 ## Rust range progress and bounded work
 
-The production client listener calls Responses::send_observed, which prepares the
-first slice before headers, enables progress for normal pinned client ranges, and
-polls the existing prefetch window while delivering bytes. Direct Responses::send
-and explicit aggregate-budget APIs retain absolute deadlines
-(`cmd/racer-dataplane/src/client/listener.rs:556`,
-`cmd/racer-dataplane/src/client/response.rs:101-198`). Rust paths in the rest of this
-section are relative to `cmd/racer-dataplane/`.
+The production client listener selects Responses::send_subscription for POST.
+It prepares the first slice before success headers, enables progress, and holds
+delivered plaintext ownership until exact release or stream teardown. Complete
+does not wait for final releases (`cmd/racer-dataplane/src/client/subscription.rs:145-179,229-272`,
+`cmd/racer-dataplane/src/read/range_stream.rs:263-269`). Rust paths in the rest of
+this section are relative to `cmd/racer-dataplane/`.
 
-- Initial metadata/bootstrap receives 32 attempts and 96 aggregate forwarded
-  links (`src/read/serve.rs:51-52`). Normal pinned client ranges use per-page
-  budgets rather than spending a range-wide allowance for each successful page
-  (`src/read/serve.rs:263-293`). Each distinct admitted page gets at most eight
-  attempts and sixteen links in the bounded window (`src/read/range_stream.rs:30-65`).
+- Initial metadata uses the coordinator's bounded acquisition budget. Normal
+  subscriptions open a per-selection budgeted stream, then configure credits
+  (`src/read/serve.rs:216-267`). Local page/byte credits are distinct from the
+  cumulative peer transfer ceilings and per-selection attempts/links; releasing
+  a client lease never replenishes remote acquisition authority.
 - Idle/header reception and initial metadata/first-slice work retain the configured
   request deadline. After successful headers, newly admitted pages in a normal
-  pinned client range receive fixed child acquisition deadlines. Already admitted
+  client subscription receive fixed child acquisition deadlines. Already admitted
   pages and retries never receive new time or credits. Pending futures stay in
   the stream; dropping a next_slice future does not restart a page. Explicit
   aggregate budgets partition/reunite only their owned credits and cannot be
-  upgraded to progressing budgets (`src/read/range_stream.rs:223-315`).
+  upgraded to progressing budgets (`src/read/range_stream.rs:277-305`).
 - Positive client socket writes renew the reader-stall clock. Backpressure does
   not grow the prefetch window. Peer writes still take the minimum of the original
   deadline and stall deadline (`src/memory/delivery.rs:153-205,261-265`).
 - Runtime defaults are `RACER_REQUEST_TIMEOUT_MS=30000`,
-  `RACER_READER_STALL_TIMEOUT_MS=10000`, and `RACER_RANGE_WINDOW_PAGES=2`
-  (`src/config.rs:167-186`). Increasing SDK concurrency does not increase Rust
+  `RACER_READER_STALL_TIMEOUT_MS=10000`. Subscription scheduling uses negotiated
+  credits; `RACER_RANGE_WINDOW_PAGES=2` remains for internal legacy range callers,
+  not the v2 client contract (`src/read/range_stream.rs:235-260`). Increasing SDK concurrency does not increase Rust
   page, pipe, connection, queue, or origin capacity automatically.
 
-This permits healthy large remainders to outlive the initial request timeout;
+This permits progressing client subscriptions to outlive the initial request timeout;
 it does not guarantee successful completion. Acquisition failure, deadline,
 overload, cancellation, and stalled downstream delivery can still terminate a
-stream. Submitted work retains buffers and admission until its completion fence.
+stream. Retained peer contracts keep their original deadline and cannot be renewed
+by later selections. No unlimited whole-object remote subscription is promised.
+Local peer-attempt timeouts reserve time for fixed-page fallback while retaining
+the original signed contract deadline and spent budgets. Timeout still waits for
+accepted I/O completion before fallback (`src/read/candidates.rs:460-587`). Selected
+ciphertext moves to the stable page owner for local admission, plaintext allocation,
+authentication, and publication (`src/read/fill.rs:136-190`,
+`src/read/dispatch.rs:243-269`).
+Submitted work retains buffers and admission until its completion fence. See
+[subscription integration](racer-hot-subscriptions.md) for selection and fanout limits.
 
 ## Gantry object identity and origin bandwidth
 
@@ -371,7 +414,7 @@ payload identity (`internal/gantry/racer/racer.go:42-74,193-201`,
 
 Ordinary digest GETs do not add a HEAD preflight. Manifest GETs use SmallObject;
 HEAD uses Stat. A supported open-ended blob resume performs one Stat and supplies
-that snapshot to an exact pinned offset Get, avoiding a second HEAD and avoiding
+that snapshot to an exact pinned offset Get subscription, avoiding
 reading/discarding the skipped prefix in Go. The dataplane still acquires the
 whole page containing an unaligned starting offset. Unsupported range forms use
 the existing full-response behavior. These are distinct from containerd's own
@@ -423,7 +466,8 @@ later metadata includes or omits content type
 `cmd/racer-dataplane/src/model/metadata.rs:99-107`). Gantry writes the selected
 metadata's content type without fetching/parsing a manifest to rediscover it.
 
-Client/origin HTTP remains v1 with this optional response header. Typed peer
+Client HTTP body reads use v2 subscriptions; origin HTTP remains v1 with this
+optional response header. Typed peer
 responses additionally sign `racer-metadata-version: 2` and `racer-content-type`;
 untyped responses retain the old shape. New decoders reject unknown versions,
 missing typed values, and unversioned typed fields. Signature/logical agreement
@@ -431,21 +475,15 @@ covers MIME metadata (`cmd/racer-dataplane/src/security/protocol.rs:305-307`,
 `cmd/racer-dataplane/src/peer/decode.rs:76-99`,
 `cmd/racer-dataplane/src/security/forwarding.rs:1422-1448`).
 
-Old strict peer decoders reject the typed shape: mixed old/new peer paths carrying
-content type may fail until all participating nodes are upgraded. There is no
-capability negotiation or silent downgrade. This is the compatibility limit
-specified in `cmd/racer-dataplane/CLIENT_ORIGIN_API.md:95-111`, not a claim that a
-mixed-version deployment has passed end-to-end validation.
+Peer v5 is a coordinated breaking upgrade: older profiles fail closed, regardless
+of content type. There is no capability negotiation or silent downgrade. This is
+not a claim that a mixed-version deployment has passed end-to-end validation.
 
-Untyped disk records retain v1 encoding; typed records use v2 with a little-endian
-u32 MIME length and MIME bytes before the header digest. New checkpoints use v2
-and append a counted MIME string to each descriptor (zero count means absent).
-Readers accept v1 and v2, recovering v1 content type as unknown
-(`cmd/racer-dataplane/src/store/format.rs:105-127,182-227,288-294`,
-`cmd/racer-dataplane/src/store/checkpoint.rs:155`,
-`cmd/racer-dataplane/src/store/checkpoint_format.rs:442-456,491-510`). Old binaries
-cannot consume v2 data; rollback needs a compatible checkpoint or refetching
-disposable cache contents, not an assumption of bidirectional disk compatibility.
+The former v1/v2 disk compatibility description is also superseded independently
+of subscriptions. Record v4 is the sole accepted/written format, with CRC-64/XZ
+and optional content type (`cmd/racer-dataplane/src/store/format.rs:19-20`). See
+[store protocol](racer-store-protocol.md) for record/checkpoint compatibility;
+neither client API version nor origin v1 determines disk compatibility.
 
 ## Telemetry and workload configuration
 
@@ -487,7 +525,7 @@ I/O failure. `errors.As` exposes kind/status; `errors.Is` traverses context and 
 causes, especially `context.Canceled`, `context.DeadlineExceeded`, and
 `io.ErrUnexpectedEOF`. Clean EOF remains bare `io.EOF`. Syntactically invalid
 arguments fail before network/filesystem access; range satisfiability without a
-trusted snapshot requires HEAD metadata. Errors contain no context header or payload.
+trusted snapshot is resolved in the subscription exchange. Errors contain no context header or payload.
 
 Provide `NewOriginError(kind ErrorKind, cause error) error` for callback failures;
 only documented origin kinds map to 400/401/403/404/412/416/431/500/502/503.
@@ -528,7 +566,9 @@ The following steps describe the original implementation sequence.
 
 ### Private protocol integration interface
 
-The step 2 implementation exposes these package-private seams for client/origin:
+The original step 2 implementation exposed these package-private seams, still
+used for origin v1 and sequential HEAD handling. Client body subscriptions instead
+use `subscription.go` for raw heads, frames, credit accounting, and release writes:
 
 - `readRawHead(*bufio.Reader, response)` reads at most 32 KiB and runs
   `validateRawHead`. Preserve that same buffered reader across head, body, and
@@ -555,18 +595,17 @@ The step 2 implementation exposes these package-private seams for client/origin:
 
 The installed guards in `pkg/racersdk/response_conn.go` and `origin_conn.go` use
 these building blocks before net/http normalization. They validate raw heads and
-account for sequential request/response boundaries and read-ahead without adding
-an object/page buffer. Parsed Header maps alone cannot enforce context separator
+account for sequential request/response boundaries and read-ahead. The replacement
+subscription reader intentionally adds credit-bounded page buffers. Parsed Header maps alone cannot enforce context separator
 whitespace or duplicate Content-Length; raw validation remains mandatory even
 when semantic validation is also applied to parsed objects.
 
 ### Acceptance checks (requirements, not results)
 
-These checks define verification requirements. The rewrite's final gates,
-including deployed containerd/Gantry/Rust E2E, passed on 2026-09-28; see the
-[dated acceptance summary](racer-sdk-verification.md). Historical reports alone
-do not establish that result. Measurement scope and limitations remain in
-[throughput performance](racer-sdk-throughput-performance.md).
+These checks define replacement-subscription verification requirements, not new
+passing results. The [dated acceptance summary](racer-sdk-verification.md) and
+[throughput performance](racer-sdk-throughput-performance.md) cover the prior
+contract and must not be reused as replacement performance or deployed acceptance.
 
 - Table tests and fuzzing for keys/names/ETags, expiry precision/overflow, private
   type zero values, ranges at 0, P-1, P, P+1, and MaxInt64; never panic or allocate
@@ -576,10 +615,13 @@ do not establish that result. Measurement scope and limitations remain in
   chunking/compression, unknown status/redirect, HEAD/body rules, and empty errors.
   Cover normalization by Go's parser, not just Header.Get-based validation.
 - Client request transcripts for empty, short page, exactly one page, multi-page,
-  unchanged credentials, and lazy cancellation.
-  Verify at most two GETs for full reads regardless of page count; no HEAD preflight.
-  Verify Stat is bodyless; snapshot ranges skip HEAD and all options-based ranges
-  skip bootstrap; empty pinned selections issue no GET. Check independent bulk,
+  unchanged credentials, and cancellation.
+  Verify one POST for full/ranged reads regardless of page count, no HEAD preflight,
+  and no GET fallback. Verify Stat is bodyless and empty objects validate Complete.
+  Check arbitrary page order, exact membership and slice offsets, duplicates,
+  missing/invalid Complete, page/byte credit waits, exact release, and Close races.
+  Verify Get forces ordering and DownloadTo uses absolute offsets and releases
+  leases on destination errors. Check independent bulk,
   metadata, and small-object queues under saturation and cancellation, oversized
   SmallObject rejection, and bounded scratch with blocked destination writers.
   Verify pin/size mismatch, 412/503, short body, late failure, expiry during read,
@@ -600,16 +642,17 @@ do not establish that result. Measurement scope and limitations remain in
   0, 4 KiB, P, and 1 GiB; concurrency 1 and 16; Read buffers 4 KiB/32 KiB/256 KiB
   and io.Copy. Report throughput, allocs/op, allocated bytes/op, peak live heap,
   and comparison to a bare stdlib Unix HTTP stream on the same host/toolchain.
-  Warm pools separately. SDK allocations must not scale with read-call count,
-  page count, or object length; live memory scales with configured concurrency
-  and fixed scratch/framing buffers. Verify no 16 MiB SDK allocation in profiles.
+  Warm reusable HEAD pools separately. Subscription connections are not reusable.
+  SDK cumulative payload allocations may scale with pages consumed; live payload
+  memory must remain bounded by negotiated credits and concurrency, plus bounded
+  scratch/framing and interval state. Full-page SDK allocations are expected.
   Use long steady-state streams to demonstrate a plateau, and run with slow
   destinations to verify backpressure rather than growing buffering. Record any
   throughput regression above 10% versus the same-buffer baseline for review;
   no hardware-independent absolute throughput promise is made.
 - Verify registry 206 boundaries and complete-200 fit rules, no per-page HEAD on
   the production adapter, no open-ended tail drain, consumer digest rejection,
-  typed metadata across peer/disk recovery, and progressing large Rust remainders
+  typed metadata across peer/disk recovery, and progressing large Rust subscriptions
   without refilling same-page retry budgets. Exercise deployed cold/warm pulls,
   resumes, concurrency, slow readers, restart/recovery, and failure paths with
   origin request/byte accounting. Scripted UDS results are not this E2E evidence.
@@ -617,11 +660,12 @@ do not establish that result. Measurement scope and limitations remain in
   commits. Run benchmarks with `go test ./pkg/racersdk -run '^$' -bench . -benchmem`.
   Documentation examples with Output run as Go tests; deployment-only examples
   are compile-checked without requiring Rust or `/run/racer` permissions.
-# Throughput integration addendum
+## Superseded throughput options
 
-`ClientConfig.PageWindow > 1` enables bounded concurrent page continuations with
-ordered delivery, cancellation, and shared connection admission. Zero retains
-the single pinned-remainder default described below. FD sinks may use Linux
-splice while updating the custom pool's body accounting; unsupported or wrapped
-bodies use the bounded copy path. See `racer-throughput-integration.md` for final
-compatibility decisions and verification.
+ClientConfig.PageWindow now sets default subscription page credits; zero selects
+two, and every subscription still owns one connection. PrefetchBootstrap remains
+an unused configuration field, not an alternate request path. The old concurrent
+GET window and SDK splice implementations have been removed. Historical results
+in [throughput integration](racer-throughput-integration.md) do not establish the
+replacement subscription's throughput (`pkg/racersdk/client.go:18-26,241-255`,
+`pkg/racersdk/subscription.go:72-99`, `pkg/racersdk/http_transfer.go:8-14`).

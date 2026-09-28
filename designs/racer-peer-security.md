@@ -1,7 +1,45 @@
-# Racer peer security v4
+# Racer peer security v5
 
-V4 supersedes v3 below: profile `racer-peer-v4`, outer version `4`, and
-`/racer/peer/v4/exchange`. Every original request additionally carries
+The current profile is `racer-peer-v5`, outer version `5`, and
+`/racer/peer/v5/exchange`. Subscribe carries an immutable object version and up to
+64 sorted, disjoint, nonadjacent half-open page intervals encoded as padded base64
+of consecutive big-endian u64 start/end pairs. `racer-subscription` is a 16-byte
+identifier, `racer-subscription-sequence` is canonical u64, and page/byte transfer
+ceilings are canonical u32/u64. The subscription sequence is distinct from the
+socket's `racer-sequence`; it participates in exact logical agreement.
+
+Selected responses retain the ordinary page envelope and additionally bind the
+subscription ID/sequence, receiving node, membership, absolute deadline and
+remaining page/byte ceilings to the exact signed request. A grant is for one page
+inside the signed demand, not blanket origin authority. Acquire selection is
+restricted to the provider's primary placement for the actual selected page;
+existing Fill revalidates candidate authority. CopyOnly never starts origin work.
+
+The receiving node aggregates local capacity-bearing demand and permits one owned
+selection per version. The provider shares acquisition across receiving nodes and
+one ciphertext allocation across responses. Credential rejections elect another
+supplier sequentially with its own request context and original budget. Request
+MAC keys and trust are rechecked before response completion. Existing socket
+sessions, retirement, reverse-path proofs and response binding remain mandatory.
+Older profiles fail closed; no downgrade or compatibility substitution is provided.
+
+Each Subscribe exchange returns at most one Selected page, not a persistent
+whole-object push stream. Receiving contracts are retained per
+version/membership/provider with monotonically increasing subscription sequences,
+nonrenewing deadlines, and conservatively decreasing transfer ceilings. Provider
+entries are keyed by receiving node/membership/ID, reject a second live ID for the
+same receiver/version/membership, and exclude completed pages. Client lease
+release does not replenish these peer transfer budgets. Provider defaults bound
+entries, completed intervals, acquisition owners, and pending/unconsumed responses
+independently (`cmd/racer-dataplane/src/read/subscription.rs:43-89`,
+`cmd/racer-dataplane/src/peer/subscriptions.rs:86-104,239-344,365-386`).
+See [replacement subscriptions](racer-hot-subscriptions.md) for the integrated
+selection/fanout contract and inspected regression scope. No survival across
+restart, disconnected-client resume, or cross-membership persistent demand is promised.
+
+## Request MAC and retained operations
+
+V5 retains the request MAC introduced in v4. Every original request carries
 `racer-mac-key` and `racer-request-mac` (canonical padded base64). The key ID
 selects a trusted OriginCredentials epoch. HMAC-SHA256 derives a request-only
 subkey over `racer/request-mac/key/v1\0`, u32-BE length-prefixed cache UID and
@@ -12,14 +50,14 @@ excluding Signature, Signature-Input and racer-request-mac. All identity,
 freshness and route fields are included; Ed25519 signs the MAC fields too.
 Existing certificate sessions, sequence checks, original/destination authority
 and forwarding proofs remain mandatory. Key retirement follows existing keyring
-admission. Mixed v3/v4 fails closed and requires coordinated upgrade.
+admission. Mixed older/v5 peers fail closed and require coordinated upgrade.
 
-Phase 4 is a coordinated dataplane upgrade. The signed profile is
-`racer-peer-v4`, outer version is `4`, and exchange target is
-`/racer/peer/v4/exchange`. Versions 1, 2, 3, and unknown versions are rejected before
+V5 is a coordinated dataplane upgrade. The signed profile is
+`racer-peer-v5`, outer version is `5`, and exchange target is
+`/racer/peer/v5/exchange`. Versions 1 through 4 and unknown versions are rejected before
 logical execution; there is no downgrade or silent Metadata/Page substitution.
 The existing v2 session endpoint and digest domain labels remain unchanged;
-session messages carry the v4 signed profile, so mixed-profile sessions fail closed.
+session messages carry the v5 signed profile, so mixed-profile sessions fail closed.
 
 `Bootstrap { object, mode }` is an explicit fresh metadata-plus-page-zero intent.
 Its signed response is `bootstrap`, with complete immutable metadata and
@@ -33,8 +71,10 @@ Bootstrap initially uses HTTP because the ETag used to choose an RDMA rail is no
 known until its response. Pinned page transfers retain native RDMA eligibility.
 
 The peer codecs are Rust-owned; repository inspection found no Go peer codec.
-Go SDK client/origin framing and control DTOs remain unchanged by this peer-only
-revision. No generated control artifacts or client API version changes are needed.
+The corresponding client body API is separately replaced by v2 POST subscriptions;
+origin v1 and control DTOs are unchanged. Bootstrap remains an internal peer/origin
+operation, not support for the old client GET contract. See
+[client/origin API](../cmd/racer-dataplane/CLIENT_ORIGIN_API.md).
 
 This document is owned by the security implementer. It defines the peer protocol,
 not the control HTTPS or SDK Unix-socket protocol. Implemented exported encoders
@@ -70,7 +110,7 @@ Use RFC 9421 signature-base construction and structured `Signature-Input` and
 `@status`. Cover every security/operation header in deterministic order. Reject
 duplicate fields, malformed structured fields, unsupported signature algorithms,
 unknown profile versions, and logical fields that disagree with the signed head.
-The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v4`.
+The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v5`.
 No body digest is used: the signed page envelope and AEAD tag protect page bytes.
 
 Signature components begin with request derived components in the order above (or
@@ -80,7 +120,7 @@ case-insensitively. Header values must be ASCII without leading/trailing whitesp
 The signature parameters have this exact canonical structured-field serialization:
 
 ```
-("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v4"
+("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v5"
 ```
 
 The base consists of RFC 9421 `"component": value` lines joined by LF, followed by
@@ -225,8 +265,10 @@ proofs, optional native control, framing, session ID, direction (0 client-to-ser
 1 server-to-client), and sequence (u64 starting at 1). Each direction accepts exactly
 the next sequence. Signature, certificate identity, receiver, session, and direction
 checks precede counter advancement. Forged high sequences cannot advance state.
-There is no sliding window, nonce set, expiry tree, node mutex, or peer registry.
-Memory is fixed per live/idle connection plus bounded handshake admissions.
+Socket sequence admission needs no sliding window, nonce set, or node-wide replay
+registry. Its memory is fixed per live/idle connection plus bounded handshake
+admissions. The separate subscription scheduler does use a bounded node-wide mutex
+and retained entries/tombstones; socket sessions do not replace that accounting.
 
 `HttpIo` verifies and admits the immediate-hop head on its owning socket before
 logical decoding or worker dispatch. Historical original/hop/control signatures
@@ -327,7 +369,7 @@ signatures must also enforce freshness/deadline validity, while sequence admissi
 is only for the fresh immediate-hop HTTP head. Immutable response descriptors must
 match the requested object/version/page, not only a self-consistent signed response.
 The canonical application target is `/racer/peer/v1`; the transport envelope uses
-`/racer/peer/v4/exchange`, with the original signed application head carried intact.
+`/racer/peer/v5/exchange`, with the original signed application head carried intact.
 
 Current compiler integration requests:
 

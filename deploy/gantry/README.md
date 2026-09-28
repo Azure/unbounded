@@ -229,7 +229,7 @@ remains `GANTRY_RACER_ENABLED=true`, set by the deployment profile, not a YAML
 | `racer_small_object_connections` | 4 | Reserved manifest/small-object connections and live Values |
 | `racer_small_object_queued_requests` | 128 | Independent small-object queue |
 | `racer_queue_timeout` | `5s` | Maximum wait for an admission slot |
-| `racer_response_header_timeout` | `60s` | SDK request-write bound, then response-head wait after request write |
+| `racer_response_header_timeout` | `60s` | Subscription POST write plus response-head wait on one deadline; HEAD retains separate write/head bounds |
 | `racer_origin_max_connections` | 128 | Accepted origin connections, including idle |
 | `racer_origin_concurrent_requests` | 64 | Active origin GET callbacks and bodies |
 | `racer_origin_concurrent_head_requests` | 4 | Separately reserved origin HEAD callbacks |
@@ -258,17 +258,22 @@ Capacity interpretation:
   capacity still apply; this is not an E2E success guarantee.
 - SmallObject checks the total object size, at most 16 MiB. A tiny range of a
   larger object does not qualify. Manifest GETs select this pool without a HEAD
-  preflight. Ordinary GETs use one bootstrap and at most one pinned remainder;
-  Go does not issue one request per page.
+  preflight. Gantry's ordinary HTTP GETs use one Racer v2 POST subscription through
+  the SDK's ordered Get adapter, not a client bootstrap/remainder GET sequence.
+  Go does not issue one request per page. Racer's origin socket still uses v1
+  HEAD and whole-page GET operations; do not change the origin adapter protocol.
 - SDK copy scratch is capped independently at 32 KiB times bulk plus small-object
   copy capacity: 2.125 MiB at defaults. Origin copy scratch is up to 2 MiB at the
-  default 64 GET callbacks. This is not a process memory estimate: add headers,
-  runtime, caller buffers, kernel sockets, and Rust's separately bounded pages.
+  default 64 GET callbacks. Subscription SDK payload memory is additional and
+  bounded by page/byte lease credits, defaulting to two pages and 32 MiB per live
+  subscription, allocated as slices arrive. This is not a process memory estimate:
+  add headers, runtime, caller buffers, kernel sockets, and Rust's bounded pages.
   Increasing queue depth permits more waiters, not more active throughput.
 - Tune against actual registry, Rust page/pipe, and node CPU/memory capacity.
   Rust defaults include `RACER_CLIENT_CONNECTIONS=128`,
   `RACER_ORIGIN_CONNECTIONS_PER_CACHE=8`, `RACER_PIPES=16`, and
-  `RACER_RANGE_WINDOW_PAGES=2`. These are dataplane environment settings, not
+  `RACER_RANGE_WINDOW_PAGES=2` for internal legacy range callers. V2 subscriptions
+  use negotiated page/byte credits instead of that window. These are dataplane environment settings, not
   Gantry YAML or ClusterCache fields (`cmd/racer-dataplane/src/config.rs:174-194`,
   `api/racer/v1alpha1/clustercache_types.go:18-21`).
 
@@ -276,16 +281,24 @@ For long objects, distinguish timeouts rather than increasing every limit.
 SDK body lifetime follows the caller's context. Gantry refreshes the downstream
 write deadline for each bounded write and final flush. Rust bounds initial
 metadata/first-page work with `RACER_REQUEST_TIMEOUT_MS` (default 30000), then
-new distinct pages in normal pinned ranges receive fixed child acquisition
+new distinct subscription selections receive fixed child acquisition
 deadlines; already admitted pages and retries do not renew their budgets.
 Client writes use `RACER_READER_STALL_TIMEOUT_MS` (default 10000), renewed only
 on positive socket progress. Explicit aggregate-budget and peer operations keep
 absolute deadlines. Origin RequestTimeout still caps each whole-page callback
-operation. A healthy long remainder may therefore exceed the initial request
+operation. A progressing client subscription may therefore exceed the initial request
 timeout, while a stalled page or consumer still fails
 (`internal/gantry/mirror/racer_io.go:25-54,99-126`,
 `cmd/racer-dataplane/src/read/range_stream.rs:30-65,223-315`,
 `cmd/racer-dataplane/src/memory/delivery.rs:153-205,261-265`).
+
+This client change is breaking: upgrade SDK consumers with the dataplane. Client
+GET/window bootstrap is not a supported fallback. Each subscription owns one
+connection and explicit page leases; the ordered SDK adapter releases consumed
+leases, while direct OpenPages users must call Release themselves. DownloadTo is
+available for absolute-offset io.WriterAt destinations. Completion validates a
+terminal frame; no automatic restart or object-version substitution occurs
+(`pkg/racersdk/client.go:241-255`, `pkg/racersdk/subscription.go:180-318`).
 
 ### Racer metrics
 

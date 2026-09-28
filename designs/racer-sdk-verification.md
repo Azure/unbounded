@@ -1,6 +1,19 @@
 # Racer SDK verification and measurements
 
-## Acceptance: VERIFIED (2026-09-28)
+## Historical acceptance: VERIFIED (2026-09-28)
+
+This acceptance predates [replacement subscriptions](racer-hot-subscriptions.md).
+The GET bootstrap/remainder/window and copy-performance results below do not
+validate the current v2 client wire protocol, page-lease memory bounds, or deployed
+subscription behavior. Origin v1 is unchanged. Preserve these results as evidence
+for their tested revision, not as new replacement acceptance.
+
+The current fixtures have since migrated to v2 subscriptions. The live Go SDK/Rust
+harness additionally defines 12 subtests, including a 512 MiB + 13 DownloadTo with
+two SDK page credits and a Rust 64 MiB plaintext-admission limit. See
+[current inspected assertions](racer-hot-subscriptions.md#evidence-and-validation-scope)
+for frame/credit, cleanup, cross-worker ownership, and fallback coverage. This
+source-level update does not add a test-run total to the historical report.
 
 All final gates passed for the approved high-throughput rewrite in the
 `tmp/racer-sdk-throughput` worktree. This records acceptance of the tested
