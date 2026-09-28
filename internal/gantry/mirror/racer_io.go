@@ -12,6 +12,10 @@ import (
 
 const racerWriteChunk = 32 * 1024
 
+// Socket transfers avoid scratch copying; amortize ReadFrom, deadline and pipe
+// setup over a larger bounded batch without changing fallback write granularity.
+const racerSocketChunk = 256 * 1024
+
 // RacerHTTPObservation reports actual downstream bytes, final HTTP status, and
 // handler duration. Aborted distinguishes incomplete responses after headers.
 type RacerHTTPObservation struct {
@@ -151,7 +155,7 @@ func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 		}
 
 		remaining := source.N
-		source.N = min(remaining, int64(racerWriteChunk))
+		source.N = min(remaining, int64(racerSocketChunk))
 		chunk := source.N
 		n, err := fast.ReadFrom(source)
 		consumed := chunk - source.N

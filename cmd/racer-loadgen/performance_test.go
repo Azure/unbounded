@@ -122,7 +122,7 @@ func TestRacerMixedPerformance(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
-	server := httptest.NewServer(mirror.New(cfg, nil, upstream, mirror.WithRacer(performanceObservedClient{Client: client, t: t})).Handler())
+	server := httptest.NewServer(mirror.RacerHTTPHandler(mirror.New(cfg, nil, upstream, mirror.WithRacer(performanceObservedClient{Client: client, t: t})).Handler(), cfg.RacerWriteTimeout, nil))
 	t.Cleanup(server.Close)
 	opts := pullTestOptions(server.URL)
 	opts.Namespace, opts.Concurrency, opts.LayerConcurrency, opts.Timeout = "loadgen.invalid", concurrency, 1, 60*time.Second

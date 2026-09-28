@@ -36,7 +36,7 @@ func TestRacerIOBoundedReadFrom(t *testing.T) {
 	for _, truncated := range []bool{false, true} {
 		w := &racerFastWriter{racerDeadlineWriter: &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
 		wrapped := &racerResponseWriter{ResponseWriter: w, timeout: time.Second}
-		length := 3*racerWriteChunk + 1
+		length := 3*racerSocketChunk + 1
 
 		advertised := length
 		if truncated {
