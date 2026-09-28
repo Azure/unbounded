@@ -383,6 +383,20 @@ fn lifecycle(size: usize, rotating: bool, paired: bool, operation: &str) {
 #[ignore = "release-only bounded crypto measurement; see designs/racer-crypto-performance.md"]
 fn crypto_measurement() {
     assert!(!cfg!(debug_assertions), "run with --release");
+    provenance();
+    for size in [63, 4095, 1024 * 1024, 16 * 1024 * 1024] {
+        for rotating in [false, true] {
+            primitive(size, rotating, false);
+            for paired in [false, true] {
+                for operation in ["encrypt", "decrypt", "bad_tag"] {
+                    lifecycle(size, rotating, paired, operation);
+                }
+            }
+        }
+    }
+}
+
+fn provenance() {
     println!(
         "CRYPTO_PROVENANCE {}",
         serde_json::json!({
@@ -397,16 +411,6 @@ fn crypto_measurement() {
             "cpuinfo": std::fs::read_to_string("/proc/cpuinfo").unwrap().lines().filter(|l| l.starts_with("model name") || l.starts_with("flags")).take(2).collect::<Vec<_>>(),
         })
     );
-    for size in [63, 4095, 1024 * 1024, 16 * 1024 * 1024] {
-        for rotating in [false, true] {
-            primitive(size, rotating, false);
-            for paired in [false, true] {
-                for operation in ["encrypt", "decrypt", "bad_tag"] {
-                    lifecycle(size, rotating, paired, operation);
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -416,6 +420,223 @@ fn crypto_measurement_inout() {
     for size in [63, 4095, 1024 * 1024, 16 * 1024 * 1024] {
         for rotating in [false, true] {
             primitive(size, rotating, true);
+        }
+    }
+}
+
+/// Full client submission, waiter registration, real paired execution, I/O reap,
+/// result delivery, and cleanup. Only attribution differs between the two modes.
+fn accounting_sample(size: usize, decrypt: bool, enabled: bool, iterations: usize) -> (u64, u64) {
+    use crate::telemetry::metrics::{Event::*, Metrics};
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = NonZeroUsize::new(512 * 1024 * 1024).unwrap();
+    limits.ciphertext_bytes = limits.plaintext_bytes;
+    let admission = Rc::new(Admission::new(limits));
+    let pool = BufferPool::new(admission.clone());
+    let keys = tests::keyring();
+    let page = page();
+    let cache = &page.version.object.cache;
+    let source = vec![7; size];
+    let descriptor = envelope(size);
+    let mut encrypted = source.clone();
+    XChaCha20Poly1305::new((&[7; 32]).into())
+        .encrypt_in_place(
+            (&descriptor.nonce.0).into(),
+            &page_aad(&descriptor).unwrap(),
+            &mut encrypted,
+        )
+        .unwrap();
+    let metrics = Metrics::default();
+    let (mut io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
+    io.attribution_disabled = !enabled;
+    let client = CryptoClient::new(io);
+    client.set_metrics(metrics.clone());
+    let environment = crate::runtime::environment::Environment::current();
+    let thread = std::thread::spawn(move || {
+        let _env = environment.enter();
+        while let Some(job) =
+            futures::executor::block_on(futures::future::poll_fn(|cx| engine.poll_job(cx))).unwrap()
+        {
+            assert!(engine.complete(PageCryptoEngine::process(job)).is_ok());
+        }
+    });
+    let scope = RequestScope::new(
+        RequestId([0; 16]),
+        crate::runtime::environment::now() + Duration::from_secs(240),
+    )
+    .unwrap();
+    let cpu = cpu_ns();
+    let start = Instant::now();
+    for batch in (0..iterations).step_by(8) {
+        let operations = (batch..(batch + 8).min(iterations)).map(|_| async {
+            let input = if decrypt {
+                CryptoInput::Decrypt {
+                    ciphertext: pool
+                        .ciphertext(
+                            admission
+                                .reserve(Some(cache), ResourceClass::Ciphertext, encrypted.len())
+                                .unwrap(),
+                            descriptor.clone(),
+                            encrypted.clone(),
+                        )
+                        .unwrap(),
+                    plaintext: admission
+                        .reserve(Some(cache), ResourceClass::Plaintext, size)
+                        .unwrap(),
+                }
+            } else {
+                let mut plaintext = pool
+                    .plaintext(
+                        admission
+                            .reserve(Some(cache), ResourceClass::Plaintext, size)
+                            .unwrap(),
+                        size,
+                    )
+                    .unwrap();
+                plaintext.bytes_mut().unwrap().copy_from_slice(&source);
+                CryptoInput::Encrypt {
+                    page: page.clone(),
+                    plaintext,
+                    ciphertext: admission
+                        .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
+                        .unwrap(),
+                }
+            };
+            let output = client
+                .execute(
+                    input,
+                    keys.active(cache, crate::security::keyring::KeyPurpose::Page)
+                        .unwrap(),
+                    &scope,
+                )
+                .await
+                .unwrap();
+            let (CryptoOutput::Encrypted(plain, cipher) | CryptoOutput::Decrypted(plain, cipher)) =
+                &output;
+            assert_eq!(plain.bytes().len(), size);
+            assert_eq!((plain.bytes()[0], plain.bytes()[size - 1]), (7, 7));
+            assert_eq!(cipher.bytes().len(), size + 16);
+            black_box(&output);
+            drop(output);
+        });
+        let mut all = Box::pin(futures::future::join_all(operations));
+        futures::executor::block_on(futures::future::poll_fn(|cx| {
+            client.register_driver(cx.waker());
+            client.poll_budgeted(8).unwrap();
+            std::future::Future::poll(all.as_mut(), cx)
+        }));
+    }
+    client.close_submissions().unwrap();
+    thread.join().unwrap();
+    admission.reclaim_buffers();
+    let elapsed = start.elapsed().as_nanos() as u64;
+    let cpu = cpu_ns() - cpu;
+    assert_eq!(client.outstanding(), 0);
+    assert!(client.waiters.borrow().is_empty());
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    let events = if decrypt {
+        [
+            CryptoDecryptStarted,
+            CryptoDecryptSuccess,
+            CryptoDecryptFailure,
+            CryptoDecryptBytes,
+            CryptoDecryptExecutionCount,
+            CryptoDecryptExecutionNs,
+            CryptoDecryptQueueCount,
+            CryptoDecryptQueueNs,
+        ]
+    } else {
+        [
+            CryptoEncryptStarted,
+            CryptoEncryptSuccess,
+            CryptoEncryptFailure,
+            CryptoEncryptBytes,
+            CryptoEncryptExecutionCount,
+            CryptoEncryptExecutionNs,
+            CryptoEncryptQueueCount,
+            CryptoEncryptQueueNs,
+        ]
+    };
+    for (event, expected) in events.into_iter().zip([
+        iterations as u64,
+        iterations as u64,
+        0,
+        (iterations * size) as u64,
+        iterations as u64,
+        metrics.count(events[5]),
+        iterations as u64,
+        metrics.count(events[7]),
+    ]) {
+        assert_eq!(metrics.count(event), if enabled { expected } else { 0 });
+    }
+    if enabled && crate::runtime::environment::simulation_seed().is_none() {
+        assert!(metrics.count(events[5]) > 0);
+        assert!(metrics.count(events[7]) > 0);
+    }
+    (elapsed, cpu)
+}
+
+#[test]
+fn attribution_toggle_preserves_client_cleanup_and_dst() {
+    use crate::runtime::environment::{self, SimulationClock};
+    let clock = SimulationClock::new(73);
+    let env = clock.environment(0);
+    let _env = env.enter();
+    let _strict = environment::require_simulated();
+    for enabled in [false, true] {
+        for decrypt in [false, true] {
+            accounting_sample(63, decrypt, enabled, 16);
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-only full-client attribution on/off comparison, eight alternating pairs"]
+fn crypto_attribution_overhead() {
+    assert!(!cfg!(debug_assertions), "run with --release");
+    provenance();
+    for size in [63, 16 * 1024 * 1024] {
+        let iterations = if size == 63 { 32768 } else { 16 };
+        for decrypt in [false, true] {
+            // Warm both paths before collecting samples; order alternates below.
+            for enabled in [false, true] {
+                accounting_sample(size, decrypt, enabled, if size == 63 { 512 } else { 8 });
+            }
+            let mut ratios = Vec::new();
+            for pair in 0..8 {
+                let mut samples = [(0, 0); 2];
+                for enabled in if pair % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let sample = accounting_sample(size, decrypt, enabled, iterations);
+                    samples[usize::from(enabled)] = sample;
+                    println!(
+                        "CRYPTO_ATTRIBUTION {}",
+                        serde_json::json!({
+                            "layer": "full_client_paired", "input": "reused", "bytes": size,
+                            "operation": if decrypt { "decrypt" } else { "encrypt" },
+                            "pair": pair, "instrumented_first": pair % 2 != 0,
+                            "instrumented": enabled, "iterations": iterations, "concurrency": 8,
+                            "cleanup_inclusive": true, "elapsed_ns": sample.0, "process_cpu_ns": sample.1,
+                            "success_bytes": iterations * size, "failures": 0
+                        })
+                    );
+                }
+                ratios.push((
+                    samples[1].0 as f64 / samples[0].0 as f64,
+                    samples[1].1 as f64 / samples[0].1 as f64,
+                ));
+            }
+            println!(
+                "CRYPTO_ATTRIBUTION_RATIOS {}",
+                serde_json::json!({
+                    "bytes": size, "operation": if decrypt { "decrypt" } else { "encrypt" },
+                    "on_over_off_elapsed_cpu": ratios
+                })
+            );
         }
     }
 }
