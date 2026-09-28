@@ -880,6 +880,7 @@ mod tests {
                 result.unwrap();
             }
             reader.join().unwrap();
+            admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }

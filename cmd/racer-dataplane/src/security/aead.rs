@@ -211,8 +211,9 @@ impl PageCryptoEngine {
                         return Err(Error::InvalidConfiguration);
                     }
                     let mut bytes =
-                        Zeroizing::new(Vec::with_capacity(envelope.ciphertext_length as usize));
-                    bytes.extend_from_slice(raw);
+                        Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
+                    bytes[..raw.len()].copy_from_slice(raw);
+                    bytes.truncate(raw.len());
                     cipher
                         .encrypt_in_place(XNonce::from_slice(&envelope.nonce.0), &aad, &mut *bytes)
                         .map_err(|_| Error::CorruptRecord)?;
@@ -241,7 +242,8 @@ impl PageCryptoEngine {
                     // Detached decryption allocates only plaintext-length storage,
                     // never an uncharged tag-sized tail under plaintext admission.
                     let length = envelope.plaintext_length as usize;
-                    let mut bytes = Zeroizing::new(ciphertext.bytes()[..length].to_vec());
+                    let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
+                    bytes.copy_from_slice(&ciphertext.bytes()[..length]);
                     let tag = chacha20poly1305::Tag::from_slice(&ciphertext.bytes()[length..]);
                     cipher
                         .decrypt_in_place_detached(

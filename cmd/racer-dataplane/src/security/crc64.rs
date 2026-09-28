@@ -88,4 +88,16 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn pclmul_hardware_path_executes_when_available() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("pclmulqdq") {
+                return;
+            }
+            let bytes = vec![0x5a; 16384];
+            assert_eq!(unsafe { pclmul(&bytes) }, portable(&bytes));
+            eprintln!("CRC64 hardware path executed: x86 PCLMULQDQ, ECMA-182");
+        }
+    }
 }

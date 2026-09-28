@@ -767,6 +767,150 @@ struct GatedMetadataOrigin {
     receive: RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>,
     calls: Cell<usize>,
 }
+
+struct BootstrapOrigin {
+    buffers: Rc<BufferPool>,
+    metadata: ObjectMetadata,
+    calls: Cell<usize>,
+    reject: Cell<bool>,
+    version: Cell<u8>,
+}
+impl Origin for BootstrapOrigin {
+    fn metadata<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: crate::model::metadata::MetadataSelector,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async { panic!("bootstrap must not HEAD") })
+    }
+    fn page<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        Box::pin(async { panic!("bootstrap must not refetch page") })
+    }
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        reservation: Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async move {
+            self.calls.set(self.calls.get() + 1);
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            if self.reject.replace(false) {
+                return Err(Error::OriginForbidden);
+            }
+            let version = self.version.get();
+            let mut metadata = self.metadata.clone();
+            metadata.version.etag = StrongEtag::test_value(&format!("v{version}"));
+            metadata.expires_at = ExpiresAt(std::time::UNIX_EPOCH);
+            let mut plaintext = self.buffers.plaintext(reservation, 3)?;
+            plaintext.bytes_mut()?.fill(version);
+            Ok(MetadataReply {
+                metadata: metadata.clone(),
+                page_zero: Some(OriginPage {
+                    metadata,
+                    plaintext,
+                }),
+            })
+        })
+    }
+}
+
+#[test]
+fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
+    use crate::model::metadata::MetadataSelector;
+    use crate::read::metadata::{BootstrapResult, MetadataDependencies, MetadataService};
+    let mut f = fixture();
+    let origin = Rc::new(BootstrapOrigin {
+        buffers: f.fill.dependencies.buffers.clone(),
+        metadata: f.origin.metadata.clone(),
+        calls: Cell::new(0),
+        reject: Cell::new(true),
+        version: Cell::new(1),
+    });
+    let service = MetadataService::new(
+        f.fill.dependencies.candidates.clone(),
+        origin.clone(),
+        f.fill.dependencies.peers.clone(),
+        f.fill.dependencies.credentials.clone(),
+        8,
+        MetadataDependencies {
+            index: Rc::new(Index::new(WorkerId(0), 8)),
+            fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+            owners: f.fill.dependencies.metadata_owner.clone(),
+        },
+    );
+    let second_scope = RequestScope::new(RequestId([93; 16]), f.scope.deadline.0).unwrap();
+    let second_context = OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let (a, b) = drive(
+        async {
+            futures::join!(
+                service.bootstrap(
+                    MetadataSelector::Fresh,
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope
+                ),
+                service.bootstrap(
+                    MetadataSelector::Fresh,
+                    f.membership.clone(),
+                    &second_context,
+                    &second_scope
+                )
+            )
+        },
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(matches!(a, Err(Error::OriginForbidden)));
+    let BootstrapResult::Page(first) = b.unwrap() else {
+        panic!("page")
+    };
+    assert_eq!(first.plaintext.bytes(), &[1; 3]);
+    assert_eq!(origin.calls.get(), 2);
+    origin.version.set(2);
+    let result = drive(
+        service.bootstrap(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &second_context,
+            &second_scope,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let BootstrapResult::Page(second) = result else {
+        panic!("page")
+    };
+    assert_eq!(second.plaintext.bytes(), &[2; 3]);
+    assert_eq!(second.metadata.version.etag, StrongEtag::test_value("v2"));
+    assert_eq!(first.plaintext.bytes(), &[1; 3]);
+    assert_eq!(first.metadata.version.etag, StrongEtag::test_value("v1"));
+    assert_eq!(origin.calls.get(), 3, "rejection was not negative-cached");
+}
 impl Origin for GatedMetadataOrigin {
     fn metadata<'a>(
         &'a self,

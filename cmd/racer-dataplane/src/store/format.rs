@@ -477,6 +477,7 @@ mod tests {
             assert_eq!(decoded.header.generation, Generation(9));
             assert_eq!(decoded.header.metadata, page.metadata.immutable());
         }
+        admission.reclaim_buffers();
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 

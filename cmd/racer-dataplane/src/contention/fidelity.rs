@@ -155,6 +155,7 @@ fn allocated_page(
 }
 
 fn occupancy(admission: &Admission) -> [usize; 3] {
+    admission.reclaim_buffers();
     [
         ResourceClass::Plaintext,
         ResourceClass::Ciphertext,

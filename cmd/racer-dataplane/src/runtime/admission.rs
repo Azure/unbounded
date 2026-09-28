@@ -57,6 +57,7 @@ pub struct Admission {
     active_caches: Arc<AtomicUsize>,
     retired_caches: Arc<Mutex<std::collections::VecDeque<CacheId>>>,
     stopped: Arc<AtomicBool>,
+    buffers: Arc<Mutex<Vec<(Vec<u8>, Reservation)>>>,
 }
 
 /// Ownership of a charge, released only when its last containing allocation dies.
@@ -66,8 +67,67 @@ pub struct Reservation {
     cache: Option<CacheId>,
     totals: Arc<Counters>,
     local: Option<Arc<Counters>>,
+    buffers: Weak<Mutex<Vec<(Vec<u8>, Reservation)>>>,
+    stopped: Arc<AtomicBool>,
 }
 impl Reservation {
+    /// Return only the final exclusive payload owner. The retained reservation
+    /// accounts for idle capacity; at most two buffers survive per worker.
+    pub(crate) fn recycle(&mut self, mut bytes: Vec<u8>) {
+        use zeroize::Zeroize;
+        bytes.zeroize();
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        if bytes.capacity() < 1024 * 1024 || bytes.capacity() > self.amount {
+            return;
+        }
+        let Some(pool) = self.buffers.upgrade() else {
+            return;
+        };
+        let Ok(mut pool) = pool.try_lock() else {
+            return;
+        };
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        if pool.len() >= 2 {
+            return;
+        }
+        let reservation = Reservation {
+            class: self.class,
+            amount: std::mem::take(&mut self.amount),
+            cache: self.cache.clone(),
+            totals: self.totals.clone(),
+            local: self.local.clone(),
+            buffers: Weak::new(),
+            stopped: self.stopped.clone(),
+        };
+        pool.push((bytes, reservation));
+    }
+    pub(crate) fn buffer(&self, length: usize) -> Result<Vec<u8>> {
+        if length > self.amount {
+            return Err(Error::InvalidConfiguration);
+        }
+        if let Some(pool) = self.buffers.upgrade() {
+            let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = pool
+                .iter()
+                .position(|(bytes, _)| bytes.capacity() == length)
+            {
+                let (mut bytes, old) = pool.swap_remove(index);
+                drop(old);
+                bytes.resize(length, 0);
+                return Ok(bytes);
+            }
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| Error::Overloaded)?;
+        bytes.resize(length, 0);
+        Ok(bytes)
+    }
     /// Release unused capacity only while the allocation owner is exclusive.
     /// Callers must retain at least the capacity of every live backing allocation.
     pub fn shrink(&mut self, amount: usize) -> Result<()> {
@@ -94,6 +154,8 @@ impl Reservation {
             cache: self.cache.clone(),
             totals: self.totals.clone(),
             local: self.local.clone(),
+            buffers: self.buffers.clone(),
+            stopped: self.stopped.clone(),
         })
     }
     pub fn amount(&self) -> usize {
@@ -160,6 +222,8 @@ impl ConnectionAdmission {
                 })
                 .map_err(|_| Error::Overloaded)?;
             Ok(Reservation {
+                buffers: Weak::new(),
+                stopped: self.stopped.clone(),
                 class,
                 amount: 1,
                 cache: None,
@@ -213,6 +277,7 @@ impl Admission {
             active_caches: Arc::new(AtomicUsize::new(0)),
             retired_caches: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             stopped: Arc::new(AtomicBool::new(false)),
+            buffers: Arc::new(Mutex::new(Vec::new())),
         }
     }
     pub fn limits(&self) -> &Limits {
@@ -220,6 +285,7 @@ impl Admission {
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        self.reclaim_buffers();
         self.totals.wake.wake();
     }
     pub fn is_stopped(&self) -> bool {
@@ -306,7 +372,12 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        self.reserve_inner(cache, class, amount, false)
+        let result = self.reserve_inner(cache, class, amount, false);
+        if matches!(result, Err(Error::Overloaded)) {
+            self.reclaim_buffers();
+            return self.reserve_inner(cache, class, amount, false);
+        }
+        result
     }
     /// Only for already-admitted work during drain. Does not bypass byte/count
     /// bounds; callers must not use this entry point to accept new requests.
@@ -316,7 +387,26 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        self.reserve_inner(cache, class, amount, true)
+        let result = self.reserve_inner(cache, class, amount, true);
+        if matches!(result, Err(Error::Overloaded)) {
+            self.reclaim_buffers();
+            return self.reserve_inner(cache, class, amount, true);
+        }
+        result
+    }
+    pub fn retained_buffer_bytes(&self) -> usize {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, reservation)| reservation.amount())
+            .sum()
+    }
+    pub fn reclaim_buffers(&self) {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
     fn reserve_inner(
         &self,
@@ -400,6 +490,8 @@ impl Admission {
             cache: cache.cloned(),
             totals: self.totals.clone(),
             local,
+            buffers: Arc::downgrade(&self.buffers),
+            stopped: self.stopped.clone(),
         })
     }
     /// All allocation dimensions are acquired together; failure rolls back every charge.
@@ -428,6 +520,31 @@ impl Admission {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recycled_payload_capacity_stays_admitted_zeroed_and_reclaimable() {
+        use super::*;
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let cache = CacheId("pool".into());
+        let mut reservation = admission
+            .reserve(Some(&cache), ResourceClass::Plaintext, 1024 * 1024)
+            .unwrap();
+        let mut bytes = reservation.buffer(1024 * 1024).unwrap();
+        let pointer = bytes.as_ptr();
+        bytes.fill(87);
+        reservation.recycle(bytes);
+        drop(reservation);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 1024 * 1024);
+        let reservation = admission
+            .reserve(Some(&cache), ResourceClass::Plaintext, 1024 * 1024)
+            .unwrap();
+        let bytes = reservation.buffer(1024 * 1024).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert!(bytes.iter().all(|b| *b == 0));
+        assert_eq!(admission.used(ResourceClass::Plaintext), 1024 * 1024);
+        drop((bytes, reservation));
+        assert_eq!(admission.retained_buffer_bytes(), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
     use super::*;
     #[test]
     fn ingress_saturation_preserves_outbound_and_control_without_raising_total() {

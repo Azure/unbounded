@@ -262,6 +262,7 @@ impl MemoryCache {
                 .saturating_add(entry.ciphertext.inner.reservation.amount());
             entries.remove(&id);
         }
+        self.pool.reclaim_buffers();
         Ok(released)
     }
     /// One bounded LRU pass, counting only the exhausted class. The callback may

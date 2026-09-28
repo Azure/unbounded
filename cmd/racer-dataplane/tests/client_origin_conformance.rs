@@ -943,6 +943,7 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
     });
     let raw = reader.join().unwrap();
     assert_eq!(rig.reactor.in_flight(), 0);
+    rig.admission.reclaim_buffers();
     for class in [
         ResourceClass::Plaintext,
         ResourceClass::Ciphertext,

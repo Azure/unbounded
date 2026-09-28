@@ -1884,6 +1884,7 @@ mod tests {
     }
 
     fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePool) {
+        fixture.listeners.admission.reclaim_buffers();
         use crate::model::limits::ResourceClass;
         assert_eq!(fixture.listeners.active_connections(), 0);
         assert_eq!(

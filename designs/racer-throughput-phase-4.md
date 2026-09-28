@@ -40,8 +40,28 @@ Latest bounded commands (each preceded by
 - `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet`:
   14 passed, zero failures/ignores, 113.82 s.
 
-Still in progress: page allocation recycling and expanded Bootstrap-specific
-credential/version-mutation tests. No full Phase 4 completion is claimed yet.
+`4e0029a3` committed CRC64 records, v4 request MACs and HTTP staging recycling.
+Page allocations now return from the final VerifiedBytes/CiphertextBytes owner to
+a two-entry worker admission pool. Idle capacity remains charged; allocations
+are zeroized before return, geometry must match on reuse, and pressure/stop
+reclaims retained capacity. Crypto inputs and origin buffers obtain their backing
+from the same pool. A stop/return race is fenced by the stopped flag recheck under
+the pool lock. Existing completion ownership prevents kernel or crypto reuse
+before final release. The minimum retained allocation is 1 MiB, avoiding pooling
+tiny objects; there is no uncharged payload RSS pool.
+
+Expanded Bootstrap tests coalesce two callers, reject the elected supplier with
+403, re-elect the independent caller, then change origin ETag/data. They require
+the original page to remain v1, the new page to be wholly v2, exact origin counts,
+no HEAD/refetch, and no incorrect negative cache. Corrupt-prefetch fallback and
+the four-Application noncandidate/empty/bodyless-HEAD checks remain in place.
+
+Latest follow-up results (same external timeout prefix): library 754 passed/seven
+ignores (59.95 s); production 13 passed/two ignores (7.75 s); conformance 19
+passed/one ignore (0.26 s); all 14 strict process tests passed (103.43 s).
+`cargo test --locked --all-features --lib pclmul_hardware -j 2 -- --nocapture`
+passed and explicitly reported execution of x86 PCLMULQDQ on this host. This is
+instruction-path correctness evidence, not a CRC throughput benchmark.
 
 ## Authority and execution
 

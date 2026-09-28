@@ -47,6 +47,11 @@ pub(crate) struct VerifiedBytes {
     pub bytes: Vec<u8>,
     pub reservation: Reservation,
 }
+impl Drop for VerifiedBytes {
+    fn drop(&mut self) {
+        self.reservation.recycle(std::mem::take(&mut self.bytes));
+    }
+}
 #[derive(Clone)]
 pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
@@ -56,6 +61,11 @@ pub(crate) struct CiphertextBytes {
     pub envelope: PageEnvelope,
     pub bytes: Vec<u8>,
     pub reservation: Reservation,
+}
+impl Drop for CiphertextBytes {
+    fn drop(&mut self) {
+        self.reservation.recycle(std::mem::take(&mut self.bytes));
+    }
 }
 impl BufferPool {
     pub fn new(admission: Rc<Admission>) -> Self {
@@ -75,11 +85,7 @@ impl BufferPool {
             length,
             reservation.cache(),
         )?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| Error::Overloaded)?;
-        bytes.resize(length, 0);
+        let bytes = reservation.buffer(length)?;
         let bytes = bytes.into_boxed_slice();
         reservation.shrink(bytes.len())?;
         Ok(PlaintextBuffer { bytes, reservation })
@@ -112,6 +118,9 @@ impl BufferPool {
     }
     pub(super) fn entry_limit(&self) -> usize {
         self.admission.limits().metadata_entries.get()
+    }
+    pub(super) fn reclaim_buffers(&self) {
+        self.admission.reclaim_buffers();
     }
     fn validate_reservation(
         &self,
@@ -272,6 +281,17 @@ pub(crate) mod tests {
             plaintext,
             ciphertext,
         }
+    }
+    #[test]
+    fn persisted_crc_rejects_payload_corruption_independently_of_structural_validation() {
+        let admission = admission(8);
+        let mut page = bundle(&admission, "crc");
+        let checksum = page.ciphertext.checksum();
+        assert_eq!(page.ciphertext.verify_checksum(), Ok(()));
+        Arc::get_mut(&mut page.ciphertext.inner).unwrap().bytes[0] ^= 1;
+        assert!(page.validate_metadata().is_ok());
+        assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
+        assert_eq!(*page.ciphertext.inner.checksum.get().unwrap(), checksum);
     }
     #[test]
     fn plaintext_is_stable_zeroed_and_reservation_backed() {
