@@ -47,9 +47,21 @@ func (v *Value) writeHTTPBody(w io.Writer) (int64, bool, error) {
 		return 0, false, nil
 	}
 
-	reader := &io.LimitedReader{R: source, N: v.remaining}
+	// Bound each raw transfer so its read deadline is renewed between chunks.
+	// Clear the deadline before returning control to a potentially slow caller.
+	reader := &io.LimitedReader{R: source, N: min(v.remaining, 256*1024)}
 	before := reader.N
+
+	if err := body.beginRead(); err != nil {
+		v.finish(ioFailure("HTTP transfer deadline", err))
+		return 0, true, v.err()
+	}
+
 	n, err := rf.ReadFrom(reader)
+	if clearErr := body.endRead(); err == nil {
+		err = clearErr
+	}
+
 	consumed := before - reader.N
 
 	body.mu.Lock()

@@ -195,7 +195,16 @@ func (b *responseBody) Read(p []byte) (int, error) {
 	}
 
 	p = p[:min(int64(len(p)), remaining)]
+
+	if err := b.beginRead(); err != nil {
+		return 0, err
+	}
+
 	n, err := b.conn.reader.Read(p)
+	if clearErr := b.endRead(); err == nil {
+		err = clearErr
+	}
+
 	b.client.stats.bytesRead.Add(uint64(n))
 	b.mu.Lock()
 
@@ -210,6 +219,14 @@ func (b *responseBody) Read(p []byte) (int, error) {
 	b.mu.Unlock()
 
 	return n, err
+}
+
+func (b *responseBody) beginRead() error {
+	return b.conn.SetReadDeadline(time.Now().Add(b.client.config.BodyReadTimeout))
+}
+
+func (b *responseBody) endRead() error {
+	return b.conn.SetReadDeadline(time.Time{})
 }
 
 func (b *responseBody) Close() error {

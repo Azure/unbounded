@@ -86,6 +86,10 @@ func spliceBody(ctx context.Context, source *responseBody, sink *FDSink, length 
 			callErr error
 		)
 
+		if err := source.beginRead(); err != nil {
+			return sent, true, err
+		}
+
 		err := input.Read(func(fd uintptr) bool {
 			for {
 				count, callErr = unix.Splice(int(fd), nil, pipe[1], nil, int(min(length-sent, 64*1024)), unix.SPLICE_F_NONBLOCK)
@@ -96,6 +100,10 @@ func spliceBody(ctx context.Context, source *responseBody, sink *FDSink, length 
 				return !errors.Is(callErr, unix.EAGAIN)
 			}
 		})
+		if clearErr := source.endRead(); err == nil {
+			err = clearErr
+		}
+
 		if err != nil {
 			return sent, true, err
 		}

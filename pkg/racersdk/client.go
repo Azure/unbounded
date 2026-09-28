@@ -39,6 +39,9 @@ type ClientConfig struct {
 	DialTimeout time.Duration
 	// ResponseHeaderTimeout starts after request headers are written (default 60 seconds).
 	ResponseHeaderTimeout time.Duration
+	// BodyReadTimeout bounds one body read or bounded socket-transfer chunk
+	// (default 60 seconds), not the total object lifetime or caller think time.
+	BodyReadTimeout time.Duration
 	// IdleConnTimeout bounds pooled idle connections (default 90 seconds).
 	IdleConnTimeout time.Duration
 	// MaxConnAge bounds connection reuse (default 5 minutes). Each successful dial
@@ -88,7 +91,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		return nil, err
 	}
 
-	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 || config.MaxConnAge < 0 {
+	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.BodyReadTimeout < 0 || config.IdleConnTimeout < 0 || config.MaxConnAge < 0 {
 		return nil, failure(ErrorInvalidArgument, "client config", nil)
 	}
 
@@ -126,6 +129,10 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 
 	if config.ResponseHeaderTimeout == 0 {
 		config.ResponseHeaderTimeout = 60 * time.Second
+	}
+
+	if config.BodyReadTimeout == 0 {
+		config.BodyReadTimeout = 60 * time.Second
 	}
 
 	if config.IdleConnTimeout == 0 {
