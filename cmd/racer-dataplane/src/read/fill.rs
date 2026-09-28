@@ -530,7 +530,7 @@ impl Fill {
         let candidates = self
             .dependencies
             .candidates
-            .candidates_async(membership, &page.version.object, page.number)
+            .candidates_scoped(membership, &page.version.object, page.number, scope)
             .await?;
         if !self.dependencies.candidates.is_candidate(&candidates) {
             return Err(Error::Unauthorized);
@@ -624,12 +624,6 @@ impl Fill {
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
         scope.check()?;
-        let candidates = self
-            .dependencies
-            .candidates
-            .candidates_async(membership, &page.version.object, page.number)
-            .await?;
-        let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
         let plaintext = if want_plaintext {
@@ -704,6 +698,12 @@ impl Fill {
         } else {
             drop(plaintext);
         }
+        let candidates = self
+            .dependencies
+            .candidates
+            .candidates_scoped(membership, &page.version.object, page.number, scope)
+            .await?;
+        let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
         let mut plaintext = if want_plaintext {

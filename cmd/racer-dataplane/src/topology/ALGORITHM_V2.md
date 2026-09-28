@@ -37,9 +37,11 @@ Cache-only publications reuse that allocation. Existing operation leases keep ol
 generations usable; the control publication owner admits at most the configured
 old-generation limit plus the current generation. Its sole incoming-version registry
 holds weak references; outgoing routes and endpoints use operation leases directly.
-Topology caches hold only weak snapshot
-references. A cache identity includes the immutable allocation, preventing
-accidental reuse across different snapshots with the same version counter.
+Route caches hold weak snapshot references. Placement cache identity is a local
+SHA-256 digest of sorted length-prefixed Node IDs and big-endian u32 shares,
+under `racer/placement-identity/v1\0`. It excludes routing fields and counters.
+Rankings contain numeric positions, never snapshot owners; equal placement
+identity reuses work while returning the caller's current routing lease.
 
 ## Canonical encoding and slots
 
@@ -80,14 +82,20 @@ only the best three distinct members. Complexity is O(N) with O(1) score
 storage, independent of shares; no virtual-node expansion exists. Finite hash
 precision and the specified fixed-point truncation define the distribution.
 
-The bounded FIFO ranking cache contains at most its configured number of
-slots. Active entries cannot be evicted: if all entries are active, a new
-cold slot fails `Overloaded`. `rank_async` shares partially completed work
-for a resident snapshot/slot, hashes at most 256 members per poll, and yields.
+The bounded FIFO ranking cache charges a conservative 512 bytes per retained
+slot, including four-score capacity, indexes and allocation overhead. Production
+defaults to a 16 MiB aggregate placement budget, partitioned across workers.
+Active entries cannot be evicted; eviction examines at most 64 entries per call.
+`rank_scoped` shares partially completed work for a resident placement/slot,
+checks cancellation/deadline, hashes at most 256 members per poll, and yields.
+Small membership changes retain up to 64 index edits prepared outside publication
+locks. Demand updates retained exact ranks for additions, nonwinner removals and
+improved winner shares. Removing/worsening a winner triggers an exact cold scan.
+Larger changes likewise recompute on demand, never precomputing all slots.
 Cancellation releases active admission; a later request can resume progress.
 Capacity zero explicitly disables caching/coalescing. The synchronous `rank`
 method is for callers that can budget the complete O(N) computation; reactor
-paths should use `rank_async` and check their request scope around it.
+paths use `rank_scoped` with their original request scope.
 
 ## Graph and bounded shortest paths
 

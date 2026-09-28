@@ -190,7 +190,8 @@ is no replay-entry capacity setting. MiB means 1048576 bytes.
 | `RACER_PIPES` | `16` | 65536 |
 | `RACER_RANGE_WINDOW_PAGES` | `2` | 64 |
 | `RACER_HEADER_BYTES` | `32768` | 32768 |
-| `RACER_CACHED_RANKINGS` | `128` | 1048576 |
+| `RACER_PLACEMENT_CACHE_BYTES` | `16777216` | 536870912; aggregate conservative 512-byte ranking charges, divided among workers |
+| `RACER_CACHED_RANKINGS` | derived from placement bytes / 512 | 1048576; legacy explicit entry override |
 | `RACER_CACHED_PATHS` | `128` | 1048576 |
 | `RACER_RETAINED_SNAPSHOTS` | `2` | 64 |
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |

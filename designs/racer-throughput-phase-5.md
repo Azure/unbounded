@@ -146,4 +146,33 @@ unverified unless measured explicitly. Do not report scaffolding as completion.
 
 ## Execution results
 
-Plan committed before source changes. Implementation and verification pending.
+Plan committed before source changes as `81396ff3`.
+
+### Placement increment
+
+Placement identity now excludes routing fields, retains compact numeric rankings
+without snapshot ownership, and returns current routing leases on reuse. A 16 MiB
+aggregate memory-derived default replaces 128 tiny entries. Eviction examines at
+most 64 entries. Prepared memberships retain at most 64 edits for demand-driven
+exact maintenance: additions/nonwinner removals/improved winners update retained
+ranks; missing/worsened winners and larger deltas take cooperative cold scans.
+Local queued/disk reads precede remote ranking; all production CandidatePolicy
+callers pass scope into ranking. Algorithm arithmetic/vectors are unchanged.
+
+Commands from `cmd/racer-dataplane`, all tests preceded by the mandatory external
+timeout prefix:
+
+- `cargo fmt`: passed.
+- `cargo test --locked --all-features --lib topology::placement -j 2 -- --test-threads=2 --quiet`:
+  nine passed, including 100k endpoint reuse, cancellation and churn/cold oracle.
+- First full library: 756 passed, one failure, seven ignores. Scoped ranking had
+  retained a completed operation's cancellation waker, spuriously marking the
+  acquisition driver runnable. Changed to an operation-owned subscription that
+  unregisters on completion. No test/assertion was removed or weakened.
+- `cargo test --locked --all-features --lib blocked_metadata_leader_and_follower -j 2 -- --test-threads=1 --quiet`:
+  one passed after the subscription fix.
+- `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
+  final 757 passed, zero failed, seven ignores (58.43 s). No timeout fired.
+
+Remaining: actual 100k traffic/update latency gate, bounded warming beyond
+on-demand maintenance, full control/storage obligations, exit suites and merge.

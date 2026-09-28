@@ -1,7 +1,7 @@
 //! Canonical slot encoding and weighted rendezvous ranking of up to three nodes.
 //!
 //! Freeze hash, integer arithmetic, and tie vectors before interoperability work.
-//! Coalesce O(N) cold rankings under a CPU budget and cache by membership version.
+//! Coalesce O(N) cold rankings under a CPU budget and cache by placement identity.
 use super::{
     hash,
     membership::{Membership, MembershipLease},
@@ -15,12 +15,14 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     rc::Rc,
-    sync::{Arc, Weak},
     task::Poll,
 };
 
 pub const SLOT_COUNT: u32 = 1 << 20;
 const WORK_QUANTUM: usize = 256;
+/// Conservative allocation charge: ranking, four scores, Rc/RefCell, BTree
+/// entry and FIFO key, including container slack and allocator overhead.
+pub const RANKING_BYTES: usize = 512;
 
 pub struct Placement {
     capacity: usize,
@@ -32,7 +34,7 @@ pub struct Candidates {
     pub ordered: Vec<NodeId>,
 }
 
-type CacheKey = (usize, u32);
+type CacheKey = ([u8; 32], u32);
 #[derive(Default)]
 struct RankingCache {
     entries: BTreeMap<CacheKey, Rc<RefCell<Ranking>>>,
@@ -40,7 +42,6 @@ struct RankingCache {
 }
 
 struct Ranking {
-    membership: Weak<Membership>,
     cursor: usize,
     best: Vec<Score>,
 }
@@ -89,28 +90,79 @@ fn exponential_cost(sample: u64) -> u64 {
 }
 
 impl Ranking {
+    fn score(membership: &Membership, slot: u32, index: usize) -> Score {
+        let member = &membership.members()[index];
+        let mut digest = hash::domain(b"racer/hrw/v1\0");
+        digest.update(slot.to_be_bytes());
+        hash::bytes(&mut digest, member.node.0.as_bytes());
+        let digest = hash::finish(digest);
+        Score {
+            node: index,
+            cost: exponential_cost(u64::from_be_bytes(digest[..8].try_into().unwrap())),
+            shares: member.shares.get(),
+        }
+    }
+    fn insert(&mut self, score: Score) {
+        let position = self.best.partition_point(|old| old.compare(&score).is_lt());
+        if position < 3 {
+            self.best.insert(position, score);
+            self.best.truncate(3);
+        }
+    }
+    fn updated(&self, membership: &Membership, slot: u32) -> Option<Self> {
+        let delta = membership.placement_delta.as_ref()?;
+        if self.cursor != delta.old_count {
+            return None;
+        }
+        let mut next = Self {
+            cursor: membership.members().len(),
+            best: Vec::with_capacity(4),
+        };
+        for old in &self.best {
+            if let Some((_, new)) = delta
+                .changes
+                .iter()
+                .find(|(index, _)| *index == Some(old.node))
+            {
+                let new = (*new)?;
+                let score = Self::score(membership, slot, new);
+                // A worse retained winner may expose an unretained fourth node.
+                if score.shares < old.shares {
+                    return None;
+                }
+                next.insert(score);
+            } else {
+                let removed = delta
+                    .changes
+                    .iter()
+                    .filter(|(a, b)| b.is_none() && a.is_some_and(|a| a < old.node))
+                    .count();
+                let base = old.node - removed;
+                let mut node = base;
+                for (_, added) in delta.changes.iter().filter(|(a, _)| a.is_none()) {
+                    if added.is_some_and(|added| added <= node) {
+                        node += 1;
+                    }
+                }
+                next.insert(Score { node, ..*old });
+            }
+        }
+        for (_, new) in &delta.changes {
+            if let Some(index) = new {
+                if !next.best.iter().any(|score| score.node == *index) {
+                    next.insert(Self::score(membership, slot, *index));
+                }
+            }
+        }
+        Some(next)
+    }
     fn advance(&mut self, membership: &Membership, slot: u32, work: usize) {
         let end = self
             .cursor
             .saturating_add(work)
             .min(membership.members().len());
         for index in self.cursor..end {
-            let member = &membership.members()[index];
-            let mut digest = hash::domain(b"racer/hrw/v1\0");
-            digest.update(slot.to_be_bytes());
-            hash::bytes(&mut digest, member.node.0.as_bytes());
-            let digest = hash::finish(digest);
-            let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
-            let score = Score {
-                node: index,
-                cost: exponential_cost(sample),
-                shares: member.shares.get(),
-            };
-            let position = self.best.partition_point(|old| old.compare(&score).is_lt());
-            if position < 3 {
-                self.best.insert(position, score);
-                self.best.truncate(3);
-            }
+            self.insert(Self::score(membership, slot, index));
         }
         self.cursor = end;
     }
@@ -136,31 +188,43 @@ impl Placement {
         }
     }
 
+    pub fn with_memory_budget(bytes: usize) -> Self {
+        Self::new(bytes / RANKING_BYTES)
+    }
+
     fn ranking(&self, membership: &MembershipLease, slot: u32) -> Result<Rc<RefCell<Ranking>>> {
-        let key = (Arc::as_ptr(membership) as usize, slot);
+        let key = (membership.placement_identity(), slot);
         let mut cache = self.cache.borrow_mut();
         if let Some(ranking) = cache.entries.get(&key) {
-            // Weak ownership prevents pointer reuse, and never pins old snapshots.
-            if ranking.borrow().membership.upgrade().is_some() {
-                return Ok(ranking.clone());
-            }
+            return Ok(ranking.clone());
         }
-        let ranking = Rc::new(RefCell::new(Ranking {
-            membership: Arc::downgrade(membership),
+        let updated = membership.placement_delta.as_ref().and_then(|delta| {
+            cache
+                .entries
+                .get(&(delta.base, slot))?
+                .borrow()
+                .updated(membership, slot)
+        });
+        let ranking = Rc::new(RefCell::new(updated.unwrap_or_else(|| Ranking {
             cursor: 0,
             best: Vec::with_capacity(4),
-        }));
+        })));
         if self.capacity == 0 {
             return Ok(ranking);
         }
         if cache.entries.len() == self.capacity {
-            let victim = cache
-                .fifo
-                .iter()
-                .position(|key| Rc::strong_count(&cache.entries[key]) == 1)
-                .ok_or(Error::Overloaded)?;
-            let key = cache.fifo.remove(victim).unwrap();
-            cache.entries.remove(&key);
+            // Rotate busy entries instead of scanning the entire working set.
+            for _ in 0..cache.fifo.len().min(64) {
+                let key = cache.fifo.pop_front().unwrap();
+                if Rc::strong_count(&cache.entries[&key]) == 1 {
+                    cache.entries.remove(&key);
+                    break;
+                }
+                cache.fifo.push_back(key);
+            }
+            if cache.entries.len() == self.capacity {
+                return Err(Error::Overloaded);
+            }
         }
         cache.fifo.push_back(key);
         cache.entries.insert(key, ranking.clone());
@@ -188,10 +252,32 @@ impl Placement {
         object: &ObjectId,
         page: PageNumber,
     ) -> Operation<'a, Candidates> {
+        self.rank_scoped(membership, object, page, None)
+    }
+
+    pub fn rank_scoped<'a>(
+        &'a self,
+        membership: MembershipLease,
+        object: &ObjectId,
+        page: PageNumber,
+        scope: Option<&'a crate::runtime::deadline::RequestScope>,
+    ) -> Operation<'a, Candidates> {
         let slot = slot(object, page);
         Box::pin(async move {
+            if let Some(scope) = scope {
+                scope.check()?;
+            }
+            let cancellation = scope
+                .map(|scope| scope.cancellation.subscribe())
+                .transpose()?;
             let ranking = self.ranking(&membership, slot)?;
             std::future::poll_fn(|cx| {
+                if let Some(scope) = scope {
+                    if let Some(cancellation) = &cancellation {
+                        cancellation.register(cx.waker());
+                    }
+                    scope.check()?;
+                }
                 let mut ranking = ranking.borrow_mut();
                 ranking.advance(&membership, slot, WORK_QUANTUM);
                 if ranking.cursor == membership.members().len() {
@@ -219,6 +305,7 @@ mod tests {
             membership::Membership,
         },
     };
+    use std::sync::Arc;
 
     #[test]
     fn golden_slot_and_weighted_ranking_vectors() {
@@ -383,7 +470,6 @@ mod tests {
         let mut counts = [0usize; 3];
         for slot in 0..20_000 {
             let mut ranking = Ranking {
-                membership: Arc::downgrade(&members),
                 cursor: 0,
                 best: vec![],
             };
@@ -407,6 +493,103 @@ mod tests {
                 .unwrap()
                 .ordered[0],
             member(0, 1).node
+        );
+    }
+
+    #[test]
+    fn incremental_demand_maintenance_matches_cold_oracle_under_churn() {
+        let placement = Placement::with_memory_budget(512 * RANKING_BYTES);
+        let oracle = Placement::new(0);
+        let mut old = membership(80);
+        for generation in 2..42 {
+            for page in 0..40 {
+                placement
+                    .rank(old.clone(), &object(), PageNumber(page))
+                    .unwrap();
+            }
+            let mut members = old.members().to_vec();
+            members.remove(generation as usize % members.len());
+            members.push(member(100 + generation as usize, 4));
+            members[generation as usize % 10].shares =
+                std::num::NonZeroU32::new(generation % 7 + 1).unwrap();
+            let next = Arc::new(
+                Membership::validate(MembershipVersion(generation as u64), members)
+                    .unwrap()
+                    .with_predecessor(&old),
+            );
+            for page in 0..40 {
+                assert_eq!(
+                    placement
+                        .rank(next.clone(), &object(), PageNumber(page))
+                        .unwrap()
+                        .ordered,
+                    oracle
+                        .rank(next.clone(), &object(), PageNumber(page))
+                        .unwrap()
+                        .ordered,
+                    "generation {generation} page {page}"
+                );
+            }
+            old = next;
+        }
+    }
+
+    #[test]
+    fn endpoint_epoch_reuses_completed_rank_and_returns_current_routing() {
+        let placement = Placement::with_memory_budget(RANKING_BYTES);
+        let old = membership(100_000);
+        let expected = placement
+            .rank(old.clone(), &object(), PageNumber(0))
+            .unwrap();
+        let mut nodes = old.members().to_vec();
+        for node in &mut nodes {
+            node.peer_endpoint = "[::1]:9090".into();
+            node.alignment_enabled = false;
+        }
+        let current = Arc::new(Membership::validate(MembershipVersion(2), nodes).unwrap());
+        assert_eq!(old.placement_identity(), current.placement_identity());
+        let mut future = placement.rank_async(current.clone(), &object(), PageNumber(0));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(actual)) = future.as_mut().poll(&mut cx) else {
+            panic!("endpoint-only change must not perform another cold ranking");
+        };
+        assert_eq!(actual.ordered, expected.ordered);
+        assert!(Arc::ptr_eq(&actual.membership, &current));
+        assert_eq!(placement.cached_rankings(), 1);
+        drop(old);
+        drop(expected);
+        assert_eq!(placement.cached_rankings(), 1);
+    }
+
+    #[test]
+    fn scoped_cold_rank_cancels_between_bounded_quanta() {
+        use crate::{model::identity::RequestId, runtime::deadline::RequestScope};
+        let placement = Placement::with_memory_budget(4 * RANKING_BYTES);
+        let members = membership(100_000);
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut future = placement.rank_scoped(members, &object(), PageNumber(0), Some(&scope));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        scope.cancel().unwrap();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        assert_eq!(
+            placement
+                .cache
+                .borrow()
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .borrow()
+                .cursor,
+            WORK_QUANTUM
         );
     }
 

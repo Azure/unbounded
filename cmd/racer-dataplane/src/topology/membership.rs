@@ -25,6 +25,14 @@ pub struct Member {
 pub struct Membership {
     pub version: MembershipVersion,
     members: Vec<Member>,
+    placement_identity: [u8; 32],
+    pub(crate) placement_delta: Option<PlacementDelta>,
+}
+#[derive(Debug)]
+pub(crate) struct PlacementDelta {
+    pub base: [u8; 32],
+    pub old_count: usize,
+    pub changes: Vec<(Option<usize>, Option<usize>)>,
 }
 pub type MembershipLease = Arc<Membership>;
 impl Membership {
@@ -63,7 +71,64 @@ impl Membership {
         if members.windows(2).any(|pair| pair[0].node == pair[1].node) {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self { version, members })
+        use sha2::Digest;
+        let mut hash = super::hash::domain(b"racer/placement-identity/v1\0");
+        for member in &members {
+            super::hash::bytes(&mut hash, member.node.0.as_bytes());
+            hash.update(member.shares.get().to_be_bytes());
+        }
+        Ok(Self {
+            version,
+            placement_identity: super::hash::finish(hash),
+            members,
+            placement_delta: None,
+        })
+    }
+    /// Prepare bounded incremental ranking hints outside the publication lock.
+    /// Larger changes use exact cooperative cold computation on demand.
+    pub fn with_predecessor(mut self, old: &Membership) -> Self {
+        if self.placement_identity == old.placement_identity {
+            return self;
+        }
+        let mut changes = Vec::new();
+        let (mut a, mut b) = (0, 0);
+        while a < old.members.len() || b < self.members.len() {
+            let order = match (old.members.get(a), self.members.get(b)) {
+                (Some(a), Some(b)) => a.node.cmp(&b.node),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Greater,
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    changes.push((Some(a), None));
+                    a += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    changes.push((None, Some(b)));
+                    b += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    if old.members[a].shares != self.members[b].shares {
+                        changes.push((Some(a), Some(b)));
+                    }
+                    a += 1;
+                    b += 1;
+                }
+            }
+            if changes.len() > 64 {
+                return self;
+            }
+        }
+        self.placement_delta = Some(PlacementDelta {
+            base: old.placement_identity,
+            old_count: old.members.len(),
+            changes,
+        });
+        self
+    }
+    /// Local cache identity only. Routing still uses the authenticated version.
+    pub fn placement_identity(&self) -> [u8; 32] {
+        self.placement_identity
     }
     pub fn members(&self) -> &[Member] {
         &self.members

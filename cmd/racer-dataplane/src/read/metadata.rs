@@ -591,7 +591,7 @@ impl MetadataService {
         let clock_epoch = self.clock.borrow().epoch;
         let candidates = self
             .candidates
-            .candidates_async(membership.clone(), &context.object, PageNumber(0))
+            .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
             .await?;
         let operation = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
             PeerOperation::Bootstrap {
@@ -667,7 +667,12 @@ impl MetadataService {
                         // copies on later candidates. Probe those copy-only first.
                         let candidates = self
                             .candidates
-                            .candidates_async(membership.clone(), &context.object, PageNumber(0))
+                            .candidates_scoped(
+                                membership.clone(),
+                                &context.object,
+                                PageNumber(0),
+                                scope,
+                            )
                             .await?;
                         let operation = PeerOperation::Metadata {
                             object: context.object.clone(),

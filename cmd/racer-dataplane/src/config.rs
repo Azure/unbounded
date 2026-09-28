@@ -168,6 +168,13 @@ impl Config {
         let reader_stall_timeout =
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
+        let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
+        if ranking_bytes < crate::topology::placement::RANKING_BYTES as u64
+            || ranking_bytes > 512 * MIB
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let ranking_entries = ranking_bytes / crate::topology::placement::RANKING_BYTES as u64;
         let mut limit = |name: &str, default| {
             NonZeroUsize::new(to_usize(number(name, default)?)?).ok_or(Error::InvalidConfiguration)
         };
@@ -185,7 +192,7 @@ impl Config {
             pipes: limit("RACER_PIPES", 16)?,
             range_window_pages: limit("RACER_RANGE_WINDOW_PAGES", 2)?,
             header_bytes: limit("RACER_HEADER_BYTES", 32 * 1024)?,
-            cached_rankings: limit("RACER_CACHED_RANKINGS", 128)?,
+            cached_rankings: limit("RACER_CACHED_RANKINGS", ranking_entries)?,
             cached_paths: limit("RACER_CACHED_PATHS", 128)?,
             retained_snapshots: limit("RACER_RETAINED_SNAPSHOTS", 2)?,
             metadata_entries: limit("RACER_METADATA_ENTRIES", 4096)?,

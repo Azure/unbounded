@@ -146,16 +146,19 @@ impl SnapshotStore {
         let (content, membership) = super::wire::canonical_content(&publication)?;
         let content_hash: [u8; 32] = Sha256::digest(content).into();
         let membership_hash: [u8; 32] = Sha256::digest(membership).into();
+        let current = self.current().ok();
+        let mut validated =
+            Membership::validate(publication.membership_version, publication.members)?;
+        if let Some(current) = &current {
+            validated = validated.with_predecessor(&current.membership);
+        }
         let mut next = Snapshot {
             cluster: publication.cluster,
             sequence: publication.sequence,
-            membership: Arc::new(Membership::validate(
-                publication.membership_version,
-                publication.members,
-            )?),
+            membership: Arc::new(validated),
             caches: publication.caches,
         };
-        if let Ok(current) = self.current() {
+        if let Some(current) = current {
             if current.membership.version == next.membership.version {
                 next.membership = current.membership.clone();
             }

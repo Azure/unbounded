@@ -89,6 +89,17 @@ impl CandidatePolicy {
         self.placement.rank_async(membership, object, page)
     }
 
+    pub fn candidates_scoped<'a>(
+        &'a self,
+        membership: MembershipLease,
+        object: &ObjectId,
+        page: PageNumber,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Candidates> {
+        self.placement
+            .rank_scoped(membership, object, page, Some(scope))
+    }
+
     pub fn resolve<'a>(
         &'a self,
         candidates: Candidates,
@@ -135,7 +146,7 @@ impl CandidatePolicy {
             }
             // Public Candidates values are not authority. Recompute before origin.
             let expected = self
-                .candidates_async(candidates.membership.clone(), object, page)
+                .candidates_scoped(candidates.membership.clone(), object, page, scope)
                 .await?;
             if expected.ordered != candidates.ordered
                 || candidates.ordered.is_empty()
