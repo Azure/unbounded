@@ -104,7 +104,7 @@ impl Responses {
         response: ReadResponse,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
-        self.send_inner(connection, response, scope, None)
+        self.send_inner(connection, response, scope, None, None)
     }
 
     pub(crate) fn send_observed<'a>(
@@ -113,8 +113,15 @@ impl Responses {
         response: ReadResponse,
         scope: &'a RequestScope,
         observation: &'a mut crate::telemetry::metrics::RequestMetrics,
+        page_timeout: Duration,
     ) -> Operation<'a, ConnectionLease> {
-        self.send_inner(connection, response, scope, Some(observation))
+        self.send_inner(
+            connection,
+            response,
+            scope,
+            Some(observation),
+            Some(page_timeout),
+        )
     }
 
     fn send_inner<'a>(
@@ -123,6 +130,7 @@ impl Responses {
         mut response: ReadResponse,
         scope: &'a RequestScope,
         mut observation: Option<&'a mut crate::telemetry::metrics::RequestMetrics>,
+        page_timeout: Option<Duration>,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
@@ -156,6 +164,9 @@ impl Responses {
             connection = self.io.send_head(connection, head, scope).await?.connection;
             let mut sent = 0u64;
             if let Some(stream) = response.body.as_mut() {
+                if let Some(timeout) = page_timeout {
+                    stream.enable_progress(timeout);
+                }
                 loop {
                     let reader = match first.take() {
                         Some(reader) => reader,
@@ -168,7 +179,16 @@ impl Responses {
                     if length == 0 || length > expected - sent {
                         return Err(Error::BadGateway);
                     }
-                    connection = self.delivery.finish_to(reader, connection, scope).await?;
+                    connection = if page_timeout.is_some() {
+                        let mut write = self.delivery.finish_progressing(reader, connection, scope);
+                        std::future::poll_fn(|cx| {
+                            stream.poll_prefetch(cx);
+                            write.as_mut().poll(cx)
+                        })
+                        .await?
+                    } else {
+                        self.delivery.finish_to(reader, connection, scope).await?
+                    };
                     sent += length;
                 }
             }
@@ -250,6 +270,9 @@ fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Resu
         header("ETag", metadata.version.etag.as_bytes()),
         header("Racer-Expires-At", expiry.as_millis().to_string()),
     ];
+    if let Some(content_type) = &metadata.content_type {
+        headers.push(header("Racer-Content-Type", content_type.as_bytes()));
+    }
     let status = if let Some(range) = range {
         if range.end() > metadata.length {
             return Err(Error::BadGateway);
@@ -288,6 +311,7 @@ mod tests {
 
     pub(super) fn metadata(length: u64) -> ObjectMetadata {
         ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),
@@ -325,6 +349,28 @@ mod tests {
             head.unique("Content-Type").unwrap().unwrap(),
             b"application/octet-stream"
         );
+    }
+
+    #[test]
+    fn head_and_get_carry_optional_object_content_type() {
+        let mut metadata = metadata(3);
+        metadata.content_type = Some(
+            crate::model::metadata::ContentType::parse(
+                b"application/vnd.oci.image.manifest.v1+json",
+            )
+            .unwrap(),
+        );
+        for range in [None, Some(ByteRange::From(0).resolve(3).unwrap())] {
+            let head = success_head(&metadata, range).unwrap();
+            assert_eq!(
+                head.unique("Racer-Content-Type").unwrap(),
+                Some(metadata.content_type.as_ref().unwrap().as_bytes())
+            );
+            assert_eq!(
+                head.unique("Content-Type").unwrap(),
+                Some(b"application/octet-stream".as_slice())
+            );
+        }
     }
 
     #[test]

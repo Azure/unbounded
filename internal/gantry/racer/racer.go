@@ -209,6 +209,10 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 		return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorInternal, nil)
 	}
 
+	if bounded, ok := upstream.(ifaces.OriginRangePuller); ok && operation != racersdk.OperationHead {
+		return openRange(ctx, bounded, ref, operation, tag, page)
+	}
+
 	size, contentType, err := upstream.Head(ctx, ref)
 	if err != nil {
 		return racersdk.Metadata{}, nil, classifyError(err)
@@ -220,7 +224,8 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 
 	metadata := racersdk.Metadata{
 		Size: racersdk.ByteLength(size), ETag: tag,
-		ExpiresAt: time.Now().Add(metadataTTL).Truncate(time.Millisecond),
+		ContentType: contentType,
+		ExpiresAt:   time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 	if operation == racersdk.OperationHead || operation == racersdk.OperationBootstrap && size == 0 {
 		return metadata, nil, nil
@@ -250,7 +255,46 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 	return metadata, &pageBody{Reader: io.LimitReader(body, int64(last-first)+1), upstream: body}, nil
 }
 
-// pageBody limits the open-ended registry response to one Racer page. Close
+func openRange(ctx context.Context, upstream ifaces.OriginRangePuller, ref ifaces.OriginRef, operation racersdk.Operation, tag racersdk.ETag, page racersdk.Range) (racersdk.Metadata, io.ReadCloser, error) {
+	first, last, present := page.Bounds()
+	if !present || first > last || last-first >= racersdk.ByteOffset(racersdk.PageSize) || first%racersdk.ByteOffset(racersdk.PageSize) != 0 {
+		return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorInvalidArgument, nil)
+	}
+
+	ref.Offset = int64(first)
+
+	body, size, contentType, err := upstream.PullRange(ctx, ref, int64(last-first)+1)
+	if err != nil {
+		return racersdk.Metadata{}, body, classifyError(err)
+	}
+
+	metadata := racersdk.Metadata{
+		Size: racersdk.ByteLength(size), ETag: tag, ContentType: contentType,
+		ExpiresAt: time.Now().Add(metadataTTL).Truncate(time.Millisecond),
+	}
+	if size < 0 || body == nil || metadata.Validate() != nil {
+		return racersdk.Metadata{}, body, racersdk.NewOriginError(racersdk.ErrorBadGateway, nil)
+	}
+
+	if size == 0 {
+		_ = body.Close() //nolint:errcheck // best-effort close of an empty body
+
+		if operation == racersdk.OperationBootstrap {
+			return metadata, nil, nil
+		}
+
+		return metadata, nil, racersdk.NewOriginError(racersdk.ErrorUnsatisfiableRange, nil)
+	}
+
+	if _, _, err := page.Resolve(metadata.Size); err != nil {
+		return metadata, body, classifyError(err)
+	}
+	// The bounded origin owns framing; the SDK checks exact body length and
+	// metadata consistency across pinned pages. Do not hide excess bytes here.
+	return metadata, body, nil
+}
+
+// pageBody supports legacy external OriginPullers without bounded reads. Close
 // delegates directly to the upstream body, without a lock held by a blocked Read.
 type pageBody struct {
 	io.Reader
@@ -294,6 +338,9 @@ func classifyError(err error) error {
 		switch originError.Class {
 		case ifaces.FailureAuth:
 			kind = racersdk.ErrorUnauthorized
+			if originError.StatusCode == 403 {
+				kind = racersdk.ErrorForbidden
+			}
 		case ifaces.FailureNotFound:
 			kind = racersdk.ErrorNotFound
 		case ifaces.FailureRateLimited, ifaces.FailureTransient:

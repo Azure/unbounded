@@ -27,6 +27,7 @@ spec:
           The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
           Each DNS label is limited to 63 characters to match the wire contract;
           Kubernetes metadata validation enforces DNS subdomain spelling.
+          The bounded regex checks label lengths without a costly CEL split/all loop.
         properties:
           apiVersion:
             description: |-
@@ -50,6 +51,6 @@ spec:
         - message: name must fit the canonical Unix socket path
           rule: size(self.metadata.name) <= 82
         - message: each name label must be at most 63 characters
-          rule: self.metadata.name.split('.').all(label, size(label) <= 63)
+          rule: self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')
     served: true
     storage: true

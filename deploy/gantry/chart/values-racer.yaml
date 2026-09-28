@@ -1,0 +1,4 @@
+# Layer over standalone defaults or values-operator.yaml explicitly.
+# Requires a separately provisioned Racer ClusterCache named gantry.
+racer:
+  enabled: true

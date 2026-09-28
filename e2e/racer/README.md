@@ -1,7 +1,7 @@
 # Racer full-stack e2e test
 
 Run from the repository root on a Linux Docker host with Go, Docker, kind,
-kubectl, and make installed. Build the images first, outside the test timeout:
+kubectl, Helm, and make installed. Build the images first, outside the test timeout:
 
 ```sh
 for component in unbounded-operator racer-controller racer-dataplane gantry; do
@@ -22,8 +22,17 @@ be able to reach HTTP fixtures on the Docker network's IPv4 host gateway.
 The test deploys the real unbounded-operator using its rendered manifests and
 creates a single `ClusterCache` named `gantry`. The operator and Racer controller
 provision Racer's initialization, identity, configuration, and workloads. A
-test Gantry DaemonSet shares the node's Racer socket directory and runs in Racer
-mode with the same UID as the dataplane.
+Gantry DaemonSet is rendered from the production chart with `values-racer.yaml`,
+using its root-owned private socket model. Node-config is disabled because the
+test explicitly directs containerd through its recording proxy.
+The fixture clears Gantry's tolerations so it runs on the same two workers as
+Racer, with access to their node-local sockets, rather than on the tainted kind
+control-plane node.
+The origin uses HTTPS with a generated per-run CA and a server certificate valid
+for the Docker gateway, loopback IPs, and localhost. Only the public CA is mounted
+into Gantry, via a fixture-only DaemonSet patch and `SSL_CERT_FILE`; normal system
+certificate directories remain available and TLS verification is never disabled.
+Private test keys remain in the test process's memory.
 
 The acceptance check is a digest-pinned containerd image pull and unpack from an
 empty content namespace. Its only registry endpoint is a recording proxy to
@@ -34,6 +43,22 @@ layer larger than Racer's 16 MiB page size. The test verifies:
 - Complete manifest, config, and layer delivery with `Gantry-Mirrored: 1`.
 - Origin requests for every object.
 - Exact SHA-256 digests and sizes in containerd's content store.
+- Containerd rejects a complete corrupt layer at content-store commit and does
+  not publish it under the expected digest.
+- Containerd rejects a corrupt prefix assembled with a valid resumed suffix.
+  The recording proxy interrupts the first response beyond page zero and asserts
+  that containerd makes a Range request through Gantry before rejecting the digest.
+
+Gantry verifies transport metadata and framing, while the OCI consumer verifies
+the final object digest. The corruption phases inject faults after Gantry and
+leave Racer's cached content intact. The load generator defaults to `--verify=true`;
+benchmark deployments should retain that setting because Gantry no longer hashes
+each object or rereads skipped prefixes.
+
+Each corruption phase uses a distinct fresh image digest to avoid containerd's
+shared physical content cache. It uses `ctr images pull --local` to exercise the
+HTTP retry reader and content-store commit through that phase's proxy. An initial
+`Range: bytes=0-` is a full fetch; only a positive offset counts as a resume.
 
 This preserves the cold origin-backed path through Gantry, the Go SDK, the
 deployed Rust dataplane, and Gantry's origin adapter.
@@ -51,8 +76,8 @@ The test warms all three pages on that worker, then reads through the second:
 
 1. Read page zero and require exactly one new `racer_peer_hits_total`, no new
    reader origin fill, and no new fixture GET for any page.
-2. Insert a narrowly scoped `iptables` TCP-reset rule inside the serving kind
-   node for the reader pod's traffic to the serving pod's peer port. Read page
+2. Insert a narrowly scoped `iptables` TCP-reset rule in the reader pod's network
+   namespace for traffic to the serving pod's deployed named TCP peer port. Read page
    one, which is still cold on the reader. Require completion within 30 seconds,
    exactly one origin fill and corresponding origin range GET, no peer hit, and
    a positive packet count on the interruption rule. This verifies that the read
@@ -70,11 +95,18 @@ data GET. No request retries hide a failed read; curl has a 25-second limit and
 its process has a 30-second context deadline.
 
 The interruption rule is removed on failure as well as success. Metrics snapshots
-and packet counters are retained alongside normal diagnostics. The host needs
+and packet counters are retained alongside normal diagnostics, including counters
+captured during failure cleanup before the rule is removed. The host needs
 capacity for three kind containers and enough free inotify instances for their
 systemd/kubelet processes. `Failed to create control group inotify object: Too many
 open files` during kind startup indicates host inotify exhaustion, before Racer is
 deployed.
+
+Peer recovery, live rotation, and cache recreation run as separate subtests so
+one failed assertion does not suppress evidence from later phases. All phases
+share the original cluster deadline and retain their delivery assertions.
+Phase cleanup also returns the artifact sequence to the parent on early exit,
+so later phases cannot overwrite an earlier phase's numbered artifacts.
 
 ## Populated cache deletion and recreation
 
@@ -90,7 +122,10 @@ The test:
    through retained old socket links. Already accepted work may drain under its
    original deadline.
 3. Recreates the cache and polls pinned HEAD requests for replacement socket
-   readiness. Hard links retained to the old sockets must reject promptly, and
+   readiness. First it observes the controller's active page key for the new UID,
+   nudges kubelet's ordinary Secret projection with a pod annotation, and verifies
+   that both live dataplanes install that generation. Hard links retained to the
+   old sockets must reject promptly, and
    the replacement sockets must have different inodes.
 4. Releases the old origin handler only after replacement readiness, attempting
    its late body write, and waits for the old client to finish. Successful old
@@ -108,6 +143,8 @@ from old byte reuse even though the correct object bytes are identical. No
 metrics thresholds or fixed sleeps are used. Release is idempotent and the held
 handler also exits on test cancellation. The existing `make e2e-racer` target
 includes this phase without additional tools or images.
+Replacement readiness polls retain status/error summaries on success or failure;
+the held fixture body is released during phase cleanup if an assertion fails.
 
 ## Live key and issuer rotation
 
@@ -218,4 +255,6 @@ wire test with `make racer-sdk-conformance`. See the
   listener is starting. Each attempt retains a
   `forward-<pod>-<port>-<sequence>-<attempt>.log`;
   an HTTP 200 is required within the readiness deadline.
+- Racer readiness and metrics use the authenticated Kubernetes pod proxy because
+  its production diagnostics listener binds the pod IP rather than loopback.
 - The cluster is deleted by default. No existing cluster is used.

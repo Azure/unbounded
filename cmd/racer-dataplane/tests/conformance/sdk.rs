@@ -92,11 +92,14 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
         let context_baseline = rig.admission.used(ResourceClass::RequestContext);
         rig.drive(async {
             let mut connection = rig.lease(accepted);
-            // Empty objects still perform one bootstrap exchange. Nonempty
-            // objects continue one page at a time, including a short final page.
-            for index in 0..size.div_ceil(P).max(1) {
+            // One bootstrap and at most one pinned multipage remainder.
+            for index in 0..if size > P { 2 } else { 1 } {
                 let first = index * P;
-                let length = size.saturating_sub(first).min(P);
+                let length = if index == 0 {
+                    size.min(P)
+                } else {
+                    size - first
+                };
                 let scope = scope();
                 let received = rig.io.receive_head(connection, &scope).await.unwrap();
                 let parsed = RequestParser::new(LIMIT)
@@ -139,13 +142,17 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
                 }
                 drop(parsed);
                 // This is a scripted HTTP peer, not a substitute Coordinator. It
-                // checks SDK's page-sized requests and real Rust framing with
+                // checks SDK's multipage requests and real Rust framing with
                 // bounded chunks. Page acquisition is a separate acceptance gate.
                 let mut fields = vec![
                     ("Content-Length", length.to_string()),
                     ("Content-Type", "application/octet-stream".into()),
                     ("ETag", "\"v\"".into()),
                     ("Racer-Expires-At", index.to_string()),
+                    (
+                        "Racer-Content-Type",
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
                 ];
                 if length != 0 {
                     fields.push((
@@ -208,6 +215,7 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        sdk_range(&binary, &socket, &listener, size);
         drop(listener);
         fs::remove_file(output.join("socket")).unwrap();
     }
@@ -219,6 +227,180 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
     fs::create_dir(&origin_directory).unwrap();
     let _origin_cleanup = Cleanup(origin_directory.clone());
     sdk_origin(&binary, &origin_directory.join("socket"));
+}
+
+fn sdk_range(
+    binary: &std::path::Path,
+    socket: &std::path::Path,
+    listener: &UnixListener,
+    size: u64,
+) {
+    let mut child = Process(
+        Command::new(binary)
+            .args(["-test.run=^TestRustWireRangeFixture$", "-test.timeout=30s"])
+            .env("RACER_CONFORMANCE_SOCKET", socket)
+            .env("RACER_CONFORMANCE_SIZE", size.to_string())
+            .spawn()
+            .unwrap(),
+    );
+    let accept = || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "range fixture did not connect");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("range accept: {e}"),
+            }
+        }
+    };
+    let accepted = accept();
+    let rig = Rig::new();
+    rig.reactor.init().unwrap();
+    rig.drive(async {
+        let mut connection = rig.lease(accepted);
+        for pinned in [false, true] {
+            let scope = scope();
+            let received = rig.io.receive_head(connection, &scope).await.unwrap();
+            let request = RequestParser::new(LIMIT)
+                .parse(&object().cache, received.value)
+                .unwrap();
+            assert_eq!(
+                request.kind,
+                if pinned {
+                    ReadKind::HeadPinned {
+                        etag: StrongEtag::parse(b"\"v\"").unwrap(),
+                    }
+                } else {
+                    ReadKind::Head
+                }
+            );
+            connection = rig
+                .io
+                .send_head(
+                    received.connection,
+                    MessageHead {
+                        start: StartLine::Response { status: 200 },
+                        headers: vec![
+                            Header {
+                                name: "Content-Length".into(),
+                                value: size.to_string().into_bytes(),
+                            },
+                            Header {
+                                name: "ETag".into(),
+                                value: b"\"v\"".to_vec(),
+                            },
+                            Header {
+                                name: "Racer-Expires-At".into(),
+                                value: b"0".to_vec(),
+                            },
+                            Header {
+                                name: "Racer-Content-Type".into(),
+                                value: b"text/plain".to_vec(),
+                            },
+                        ],
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap()
+                .connection;
+            connection.finish_exchange().unwrap();
+        }
+    });
+    if size != 0 {
+        let first = (size - 1).min(P - 3);
+        let length = (size - first).min(P + 9);
+        let accepted = accept();
+        rig.drive(async {
+            let scope = scope();
+            let received = rig
+                .io
+                .receive_head(rig.lease(accepted), &scope)
+                .await
+                .unwrap();
+            let request = RequestParser::new(LIMIT)
+                .parse(&object().cache, received.value)
+                .unwrap();
+            assert_eq!(
+                request.kind,
+                ReadKind::Pinned {
+                    etag: StrongEtag::parse(b"\"v\"").unwrap(),
+                    range: ByteRange::Closed {
+                        first,
+                        last: first + length - 1
+                    },
+                }
+            );
+            let mut connection = rig
+                .io
+                .send_head(
+                    received.connection,
+                    MessageHead {
+                        start: StartLine::Response { status: 206 },
+                        headers: vec![
+                            Header {
+                                name: "Content-Length".into(),
+                                value: length.to_string().into_bytes(),
+                            },
+                            Header {
+                                name: "Content-Range".into(),
+                                value: format!("bytes {first}-{}/{size}", first + length - 1)
+                                    .into_bytes(),
+                            },
+                            Header {
+                                name: "Content-Type".into(),
+                                value: b"application/octet-stream".to_vec(),
+                            },
+                            Header {
+                                name: "ETag".into(),
+                                value: b"\"v\"".to_vec(),
+                            },
+                            Header {
+                                name: "Racer-Expires-At".into(),
+                                value: b"0".to_vec(),
+                            },
+                            Header {
+                                name: "Racer-Content-Type".into(),
+                                value: b"text/plain".to_vec(),
+                            },
+                        ],
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap()
+                .connection;
+            let mut offset = first;
+            while offset < first + length {
+                let n = (first + length - offset).min(32768) as usize;
+                let mut buffer = rig.io.buffer(n).unwrap();
+                for (i, b) in buffer.bytes_mut().unwrap().iter_mut().enumerate() {
+                    *b = ((offset + i as u64) % 251) as u8;
+                }
+                connection = rig
+                    .io
+                    .write_body(connection, buffer, &scope)
+                    .await
+                    .unwrap()
+                    .lease;
+                offset += n as u64;
+            }
+            connection.finish_exchange().unwrap();
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "range fixture failed");
+            break;
+        }
+        assert!(Instant::now() < deadline, "range fixture stalled");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(rig.admission.used(ResourceClass::Connection), 0);
 }
 
 fn sdk_origin(binary: &std::path::Path, socket: &std::path::Path) {
@@ -357,6 +539,7 @@ fn sdk_origin(binary: &std::path::Path, socket: &std::path::Path) {
             );
             assert!(head.unique("ETag").unwrap().is_none());
             assert!(head.unique("Racer-Expires-At").unwrap().is_none());
+            assert!(head.unique("Racer-Content-Type").unwrap().is_none());
             if status == 416 {
                 assert_eq!(
                     head.unique("Content-Range").unwrap(),
@@ -367,6 +550,10 @@ fn sdk_origin(binary: &std::path::Path, socket: &std::path::Path) {
                 assert_eq!(head.unique("Allow").unwrap(), Some(b"HEAD, GET".as_slice()));
             }
         } else if method == "HEAD" {
+            assert_eq!(
+                head.unique("Racer-Content-Type").unwrap(),
+                Some(b"text/plain".as_slice())
+            );
             assert_eq!(metadata::validate(&head, &object()).unwrap().length, 3);
         } else if !fields.contains("If-Match") {
             assert_eq!(

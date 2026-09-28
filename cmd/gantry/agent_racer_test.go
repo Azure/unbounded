@@ -23,8 +23,12 @@ import (
 
 type startupRacerClient struct{ closed atomic.Bool }
 
-func (*startupRacerClient) Get(context.Context, racersdk.Request) (*racersdk.Value, error) {
+func (*startupRacerClient) Get(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error) {
 	return nil, errors.New("unexpected content request")
+}
+
+func (*startupRacerClient) Stat(context.Context, racersdk.Request) (racersdk.Metadata, error) {
+	return racersdk.Metadata{}, errors.New("unexpected metadata request")
 }
 
 func (c *startupRacerClient) Close() error { c.closed.Store(true); return nil }

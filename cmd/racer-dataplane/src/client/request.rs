@@ -128,6 +128,7 @@ impl RequestParser {
                     | "if-match"
                     | "range"
                     | "racer-expires-at"
+                    | "racer-content-type"
                     | "racer-metadata"
                     | "authorization"
             ) && !seen.insert(name.clone())
@@ -141,6 +142,7 @@ impl RequestParser {
                 | "content-range"
                 | "etag"
                 | "racer-expires-at"
+                | "racer-content-type"
                 | "transfer-encoding"
                 | "content-encoding"
                 | "trailer"

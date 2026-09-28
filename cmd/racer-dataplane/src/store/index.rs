@@ -35,7 +35,7 @@ pub struct Index {
 struct State {
     pages: HashMap<PageId, IndexedPage>,
     reverse: HashMap<SegmentId, HashSet<PageId>>,
-    versions: HashMap<ObjectVersion, (u64, usize)>,
+    versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
     metadata: HashMap<ObjectVersion, VersionMetadata>,
     order: VecDeque<ObjectVersion>,
     current: HashMap<ObjectId, CurrentVersion>,
@@ -58,18 +58,21 @@ impl IndexSnapshot {
     /// Structural checkpoint validation, in addition to checksum, ownership,
     /// capacity, geometry, and generation checks performed during recovery.
     pub fn validate_metadata(&self) -> Result<()> {
-        let mut lengths = HashMap::default();
+        let mut lengths: HashMap<&ObjectVersion, &VersionMetadata> = HashMap::default();
         for metadata in self
             .metadata
             .iter()
             .chain(self.entries.iter().map(|(_, entry)| &entry.metadata))
         {
-            if lengths
-                .insert(&metadata.version, metadata.length)
-                .is_some_and(|length| length != metadata.length)
-            {
-                return Err(crate::error::Error::CorruptRecord);
+            if let Some(old) = lengths.get(&metadata.version) {
+                if !old.compatible(metadata) {
+                    return Err(Error::CorruptRecord);
+                }
+                if old.content_type.is_some() {
+                    continue;
+                }
             }
+            lengths.insert(&metadata.version, metadata);
         }
         for (page, entry) in &self.entries {
             entry.metadata.page_length(page)?;
@@ -154,8 +157,11 @@ impl Index {
         let version = state
             .versions
             .entry(page.version.clone())
-            .or_insert((entry.metadata.length, 0));
+            .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
+        if version.0.content_type.is_none() {
+            version.0.content_type = entry.metadata.content_type.clone();
+        }
         state
             .reverse
             .entry(entry.location.segment)
@@ -171,22 +177,37 @@ impl Index {
             return Ok(None);
         }
         let s = self.state.borrow();
-        Ok(s.metadata.get(version).cloned().or_else(|| {
-            s.versions.get(version).map(|(length, _)| VersionMetadata {
-                version: version.clone(),
-                length: *length,
-            })
-        }))
+        let mut descriptor = s.metadata.get(version).cloned().or_else(|| {
+            s.versions
+                .get(version)
+                .map(|(metadata, _)| metadata.clone())
+        });
+        if let Some(m) = descriptor.as_mut() {
+            if m.content_type.is_none() {
+                m.content_type = s
+                    .versions
+                    .get(version)
+                    .and_then(|(v, _)| v.content_type.clone());
+            }
+        }
+        Ok(descriptor)
     }
     /// Page-zero owner only. Supports metadata-only objects without a dirty page,
     /// slab allocation, encryption record, or ciphertext reservation.
-    pub fn publish_version(&self, metadata: VersionMetadata) -> Result<()> {
+    pub fn publish_version(&self, mut metadata: VersionMetadata) -> Result<()> {
         if !self.available(&metadata.version.object.cache) {
             return Ok(());
         }
         Self::validate_descriptor(&metadata)?;
         let mut s = self.state.borrow_mut();
         Self::check_length(&s, &metadata)?;
+        if metadata.content_type.is_none() {
+            metadata.content_type = s
+                .metadata
+                .get(&metadata.version)
+                .or_else(|| s.versions.get(&metadata.version).map(|(m, _)| m))
+                .and_then(|m| m.content_type.clone());
+        }
         if self.metadata_capacity == 0 {
             return Err(Error::Overloaded);
         }
@@ -347,10 +368,8 @@ impl Index {
     fn check_length(s: &State, m: &VersionMetadata) -> Result<()> {
         if s.versions
             .get(&m.version)
-            .is_some_and(|(l, _)| *l != m.length)
-            || s.metadata
-                .get(&m.version)
-                .is_some_and(|v| v.length != m.length)
+            .is_some_and(|(v, _)| !v.compatible(m))
+            || s.metadata.get(&m.version).is_some_and(|v| !v.compatible(m))
         {
             return Err(Error::CorruptRecord);
         }
@@ -397,6 +416,23 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn content_type_survives_catalog_and_legacy_refresh_and_rejects_conflicts() {
+        let index = Index::new(WorkerId(0), 8);
+        let legacy = descriptor("v1", 3);
+        index.publish_version(legacy.clone()).unwrap();
+        let mut typed = legacy.clone();
+        typed.content_type =
+            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        index.publish_version(typed.clone()).unwrap();
+        index.publish_version(legacy).unwrap();
+        assert_eq!(index.version(&typed.version).unwrap(), Some(typed.clone()));
+        assert_eq!(typed.for_pin().content_type, typed.content_type);
+        let mut conflict = typed.clone();
+        conflict.content_type =
+            Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+        assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
+    }
     use crate::{
         error::Error,
         model::identity::{CacheId, CacheKey, StrongEtag},
@@ -404,6 +440,7 @@ mod tests {
 
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),
@@ -535,6 +572,7 @@ mod tests {
             metadata: vec![
                 m.clone(),
                 VersionMetadata {
+                    content_type: None,
                     length: 99,
                     ..m.clone()
                 },

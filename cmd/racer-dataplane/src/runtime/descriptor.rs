@@ -111,6 +111,22 @@ impl Descriptor {
         result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
     }
 
+    /// Full peer close, not a write-half shutdown. Safe during response writes
+    /// and acquisition: consumes no bytes and never competes with HTTP parsing.
+    pub(crate) fn peer_disconnected(&self) -> bool {
+        #[cfg(test)]
+        if let Self::Sim(handle) = self {
+            return handle.peer_disconnected();
+        }
+        let mut fd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        (unsafe { libc::poll(&mut fd, 1, 0) > 0 })
+            && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    }
+
     pub fn validate_socket(&self) -> Result<()> {
         #[cfg(test)]
         if let Self::Sim(handle) = self {

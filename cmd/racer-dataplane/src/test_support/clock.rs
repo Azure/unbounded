@@ -293,6 +293,7 @@ mod tests {
         };
         let clock = Clock::default();
         let descriptor = VersionMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
                     cache: CacheId("cache".into()),

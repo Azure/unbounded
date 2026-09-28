@@ -360,7 +360,7 @@ func TestOriginProbeCancellation(t *testing.T) {
 func TestOriginLateCallbackAndSaturation(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	body := &ownedReader{Reader: strings.NewReader("")}
-	path, cancel, done := startOrigin(t, OriginConfig{MaxConcurrentRequests: 1, RequestTimeout: 50 * time.Millisecond}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, OriginConfig{MaxConcurrentHeadRequests: 1, RequestTimeout: 50 * time.Millisecond}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		close(entered)
 		<-release
 

@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -206,14 +205,14 @@ func TestIntegrationClientConnectionReuse(t *testing.T) {
 
 	var connections []net.Conn
 
-	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { connections = append(connections, info.Conn) }}
-
-	ctx := httptrace.WithClientTrace(context.Background(), trace)
+	ctx := context.Background()
 	for range 3 {
 		v, err := client.Get(ctx, Request{})
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		connections = append(connections, v.body.(*responseBody).conn.Conn)
 
 		if n, err := io.CopyN(io.Discard, v, int64(PageSize)); err != nil || n != int64(PageSize) {
 			t.Fatal(n, err)
@@ -372,14 +371,14 @@ func TestIntegrationAbortedConnectionNotReused(t *testing.T) {
 
 	var connections []net.Conn
 
-	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { connections = append(connections, info.Conn) }}
-
-	ctx := httptrace.WithClientTrace(context.Background(), trace)
+	ctx := context.Background()
 	for range 2 {
 		value, err := client.Get(ctx, Request{})
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		connections = append(connections, value.body.(*responseBody).conn.Conn)
 
 		closeBody(value)
 	}

@@ -939,6 +939,10 @@ impl Handle {
         let w = self.sim.0.borrow();
         matches!(w.resources.get(&self.id), Some(Resource::Socket { peer: Some(peer), bytes, .. }) if bytes.is_empty() && w.resources.contains_key(peer))
     }
+    pub fn peer_disconnected(&self) -> bool {
+        let w = self.sim.0.borrow();
+        !matches!(w.resources.get(&self.id), Some(Resource::Socket { peer: Some(peer), .. }) if w.resources.contains_key(peer))
+    }
     pub fn connect(&self, address: &SocketAddress) -> io::Result<()> {
         let mut w = self.sim.0.borrow_mut();
         let local = match w.resources.get(&self.id) {

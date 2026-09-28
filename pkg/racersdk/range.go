@@ -15,6 +15,12 @@ type Range struct {
 	first, last uint64
 }
 
+// Bounds returns the inclusive, unresolved wire bounds and whether a range is
+// present. Origin adapters should use Resolve to validate against object size.
+func (r Range) Bounds() (first, last ByteOffset, present bool) {
+	return ByteOffset(r.first), ByteOffset(r.last), r.present
+}
+
 func ClosedRange(first, last ByteOffset) (Range, error) {
 	if first > last || last > math.MaxInt64 {
 		return Range{}, failure(ErrorInvalidArgument, "range", nil)

@@ -166,6 +166,7 @@ fn geometry() -> CheckpointGeometry {
 
 fn descriptor(etag: &str, length: u64) -> VersionMetadata {
     VersionMetadata {
+        content_type: None,
         version: ObjectVersion {
             object: ObjectId {
                 cache: CacheId("cache".into()),
@@ -251,7 +252,7 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     let decoded = CheckpointCodec.decode(&encoded).unwrap();
     assert_eq!(decoded.sequence, 7);
     assert_eq!(&encoded[..8], b"RACERCP\0");
-    assert_eq!(&encoded[8..12], &[1, 0, 0, 0]);
+    assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION.to_le_bytes());
     let shard = &decoded.shards[0];
     assert_eq!(shard.geometry, geometry());
     let (_, entry) = &shard.index.entries[0];
@@ -269,10 +270,55 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
 }
 
 #[test]
+fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
+    let mut legacy = image(9);
+    legacy.version = 1;
+    let encoded = CheckpointCodec.encode(&legacy).unwrap();
+    let mut recovered = CheckpointCodec.decode(&encoded).unwrap();
+    assert_eq!(recovered.version, 1);
+    assert!(
+        recovered.shards[0]
+            .index
+            .metadata
+            .iter()
+            .all(|m| m.content_type.is_none())
+    );
+    assert_eq!(CheckpointCodec.encode(&recovered).unwrap(), encoded);
+    let value =
+        crate::model::metadata::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
+            .unwrap();
+    for m in recovered.shards[0].index.metadata.iter_mut() {
+        m.content_type = Some(value.clone());
+    }
+    for (_, entry) in recovered.shards[0].index.entries.iter_mut() {
+        entry.metadata.content_type = Some(value.clone());
+    }
+    assert!(
+        CheckpointCodec.encode(&recovered).is_err(),
+        "v1 cannot silently lose metadata"
+    );
+    recovered.version = CHECKPOINT_VERSION;
+    let extended = CheckpointCodec.encode(&recovered).unwrap();
+    let decoded = CheckpointCodec.decode(&extended).unwrap();
+    assert_eq!(
+        decoded.shards[0].index.entries[0].1.metadata.content_type,
+        Some(value.clone())
+    );
+    assert!(
+        decoded.shards[0]
+            .index
+            .metadata
+            .iter()
+            .all(|m| m.content_type == Some(value.clone()))
+    );
+    assert_eq!(CheckpointCodec.encode(&decoded).unwrap(), extended);
+}
+
+#[test]
 fn empty_cut_has_stable_version_one_binary_vector() {
     let (index, segments) = state(8);
     let image = CheckpointImage {
-        version: CHECKPOINT_VERSION,
+        version: 1,
         sequence: 1,
         shards: vec![ShardImage {
             worker: WorkerId(0),
@@ -385,7 +431,7 @@ fn malformed_hash_version_length_counts_and_trailing_bytes_are_rejected() {
     let mut corrupt = encoded.clone();
     corrupt[20] ^= 1;
     assert!(CheckpointCodec.decode(&corrupt).is_err());
-    for (offset, value) in [(8, 2u32), (12, 1), (32, u32::MAX)] {
+    for (offset, value) in [(8, 3u32), (12, 1), (32, u32::MAX)] {
         let mut corrupt = encoded.clone();
         corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         resign(&mut corrupt);
@@ -487,6 +533,7 @@ fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() 
     let keep = descriptor("keep", 0);
     index
         .publish_current(crate::model::metadata::ObjectMetadata {
+            content_type: None,
             version: keep.version.clone(),
             length: keep.length,
             expires_at: crate::model::metadata::ExpiresAt(

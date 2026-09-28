@@ -194,6 +194,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         .sign_response(
             destination.binding(),
             PeerResponse::Metadata(ObjectMetadata {
+                content_type: None,
                 version: ObjectVersion { object, etag: pin },
                 length: 42,
                 expires_at: ExpiresAt(std::time::SystemTime::now()),

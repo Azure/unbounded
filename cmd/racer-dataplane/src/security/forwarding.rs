@@ -1136,6 +1136,7 @@ mod tests {
         let (signed, binding) = a.sign_request(request).unwrap();
         let admitted = b.verify_request(signed).unwrap();
         let metadata = ObjectMetadata {
+            content_type: None,
             version: page.version.clone(),
             length: 7,
             expires_at: ExpiresAt(std::time::SystemTime::now()),
@@ -1230,6 +1231,7 @@ mod tests {
                 page.number = PageNumber(1);
             }
             let metadata = ObjectMetadata {
+                content_type: None,
                 version: page.version.clone(),
                 length: page.number.0 * PAGE_BYTES + 3,
                 expires_at: ExpiresAt(std::time::SystemTime::now()),
@@ -1407,6 +1409,7 @@ mod tests {
         let (signed, _) = f[0].sign_request(request(1)).unwrap();
         let admitted = f[2].verify_request(signed).unwrap();
         let good = ObjectMetadata {
+            content_type: Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap()),
             version: ObjectVersion {
                 object: admitted.request().origin.object.clone(),
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
@@ -1416,6 +1419,34 @@ mod tests {
         };
         f[2].sign_response(admitted.binding(), PeerResponse::Metadata(good.clone()))
             .unwrap();
+        let (signed, binding) = f[0].sign_request(request(2)).unwrap();
+        let admitted_typed = f[2].verify_request(signed).unwrap();
+        let mut signed = f[2]
+            .sign_response(
+                admitted_typed.binding(),
+                PeerResponse::Metadata(good.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            protocol::field(
+                &signed.authentication.original.head,
+                "racer-metadata-version"
+            )
+            .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            protocol::field(&signed.authentication.original.head, "content-length").unwrap(),
+            "0"
+        );
+        if let PeerResponse::Metadata(metadata) = &mut signed.response {
+            metadata.content_type =
+                Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+        }
+        assert!(
+            f[0].verify_response(signed, &binding).is_err(),
+            "MIME metadata is covered by signed agreement"
+        );
         let mut bad = good.clone();
         bad.version.etag = StrongEtag::parse(b"\"other\"").unwrap();
         assert!(
@@ -1438,6 +1469,7 @@ mod tests {
         let (signed, binding) = requester.sign_request_to(request(1), &node(1)).unwrap();
         let admitted = relay.verify_request(signed).unwrap();
         let metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: admitted.request().origin.object.clone(),
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
@@ -1499,6 +1531,7 @@ mod tests {
         let (signed, binding) = requester.sign_request(local).unwrap();
         let admitted = server.verify_request(signed).unwrap();
         let metadata = ObjectMetadata {
+            content_type: None,
             version: page.version.clone(),
             length: 3,
             expires_at: ExpiresAt(std::time::SystemTime::now()),

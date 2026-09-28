@@ -77,7 +77,10 @@ impl MemoryCache {
         let mut entries = self.entries.borrow_mut();
         for entry in entries.iter() {
             if entry.metadata.version == page.metadata.version
-                && entry.metadata.length != page.metadata.length
+                && !entry
+                    .metadata
+                    .immutable()
+                    .compatible(&page.metadata.immutable())
             {
                 return Err(Error::CorruptRecord);
             }

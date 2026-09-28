@@ -551,11 +551,15 @@ impl WorkerDirectory {
                         .value?
                 };
                 match value {
-                    Value::Retained(Some(value)) => {
+                    Value::Retained(Some(mut value)) => {
                         if value.version != *version
-                            || found.as_ref().is_some_and(|old| old != &value)
+                            || found.as_ref().is_some_and(|old| !old.compatible(&value))
                         {
                             return Err(Error::CorruptRecord);
+                        }
+                        if value.content_type.is_none() {
+                            value.content_type =
+                                found.as_ref().and_then(|old| old.content_type.clone());
                         }
                         found = Some(value);
                     }
@@ -899,6 +903,62 @@ mod tests {
     }
 
     #[test]
+    fn retained_metadata_merges_legacy_workers_in_both_orders_and_rejects_conflicts() {
+        let version = version();
+        let legacy = VersionMetadata {
+            version: version.clone(),
+            length: 3,
+            content_type: None,
+        };
+        let mut typed = legacy.clone();
+        typed.content_type =
+            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        let mut conflict = typed.clone();
+        conflict.content_type =
+            Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+        let mut wrong_length = legacy.clone();
+        wrong_length.length += 1;
+        let mut wrong_version = legacy.clone();
+        wrong_version.version.etag = StrongEtag::test_value("other");
+        for (values, expected) in [
+            ([legacy.clone(), typed.clone()], Ok(Some(typed.clone()))),
+            ([typed.clone(), legacy.clone()], Ok(Some(typed.clone()))),
+            ([typed.clone(), conflict.clone()], Err(Error::CorruptRecord)),
+            ([conflict, typed.clone()], Err(Error::CorruptRecord)),
+            ([legacy.clone(), wrong_length], Err(Error::CorruptRecord)),
+            ([legacy, wrong_version], Err(Error::CorruptRecord)),
+        ] {
+            let directory = directory(1);
+            let scope = scope();
+            let mut lookup = directory.retained_metadata(&version, &scope);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for (mailbox, value) in directory.mailboxes.iter().zip(values) {
+                assert!(lookup.as_mut().poll(&mut cx).is_pending());
+                let command = mailbox.state.lock().unwrap().queue.pop_front().unwrap();
+                assert!(
+                    matches!(&command.work, Work::Retained(requested) if requested == &version)
+                );
+                command
+                    .reply
+                    .complete(
+                        command.generation,
+                        Completion {
+                            value: Ok(Value::Retained(Some(value))),
+                            budget: None,
+                        },
+                    )
+                    .unwrap();
+                drop(command);
+            }
+            assert_eq!(lookup.as_mut().poll(&mut cx), Poll::Ready(expected));
+            drop(lookup);
+            for mailbox in &directory.mailboxes {
+                assert_eq!(mailbox.state.lock().unwrap().outstanding, 0);
+            }
+        }
+    }
+
+    #[test]
     fn blocked_endpoint_is_quiet_and_round_robin_is_budgeted() {
         let directory = Arc::new(directory(4));
         let mut endpoint = WorkerEndpoint {
@@ -968,6 +1028,7 @@ mod tests {
                         .submit(
                             WorkerId(0),
                             Work::Publish(crate::model::metadata::VersionMetadata {
+                                content_type: None,
                                 version: version(),
                                 length: 0,
                             }),

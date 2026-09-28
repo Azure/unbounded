@@ -51,6 +51,7 @@ impl Peers {
                 .clone(),
         );
         let metadata = ObjectMetadata {
+            content_type: None,
             version: ObjectVersion {
                 object: request.origin.object.clone(),
                 etag: StrongEtag::test_value("fallback"),

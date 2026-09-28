@@ -4,7 +4,6 @@
 package racersdk
 
 import (
-	"bufio"
 	"bytes"
 	"math"
 	"net/http"
@@ -148,22 +147,33 @@ func parseRequestHead(head []byte, origin bool) (OriginRequest, error) {
 		return result, bad
 	}
 
-	for _, name := range []string{"Content-Range", "Etag", "Racer-Expires-At"} {
+	for _, name := range []string{"Content-Range", "Etag", "Racer-Expires-At", "Racer-Content-Type"} {
 		if _, ok := h[name]; ok {
 			return result, bad
 		}
 	}
 
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
-	if err != nil {
+	line := string(head[:bytes.Index(head, []byte("\r\n"))])
+	method, rest, ok := strings.Cut(line, " ")
+
+	target, protocol, valid := strings.Cut(rest, " ")
+	if !ok || !valid || protocol != "HTTP/1.1" || len(target) != len(objectPrefix)+64 || !strings.HasPrefix(target, objectPrefix) {
 		return result, bad
 	}
 
-	if req.Proto != "HTTP/1.1" || len(req.RequestURI) != len(objectPrefix)+64 || !strings.HasPrefix(req.RequestURI, objectPrefix) {
+	if method == "" {
 		return result, bad
 	}
 
-	result.key, err = ParseKey(req.RequestURI[len(objectPrefix):])
+	for i := range len(method) {
+		if !headerToken(method[i]) {
+			return result, bad
+		}
+	}
+
+	var err error
+
+	result.key, err = ParseKey(target[len(objectPrefix):])
 	if err != nil {
 		return OriginRequest{}, bad
 	}
@@ -196,7 +206,7 @@ func parseRequestHead(head []byte, origin bool) (OriginRequest, error) {
 		}
 	}
 
-	switch req.Method {
+	switch method {
 	case "HEAD":
 		if result.byteRange.present {
 			return OriginRequest{}, bad
@@ -291,8 +301,7 @@ func requestHeaders(r OriginRequest) http.Header {
 	return h
 }
 
-// requestHead replays a validated origin request to net/http. Outgoing client
-// requests use requestHeaders directly instead of serializing and reparsing.
+// requestHead serializes a validated operation directly to HTTP/1.1.
 func requestHead(r OriginRequest) ([]byte, error) {
 	if err := validateRequest(r); err != nil {
 		return nil, err
@@ -331,6 +340,7 @@ type wireResponse struct {
 	metadata    Metadata
 	first, last ByteOffset
 	length      int64
+	close       bool
 }
 
 // parseResponseHead validates a success or empty protocol error against the exact
@@ -355,22 +365,29 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 		return result, bad
 	}
 
-	method := "GET"
-	if request.operation == OperationHead {
-		method = "HEAD"
-	}
-
 	if request.operation < OperationHead || request.operation > OperationPinned {
 		return result, bad
 	}
 
-	res, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(head)), &http.Request{Method: method})
-	if err != nil || res.Proto != "HTTP/1.1" {
+	line := head[:bytes.Index(head, []byte("\r\n"))]
+	if len(line) < 12 || !bytes.HasPrefix(line, []byte("HTTP/1.1 ")) || len(line) > 12 && line[12] != ' ' {
 		return result, bad
 	}
 
-	if res.StatusCode != 200 && res.StatusCode != 206 {
-		statusErr := statusError(res.StatusCode)
+	status := 0
+
+	for _, b := range line[9:12] {
+		if b < '0' || b > '9' {
+			return result, bad
+		}
+
+		status = status*10 + int(b-'0')
+	}
+
+	result.close = connectionClose(h)
+
+	if status != 200 && status != 206 {
+		statusErr := statusError(status)
 		if statusErr.kind == ErrorProtocol || length != 0 {
 			return result, bad
 		}
@@ -383,7 +400,11 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 			return result, bad
 		}
 
-		if res.StatusCode == 416 {
+		if _, ok := h["Racer-Content-Type"]; ok {
+			return result, bad
+		}
+
+		if status == 416 {
 			cr, err := parseContentRange(h.Get("Content-Range"))
 			if err != nil || !cr.unsatisfied || snapshot != nil && cr.size != snapshot.Size {
 				return result, bad
@@ -392,11 +413,11 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 			return result, bad
 		}
 
-		if res.StatusCode == 405 && h.Get("Allow") != "HEAD, GET" {
+		if status == 405 && h.Get("Allow") != "HEAD, GET" {
 			return result, bad
 		}
 
-		if request.pin.value != "" && res.StatusCode == 404 {
+		if request.pin.value != "" && status == 404 {
 			return result, bad
 		}
 
@@ -413,13 +434,18 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 		return result, bad
 	}
 
-	result.metadata = Metadata{ETag: tag, ExpiresAt: time.UnixMilli(int64(expiry)).UTC()}
+	contentType := h.Get("Racer-Content-Type")
+	if values, present := h["Racer-Content-Type"]; present && (values[0] == "" || validateContentType(contentType) != nil) {
+		return result, bad
+	}
+
+	result.metadata = Metadata{ETag: tag, ExpiresAt: time.UnixMilli(int64(expiry)).UTC(), ContentType: contentType}
 	if request.pin.value != "" && tag != request.pin {
 		return wireResponse{}, bad
 	}
 
 	if request.operation == OperationHead {
-		if res.StatusCode != 200 {
+		if status != 200 {
 			return wireResponse{}, bad
 		}
 
@@ -434,7 +460,7 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 		}
 
 		result.length = int64(length)
-		if res.StatusCode == 200 {
+		if status == 200 {
 			if request.operation != OperationBootstrap || length != 0 {
 				return wireResponse{}, bad
 			}
@@ -457,7 +483,7 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 		}
 	}
 
-	if snapshot != nil && (snapshot.Size != result.metadata.Size || snapshot.ETag != result.metadata.ETag) {
+	if snapshot != nil && (snapshot.Size != result.metadata.Size || snapshot.ETag != result.metadata.ETag || snapshot.ContentType != "" && result.metadata.ContentType != "" && snapshot.ContentType != result.metadata.ContentType) {
 		return wireResponse{}, bad
 	}
 
@@ -471,7 +497,24 @@ func metadataHeaders(m Metadata) (http.Header, error) {
 		return nil, err
 	}
 
-	return http.Header{"Etag": {m.ETag.value}, "Racer-Expires-At": {strconv.FormatInt(m.ExpiresAt.UnixMilli(), 10)}}, nil
+	h := http.Header{"Etag": {m.ETag.value}, "Racer-Expires-At": {strconv.FormatInt(m.ExpiresAt.UnixMilli(), 10)}}
+	if m.ContentType != "" {
+		h.Set("Racer-Content-Type", m.ContentType)
+	}
+
+	return h, nil
+}
+
+func connectionClose(h http.Header) bool {
+	for _, value := range h.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "close") {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // originResponse validates successful callback metadata against the selected

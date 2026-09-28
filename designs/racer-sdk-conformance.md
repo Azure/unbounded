@@ -1,6 +1,54 @@
 # Independent client/origin v1 conformance
 
-## Authority and scope
+## Current scope and historical status
+
+The report below records an earlier conformance review, including its then-open
+handoffs, line numbers, and pass/fail counts. It is historical evidence, not a
+current failure list or acceptance of the approved high-throughput rewrite.
+Use [Racer Go SDK](racer-sdk.md) for the current contract and
+[Racer SDK throughput performance](racer-sdk-throughput-performance.md) for new
+verification results. The rewrite is **VERIFIED**, as of
+2026-09-28: separate UDS conformance and deployed E2E both passed. See the
+[dated acceptance summary](racer-sdk-verification.md) for all final gates and
+the distinction between the Rust suite's 12 ignored tests and the separately
+executed conformance run.
+
+Current source-level coverage includes the following. These are inspected test
+assertions, not newly executed results:
+
+- The opt-in Go/Rust UDS fixture now checks sizes 0, 3, P, 2P, and 3P+13,
+  with one bootstrap and at most one full pinned remainder, opaque context
+  forwarding, and content type. It also invokes a range fixture for each size
+  (`cmd/racer-dataplane/tests/conformance/sdk.rs:63-218`). Its responses are
+  scripted through production HTTP/request parsing, not a full Coordinator.
+- SDK tests check exact options-based ranges and HEAD/GET counts, trusted
+  snapshot copying and HEAD bypass, independent admission queues, SmallObject
+  size checks, and legacy/present content-type compatibility
+  (`pkg/racersdk/read_options_test.go:21-102`,
+  `pkg/racersdk/snapshot_stats_test.go:34-115`,
+  `pkg/racersdk/reserved_admission_test.go:18-208,303-335`).
+- Registry tests check bounded 206 responses and complete 200 responses that
+  fit at offset zero, with rejection of unknown/oversized/nonzero-offset 200
+  without body reads (`internal/gantry/origin/range_test.go:26-95,139-265`).
+- Gantry resume assertions check one HEAD and one relevant origin page, with no
+  skipped-page fetch (`internal/gantry/mirror/racer_test.go:350-388`). This is a
+  protocol-fake test, not deployed bandwidth evidence.
+
+To reproduce current cross-language coverage from `cmd/racer-dataplane` in the
+target worktree:
+
+```sh
+cargo test --test client_origin_conformance
+RACER_SDK_ROOT="$(git rev-parse --show-toplevel)" \
+  cargo test --test client_origin_conformance -- --include-ignored
+```
+
+The SDK root must identify the same revision under test. Passing this target
+does not establish containerd consumer digest rejection, actual cluster routing,
+peer/disk restart recovery, or large-stream throughput. Those require the
+deployed suite and performance report.
+
+## Historical authority and scope
 
 Required contract: `/home/azureuser/code/unbounded/cmd/racer-dataplane/CLIENT_ORIGIN_API.md`,
 read completely (lines 1-176). The current SDK is `/home/azureuser/code/unbounded/pkg/racersdk`.

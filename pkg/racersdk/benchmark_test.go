@@ -45,18 +45,49 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 			return context.WithValue(ctx, originConnKey{}, conn)
 		}
 		slots := make(chan struct{}, 64)
-		callback := func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
-			return originMeta(ByteLength(size)), io.NopCloser(io.LimitReader(repeatedByte('x'), size)), nil
-		}
-		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, callback, slots) })
-	} else {
-		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			first, length := int64(0), min(size, int64(PageSize))
-			if r.Header.Get("If-Match") != "" {
-				first, length = int64(PageSize), size-int64(PageSize)
+		headSlots := make(chan struct{}, config.MaxConcurrentHeadRequests)
+		callback := func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+			m := originMeta(ByteLength(size))
+			if r.Operation() == OperationHead || size == 0 {
+				return m, nil, nil
 			}
 
-			streamResponse(w, first, length, size, `"v"`)
+			first, last, err := r.byteRange.Resolve(m.Size)
+			if err != nil {
+				return m, nil, err
+			}
+
+			return m, io.NopCloser(io.LimitReader(repeatedByte('x'), int64(last-first)+1)), nil
+		}
+		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, callback, slots, headSlots) })
+	} else {
+		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "HEAD" {
+				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+				w.Header().Set("ETag", `"v"`)
+				w.Header().Set("Racer-Expires-At", "0")
+
+				return
+			}
+
+			if size == 0 {
+				streamResponse(w, 0, 0, 0, `"v"`)
+				return
+			}
+
+			requested, err := parseRange(r.Header.Get("Range"))
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			first, last, err := requested.resolve(ByteLength(size))
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			streamResponse(w, int64(first), int64(last-first)+1, size, `"v"`)
 		})
 	}
 
@@ -110,7 +141,7 @@ func (r *benchmarkReader) copy(dst io.Writer, body io.Reader) (int64, error) {
 func (r *benchmarkReader) read(dst io.Writer, fresh bool) error {
 	if r.client != nil {
 		if fresh {
-			r.client.transport.CloseIdleConnections()
+			r.client.closeIdleConnections()
 		}
 
 		value, err := r.client.Get(context.Background(), Request{})
@@ -270,6 +301,54 @@ func BenchmarkConcurrentStream(b *testing.B) {
 
 				workers.Wait()
 			})
+		}
+	}
+}
+
+func BenchmarkClientStat(b *testing.B) {
+	path := benchmarkPeer(b, 1<<30, false)
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "bench"}}, path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer closeBody(c)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		m, err := c.Stat(context.Background(), Request{})
+		if err != nil || m.Size != 1<<30 {
+			b.Fatal(m, err)
+		}
+	}
+}
+
+func BenchmarkClientRange(b *testing.B) {
+	path := benchmarkPeer(b, 1<<30, false)
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "bench"}}, path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer closeBody(c)
+
+	b.ReportAllocs()
+	b.SetBytes(4096)
+	b.ResetTimer()
+
+	for range b.N {
+		v, err := c.Get(context.Background(), Request{}, ReadOptions{Offset: ByteOffset(PageSize) + 3, Length: 4096})
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		n, err := v.WriteTo(io.Discard)
+		closeBody(v)
+
+		if err != nil || n != 4096 {
+			b.Fatal(n, err)
 		}
 	}
 }

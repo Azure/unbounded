@@ -5,8 +5,10 @@ package config
 
 import (
 	"flag"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRacerEnabledEnvironment(t *testing.T) {
@@ -40,6 +42,115 @@ func TestRacerEnabledEnvironment(t *testing.T) {
 
 			if err != nil || c.RacerEnabled != test.want {
 				t.Fatalf("enabled=%v err=%v, want %v", c.RacerEnabled, err, test.want)
+			}
+		})
+	}
+}
+
+func TestRacerTuning(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		defaultValue string
+		yamlValue    string
+		envValue     string
+		flagValue    string
+		get          func(*Config) string
+	}{
+		{"racer_max_connections", "64", "12", "13", "14", func(c *Config) string { return strconv.Itoa(c.RacerMaxConnections) }},
+		{"racer_metadata_connections", "4", "2", "3", "6", func(c *Config) string { return strconv.Itoa(c.RacerMetadataConnections) }},
+		{"racer_metadata_queued_requests", "16", "5", "6", "7", func(c *Config) string { return strconv.Itoa(c.RacerMetadataQueuedRequests) }},
+		{"racer_small_object_connections", "4", "2", "3", "6", func(c *Config) string { return strconv.Itoa(c.RacerSmallObjectConnections) }},
+		{"racer_small_object_queued_requests", "128", "8", "9", "10", func(c *Config) string { return strconv.Itoa(c.RacerSmallObjectQueuedRequests) }},
+		{"racer_max_queued_requests", "128", "20", "21", "22", func(c *Config) string { return strconv.Itoa(c.RacerMaxQueuedRequests) }},
+		{"racer_queue_timeout", "5s", "2s", "3s", "4s", func(c *Config) string { return c.RacerQueueTimeout.String() }},
+		{"racer_response_header_timeout", "1m0s", "2s", "3s", "4s", func(c *Config) string { return c.RacerResponseHeaderTimeout.String() }},
+		{"racer_origin_max_connections", "128", "12", "13", "14", func(c *Config) string { return strconv.Itoa(c.RacerOriginMaxConnections) }},
+		{"racer_origin_concurrent_requests", "64", "12", "13", "14", func(c *Config) string { return strconv.Itoa(c.RacerOriginConcurrentRequests) }},
+		{"racer_origin_concurrent_head_requests", "4", "2", "3", "6", func(c *Config) string { return strconv.Itoa(c.RacerOriginConcurrentHeadRequests) }},
+		{"racer_origin_request_timeout", "1m0s", "2s", "3s", "4s", func(c *Config) string { return c.RacerOriginRequestTimeout.String() }},
+		{"racer_write_timeout", "30s", "2s", "3s", "4s", func(c *Config) string { return c.RacerWriteTimeout.String() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.RacerEnabled = true
+
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: "https://registry.example"}}
+			if got := test.get(c); got != test.defaultValue {
+				t.Fatalf("default = %s, want %s", got, test.defaultValue)
+			}
+
+			if err := c.LoadYAML(strings.NewReader(test.name + ": " + test.yamlValue)); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := test.get(c); got != test.yamlValue {
+				t.Fatalf("YAML = %s, want %s", got, test.yamlValue)
+			}
+
+			envName := "GANTRY_" + strings.ToUpper(test.name)
+
+			env := func(value string) func(string) string {
+				return func(key string) string {
+					if key == envName {
+						return value
+					}
+
+					return ""
+				}
+			}
+			if err := c.LoadEnv(env(test.envValue)); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := test.get(c); got != test.envValue {
+				t.Fatalf("env = %s, want %s", got, test.envValue)
+			}
+
+			flags := flag.NewFlagSet("test", flag.ContinueOnError)
+			c.BindFlags(flags)
+
+			if err := flags.Parse([]string{"--" + strings.ReplaceAll(test.name, "_", "-") + "=" + test.flagValue}); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := test.get(c); got != test.flagValue {
+				t.Fatalf("flag = %s, want %s", got, test.flagValue)
+			}
+
+			if err := c.Validate(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.LoadEnv(env("invalid")); err == nil || !strings.Contains(err.Error(), envName) {
+				t.Fatalf("parse error = %v", err)
+			}
+
+			negative := "-1"
+			zero := "0"
+
+			if strings.HasSuffix(test.name, "timeout") {
+				negative = (-time.Second).String()
+				zero = "0s"
+			}
+
+			if err := c.LoadEnv(env(negative)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), test.name) {
+				t.Fatalf("negative validation = %v", err)
+			}
+
+			if err := c.LoadEnv(env(zero)); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := test.get(c); got != zero {
+				t.Fatalf("explicit zero = %s, want %s", got, zero)
+			}
+
+			if err := c.Validate(); err != nil {
+				t.Fatalf("zero must select defaults: %v", err)
 			}
 		})
 	}

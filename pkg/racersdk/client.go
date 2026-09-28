@@ -5,10 +5,9 @@ package racersdk
 
 import (
 	"context"
-	"errors"
+	"io"
+	"math"
 	"net"
-	"net/http"
-	"net/http/httptrace"
 	"sync"
 	"time"
 )
@@ -17,31 +16,51 @@ import (
 // fields select defaults; negative values and a zero Cache are invalid.
 type ClientConfig struct {
 	Cache CacheName
-	// MaxConnections bounds both connections and live Values (default 16).
+	// MaxConnections bounds bulk connections and live Values (default 64).
 	MaxConnections int
+	// MetadataConnections reserves a separate Stat connection pool (default 4).
+	MetadataConnections int
+	// MaxQueuedRequests bounds waiting bulk calls (default 128).
+	MaxQueuedRequests int
+	// MetadataQueuedRequests reserves a separate bounded Stat queue (default 16).
+	MetadataQueuedRequests int
+	// SmallObjectConnections reserves connections/live Values for SmallObject reads (default 4).
+	SmallObjectConnections int
+	// SmallObjectQueuedRequests bounds the independent small-object queue (default 128).
+	SmallObjectQueuedRequests int
+	// QueueTimeout bounds admission waits (default 5 seconds).
+	QueueTimeout time.Duration
 	// DialTimeout bounds each Unix dial (default 5 seconds).
 	DialTimeout time.Duration
-	// ResponseHeaderTimeout starts after request headers are written (default 10 seconds).
+	// ResponseHeaderTimeout starts after request headers are written (default 60 seconds).
 	ResponseHeaderTimeout time.Duration
 	// IdleConnTimeout bounds pooled idle connections (default 90 seconds).
 	IdleConnTimeout time.Duration
 }
 
-// Client opens fresh, full-object streams over the cache's canonical Unix socket.
-// Get and Close are safe concurrently. Construct with NewClient; do not copy.
+// Client streams immutable objects over the cache's canonical Unix socket.
+// Get, Stat and Close are safe concurrently. Construct with NewClient; do not copy.
 type Client struct {
-	mu        sync.Mutex
-	closed    bool
-	active    map[*Value]struct{}
-	slots     chan struct{}
-	transport *http.Transport
-	ctx       context.Context
-	cancel    context.CancelFunc
-	dial      func(context.Context, string, string) (net.Conn, error)
+	mu                            sync.Mutex
+	closed                        bool
+	active                        map[*Value]struct{}
+	slots                         chan struct{}
+	queued                        chan struct{}
+	bulk, metadataPool, smallPool connectionPool
+	config                        ClientConfig
+	path                          string
+	ctx                           context.Context
+	cancel                        context.CancelFunc
+	dial                          func(context.Context, string, string) (net.Conn, error)
+	stats                         clientStats
+	copySlots                     chan struct{}
+	copyBuffers                   chan *[copyBufferSize]byte
+	smallCopySlots                chan struct{}
+	smallCopyBuffers              chan *[copyBufferSize]byte
 }
 
-// NewClient validates config without dialing. Each client owns its transport and
-// connection pool. Get contexts, rather than a total HTTP timeout, bound streams.
+// NewClient validates config without dialing. Contexts bound stream lifetimes;
+// no total HTTP timeout interrupts a progressing body.
 func NewClient(config ClientConfig) (*Client, error) {
 	return newClient(config, "/run/racer/"+config.Cache.value+"/client/socket")
 }
@@ -51,12 +70,36 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		return nil, err
 	}
 
-	if config.MaxConnections < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 {
+	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.IdleConnTimeout < 0 {
 		return nil, failure(ErrorInvalidArgument, "client config", nil)
 	}
 
 	if config.MaxConnections == 0 {
-		config.MaxConnections = 16
+		config.MaxConnections = 64
+	}
+
+	if config.MetadataConnections == 0 {
+		config.MetadataConnections = 4
+	}
+
+	if config.MaxQueuedRequests == 0 {
+		config.MaxQueuedRequests = 128
+	}
+
+	if config.MetadataQueuedRequests == 0 {
+		config.MetadataQueuedRequests = 16
+	}
+
+	if config.SmallObjectConnections == 0 {
+		config.SmallObjectConnections = 4
+	}
+
+	if config.SmallObjectQueuedRequests == 0 {
+		config.SmallObjectQueuedRequests = 128
+	}
+
+	if config.QueueTimeout == 0 {
+		config.QueueTimeout = 5 * time.Second
 	}
 
 	if config.DialTimeout == 0 {
@@ -64,58 +107,114 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	}
 
 	if config.ResponseHeaderTimeout == 0 {
-		config.ResponseHeaderTimeout = 10 * time.Second
+		config.ResponseHeaderTimeout = 60 * time.Second
 	}
 
 	if config.IdleConnTimeout == 0 {
 		config.IdleConnTimeout = 90 * time.Second
 	}
 
-	dialer := &net.Dialer{Timeout: config.DialTimeout}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), ctx: ctx, cancel: cancel, dial: dialer.DialContext}
-	t := &http.Transport{
-		Proxy: nil, DisableCompression: true,
-		MaxConnsPerHost: config.MaxConnections, MaxIdleConns: config.MaxConnections, MaxIdleConnsPerHost: config.MaxConnections,
-		ResponseHeaderTimeout: config.ResponseHeaderTimeout, IdleConnTimeout: config.IdleConnTimeout,
-		MaxResponseHeaderBytes: maxHeadBytes,
-		Protocols:              new(http.Protocols),
-	}
-	t.Protocols.SetHTTP1(true)
-	t.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		// Transport detaches dials from request cancellation for pool reuse. Keep
-		// them attached to the client lifetime so Close also stops pending dials.
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		stop := context.AfterFunc(c.ctx, cancel)
-		defer stop()
-
-		conn, err := c.dial(ctx, "unix", path)
-		if err != nil {
-			return nil, err
-		}
-
-		if err := c.ctx.Err(); err != nil {
-			closeBody(conn)
-			return nil, err
-		}
-
-		return newResponseConn(conn), nil
-	}
-
-	c.transport = t
+	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), queued: make(chan struct{}, config.MaxQueuedRequests), config: config, path: path, ctx: ctx, cancel: cancel}
+	c.bulk.slots = c.slots
+	c.bulk.queued = c.queued
+	c.copySlots = make(chan struct{}, config.MaxConnections)
+	c.copyBuffers = make(chan *[copyBufferSize]byte, config.MaxConnections)
+	c.metadataPool.slots = make(chan struct{}, config.MetadataConnections)
+	c.metadataPool.queued = make(chan struct{}, config.MetadataQueuedRequests)
+	c.smallPool.slots = make(chan struct{}, config.SmallObjectConnections)
+	c.smallPool.queued = make(chan struct{}, config.SmallObjectQueuedRequests)
+	c.smallCopySlots = make(chan struct{}, config.SmallObjectConnections)
+	c.smallCopyBuffers = make(chan *[copyBufferSize]byte, config.SmallObjectConnections)
+	c.dial = (&net.Dialer{Timeout: config.DialTimeout}).DialContext
 
 	return c, nil
 }
 
-// Get admits a fresh object using a bootstrap GET and returns as soon as validated
-// headers arrive, without buffering page zero. ctx governs the returned Value's
-// entire lifetime, including capacity waits and its lazy pinned continuations.
-// The caller owns the Value and should defer Close.
-func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
-	if ctx == nil {
-		return nil, failure(ErrorInvalidArgument, "get context", nil)
+// admit bounds waiters before allocating a Value, derived context, or callback.
+func (c *Client) admit(ctx context.Context, pool *connectionPool, r OriginRequest) (*Value, error) {
+	c.mu.Lock()
+	closed := c.closed || c.ctx == nil
+	c.mu.Unlock()
+
+	if closed {
+		return nil, failure(ErrorClosed, "admission", nil)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, ioFailure("admission", err)
+	}
+
+	select {
+	case pool.slots <- struct{}{}:
+	default:
+		select {
+		case pool.queued <- struct{}{}:
+		default:
+			c.stats.queueRejections.Add(1)
+			return nil, failure(ErrorUnavailable, "queue full", nil)
+		}
+
+		c.stats.queueWaits.Add(1)
+
+		started := time.Now()
+		timer := time.NewTimer(c.config.QueueTimeout)
+
+		var err error
+
+		select {
+		case pool.slots <- struct{}{}:
+		case <-ctx.Done():
+			err = ioFailure("admission", ctx.Err())
+		case <-c.ctx.Done():
+			err = failure(ErrorClosed, "admission", nil)
+		case <-timer.C:
+			c.stats.queueTimeouts.Add(1)
+
+			err = failure(ErrorDeadline, "queue timeout", context.DeadlineExceeded)
+		}
+
+		timer.Stop()
+		c.stats.queueWaitNanoseconds.Add(uint64(time.Since(started)))
+		<-pool.queued
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c.mu.Lock()
+	if c.closed || ctx.Err() != nil {
+		closed := c.closed
+
+		<-pool.slots
+		c.mu.Unlock()
+
+		if closed {
+			return nil, failure(ErrorClosed, "admission", nil)
+		}
+
+		return nil, ioFailure("admission", ctx.Err())
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	v := &Value{client: c, pool: pool, ctx: ctx, cancel: cancel, request: r, slot: true, finished: make(chan struct{})}
+	c.active[v] = struct{}{}
+	c.mu.Unlock()
+	stopPending(v, context.AfterFunc(ctx, func() { v.finish(ioFailure("value", ctx.Err())) }))
+
+	return v, nil
+}
+
+// Get returns validated headers and an owned stream. Without options it performs
+// a fresh bootstrap followed lazily by one pinned remainder. Empty options and
+// SmallObject alone preserve bootstrap. Range/pin options select metadata using
+// HEAD (or a validated supplied snapshot), then open
+// exactly the pinned range without a page-zero body. ctx governs admission and
+// the returned Value's entire lifetime.
+func (c *Client) Get(ctx context.Context, request Request, options ...ReadOptions) (*Value, error) {
+	if ctx == nil || len(options) > 1 {
+		return nil, failure(ErrorInvalidArgument, "get", nil)
 	}
 
 	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationBootstrap, byteRange: bootstrapRange()}
@@ -123,51 +222,137 @@ func (c *Client) Get(ctx context.Context, request Request) (*Value, error) {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	v := &Value{client: c, ctx: ctx, cancel: cancel, request: r, finished: make(chan struct{})}
-	c.mu.Lock()
-	if c.closed || c.transport == nil {
-		c.mu.Unlock()
-		cancel()
+	var (
+		snapshot   *Metadata
+		first, end int64
+	)
 
-		return nil, failure(ErrorClosed, "get", nil)
+	var o ReadOptions
+	if len(options) == 1 {
+		o = options[0]
 	}
 
-	c.active[v] = struct{}{}
-	c.mu.Unlock()
+	pool := &c.bulk
+	if o.SmallObject {
+		pool = &c.smallPool
+	}
 
-	stop := context.AfterFunc(ctx, func() { v.finish(ioFailure("value", ctx.Err())) })
-	defer stopPending(v, stop)
-
-	select {
-	case c.slots <- struct{}{}:
-		v.mu.Lock()
-		if v.terminal != nil {
-			v.mu.Unlock()
-			<-c.slots
-
-			return nil, v.err()
+	if o.Offset != 0 || o.Length != 0 || o.Pin.value != "" || o.Metadata != nil {
+		if uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
+			return nil, failure(ErrorInvalidArgument, "read options", nil)
 		}
 
-		v.slot = true
-		v.mu.Unlock()
-	case <-ctx.Done():
-		v.finish(ioFailure("get", ctx.Err()))
-		return nil, v.err()
+		if o.Pin.value != "" {
+			if _, err := ParseETag(o.Pin.value); err != nil {
+				return nil, err
+			}
+		}
+
+		var m Metadata
+		if o.Metadata != nil {
+			m = *o.Metadata
+			if err := m.Validate(); err != nil {
+				return nil, err
+			}
+
+			if o.Pin.value != "" && o.Pin != m.ETag {
+				return nil, failure(ErrorInvalidArgument, "snapshot pin", nil)
+			}
+		} else {
+			var err error
+
+			m, err = c.stat(ctx, request, o.Pin)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if ByteLength(o.Offset) > m.Size || o.Length > m.Size-ByteLength(o.Offset) {
+			return nil, failure(ErrorUnsatisfiableRange, "read options", nil)
+		}
+
+		if o.SmallObject && m.Size > PageSize {
+			return nil, failure(ErrorInvalidArgument, "small object size", nil)
+		}
+
+		first, end = int64(o.Offset), int64(m.Size)
+		if o.Length != 0 {
+			end = first + int64(o.Length)
+		}
+
+		snapshot = &m
+		r.operation, r.pin = OperationPinned, m.ETag
+		r.byteRange = Range{present: true, first: uint64(first), last: uint64(end - 1)}
 	}
 
-	meta, length, err := v.open(r, nil)
+	v, err := c.admit(ctx, pool, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if snapshot != nil && first == end {
+		v.metadata, v.offset, v.end = *snapshot, first, end
+		v.finish(io.EOF)
+
+		if err := v.err(); err != io.EOF {
+			return nil, err
+		}
+
+		return v, nil
+	}
+
+	meta, length, err := v.open(r, snapshot)
 	if err != nil {
 		v.finish(err)
 		return nil, v.err()
 	}
 
-	v.metadata, v.remaining = meta, length
+	v.metadata, v.remaining, v.offset, v.end = meta, length, first, int64(meta.Size)
+	if snapshot != nil {
+		v.metadata, v.end = *snapshot, end
+	}
+
 	if err := v.err(); err != nil {
 		return nil, err
 	}
 
 	return v, nil
+}
+
+// Stat obtains fresh full-object metadata using HEAD on separately reserved
+// connections, so long-lived bulk streams cannot starve metadata requests.
+func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
+	return c.stat(ctx, request, ETag{})
+}
+
+func (c *Client) stat(ctx context.Context, request Request, pin ETag) (Metadata, error) {
+	if ctx == nil {
+		return Metadata{}, failure(ErrorInvalidArgument, "stat", nil)
+	}
+
+	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationHead, pin: pin}
+	if err := validateRequest(r); err != nil {
+		return Metadata{}, err
+	}
+
+	v, err := c.admit(ctx, &c.metadataPool, r)
+	if err != nil {
+		return Metadata{}, err
+	}
+
+	m, _, err := v.open(r, nil)
+	if err != nil {
+		v.finish(err)
+		return Metadata{}, v.err()
+	}
+
+	v.finish(io.EOF)
+
+	if err := v.err(); err != io.EOF {
+		return Metadata{}, err
+	}
+
+	return m, nil
 }
 
 func stopPending(v *Value, stop func() bool) {
@@ -181,11 +366,22 @@ func stopPending(v *Value, stop func() bool) {
 	}
 }
 
-// Close rejects new work, cancels pending Gets and active Values, closes their
-// bodies without draining, and closes idle connections. It is idempotent.
+// Close rejects new work, cancels queued calls and active Values, and closes
+// connections without draining. Concurrent calls wait for active cleanup.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	c.closed = true
+
+	for _, buffers := range []chan *[copyBufferSize]byte{c.copyBuffers, c.smallCopyBuffers} {
+	drainCopyBuffers:
+		for {
+			select {
+			case <-buffers:
+			default:
+				break drainCopyBuffers
+			}
+		}
+	}
 
 	values := make([]*Value, 0, len(c.active))
 	for v := range c.active {
@@ -201,81 +397,7 @@ func (c *Client) Close() error {
 		c.cancel()
 	}
 
-	if c.transport != nil {
-		c.transport.CloseIdleConnections()
-	}
+	c.closeIdleConnections()
 
 	return nil
-}
-
-func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, error) {
-	if err := validateRequest(r); err != nil {
-		return Metadata{}, 0, err
-	}
-
-	state := &responseState{request: r, snapshot: snapshot}
-	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
-		conn, ok := info.Conn.(*responseConn)
-		if !ok {
-			return
-		}
-
-		conn.mu.Lock()
-		conn.state = state
-		conn.mu.Unlock()
-	}}
-	ctx := httptrace.WithClientTrace(v.ctx, trace)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://racer"+objectPrefix+r.key.String(), nil)
-	if err != nil {
-		return Metadata{}, 0, ioFailure("request", err)
-	}
-
-	req.Header = requestHeaders(r)
-	req.Header["User-Agent"] = nil
-
-	res, err := v.client.transport.RoundTrip(req)
-	if err != nil {
-		state.mu.Lock()
-		wireErr := state.err
-		state.mu.Unlock()
-
-		if wireErr != nil {
-			return Metadata{}, 0, wireErr
-		}
-
-		if v.ctx.Err() != nil {
-			return Metadata{}, 0, ioFailure("get", v.ctx.Err())
-		}
-
-		var typed *Error
-		if errors.As(err, &typed) {
-			return Metadata{}, 0, typed
-		}
-
-		return Metadata{}, 0, ioFailure("get", err)
-	}
-
-	state.mu.Lock()
-	result, wireErr := state.result, state.err
-	state.mu.Unlock()
-
-	if wireErr != nil {
-		closeBody(res.Body)
-		return Metadata{}, 0, wireErr
-	}
-
-	v.mu.Lock()
-	if v.terminal != nil {
-		err = v.terminal
-		v.mu.Unlock()
-		closeBody(res.Body)
-
-		return Metadata{}, 0, err
-	}
-
-	v.body = res.Body
-	v.mu.Unlock()
-
-	return result.metadata, result.length, nil
 }

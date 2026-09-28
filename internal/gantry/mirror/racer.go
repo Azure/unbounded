@@ -4,8 +4,6 @@
 package mirror
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,7 +12,6 @@ import (
 	"strconv"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -23,7 +20,8 @@ import (
 
 // RacerClient is satisfied by the SDK client, including its protocol fake.
 type RacerClient interface {
-	Get(context.Context, racersdk.Request) (*racersdk.Value, error)
+	Get(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error)
+	Stat(context.Context, racersdk.Request) (racersdk.Metadata, error)
 }
 
 // WithRacer selects the exclusive Racer content path. The origin passed to New
@@ -44,80 +42,74 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		return
 	}
 
-	value, err := s.racer.Get(r.Context(), request)
-	if err != nil {
-		var sdkErr *racersdk.Error
-		if s.auth != nil && errors.As(err, &sdkErr) && sdkErr.Kind() == racersdk.ErrorUnauthorized {
-			// A same-node origin callback may have remembered a validated
-			// repository challenge. The registry-level API cannot discover a
-			// remote repository challenge when its /v2/ endpoint is public.
-			challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
-			challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
+	offset, ranged := parseOriginRetryRange(r.Header.Get("Range"))
+	ranged = ranged && kind == ifaces.KindBlob
 
-			cancel()
+	var (
+		metadata racersdk.Metadata
+		options  []racersdk.ReadOptions
+	)
 
-			if challengeErr == nil && required && challenge != "" {
-				w.Header().Set("WWW-Authenticate", challenge)
-			}
+	if r.Method == http.MethodHead || ranged {
+		metadata, err = s.racer.Stat(r.Context(), request)
+		if err != nil {
+			s.racerError(w, r, upstream, err)
+			return
 		}
 
-		writeRacerError(w, err)
+		if !validRacerMetadata(metadata, d) {
+			http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
+			return
+		}
 
-		return
-	}
+		if r.Method == http.MethodHead {
+			writeRacerHeaders(w, d, metadata, kind)
+			w.WriteHeader(http.StatusOK)
 
-	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close
+			return
+		}
 
-	metadata := value.Metadata()
-	if metadata.ETag.String() != `"`+d.String()+`"` {
-		http.Error(w, "invalid Racer version", http.StatusBadGateway)
-		return
-	}
-
-	size := int64(metadata.Size)
-	reader := bufio.NewReader(value)
-
-	prefix, err := reader.Peek(int(min(size, 512)))
-	if err != nil {
-		writeRacerError(w, err)
-		return
-	}
-
-	// The SDK has no HEAD operation and carries no media type. Inspecting the
-	// bootstrap prefix preserves the OCI descriptor type, including indexes.
-	if r.Method == http.MethodHead {
-		writeBlobHeadersWithPrefix(w, d, size, kind, prefix)
-		w.Header().Set("Gantry-Mirrored", "1")
-		w.WriteHeader(http.StatusOK)
-
-		return
-	}
-
-	prefix = bytes.Clone(prefix)
-
-	// Hash skipped bytes too, so a resumed response still verifies the entire
-	// Racer value. No direct-origin request can be reached from this handler.
-	verifier := digestpipe.New(io.Discard)
-	source := io.TeeReader(reader, verifier)
-	offset, ranged := parseOriginRetryRange(r.Header.Get("Range"))
-
-	ranged = ranged && kind == ifaces.KindBlob
-	if ranged {
-		if offset >= size {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		if offset >= int64(metadata.Size) {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", metadata.Size))
 			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 
 			return
 		}
 
-		if _, err := io.CopyN(io.Discard, source, offset); err != nil {
-			writeRacerError(w, err)
-			return
-		}
+		options = []racersdk.ReadOptions{{Offset: racersdk.ByteOffset(offset), Pin: metadata.ETag, Metadata: &metadata}}
 	}
 
-	writeBlobHeadersWithPrefix(w, d, size, kind, prefix)
-	w.Header().Set("Gantry-Mirrored", "1")
+	if kind == ifaces.KindManifest {
+		options = []racersdk.ReadOptions{{SmallObject: true}}
+	}
+
+	value, err := s.racer.Get(r.Context(), request, options...)
+	if err != nil {
+		s.racerError(w, r, upstream, err)
+		return
+	}
+	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close
+
+	actual := value.Metadata()
+	if !validRacerMetadata(actual, d) || (ranged && (actual.Size != metadata.Size ||
+		(actual.ContentType != "" && metadata.ContentType != "" && actual.ContentType != metadata.ContentType))) {
+		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
+		return
+	}
+
+	if kind == ifaces.KindManifest && actual.Size > racersdk.PageSize {
+		http.Error(w, "Racer manifest too large", http.StatusBadGateway)
+		return
+	}
+
+	if ranged {
+		// Optional media type may be absent on a legacy peer. Keep the selected
+		// snapshot rather than changing headers as later metadata arrives.
+		actual = metadata
+	}
+
+	size := int64(actual.Size)
+	writeRacerHeaders(w, d, actual, kind)
 
 	if ranged {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -130,30 +122,40 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	if ranged {
 		remaining -= offset
 	}
-	// Hold the final bounded chunk until both framing and digest verification
-	// succeed. A bad digest must not look like a complete Content-Length body.
-	if _, err := io.CopyN(w, source, max(0, remaining-32*1024)); err != nil {
+	// Read through SDK EOF, including its final framing check. A LimitedReader
+	// would hide a truncated terminator after the advertised payload. OCI digest
+	// verification belongs to the consumer, including resumed object assembly.
+	if n, err := io.Copy(w, value); err != nil || n != remaining {
 		panic(http.ErrAbortHandler)
+	}
+}
+
+func validRacerMetadata(metadata racersdk.Metadata, d digest.Digest) bool {
+	return metadata.Validate() == nil && metadata.ETag.String() == `"`+d.String()+`"`
+}
+
+func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk.Metadata, kind ifaces.OriginRefKind) {
+	w.Header().Set("Content-Type", metadata.ContentType)
+	writeBlobHeaders(w, d, int64(metadata.Size), kind)
+	w.Header().Set("Gantry-Mirrored", "1")
+}
+
+func (s *Server) racerError(w http.ResponseWriter, r *http.Request, upstream string, err error) {
+	var sdkErr *racersdk.Error
+	if s.auth != nil && errors.As(err, &sdkErr) && sdkErr.Kind() == racersdk.ErrorUnauthorized {
+		// A same-node origin callback may have remembered a validated repository
+		// challenge even when the registry's /v2/ endpoint is public.
+		challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
+		challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
+
+		cancel()
+
+		if challengeErr == nil && required && challenge != "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+		}
 	}
 
-	last := make([]byte, min(remaining, 32*1024)+1)
-
-	n, err := io.ReadFull(source, last[:len(last)-1])
-	if err != nil {
-		panic(http.ErrAbortHandler)
-	}
-	// Probe separately so an upstream UnexpectedEOF cannot pass as clean EOF.
-	if _, err := io.ReadFull(source, last[n:]); err != io.EOF {
-		panic(http.ErrAbortHandler)
-	}
-
-	if err := verifier.Verify(d); err != nil {
-		panic(http.ErrAbortHandler)
-	}
-
-	if _, err := w.Write(last[:n]); err != nil {
-		panic(http.ErrAbortHandler)
-	}
+	writeRacerError(w, err)
 }
 
 func writeRacerError(w http.ResponseWriter, err error) {
