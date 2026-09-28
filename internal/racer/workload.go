@@ -4,10 +4,7 @@
 package racer
 
 import (
-	"fmt"
-	"net/url"
 	"strconv"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,21 +19,9 @@ import (
 // node-private identity and slab storage, socket mounts, and exclusion affinity.
 // It must never introduce a per-node Secret or trust a node-name as a Node UID.
 // This pure builder is consumed by the operator, never by controller startup.
-func DesiredDaemonSet(c Config) (*appsv1.DaemonSet, error) {
+func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
-	}
-
-	u, err := url.Parse(c.ControlURL)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || strings.TrimSpace(c.DataplaneImage) == "" {
-		return nil, fmt.Errorf("workload endpoint or image: %w", wire.InvalidRequest)
-	}
-
-	if u.Port() != "" {
-		port, err := strconv.ParseUint(u.Port(), 10, 16)
-		if err != nil || port == 0 {
-			return nil, fmt.Errorf("workload endpoint port: %w", wire.InvalidRequest)
-		}
 	}
 
 	// The legacy managed-by label is part of the immutable selector. Preserve it

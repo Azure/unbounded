@@ -57,6 +57,23 @@ func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigDoesNotReadWorkloadOnlySettings(t *testing.T) {
+	_, err := ConfigFromLookup(func(key string) (string, bool) {
+		switch key {
+		case "RACER_CLUSTER_ID":
+			return "11111111-1111-1111-1111-111111111111", true
+		case "RACER_CONTROL_URL", "RACER_DATAPLANE_IMAGE", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
+			t.Errorf("runtime requested workload-only setting %s", key)
+			return "invalid", true
+		default:
+			return "", false
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConfigShortRotationDurations(t *testing.T) {
 	testConfig(t)
 

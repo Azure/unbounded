@@ -8,6 +8,7 @@ metadata:
 data:
   # Supply one permanent UUID before deployment. Empty fails configuration validation.
   RACER_CLUSTER_ID: {{ .ClusterID | default "" | quote }}
+  # Workload wiring is consumed by the operator's WorkloadConfig, not the controller.
   RACER_DATAPLANE_IMAGE: {{ .DataplaneImage | default "ghcr.io/azure/racer-dataplane:latest" | quote }}
   RACER_CONTROL_URL: {{ .ControlURL | default (printf "https://racer-controller.%s.svc:8443" (.Namespace | default "unbounded-system")) | quote }}
   RACER_CONTROL_ADDRESS: ":8443"
@@ -16,6 +17,7 @@ data:
   RACER_PEER_PORT: "8082"
   RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
   RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
+  # Bootstrap trust is also workload-only wiring.
   RACER_BOOTSTRAP_TRUST_CONFIGMAP: {{ .BootstrapTrustConfigMap | default "racer-bootstrap-trust" | quote }}
   RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
   RACER_DAEMONSET_NAME: "racer-dataplane"

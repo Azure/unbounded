@@ -25,7 +25,17 @@ both the test-only reference codec and the existing Rust runtime codec.
 - `internal/racer/wire`: shared contract declarations and bounded codec boundaries.
 - `deploy/racer`: controller/RBAC/config/admission templates.
 - `internal/operator/components/racer`: the sole controller Deployment and dataplane
-  DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet` builder.
+  DaemonSet owner, reusing the pure `internal/racer.DesiredDaemonSet(WorkloadConfig)` builder.
+
+`WorkloadConfig` validates only dataplane deployment inputs: cluster UUID,
+namespace, peer port, DaemonSet/service account/keyring/trust names, HTTPS control
+URL, and image. The operator loads it with `WorkloadConfigFromLookup` from the
+preserved `racer-config` payload. Controller `Config` and `ConfigFromLookup` cover
+runtime settings independently; limits, rotation policy, serving TLS, and durable
+state settings are not prerequisites for building a DaemonSet. Invalid controller
+runtime settings are rejected by controller startup rather than workload planning.
+`RACER_DATAPLANE_IMAGE`, `RACER_CONTROL_URL`, and `RACER_BOOTSTRAP_TRUST_CONFIGMAP`
+remain deployment wiring in `racer-config`, but the controller does not read them.
 
 Topology lists Pods in the installation namespace using the assigned-node index
 and passes those grouped lists directly to the pure `ReconcileMembers` helper.

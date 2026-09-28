@@ -94,8 +94,10 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 
 	cfg, err := racercore.LoadConfig()
 	require.NoError(t, err)
+	workloadCfg, err := racercore.WorkloadConfigFromLookup(os.LookupEnv)
+	require.NoError(t, err)
 	// Adopt the old controller's exact immutable selector and keep its UID.
-	legacy, err := racercore.DesiredDaemonSet(cfg)
+	legacy, err := racercore.DesiredDaemonSet(workloadCfg)
 	require.NoError(t, err)
 	require.NoError(t, c.Create(ctx, legacy, client.FieldOwner("racer-controller")))
 
