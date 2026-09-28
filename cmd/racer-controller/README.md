@@ -104,9 +104,14 @@ Standalone deployment must supply the namespace, `racer-controller-tls` serving 
 `racer-bootstrap-trust` ConfigMap with `ca.crt`. The serving certificate must cover
 the configured service DNS name. These public trust/server TLS inputs are separate
 from the controller-managed node issuer. No sample private keys are shipped.
-The serving files are loaded at startup, so replacing deployment TLS certificates
-requires a controller restart. Rotating node issuer roots are read live. Bootstrap
-recovery must omit expired client certificates; snapshot always requires mTLS.
+The server validates serving files at startup and hot-reloads valid replacements
+on a one-second polling interval. In Kubernetes, that interval starts from file
+visibility after kubelet Secret projection, not from the API write. Standalone
+deployments use the same reloader, but an external certificate issuer and trust
+owner must renew certificates and distribute compatible bootstrap trust. Hot
+reload does not provide issuance or trust rotation for standalone installations.
+Rotating node issuer roots are read live and remain separate from serving TLS.
+Bootstrap recovery must omit expired client certificates; snapshot always requires mTLS.
 
 ## Operator installation
 
@@ -141,16 +146,66 @@ Use the existing `unbounded-component-overrides` ConfigMap with `component: race
 `kind: Deployment` or `kind: DaemonSet` for resources, environment, devices,
 scheduling, mounts, and RDMA. Invalid overrides withhold affected workload writes;
 removing valid overrides returns those fields to defaults through SSA.
-Deleting the last ClusterCache retains resources and pauses operator reconciliation
-for Racer. Administrators may remove workloads deliberately; a later cache resumes
-provisioning with the retained identity and counters.
+Deleting the last ClusterCache retains resources and pauses workload management,
+not all TLS maintenance. For an established installation with a validated permanent
+operator claim, matching consumed immutable marker, and existing serving Secret,
+the operator checks serving TLS hourly and maintains its bootstrap trust. This
+does not resume initialization, repair workloads, or recreate deleted serving
+credentials. Administrators may remove workloads deliberately; a later cache
+resumes provisioning with the retained identity and counters. Standalone resources
+without an operator claim are not adopted by retained TLS maintenance.
 
-The operator renews serving certificates with the same CA key, republishes public
-trust, and stamps the controller pod template to restart after certificate changes.
-The serving CA key stays in `racer-controller-tls`, separate from the controller's
-node issuer. Missing established serving credentials fail closed. Reconciliation
-checks renewal hourly while a cache exists. Controller updates use the Recreate
-and leader-only readiness contract described below.
+### Serving TLS rotation and recovery
+
+The operator's serving TLS policy is fixed in code, independent of the node
+issuer/shared-key policy below:
+
+- Serving leaves expire 14 days after issuance and renew seven days before expiry,
+  with a new leaf private key. Leaf validity is capped by the signing CA's expiry.
+- Serving CAs expire 28 days after issuance and rotate every seven days, with a new
+  CA private key and leaf. Hourly reconciliation checks the deadlines, so weekly
+  key replacement depends on the operator being available.
+- Previous public roots overlap for 14 days after replacement, capped by their
+  expiration, with at most two previous roots. Bounded cross-signed compatibility
+  chains let clients with retained old trust verify the new leaf during that
+  overlap. The Secret retains only the current CA and leaf private keys, never old
+  private keys. `racer-bootstrap-trust` publishes the current and retained previous
+  roots, separate from the controller's node/peer issuer.
+
+Credentials and rotation state commit together in `racer-controller-tls` under an
+optimistic lock before the operator derives public bootstrap trust from the
+committed Secret. Recognized legacy serving credentials migrate to weekly rotation
+with an old-root compatibility bridge. Routine renewals and rotations do not
+change either workload's pod template or trigger a rollout. An existing
+`unbounded-cloud.io/racer-tls-hash` annotation is preserved as an inert value,
+not recomputed. Config payload hashes still trigger workload rollouts.
+
+The reloader accepts a coherent certificate/key pair, retains the last valid pair
+on missing, malformed, or mixed-generation updates, and uses new credentials for
+new handshakes without closing existing connections or long polls. It rejects
+new handshakes when the cached leaf expires; retaining a pair does not extend its
+validity. Expired optional cross-signed bridge suffixes are trimmed from validated
+chains so clients trusting the current CA can still connect while the leaf remains
+valid. Invalid initial files prevent listener startup. One-second polling is not
+an immediate API-to-serving guarantee: kubelet projection and client trust delivery
+remain asynchronous.
+
+Continuity covers routine rotation with valid credentials and stale client trust
+still inside the retained overlap, not indefinitely disconnected clients or
+arbitrary operator/projection outages. An expired leaf can be renewed if the
+current CA and persisted state are still valid, but any leaf-expiry outage has
+already occurred. Operator downtime through the current CA's expiration requires
+manual recovery of valid, consistent serving state and client trust. Missing
+established serving credentials, invalid key pairs, or corrupt rotation state are
+not silently replaced: restore consistent serving state rather than deleting
+rotation metadata or resetting installation claims. With zero caches, a missing
+serving Secret is left absent; reactivating provisioning reports it as missing.
+
+The initial software deployment of hot reload still uses the Recreate update path
+and has the control-plane interruption described below. Subsequent routine TLS
+renewals require no rollout. Local rotation/reloader tests passed, but this is not
+a live Kubernetes or production no-downtime validation; see the design's
+[weekly serving TLS validation](../../designs/racer-control-plane.md#weekly-serving-tls-validation).
 
 ### Runtime profile and resource policy
 

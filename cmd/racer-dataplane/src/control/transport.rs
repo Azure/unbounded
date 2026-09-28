@@ -1046,6 +1046,356 @@ mod tests {
     fn real_server_auth_and_mutual_tls_chunked_response() {
         tls_fixture(None, false);
     }
+    // Match operator/components/racer/tls.go: fresh P-256 keys, distinct CA
+    // subjects, unconstrained cert-signing CAs and server-auth leaves. Keys live
+    // only in memory. These are rcgen equivalents, not Go-generated fixtures.
+    struct WeeklyCertificates {
+        roots: Vec<rcgen::Certificate>,
+        crosses: Vec<rcgen::Certificate>,
+        servers: Vec<Arc<rustls::ServerConfig>>,
+        leaf_only_servers: Vec<Arc<rustls::ServerConfig>>,
+    }
+    impl WeeklyCertificates {
+        fn new() -> Self {
+            let day = Duration::from_secs(86400);
+            let now = SystemTime::now();
+            let mut roots: Vec<rcgen::Certificate> = Vec::new();
+            let mut keys = Vec::new();
+            let mut crosses = Vec::new();
+            let mut servers = Vec::new();
+            let mut leaf_only_servers = Vec::new();
+            for generation in 0..4 {
+                let created = now - day * (7 * (3 - generation) as u32);
+                let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                ca.distinguished_name = rcgen::DistinguishedName::new();
+                ca.distinguished_name.push(
+                    rcgen::DnType::CommonName,
+                    format!("racer-serving-ca-{generation}"),
+                );
+                ca.serial_number = Some((generation as u64 + 1).into());
+                ca.not_before = (created - Duration::from_secs(3600)).into();
+                ca.not_after = (created + day * 28).into();
+                ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                ca.key_usages = vec![
+                    rcgen::KeyUsagePurpose::KeyCertSign,
+                    rcgen::KeyUsagePurpose::CrlSign,
+                ];
+                let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+                let root = ca.clone().self_signed(&key).unwrap();
+                if generation > 0 {
+                    // crossSign preserves the child's subject/key/serial and
+                    // caps validity at the signing parent's expiration.
+                    ca.not_after = ca.not_after.min(roots[generation - 1].params().not_after);
+                    ca.use_authority_key_identifier_extension = true;
+                    crosses.push(
+                        ca.signed_by(&key, &roots[generation - 1], &keys[generation - 1])
+                            .unwrap(),
+                    );
+                }
+                let mut leaf = rcgen::CertificateParams::new(vec![
+                    "racer-controller.custom-system.svc".into(),
+                    "racer-controller.custom-system.svc.cluster.local".into(),
+                ])
+                .unwrap();
+                leaf.distinguished_name = rcgen::DistinguishedName::new();
+                leaf.distinguished_name.push(
+                    rcgen::DnType::CommonName,
+                    "racer-controller.custom-system.svc",
+                );
+                leaf.is_ca = rcgen::IsCa::ExplicitNoCa;
+                // Reissue each snapshot's leaf now so all server generations
+                // can be exercised without changing rustls's wall clock.
+                leaf.not_before = (now - Duration::from_secs(3600)).into();
+                leaf.not_after = root.params().not_after.min((now + day * 14).into());
+                leaf.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+                leaf.use_authority_key_identifier_extension = true;
+                let leaf_key =
+                    rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+                let cert = leaf.signed_by(&leaf_key, &root, &key).unwrap();
+                let mut chain = vec![cert.der().clone()];
+                // servingChain omits the self-signed root and retains at most
+                // two compatibility bridges, newest first.
+                chain.extend(crosses.iter().rev().take(2).map(|c| c.der().clone()));
+                let config = |chain| {
+                    Arc::new(
+                        rustls::ServerConfig::builder_with_provider(Arc::new(
+                            rustls::crypto::ring::default_provider(),
+                        ))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            chain,
+                            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der())
+                                .into(),
+                        )
+                        .unwrap(),
+                    )
+                };
+                leaf_only_servers.push(config(vec![cert.der().clone()]));
+                servers.push(config(chain));
+                roots.push(root);
+                keys.push(key);
+            }
+            Self {
+                roots,
+                crosses,
+                servers,
+                leaf_only_servers,
+            }
+        }
+    }
+
+    // A join-on-drop server also cleans up after assertion failures. Accept is
+    // nonblocking, every socket operation has a timeout, and request headers
+    // have both a size bound and an absolute deadline.
+    struct RotationServer {
+        port: u16,
+        config: Arc<std::sync::Mutex<Arc<rustls::ServerConfig>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl RotationServer {
+        fn new(config: Arc<rustls::ServerConfig>) -> Self {
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let config = Arc::new(std::sync::Mutex::new(config));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (selected, stopped) = (config.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                let mut accepted = 0;
+                while !stopped.load(Ordering::SeqCst) {
+                    let socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("rotation fixture accept: {e}"),
+                    };
+                    accepted += 1;
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let tls =
+                        rustls::ServerConnection::new(selected.lock().unwrap().clone()).unwrap();
+                    let mut stream = rustls::StreamOwned::new(tls, socket);
+                    'connection: while !stopped.load(Ordering::SeqCst) {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            if Instant::now() >= deadline || request.len() >= 16384 {
+                                break 'connection;
+                            }
+                            let mut byte = [0];
+                            if stream.read_exact(&mut byte).is_err() {
+                                // Certificate rejection and discarded idle
+                                // connections deliberately close the socket.
+                                break 'connection;
+                            }
+                            request.push(byte[0]);
+                        }
+                        let body = format!("{{\"connection\":{accepted}}}");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).is_err() || stream.flush().is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                port,
+                config,
+                stop,
+                thread: Some(thread),
+            }
+        }
+        fn rotate(&self, config: Arc<rustls::ServerConfig>) {
+            *self.config.lock().unwrap() = config;
+        }
+        fn transport(&self, trust_bundle: std::path::PathBuf) -> ControlTransport {
+            let transport = ControlTransport::new(ControlEndpoint {
+                url: format!("https://racer-controller.custom-system.svc:{}", self.port),
+                trust_bundle,
+            });
+            transport.attach_io(Rc::new(FixtureIo));
+            transport
+        }
+    }
+    impl Drop for RotationServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+    fn rotation_request(
+        transport: &ControlTransport,
+        identity: Option<&LocalSigningIdentity>,
+    ) -> Result<Vec<u8>> {
+        let scope = testing::scope();
+        futures::executor::block_on(async {
+            let connection = if let Some(identity) = identity {
+                transport.authenticated(identity, &scope).await?
+            } else {
+                transport.bootstrap(&scope).await?
+            };
+            let mut response = connection
+                .request("GET", wire::SNAPSHOT_PATH, None, &[], 1024, &scope)
+                .await?;
+            assert_eq!(response.status, 200);
+            Ok(std::mem::take(&mut response.body))
+        })
+    }
+
+    #[test]
+    fn weekly_cross_signed_chains_accept_retained_anchors_only() {
+        let certs = WeeklyCertificates::new();
+        let d = testing::Directory::new();
+        let trust = d.0.join("trust.pem");
+        let server = RotationServer::new(certs.servers[1].clone());
+        let transport = server.transport(trust.clone());
+        let (unrelated, _) = testing::ca();
+        for generation in 1..4 {
+            server.rotate(certs.servers[generation].clone());
+            let first_retained = generation.saturating_sub(2);
+            let overlap = certs.roots[first_retained..=generation]
+                .iter()
+                .rev()
+                .map(|c| c.pem())
+                .collect::<String>();
+            for (label, bundle, accepted) in [
+                ("old-only", certs.roots[generation - 1].pem(), true),
+                ("current-only", certs.roots[generation].pem(), true),
+                ("overlap", overlap, true),
+                ("oldest-only", certs.roots[0].pem(), generation <= 2),
+                (
+                    "new-cross-anchor",
+                    certs.crosses[generation - 1].pem(),
+                    true,
+                ),
+                ("unrelated", unrelated.pem(), false),
+            ] {
+                std::fs::write(&trust, bundle).unwrap();
+                let result = rotation_request(&transport, None);
+                if accepted {
+                    assert!(result.is_ok(), "week {generation}, {label}: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::Unauthorized)),
+                        "week {generation}, {label}: {result:?}"
+                    );
+                }
+            }
+        }
+        // Week two: leaf -> CA2-by-CA1 -> CA1-by-CA0. A public
+        // intermediate is also a valid anchor, without its self-signed root.
+        server.rotate(certs.servers[2].clone());
+        std::fs::write(&trust, certs.crosses[0].pem()).unwrap();
+        assert!(rotation_request(&transport, None).is_ok());
+
+        // Removing the compatibility bridges must break old-only trust, but
+        // the exact same leaf still verifies directly under the current root.
+        server.rotate(certs.leaf_only_servers[2].clone());
+        std::fs::write(&trust, certs.roots[0].pem()).unwrap();
+        assert!(matches!(
+            rotation_request(&transport, None),
+            Err(Error::Unauthorized)
+        ));
+        std::fs::write(&trust, certs.roots[2].pem()).unwrap();
+        assert!(rotation_request(&transport, None).is_ok());
+    }
+
+    #[test]
+    fn weekly_projected_trust_reload_invalidates_idle_transport() {
+        let certs = WeeklyCertificates::new();
+        let d = testing::Directory::new();
+        let trust = d.0.join("ca.crt");
+        std::os::unix::fs::symlink("..data/ca.crt", &trust).unwrap();
+        let project = |revision: usize, bundle: String| {
+            let directory = format!("revision-{revision}");
+            std::fs::create_dir(d.0.join(&directory)).unwrap();
+            std::fs::write(d.0.join(&directory).join("ca.crt"), bundle).unwrap();
+            std::os::unix::fs::symlink(directory, d.0.join("..data-next")).unwrap();
+            std::fs::rename(d.0.join("..data-next"), d.0.join("..data")).unwrap();
+        };
+        let (peer_ca, peer_key) = testing::ca();
+        let enrollment = Enrollment::new(
+            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            d.0.join("token"),
+            d.0.join("identity"),
+        );
+        enrollment
+            .set_peer_trust_roots(vec![peer_ca.der().to_vec()])
+            .unwrap();
+        let identity = enrollment
+            .accept_response(testing::issue(
+                &enrollment.prepare_now().unwrap(),
+                &peer_ca,
+                &peer_key,
+                "22222222-2222-4222-8222-222222222222",
+            ))
+            .unwrap();
+        let server = RotationServer::new(certs.servers[1].clone());
+        let transport = server.transport(trust);
+        project(0, certs.roots[0].pem());
+        let old = rotation_request(&transport, Some(&identity)).unwrap();
+        assert!(transport.idle.borrow().is_some());
+        assert_eq!(rotation_request(&transport, Some(&identity)).unwrap(), old);
+
+        // Projected overlap must still accept the previous live server. The
+        // changed bytes must discard its cached TLS connection, not reuse it.
+        project(
+            1,
+            certs.roots[2].pem() + &certs.roots[1].pem() + &certs.roots[0].pem(),
+        );
+        let overlap = rotation_request(&transport, Some(&identity)).unwrap();
+        assert_ne!(overlap, old);
+        assert_eq!(
+            rotation_request(&transport, Some(&identity)).unwrap(),
+            overlap
+        );
+
+        // Removing old trust while the old server is still live must fail,
+        // rather than bypass verification by recycling its idle connection.
+        project(2, certs.roots[2].pem());
+        assert!(matches!(
+            rotation_request(&transport, Some(&identity)),
+            Err(Error::Unauthorized)
+        ));
+        assert!(transport.idle.borrow().is_none());
+        server.rotate(certs.servers[2].clone());
+        let current = rotation_request(&transport, Some(&identity)).unwrap();
+        assert_ne!(current, overlap);
+        assert_eq!(
+            rotation_request(&transport, Some(&identity)).unwrap(),
+            current
+        );
+
+        project(3, peer_ca.pem());
+        assert!(matches!(
+            rotation_request(&transport, Some(&identity)),
+            Err(Error::Unauthorized)
+        ));
+        assert!(transport.idle.borrow().is_none());
+        // Recover using only the oldest root through both cross certificates,
+        // still without recreating or reattaching the transport.
+        project(4, certs.roots[0].pem());
+        assert!(rotation_request(&transport, Some(&identity)).is_ok());
+        transport.close_idle();
+    }
     #[test]
     fn rejects_trailing_tls_plaintext_before_connection_reuse() {
         tls_fixture(None, true);

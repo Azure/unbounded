@@ -44,7 +44,9 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
    racer-control tokens, controller bootstrap trust, private identity storage,
   slabs, sockets, and exclusion affinity. No workload reconciler is registered by
   the Racer manager; startup does not build a DaemonSet. ClusterCache activates
-  provisioning independently of Sites; zero caches retain the installation.
+  provisioning independently of Sites; zero caches retain the installation and
+  pause workload management while claim-checked serving TLS maintenance continues
+  hourly for established installations with an existing serving Secret.
 - Administrator configuration is preserved with the operator's create-if-absent
   and optimistic merge-patch pipeline. The generic overrides pipeline handles both
   workloads, including device/resource/env/mount and scheduling customization.
@@ -480,8 +482,19 @@ deployment integration check and is not exercised by envtest.
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
   and verifies optional client certificates using current local roots per handshake, and
   disables session tickets. Bootstrap recovery omits an expired certificate.
-  HTTPS server certificate files are loaded at startup; deployment certificate
-  replacement requires a controller restart. Peer root rotation remains live.
+  HTTPS server certificate files are validated at startup and hot-reloaded on a
+  one-second polling interval after files become visible. Kubernetes API writes
+  are not immediately visible: kubelet must first project the Secret. The poller
+  validates coherent certificate/key generations and atomically publishes valid
+  replacements; handshakes use immutable cached credentials without file reads.
+  Missing, malformed, or mixed-generation updates retain the last valid pair.
+  New handshakes fail once its leaf expires, and invalid initial files prevent
+  listener startup. Expired optional cross-signed compatibility suffixes are
+  trimmed to validated usable prefixes, preserving current-root clients while the
+  leaf remains valid; malformed chains are not rescued by trimming. Reload does
+  not close existing connections or long polls. Peer root rotation remains live
+  and independent (`internal/racer/server.go:66-81`,
+  `internal/racer/serving_certificate.go:24-77`, `:106-159`, `:215-279`).
 - Only exact POST `/v1/bootstrap`, GET `/v1/snapshot`, and GET `/v1/keyring` routes are admitted.
   Alternate methods/paths, encoded path aliases, unknown/duplicate/noncanonical
   query parameters, snapshot bodies, and bootstrap media/encoding mismatches fail
@@ -582,15 +595,115 @@ Projection requires a kubelet and remains deployment verification.
   [update procedure](../cmd/racer-controller/README.md#controller-updates-and-availability)
   for verification, outage semantics, and rollback guidance. Templates
   accept `ServingTLSSecret`, `BootstrapTrustConfigMap`, and `ControlURL` overrides.
-  Supply the serving TLS Secret externally. Supply the trust ConfigMap externally,
+  For standalone deployments, supply the serving TLS Secret externally and keep
+  an external certificate issuer and bootstrap trust owner responsible for renewal
+  and overlap. The same hot reloader works without operator-managed issuance.
+  Supply the trust ConfigMap externally,
   or render with `BootstrapCA` containing the public PEM CA bundle. An omitted
   `BootstrapCA` emits no ConfigMap, preserving externally managed trust. It must
   verify the controller Service hostname and must not be copied from rotating peer
   roots. For example, the generic renderer accepts `--set BootstrapCA="$(cat ca.crt)"`
   with `--templates-dir deploy/racer --output-dir deploy/racer/rendered` and the
   same namespace, cluster UUID, and image settings used by `make racer-manifests`.
-  ConfigMap environment changes and serving certificate replacement require a
-  controller rollout; bootstrap trust remains a live projected directory.
+  ConfigMap environment changes require a controller rollout; serving certificate
+  replacement does not. Bootstrap trust remains a live projected directory.
+  The initial software update that introduces hot reload still incurs the
+  Recreate interruption; routine TLS renewals afterward do not roll workloads.
+
+### Operator-managed serving TLS
+
+Serving TLS is separate from the Phase 4 peer/node issuer and shared cache keys.
+The operator owns `racer-controller-tls` and `racer-bootstrap-trust`; the Racer
+controller cannot write either. Policy constants in
+`internal/operator/components/racer/tls.go:30-40` specify:
+
+| Material | Validity/deadline | Replacement and retention |
+| --- | --- | --- |
+| Serving leaf | 14 days from issuance, capped by CA expiry | Renew seven days early with a new private key |
+| Serving CA | 28 days from issuance | Rotate every seven days with a new private key and leaf |
+| Previous public roots | 14 days after replacement, capped by certificate expiry | At most two previous roots; bounded public cross-signed compatibility chain |
+
+Hourly reconciliation checks rotation deadlines while caches exist. The Secret
+persists the current CA/leaf keys, public compatibility certificates, retirement
+deadlines, and versioned rotation state together. It retains no old private keys.
+Each cross-certificate links a new CA to its predecessor, allowing a new leaf to
+verify against retained older trust without signing new leaves with old keys.
+Expired/retired suffixes are pruned rather than accumulating generations.
+Recognized legacy long-lived serving credentials migrate immediately, retaining
+the legacy public root and a bridge for the overlap, not its private key
+(`internal/operator/components/racer/tls.go:182-295`, `:428-508`).
+
+Create-if-absent or optimistic Secret patch commits before any derived trust is
+published. Subsequent reconciliation reads the committed Secret and publishes
+current plus retained previous roots in the bootstrap ConfigMap, so a losing
+write never publishes trust for uncommitted credentials. Neither controller nor
+dataplane pod templates change for routine TLS rotation. Any existing
+`unbounded-cloud.io/racer-tls-hash` stays unchanged as inert compatibility metadata;
+removing or recomputing it would cause an unnecessary rollout. Configuration hashes
+still roll workloads (`internal/operator/components/racer/tls.go:132-179`,
+`internal/operator/components/racer/racer.go:227-258`).
+
+Zero caches still pause provisioning and workload repair, but do not abandon
+retained serving credentials. Maintenance validates the permanent operator claim
+and its matching consumed immutable installation marker, renews an existing
+serving Secret, and repairs/publishes bootstrap trust from committed credentials.
+Idle checks requeue hourly; pending Secret/trust writes requeue after five seconds.
+This path never initializes an installation, adopts standalone resources, repairs
+workloads, or recreates a missing serving Secret. An absent claim, reserved claim,
+or fresh marker does not authorize maintenance. Invalid established claim/marker
+bindings or malformed TLS state fail closed
+(`internal/operator/components/racer/tls.go:58-129`,
+`internal/operator/components/racer/identity.go:83-101`).
+
+The continuity guarantee is bounded: stale client roots verify new serving chains
+through retained bridges, and the new overlapping trust bundle still verifies a
+valid old serving leaf while its Secret projection lags. This holds only within
+the retained overlap, not for arbitrary combinations of old and new material.
+Projection must deliver renewals before the old leaf expires, and clients must
+refresh trust before their compatibility path retires or expires. One-second
+server polling is after kubelet projection, not a bound on API-to-client propagation.
+An expired leaf can recover automatically while its current CA and persisted state
+remain valid, but this does not undo the expiry outage. Operator downtime beyond
+the current CA's expiration requires manual restoration of valid, consistent
+serving state and client trust. Missing established serving credentials or invalid
+rotation state are not silently regenerated. With no caches, a missing Secret is
+left absent; with provisioning active it is an error. Do not delete rotation
+metadata or reset installation claims to bypass recovery checks
+(`internal/operator/components/racer/tls.go:83-88`, `:138-148`, `:182-242`).
+
+### Weekly serving TLS validation
+
+The following local race-instrumented Go suites and Rust transport tests passed:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s go test -race -timeout=5m \
+  ./internal/racer/... ./internal/operator/components/racer/... \
+  ./internal/operator/component/... ./cmd/racer-controller/...
+# From cmd/racer-dataplane:
+timeout --signal=TERM --kill-after=10s 300s cargo test control::transport::tests -- --nocapture
+```
+
+The operator tests exercise weekly fresh keys, bounded old-root compatibility,
+legacy migration, delayed renewal/CA expiry, corrupt state, create/CAS races and
+lost responses, unchanged workload templates including legacy hash preservation,
+and claim-checked retained TLS/trust maintenance. These use fake Kubernetes clients,
+not a live API server (`internal/operator/components/racer/tls_test.go`,
+`internal/operator/components/racer/retained_tls_test.go`). Server tests exercise
+local projected-directory swaps and torn files, invalid-update retention, cached
+leaf expiry, bridge expiry trimming, cancellation, and concurrent reload. A local
+HTTPS test verifies fresh handshakes see a new certificate while an existing
+connection and long poll survive (`internal/racer/serving_certificate_test.go`).
+
+Rust transport tests verify retained anchors across several cross-signed
+generations and projected trust reload on the same transport. Their certificates
+are generated independently with rcgen, not by the Go operator. These local tests
+support routine-rotation continuity but do not establish production no-downtime
+operation or end-to-end Go-to-Rust issuance interoperability. Actual kubelet
+Secret/ConfigMap projection timing, Service routing, the initial Recreate software
+upgrade, and full deployed controller/dataplane rotation still require live
+validation. The Phase 7 envtest results below do not cover those deployment paths.
+
+### Workload validation
 
 Upgrade the controller first and verify the ready leader supports `/v1/keyring`
 before rolling out the new dataplane/mount contract. Preserve durable issuer and
